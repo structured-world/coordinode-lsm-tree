@@ -57,6 +57,8 @@ pub(crate) struct MultiWriter {
     index_block_restart_interval: u8,
 
     use_partitioned_filter: bool,
+    /// See [`Writer::use_whole_filter_up_to`].
+    whole_filter_limit: Option<u64>,
 
     /// `Some(threshold)` selects the size-adaptive index (single-level
     /// until the index exceeds `threshold` bytes, then a streaming
@@ -481,6 +483,7 @@ impl MultiWriter {
             index_block_compression: CompressionType::None,
 
             use_partitioned_filter: false,
+            whole_filter_limit: None,
             index_spill_threshold: None,
 
             bloom_policy: BloomConstructionPolicy::default(),
@@ -1047,6 +1050,14 @@ impl MultiWriter {
     pub(crate) fn use_partitioned_filter(mut self) -> Self {
         self.use_partitioned_filter = true;
         self.writer = self.writer.use_partitioned_filter();
+        self
+    }
+
+    /// See [`Writer::use_whole_filter_up_to`].
+    #[must_use]
+    pub(crate) fn use_whole_filter_up_to(mut self, limit: u64) -> Self {
+        self.whole_filter_limit = Some(limit);
+        self.writer = self.writer.use_whole_filter_up_to(limit);
         self
     }
 
@@ -1701,6 +1712,9 @@ impl MultiWriter {
         }
         if self.use_partitioned_filter {
             new_writer = new_writer.use_partitioned_filter();
+        }
+        if let Some(limit) = self.whole_filter_limit {
+            new_writer = new_writer.use_whole_filter_up_to(limit);
         }
 
         new_writer = new_writer.use_prefix_extractor(self.prefix_extractor.clone());

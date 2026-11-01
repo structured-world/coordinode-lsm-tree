@@ -2003,14 +2003,32 @@ impl Writer {
     }
 
     #[must_use]
-    pub fn use_partitioned_filter(mut self) -> Self {
+    pub fn use_partitioned_filter(self) -> Self {
+        self.install_partitioned_filter(None)
+    }
+
+    /// Writes the filter as one block while it stays within `limit` bytes,
+    /// and partitioned past that, so a table never holds a filter block
+    /// heavier than the block cache can keep.
+    #[must_use]
+    pub fn use_whole_filter_up_to(self, limit: u64) -> Self {
+        self.install_partitioned_filter(Some(limit))
+    }
+
+    fn install_partitioned_filter(mut self, whole_limit: Option<u64>) -> Self {
         self.assert_not_started("partitioned filter");
-        let filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
+        let writer = filter::PartitionedFilterWriter::new(self.bloom_policy);
+        let writer = match whole_limit {
+            Some(limit) => writer.holding_whole_up_to(limit),
+            None => writer,
+        };
+        let filter_writer = Box::new(writer)
             .use_tli_compression(self.index_block_compression)
             .use_partition_size(self.filter_partition_size)
             .set_prefix_extractor(self.prefix_extractor.clone())
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id)
+            .use_ecc(self.ecc)
             .use_sizing(self.filter_sizing.clone());
         // Replacing a subwriter re-applies the settings already chosen, so the
         // builder reads the same whatever order its methods are called in.

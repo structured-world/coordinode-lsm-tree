@@ -42,6 +42,12 @@ pub struct Metrics {
     /// read of the file.
     pub(crate) block_load_shared: AtomicUsize,
 
+    /// Blocks read from disk that no shard of the block cache can hold.
+    pub(crate) block_cache_refused: AtomicUsize,
+
+    /// Bytes of the blocks counted by `block_cache_refused`.
+    pub(crate) block_cache_refused_bytes: AtomicU64,
+
     /// Separated-value misses served by another read's concurrent load of
     /// the same record, on the same terms as `block_load_shared`.
     pub(crate) blob_load_shared: AtomicUsize,
@@ -446,6 +452,18 @@ impl Metrics {
     /// Counted apart from cache hits and from file reads.
     pub fn block_load_shared_count(&self) -> usize {
         self.block_load_shared.load(Relaxed)
+    }
+
+    /// Blocks read from disk too heavy for any block cache shard, so every
+    /// read of one reads the file again. A steady rise points at tables
+    /// written for a larger cache, or at blocks written whole by policy.
+    pub fn block_cache_refused_count(&self) -> usize {
+        self.block_cache_refused.load(Relaxed)
+    }
+
+    /// The weight of the blocks in [`Self::block_cache_refused_count`].
+    pub fn block_cache_refused_bytes(&self) -> u64 {
+        self.block_cache_refused_bytes.load(Relaxed)
     }
 
     /// Separated-value misses served by another read's concurrent load of the

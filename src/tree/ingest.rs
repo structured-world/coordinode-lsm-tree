@@ -14,7 +14,7 @@ use core::cmp::Ordering;
 
 use crate::path::PathBuf;
 
-pub const INITIAL_CANONICAL_LEVEL: usize = 1;
+pub(crate) const INITIAL_CANONICAL_LEVEL: usize = 1;
 
 /// Bulk ingestion
 ///
@@ -200,10 +200,17 @@ impl<'a> Ingestion<'a> {
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
             // partitioned only past the threshold (see flush path).
-            writer = writer.use_adaptive_index(rc.index_partition_spill_threshold);
+            // Level 0, unlike the settings around it: pinning follows where
+            // the table is installed, an L0 run.
+            writer = writer.use_adaptive_index(
+                tree.config
+                    .index_spill_threshold(0, rc.index_partition_spill_threshold),
+            );
         }
         if filter_partitioning {
             writer = writer.use_partitioned_filter();
+        } else if let Some(limit) = tree.config.whole_filter_limit(0) {
+            writer = writer.use_whole_filter_up_to(limit);
         }
 
         writer = writer.use_prefix_extractor(tree.config.prefix_extractor.clone());

@@ -471,10 +471,15 @@ pub(super) fn prepare_table_writer(
     if index_partitioning {
         // Size-adaptive index: single-level for small SSTs, spill to a
         // partitioned index only past the threshold (see flush path).
-        table_writer = table_writer.use_adaptive_index(rc.index_partition_spill_threshold);
+        table_writer = table_writer.use_adaptive_index(
+            opts.config
+                .index_spill_threshold(dst_lvl, rc.index_partition_spill_threshold),
+        );
     }
     if filter_partitioning {
         table_writer = table_writer.use_partitioned_filter();
+    } else if let Some(limit) = opts.config.whole_filter_limit(dst_lvl) {
+        table_writer = table_writer.use_whole_filter_up_to(limit);
     }
 
     let table_writer = table_writer

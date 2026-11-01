@@ -1728,6 +1728,32 @@ impl Config {
 mod tests;
 
 impl Config {
+    /// The bytes past which a full filter at `level` is partitioned instead,
+    /// because the block cache could not keep it. `None` where it stays whole:
+    /// a pinned filter never goes through the cache, and only a full filter
+    /// answers prefix queries.
+    pub(crate) fn whole_filter_limit(&self, level: usize) -> Option<u64> {
+        (!self.filter_block_pinning_policy.get(level) && self.prefix_extractor.is_none()).then(
+            || {
+                self.cache
+                    .largest_block(crate::table::block::BlockType::Filter)
+            },
+        )
+    }
+
+    /// The index spill threshold at `level`: `configured`, lowered to what the
+    /// block cache can keep where the index goes through it.
+    pub(crate) fn index_spill_threshold(&self, level: usize, configured: u64) -> u64 {
+        if self.index_block_pinning_policy.get(level) {
+            configured
+        } else {
+            configured.min(
+                self.cache
+                    .largest_block(crate::table::block::BlockType::Index),
+            )
+        }
+    }
+
     /// The [`level_routes`](Self::level_routes) entry covering `level`, if any.
     ///
     /// The single place the level→route lookup lives, so the path a level's
@@ -2123,6 +2149,14 @@ impl Config {
     }
 
     /// Sets the partitioning policy for filter blocks.
+    ///
+    /// `true` always partitions. `false` writes one block, unless the block
+    /// cache could not keep it: a filter past one cache shard is partitioned
+    /// too, or every read would fetch it whole from the file. A pinned filter
+    /// and a filter under a prefix extractor stay one block regardless, the
+    /// first bypassing the cache and the second answering prefix queries.
+    /// Under the `metrics` feature, `block_cache_refused_count` counts the
+    /// reads such a block costs.
     #[must_use]
     pub fn filter_block_partitioning_policy(mut self, policy: PinningPolicy) -> Self {
         self.filter_block_partitioning_policy = policy;

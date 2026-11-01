@@ -66,6 +66,22 @@ impl FullFilterWriter {
         }
     }
 
+    /// A writer holding `hashes`, one per key, already registered elsewhere.
+    pub(crate) fn over_hashes(
+        bloom_policy: BloomConstructionPolicy,
+        hashes: Vec<u64>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
+        key_range: Option<(UserKey, UserKey)>,
+    ) -> Self {
+        Self {
+            keys: hashes.len(),
+            bloom_hash_buffer: hashes,
+            sizing,
+            key_range,
+            ..Self::new(bloom_policy)
+        }
+    }
+
     /// A writer that writes `filter`, the wire bytes of a filter, instead of
     /// building one. How many hashes it holds is not known here: a prefix
     /// extractor may have added some, so the output reports none and the
@@ -98,6 +114,61 @@ impl FullFilterWriter {
             .as_ref()
             .map_or(self.bloom_policy, |sizing| sizing.bound_policy())
     }
+}
+
+/// Heap bytes building one full filter over `hashes` allocates on top of them,
+/// `policy` its widest. `sized` when a retry may need the hashes again.
+pub(super) fn whole_scratch_bytes(
+    hashes: usize,
+    policy: BloomConstructionPolicy,
+    sized: bool,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+) -> u64 {
+    // The hashes move into the build, which allocates its scratch and the
+    // filter bytes on top of them. When the block is transformed, the filter
+    // bytes are framed into a second buffer.
+    let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(hashes, false);
+    let filter = policy.filter_size_bound(hashes) as u64;
+    // A sized filter builds from a copy of the hashes while a narrower retry
+    // may still need them.
+    let retry_copy = if sized {
+        (hashes * core::mem::size_of::<u64>()) as u64
+    } else {
+        0
+    };
+    build as u64
+        + retry_copy
+        + filter
+        + crate::table::block::transform_scratch_bound(
+            filter,
+            crate::table::block::BlockType::Filter,
+            CompressionType::None,
+            encryption,
+            ecc,
+        )
+}
+
+/// Bytes one full filter over `hashes` appends to the table file, `policy` its
+/// widest; none without hashes.
+pub(super) fn whole_output_bytes(
+    hashes: usize,
+    policy: BloomConstructionPolicy,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+) -> u64 {
+    if hashes == 0 {
+        return 0;
+    }
+    // Tokens that repeat out of order are deduplicated only at `finish`, so
+    // this counts them before the dedup: an estimate from above.
+    crate::table::block::framed_len_bound(
+        policy.filter_size_bound(hashes) as u64,
+        crate::table::block::BlockType::Filter,
+        CompressionType::None,
+        encryption,
+        ecc,
+    )
 }
 
 #[cfg(test)]
@@ -219,30 +290,13 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     }
 
     fn finish_scratch_bytes(&self) -> u64 {
-        // The hashes move into the build, which allocates its scratch and
-        // the filter bytes on top of them.
-        // When the block is transformed, the filter bytes are framed into a
-        // second buffer.
-        let n = self.bloom_hash_buffer.len();
-        let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false);
-        let filter = self.bound_policy().filter_size_bound(n) as u64;
-        // A sized filter builds from a copy of the hashes while a narrower
-        // retry may still need them.
-        let retry_copy = if self.sizing.is_some() {
-            (n * core::mem::size_of::<u64>()) as u64
-        } else {
-            0
-        };
-        build as u64
-            + retry_copy
-            + filter
-            + crate::table::block::transform_scratch_bound(
-                filter,
-                crate::table::block::BlockType::Filter,
-                CompressionType::None,
-                self.encryption.as_deref(),
-                self.ecc,
-            )
+        whole_scratch_bytes(
+            self.bloom_hash_buffer.len(),
+            self.bound_policy(),
+            self.sizing.is_some(),
+            self.encryption.as_deref(),
+            self.ecc,
+        )
     }
 
     fn finish_output_bytes(&self) -> u64 {
@@ -255,16 +309,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
                 self.ecc,
             );
         }
-        if self.bloom_hash_buffer.is_empty() {
-            return 0;
-        }
-        // Tokens that repeat out of order are deduplicated only at `finish`,
-        // so this counts them before the dedup: an estimate from above.
-        crate::table::block::framed_len_bound(
-            self.bound_policy()
-                .filter_size_bound(self.bloom_hash_buffer.len()) as u64,
-            crate::table::block::BlockType::Filter,
-            CompressionType::None,
+        whole_output_bytes(
+            self.bloom_hash_buffer.len(),
+            self.bound_policy(),
             self.encryption.as_deref(),
             self.ecc,
         )

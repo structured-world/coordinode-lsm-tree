@@ -2147,10 +2147,16 @@ impl AbstractTree for BlobTree {
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
             // partitioned only past the threshold (see flush path).
-            table_writer = table_writer.use_adaptive_index(rc.index_partition_spill_threshold);
+            table_writer = table_writer.use_adaptive_index(
+                self.index
+                    .config
+                    .index_spill_threshold(0, rc.index_partition_spill_threshold),
+            );
         }
         if filter_partitioning {
             table_writer = table_writer.use_partitioned_filter();
+        } else if let Some(limit) = self.index.config.whole_filter_limit(0) {
+            table_writer = table_writer.use_whole_filter_up_to(limit);
         }
 
         table_writer =

@@ -102,6 +102,28 @@ pub(crate) struct PartitionedFilterWriter {
 
     /// Hashes of the largest partition so far, which `finish` reports.
     largest_partition: usize,
+
+    /// Set while the filter may still end up one block.
+    hold: Option<WholeHold>,
+}
+
+/// The smallest partition a limit cuts a filter down to: a cache this tight
+/// gains nothing from partitions of a few keys.
+const MIN_LIMITED_PARTITION: u32 = 256;
+
+/// A filter held back from partitioning until it outgrows what one block may
+/// hold. Its hashes wait in `bloom_hash_buffer`, undivided, and a table that
+/// stays under the limit writes them as a full filter.
+struct WholeHold {
+    /// Filter bytes above which the filter is partitioned.
+    limit: u64,
+    /// Hashes at which the filter's bound first passes `limit`, worked out
+    /// with `spill_hashes`; 0 until then.
+    hashes: usize,
+    /// The key each partition would end on, one per `spill_hashes` hashes.
+    ends: Vec<UserKey>,
+    /// The table's key range, for a sized full filter.
+    key_range: Option<(UserKey, UserKey)>,
 }
 
 impl PartitionedFilterWriter {
@@ -140,7 +162,21 @@ impl PartitionedFilterWriter {
             spilled_key: None,
             table_hashes: 0,
             largest_partition: 0,
+            hold: None,
         }
+    }
+
+    /// Writes one full filter while it stays within `limit` bytes, and
+    /// partitions past that.
+    #[must_use]
+    pub(crate) fn holding_whole_up_to(mut self, limit: u64) -> Self {
+        self.hold = Some(WholeHold {
+            limit,
+            hashes: 0,
+            ends: Vec::new(),
+            key_range: None,
+        });
+        self
     }
 
     /// A writer for table `table_id` that writes `partitions`, each the wire
@@ -200,14 +236,20 @@ impl PartitionedFilterWriter {
     /// an estimate. The estimate grows with the count. `usize::MAX` when it
     /// never does, as for a policy that builds no filter.
     fn spill_threshold(&self) -> usize {
+        Self::first_count_where(|n| {
+            self.bloom_policy.estimated_filter_size(n) >= self.partition_size as usize
+        })
+    }
+
+    /// The smallest hash count `reaches` holds for, `reaches` staying true
+    /// above it. `usize::MAX` when it never does.
+    fn first_count_where(reaches: impl Fn(usize) -> bool) -> usize {
         const NEVER_PAST: usize = 1
             << if usize::BITS > 40 {
                 40
             } else {
                 usize::BITS - 2
             };
-        let reaches =
-            |n| self.bloom_policy.estimated_filter_size(n) >= self.partition_size as usize;
         let mut high = 1_usize;
         while !reaches(high) {
             if high >= NEVER_PAST {
@@ -226,6 +268,38 @@ impl PartitionedFilterWriter {
             }
         }
         high
+    }
+
+    /// Works out where partitions spill, and where a held filter stops being
+    /// held, when the first key arrives and the settings are final.
+    fn settle_thresholds(&mut self) {
+        // A partition must fit where the whole filter did not. The estimate
+        // that cuts partitions is no bound, hence the margin.
+        if let Some(hold) = &self.hold {
+            let target = u32::try_from(hold.limit / 2).unwrap_or(u32::MAX);
+            self.partition_size = self.partition_size.min(target.max(MIN_LIMITED_PARTITION));
+        }
+        self.spill_hashes = self.spill_threshold();
+        let policy = self.bound_policy();
+        if let Some(hold) = self.hold.as_mut() {
+            let limit = hold.limit;
+            hold.hashes = Self::first_count_where(|n| policy.filter_size_bound(n) as u64 > limit);
+        }
+    }
+
+    /// Partitions a filter that has outgrown its hold. Each key in `ends`
+    /// closes a partition: what follows the last one stays open, as it would
+    /// had the writer never held.
+    fn release_hold(&mut self, ends: Vec<UserKey>) -> crate::Result<()> {
+        let spill = self.spill_hashes;
+        let hashes = core::mem::take(&mut self.bloom_hash_buffer);
+        let (closed, open) = hashes.split_at(ends.len() * spill);
+        for (partition, end) in closed.chunks_exact(spill).zip(ends) {
+            self.last_key = Some(end.clone());
+            self.spill_filter_partition(&end, partition.to_vec())?;
+        }
+        self.bloom_hash_buffer.extend_from_slice(open);
+        Ok(())
     }
 
     /// The open partition's filter bytes, bounded from above: what `finish`
@@ -719,8 +793,15 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     }
 
     // Partitions are sized as they spill, before the table's last key is
-    // known; the first key is kept as keys arrive.
-    fn set_key_range(&mut self, _: &UserKey, _: &UserKey) {}
+    // known; the first key is kept as keys arrive. Only a filter still held
+    // is written whole and takes the range.
+    fn set_key_range(&mut self, first: &UserKey, last: &UserKey) {
+        if self.sizing.is_some()
+            && let Some(hold) = self.hold.as_mut()
+        {
+            hold.key_range = Some((first.clone(), last.clone()));
+        }
+    }
 
     fn use_partition_size(mut self: Box<Self>, size: u32) -> Box<dyn FilterWriter<W>> {
         self.partition_size = size;
@@ -775,7 +856,19 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         self.open_key_len = key.len();
 
         if self.spill_hashes == 0 {
-            self.spill_hashes = self.spill_threshold();
+            self.settle_thresholds();
+        }
+        if let Some(hold) = self.hold.as_mut() {
+            let held = self.bloom_hash_buffer.len();
+            if held.is_multiple_of(self.spill_hashes) {
+                hold.ends.push(UserKey::new(key));
+            }
+            if held >= hold.hashes {
+                let ends = core::mem::take(&mut hold.ends);
+                self.hold = None;
+                self.release_hold(ends)?;
+            }
+            return Ok(1);
         }
         if self.bloom_hash_buffer.len() >= self.spill_hashes {
             // Owned bytes: the partition index keeps this key until the table
@@ -808,7 +901,11 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
             self.tli_handles.capacity(),
         );
         let (pending_hashes, pending_framed) = self.pending_bytes();
-        (self.final_filter_buffer.capacity() + hashes + tli) as u64
+        let held_ends = self.hold.as_ref().map_or(0, |hold| {
+            hold.ends.capacity() * core::mem::size_of::<UserKey>()
+                + hold.ends.iter().map(|end| end.len()).sum::<usize>()
+        });
+        (self.final_filter_buffer.capacity() + hashes + tli + held_ends) as u64
             + pending_hashes
             + pending_framed
     }
@@ -816,6 +913,15 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     fn finish_scratch_bytes(&self) -> u64 {
         use crate::table::block::{BlockType, framed_len_bound, transform_scratch_bound};
         let encryption = self.encryption.as_deref();
+        if self.hold.is_some() {
+            return super::full::whole_scratch_bytes(
+                self.bloom_hash_buffer.len(),
+                self.bound_policy(),
+                self.sizing.is_some(),
+                encryption,
+                self.ecc,
+            );
+        }
         // `finish` builds the open partition and frames it, and appends it and
         // the partitions still on workers to the partition buffer, which
         // reallocates when it outgrows its capacity and holds both copies
@@ -870,6 +976,14 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
 
     fn finish_output_bytes(&self) -> u64 {
         use crate::table::block::{BlockType, framed_len_bound};
+        if self.hold.is_some() {
+            return super::full::whole_output_bytes(
+                self.bloom_hash_buffer.len(),
+                self.bound_policy(),
+                self.encryption.as_deref(),
+                self.ecc,
+            );
+        }
         if self.last_key.is_none() && self.bloom_hash_buffer.is_empty() {
             return 0;
         }
@@ -907,6 +1021,20 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
         last_key: Option<&UserKey>,
     ) -> crate::Result<super::FilterOutput> {
+        if let Some(hold) = self.hold.take() {
+            let whole: Box<dyn FilterWriter<W>> = Box::new(super::FullFilterWriter::over_hashes(
+                self.bloom_policy,
+                core::mem::take(&mut self.bloom_hash_buffer),
+                self.sizing.take(),
+                hold.key_range,
+            ));
+            return whole
+                .use_encryption(self.encryption.take())
+                .use_table_id(self.table_id)
+                .use_ecc(self.ecc)
+                .finish(file_writer, last_key);
+        }
+
         if self.last_key.is_none() && self.bloom_hash_buffer.is_empty() {
             log::trace!("Filter writer has not seen any writes - not building filter");
             return Ok(super::FilterOutput::default());
