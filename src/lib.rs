@@ -609,9 +609,9 @@ pub use compression::{ZstdDictionaries, ZstdDictionary};
 #[cfg(feature = "metrics")]
 pub use metrics::{AcceptedWrites, CacheStats, Metrics};
 
-#[cfg(feature = "std")]
-pub use backpressure::WriteBufferBudget;
 pub use backpressure::{Backpressure, BackpressureSignals, BackpressureThresholds};
+#[cfg(feature = "std")]
+pub use backpressure::{Unflushed, WriteBufferBudget};
 
 pub use compaction::capacity::CapacityPool;
 

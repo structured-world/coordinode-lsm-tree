@@ -247,3 +247,54 @@ fn is_throttled_reflects_tier() {
     );
     assert!(Backpressure::Stop.is_throttled());
 }
+
+/// A metered file system reads the budget from inside a version install, which
+/// holds the version lock: a read that took that lock would deadlock here.
+#[test]
+fn a_budget_reads_its_members_under_their_version_lock() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+
+    let folder = crate::get_tmp_folder();
+    let budget = alloc::sync::Arc::new(WriteBufferBudget::default());
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .write_buffer_budget(alloc::sync::Arc::clone(&budget))
+    .open()?;
+    tree.insert("k", "v", 0);
+    let AnyTree::Standard(tree) = &tree else {
+        unreachable!("no separation configured");
+    };
+
+    let held = tree.version_history.write();
+    assert_eq!(budget.unflushed().memtables, 1);
+    drop(held);
+    Ok(())
+}
+
+/// A memtable holding only a range tombstone still waits for a flush, and
+/// counting it takes no memtable lock: inserting a tombstone holds its lock
+/// across the tree's comparator, which is the caller's code.
+#[test]
+fn a_budget_counts_a_tombstone_only_memtable_under_its_tombstone_lock() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let folder = crate::get_tmp_folder();
+    let budget = alloc::sync::Arc::new(WriteBufferBudget::default());
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .write_buffer_budget(alloc::sync::Arc::clone(&budget))
+    .open()?;
+    tree.remove_range("a", "b", 0);
+
+    let active = tree.active_memtable();
+    let held = active.range_tombstones.write();
+    assert_eq!(budget.unflushed().memtables, 1);
+    drop(held);
+    Ok(())
+}

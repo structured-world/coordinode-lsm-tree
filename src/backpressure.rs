@@ -238,6 +238,17 @@ impl Backpressure {
     }
 }
 
+/// What a [`WriteBufferBudget`]'s members hold that flushes have yet to write.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unflushed {
+    /// Memtable bytes, active and sealed.
+    pub bytes: u64,
+    /// Memtables: each sealed one and each non-empty active one. Each costs a
+    /// flush its own table.
+    pub memtables: u64,
+}
+
 /// The current memtables of a tree, as a budget reads them: the tree's
 /// lock-free mirror of its latest super version.
 #[cfg(feature = "std")]
@@ -285,15 +296,44 @@ impl WriteBufferBudget {
     /// memtables together.
     #[must_use]
     pub fn unflushed_bytes(&self) -> u64 {
+        self.unflushed().bytes
+    }
+
+    /// The memtables of every live member that flushes have yet to write, and
+    /// their bytes, read in one pass.
+    ///
+    /// Takes no tree lock, so it is safe to call from inside a tree's own
+    /// writes, such as from a metered [`Fs`](crate::fs::Fs).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, WriteBufferBudget};
+    /// use std::sync::Arc;
+    ///
+    /// # let folder = tempfile::tempdir()?;
+    /// let budget = Arc::new(WriteBufferBudget::default());
+    /// let tree = Config::new(folder.path(), Default::default(), Default::default())
+    ///     .write_buffer_budget(Arc::clone(&budget))
+    ///     .open()?;
+    /// assert_eq!(budget.unflushed().memtables, 0);
+    /// tree.insert("k", "v", 0);
+    /// assert_eq!(budget.unflushed().memtables, 1);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn unflushed(&self) -> Unflushed {
         let mut members = self.members.lock();
-        let mut total = 0u64;
+        let mut total = Unflushed::default();
         members.retain(|member| {
             let Some(mirror) = member.upgrade() else {
                 return false;
             };
-            // Each term is one tree's memtable bytes in memory, so the sum is
+            let version = mirror.load();
+            // Each term is one tree's memtables in memory, so the sums are
             // bounded by the process's memory and cannot overflow u64.
-            total += mirror.load().unflushed_bytes();
+            total.bytes += version.unflushed_bytes();
+            total.memtables += version.unflushed_memtables();
             true
         });
         total
