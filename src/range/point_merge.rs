@@ -26,7 +26,6 @@ use crate::{
     memtable::Memtable,
     merge_operator::MergeOperator,
     mvcc_stream::{MvccStream, ValueLog},
-    range_tombstone::RangeTombstone,
     table::Table,
     version::SuperVersion,
 };
@@ -47,7 +46,7 @@ enum Source<'a> {
 /// the memtables up to the next table and hands that table out,
 /// [`Self::take_table`] takes its versions of the key, and once no table is
 /// left [`Self::finish`] resolves them.
-pub struct MergeWalk<'v> {
+pub(crate) struct MergeWalk<'v> {
     super_version: &'v SuperVersion,
     key: UserKey,
     seqno: SeqNo,
@@ -60,18 +59,18 @@ pub struct MergeWalk<'v> {
     next: usize,
     /// Each version with the rank of the source it was read from.
     entries: Vec<(usize, InternalValue)>,
-    /// Each with the read's seqno, the cutoff the merge checks it against.
-    tombstones: Vec<(RangeTombstone, SeqNo)>,
+    /// The seqno of the newest range tombstone over the key the read sees.
+    hiding: Option<SeqNo>,
     /// The seqno of the newest base found: what is below it is hidden.
     floor: Option<SeqNo>,
-    /// The table handed out and not taken back: where its versions and
-    /// tombstones start, and its rank.
-    pending: Option<(usize, usize, usize)>,
+    /// The table handed out and not taken back: where its versions start, and
+    /// its rank.
+    pending: Option<(usize, usize)>,
 }
 
 /// A table [`MergeWalk::next_table`] hands out, and its place in the version:
 /// level, run in the level, position in the run.
-pub struct MergeTable<'v> {
+pub(crate) struct MergeTable<'v> {
     pub table: &'v Table,
     pub at: (usize, usize, usize),
 }
@@ -122,7 +121,7 @@ impl<'v> MergeWalk<'v> {
             sources,
             next: 0,
             entries: Vec::new(),
-            tombstones: Vec::new(),
+            hiding: None,
             floor: None,
             pending: None,
         }
@@ -153,12 +152,14 @@ impl<'v> MergeWalk<'v> {
                 break;
             }
             self.next += 1;
-            let (entries_before, tombstones_before) = (self.entries.len(), self.tombstones.len());
+            let entries_before = self.entries.len();
             match source {
                 Source::Memtable(memtable) => {
                     let seqno = self.seqno;
                     memtable.for_each_range_tombstone_containing(key, |rt| {
-                        self.tombstones.push((rt.clone(), seqno));
+                        if rt.visible_at(seqno) {
+                            self.hiding = self.hiding.max(Some(rt.seqno));
+                        }
                     });
                     let range = (
                         Bound::Included(InternalKey::bound(
@@ -176,7 +177,7 @@ impl<'v> MergeWalk<'v> {
                         rank,
                         &mut self.entries,
                     )?;
-                    self.raise_floor(entries_before, tombstones_before);
+                    self.raise_floor(entries_before);
                 }
                 Source::Table(table, at) => {
                     // A table's tombstones are sorted by start: those starting
@@ -184,15 +185,18 @@ impl<'v> MergeWalk<'v> {
                     let starting = table.range_tombstones().partition_point(|rt| {
                         comparator.compare(&rt.start, key) != core::cmp::Ordering::Greater
                     });
-                    self.tombstones.extend(
+                    let seqno = self.seqno;
+                    self.hiding = self.hiding.max(
                         table
                             .range_tombstones()
                             .iter()
                             .take(starting)
+                            .filter(|rt| rt.visible_at(seqno))
                             .filter(|rt| rt.contains_key_with(key, comparator))
-                            .map(|rt| (rt.clone(), self.seqno)),
+                            .map(|rt| rt.seqno)
+                            .max(),
                     );
-                    self.pending = Some((entries_before, tombstones_before, rank));
+                    self.pending = Some((entries_before, rank));
                     return Ok(Some(MergeTable { table, at }));
                 }
             }
@@ -210,19 +214,18 @@ impl<'v> MergeWalk<'v> {
         &mut self,
         versions: impl Iterator<Item = crate::Result<InternalValue>>,
     ) -> crate::Result<()> {
-        let Some((entries_before, tombstones_before, rank)) = self.pending.take() else {
+        let Some((entries_before, rank)) = self.pending.take() else {
             debug_assert!(false, "versions handed back for no table");
             return Ok(());
         };
         take_versions(versions, rank, &mut self.entries)?;
-        self.raise_floor(entries_before, tombstones_before);
+        self.raise_floor(entries_before);
         Ok(())
     }
 
-    /// Raises the floor to the newest base among the versions and tombstones
-    /// read since `entries_before` and `tombstones_before`.
-    fn raise_floor(&mut self, entries_before: usize, tombstones_before: usize) {
-        let seqno = self.seqno;
+    /// Raises the floor to the newest base among the versions read since
+    /// `entries_before` and the range tombstones read so far.
+    fn raise_floor(&mut self, entries_before: usize) {
         let bases = self
             .entries
             .get(entries_before..)
@@ -230,14 +233,7 @@ impl<'v> MergeWalk<'v> {
             .iter()
             .filter(|(_, entry)| !entry.key.value_type.is_merge_operand())
             .map(|(_, entry)| entry.key.seqno);
-        let hiding = self
-            .tombstones
-            .get(tombstones_before..)
-            .unwrap_or_default()
-            .iter()
-            .filter(|(rt, _)| rt.visible_at(seqno))
-            .map(|(rt, _)| rt.seqno);
-        self.floor = self.floor.max(bases.chain(hiding).max());
+        self.floor = self.floor.max(bases.max()).max(self.hiding);
     }
 
     /// The value the operands read make over the newest base, or `None` when
@@ -261,19 +257,17 @@ impl<'v> MergeWalk<'v> {
     /// the value log is read as the merge resolves, which may block.
     pub(crate) fn into_read(self) -> MergeRead {
         MergeRead {
-            key: self.key,
             entries: self.entries,
-            tombstones: self.tombstones,
+            hiding: self.hiding,
         }
     }
 }
 
 /// The versions and tombstones a [`MergeWalk`] read of one key, holding no
 /// borrow of the version it read them from.
-pub struct MergeRead {
-    key: UserKey,
+pub(crate) struct MergeRead {
     entries: Vec<(usize, InternalValue)>,
-    tombstones: Vec<(RangeTombstone, SeqNo)>,
+    hiding: Option<SeqNo>,
 }
 
 impl MergeRead {
@@ -289,11 +283,11 @@ impl MergeRead {
         blob_source: Option<&BlobSource>,
     ) -> crate::Result<Option<InternalValue>> {
         let Self {
-            key,
             mut entries,
-            tombstones,
+            hiding,
         } = self;
-        let comparator = super_version.active_memtable.comparator.as_ref();
+        // No version sits below seqno 0, so it stands for no tombstone.
+        let hiding = hiding.unwrap_or(0);
         // Newest first; at one seqno the newer source first, as the point read
         // and a merging read take it. Stable: one batch's operands of the key
         // share a seqno and a source, and an operator may depend on their
@@ -304,10 +298,7 @@ impl MergeRead {
         let Some((_, head)) = entries.first() else {
             return Ok(None);
         };
-        if tombstones
-            .iter()
-            .any(|(rt, cutoff)| rt.should_suppress_with(&key, head.key.seqno, *cutoff, comparator))
-        {
+        if head.key.seqno < hiding {
             return Ok(None);
         }
 
@@ -320,7 +311,7 @@ impl MergeRead {
             source,
             version: &super_version.version,
         }))
-        .with_range_tombstones(tombstones)
+        .with_suppression_below(hiding)
         .next()
         .transpose()?;
         Ok(resolved.filter(|value| !value.key.is_tombstone()))
@@ -329,7 +320,7 @@ impl MergeRead {
 
 /// What a table's filters said of a merge's key, the probe counted.
 #[derive(Clone, Copy)]
-pub struct TableFilter(FilterAnswer);
+pub(crate) struct TableFilter(FilterAnswer);
 
 impl TableFilter {
     /// Asks `table`'s filters about `key`, counting the probe they answer.
@@ -390,7 +381,7 @@ impl TableFilter {
 /// operands visible there make over the newest base, or `None` when the key
 /// reads as deleted. `blob_source` reads a base kept in the value log, which
 /// only a blob tree's index holds.
-pub fn resolve_point_merge(
+pub(crate) fn resolve_point_merge(
     super_version: &SuperVersion,
     key: &[u8],
     seqno: SeqNo,

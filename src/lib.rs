@@ -427,6 +427,7 @@ pub mod recovery_progress;
 pub(crate) mod active_tombstone_set;
 pub(crate) mod range_tombstone;
 pub(crate) mod range_tombstone_filter;
+pub(crate) mod range_tombstone_index;
 
 #[doc(hidden)]
 pub mod table;

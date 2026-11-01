@@ -12,7 +12,9 @@
 
 use crate::active_tombstone_set::{ActiveTombstoneSet, ActiveTombstoneSetReverse};
 use crate::range_tombstone::RangeTombstone;
+use crate::range_tombstone_index::ScanTombstones;
 use crate::{InternalValue, SeqNo, comparator::SharedComparator};
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
@@ -21,15 +23,14 @@ use alloc::vec::Vec;
 /// Each tombstone is paired with a per-source visibility cutoff (`SeqNo`).
 /// Different sources may use different cutoffs — e.g., an ephemeral memtable
 /// uses its own `index_seqno` while disk segments use the outer scan seqno.
-pub struct RangeTombstoneFilter<I> {
+pub(crate) struct RangeTombstoneFilter<I> {
     inner: I,
     comparator: SharedComparator,
 
-    // Forward state: (tombstone, per-source cutoff)
-    fwd_tombstones: Vec<(RangeTombstone, SeqNo)>,
+    // Forward state: the tombstones in forward order, each with its cutoff.
+    fwd_tombstones: Arc<ScanTombstones>,
     fwd_idx: usize,
     fwd_active: ActiveTombstoneSet,
-    fwd_initialized: bool,
 
     // Reverse state: (tombstone, per-source cutoff)
     rev_tombstones: Vec<(RangeTombstone, SeqNo)>,
@@ -39,32 +40,22 @@ pub struct RangeTombstoneFilter<I> {
 }
 
 impl<I> RangeTombstoneFilter<I> {
-    /// Creates a new bidirectional filter.
-    ///
-    /// Each tombstone is paired with its per-source visibility cutoff.
-    /// Forward and reverse sorting is deferred to first `next()` /
-    /// `next_back()` respectively, so construction is O(1).
-    #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "backward-compatible default-comparator constructor"
-        )
-    )]
-    pub fn new(inner: I, fwd_tombstones: Vec<(RangeTombstone, SeqNo)>) -> Self {
-        Self::new_with_comparator(
-            inner,
-            fwd_tombstones,
-            crate::comparator::default_comparator(),
-        )
+    /// Creates a new bidirectional filter over tombstones in any order.
+    #[cfg(test)]
+    pub(crate) fn new(inner: I, mut tombstones: Vec<(RangeTombstone, SeqNo)>) -> Self {
+        let comparator = crate::comparator::default_comparator();
+        tombstones.sort_by(|a, b| a.0.cmp_with_comparator(&b.0, comparator.as_ref()));
+        Self::new_with_comparator(inner, Arc::new(ScanTombstones::new(tombstones)), comparator)
     }
 
     /// Creates a new bidirectional filter with the given comparator.
+    ///
+    /// The tombstones are in forward order. The reverse order is built by the
+    /// first `next_back()`.
     #[must_use]
-    pub fn new_with_comparator(
+    pub(crate) fn new_with_comparator(
         inner: I,
-        fwd_tombstones: Vec<(RangeTombstone, SeqNo)>,
+        fwd_tombstones: Arc<ScanTombstones>,
         comparator: SharedComparator,
     ) -> Self {
         Self {
@@ -73,7 +64,6 @@ impl<I> RangeTombstoneFilter<I> {
             fwd_tombstones,
             fwd_idx: 0,
             fwd_active: ActiveTombstoneSet::new_with_comparator(comparator.clone()),
-            fwd_initialized: false,
             rev_tombstones: Vec::new(),
             rev_idx: 0,
             rev_active: ActiveTombstoneSetReverse::new_with_comparator(comparator),
@@ -81,23 +71,12 @@ impl<I> RangeTombstoneFilter<I> {
         }
     }
 
-    /// Ensures forward tombstones are sorted (start asc, seqno desc, end asc).
-    fn ensure_fwd_initialized(&mut self) {
-        if !self.fwd_initialized {
-            let comparator = self.comparator.as_ref();
-            self.fwd_tombstones
-                .sort_by(|a, b| a.0.cmp_with_comparator(&b.0, comparator));
-            self.fwd_initialized = true;
-        }
-    }
-
     /// Ensures reverse tombstones are built and sorted (end desc, seqno desc).
     fn ensure_rev_initialized(&mut self) {
         if !self.rev_initialized {
-            // Sort fwd first so both directions share a canonical base order,
-            // preserving tie-breaking semantics from the pre-lazy implementation.
-            self.ensure_fwd_initialized();
-            self.rev_tombstones = self.fwd_tombstones.clone();
+            // From the forward order, so both directions share a canonical
+            // base order and the stable sort below keeps its tie-breaking.
+            self.rev_tombstones = self.fwd_tombstones.list().to_vec();
             let comparator = self.comparator.as_ref();
             self.rev_tombstones.sort_by(|a, b| {
                 comparator
@@ -111,7 +90,7 @@ impl<I> RangeTombstoneFilter<I> {
 
     /// Activates forward tombstones whose start <= `current_key`.
     fn fwd_activate_up_to(&mut self, key: &[u8]) {
-        while let Some((rt, cutoff)) = self.fwd_tombstones.get(self.fwd_idx) {
+        while let Some((rt, cutoff)) = self.fwd_tombstones.list().get(self.fwd_idx) {
             if self.comparator.compare(&rt.start, key) == core::cmp::Ordering::Greater {
                 break;
             }
@@ -138,9 +117,9 @@ impl<I: crate::reseek::Reseekable> crate::reseek::Reseekable for RangeTombstoneF
     /// pull re-activates tombstones from the start of the (position-independent)
     /// sorted lists, then forward the reposition to the wrapped stream.
     ///
-    /// The sorted tombstone lists and the `*_initialized` flags are kept: sort
-    /// order does not depend on iteration position, so re-sorting on every
-    /// reposition would be wasted work.
+    /// The sorted tombstone lists are kept: sort order does not depend on
+    /// iteration position, so re-sorting on every reposition would be wasted
+    /// work.
     fn reseek(&mut self, ctx: &crate::reseek::ReseekCtx) {
         self.fwd_idx = 0;
         self.rev_idx = 0;
@@ -157,8 +136,6 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for RangeTombsto
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.ensure_fwd_initialized();
-
         loop {
             let item = self.inner.next()?;
 

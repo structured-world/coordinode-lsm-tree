@@ -149,6 +149,7 @@ enum Variant {
     Lexicographic,
     Reverse,
     Merge,
+    ReverseMerge,
     /// Tables written in the columnar layout, read through its own block
     /// reader.
     #[cfg(feature = "columnar")]
@@ -167,6 +168,9 @@ fn open(dir: &std::path::Path, variant: Variant) -> AnyTree {
         Variant::Lexicographic => config,
         Variant::Reverse => config.comparator(Arc::new(Reverse)),
         Variant::Merge => config.with_merge_operator(Some(Arc::new(Concat))),
+        Variant::ReverseMerge => config
+            .comparator(Arc::new(Reverse))
+            .with_merge_operator(Some(Arc::new(Concat))),
         #[cfg(feature = "columnar")]
         Variant::Columnar => {
             let tree = config.open().expect("open");
@@ -335,7 +339,7 @@ fn run(
     let mut model = Model {
         versions: Vec::new(),
         range_tombstones: Vec::new(),
-        reverse: matches!(variant, Variant::Reverse),
+        reverse: matches!(variant, Variant::Reverse | Variant::ReverseMerge),
     };
     let mut seqno = 0u64;
     let mut next = || {
@@ -409,6 +413,18 @@ fn run(
     for read in reads.into_iter().map(|r| r % end).chain([end]) {
         check(&tree, &model, read, &Bound::Unbounded, &Bound::Unbounded)?;
         check(&tree, &model, read, &lo, &hi)?;
+        for idx in 0..KEY_SPACE {
+            let got = tree
+                .get(key(idx), read)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(
+                got.map(|value| value.to_vec()),
+                model.resolve(&key(idx), read),
+                "get of {} at {}",
+                idx,
+                read,
+            );
+        }
     }
     Ok(())
 }
@@ -450,6 +466,17 @@ proptest! {
         run(Variant::Merge, ops, reads, bounds)?;
     }
 
+    /// A merge meets range tombstones in the comparator's order, not in the
+    /// bytes': a tombstone's bounds decide what it deletes under it alone.
+    #[test]
+    fn long_merge_chains_under_a_reverse_comparator(
+        ops in prop::collection::vec(op_strategy(true), 1..40),
+        reads in prop::collection::vec(any::<u64>(), 1..4),
+        bounds in bounds_strategy(),
+    ) {
+        run(Variant::ReverseMerge, ops, reads, bounds)?;
+    }
+
     #[cfg(feature = "columnar")]
     #[test]
     fn long_chains_in_columnar_tables(
@@ -459,6 +486,24 @@ proptest! {
     ) {
         run(Variant::Columnar, ops, reads, bounds)?;
     }
+}
+
+/// A tombstone in the memtable, newer than the snapshot: the merge below it
+/// reads as if it were not there, while the newest read stops at it.
+#[test]
+fn a_memtable_tombstone_above_the_snapshot_hides_nothing_from_a_merge() -> Result<(), TestCaseError>
+{
+    run(
+        Variant::Merge,
+        vec![
+            Op::Put { key: 0, value: 1 },
+            Op::Merge { key: 0, op: 2 },
+            Op::RemoveRange { a: 0, b: 1 },
+            Op::Merge { key: 0, op: 3 },
+        ],
+        vec![2],
+        (None, None),
+    )
 }
 
 /// Chains in a run of narrow tables, one key's versions to a table, with
