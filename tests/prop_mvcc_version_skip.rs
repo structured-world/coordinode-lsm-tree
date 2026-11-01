@@ -149,6 +149,7 @@ enum Variant {
     Lexicographic,
     Reverse,
     Merge,
+    ReverseMerge,
     /// Tables written in the columnar layout, read through its own block
     /// reader.
     #[cfg(feature = "columnar")]
@@ -167,6 +168,9 @@ fn open(dir: &std::path::Path, variant: Variant) -> AnyTree {
         Variant::Lexicographic => config,
         Variant::Reverse => config.comparator(Arc::new(Reverse)),
         Variant::Merge => config.with_merge_operator(Some(Arc::new(Concat))),
+        Variant::ReverseMerge => config
+            .comparator(Arc::new(Reverse))
+            .with_merge_operator(Some(Arc::new(Concat))),
         #[cfg(feature = "columnar")]
         Variant::Columnar => {
             let tree = config.open().expect("open");
@@ -335,7 +339,7 @@ fn run(
     let mut model = Model {
         versions: Vec::new(),
         range_tombstones: Vec::new(),
-        reverse: matches!(variant, Variant::Reverse),
+        reverse: matches!(variant, Variant::Reverse | Variant::ReverseMerge),
     };
     let mut seqno = 0u64;
     let mut next = || {
@@ -448,6 +452,17 @@ proptest! {
         bounds in bounds_strategy(),
     ) {
         run(Variant::Merge, ops, reads, bounds)?;
+    }
+
+    /// A merge meets range tombstones in the comparator's order, not in the
+    /// bytes': a tombstone's bounds decide what it deletes under it alone.
+    #[test]
+    fn long_merge_chains_under_a_reverse_comparator(
+        ops in prop::collection::vec(op_strategy(true), 1..40),
+        reads in prop::collection::vec(any::<u64>(), 1..4),
+        bounds in bounds_strategy(),
+    ) {
+        run(Variant::ReverseMerge, ops, reads, bounds)?;
     }
 
     #[cfg(feature = "columnar")]
