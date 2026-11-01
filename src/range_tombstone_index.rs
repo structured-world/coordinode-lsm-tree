@@ -63,46 +63,80 @@ impl ScanTombstones {
     }
 }
 
+/// Where a tombstone begins or stops counting.
+#[derive(Clone, Copy)]
+struct Edge<'a> {
+    key: &'a UserKey,
+    starts: bool,
+    seqno: SeqNo,
+    /// The tombstone's place in the list.
+    at: usize,
+}
+
 impl Stretches {
     fn new(list: &[(RangeTombstone, SeqNo)], comparator: &dyn UserComparator) -> Self {
-        // `list` is sorted by start, and leaving some out keeps it so.
-        let visible: Vec<&RangeTombstone> = list
-            .iter()
-            .filter(|(rt, cutoff)| rt.visible_at(*cutoff))
-            .map(|(rt, _)| rt)
-            .collect();
+        // Every start and end, a tombstone's start and end side by side: a
+        // list of tombstones that do not overlap comes out already sorted,
+        // which the sort sees in one pass.
+        let mut edges: Vec<Edge<'_>> = Vec::with_capacity(list.len() * 2);
+        for (at, (rt, cutoff)) in list.iter().enumerate() {
+            if rt.visible_at(*cutoff) {
+                edges.extend([
+                    Edge {
+                        key: &rt.start,
+                        starts: true,
+                        seqno: rt.seqno,
+                        at,
+                    },
+                    Edge {
+                        key: &rt.end,
+                        starts: false,
+                        seqno: rt.seqno,
+                        at,
+                    },
+                ]);
+            }
+        }
+        // An end before a start on the same key: the end excludes that key,
+        // and a tombstone that ends where or before it starts never joins.
+        edges.sort_unstable_by(|a, b| {
+            comparator
+                .compare(a.key, b.key)
+                .then(a.starts.cmp(&b.starts))
+        });
 
-        let mut bounds: Vec<&UserKey> =
-            visible.iter().flat_map(|rt| [&rt.start, &rt.end]).collect();
-        bounds.sort_unstable_by(|a, b| comparator.compare(a, b));
-        bounds.dedup_by(|a, b| comparator.compare(a, b) == Ordering::Equal);
-
-        // A sweep: a tombstone joins at its start, and the newest one that
-        // has not ended is what a stretch comes to. One that ended stays in
-        // the heap until it would be that newest.
-        let mut floors = Vec::with_capacity(bounds.len());
+        // A sweep over the edges, which needs no more key comparisons than
+        // telling bounds apart. A tombstone that ended stays in the heap
+        // until it would be the newest.
+        let mut bounds = Vec::with_capacity(edges.len());
+        let mut floors = Vec::with_capacity(edges.len());
+        let mut ended = vec![false; list.len()];
         let mut covering: BinaryHeap<(SeqNo, usize)> = BinaryHeap::new();
-        let mut starting = visible.iter().enumerate().peekable();
-        for bound in &bounds {
-            while let Some((at, rt)) = starting
-                .next_if(|(_, rt)| comparator.compare(&rt.start, bound) != Ordering::Greater)
+        let mut edges = edges.iter().peekable();
+        while let Some(&&Edge { key: bound, .. }) = edges.peek() {
+            while let Some(edge) =
+                edges.next_if(|edge| comparator.compare(edge.key, bound) == Ordering::Equal)
             {
-                covering.push((rt.seqno, at));
+                if let Some(ended) = ended.get_mut(edge.at) {
+                    if !edge.starts {
+                        *ended = true;
+                    } else if !*ended {
+                        covering.push((edge.seqno, edge.at));
+                    }
+                }
             }
             while let Some(&(_, at)) = covering.peek() {
-                let ended = visible
-                    .get(at)
-                    .is_none_or(|rt| comparator.compare(&rt.end, bound) != Ordering::Greater);
-                if !ended {
+                if !ended.get(at).copied().unwrap_or(true) {
                     break;
                 }
                 covering.pop();
             }
+            bounds.push(bound.clone());
             floors.push(covering.peek().map_or(0, |&(seqno, _)| seqno));
         }
 
         Self {
-            bounds: bounds.into_iter().cloned().collect(),
+            bounds,
             highest: floors.iter().copied().max().unwrap_or(0),
             floors,
         }
