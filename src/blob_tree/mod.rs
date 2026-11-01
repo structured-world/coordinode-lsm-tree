@@ -168,6 +168,10 @@ fn write_encoded_value(
 /// Finishes a flush's blob and table outputs. Nothing orders the syncs of the
 /// two against each other, only both against the manifest edit that names them,
 /// so a synced flush runs them side by side.
+#[cfg_attr(
+    not(feature = "std"),
+    expect(unused_variables, reason = "without threads the two run in turn")
+)]
 fn finish_flush(
     blob_writer: BlobFileWriter,
     table_writer: crate::table::multi_writer::MultiWriter,
