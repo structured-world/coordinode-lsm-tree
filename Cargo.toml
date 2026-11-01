@@ -64,7 +64,7 @@ path = "src/lib.rs"
 # stay no-std-friendly: prefer `core::*` / `alloc::*`, gate std-only primitives
 # behind `#[cfg(feature = "std")]`, and pick external crates that support
 # no-std.
-default = ["std", "parallel"]
+default = ["std", "parallel", "io-uring"]
 std = [
     "dep:arc-swap",
     "dep:parking_lot",
@@ -291,8 +291,12 @@ rayon = { version = "1.10", optional = true }
 # references it under the same `cfg`. Used by: `table::util`.
 cpufeatures = "0.3"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
+# Only the architectures the crate ships bindings for: it `compile_error!`s on
+# any other, and the feature is on by default. `build.rs` holds the same list.
 io-uring = { version = "0.7", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 # `#![no_std]` raw Linux syscall layer for the `io-uring-raw` backend (#346):
 # the `syscall!` macro + `Sysno` numbers for `io_uring_setup` / `io_uring_enter`
 # / `mmap` / `openat` / `close` etc. No libc, no std. Linux-target-gated since
@@ -343,6 +347,7 @@ structured-zstd = { version = "0.2.6", features = ["dict-builder", "lsm"] }
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(coverage,coverage_nightly)',
   'cfg(zstd_any)',
+  'cfg(io_uring_fs)',
 ] }
 
 [package.metadata.cargo-all-features]

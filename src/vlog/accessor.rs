@@ -20,7 +20,7 @@ use alloc::{string::ToString, vec::Vec};
 /// each was read for, so a handle taking one out is proven to be the handle it
 /// was read for, as a cache lookup proves it.
 #[derive(Default)]
-pub struct Prefetched {
+pub(crate) struct Prefetched {
     values: crate::HashMap<(crate::vlog::BlobFileId, u64), (crate::UserKey, u32, UserValue)>,
 }
 
@@ -57,7 +57,7 @@ impl Prefetched {
 }
 
 /// Where a read-ahead puts what it reads.
-pub enum PrefetchInto<'p> {
+pub(crate) enum PrefetchInto<'p> {
     /// The shared cache, for every read to find.
     Cache,
     /// The read's own store, bounded by the read-ahead's own budget.
@@ -69,7 +69,7 @@ pub enum PrefetchInto<'p> {
 /// Takes no dictionary: a `ZstdDict` blob file carries its own, pinned on the
 /// handle this walks, so decoding needs nothing the version does not already
 /// hold.
-pub struct Accessor<'a> {
+pub(crate) struct Accessor<'a> {
     blob_files: &'a BlobFileList,
     /// Whether the values this accessor reads from disk go into the cache.
     fill: BlobCacheFill,
@@ -83,7 +83,7 @@ pub struct Accessor<'a> {
 }
 
 impl<'a> Accessor<'a> {
-    pub fn new(
+    pub(crate) fn new(
         blob_files: &'a BlobFileList,
         fill: BlobCacheFill,
         #[cfg(feature = "metrics")] metrics: Option<&'a Metrics>,
@@ -148,7 +148,7 @@ impl<'a> Accessor<'a> {
     /// # Errors
     ///
     /// Propagates the blob file's open / read failures.
-    pub fn get(
+    pub(crate) fn get(
         &self,
         tree_id: TreeId,
         key: &[u8],
@@ -283,7 +283,7 @@ impl<'a> Accessor<'a> {
     /// `into` says where the values go: the shared cache, or the read's own
     /// store when blob values are not cached, which then holds at most one
     /// coalesced read's worth.
-    pub fn prefetch(
+    pub(crate) fn prefetch(
         &self,
         tree_id: TreeId,
         items: &mut Vec<(&[u8], ValueHandle, usize)>,
@@ -437,12 +437,13 @@ impl<'a> Accessor<'a> {
         admit_budget: &mut u64,
     ) {
         /// One span's read: its span, its blob file and the open file, and
-        /// the buffer its extent is read into, emptied when the read fails.
+        /// the buffer its extent is read into, which the span's values go on
+        /// to share, `None` when the read fails.
         struct SpanRead<'b> {
             span: usize,
             blob_file: &'b crate::vlog::BlobFile,
             file: alloc::sync::Arc<dyn crate::fs::FsFile>,
-            buf: Vec<u8>,
+            buf: Option<crate::slice::Builder>,
         }
 
         let mut reads: Vec<SpanRead<'_>> = Vec::with_capacity(spans.len());
@@ -484,7 +485,7 @@ impl<'a> Accessor<'a> {
                 span: at,
                 blob_file,
                 file,
-                buf: alloc::vec![0u8; len],
+                buf: Some(crate::Slice::builder(len)),
             });
         }
 
@@ -522,10 +523,12 @@ impl<'a> Accessor<'a> {
                     .iter_mut()
                     .enumerate()
                     .filter(|(at, _)| group.binary_search(at).is_ok())
-                    .map(|(_, read)| crate::fs::BlockRead {
-                        file: read.file.as_ref(),
-                        offset: spans.get(read.span).map_or(0, |span| span.start),
-                        buf: crate::fs::BlockBuf::new(&mut read.buf),
+                    .filter_map(|(_, read)| {
+                        Some(crate::fs::BlockRead {
+                            file: read.file.as_ref(),
+                            offset: spans.get(read.span).map_or(0, |span| span.start),
+                            buf: crate::fs::BlockBuf::new(read.buf.as_mut()?),
+                        })
                     })
                     .collect();
                 // Best effort: a failed call still hands over the spans it
@@ -538,7 +541,7 @@ impl<'a> Accessor<'a> {
             }
             for (&at, got) in group.iter().zip(got) {
                 if !got && let Some(read) = reads.get_mut(at) {
-                    read.buf.clear();
+                    read.buf = None;
                 }
             }
         }
@@ -547,7 +550,7 @@ impl<'a> Accessor<'a> {
             if *admit_budget == 0 {
                 return;
             }
-            let (Some(span), false) = (spans.get(read.span), read.buf.is_empty()) else {
+            let (Some(span), Some(buf)) = (spans.get(read.span), read.buf) else {
                 continue;
             };
             let Some(records) = items.get(span.records.clone()) else {
@@ -557,7 +560,7 @@ impl<'a> Accessor<'a> {
                 tree_id,
                 records,
                 span.start,
-                &crate::Slice::from(read.buf),
+                &buf.freeze().into(),
                 read.blob_file,
                 read.file.as_ref(),
                 cache,

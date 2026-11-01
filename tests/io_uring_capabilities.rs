@@ -7,7 +7,7 @@
 //! checkpoint clones where the file system clones. Skipped when the kernel
 //! lacks `io_uring`.
 
-#![cfg(all(target_os = "linux", feature = "io-uring"))]
+#![cfg(io_uring_fs)]
 
 use lsm_tree::fs::{Fs, IoUringFs, StdFs, is_io_uring_available};
 use lsm_tree::{

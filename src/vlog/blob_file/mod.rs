@@ -2,12 +2,13 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-pub mod merge;
-pub mod meta;
-pub mod multi_writer;
-pub mod reader;
-pub mod scanner;
-pub mod writer;
+pub(crate) mod merge;
+pub(crate) mod meta;
+pub(crate) mod multi_writer;
+pub(crate) mod reader;
+pub(crate) mod scanner;
+pub(crate) mod value_encoder;
+pub(crate) mod writer;
 
 use crate::path::{Path, PathBuf};
 use crate::{
@@ -18,7 +19,7 @@ use crate::{
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicBool;
-pub use meta::Metadata;
+pub(crate) use meta::Metadata;
 
 /// A blob file is an immutable, sorted, contiguous file that contains large key-value pairs (blobs)
 //
@@ -28,7 +29,7 @@ pub use meta::Metadata;
 // same operational ergonomics as the previous derived `Debug` without
 // pulling `Debug` into the `Fs` trait bound (which would cascade through
 // every backend).
-pub struct Inner {
+pub(crate) struct Inner {
     /// Blob file ID
     pub id: BlobFileId,
 

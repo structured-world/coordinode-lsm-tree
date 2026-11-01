@@ -97,11 +97,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir = tempfile::tempdir()?;
     let fs: Arc<dyn lsm_tree::fs::Fs> = if std::env::var_os("MULTI_GET_IO_URING").is_some() {
-        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        #[cfg(io_uring_fs)]
         {
             Arc::new(lsm_tree::fs::IoUringFs::new()?)
         }
-        #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+        #[cfg(not(io_uring_fs))]
         {
             return Err("MULTI_GET_IO_URING needs the io-uring feature on Linux".into());
         }

@@ -728,7 +728,7 @@ impl BlobFileImport {
                 self.writer.written_blob_bytes = source.compressed_bytes;
                 self.writer.uncompressed_bytes = source.uncompressed_bytes;
                 self.writer.first_key = Some(source.first_key);
-                self.writer.last_key = Some(source.last_key);
+                self.writer.last_key = source.last_key.to_vec();
                 source.live_from
             }
         };

@@ -1,6 +1,42 @@
 use super::*;
 use crate::fs::StdFs;
 
+/// The file format is the streaming digest: the one-call path has to give it
+/// on both sides of the size that selects it, or written blobs stop verifying.
+#[test]
+fn record_checksum_matches_streaming_digest_around_one_call_limit() {
+    let key = [7_u8; 16];
+    let crc = 0xDEAD_BEEF_u32;
+    let limit = ONE_CALL_HASH_BYTES - key.len() - 4;
+    for value_len in [0, 1, 200, 256, limit - 1, limit, limit + 1, 4096] {
+        let value = vec![0x5A_u8; value_len];
+        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+        hasher.update(&key);
+        hasher.update(&value);
+        hasher.update(&crc.to_le_bytes());
+        assert_eq!(
+            record_checksum(&key, &value, crc),
+            hasher.digest128(),
+            "value of {value_len} bytes",
+        );
+    }
+}
+
+/// The header CRC is stored in every record, so it has to stay the digest of
+/// the same 18 field bytes.
+#[test]
+fn header_crc_matches_streaming_digest() {
+    let (seqno, key_len, real, on_disk) = (0x0123_4567_89AB_CDEF_u64, 16_u16, 256_u32, 300_u32);
+    let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+    hasher.update(&seqno.to_le_bytes());
+    hasher.update(&key_len.to_le_bytes());
+    hasher.update(&real.to_le_bytes());
+    hasher.update(&on_disk.to_le_bytes());
+    #[expect(clippy::cast_possible_truncation, reason = "the CRC is 4 bytes")]
+    let streaming = hasher.digest() as u32;
+    assert_eq!(compute_header_crc(seqno, key_len, real, on_disk), streaming);
+}
+
 #[test]
 fn blob_write_rejects_oversized_value() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;

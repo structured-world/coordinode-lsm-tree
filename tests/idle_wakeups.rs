@@ -51,7 +51,7 @@ fn an_idle_tree_leaves_its_threads_asleep() -> lsm_tree::Result<()> {
     .compaction_threads(4)
     .subcompaction_min_bytes(0)
     .compaction_rate_limit(1_000_000);
-    #[cfg(feature = "io-uring")]
+    #[cfg(io_uring_fs)]
     let config = if lsm_tree::fs::is_io_uring_available() {
         config.with_shared_fs(std::sync::Arc::new(lsm_tree::fs::IoUringFs::new()?))
     } else {

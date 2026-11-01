@@ -80,6 +80,27 @@ fn read_at_pread_semantics() -> io::Result<()> {
     Ok(())
 }
 
+/// One region has nothing to batch with: it stays off the ring and still
+/// fills its buffer.
+#[test]
+fn read_many_of_one_region_fills_it() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&dir.path().join("one.bin"), &opts)?;
+    file.write_all(b"hello world")?;
+    file.sync_data()?;
+
+    let mut buf = [0u8; 5];
+    file.read_many(&mut [(6, &mut buf[..])])?;
+    assert_eq!(&buf, b"world");
+
+    Ok(())
+}
+
 #[test]
 fn directory_operations() -> io::Result<()> {
     let Some(fs) = try_io_uring() else {
