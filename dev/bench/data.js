@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793576188490,
+  "lastUpdate": 1793576193687,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -99480,6 +99480,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.456366583,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a590a679a9c7fd478347db564c3048c89a91167f",
+          "message": "perf(table): split blocks no cache shard can keep (#1040)\n\n## Summary\n- A filter or an index block heavier than a block cache shard is refused\nby the cache, so every read fetched it whole from the file. Tables now\nwrite such a block in pieces that fit a shard.\n- The layout is chosen from the cache at write time; a block that fits\nstays one block, written byte for byte as before. No format change: both\nlayouts exist already.\n- New counters report what is still refused.\n\n## Changes\n- `PartitionedFilterWriter` can hold a filter whole up to a limit,\nnoting partition boundaries as it grows. Past the limit it writes what\npartitioning from the start writes; under it, what a full filter writer\nwrites.\n- Flush, blob flush, compaction and ingestion use that limit where the\nfilter goes through the cache, and lower the adaptive index's spill\nthreshold to it the same way.\n- Pinned blocks stay whole, and so does a filter under a prefix\nextractor, since only a full filter answers prefix queries. Tables\nalready written keep their layout until compaction rewrites them.\n- `Metrics::block_cache_refused_count` and `block_cache_refused_bytes`,\nunder `metrics`.\n- `benches/large_block_admission.rs` times blocks heavier than a shard;\n`block_cache_contention` gains 32 threads.\n- `cache.rs` and `tree/ingest.rs` items no outside caller reaches become\n`pub(crate)`.\n\n## Performance\nA refused block cost every read hundreds of microseconds with the file\nin the page cache, and a pass of 5000 reads 11.6 GiB of filter from the\nfile; in pieces the same pass reads none once warm. Blocks that fit a\nshard are written as before. Numbers are in the issue, with the shard\ncount grid that led to keeping 64 shards.\n\n## Testing\n- Unit tests compare the bytes a held filter writes with those of both\nplain writers, on the writer's thread and on workers; integration tests\ncover both block kinds, compaction output, pinned blocks and prefix\nfilters.\n- Formatting, lints in both feature configurations, tests, doc tests,\nthe doc build and the no-std check pass; the full suite ran on macOS and\nLinux before the final visibility change.\n\nPart of #954\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Filter and index block layouts now adapt to cache capacity, helping\nreduce cache refusals for oversized blocks while preserving whole\nfilters where required by configuration.\n  * Added cache-refusal metrics, including counts and refused bytes.\n* Added a benchmark for large-block admission and expanded cache\ncontention benchmarks to include 32 threads.\n* **Tests**\n* Added coverage for cache-dependent layouts, ingestion and compaction\nbehavior, and filter configuration consistency.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-01T23:12:57Z",
+          "tree_id": "444d1f0adf56de5cc82de1f63a5594a82cdcd030",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a590a679a9c7fd478347db564c3048c89a91167f"
+        },
+        "date": 1793576192427,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 656.61,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 157.808682ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 290.831,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 197.811769ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1549.088,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 254.003638ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5147.278,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 22993.825,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.887,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 50.429951,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.417312792,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.383,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.658175,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.416502797,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
