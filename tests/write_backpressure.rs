@@ -453,6 +453,40 @@ fn a_budget_counts_the_memtables_waiting_for_a_flush() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// The active memtable, and only it, decides: sealed writes still owe a flush,
+/// but the next write owes one more.
+fn active_memtable_reads_empty_until_written(tree: &impl AbstractTree) {
+    assert!(tree.active_memtable_is_empty(), "nothing written");
+
+    tree.insert("k", "v", 0);
+    assert!(!tree.active_memtable_is_empty(), "one insert");
+
+    assert!(tree.rotate_memtable().is_some());
+    assert!(tree.active_memtable_is_empty(), "sealed, not flushed");
+
+    tree.insert("k2", "v", 1);
+    assert!(!tree.active_memtable_is_empty(), "the next insert");
+}
+
+#[test]
+fn an_active_memtable_reads_empty_until_written_on_every_tree() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    active_memtable_reads_empty_until_written(&open_tree(folder.path()));
+
+    let folder = get_tmp_folder();
+    active_memtable_reads_empty_until_written(&open_blob_tree(folder.path()));
+
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    active_memtable_reads_empty_until_written(&tree);
+    Ok(())
+}
+
 /// A tree past an L0 slowdown threshold, paced at `rate` bytes per second.
 fn slowed_tree(path: &std::path::Path, rate: u64) -> lsm_tree::Tree {
     let tree = match Config::new(

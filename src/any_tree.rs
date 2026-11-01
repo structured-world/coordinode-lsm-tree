@@ -496,6 +496,11 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
+    fn active_memtable_is_empty(&self) -> bool {
+        forward!(self.active_memtable_is_empty())
+    }
+
+    #[inline]
     fn tree_type(&self) -> crate::TreeType {
         forward!(self.tree_type())
     }

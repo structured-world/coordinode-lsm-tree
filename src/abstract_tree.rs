@@ -1254,6 +1254,36 @@ pub trait AbstractTree: sealed::Sealed {
     /// Returns the active memtable.
     fn active_memtable(&self) -> Arc<Memtable>;
 
+    /// Whether the active memtable holds nothing, so that the next write makes
+    /// one more flush owed. Sealed memtables do not count.
+    ///
+    /// Under `std` it takes no lock, unlike [`active_memtable`](Self::active_memtable),
+    /// so it may be called from inside a version install, as a metered file
+    /// system's admission is. A concurrent write can change the answer as it
+    /// returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    /// # let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(
+    ///     &folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .open()?;
+    /// assert!(tree.active_memtable_is_empty());
+    ///
+    /// tree.insert("key", "value", 0);
+    /// assert!(!tree.active_memtable_is_empty());
+    ///
+    /// tree.rotate_memtable();
+    /// assert!(tree.active_memtable_is_empty());
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    fn active_memtable_is_empty(&self) -> bool;
+
     /// Returns the tree type.
     fn tree_type(&self) -> crate::TreeType {
         if self.tree_config().kv_separation_opts.is_some() {

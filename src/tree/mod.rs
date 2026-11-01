@@ -1572,6 +1572,23 @@ impl AbstractTree for Tree {
             .clone()
     }
 
+    // Its size says so without the range-tombstone lock `Memtable::is_empty`
+    // takes, which a tombstone insert holds across the tree's comparator.
+    #[cfg(feature = "std")]
+    fn active_memtable_is_empty(&self) -> bool {
+        self.latest_super_version.load().active_memtable.size() == 0
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn active_memtable_is_empty(&self) -> bool {
+        self.version_history
+            .read()
+            .latest_version_ref()
+            .active_memtable
+            .size()
+            == 0
+    }
+
     fn rotate_memtable(&self) -> Option<Arc<Memtable>> {
         self.rotate_memtable_locked(&mut self.version_history.write())
     }
