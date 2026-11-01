@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793561191534,
+  "lastUpdate": 1793576181367,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66724,6 +66724,90 @@ window.BENCHMARK_DATA = {
             "value": 330499.008538503,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 16.5us | P99.9: 104.6us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a590a679a9c7fd478347db564c3048c89a91167f",
+          "message": "perf(table): split blocks no cache shard can keep (#1040)\n\n## Summary\n- A filter or an index block heavier than a block cache shard is refused\nby the cache, so every read fetched it whole from the file. Tables now\nwrite such a block in pieces that fit a shard.\n- The layout is chosen from the cache at write time; a block that fits\nstays one block, written byte for byte as before. No format change: both\nlayouts exist already.\n- New counters report what is still refused.\n\n## Changes\n- `PartitionedFilterWriter` can hold a filter whole up to a limit,\nnoting partition boundaries as it grows. Past the limit it writes what\npartitioning from the start writes; under it, what a full filter writer\nwrites.\n- Flush, blob flush, compaction and ingestion use that limit where the\nfilter goes through the cache, and lower the adaptive index's spill\nthreshold to it the same way.\n- Pinned blocks stay whole, and so does a filter under a prefix\nextractor, since only a full filter answers prefix queries. Tables\nalready written keep their layout until compaction rewrites them.\n- `Metrics::block_cache_refused_count` and `block_cache_refused_bytes`,\nunder `metrics`.\n- `benches/large_block_admission.rs` times blocks heavier than a shard;\n`block_cache_contention` gains 32 threads.\n- `cache.rs` and `tree/ingest.rs` items no outside caller reaches become\n`pub(crate)`.\n\n## Performance\nA refused block cost every read hundreds of microseconds with the file\nin the page cache, and a pass of 5000 reads 11.6 GiB of filter from the\nfile; in pieces the same pass reads none once warm. Blocks that fit a\nshard are written as before. Numbers are in the issue, with the shard\ncount grid that led to keeping 64 shards.\n\n## Testing\n- Unit tests compare the bytes a held filter writes with those of both\nplain writers, on the writer's thread and on workers; integration tests\ncover both block kinds, compaction output, pinned blocks and prefix\nfilters.\n- Formatting, lints in both feature configurations, tests, doc tests,\nthe doc build and the no-std check pass; the full suite ran on macOS and\nLinux before the final visibility change.\n\nPart of #954\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Filter and index block layouts now adapt to cache capacity, helping\nreduce cache refusals for oversized blocks while preserving whole\nfilters where required by configuration.\n  * Added cache-refusal metrics, including counts and refused bytes.\n* Added a benchmark for large-block admission and expanded cache\ncontention benchmarks to include 32 threads.\n* **Tests**\n* Added coverage for cache-dependent layouts, ingestion and compaction\nbehavior, and filter configuration consistency.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-01T23:12:57Z",
+          "tree_id": "444d1f0adf56de5cc82de1f63a5594a82cdcd030",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a590a679a9c7fd478347db564c3048c89a91167f"
+        },
+        "date": 1793576179287,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 126125.49344410776,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 19.8us | P99.9: 37.2us\nthreads: 1 | elapsed: 4.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2922238.8586903913,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 706729.7135532596,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 3.3us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 444793.07721207954,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 7.4us | P99.9: 32.1us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2933125.9887017747,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.8us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 306212.84316712583,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 8.1us | P99.9: 15.4us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 189982.8146960336,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 13.2us | P99.9: 26.1us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 759944.5248096334,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.6us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 944710.2158331724,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.6us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 351541.4632644831,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 12.2us | P99.9: 90.6us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
           }
         ]
       }
