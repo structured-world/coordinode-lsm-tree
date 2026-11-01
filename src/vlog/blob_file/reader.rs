@@ -275,9 +275,14 @@ impl<'a> Reader<'a> {
 
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
-                let mut buf = vec![0u8; real_val_len];
+                // Straight into the value's allocation. SAFETY: `check_record`
+                // verified the record's checksum, so the stream is intact and
+                // wildcopy never reads an unwritten position; the length check
+                // below rejects a short fill.
+                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                let mut builder = unsafe { UserValue::builder_unzeroed(real_val_len) };
 
-                let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut buf)
+                let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut builder)
                     .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
                 *decoded = bytes_written;
 
@@ -286,21 +291,29 @@ impl<'a> Reader<'a> {
                     return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
                 }
 
-                UserValue::from(buf)
+                builder.freeze().into()
             }
 
             #[cfg(zstd_any)]
             CompressionType::Zstd(_) => {
-                let decompressed =
-                    crate::compression::ZstdBackend::decompress(&raw_data, real_val_len)
-                        .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
-                *decoded = decompressed.len();
+                // Straight into the value's allocation, on the thread's reused
+                // decoder. SAFETY: `check_record` verified the record's
+                // checksum, so the frame is intact and its back-references only
+                // target written positions; the length check below rejects a
+                // short fill.
+                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                let mut builder = unsafe { UserValue::builder_unzeroed(real_val_len) };
 
-                if decompressed.len() != real_val_len {
+                let bytes_written =
+                    crate::compression::ZstdBackend::decompress_into(&raw_data, &mut builder)
+                        .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
+                *decoded = bytes_written;
+
+                if bytes_written != real_val_len {
                     return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
                 }
 
-                UserValue::from(decompressed)
+                builder.freeze().into()
             }
 
             #[cfg(zstd_any)]
