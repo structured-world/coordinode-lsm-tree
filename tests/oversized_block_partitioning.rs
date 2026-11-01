@@ -5,8 +5,8 @@
 #![cfg(feature = "metrics")]
 
 use lsm_tree::{
-    AbstractTree, AnyTree, Cache, Config, PrefixExtractor, SequenceNumberCounter,
-    config::PinningPolicy, get_tmp_folder,
+    AbstractTree, AnyTree, Cache, Config, Guard, KvSeparationOptions, PrefixExtractor,
+    SequenceNumberCounter, config::PinningPolicy, get_tmp_folder,
 };
 use std::sync::Arc;
 
@@ -153,10 +153,47 @@ fn an_index_no_shard_can_keep_is_written_in_pieces() -> lsm_tree::Result<()> {
     fill(&tree)?;
 
     for i in 0..READS {
-        let row = tree.range(key(i * (KEYS / READS)).., 1, None).next();
-        assert!(row.is_some());
+        let at = key(i * (KEYS / READS));
+        let row = tree.range(at.., 1, None).next().map(Guard::into_inner);
+        let (found, _) = row.expect("a written key")?;
+        assert_eq!(&*found, at.as_slice());
     }
     assert_eq!(tree.metrics().block_cache_refused_count(), 0);
+    Ok(())
+}
+
+/// The blob tree's index tables take the layout a plain tree's do.
+#[test]
+fn a_blob_trees_index_tables_are_written_in_pieces_too() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = config(&folder, SMALL)
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .open()?;
+    fill(&tree)?;
+
+    read_all(&tree)?;
+    assert_eq!(tree.metrics().block_cache_refused_count(), 0);
+    Ok(())
+}
+
+/// An ingested table is an L0 run, so the L0 policy decides: pinned there by
+/// default, its filter stays one block however small the cache.
+#[test]
+fn an_ingested_table_takes_the_layout_of_l0() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = config(&folder, SMALL)
+        .filter_block_pinning_policy(PinningPolicy::new([true, false]))
+        .open()?;
+    let mut ingestion = tree.ingestion()?;
+    for i in 0..KEYS {
+        ingestion.write(key(i), b"v")?;
+    }
+    ingestion.finish()?;
+
+    assert!(
+        tree.pinned_filter_size() > 0,
+        "one block, held by the table"
+    );
     Ok(())
 }
 

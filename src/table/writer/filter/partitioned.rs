@@ -107,6 +107,10 @@ pub(crate) struct PartitionedFilterWriter {
     hold: Option<WholeHold>,
 }
 
+/// The smallest partition a limit cuts a filter down to: a cache this tight
+/// gains nothing from partitions of a few keys.
+const MIN_LIMITED_PARTITION: u32 = 256;
+
 /// A filter held back from partitioning until it outgrows what one block may
 /// hold. Its hashes wait in `bloom_hash_buffer`, undivided, and a table that
 /// stays under the limit writes them as a full filter.
@@ -269,6 +273,12 @@ impl PartitionedFilterWriter {
     /// Works out where partitions spill, and where a held filter stops being
     /// held, when the first key arrives and the settings are final.
     fn settle_thresholds(&mut self) {
+        // A partition must fit where the whole filter did not. The estimate
+        // that cuts partitions is no bound, hence the margin.
+        if let Some(hold) = &self.hold {
+            let target = u32::try_from(hold.limit / 2).unwrap_or(u32::MAX);
+            self.partition_size = self.partition_size.min(target.max(MIN_LIMITED_PARTITION));
+        }
         self.spill_hashes = self.spill_threshold();
         let policy = self.bound_policy();
         if let Some(hold) = self.hold.as_mut() {
@@ -277,25 +287,11 @@ impl PartitionedFilterWriter {
         }
     }
 
-    /// Notes `key`, whose hash just joined a held filter, and partitions the
-    /// filter once it has outgrown its limit.
-    fn hold_key(&mut self, key: &UserKey) -> crate::Result<()> {
-        let held = self.bloom_hash_buffer.len();
+    /// Partitions a filter that has outgrown its hold. Each key in `ends`
+    /// closes a partition: what follows the last one stays open, as it would
+    /// had the writer never held.
+    fn release_hold(&mut self, ends: Vec<UserKey>) -> crate::Result<()> {
         let spill = self.spill_hashes;
-        let Some(hold) = self.hold.as_mut() else {
-            return Ok(());
-        };
-        if held.is_multiple_of(spill) {
-            hold.ends.push(UserKey::new(key));
-        }
-        if held < hold.hashes {
-            return Ok(());
-        }
-        let ends = core::mem::take(&mut hold.ends);
-        self.hold = None;
-
-        // Each key noted closes a partition: what follows the last one stays
-        // open, as it would had the writer never held.
         let hashes = core::mem::take(&mut self.bloom_hash_buffer);
         let (closed, open) = hashes.split_at(ends.len() * spill);
         for (partition, end) in closed.chunks_exact(spill).zip(ends) {
@@ -862,8 +858,16 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         if self.spill_hashes == 0 {
             self.settle_thresholds();
         }
-        if self.hold.is_some() {
-            self.hold_key(key)?;
+        if let Some(hold) = self.hold.as_mut() {
+            let held = self.bloom_hash_buffer.len();
+            if held.is_multiple_of(self.spill_hashes) {
+                hold.ends.push(UserKey::new(key));
+            }
+            if held >= hold.hashes {
+                let ends = core::mem::take(&mut hold.ends);
+                self.hold = None;
+                self.release_hold(ends)?;
+            }
             return Ok(1);
         }
         if self.bloom_hash_buffer.len() >= self.spill_hashes {

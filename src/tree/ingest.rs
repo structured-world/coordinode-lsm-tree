@@ -200,14 +200,16 @@ impl<'a> Ingestion<'a> {
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
             // partitioned only past the threshold (see flush path).
-            writer = writer.use_adaptive_index(tree.config.index_spill_threshold(
-                INITIAL_CANONICAL_LEVEL,
-                rc.index_partition_spill_threshold,
-            ));
+            // Level 0, unlike the settings around it: pinning follows where
+            // the table is installed, an L0 run.
+            writer = writer.use_adaptive_index(
+                tree.config
+                    .index_spill_threshold(0, rc.index_partition_spill_threshold),
+            );
         }
         if filter_partitioning {
             writer = writer.use_partitioned_filter();
-        } else if let Some(limit) = tree.config.whole_filter_limit(INITIAL_CANONICAL_LEVEL) {
+        } else if let Some(limit) = tree.config.whole_filter_limit(0) {
             writer = writer.use_whole_filter_up_to(limit);
         }
 

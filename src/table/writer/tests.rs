@@ -1376,6 +1376,31 @@ fn the_size_hint_counts_the_parity_of_the_blocks_to_come() -> crate::Result<()> 
     assert_hint_matches_the_table(writer, &path)
 }
 
+/// The settings a builder takes apply whatever order they come in: a filter
+/// writer installed after the ECC scheme frames its blocks under it too, or
+/// the table records parity its filter does not carry.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn a_filter_writer_installed_after_ecc_keeps_its_parity() -> crate::Result<()> {
+    let ecc = Some(crate::table::block::EccParams::RS_4_2);
+    let dir = tempfile::tempdir()?;
+    let size = |writer: Writer, path: &std::path::Path| -> crate::Result<u64> {
+        let mut writer = writer;
+        write_long_keys(&mut writer, 5_000, 16)?;
+        writer.finish()?;
+        Ok(std::fs::metadata(path)?.len())
+    };
+    let (first, second) = (dir.path().join("1"), dir.path().join("2"));
+    let ecc_last = Writer::new(first.clone(), 1, 0, Arc::new(StdFs))?
+        .use_partitioned_filter()
+        .use_ecc(ecc);
+    let ecc_first = Writer::new(second.clone(), 1, 0, Arc::new(StdFs))?
+        .use_ecc(ecc)
+        .use_partitioned_filter();
+    assert_eq!(size(ecc_first, &second)?, size(ecc_last, &first)?);
+    Ok(())
+}
+
 /// A table of exactly `2^k` blocks fits explicit `k`-bit block ids, so its
 /// locator section is written and both estimates count it, although the next
 /// block ordinal no longer fits.

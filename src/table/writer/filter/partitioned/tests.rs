@@ -244,6 +244,30 @@ mod parallel {
         Ok(())
     }
 
+    /// A partition is cut within the limit that split the filter, however large
+    /// the configured partition: past it the cache would refuse the partition.
+    #[test]
+    fn a_partition_stays_within_the_limit_that_split_the_filter() -> crate::Result<()> {
+        let keys = 200_000;
+        let setup = Setup {
+            partition_size: 64 * 1_024,
+            ..Setup::new(keys)
+        };
+        let (_, configured) = setup.write(None, &|| {})?;
+        let limit = 8 * 1_024;
+        let filter = BloomConstructionPolicy::default().filter_size_bound(keys as usize) as u64;
+        let (_, capped) = Setup {
+            hold: Some(limit),
+            ..setup
+        }
+        .write(None, &|| {})?;
+        assert!(
+            capped as u64 >= filter / limit,
+            "{capped} partitions of a {filter} byte filter, {configured} as configured",
+        );
+        Ok(())
+    }
+
     /// A filter that stays under its limit writes what a full filter writer
     /// writes, byte for byte, and estimates what it estimates.
     #[test]

@@ -2028,6 +2028,7 @@ impl Writer {
             .set_prefix_extractor(self.prefix_extractor.clone())
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id)
+            .use_ecc(self.ecc)
             .use_sizing(self.filter_sizing.clone());
         // Replacing a subwriter re-applies the settings already chosen, so the
         // builder reads the same whatever order its methods are called in.
