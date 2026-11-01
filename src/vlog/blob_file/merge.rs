@@ -25,7 +25,7 @@ struct IteratorValue {
 /// instead would put the two out of step under any other ordering. The heap
 /// is kept here rather than in a `BinaryHeap` because its ordering needs the
 /// comparator, which would otherwise have to ride along in every entry.
-pub struct MergeScanner {
+pub(crate) struct MergeScanner {
     readers: Vec<BlobFileScanner>,
     comparator: SharedComparator,
     /// Min-heap by [`Self::order`].
@@ -36,7 +36,7 @@ pub struct MergeScanner {
 impl MergeScanner {
     /// Initializes a new merging reader over `readers`, ordering keys by
     /// `comparator`.
-    pub fn new(readers: Vec<BlobFileScanner>, comparator: SharedComparator) -> Self {
+    pub(crate) fn new(readers: Vec<BlobFileScanner>, comparator: SharedComparator) -> Self {
         let heap = Vec::with_capacity(readers.len());
         Self {
             readers,

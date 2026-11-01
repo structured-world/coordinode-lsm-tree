@@ -1180,9 +1180,10 @@ impl Block {
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
                 // Decompress straight into the Slice allocation, skipping the
-                // zero-fill and the Vec -> Slice copy. SAFETY: the payload's
-                // checksum verified above, so the stream is intact and
-                // wildcopy never reads an unwritten position.
+                // zero-fill and the Vec -> Slice copy. SAFETY: the slice goes to
+                // this one decoder and no open trait, and it refuses a match
+                // reaching before the output, so it never reads an unwritten
+                // position whatever the stream holds.
                 #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                 let mut builder =
                     unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
@@ -1201,13 +1202,12 @@ impl Block {
             #[cfg(zstd_any)]
             CompressionType::Zstd(_) => {
                 // Decompress straight into the Slice allocation, skipping the
-                // zero-fill and the Vec -> Slice copy. SAFETY: the same
-                // precondition as the lz4 arm — every caller verifies the
-                // payload against the header checksum BEFORE reaching here, so
-                // the frame is intact and the decoder's back-references only
-                // target already-written positions. The length equality below
-                // rejects a short fill, so no uninitialized byte survives into
-                // the frozen Slice.
+                // zero-fill and the Vec -> Slice copy. SAFETY: the slice goes to
+                // this one decoder and no open trait, and it resolves matches
+                // in a window of its own and refuses an offset past what it
+                // wrote, so the slice is only written, whatever the frame
+                // holds. The length equality below rejects a short fill, so no
+                // uninitialized byte survives into the frozen Slice.
                 #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                 let mut builder =
                     unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };

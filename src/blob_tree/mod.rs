@@ -19,13 +19,16 @@ use crate::tree::inner::{FlushGuard, VersionsWriteGuard};
 use crate::{
     Config, Memtable, ScanSinceEvent, SeqNo, TableId, TreeId, UserKey, UserValue,
     abstract_tree::{AbstractTree, RangeItem},
-    coding::Decode,
+    coding::{Decode, Encode},
     iter_guard::{IterGuard, IterGuardImpl},
     table::Table,
     tree::inner::MemtableId,
     value::InternalValue,
     version::Version,
-    vlog::{Accessor, BlobFile, BlobFileWriter},
+    vlog::{
+        Accessor, BlobFile, BlobFileWriter,
+        blob_file::value_encoder::{Separated, ValueEncoder},
+    },
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
@@ -132,6 +135,63 @@ impl IterGuard for Guard {
             self.kv?,
         )
     }
+}
+
+/// Writes the oldest value `ahead` holds to the blob file and its indirection
+/// to the table. `false` when it holds none.
+fn write_encoded_value(
+    ahead: &mut ValueEncoder,
+    blob_writer: &mut BlobFileWriter,
+    table_writer: &mut crate::table::multi_writer::MultiWriter,
+    encoded: &mut Vec<u8>,
+) -> crate::Result<bool> {
+    let Some(next) = ahead.take() else {
+        return Ok(false);
+    };
+    let (separated, value) = next?;
+    let Separated {
+        mut key,
+        size,
+        class,
+    } = separated;
+    blob_writer.select_lifetime_class(class)?;
+    let vhandle = blob_writer.write_encoded(&key.user_key, key.seqno, &value, size)?;
+    let indirection = BlobIndirection { vhandle, size };
+    encoded.clear();
+    indirection.encode_into(encoded)?;
+    key.value_type = crate::ValueType::Indirection;
+    table_writer.write(InternalValue::new(key, UserValue::new(encoded)))?;
+    table_writer.register_blob(indirection);
+    Ok(true)
+}
+
+/// Finishes a flush's blob and table outputs. Nothing orders the syncs of the
+/// two against each other, only both against the manifest edit that names them,
+/// so a synced flush runs them side by side.
+#[cfg_attr(
+    not(feature = "std"),
+    expect(unused_variables, reason = "without threads the two run in turn")
+)]
+fn finish_flush(
+    blob_writer: BlobFileWriter,
+    table_writer: crate::table::multi_writer::MultiWriter,
+    durability: crate::config::FlushDurability,
+) -> (
+    crate::Result<Vec<BlobFile>>,
+    crate::Result<crate::table::multi_writer::Written>,
+) {
+    #[cfg(feature = "std")]
+    if durability == crate::config::FlushDurability::Synced {
+        return std::thread::scope(|scope| {
+            let blob = scope.spawn(|| blob_writer.finish());
+            let table = table_writer.finish();
+            let blob = blob
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (blob, table)
+        });
+    }
+    (blob_writer.finish(), table_writer.finish())
 }
 
 /// The value `prefetched` holds for `vhandle`: read ahead for this very item,
@@ -2191,6 +2251,24 @@ impl AbstractTree for BlobTree {
         // carry the RT metadata.
         table_writer.set_range_tombstones(range_tombstones);
 
+        // One buffer for every indirection of the flush.
+        let mut encoded = Vec::new();
+
+        // A key domain picks the dictionary of the values under it, as the
+        // writer enters it, so those stay on the writer's thread.
+        #[cfg(all(feature = "std", zstd_any))]
+        let mut ahead = if self.index.config.key_domains.is_none() {
+            ValueEncoder::for_flush(
+                self.index.config.parallel_compression(),
+                rc.blob_compression,
+                rc.zstd_two_pass_seed,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "std", zstd_any)))]
+        let mut ahead: Option<ValueEncoder> = None;
+
         for item in stream {
             let item = item?;
 
@@ -2198,6 +2276,33 @@ impl AbstractTree for BlobTree {
             // key once the flush has passed it.
             let overwritten = overwritten
                 .is_some_and(|keys| keys.take_before_and_check(&item.key.user_key, comparator));
+
+            if let Some(ahead) = &mut ahead {
+                #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
+                let size = item.value.len() as u32;
+                if item.key.value_type == crate::ValueType::Value && size >= separation_threshold {
+                    if ahead.is_full() {
+                        write_encoded_value(
+                            ahead,
+                            &mut blob_writer,
+                            &mut table_writer,
+                            &mut encoded,
+                        )?;
+                    }
+                    let class = lifetime.class_of(&item.key.user_key, overwritten);
+                    let separated = Separated {
+                        key: item.key,
+                        size,
+                        class,
+                    };
+                    ahead.submit(separated, item.value);
+                    continue;
+                }
+                // Anything else follows the values before it into the table.
+                while write_encoded_value(ahead, &mut blob_writer, &mut table_writer, &mut encoded)?
+                {
+                }
+            }
 
             if item.is_tombstone() {
                 // NOTE: Still need to add tombstone to index tree
@@ -2242,9 +2347,10 @@ impl AbstractTree for BlobTree {
                     size: value_size,
                 };
 
+                encoded.clear();
+                indirection.encode_into(&mut encoded)?;
                 table_writer.write({
-                    let mut vptr =
-                        InternalValue::new(item.key.clone(), indirection.encode_into_vec());
+                    let mut vptr = InternalValue::new(item.key, UserValue::new(&encoded));
                     vptr.key.value_type = crate::ValueType::Indirection;
                     vptr
                 })?;
@@ -2255,9 +2361,17 @@ impl AbstractTree for BlobTree {
             }
         }
 
-        let blob_files = blob_writer.finish()?;
+        if let Some(ahead) = &mut ahead {
+            while write_encoded_value(ahead, &mut blob_writer, &mut table_writer, &mut encoded)? {}
+        }
 
-        let written = table_writer.finish()?;
+        let (blob_files, written) = finish_flush(
+            blob_writer,
+            table_writer,
+            self.index.config.flush_durability,
+        );
+        let blob_files = blob_files?;
+        let written = written?;
         let entries_durable = written.entries_durable;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());

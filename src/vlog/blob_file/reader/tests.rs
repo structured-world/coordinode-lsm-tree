@@ -117,6 +117,67 @@ fn blob_reader_zero_real_val_len_with_data_fails_decompress() {
     );
 }
 
+/// `frame`, under checksums that hold, as a record of a blob file of
+/// `compression` declaring `len` decoded bytes: the reader gets `Err` from the
+/// decoder alone, which is what keeps a back-reference off the value's
+/// uninitialized bytes.
+#[cfg(any(feature = "lz4", zstd_any))]
+fn read_crafted_frame(
+    compression: CompressionType,
+    frame: &[u8],
+    len: u32,
+) -> crate::Result<UserValue> {
+    let folder = tempfile::tempdir()?;
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        SequenceNumberCounter::default(),
+        folder.path(),
+        0,
+        None,
+        Arc::new(StdFs),
+    )?
+    .use_target_size(u64::MAX)
+    .use_compression(compression);
+    let handle = writer.write_encoded(b"k", 0, frame, len)?;
+    let blob_file = writer.finish()?;
+    let blob_file = blob_file.first().unwrap();
+    let file = File::open(&blob_file.0.path)?;
+    Reader::new(blob_file, &file).get(b"k", &handle)
+}
+
+/// A match reaching 16 bytes back with one byte written.
+#[test]
+#[cfg(feature = "lz4")]
+fn blob_reader_refuses_an_lz4_match_before_the_value() {
+    let frame = [0x10, b'a', 0x10, 0x00, 0x10, b'b'];
+    let result = read_crafted_frame(CompressionType::Lz4, &frame, 6);
+    assert!(
+        matches!(result, Err(crate::Error::Decompress(_))),
+        "expected Decompress error, got: {result:?}",
+    );
+}
+
+/// One sequence with a match reaching 29 bytes back with one byte written: RLE
+/// tables, so the bitstream is the offset's five extra bits and its end marker.
+#[test]
+#[cfg(zstd_any)]
+fn blob_reader_refuses_a_zstd_match_before_the_value() {
+    #[rustfmt::skip]
+    let frame = [
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x20, 0x05,             // single segment, 5 bytes
+        0x45, 0x00, 0x00,       // last compressed block of 8 bytes
+        0x08, b'a',             // one raw literal
+        0x01, 0x54,             // one sequence, three RLE tables
+        0x01, 0x05, 0x01,       // literal, offset and match length codes
+        0x20,                   // bitstream
+    ];
+    let result = read_crafted_frame(CompressionType::Zstd(3), &frame, 5);
+    assert!(
+        matches!(result, Err(crate::Error::Decompress(_))),
+        "expected Decompress error, got: {result:?}",
+    );
+}
+
 /// A record whose checksums hold but whose value decompresses to fewer bytes
 /// than its header declares is refused after the decompressor ran: the length
 /// it produced is reported all the same, so a read that fails there is not

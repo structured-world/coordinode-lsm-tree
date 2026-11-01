@@ -15,8 +15,9 @@
 //!
 //! # Platform-specific backends
 //!
-//! - **Linux 5.6+**: `IoUringFs` - batched SQE submission via `io_uring`
-//!   (feature-gated: `io-uring`)
+//! - **Linux 5.6+**: `IoUringFs` - batched SQE submission via `io_uring`, the
+//!   default backend where a ring can be created (feature-gated: `io-uring`,
+//!   on by default); [`StdFs`](crate::fs::StdFs) otherwise
 //! - **Windows**: IOCP (`IoCompletionPort`) could provide similar batched
 //!   completion semantics - not yet implemented, tracked for when Windows
 //!   becomes a production target
@@ -61,7 +62,7 @@ pub use counting_fs::{
     CountingFs, DirectoryWrites, FileWrites, WriteIoSnapshot, WriteIoStats, WriteOrigin,
 };
 
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(io_uring_fs)]
 mod io_uring_fs;
 
 // Pure-Rust `no_std` io_uring driver core on raw Linux syscalls (#346).
@@ -72,8 +73,7 @@ mod io_uring_raw;
 #[cfg(all(
     test,
     feature = "std",
-    target_os = "linux",
-    any(feature = "io-uring", feature = "io-uring-raw")
+    any(io_uring_fs, all(target_os = "linux", feature = "io-uring-raw"))
 ))]
 mod batch_conformance;
 
@@ -90,7 +90,7 @@ pub use std_fs::StdFs;
 #[cfg(feature = "std")]
 pub(crate) use std_fs::is_cross_device;
 
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(io_uring_fs)]
 pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 
 // Raw-syscall `no_std` io_uring driver (#346): the driver core (`IoUringRaw`),
@@ -103,6 +103,25 @@ pub use io_uring_raw::{
     IoUringRaw, IoUringRawFile, IoUringRawFs, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     close_raw, open_raw,
 };
+
+/// The backend a [`Config`](crate::Config) starts with: `io_uring` where the
+/// kernel and the process limits allow a ring, [`StdFs`] everywhere else.
+///
+/// Every default config shares one ring and its thread, so a process with many
+/// trees still holds one. The probe runs once: a process that cannot create a
+/// ring stays on [`StdFs`] rather than failing to open a tree.
+#[cfg(feature = "std")]
+pub(crate) fn default_fs() -> alloc::sync::Arc<dyn Fs> {
+    #[cfg(io_uring_fs)]
+    {
+        static SHARED: std::sync::OnceLock<Option<alloc::sync::Arc<IoUringFs>>> =
+            std::sync::OnceLock::new();
+        if let Some(fs) = SHARED.get_or_init(|| IoUringFs::new().ok().map(alloc::sync::Arc::new)) {
+            return alloc::sync::Arc::clone(fs) as alloc::sync::Arc<dyn Fs>;
+        }
+    }
+    alloc::sync::Arc::new(StdFs)
+}
 
 // `Read` / `Write` / `Seek` come from `crate::io`, the local mirror
 // of `std::io` that compiles under `no_std + alloc`. Under `feature =
@@ -415,9 +434,9 @@ pub enum FileHint {
 
     /// File is being written and we won't need it cached afterwards -
     /// drop pages from the page cache when the write completes
-    /// (`POSIX_FADV_DONTNEED`). Use for compaction output and memtable
-    /// flush output to keep them from evicting hot pages of files we're
-    /// still reading from.
+    /// (`POSIX_FADV_DONTNEED`). Use only for a file no read will follow,
+    /// such as an export: a table holds live data, and dropping its pages
+    /// sends its reads to the device.
     WriteOnce,
 }
 

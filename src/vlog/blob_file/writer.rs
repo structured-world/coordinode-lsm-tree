@@ -5,13 +5,12 @@
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
 #[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 
 use super::meta::{META_VERSION, Metadata};
 use crate::io::BufWriter;
 #[cfg(not(feature = "std"))]
 use crate::io::Write;
-use crate::io::{LittleEndian, WriteBytesExt};
 use crate::path::{Path, PathBuf};
 use crate::{
     Checksum, CompressionType, KeyRange, SeqNo, TreeId, UserKey,
@@ -143,12 +142,42 @@ pub(super) fn compute_header_crc(
     real_val_len: u32,
     on_disk_val_len: u32,
 ) -> u32 {
+    let mut fields = [0_u8; 18];
+    fields[..8].copy_from_slice(&seqno.to_le_bytes());
+    fields[8..10].copy_from_slice(&key_len.to_le_bytes());
+    fields[10..14].copy_from_slice(&real_val_len.to_le_bytes());
+    fields[14..18].copy_from_slice(&on_disk_val_len.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&fields) as u32
+}
+
+/// Key, value and CRC bytes that hash in one call. A streaming hasher costs
+/// more to set up than this many bytes cost to copy.
+const ONE_CALL_HASH_BYTES: usize = 1024;
+
+/// The checksum of a record: its key, its stored value and its header CRC, in
+/// that order. Covering the CRC detects a header recomputed after tampering.
+pub(super) fn record_checksum(key: &[u8], value: &[u8], header_crc: u32) -> u128 {
+    let crc = header_crc.to_le_bytes();
+    let len = key.len() + value.len() + crc.len();
+    if len <= ONE_CALL_HASH_BYTES {
+        let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); ONE_CALL_HASH_BYTES];
+        let dst = buf.as_mut_ptr().cast::<u8>();
+        // SAFETY: the three copies are disjoint, fill exactly the first `len`
+        // bytes, and `len` is within the buffer.
+        let bytes = unsafe {
+            core::ptr::copy_nonoverlapping(key.as_ptr(), dst, key.len());
+            let at = dst.add(key.len());
+            core::ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
+            core::ptr::copy_nonoverlapping(crc.as_ptr(), at.add(value.len()), crc.len());
+            core::slice::from_raw_parts(dst, len)
+        };
+        return xxhash_rust::xxh3::xxh3_128(bytes);
+    }
     let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-    hasher.update(&seqno.to_le_bytes());
-    hasher.update(&key_len.to_le_bytes());
-    hasher.update(&real_val_len.to_le_bytes());
-    hasher.update(&on_disk_val_len.to_le_bytes());
-    hasher.digest() as u32
+    hasher.update(key);
+    hasher.update(value);
+    hasher.update(&crc);
+    hasher.digest128()
 }
 
 /// Validate the frame header CRC: recompute from header fields and compare
@@ -188,7 +217,9 @@ pub(crate) struct Writer {
     pub(crate) uncompressed_bytes: u64,
 
     pub(crate) first_key: Option<UserKey>,
-    pub(crate) last_key: Option<UserKey>,
+    /// Rewritten by every frame, so it reuses its buffer rather than keeping a
+    /// key of its own per frame.
+    pub(crate) last_key: Vec<u8>,
 
     pub(crate) compression: CompressionType,
 
@@ -283,8 +314,9 @@ impl Writer {
         // error — an open failure above created nothing, so caller-side
         // cleanup would race a concurrent creator and delete a file it does
         // not own.
-        let mut writer =
-            crate::sfa::Writer::from_writer(ChecksummedWriter::new(BufWriter::new(file)));
+        let mut writer = crate::sfa::Writer::from_writer(ChecksummedWriter::new(
+            BufWriter::with_capacity(u16::MAX.into(), file),
+        ));
         if let Err(e) = writer.start("data") {
             drop(writer);
             // Best-effort cleanup of the partial file we own, but do not swallow
@@ -313,7 +345,7 @@ impl Writer {
             uncompressed_bytes: 0,
 
             first_key: None,
-            last_key: None,
+            last_key: Vec::new(),
 
             compression: CompressionType::None,
             metadata_compression_override: None,
@@ -524,7 +556,8 @@ impl Writer {
         if self.first_key.is_none() {
             self.first_key = Some(key.into());
         }
-        self.last_key = Some(key.into());
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
 
         self.uncompressed_bytes += u64::from(uncompressed_len);
 
@@ -552,34 +585,28 @@ impl Writer {
         // Data checksum includes header_crc bytes so that changes to header
         // fields without correspondingly updating the data checksum will be
         // detected as an inconsistency between header and data.
-        let checksum = {
-            let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-            hasher.update(key);
-            hasher.update(value);
-            hasher.update(&header_crc.to_le_bytes());
-            hasher.digest128()
-        };
+        let checksum = record_checksum(key, value, header_crc);
 
-        // Write header
-        self.writer.write_all(BLOB_HEADER_MAGIC)?;
-
-        // Write data checksum
-        self.writer.write_u128::<LittleEndian>(checksum)?;
-
-        // Write seqno
-        self.writer.write_u64::<LittleEndian>(seqno)?;
-
-        #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
-        self.writer.write_u16::<LittleEndian>(key.len() as u16)?;
-
-        // Write uncompressed value length
-        self.writer.write_u32::<LittleEndian>(uncompressed_len)?;
-
-        // Write compressed (on-disk) value length
-        self.writer.write_u32::<LittleEndian>(compressed_len_u32)?;
-
-        // Write header CRC
-        self.writer.write_u32::<LittleEndian>(header_crc)?;
+        // The header goes down as one write: the file's own checksum hashes
+        // every write it sees, field by field otherwise.
+        let mut header = [0_u8; BLOB_HEADER_LEN];
+        {
+            let mut rest = &mut header[..];
+            let mut put = |field: &[u8]| {
+                let (slot, after) = core::mem::take(&mut rest).split_at_mut(field.len());
+                slot.copy_from_slice(field);
+                rest = after;
+            };
+            put(BLOB_HEADER_MAGIC);
+            put(&checksum.to_le_bytes());
+            put(&seqno.to_le_bytes());
+            #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
+            put(&(key.len() as u16).to_le_bytes());
+            put(&uncompressed_len.to_le_bytes());
+            put(&compressed_len_u32.to_le_bytes());
+            put(&header_crc.to_le_bytes());
+        }
+        self.writer.write_all(&header)?;
 
         self.writer.write_all(key)?;
         self.writer.write_all(value)?;
@@ -636,9 +663,7 @@ impl Writer {
                 self.first_key
                     .clone()
                     .expect("should have written at least 1 item"),
-                self.last_key
-                    .clone()
-                    .expect("should have written at least 1 item"),
+                UserKey::from(self.last_key.as_slice()),
             )),
             // Record the override (relocation passthrough) when set, so a
             // reopened reader sees the real codec of the already-compressed

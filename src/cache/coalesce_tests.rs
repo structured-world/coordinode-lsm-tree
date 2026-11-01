@@ -469,7 +469,7 @@ fn a_suspended_resumable_multi_get_holds_no_load() -> crate::Result<()> {
 /// of their blocks and publish them from the ring's completions, while point
 /// reads of the same keys run at once and wait on those loads: every read
 /// answers right, none is left waiting, and no load stays registered.
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(io_uring_fs)]
 #[test]
 fn point_reads_wait_on_multi_gets_reading_through_io_uring() -> crate::Result<()> {
     if !crate::fs::is_io_uring_available() {

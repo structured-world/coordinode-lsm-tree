@@ -68,6 +68,12 @@ impl Slice {
         unsafe { ByteView::builder_unzeroed(len) }
     }
 
+    /// A zeroed buffer to fill in place and freeze, without a copy.
+    #[must_use]
+    pub(crate) fn builder(len: usize) -> Builder {
+        ByteView::builder(len)
+    }
+
     pub(crate) fn slice(&self, range: impl core::ops::RangeBounds<usize>) -> Self {
         Self(self.0.slice(range))
     }

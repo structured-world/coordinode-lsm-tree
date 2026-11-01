@@ -35,7 +35,7 @@ use super::writer::MAX_DECOMPRESSION_SIZE;
 /// `u16` limit (a caller cannot inflate the computed read that way), and
 /// [`crate::Error::DecompressedSizeTooLarge`] when the record would exceed the
 /// 256 MiB value cap plus its header / key overhead.
-pub fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize> {
+pub(crate) fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize> {
     // Enforce the same key-length constraint as the writer (u16::MAX)
     // so that a caller cannot inflate the computed read size.
     if key_len > u16::MAX as usize {
@@ -73,13 +73,13 @@ pub fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize>
 }
 
 /// Reads a single blob from a blob file
-pub struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     blob_file: &'a BlobFile,
     file: &'a dyn FsFile,
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(blob_file: &'a BlobFile, file: &'a dyn FsFile) -> Self {
+    pub(crate) fn new(blob_file: &'a BlobFile, file: &'a dyn FsFile) -> Self {
         Self { blob_file, file }
     }
 
@@ -93,14 +93,18 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns the file's read failures.
-    pub fn read_record(&self, vhandle: &ValueHandle, len: usize) -> crate::Result<crate::Slice> {
+    pub(crate) fn read_record(
+        &self,
+        vhandle: &ValueHandle,
+        len: usize,
+    ) -> crate::Result<crate::Slice> {
         debug_assert_eq!(vhandle.blob_file_id, self.blob_file.id());
         Ok(crate::file::read_exact(self.file, vhandle.offset, len)?)
     }
 
     /// Reads and parses one record in one call.
     #[cfg(test)]
-    pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
+    pub(crate) fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
         let record = self.read_record(vhandle, record_len(key.len(), vhandle)?)?;
         self.parse_record(key, vhandle, &record, &mut 0)
     }
@@ -122,7 +126,7 @@ impl<'a> Reader<'a> {
     /// Returns the header / checksum / decompression errors of a malformed
     /// record; a caller that prefetched speculatively should treat
     /// them as "leave this one to the read path" rather than as fatal.
-    pub fn parse_record(
+    pub(crate) fn parse_record(
         &self,
         key: &[u8],
         vhandle: &ValueHandle,
@@ -144,7 +148,7 @@ impl<'a> Reader<'a> {
     ///
     /// Returns the file's read failures and the header / checksum errors of a
     /// malformed record.
-    pub fn read_raw(
+    pub(crate) fn read_raw(
         &self,
         key: &[u8],
         vhandle: &ValueHandle,
@@ -238,13 +242,8 @@ impl<'a> Reader<'a> {
             // Checksum covers on-disk key + raw value data (upstream #277)
             // plus the header_crc bytes, so that recomputing header_crc
             // after tampering header fields is still detected.
-            let checksum = {
-                let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-                hasher.update(&on_disk_key);
-                hasher.update(&raw_data);
-                hasher.update(&stored_header_crc.to_le_bytes());
-                hasher.digest128()
-            };
+            let checksum =
+                super::writer::record_checksum(&on_disk_key, &raw_data, stored_header_crc);
 
             if expected_checksum != checksum {
                 log::error!(
@@ -280,9 +279,17 @@ impl<'a> Reader<'a> {
 
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
-                let mut buf = vec![0u8; real_val_len];
+                // Straight into the value's allocation, unzeroed: zeroing bytes
+                // about to be written buys nothing. SAFETY: the slice goes to
+                // this one decoder and no open trait, and it refuses a match
+                // reaching before the output, so it never reads an unwritten
+                // position whatever the stream holds (an unkeyed checksum
+                // proves nothing about it); the length check below rejects a
+                // short fill.
+                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                let mut builder = unsafe { UserValue::builder_unzeroed(real_val_len) };
 
-                let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut buf)
+                let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut builder)
                     .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
                 *decoded = bytes_written;
 
@@ -291,21 +298,31 @@ impl<'a> Reader<'a> {
                     return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
                 }
 
-                UserValue::from(buf)
+                builder.freeze().into()
             }
 
             #[cfg(zstd_any)]
             CompressionType::Zstd(_) => {
-                let decompressed =
-                    crate::compression::ZstdBackend::decompress(&raw_data, real_val_len)
-                        .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
-                *decoded = decompressed.len();
+                // Straight into the value's allocation, unzeroed, on the
+                // thread's reused decoder: zeroing bytes about to be written
+                // buys nothing. SAFETY: the slice goes to this one decoder and
+                // no open trait, and it resolves matches in a window of its own
+                // and refuses an offset past what it wrote, so the slice is
+                // only written, whatever the frame holds; the length check
+                // below rejects a short fill.
+                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                let mut builder = unsafe { UserValue::builder_unzeroed(real_val_len) };
 
-                if decompressed.len() != real_val_len {
+                let bytes_written =
+                    crate::compression::ZstdBackend::decompress_into(&raw_data, &mut builder)
+                        .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
+                *decoded = bytes_written;
+
+                if bytes_written != real_val_len {
                     return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
                 }
 
-                UserValue::from(decompressed)
+                builder.freeze().into()
             }
 
             #[cfg(zstd_any)]

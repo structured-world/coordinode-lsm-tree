@@ -1191,6 +1191,8 @@ pub(crate) struct RelocatingCompaction {
     /// inline for this pass to write beside the relocated frames. `None`
     /// writes every inline value inline.
     fresh: Option<FreshValues>,
+    /// Holds a pointer while it is encoded, so a pass allocates this once.
+    encoded: Vec<u8>,
 }
 
 /// What a relocating pass separates new values under: the tree's separation
@@ -1241,7 +1243,28 @@ impl RelocatingCompaction {
             relocated_bytes: 0,
             frames_read: 0,
             fresh: None,
+            encoded: Vec::new(),
         }
+    }
+
+    /// Writes the table row of `key` at `seqno` pointing at `indirection`.
+    fn write_pointer(
+        &mut self,
+        key: crate::UserKey,
+        seqno: crate::SeqNo,
+        indirection: &BlobIndirection,
+    ) -> crate::Result<()> {
+        self.encoded.clear();
+        indirection.encode_into(&mut self.encoded)?;
+        self.inner
+            .table_writer
+            .write(InternalValue::from_components(
+                key,
+                self.encoded.as_slice(),
+                seqno,
+                crate::ValueType::Indirection,
+            ))?;
+        Ok(())
     }
 
     /// Separates values at or above `fresh`'s threshold that reach this pass
@@ -1277,14 +1300,7 @@ impl RelocatingCompaction {
             vhandle,
             size: item.value.len() as u32,
         };
-        self.inner
-            .table_writer
-            .write(InternalValue::from_components(
-                item.key.user_key,
-                indirection.encode_into_vec(),
-                item.key.seqno,
-                crate::ValueType::Indirection,
-            ))?;
+        self.write_pointer(item.key.user_key, item.key.seqno, &indirection)?;
         self.inner.table_writer.register_blob(indirection);
         Ok(())
     }
@@ -1609,14 +1625,7 @@ impl CompactionFlavour for RelocatingCompaction {
                 );
                 self.relocated_bytes += u64::from(new_indirection.vhandle.on_disk_size);
 
-                self.inner
-                    .table_writer
-                    .write(InternalValue::from_components(
-                        item.key.user_key,
-                        new_indirection.encode_into_vec(),
-                        item.key.seqno,
-                        crate::ValueType::Indirection,
-                    ))?;
+                self.write_pointer(item.key.user_key, item.key.seqno, &new_indirection)?;
 
                 new_indirection
             } else {

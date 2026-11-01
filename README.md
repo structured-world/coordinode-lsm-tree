@@ -206,7 +206,7 @@ durability on top of the engine, see the external-WAL integration contract in
 
 ## Feature flags
 
-All optional. The default build (`std` + `parallel`) is the minimal core: no compression, no encryption, std filesystem, with the built-in parallel-compression executor. Every capability flag below is gated because it pulls in extra dependencies or runtime overhead. Turning `std` off (with `alloc`) selects the `no_std` build (see the platform note in `Cargo.toml`).
+All optional. The default build (`std` + `parallel` + `io-uring`) is the minimal core: no compression, no encryption, `io_uring` on Linux with a `StdFs` fallback and `StdFs` elsewhere, with the built-in parallel-compression executor. Every capability flag below is gated because it pulls in extra dependencies or runtime overhead. Turning `std` off (with `alloc`) selects the `no_std` build (see the platform note in `Cargo.toml`).
 
 | Flag | Pulls in | Enable when |
 |---|---|---|
@@ -216,7 +216,7 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 | `encryption` | `aes-gcm`, `rand_chacha` | AES-256-GCM block encryption at rest. Keys are caller-managed. |
 | `page_ecc` | [`reed-solomon-simd`](https://github.com/AndersTrier/reed-solomon-simd) | Per-block error-correcting parity (Reed-Solomon shards or per-word SEC-DED) after each on-disk block, with on-read self-healing, three-state verification, and a patrol scrub. Enable for latent-bit-rot protection on long-lived cold data. |
 | `crc32c` | [`crc32c`](https://github.com/zowens/crc32c) | Selects the hardware-accelerated CRC32C block checksum (`ChecksumType::Crc32c`) over the default XXH3. Enable when interop or CPU profile favours CRC32C. |
-| `io-uring` (linux only) | [`io-uring`](https://github.com/tokio-rs/io-uring) | I/O-bound workload on a modern Linux kernel: adds an `io_uring` `Fs` backend. |
+| `io-uring` (default-on, linux only) | [`io-uring`](https://github.com/tokio-rs/io-uring) | The default `Fs` backend on Linux on x86_64, aarch64, riscv64, loongarch64 and powerpc64, shared by every tree of the process; other targets and a process that cannot create a ring run on `StdFs`. Disable to build without the backend, or pass `Config::with_fs` to pick another. |
 | `io-uring-raw` (linux only) | [`syscalls`](https://github.com/jasonwhite/syscalls) | Pure-Rust `no_std` io_uring `Fs` backend on raw Linux syscalls (no libc), for embedded or sandboxed Linux targets without `std`. |
 | `bytes_1` | [`bytes`](https://github.com/tokio-rs/bytes) | Consumer already speaks `bytes::Bytes` (tokio/hyper/tonic stack) and wants zero-copy interop with engine slices. |
 | `parallel` (default-on) | [`rayon`](https://github.com/rayon-rs/rayon) | Built-in rayon-backed parallel block-compression executor. `std`-only; the `CompactionSpawner` trait lets a caller inject a custom executor without this flag. |

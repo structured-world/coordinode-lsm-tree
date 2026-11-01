@@ -435,6 +435,47 @@ macro_rules! batched_read_conformance {
                 Ok(())
             }
 
+            /// A backend that reads by descriptor does so for a batch of one
+            /// too: a wrapper that screens the batch would see the request
+            /// again if it went through `read_at`.
+            #[test_log::test]
+            fn read_blocks_batched_reads_a_lone_request_by_descriptor() -> $crate::io::Result<()> {
+                let Some(fs) = $make else {
+                    return Ok(());
+                };
+                let dir = tempfile::tempdir()?;
+                let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+                let mut file = fs.open(&dir.path().join("u.bin"), &opts)?;
+                file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+                file.sync_all()?;
+                let counted = CountingFile::new(file);
+
+                let mut buf = [0u8; 4];
+                {
+                    let mut reqs = [BlockRead {
+                        file: &counted,
+                        offset: 10,
+                        buf: BlockBuf::new(&mut buf),
+                    }];
+                    fs.read_blocks_batched(&mut reqs)?;
+                }
+                assert_eq!(buf, [10, 11, 12, 13]);
+                assert_eq!(counted.read_at_calls(), 0, "read by its descriptor");
+
+                let mut past_the_end = [0u8; 4];
+                let mut reqs = [BlockRead {
+                    file: &counted,
+                    offset: 254,
+                    buf: BlockBuf::new(&mut past_the_end),
+                }];
+                assert!(
+                    fs.read_blocks_batched(&mut reqs).is_err(),
+                    "a short read of a fixed-size block fails",
+                );
+                Ok(())
+            }
+
             /// Every destination holds the bytes ITS `(file, offset)` names,
             /// whichever group served it.
             #[test_log::test]
