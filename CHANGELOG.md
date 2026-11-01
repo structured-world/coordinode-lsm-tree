@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.6.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.5.0...v7.6.0) - 2026-11-01
+
+### Added
+
+- *(memtable)* tell an empty active memtable lock-free ([#1038](https://github.com/structured-world/coordinode-lsm-tree/pull/1038))
+
+### Performance
+
+- *(range)* index range tombstones for merge reads ([#1036](https://github.com/structured-world/coordinode-lsm-tree/pull/1036))
+
 ## [7.5.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.4.2...v7.5.0) - 2026-11-01
 
 ### Added
