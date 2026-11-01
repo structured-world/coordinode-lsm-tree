@@ -206,7 +206,7 @@ durability on top of the engine, see the external-WAL integration contract in
 
 ## Feature flags
 
-All optional. The default build (`std` + `parallel`) is the minimal core: no compression, no encryption, std filesystem, with the built-in parallel-compression executor. Every capability flag below is gated because it pulls in extra dependencies or runtime overhead. Turning `std` off (with `alloc`) selects the `no_std` build (see the platform note in `Cargo.toml`).
+All optional. The default build (`std` + `parallel` + `io-uring`) is the minimal core: no compression, no encryption, `io_uring` on Linux with a `StdFs` fallback and `StdFs` elsewhere, with the built-in parallel-compression executor. Every capability flag below is gated because it pulls in extra dependencies or runtime overhead. Turning `std` off (with `alloc`) selects the `no_std` build (see the platform note in `Cargo.toml`).
 
 | Flag | Pulls in | Enable when |
 |---|---|---|

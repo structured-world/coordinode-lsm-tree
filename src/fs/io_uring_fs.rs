@@ -104,9 +104,13 @@ impl IoUringFs {
         // batch) cannot be submitted, so it is read serially — but only it:
         // degrading the whole batch would forfeit the ring for the requests
         // that were perfectly submittable. A lone request has nothing to batch
-        // with, and stays on this thread like any other lone read.
-        let batch = reqs.len() > 1;
-        if batch && reqs.iter().all(|r| r.file.backing_fd().is_some()) {
+        // with, and is read by its descriptor on this thread.
+        if let [req] = reqs
+            && let Some(fd) = req.file.backing_fd()
+        {
+            return read_lone(fd, req, on_read);
+        }
+        if reqs.iter().all(|r| r.file.backing_fd().is_some()) {
             // The common case: nothing to split, and no borrow-gathering pass.
             // Every request is in the one group, so its position IS its index
             // and nothing has to be mapped back.
@@ -123,7 +127,7 @@ impl IoUringFs {
         let (mut submittable, mut serial): (IndexedReads<'_, '_>, IndexedReads<'_, '_>) = reqs
             .iter_mut()
             .enumerate()
-            .partition(|(_, r)| batch && r.file.backing_fd().is_some());
+            .partition(|(_, r)| r.file.backing_fd().is_some());
         log::debug!(
             "io_uring batched read: {} of {} requests lack a descriptor and are read serially",
             serial.len(),
@@ -236,6 +240,37 @@ impl std::fmt::Debug for IoUringFs {
 
 /// The callback [`Fs::read_blocks_batched_each`] hands each finished request to.
 type OnRead<'f> = &'f mut dyn for<'a, 'b> FnMut(usize, &'a BlockRead<'b>);
+
+/// Fills `req` from `fd`, its descriptor, on this thread.
+fn read_lone(
+    fd: i32,
+    req: &mut BlockRead<'_>,
+    on_read: Option<OnRead<'_>>,
+) -> crate::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    use std::os::unix::io::FromRawFd as _;
+
+    // A partly filled destination owns the block's first `filled` bytes
+    // already; complete it from `offset + filled`.
+    let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
+        return Err(crate::io::Error::from(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "read_blocks_batched: request offset overflows",
+        )));
+    };
+    // SAFETY: `backing_fd` names a descriptor open for as long as the request
+    // borrows its file, and `ManuallyDrop` never closes it.
+    #[expect(unsafe_code, reason = "see safety")]
+    let file = core::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    let dst = req.buf.unfilled_mut();
+    let want = dst.len();
+    file.read_exact_at(dst, offset)?;
+    req.buf.advance(want);
+    if let Some(on_read) = on_read {
+        on_read(0, req);
+    }
+    Ok(())
+}
 
 /// Makes `f` a callback over requests of any lifetime, which a closure only
 /// infers when its signature is fixed from outside.
@@ -601,8 +636,8 @@ impl FsFile for IoUringFile {
     }
 
     fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> crate::io::Result<()> {
-        // SAFETY: the ring only has the kernel write the slice, and `read_at`
-        // returns how much of it was.
+        // SAFETY: `read_at` is `File::read_at`, which only has the kernel write
+        // the slice and returns how much of it was.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
             buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))

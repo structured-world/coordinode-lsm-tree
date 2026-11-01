@@ -279,10 +279,11 @@ impl<'a> Reader<'a> {
 
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
-                // Straight into the value's allocation. SAFETY: `check_record`
-                // verified the record's checksum, so the stream is intact and
-                // wildcopy never reads an unwritten position; the length check
-                // below rejects a short fill.
+                // Straight into the value's allocation. SAFETY: the decoder
+                // refuses a match reaching before the output, so it never reads
+                // an unwritten position whatever the stream holds (an unkeyed
+                // checksum proves nothing about it); the length check below
+                // rejects a short fill.
                 #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                 let mut builder = unsafe { UserValue::builder_unzeroed(real_val_len) };
 
@@ -301,10 +302,10 @@ impl<'a> Reader<'a> {
             #[cfg(zstd_any)]
             CompressionType::Zstd(_) => {
                 // Straight into the value's allocation, on the thread's reused
-                // decoder. SAFETY: `check_record` verified the record's
-                // checksum, so the frame is intact and its back-references only
-                // target written positions; the length check below rejects a
-                // short fill.
+                // decoder. SAFETY: the decoder resolves matches in a window of
+                // its own and refuses an offset past what it wrote, so `dest`
+                // is only written, whatever the frame holds; the length check
+                // below rejects a short fill.
                 #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                 let mut builder = unsafe { UserValue::builder_unzeroed(real_val_len) };
 

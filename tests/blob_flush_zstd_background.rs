@@ -1,4 +1,4 @@
-#![cfg(feature = "zstd")]
+#![cfg(all(feature = "zstd", feature = "parallel"))]
 
 use lsm_tree::{
     AbstractTree, CompressionType, Config, KvSeparationOptions, SequenceNumberCounter,
@@ -25,6 +25,9 @@ fn zstd_blob_flush_keeps_every_key_on_its_value() -> lsm_tree::Result<()> {
         KvSeparationOptions::default().separation_threshold(128),
     ))
     .blob_compression(CompressionType::Zstd(3))
+    // A pool of its own whatever the host's core count: without one a flush
+    // compresses inline.
+    .compaction_threads(2)
     .open()?;
 
     let count = 1_000_u32;
