@@ -14,7 +14,7 @@ use core::cmp::Ordering;
 
 use crate::path::PathBuf;
 
-pub const INITIAL_CANONICAL_LEVEL: usize = 1;
+pub(crate) const INITIAL_CANONICAL_LEVEL: usize = 1;
 
 /// Bulk ingestion
 ///

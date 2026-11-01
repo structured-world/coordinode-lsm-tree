@@ -104,7 +104,7 @@ const fn row_weight(key_len: usize, value_len: usize) -> u64 {
 }
 
 /// What a block weighs in the cache: its header and its decoded payload.
-pub fn block_weight(block: &crate::table::Block) -> u64 {
+pub(crate) fn block_weight(block: &crate::table::Block) -> u64 {
     (Header::header_len(block.header.block_type) as u64)
         + u64::from(block.header.uncompressed_length)
 }
@@ -198,7 +198,7 @@ type LoadLead<'a> =
 /// result only when it asked for the same thing, so a request with another
 /// extent, role or codec never receives bytes interpreted for a different one.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum LoadIdentity {
+pub(crate) enum LoadIdentity {
     /// A table block: its role, on-disk length, codec (dictionary included)
     /// and whether it is encrypted.
     Block {
@@ -218,7 +218,7 @@ pub enum LoadIdentity {
 
 /// How a read that needs a block's partial prefix grown proceeds.
 #[cfg(feature = "zstd")]
-pub enum GrowthClaim<'a> {
+pub(crate) enum GrowthClaim<'a> {
     /// No growth of the block runs: grow it, holding the lead until the
     /// grown prefix is cached.
     Lead(GrowthLead<'a>),
@@ -232,13 +232,13 @@ pub enum GrowthClaim<'a> {
 /// The lead of a partial prefix's growth. Dropping it, after the grown prefix
 /// is cached or on any failure, lets the reads waiting on it look again.
 #[cfg(feature = "zstd")]
-pub struct GrowthLead<'a>(
+pub(crate) struct GrowthLead<'a>(
     #[expect(dead_code, reason = "held for its drop, which releases the waiters")] LoadLead<'a>,
 );
 
 /// How a block miss proceeds: lead the load, take a concurrent one's block,
 /// or load alone.
-pub enum BlockClaim<'a> {
+pub(crate) enum BlockClaim<'a> {
     /// No load of the block is in flight: read it, then [`BlockLead::publish`].
     Lead(BlockLead<'a>),
     /// A load of the block finished while this request waited for it.
@@ -252,7 +252,7 @@ pub enum BlockClaim<'a> {
 /// The lead of a block load. Dropping it unpublished (an error or an unwind)
 /// releases its waiters to read on their own. A batched read's lead also
 /// keeps its thread from waiting on other loads while it lives.
-pub struct BlockLead<'a>(LoadLead<'a>, Option<crate::inflight::BatchToken>);
+pub(crate) struct BlockLead<'a>(LoadLead<'a>, Option<crate::inflight::BatchToken>);
 
 impl BlockLead<'_> {
     /// Hands the loaded block to the waiters, if any; insert it into the
@@ -266,7 +266,7 @@ impl BlockLead<'_> {
 /// How a miss of a row group's decoded directory proceeds, as [`BlockClaim`]
 /// for a block.
 #[cfg(feature = "columnar")]
-pub enum DirectoryClaim<'a> {
+pub(crate) enum DirectoryClaim<'a> {
     /// Read the directory, then [`DirectoryLead::publish`] it.
     Lead(DirectoryLead<'a>),
     /// A concurrent read of the group's directory finished: the directory
@@ -281,7 +281,7 @@ pub enum DirectoryClaim<'a> {
 
 /// The lead of a directory load, as [`BlockLead`] for a block.
 #[cfg(feature = "columnar")]
-pub struct DirectoryLead<'a>(LoadLead<'a>);
+pub(crate) struct DirectoryLead<'a>(LoadLead<'a>);
 
 #[cfg(feature = "columnar")]
 impl DirectoryLead<'_> {
@@ -298,7 +298,7 @@ impl DirectoryLead<'_> {
 }
 
 /// How a blob miss proceeds, as [`BlockClaim`] for a block.
-pub enum BlobClaim<'a> {
+pub(crate) enum BlobClaim<'a> {
     /// Read the value, then [`BlobLead::publish`].
     Lead(BlobLead<'a>),
     /// A concurrent read of the same record, for the same key, finished.
@@ -308,7 +308,7 @@ pub enum BlobClaim<'a> {
 }
 
 /// The lead of a blob load, as [`BlockLead`] for a block.
-pub struct BlobLead<'a>(LoadLead<'a>);
+pub(crate) struct BlobLead<'a>(LoadLead<'a>);
 
 impl BlobLead<'_> {
     /// Hands the value read for `user_key` to the waiters, caching it first
