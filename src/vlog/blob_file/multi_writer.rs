@@ -660,6 +660,36 @@ impl MultiWriter {
         Ok(handle)
     }
 
+    /// Writes `encoded`, a value already encoded under this writer's codec.
+    /// `uncompressed_len` is its decoded length.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    pub(crate) fn write_encoded(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        encoded: &[u8],
+        uncompressed_len: u32,
+    ) -> crate::Result<ValueHandle> {
+        self.enter_key(key)?;
+        let target_size = self.target_size;
+
+        let writer = &mut self.active_writer;
+        let offset = writer.offset();
+        let on_disk_size = writer.write_encoded(key, seqno, encoded, uncompressed_len)?;
+        let handle = ValueHandle {
+            blob_file_id: writer.blob_file_id(),
+            offset,
+            on_disk_size,
+        };
+        if writer.offset() >= target_size {
+            self.rotate()?;
+        }
+        Ok(handle)
+    }
+
     pub(crate) fn write_raw(
         &mut self,
         key: &[u8],

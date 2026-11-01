@@ -7,6 +7,7 @@ pub mod meta;
 pub mod multi_writer;
 pub mod reader;
 pub mod scanner;
+pub(crate) mod value_encoder;
 pub mod writer;
 
 use crate::path::{Path, PathBuf};
