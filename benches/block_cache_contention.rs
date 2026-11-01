@@ -8,7 +8,7 @@
 //! |---|---|
 //! | cache | `warm` (holds every block, so readers only share read locks) or `tight` (a fifth of the data, so misses take write locks to evict) |
 //! | order | `uniform` or `skew` (a few keys take most reads, so their shards are the contended ones) |
-//! | threads | 1, 4, 8, 16 |
+//! | threads | 1, 4, 8, 16, 32 |
 //!
 //! Per configuration it prints the median over the rounds of the reads per
 //! second, the latency percentiles of one read in 64, and the fewest and most
@@ -200,7 +200,7 @@ fn main() -> lsm_tree::Result<()> {
             if !picked("CACHE_CONTENTION_ORDERS", order) {
                 continue;
             }
-            for threads in [1_u64, 4, 8, 16] {
+            for threads in [1_u64, 4, 8, 16, 32] {
                 if !picked("CACHE_CONTENTION_THREADS", &threads.to_string()) {
                     continue;
                 }
