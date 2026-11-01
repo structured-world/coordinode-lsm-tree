@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793556531005,
+  "lastUpdate": 1793556536177,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -96420,6 +96420,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.481916652,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee62466737f2a3175083c99284c787c7a2d826b8",
+          "message": "perf(range): index range tombstones for merge reads (#1036)\n\n## Summary\n- Merge resolution no longer asks every range tombstone about every\noperand: a scan's tombstones are indexed once, so a check costs a binary\nsearch, or one seqno compare for a version above every floor.\n- A scan shares one tombstone list between its stages and its\nrepositions instead of cloning it. A scan with no merge operand no\nlonger pays for the copy, and a scan with no tombstones allocates\nnothing for them.\n- A point merge keeps the seqno of the newest tombstone over its key\ninstead of cloning the tombstones.\n- No on-disk change.\n\n## Changes\n- `src/range_tombstone_index.rs`: `ScanTombstones`, the sorted list with\na lazily built index of the newest visible seqno per stretch between\ntombstone bounds. One seqno per stretch is exact because the index\nbelongs to one scan, whose snapshot and per-source cutoffs are fixed.\n- `MvccStream`: suppression is none, a scan's `ScanTombstones`, or one\nseqno for a stream of one key.\n- `RangeTombstoneFilter`: reads the shared sorted list; only the reverse\norder is built on first use.\n- `point_merge`: tracks one seqno, and is now `pub(crate)` along with\nthe filter, lowering the visibility baseline.\n- `benches/range_tombstone_merge.rs`: tombstone count, age relative to\nthe data and operands per key, with and without a merge operator,\nagainst scan, first row and point read latency (median, P99, P999),\nallocations and peak memory.\n\n## Performance\nForward scan at 1000 tombstones and 16 operands per key: 148473 to 1878\nns per row when the tombstones are older than the data, 133537 to 4208\nwhen newer. Tombstones older than the data gain from one; newer ones\nbreak even between 4 and 16, and cost up to 11% below that. A scan that\nreads few rows pays the index build once: time to the first row with one\noperand per key goes from 712 to 953 us at 10000 tombstones, repaid\nwithin a few rows. Without merge operands peak memory falls 28% at 10000\ntombstones. Full tables are in the issue.\n\n## Testing\n- The index is property tested against asking each tombstone, with\noverlapping, duplicated, inverted and unseen tombstones and a custom\ncomparator.\n- The differential test compares scans and point reads with its model,\nmerges under a reverse comparator among them, over snapshots, both scan\ndirections and table runs.\n- Formatting, lints in both feature configurations, tests, doc tests and\nthe visibility check pass on Linux and macOS.\n\nCloses #956",
+          "timestamp": "2026-11-01T17:39:10Z",
+          "tree_id": "4a8cef27a86e70d86ace3383badc7589b16523a3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ee62466737f2a3175083c99284c787c7a2d826b8"
+        },
+        "date": 1793556534578,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 628.422,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 217.384766ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 258.14300000000003,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 303.454738ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 5326.847,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 346.846478ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 10137.003999999999,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 32759.347,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.463,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 70.713343,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.460324459,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.423,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 59.703295,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.435255073,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
