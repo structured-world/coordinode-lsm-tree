@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793538376345,
+  "lastUpdate": 1793542409540,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66304,6 +66304,90 @@ window.BENCHMARK_DATA = {
             "value": 281183.5929587208,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 17.8us | P99.9: 103.6us\nthreads: 1 | elapsed: 0.71s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "61f398ad9d5d14aac6c1145b09006f81fdfbfb28",
+          "message": "feat(backpressure): report unflushed memtable count (#1035)\n\n## Summary\n\n- `WriteBufferBudget::unflushed()` reports the bytes and the count of\nmemtables its members have yet to flush, in one pass.\n- Each flush writes a table of its own, so a consumer charging room for\nflushes against a storage limit needs the count, not only the bytes.\n- The call takes neither a tree's version lock nor a memtable's\ntombstone lock, so a metered file system can read it from inside a\nversion install.\n\n## Changes\n\n- `backpressure`: new `Unflushed { bytes, memtables }` and\n`WriteBufferBudget::unflushed()`; `unflushed_bytes()` reads the same\npass.\n- `version::super_version`: `unflushed_memtables()` counts each sealed\nmemtable and an active one of non-zero size.\n\n## Testing\n\nFormat, Clippy in both configurations, nextest, doc tests, doc builds,\nthe visibility ratchet and the `sst-dump` build pass on Linux. Coverage\nincludes an empty active memtable, a sealed one, a tombstone-only one, a\ndropped member and reads under a member's version and tombstone locks.\n\nCloses #1032",
+          "timestamp": "2026-11-01T13:49:43Z",
+          "tree_id": "2cb71a951be790e725e18a3b04ad02a0b0f1bb31",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/61f398ad9d5d14aac6c1145b09006f81fdfbfb28"
+        },
+        "date": 1793542408226,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 51438.10548941416,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 21.4us | P99.9: 67.4us\nthreads: 1 | elapsed: 10.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2947480.437719709,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 701346.0426119971,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 3.0us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 438231.3061612043,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 7.3us | P99.9: 32.3us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3128271.5855275397,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 293984.91027784854,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 7.8us | P99.9: 16.4us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 139027.750385256,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 11.9us | P99.9: 39.8us\nthreads: 1 | elapsed: 1.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 639236.3447386777,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.3us | P99.9: 14.5us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 874546.2793777531,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 1.8us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 155876.84763224106,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 12.5us | P99.9: 1021.4us\nthreads: 1 | elapsed: 1.28s | num: 200000 | iterations: 3"
           }
         ]
       }
