@@ -103,8 +103,10 @@ impl IoUringFs {
         // device). A request without one (a non-io_uring file mixed into the
         // batch) cannot be submitted, so it is read serially — but only it:
         // degrading the whole batch would forfeit the ring for the requests
-        // that were perfectly submittable.
-        if reqs.iter().all(|r| r.file.backing_fd().is_some()) {
+        // that were perfectly submittable. A lone request has nothing to batch
+        // with, and stays on this thread like any other lone read.
+        let batch = reqs.len() > 1;
+        if batch && reqs.iter().all(|r| r.file.backing_fd().is_some()) {
             // The common case: nothing to split, and no borrow-gathering pass.
             // Every request is in the one group, so its position IS its index
             // and nothing has to be mapped back.
@@ -121,7 +123,7 @@ impl IoUringFs {
         let (mut submittable, mut serial): (IndexedReads<'_, '_>, IndexedReads<'_, '_>) = reqs
             .iter_mut()
             .enumerate()
-            .partition(|(_, r)| r.file.backing_fd().is_some());
+            .partition(|(_, r)| batch && r.file.backing_fd().is_some());
         log::debug!(
             "io_uring batched read: {} of {} requests lack a descriptor and are read serially",
             serial.len(),
