@@ -399,6 +399,60 @@ fn trees_sharing_a_write_buffer_budget_are_bounded_together() -> lsm_tree::Resul
     Ok(())
 }
 
+/// The budget counts the memtables a flush still has to write across its
+/// members, because each flush costs a table of its own: an empty active
+/// memtable is none, a sealed one is one, and a dropped tree leaves the count.
+#[test]
+fn a_budget_counts_the_memtables_waiting_for_a_flush() -> lsm_tree::Result<()> {
+    let budget = Arc::new(WriteBufferBudget::default());
+    let (a_dir, b_dir) = (get_tmp_folder(), get_tmp_folder());
+    let open = |path: &std::path::Path| {
+        Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .write_buffer_budget(Arc::clone(&budget))
+        .open()
+    };
+    let (a, b) = (open(a_dir.path())?, open(b_dir.path())?);
+    assert_eq!(
+        budget.unflushed().memtables,
+        0,
+        "empty memtables wait for nothing"
+    );
+
+    a.insert("k", "v", 0);
+    b.insert("k", "v", 0);
+    assert_eq!(budget.unflushed().memtables, 2);
+
+    assert!(a.rotate_memtable().is_some());
+    assert_eq!(
+        budget.unflushed().memtables,
+        2,
+        "sealed, its active one empty"
+    );
+    a.insert("k2", "v", 1);
+    let unflushed = budget.unflushed();
+    assert_eq!(unflushed.memtables, 3);
+    assert_eq!(unflushed.bytes, budget.unflushed_bytes());
+
+    a.flush_active_memtable(0)?;
+    b.flush_active_memtable(0)?;
+    let unflushed = budget.unflushed();
+    assert_eq!((unflushed.memtables, unflushed.bytes), (0, 0));
+
+    a.insert("k3", "v", 2);
+    b.insert("k3", "v", 1);
+    drop(b);
+    assert_eq!(
+        budget.unflushed().memtables,
+        1,
+        "a dropped tree leaves the count"
+    );
+    Ok(())
+}
+
 /// A tree past an L0 slowdown threshold, paced at `rate` bytes per second.
 fn slowed_tree(path: &std::path::Path, rate: u64) -> lsm_tree::Tree {
     let tree = match Config::new(
