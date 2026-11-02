@@ -28,6 +28,8 @@ jobs:
           # (rust-lang/crates-io-auth-action below); no git config
           # credentials are needed.
           persist-credentials: false
+      # `cargo publish` builds the package before it uploads it.
+      - uses: ./.github/actions/setup-mold
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: stable
