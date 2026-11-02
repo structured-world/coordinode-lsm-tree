@@ -1484,7 +1484,9 @@ impl<'r> UringReadQueue<'r> {
     /// Reads the reads held for a serial read, each into its own buffer.
     fn read_serial(&mut self) {
         for mut read in core::mem::take(&mut self.serial) {
-            let (file, offset) = (&read.file, read.offset);
+            // Past what is already filled, as the ring and a cached read
+            // resume a read; within the span the read asks for.
+            let (file, offset) = (&read.file, read.offset + read.buf.filled() as u64);
             let result = read
                 .buf
                 .fill_with(|buf| buf.fill_unfilled(|target| file.read_at_buf(target, offset)));

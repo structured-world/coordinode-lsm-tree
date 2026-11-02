@@ -1084,6 +1084,44 @@ fn a_read_without_a_descriptor_waits_for_a_wait_for_one() -> io::Result<()> {
     Ok(())
 }
 
+/// A read without a descriptor that comes with part of its buffer filled is
+/// read on from where that part ends, as the ring and the cached read resume
+/// it, not from the read's start again.
+#[test]
+fn a_serial_read_resumes_past_its_filled_part() -> io::Result<()> {
+    use crate::fs::MemFs;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let mem = MemFs::new();
+    let path = Path::new("/grow");
+    mem.open(path, &FsOpenOptions::new().write(true).create(true))?
+        .write_all(b"hello")?;
+    let file: Arc<dyn FsFile> = Arc::from(mem.open(path, &FsOpenOptions::new().read(true))?);
+    // Bytes 3..8 of the file, of which "lo" is there yet.
+    let mut buf = QueuedBuf::new(5);
+    buf.fill_with(|buf| buf.fill_unfilled(|target| file.read_at_buf(target, 3)))?;
+    assert_eq!(buf.filled_bytes(), b"lo");
+    mem.open(path, &FsOpenOptions::new().append(true))?
+        .write_all(b", world")?;
+
+    let mut queue = ring_queue(&fs);
+    queue.submit(QueuedRead {
+        tag: 0,
+        file,
+        offset: 3,
+        buf,
+    });
+    let mut got = Vec::new();
+    queue.wait(1, &mut |done| {
+        assert!(done.result.is_ok(), "the read failed");
+        got.push(done.buf.filled_bytes().to_vec());
+    });
+    assert_eq!(got, [b"lo, w".to_vec()], "the rest follows the filled part");
+    Ok(())
+}
+
 /// A wait for none never blocks on the ring's submission channel: with the
 /// ring thread held on a read that has no data yet and the channel full, it
 /// keeps its reads and returns, and a later wait for one sends and reads them.
