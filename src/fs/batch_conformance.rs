@@ -1171,18 +1171,18 @@ macro_rules! batched_read_conformance {
                             tag,
                             file: Arc::clone(&files[tag % 2]),
                             offset: (tag * 64) as u64,
-                            buf: vec![0; 64],
+                            buf: $crate::fs::QueuedBuf::new(64),
                         });
                     }
                     queue.wait(1, &mut |done| {
                         assert!(done.result.is_ok(), "read {} failed", done.tag);
-                        got.push((done.tag, done.buf));
+                        got.push((done.tag, done.buf.filled_bytes().to_vec()));
                     });
                 }
                 while queue.outstanding() > 0 {
                     queue.wait(1, &mut |done| {
                         assert!(done.result.is_ok(), "read {} failed", done.tag);
-                        got.push((done.tag, done.buf));
+                        got.push((done.tag, done.buf.filled_bytes().to_vec()));
                     });
                 }
                 got.sort_unstable_by_key(|(tag, _)| *tag);
@@ -1211,7 +1211,7 @@ macro_rules! batched_read_conformance {
                         tag,
                         file: Arc::clone(&files[0]),
                         offset,
-                        buf: vec![0; 64],
+                        buf: $crate::fs::QueuedBuf::new(64),
                     });
                 }
                 let mut got = Vec::new();

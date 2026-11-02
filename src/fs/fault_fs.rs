@@ -1398,7 +1398,7 @@ impl FaultReadQueue<'_> {
         }
         let mut sent = 0usize;
         for read in core::mem::take(&mut self.submitted) {
-            let len = read.buf.len();
+            let len = read.buf.capacity();
             let (error, spent) = self
                 .injector
                 .screen_by_fd(read.file.as_ref(), read.offset, len);
@@ -1409,7 +1409,7 @@ impl FaultReadQueue<'_> {
                     result: Err(error),
                 });
             } else {
-                self.screened.push((read.buf.as_ptr() as usize, spent));
+                self.screened.push((read.buf.addr(), spent));
                 self.inner.submit(read);
                 sent += 1;
             }
@@ -1431,7 +1431,7 @@ impl FaultReadQueue<'_> {
         // at a wait for none) was not read: what screening spent on it is
         // given back, and the wait that issues it screens it then.
         for read in self.inner.take_kept() {
-            let key = read.buf.as_ptr() as usize;
+            let key = read.buf.addr();
             if let Some(at) = self.screened.iter().position(|(held, _)| *held == key) {
                 let (_, spent) = self.screened.swap_remove(at);
                 self.injector.refund(core::slice::from_ref(&spent), [0]);

@@ -1,7 +1,8 @@
 #![expect(clippy::expect_used, reason = "test code")]
 
 use super::{
-    BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, MemFs, QueuedRead, ReadDone,
+    BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, MemFs, QueuedBuf, QueuedRead,
+    ReadDone,
 };
 use crate::io;
 use crate::path::Path;
@@ -111,7 +112,7 @@ fn three_reads(fs: &Scripted, file: &Arc<dyn FsFile>) -> alloc::vec::Vec<ReadDon
             tag,
             file: Arc::clone(file),
             offset,
-            buf: alloc::vec![0; 4],
+            buf: QueuedBuf::new(4),
         });
     }
     assert_eq!(queue.outstanding(), 3);
@@ -132,7 +133,13 @@ fn a_queue_hands_back_each_read_with_its_tag_and_bytes() {
     let done = three_reads(&fs, &file);
     let got: alloc::vec::Vec<(usize, alloc::vec::Vec<u8>, bool)> = done
         .into_iter()
-        .map(|read| (read.tag, read.buf, read.result.is_ok()))
+        .map(|read| {
+            (
+                read.tag,
+                read.buf.filled_bytes().to_vec(),
+                read.result.is_ok(),
+            )
+        })
         .collect();
     assert_eq!(
         got,
@@ -155,7 +162,7 @@ fn a_failed_batch_hands_back_every_read_it_did_not_serve_as_failed() {
     let first = done.first().expect("three reads");
     assert_eq!(first.tag, 5);
     assert!(first.result.is_ok(), "the served read is read");
-    assert_eq!(first.buf, [0, 1, 2, 3]);
+    assert_eq!(first.buf.filled_bytes(), [0, 1, 2, 3]);
     for read in done.iter().skip(1) {
         let error = read.result.as_ref().expect_err("an unserved read failed");
         assert_eq!(
@@ -197,7 +204,7 @@ fn a_wait_for_no_read_reads_nothing() {
         tag: 5,
         file: Arc::clone(&file),
         offset: 0,
-        buf: alloc::vec![0; 4],
+        buf: QueuedBuf::new(4),
     });
     let mut handed = 0;
     queue.wait(0, &mut |_| handed += 1);

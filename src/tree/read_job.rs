@@ -92,7 +92,7 @@ pub(super) struct BlockRequest<'a> {
     pub(super) cache: &'a crate::cache::Cache,
     pub(super) file: Arc<dyn FsFile>,
     pub(super) offset: u64,
-    pub(super) buf: Vec<u8>,
+    pub(super) buf: crate::fs::QueuedBuf,
 }
 
 /// Work a read asks for that is not one block read: it may block, so its

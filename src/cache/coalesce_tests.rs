@@ -400,7 +400,7 @@ fn a_waiting_point_read_caches_a_block_a_multi_get_had_no_room_for() -> crate::R
     }
     assert_eq!(cache.load_waiters(), 1, "the point read waits on the load");
     // No room left: the multi-get does not cache the block itself.
-    table.decode_data_block_keeping(&bytes, &handle, &mut 0, Some(lead))?;
+    table.decode_data_block_keeping(crate::Slice::from(bytes), &handle, &mut 0, Some(lead))?;
     assert_eq!(
         point.join().expect("reader")?.as_deref(),
         Some(&value(0)[..])
@@ -439,7 +439,7 @@ fn a_suspended_resumable_multi_get_holds_no_load() -> crate::Result<()> {
         read.complete_job(outcome);
     }
     for mut block in reads {
-        let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+        let result = block.buf.read_from(block.file.as_ref(), block.offset);
         read.complete_read(block.tag, result, block.buf);
     }
     let mut step = read.resume();
@@ -452,7 +452,7 @@ fn a_suspended_resumable_multi_get_holds_no_load() -> crate::Result<()> {
                     read.complete_job(outcome);
                 }
                 for mut block in read.take_reads() {
-                    let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+                    let result = block.buf.read_from(block.file.as_ref(), block.offset);
                     read.complete_read(block.tag, result, block.buf);
                 }
                 step = read.resume();

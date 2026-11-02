@@ -392,6 +392,55 @@ fn classify_block_trailer(
     }
 }
 
+/// Reads a block's frame out of the slice holding it, handing out views of it.
+struct FrameReader {
+    frame: Slice,
+    at: usize,
+}
+
+impl FrameReader {
+    /// The next `len` bytes, as a view of the frame.
+    fn view(&mut self, len: usize) -> crate::io::Result<Slice> {
+        let end = self
+            .at
+            .checked_add(len)
+            .filter(|&end| end <= self.frame.len());
+        let Some(end) = end else {
+            return Err(crate::io::Error::new(
+                crate::io::ErrorKind::UnexpectedEof,
+                "block frame: shorter than its header declares",
+            ));
+        };
+        let view = self.frame.slice(self.at..end);
+        self.at = end;
+        Ok(view)
+    }
+
+    fn read_into(&mut self, buf: &mut [u8]) -> usize {
+        let rest = self.frame.get(self.at..).unwrap_or_default();
+        let n = rest.len().min(buf.len());
+        let (out, _) = buf.split_at_mut(n);
+        let (bytes, _) = rest.split_at(n);
+        out.copy_from_slice(bytes);
+        self.at += n;
+        n
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Read for FrameReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(self.read_into(buf))
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl crate::io::Read for FrameReader {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+        Ok(self.read_into(buf))
+    }
+}
+
 /// A block whose transform pipeline (compress → encrypt → checksum → ecc)
 /// has run, but whose framed bytes have not yet been written to the file.
 ///
@@ -1299,6 +1348,26 @@ impl Block {
         })
     }
 
+    /// [`Self::from_reader_counting`] over a block's whole on-disk frame held
+    /// in `frame`: the payload is a view of it, not a copy, when the block is
+    /// stored as it is used.
+    pub(crate) fn from_frame_counting(
+        frame: Slice,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        at: ChecksumAt,
+        produced: &mut usize,
+    ) -> crate::Result<Self> {
+        Self::from_reader_taking(
+            &mut FrameReader { frame, at: 0 },
+            identity,
+            transform,
+            at,
+            produced,
+            |reader, len| Ok(reader.view(len)?),
+        )
+    }
+
     /// [`Self::from_reader_counting`] with the payload and parity bytes taken
     /// by `take`, `len` of them at a time: a reader already holding the bytes
     /// hands out a view of them instead of a copy.
@@ -1642,7 +1711,7 @@ impl Block {
     ///
     /// As [`Self::read_verified_payload`], minus the I/O.
     pub(crate) fn verify_frame(
-        frame: alloc::vec::Vec<u8>,
+        frame: &Slice,
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
@@ -1653,11 +1722,19 @@ impl Block {
             ));
         }
         match transform.encryption() {
+            // Decrypted in place, so into a buffer of its own.
             Some(enc) => {
                 let enc_overhead = u64::from(enc.max_overhead());
-                Self::verify_encrypted_frame(frame, handle, identity, transform, enc, enc_overhead)
+                Self::verify_encrypted_frame(
+                    frame.to_vec(),
+                    handle,
+                    identity,
+                    transform,
+                    enc,
+                    enc_overhead,
+                )
             }
-            None => Self::verify_plain_frame(&Slice::from(frame), handle, identity, transform),
+            None => Self::verify_plain_frame(frame, handle, identity, transform),
         }
     }
 

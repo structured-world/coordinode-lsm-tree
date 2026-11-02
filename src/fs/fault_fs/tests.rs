@@ -1,5 +1,5 @@
 use super::*;
-use crate::fs::{MemFs, StdFs};
+use crate::fs::{MemFs, QueuedBuf, StdFs};
 use crate::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use test_log::test;
@@ -576,14 +576,16 @@ impl ReadQueue for DescriptorQueue<'_> {
         let mut reads = core::mem::take(&mut self.kept);
         reads.append(&mut self.submitted);
         for mut read in reads {
-            let result = {
+            let (result, progress) = {
                 let mut req = BlockRead {
                     file: read.file.as_ref(),
                     offset: read.offset,
-                    buf: crate::fs::BlockBuf::new(&mut read.buf[..]),
+                    buf: read.buf.block_buf(),
                 };
-                self.fs.read_one(&mut req)
+                let result = self.fs.read_one(&mut req);
+                (result, req.buf.progress())
             };
+            read.buf.settle(&progress);
             on_done(ReadDone {
                 tag: read.tag,
                 buf: read.buf,
@@ -932,7 +934,7 @@ fn a_queued_read_the_rules_fail_is_handed_back_by_the_next_wait() -> io::Result<
             tag,
             file: Arc::clone(file),
             offset: 0,
-            buf: vec![0; 16],
+            buf: QueuedBuf::new(16),
         });
     }
     assert_eq!(queue.outstanding(), 2);
@@ -943,7 +945,7 @@ fn a_queued_read_the_rules_fail_is_handed_back_by_the_next_wait() -> io::Result<
     done.sort_by_key(|read| read.tag);
     assert_eq!(done.len(), 2);
     assert!(done[0].result.is_ok());
-    assert_eq!(done[0].buf, vec![b'0'; 16]);
+    assert_eq!(done[0].buf.filled_bytes(), [b'0'; 16]);
     assert_eq!(
         done[1].result.as_ref().map_err(io::Error::kind),
         Err::<&(), _>(ErrorKind::PermissionDenied),
@@ -1031,7 +1033,7 @@ fn a_queued_read_is_screened_when_a_wait_issues_it() -> io::Result<()> {
         tag,
         file: Arc::clone(&files[1]),
         offset: 0,
-        buf: vec![0; 16],
+        buf: QueuedBuf::new(16),
     };
     fs.injector().arm(
         FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
@@ -1124,14 +1126,14 @@ fn a_wait_for_none_issues_the_reads_of_a_queue_that_issues_them() -> io::Result<
             tag,
             file: Arc::clone(file),
             offset: 0,
-            buf: vec![0; 16],
+            buf: QueuedBuf::new(16),
         });
     }
     let mut done = Vec::new();
     queue.wait(0, &mut |read| done.push(read));
     done.sort_by_key(|read| read.tag);
     assert_eq!(done.len(), 2, "both reads were issued");
-    assert_eq!(done[0].buf, vec![b'0'; 16]);
+    assert_eq!(done[0].buf.filled_bytes(), [b'0'; 16]);
     assert_eq!(
         done[1].result.as_ref().map_err(io::Error::kind),
         Err::<&(), _>(ErrorKind::PermissionDenied),
@@ -1319,7 +1321,7 @@ fn a_read_a_queue_keeps_at_a_wait_for_none_is_screened_when_issued() -> io::Resu
         tag: 1,
         file: Arc::clone(&files[1]),
         offset: 0,
-        buf: vec![0; 16],
+        buf: QueuedBuf::new(16),
     });
     let mut done = Vec::new();
     queue.wait(0, &mut |read| done.push(read));
@@ -1365,14 +1367,14 @@ fn a_wait_met_by_failed_reads_still_issues_the_ones_it_handed_on() -> io::Result
             tag,
             file: Arc::clone(file),
             offset: 0,
-            buf: vec![0; 16],
+            buf: QueuedBuf::new(16),
         });
     }
     let mut done = Vec::new();
     queue.wait(1, &mut |read| done.push(read));
     done.sort_by_key(|read| read.tag);
     assert_eq!(done.len(), 2, "the read handed on was issued by this wait");
-    assert_eq!(done[0].buf, vec![b'0'; 16]);
+    assert_eq!(done[0].buf.filled_bytes(), [b'0'; 16]);
     assert_eq!(queue.outstanding(), 0);
     Ok(())
 }
@@ -1395,7 +1397,7 @@ fn a_kept_read_comes_back_through_nested_wrappers() -> io::Result<()> {
         tag: 1,
         file: Arc::clone(&files[1]),
         offset: 0,
-        buf: vec![0; 16],
+        buf: QueuedBuf::new(16),
     });
     let mut done = Vec::new();
     queue.wait(0, &mut |read| done.push(read));
@@ -1636,7 +1638,7 @@ fn an_empty_request_spends_no_rule() -> io::Result<()> {
         tag: 0,
         file: Arc::clone(&file),
         offset: 0,
-        buf: Vec::new(),
+        buf: QueuedBuf::new(0),
     });
     let mut done = Vec::new();
     queue.wait(1, &mut |read| done.push(read));

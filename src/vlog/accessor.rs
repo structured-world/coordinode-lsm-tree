@@ -443,7 +443,7 @@ impl<'a> Accessor<'a> {
             span: usize,
             blob_file: &'b crate::vlog::BlobFile,
             file: alloc::sync::Arc<dyn crate::fs::FsFile>,
-            buf: Option<crate::slice::Builder>,
+            buf: Option<crate::fs::QueuedBuf>,
         }
 
         let mut reads: Vec<SpanRead<'_>> = Vec::with_capacity(spans.len());
@@ -485,7 +485,7 @@ impl<'a> Accessor<'a> {
                 span: at,
                 blob_file,
                 file,
-                buf: Some(crate::Slice::builder(len)),
+                buf: Some(crate::fs::QueuedBuf::new(len)),
             });
         }
 
@@ -518,16 +518,22 @@ impl<'a> Accessor<'a> {
                 }
             }
             let mut got = alloc::vec![false; group.len()];
-            {
+            let progress: Vec<_> = {
                 let mut reqs: Vec<crate::fs::BlockRead<'_>> = reads
                     .iter_mut()
                     .enumerate()
                     .filter(|(at, _)| group.binary_search(at).is_ok())
                     .filter_map(|(_, read)| {
+                        let SpanRead {
+                            span,
+                            ref file,
+                            ref mut buf,
+                            ..
+                        } = *read;
                         Some(crate::fs::BlockRead {
-                            file: read.file.as_ref(),
-                            offset: spans.get(read.span).map_or(0, |span| span.start),
-                            buf: crate::fs::BlockBuf::new(read.buf.as_mut()?),
+                            file: file.as_ref(),
+                            offset: spans.get(span).map_or(0, |span| span.start),
+                            buf: buf.as_mut()?.block_buf(),
                         })
                     })
                     .collect();
@@ -538,9 +544,18 @@ impl<'a> Accessor<'a> {
                         *slot = true;
                     }
                 });
-            }
-            for (&at, got) in group.iter().zip(got) {
-                if !got && let Some(read) = reads.get_mut(at) {
+                reqs.iter().map(|req| req.buf.progress()).collect()
+            };
+            // Every span of the group had a buffer, so the requests and the
+            // group line up.
+            for ((&at, got), progress) in group.iter().zip(got).zip(&progress) {
+                let Some(read) = reads.get_mut(at) else {
+                    continue;
+                };
+                if let Some(buf) = read.buf.as_mut() {
+                    buf.settle(progress);
+                }
+                if !got || !read.buf.as_ref().is_some_and(crate::fs::QueuedBuf::is_full) {
                     read.buf = None;
                 }
             }
@@ -550,7 +565,10 @@ impl<'a> Accessor<'a> {
             if *admit_budget == 0 {
                 return;
             }
-            let (Some(span), Some(buf)) = (spans.get(read.span), read.buf) else {
+            let (Some(span), Some(buf)) = (
+                spans.get(read.span),
+                read.buf.and_then(crate::fs::QueuedBuf::into_slice),
+            ) else {
                 continue;
             };
             let Some(records) = items.get(span.records.clone()) else {
@@ -560,7 +578,7 @@ impl<'a> Accessor<'a> {
                 tree_id,
                 records,
                 span.start,
-                &buf.freeze().into(),
+                &buf,
                 read.blob_file,
                 read.file.as_ref(),
                 cache,

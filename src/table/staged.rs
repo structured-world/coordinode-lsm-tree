@@ -155,19 +155,19 @@ impl<'t> StagedRead<'t> {
             .sum()
     }
 
-    /// Holds `bytes`, the on-disk bytes of the needed block at `handle`, and
+    /// Holds `frame`, the on-disk bytes of the needed block at `handle`, and
     /// puts the decoded block in the cache.
     ///
     /// # Errors
     ///
     /// Propagates a decode or corruption error; the read is then to be done
     /// serially.
-    pub(crate) fn supply(&mut self, handle: BlockHandle, bytes: &[u8]) -> crate::Result<()> {
+    pub(crate) fn supply(&mut self, handle: BlockHandle, frame: crate::Slice) -> crate::Result<()> {
         let (block_type, _) = self.need();
         let offset = *handle.offset();
         let block = self
             .table
-            .decode_block_from_bytes(bytes, offset, block_type)?;
+            .decode_block_from_frame(frame, offset, block_type)?;
         self.table
             .cache
             .insert_block(self.table.global_id(), handle.offset(), block.clone());

@@ -2126,9 +2126,12 @@ impl IoUringRawFs {
             // bytes already, so its read covers the suffix from there; the
             // check above proved the offset and the length fit.
             let offset = req.offset + req.buf.filled() as u64;
+            // SAFETY: the kernel only writes the span, and it is counted
+            // filled only once its completion reports it whole.
+            let buf = unsafe { req.buf.unfilled_uninit_mut() }.as_mut_ptr();
             reads.push(RawRead {
                 fd,
-                buf: req.buf.unfilled_mut().as_mut_ptr(),
+                buf,
                 len: batch_read_len(want)?,
                 offset,
             });
@@ -2148,7 +2151,8 @@ impl IoUringRawFs {
                 // The kernel filled exactly the unfilled span the read named.
                 Ok(()) => {
                     if let Some(req) = reqs.get_mut(at) {
-                        req.buf.advance(read.len as usize);
+                        // SAFETY: the completion reports the span written whole.
+                        unsafe { req.buf.assume_written(read.len as usize) };
                     }
                 }
                 Err(error) => {
@@ -2178,12 +2182,13 @@ impl IoUringRawFs {
                 ));
                 break;
             };
-            let dst = req.buf.unfilled_mut();
-            let want = dst.len();
-            match req.file.read_at(dst, offset) {
-                Ok(n) => {
-                    req.buf.advance(n);
-                    if n != want {
+            let file = req.file;
+            match req
+                .buf
+                .fill_unfilled(|target| file.read_at_buf(target, offset))
+            {
+                Ok(()) => {
+                    if !req.buf.is_full() {
                         failure = Some((at, short_block_read()));
                         break;
                     }

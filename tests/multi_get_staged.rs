@@ -796,12 +796,7 @@ impl ReadQueue for SlowFirstQueue {
                 let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
                 seen.submitted_when_first_finished = Some(self.submitted);
             }
-            let want = read.buf.len();
-            let result = match read.file.read_at(&mut read.buf, read.offset) {
-                Ok(n) if n == want => Ok(()),
-                Ok(_) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
-                Err(error) => Err(error),
-            };
+            let result = read.buf.read_from(read.file.as_ref(), read.offset);
             on_done(ReadDone {
                 tag: read.tag,
                 buf: read.buf,
@@ -959,12 +954,7 @@ impl WakeQueue {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
                     first = false;
-                    let want = read.buf.len();
-                    let result = match read.file.read_at(&mut read.buf, read.offset) {
-                        Ok(n) if n == want => Ok(()),
-                        Ok(_) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
-                        Err(error) => Err(error),
-                    };
+                    let result = read.buf.read_from(read.file.as_ref(), read.offset);
                     if done
                         .send(ReadDone {
                             tag: read.tag,
@@ -1062,12 +1052,7 @@ impl ReadQueue for HoldingQueue {
             return;
         }
         for mut read in core::mem::take(&mut self.0) {
-            let want = read.buf.len();
-            let result = match read.file.read_at(&mut read.buf, read.offset) {
-                Ok(n) if n == want => Ok(()),
-                Ok(_) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
-                Err(error) => Err(error),
-            };
+            let result = read.buf.read_from(read.file.as_ref(), read.offset);
             on_done(ReadDone {
                 tag: read.tag,
                 buf: read.buf,

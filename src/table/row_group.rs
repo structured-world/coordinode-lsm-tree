@@ -1327,7 +1327,7 @@ impl GroupRead<'_> {
         // An owned copy per block, so each cached block holds exactly its own
         // bytes rather than a view that pins the read it came in with.
         let (header, payload, ecc_status, recovery) =
-            Block::verify_frame(bytes.to_vec(), *handle, identity, &transform)?;
+            Block::verify_frame(&crate::Slice::new(bytes), *handle, identity, &transform)?;
         let mut produced = 0;
         let data = Block::decompress_payload(&header, payload, &transform, &mut produced);
         #[cfg(feature = "metrics")]

@@ -54,11 +54,22 @@ pub struct ReadBuf<'a> {
 impl<'a> ReadBuf<'a> {
     /// A buffer over bytes that may be uninitialized.
     pub(crate) fn uninit(buf: &'a mut [MaybeUninit<u8>]) -> Self {
+        Self::partly_init(buf, 0)
+    }
+
+    /// A buffer over bytes of which the first `init` are initialized.
+    pub(crate) fn partly_init(buf: &'a mut [MaybeUninit<u8>], init: usize) -> Self {
+        debug_assert!(init <= buf.len(), "initialized past the buffer");
         Self {
             buf,
-            init: 0,
+            init,
             filled: 0,
         }
+    }
+
+    /// The bytes from the start known to be initialized.
+    pub(crate) fn initialized(&self) -> usize {
+        self.init
     }
 
     /// The bytes the buffer can take.

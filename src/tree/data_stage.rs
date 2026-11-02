@@ -23,7 +23,7 @@ struct Fill {
     index: usize,
     slot: usize,
     offset: u64,
-    buf: Vec<u8>,
+    buf: crate::fs::QueuedBuf,
 }
 
 /// The read of one chunk of block tasks for `keys`. The chunk's tasks are
@@ -132,7 +132,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                 (TaskBlock::Load, Some(read)) => *read,
                 _ => continue,
             };
-            let buf = alloc::vec![0u8; len];
+            let buf = crate::fs::QueuedBuf::new(len);
             let id = task.table.id();
             if read.files.last().is_none_or(|&(last, _)| last != id) {
                 let file = match carry.take() {
@@ -249,7 +249,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
     }
 
-    /// Takes back the read of task `index` of `chunk` as its on-disk `bytes`:
+    /// Takes back the read of task `index` of `chunk` as its on-disk `frame`:
     /// decoded (a Page-ECC or columnar block checked and rebuilt by its
     /// table), kept in the cache while it fits in `keep_room`, and
     /// point-read.
@@ -257,7 +257,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         &mut self,
         chunk: &[BlockTask<'_>],
         index: usize,
-        bytes: Vec<u8>,
+        frame: crate::Slice,
         keep_room: &mut u64,
     ) {
         let Some(task) = chunk.get(index) else {
@@ -265,7 +265,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         };
         let resolved = if task.special {
             task.table
-                .decode_special_block(&task.handle, bytes, keep_room)
+                .decode_special_block(&task.handle, &frame, keep_room)
                 .and_then(|block| match block {
                     Some(block) => {
                         Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
@@ -281,7 +281,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             Tree::resolve_block_task(
                 task,
                 index,
-                &bytes,
+                frame,
                 keep_room,
                 lead,
                 self.keys,

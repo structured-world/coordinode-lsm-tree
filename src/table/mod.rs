@@ -8118,7 +8118,7 @@ impl Table {
         Ok(Some((file, table_seqno, self.is_chunk_special(), blocks)))
     }
 
-    /// Decodes the data block at `handle` from its on-disk `bytes` (read by the
+    /// Decodes the data block at `handle` from its on-disk `frame` (read by the
     /// batched multi-get), using the same path as [`Table::load_data_block`]
     /// for a non-special table ([`Block::from_reader`] shares the header /
     /// decrypt helpers), so the block is byte-identical, and puts it in the
@@ -8131,12 +8131,12 @@ impl Table {
     /// Propagates a corruption / decode error (the resolver surfaces it).
     pub(crate) fn decode_data_block_keeping(
         &self,
-        bytes: &[u8],
+        frame: crate::Slice,
         handle: &BlockHandle,
         room: &mut u64,
         lead: Option<crate::cache::BlockLead>,
     ) -> crate::Result<DataBlock> {
-        let block = self.decode_block_from_bytes(bytes, *handle.offset(), BlockType::Data)?;
+        let block = self.decode_block_from_frame(frame, *handle.offset(), BlockType::Data)?;
         // Weighed as the cache weighs it: decoded, not as it was read.
         let weight = crate::cache::block_weight(&block);
         if weight <= *room {
@@ -8209,7 +8209,7 @@ impl Table {
     }
 
     /// The data block at `handle` of this Page-ECC or columnar table, from the
-    /// `bytes` [`Self::batched_special_read`] asked for: checked, recovered
+    /// `frame` [`Self::batched_special_read`] asked for: checked, recovered
     /// and reconstructed exactly as the load path does it, cached (a row block
     /// while it fits in `room`), and `None` when a columnar block's delete
     /// mask removes every row.
@@ -8222,7 +8222,7 @@ impl Table {
     pub(crate) fn decode_special_block(
         &self,
         handle: &BlockHandle,
-        bytes: alloc::vec::Vec<u8>,
+        frame: &crate::Slice,
         room: &mut u64,
     ) -> crate::Result<Option<DataBlock>> {
         #[cfg(feature = "columnar")]
@@ -8230,7 +8230,7 @@ impl Table {
             let fd = LookupFd::default();
             let blocks = self
                 .group_read(handle, ReadCharge::Foreground, &fd)
-                .load_whole(&crate::Slice::from(bytes))?;
+                .load_whole(frame)?;
             return self.columnar_data_block_from(handle, &blocks, ReadCharge::Foreground);
         }
         let compression = self.metadata.data_block_compression;
@@ -8248,7 +8248,7 @@ impl Table {
             window_log: 0,
         };
         let (header, payload, status, recovery) =
-            Block::verify_frame(bytes, *handle, identity, &transform)?;
+            Block::verify_frame(frame, *handle, identity, &transform)?;
         if matches!(status, crate::table::block::EccStatus::Corrected) {
             return Err(crate::Error::Io(crate::io::Error::other(
                 "a block Page-ECC corrected is loaded through the path that heals it",
@@ -8367,17 +8367,18 @@ impl Table {
         )
     }
 
-    /// Decodes the on-disk `bytes` of this table's block of `block_type` read
-    /// at `offset`, with the codec that block type is written with, exactly as
-    /// the load path decodes it; a block of another type is refused. Not for
-    /// Page-ECC tables, whose recovery needs the re-reading load path.
+    /// Decodes `frame`, the on-disk bytes of this table's block of
+    /// `block_type` read at `offset`, with the codec that block type is
+    /// written with, exactly as the load path decodes it; a block of another
+    /// type is refused. A block stored as it is used is a view of `frame`.
+    /// Not for Page-ECC tables, whose recovery needs the re-reading load path.
     ///
     /// # Errors
     ///
     /// Propagates a corruption or decode error.
-    pub(crate) fn decode_block_from_bytes(
+    pub(crate) fn decode_block_from_frame(
         &self,
-        bytes: &[u8],
+        frame: crate::Slice,
         offset: u64,
         block_type: BlockType,
     ) -> crate::Result<Block> {
@@ -8412,8 +8413,8 @@ impl Table {
         // role check refuses was still decoded. The read was charged when the
         // batch was issued.
         let mut produced = 0;
-        let decoded = Block::from_reader_counting(
-            &mut crate::io::Cursor::new(bytes),
+        let decoded = Block::from_frame_counting(
+            frame,
             identity,
             &transform,
             crate::table::block::ChecksumAt::block(identity.table_id, block_type, offset),

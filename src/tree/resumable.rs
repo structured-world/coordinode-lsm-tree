@@ -64,11 +64,13 @@ pub enum Step {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadTag(usize);
 
-/// A block read: `buf.len()` bytes of `file` from `offset`, the whole of
+/// A block read: `buf.capacity()` bytes of `file` from `offset`, the whole of
 /// them, into `buf`.
 ///
 /// The caller owns the buffer until it hands it back through
-/// [`ResumableMultiGet::complete_read`] with the read's `tag`.
+/// [`ResumableMultiGet::complete_read`] with the read's `tag`. Submitted as a
+/// [`QueuedRead`](crate::fs::QueuedRead) to [`Fs::read_queue`], it is filled
+/// without being zeroed first and becomes the block without a copy.
 pub struct BlockRequest {
     /// Names the read when it is handed back.
     pub tag: ReadTag,
@@ -81,7 +83,7 @@ pub struct BlockRequest {
     /// Where the block starts in `file`.
     pub offset: u64,
     /// The destination, exactly as long as the block.
-    pub buf: Vec<u8>,
+    pub buf: crate::fs::QueuedBuf,
 }
 
 /// Work a read needs that is not one block read.
@@ -185,7 +187,12 @@ impl ResumableMultiGet {
     /// Hands back the block read tagged `tag`: `buf` holds the whole block
     /// when `result` is `Ok`. A read that failed or came back short makes the
     /// read take another path to the same answer, never a wrong one.
-    pub fn complete_read(&mut self, tag: ReadTag, result: crate::io::Result<()>, buf: Vec<u8>) {
+    pub fn complete_read(
+        &mut self,
+        tag: ReadTag,
+        result: crate::io::Result<()>,
+        buf: crate::fs::QueuedBuf,
+    ) {
         self.cell.with_dependent_mut(|_, machine| {
             machine.read.read_done(crate::fs::ReadDone {
                 tag: tag.0,

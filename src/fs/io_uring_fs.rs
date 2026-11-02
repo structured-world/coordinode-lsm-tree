@@ -184,12 +184,13 @@ impl IoUringFs {
                 ));
                 break;
             };
-            let dst = req.buf.unfilled_mut();
-            let want = dst.len();
-            match req.file.read_at(dst, offset) {
-                Ok(n) => {
-                    req.buf.advance(n);
-                    if n != want {
+            let file = req.file;
+            match req
+                .buf
+                .fill_unfilled(|target| file.read_at_buf(target, offset))
+            {
+                Ok(()) => {
+                    if !req.buf.is_full() {
                         serial_failure = Some((
                             *idx,
                             crate::io::Error::from(io::Error::new(
@@ -262,10 +263,15 @@ fn read_lone(
     // borrows its file, and `ManuallyDrop` never closes it.
     #[expect(unsafe_code, reason = "see safety")]
     let file = core::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
-    let dst = req.buf.unfilled_mut();
-    let want = dst.len();
-    file.read_exact_at(dst, offset)?;
-    req.buf.advance(want);
+    // SAFETY: `pread` only writes the slice; `read_exact_at` fills it whole
+    // or fails, and only then is it counted.
+    #[expect(unsafe_code, reason = "see safety")]
+    unsafe {
+        let dst = req.buf.unfilled_uninit_mut();
+        let want = dst.len();
+        file.read_exact_at(dst, offset)?;
+        req.buf.assume_written(want);
+    }
     if let Some(on_read) = on_read {
         on_read(0, req);
     }
@@ -1356,9 +1362,13 @@ impl RingThread {
                 continue;
             };
             expected.push(req.buf.capacity() - req.buf.filled());
+            // SAFETY: the kernel only writes the span; it is counted filled
+            // only once its completion reports it whole.
+            #[expect(unsafe_code, reason = "see safety")]
+            let dst = unsafe { req.buf.unfilled_uninit_mut() }.as_mut_ptr();
             reads.push(BatchRead {
                 fd,
-                buf: UnsafeSendMutPtr(req.buf.unfilled_mut().as_mut_ptr()),
+                buf: UnsafeSendMutPtr(dst),
                 len,
                 offset,
             });
@@ -1374,7 +1384,12 @@ impl RingThread {
         // submission described.
         let count_filled = |req: &mut BlockRead<'r>| {
             let remaining = req.buf.capacity() - req.buf.filled();
-            req.buf.advance(remaining);
+            // SAFETY: called only for a request whose completion matched the
+            // length it asked for, or for an empty one.
+            #[expect(unsafe_code, reason = "see safety")]
+            unsafe {
+                req.buf.assume_written(remaining);
+            }
         };
 
         if let Some(on_read) = on_read {
@@ -1457,10 +1472,13 @@ impl<'r> UringReadQueue<'r> {
     /// Reads the reads held for a serial read, each into its own buffer.
     fn read_serial(&mut self) {
         for mut read in core::mem::take(&mut self.serial) {
-            let want = read.buf.len();
-            let result = match read.file.read_at(&mut read.buf, read.offset) {
-                Ok(n) if n == want => Ok(()),
-                Ok(_) => Err(short_read()),
+            let (file, offset) = (&read.file, read.offset);
+            let result = read
+                .buf
+                .fill_with(|buf| buf.fill_unfilled(|target| file.read_at_buf(target, offset)));
+            let result = match result {
+                Ok(()) if read.buf.is_full() => Ok(()),
+                Ok(()) => Err(short_read()),
                 Err(error) => Err(error),
             };
             self.finished.push(done(read, result));
@@ -1485,7 +1503,7 @@ impl<'r> UringReadQueue<'r> {
         // The submission place of each read sent below, in order.
         let mut places: Vec<usize> = Vec::new();
         for (place, mut read) in core::mem::take(&mut self.submitted).into_iter().enumerate() {
-            if read.buf.is_empty() {
+            if read.buf.capacity() == 0 {
                 self.finished.push(done(read, Ok(())));
                 continue;
             }
@@ -1497,7 +1515,7 @@ impl<'r> UringReadQueue<'r> {
                 }
                 continue;
             };
-            let Ok(len) = i32::try_from(read.buf.len()) else {
+            let Ok(len) = i32::try_from(read.buf.capacity()) else {
                 self.finished.push(done(
                     read,
                     Err(crate::io::Error::from(io::Error::new(
@@ -1507,12 +1525,16 @@ impl<'r> UringReadQueue<'r> {
                 ));
                 continue;
             };
-            // The pointer is into the Vec's heap allocation, which moving the
-            // Vec into `sent` does not move; the buffer is not touched again
-            // until its completion is received (see the type's docs).
+            // The pointer is into the buffer's heap allocation, which moving
+            // the read into `sent` does not move; the buffer is not touched
+            // again until its completion is received (see the type's docs).
+            // SAFETY: the kernel only writes the span, and the buffer is
+            // counted filled only once its completion reports it whole.
+            #[expect(unsafe_code, reason = "see safety")]
+            let (dst, _) = unsafe { read.buf.unfilled_ptr() };
             reads.push(BatchRead {
                 fd,
-                buf: UnsafeSendMutPtr(read.buf.as_mut_ptr()),
+                buf: UnsafeSendMutPtr(dst),
                 len: len.unsigned_abs(),
                 offset: read.offset,
             });
@@ -1595,11 +1617,19 @@ impl<'r> UringReadQueue<'r> {
 
     /// The read at `position` with the ring's `result` for it.
     fn complete(&mut self, position: usize, result: i32) -> Option<ReadDone> {
-        let read = self.take_sent(position)?;
+        let mut read = self.take_sent(position)?;
         self.on_ring -= 1;
-        let want = read.buf.len();
+        let want = read.buf.capacity();
         let result = match usize::try_from(result) {
-            Ok(n) if n == want => Ok(()),
+            Ok(n) if n == want => {
+                // SAFETY: the completion reports the kernel wrote all `want`
+                // bytes of the span it was given.
+                #[expect(unsafe_code, reason = "see safety")]
+                unsafe {
+                    read.buf.assume_written(want);
+                }
+                Ok(())
+            }
             Ok(_) => Err(short_read()),
             // A negative completion is `-errno`, never `i32::MIN`.
             Err(_) => Err(crate::io::Error::from(io::Error::from_raw_os_error(

@@ -301,7 +301,7 @@ impl<'a> LevelStages<'a> {
                 cache: &table.cache,
                 file: Arc::clone(file),
                 offset: *handle.offset(),
-                buf: alloc::vec![0u8; handle.size() as usize],
+                buf: crate::fs::QueuedBuf::new(handle.size() as usize),
             });
             self.asked.push((at, *handle));
             self.waiting[at] += 1;
@@ -347,7 +347,12 @@ impl<'a> LevelStages<'a> {
         clippy::indexing_slicing,
         reason = "a tag indexes `asked`, whose entries index the level's tables and `waiting`, all by construction"
     )]
-    pub(super) fn complete(&mut self, tag: usize, result: crate::io::Result<()>, buf: &[u8]) {
+    pub(super) fn complete(
+        &mut self,
+        tag: usize,
+        result: crate::io::Result<()>,
+        buf: crate::fs::QueuedBuf,
+    ) {
         let (at, handle) = self.asked[tag];
         self.waiting[at] -= 1;
         // Back from flight: held from here on decoded, if at all.
@@ -357,7 +362,10 @@ impl<'a> LevelStages<'a> {
             return;
         };
         let supplied = match result {
-            Ok(()) => read.supply(handle, buf).is_ok(),
+            // A read reported done and left short is a lost block too.
+            Ok(()) => buf
+                .into_slice()
+                .is_some_and(|frame| read.supply(handle, frame).is_ok()),
             Err(error) => {
                 log::debug!(
                     "a staged level read lost a block, its table is planned serially: {error}"

@@ -24,8 +24,34 @@ impl UnfilledSlice {
 
     /// The whole allocation as a read target.
     pub(crate) fn target(&mut self) -> crate::fs::ReadBuf<'_> {
+        crate::fs::ReadBuf::uninit(self.uninit_mut())
+    }
+
+    /// The whole allocation, as memory that may be uninitialized.
+    pub(crate) fn uninit_mut(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
         let (target, _) = self.builder.spare_capacity_mut().split_at_mut(self.len);
-        crate::fs::ReadBuf::uninit(target)
+        target
+    }
+
+    /// [`Self::uninit_mut`], shared.
+    pub(crate) fn uninit(&self) -> &[core::mem::MaybeUninit<u8>] {
+        // SAFETY: the builder owns at least `len` bytes past its (empty)
+        // length, `with_capacity(len)` having allocated them; they are read
+        // here only as `MaybeUninit`.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            core::slice::from_raw_parts(self.builder.as_ptr().cast(), self.len)
+        }
+    }
+
+    /// Whether the bytes move when this value does: never, they are on the
+    /// heap.
+    #[expect(
+        clippy::unused_self,
+        reason = "the other slice backend inlines short slices"
+    )]
+    pub(crate) fn bytes_move_with_it(&self) -> bool {
+        false
     }
 
     /// The slice.
@@ -77,12 +103,6 @@ impl Slice {
         }
 
         builder
-    }
-
-    /// A zeroed buffer to fill in place and freeze, without a copy.
-    #[must_use]
-    pub(crate) fn builder(len: usize) -> Builder {
-        Builder::zeroed(len)
     }
 
     #[doc(hidden)]

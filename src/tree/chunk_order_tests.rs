@@ -108,9 +108,11 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
     reads.reverse();
     let mut keep_room = 0;
     for mut read in reads {
-        let filled = read.file.read_at(&mut read.buf, read.offset)?;
-        assert_eq!(filled, read.buf.len(), "the whole block is read");
-        chunk.read(&tasks, read.tag, read.buf, &mut keep_room);
+        read.buf.read_from(read.file.as_ref(), read.offset)?;
+        let Some(frame) = read.buf.into_slice() else {
+            panic!("the whole block is read");
+        };
+        chunk.read(&tasks, read.tag, frame, &mut keep_room);
     }
     let mut results: Vec<Option<InternalValue>> = alloc::vec![None];
     chunk.finish(&tasks, &mut results, None)?;

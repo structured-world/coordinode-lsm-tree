@@ -727,6 +727,27 @@ impl ByteView {
         unsafe { core::slice::from_raw_parts_mut(data.cast(), len) }
     }
 
+    /// [`Self::unfilled_mut`], shared.
+    pub(crate) fn unfilled(&self) -> &[core::mem::MaybeUninit<u8>] {
+        let len = self.len();
+        let data = if self.is_inline() {
+            // SAFETY: the view is inline, so its short variant is active.
+            unsafe { (*self.trailer.short).data.as_ptr() }
+        } else {
+            // SAFETY: the view is not inline, so its heap variant is active.
+            unsafe { self.data_ptr() }
+        };
+        // SAFETY: `data` points at the view's `len` bytes, borrowed through
+        // `self`, and `MaybeUninit<u8>` has the layout of `u8`.
+        unsafe { core::slice::from_raw_parts(data.cast(), len) }
+    }
+
+    /// Whether the view's bytes live inside the view itself, and so move with
+    /// it.
+    pub(crate) fn holds_bytes_inline(&self) -> bool {
+        self.is_inline()
+    }
+
     fn get_heap_region(&self) -> &HeapAllocationHeader {
         debug_assert!(
             !self.is_inline(),

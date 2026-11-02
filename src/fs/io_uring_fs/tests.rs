@@ -8,6 +8,7 @@
 )]
 
 use super::*;
+use crate::fs::QueuedBuf;
 use std::io::{Read, Write};
 use std::sync::Arc;
 // Shadows #[test] to enable log capture in test output.
@@ -763,19 +764,19 @@ fn a_read_queue_hands_back_reads_of_several_submissions() -> io::Result<()> {
                 tag,
                 file: Arc::clone(&files[tag % 2]),
                 offset: (tag * 64) as u64,
-                buf: vec![0; 64],
+                buf: QueuedBuf::new(64),
             });
         }
         // Issues this round's reads and takes whatever has come back.
         queue.wait(0, &mut |done| {
             assert!(done.result.is_ok(), "read {} failed", done.tag);
-            got.push((done.tag, done.buf));
+            got.push((done.tag, done.buf.filled_bytes().to_vec()));
         });
     }
     while queue.outstanding() > 0 {
         queue.wait(1, &mut |done| {
             assert!(done.result.is_ok(), "read {} failed", done.tag);
-            got.push((done.tag, done.buf));
+            got.push((done.tag, done.buf.filled_bytes().to_vec()));
         });
     }
     got.sort_unstable_by_key(|(tag, _)| *tag);
@@ -810,7 +811,7 @@ fn a_wait_for_none_keeps_a_read_without_a_descriptor_for_take_kept() -> io::Resu
         tag: 3,
         file,
         offset: 0,
-        buf: vec![0; 16],
+        buf: QueuedBuf::new(16),
     });
     let mut done = Vec::new();
     queue.wait(0, &mut |read| done.push(read));
@@ -828,7 +829,7 @@ fn a_wait_for_none_keeps_a_read_without_a_descriptor_for_take_kept() -> io::Resu
     }
     queue.wait(1, &mut |read| done.push(read));
     assert_eq!(done.len(), 1);
-    assert_eq!(done[0].buf, vec![7; 16]);
+    assert_eq!(done[0].buf.filled_bytes(), [7; 16]);
     Ok(())
 }
 
@@ -864,7 +865,7 @@ fn a_read_queue_wakes_once_a_read_is_ready_to_hand_over() -> io::Result<()> {
             tag,
             file: Arc::clone(&files[tag % 2]),
             offset: (tag * 64) as u64,
-            buf: vec![0; 64],
+            buf: QueuedBuf::new(64),
         });
     }
     let mut handed = 0usize;
@@ -913,13 +914,13 @@ fn a_read_without_a_descriptor_waits_for_a_wait_for_one() -> io::Result<()> {
         tag: 1,
         file,
         offset: 7,
-        buf: vec![0; 5],
+        buf: QueuedBuf::new(5),
     });
     let mut got = Vec::new();
-    queue.wait(0, &mut |done| got.push(done.buf));
+    queue.wait(0, &mut |done| got.push(done.buf.filled_bytes().to_vec()));
     assert!(got.is_empty(), "a wait for none reads nothing");
     assert_eq!((queue.outstanding(), queue.held()), (1, 1));
-    queue.wait(1, &mut |done| got.push(done.buf));
+    queue.wait(1, &mut |done| got.push(done.buf.filled_bytes().to_vec()));
     assert_eq!(got, [b"world".to_vec()]);
     assert_eq!((queue.outstanding(), queue.held()), (0, 0));
     Ok(())
@@ -951,7 +952,7 @@ fn a_wait_for_none_does_not_wait_for_room_on_the_ring() -> io::Result<()> {
         tag: 0,
         file: Arc::clone(file),
         offset: 0,
-        buf: vec![0; len],
+        buf: QueuedBuf::new(len),
     };
 
     // The ring thread takes this read and waits on it.
@@ -1033,7 +1034,7 @@ fn a_wait_for_none_does_not_wait_for_the_submission_lock() -> io::Result<()> {
         tag: 0,
         file: Arc::clone(&files[0]),
         offset: 0,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
 
     let lock = fs
@@ -1083,7 +1084,7 @@ fn a_wake_asked_for_with_reads_in_flight_is_declined() -> io::Result<()> {
         tag: 0,
         file: Arc::clone(&files[0]),
         offset: 0,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
     queue.issue(true);
     assert!(!queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
@@ -1116,7 +1117,7 @@ fn a_reused_read_queue_keeps_no_slot_for_a_read_handed_back() -> io::Result<()> 
                 tag: round * 8 + i,
                 file: Arc::clone(&files[i % 2]),
                 offset: (i * 64) as u64,
-                buf: vec![0; 64],
+                buf: QueuedBuf::new(64),
             });
         }
         while queue.outstanding() > 0 {
@@ -1163,21 +1164,22 @@ fn a_read_queue_hands_back_reads_the_ring_cannot_take() -> io::Result<()> {
         tag: 0,
         file: Arc::clone(&files[0]),
         offset: 0,
-        buf: Vec::new(),
+        buf: QueuedBuf::new(0),
     });
-    // Zeroed and never touched, so it costs address space, not memory.
+    // Allocated unzeroed and never touched, so it costs address space, not
+    // memory.
     let too_long = usize::try_from(i32::MAX).expect("fits") + 1;
     queue.submit(QueuedRead {
         tag: 1,
         file: Arc::clone(&files[0]),
         offset: 0,
-        buf: vec![0; too_long],
+        buf: QueuedBuf::new(too_long),
     });
     queue.submit(QueuedRead {
         tag: 2,
         file: Arc::clone(&files[0]),
         offset: 64,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
     assert_eq!(
         drain_results(&mut *queue),
@@ -1217,13 +1219,13 @@ fn a_serial_read_reports_a_short_read_and_a_refused_one() -> io::Result<()> {
         tag: 0,
         file: short,
         offset: 7,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
     queue.submit(QueuedRead {
         tag: 1,
         file: refused,
         offset: 0,
-        buf: vec![0; 5],
+        buf: QueuedBuf::new(5),
     });
     assert_eq!(
         drain_results(&mut *queue),
@@ -1261,7 +1263,7 @@ fn a_read_queue_fails_its_reads_once_the_ring_thread_is_gone() -> io::Result<()>
             tag: 0,
             file: Arc::clone(&files[0]),
             offset: 0,
-            buf: vec![0; 64],
+            buf: QueuedBuf::new(64),
         });
         let mut got = Vec::new();
         queue.wait(min, &mut |done| {
@@ -1307,7 +1309,7 @@ fn a_poisoned_submission_lock_still_sends() -> io::Result<()> {
         tag: 0,
         file: Arc::clone(&files[0]),
         offset: 64,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
     let mut got = Vec::new();
     while queue.outstanding() > 0 {
@@ -1339,7 +1341,7 @@ fn a_read_queue_hands_back_completions_in_any_order() -> io::Result<()> {
             tag,
             file: Arc::clone(&files[0]),
             offset: 0,
-            buf: vec![0; 64],
+            buf: QueuedBuf::new(64),
         }));
     }
     queue.on_ring = 2;
@@ -1392,7 +1394,7 @@ fn dropping_a_read_queue_with_reads_in_flight_leaves_the_backend_usable() -> io:
                 tag,
                 file: Arc::clone(&files[tag % 2]),
                 offset: (tag * 64) as u64,
-                buf: vec![0; 64],
+                buf: QueuedBuf::new(64),
             });
         }
         // Puts every read on the ring without waiting for any.
@@ -1533,11 +1535,15 @@ fn a_fault_rule_fires_on_reads_through_the_wrapped_ring_queue() -> io::Result<()
                 tag,
                 file: Arc::clone(&file),
                 offset: (tag * 64) as u64,
-                buf: vec![0; 64],
+                buf: QueuedBuf::new(64),
             });
         }
         queue.wait(8, &mut |read| {
-            done.push((read.tag, read.buf, read.result.err().map(|e| e.kind())));
+            done.push((
+                read.tag,
+                read.buf.filled_bytes().to_vec(),
+                read.result.err().map(|e| e.kind()),
+            ));
         });
     }
     assert_eq!(
