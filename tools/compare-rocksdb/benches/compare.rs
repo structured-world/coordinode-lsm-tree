@@ -957,6 +957,7 @@ fn run_write_throughput(
         }
     };
     drop(dir);
+    settle();
     Ok(elapsed)
 }
 
@@ -1337,11 +1338,25 @@ impl SeedStates {
     }
 }
 
-/// A fresh directory holding a copy of the state at `seed`.
+/// A fresh directory holding a copy of the state at `seed`, on disk before it
+/// is returned (see [`settle`]).
 fn copy_of(seed: &Path) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     copy_dir(seed, dir.path()).expect("copy seed state");
+    settle();
     dir
+}
+
+/// Writes out every dirty page and pending metadata change of the host's file
+/// systems, outside any timed window. Copying a starting state and removing a
+/// finished one leave tens of megabytes for the kernel to write back later;
+/// left alone, that write-back lands in the next engine's timed syncs, and in
+/// the write groups it doubled one engine's time while halving another's.
+fn settle() {
+    let status = std::process::Command::new("sync")
+        .status()
+        .expect("run sync");
+    assert!(status.success(), "sync failed: {status}");
 }
 
 /// Writes the seed state for `key` into a new directory and closes the engine
@@ -1990,6 +2005,7 @@ fn overwrite_variant(
                                 let dir = tempfile::tempdir().expect("tempdir");
                                 let (rt, tree) = setup_surrealkv_warm(dir.path(), inputs)
                                     .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
+                                settle();
                                 let start = std::time::Instant::now();
                                 let mut txn = tree.begin().expect("surrealkv: begin");
                                 for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
@@ -2002,6 +2018,9 @@ fn overwrite_variant(
                                 total += start.elapsed();
                             }
                         }
+                        // The engine and its folder are gone: their removal
+                        // goes to disk before the next timed write.
+                        settle();
                     }
                     total
                 })
@@ -2033,6 +2052,8 @@ fn overwrite_variant(
                     tree.flush_active_memtable(0)
                         .expect("ours-deferred-wal: overwrite flush");
                     total += start.elapsed();
+                    drop((tree, wal, wal_dir, dir));
+                    settle();
                 }
                 total
             }));
@@ -2828,6 +2849,8 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
                         total += time_compaction(engine, level, shape, work.path()).unwrap_or_else(
                             |e| panic!("compaction failed for {}: {e}", engine.label()),
                         );
+                        drop(work);
+                        settle();
                     }
                     total
                 })
