@@ -1684,7 +1684,13 @@ fn read_cached(fd: i32, read: &mut QueuedRead) -> bool {
     if NOWAIT_REFUSED.load(Ordering::Relaxed) {
         return false;
     }
-    let Ok(offset) = libc::off_t::try_from(read.offset) else {
+    // Past what is already filled: a read handed back to wait its turn keeps
+    // what the page cache gave it before.
+    let Some(offset) = u64::try_from(read.buf.filled())
+        .ok()
+        .and_then(|filled| read.offset.checked_add(filled))
+        .and_then(|offset| libc::off_t::try_from(offset).ok())
+    else {
         return false;
     };
     // A file read past the page cache would wait for the device here: the

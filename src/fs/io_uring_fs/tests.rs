@@ -69,13 +69,17 @@ fn a_read_queue_reads_large_cached_reads_without_the_ring() -> io::Result<()> {
         assert!(done.result.is_ok(), "read {} failed", done.tag);
         got.push((done.tag, done.buf.filled_bytes().to_vec()));
     });
-    let mut first: Vec<usize> = got.iter().map(|(tag, _)| *tag).collect();
-    first.sort_unstable();
-    assert_eq!(
-        first,
-        [0, 1, 2, 3],
-        "a wait for none hands back every large cached read at once"
-    );
+    // A file system refusing reads that must not wait sends every read to
+    // the ring: what comes back is still checked, but not how.
+    let in_place = !NOWAIT_REFUSED.load(SeqCst);
+    // The small read, on the ring, may be back by then too.
+    let first: Vec<usize> = got.iter().map(|(tag, _)| *tag).collect();
+    if in_place {
+        assert!(
+            (0..4).all(|tag| first.contains(&tag)),
+            "a wait for none hands back every large cached read at once: {first:?}"
+        );
+    }
     while queue.outstanding() > 0 {
         queue.wait(1, &mut |done| {
             assert!(done.result.is_ok(), "read {} failed", done.tag);
@@ -89,10 +93,56 @@ fn a_read_queue_reads_large_cached_reads_without_the_ring() -> io::Result<()> {
             .collect();
         assert!(bytes == expected, "read {tag} holds its span of its file");
     }
-    assert_eq!(
-        wake.0.load(SeqCst),
-        1,
-        "only the small read went to the ring"
+    let wakes = wake.0.load(SeqCst);
+    if in_place {
+        assert_eq!(wakes, 1, "only the small read went to the ring");
+    } else {
+        assert_eq!(wakes, 5, "every read went to the ring");
+    }
+    Ok(())
+}
+
+/// A cached read taken up again with part of its buffer filled reads on from
+/// where that part ends, not from the read's start again: a read handed back
+/// to wait its turn keeps what the page cache already gave it.
+#[test]
+fn a_cached_read_resumed_reads_past_its_filled_part() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("grow.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    let bytes: Vec<u8> = (0..128usize)
+        .map(|i| u8::try_from(i).expect("below 128"))
+        .collect();
+    file.write_all(&bytes[..100])?;
+    let file: Arc<dyn FsFile> = Arc::from(file);
+    let Some(fd) = file.backing_fd() else {
+        panic!("an io_uring file has a descriptor");
+    };
+    let mut read = QueuedRead {
+        tag: 0,
+        file: Arc::clone(&file),
+        offset: 64,
+        buf: QueuedBuf::new(64),
+    };
+    // The file ends 36 bytes into the read: those are taken, the rest waits.
+    assert!(!read_cached(fd, &mut read), "the read is not over yet");
+    if read.buf.filled() == 0 {
+        // This file system refuses reads that must not wait.
+        return Ok(());
+    }
+    assert_eq!(read.buf.filled(), 36);
+    let mut appended = fs.open(&path, &FsOpenOptions::new().append(true))?;
+    appended.write_all(&bytes[100..])?;
+
+    assert!(read_cached(fd, &mut read), "the rest is in the cache now");
+    assert!(read.buf.is_full());
+    assert!(
+        read.buf.filled_bytes() == &bytes[64..128],
+        "the second part continues where the first ended"
     );
     Ok(())
 }
