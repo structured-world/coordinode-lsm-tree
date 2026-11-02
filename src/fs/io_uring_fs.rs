@@ -1451,6 +1451,8 @@ struct UringReadQueue<'r> {
     /// on the calling thread, so only by a wait for at least one read, never
     /// by a look at what is ready.
     serial: Vec<QueuedRead>,
+    /// The smallest read whose cached bytes are read on the calling thread.
+    cached_min: usize,
 }
 
 impl<'r> UringReadQueue<'r> {
@@ -1466,7 +1468,17 @@ impl<'r> UringReadQueue<'r> {
             on_ring: 0,
             finished: Vec::new(),
             serial: Vec::new(),
+            cached_min: CACHED_MIN,
         }
+    }
+
+    /// A queue that reads the cached bytes of reads from `cached_min` up on
+    /// the calling thread; `usize::MAX` sends every read to the ring.
+    #[cfg(test)]
+    fn with_cached_min(ring: &'r RingThread, cached_min: usize) -> Self {
+        let mut queue = Self::new(ring);
+        queue.cached_min = cached_min;
+        queue
     }
 
     /// Reads the reads held for a serial read, each into its own buffer.
@@ -1515,7 +1527,19 @@ impl<'r> UringReadQueue<'r> {
                 }
                 continue;
             };
-            let Ok(len) = i32::try_from(read.buf.capacity()) else {
+            // What the page cache holds is copied here, on the reader's core,
+            // so its bytes are checked while still in that core's cache and no
+            // thread is woken for it; what it lacks goes to the ring.
+            if read.buf.capacity() >= self.cached_min && read_cached(fd, &mut read) {
+                let result = if read.buf.is_full() {
+                    Ok(())
+                } else {
+                    Err(short_read())
+                };
+                self.finished.push(done(read, result));
+                continue;
+            }
+            let Ok(len) = i32::try_from(read.buf.capacity() - read.buf.filled()) else {
                 self.finished.push(done(
                     read,
                     Err(crate::io::Error::from(io::Error::new(
@@ -1536,7 +1560,8 @@ impl<'r> UringReadQueue<'r> {
                 fd,
                 buf: UnsafeSendMutPtr(dst),
                 len: len.unsigned_abs(),
-                offset: read.offset,
+                // Past what the page cache already gave.
+                offset: read.offset + read.buf.filled() as u64,
             });
             self.sent.push_back(Some(read));
             places.push(place);
@@ -1619,7 +1644,7 @@ impl<'r> UringReadQueue<'r> {
     fn complete(&mut self, position: usize, result: i32) -> Option<ReadDone> {
         let mut read = self.take_sent(position)?;
         self.on_ring -= 1;
-        let want = read.buf.capacity();
+        let want = read.buf.capacity() - read.buf.filled();
         let result = match usize::try_from(result) {
             Ok(n) if n == want => {
                 // SAFETY: the completion reports the kernel wrote all `want`
@@ -1638,6 +1663,66 @@ impl<'r> UringReadQueue<'r> {
         };
         Some(done(read, result))
     }
+}
+
+/// Whether the kernel refuses a read that must not wait (`RWF_NOWAIT`) on
+/// this system; once it does, every read goes to the ring.
+static NOWAIT_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The smallest read a queue copies from the page cache on the calling
+/// thread. Below it the syscall costs more than the copy, and the ring takes
+/// a batch of such reads in one submission: copying every read in place made
+/// a blob tree's multi-get of small values 1.7x dearer, a floor of 64 KiB
+/// left part of that, 256 KiB none.
+const CACHED_MIN: usize = 256 << 10;
+
+/// Copies into `read` what the page cache holds of it, without waiting for
+/// the device: `true` when the read is over, filled or at the end of the
+/// file, `false` when the rest is for the ring.
+fn read_cached(fd: i32, read: &mut QueuedRead) -> bool {
+    use core::sync::atomic::Ordering;
+    if NOWAIT_REFUSED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Ok(offset) = libc::off_t::try_from(read.offset) else {
+        return false;
+    };
+    // A file read past the page cache would wait for the device here: the
+    // ring overlaps those.
+    // SAFETY: F_GETFL only reads the descriptor's flags.
+    #[expect(unsafe_code, reason = "see safety")]
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_DIRECT != 0 {
+        return false;
+    }
+    // SAFETY: the kernel only writes the span, and only the bytes it reports
+    // are counted filled below.
+    #[expect(unsafe_code, reason = "see safety")]
+    let (dst, len) = unsafe { read.buf.unfilled_ptr() };
+    let iov = libc::iovec {
+        iov_base: dst.cast(),
+        iov_len: len,
+    };
+    // SAFETY: `iov` names `len` writable bytes of the buffer, alive for the
+    // call.
+    #[expect(unsafe_code, reason = "see safety")]
+    let n = unsafe { libc::preadv2(fd, &raw const iov, 1, offset, libc::RWF_NOWAIT) };
+    let Ok(n) = usize::try_from(n) else {
+        let errno = io::Error::last_os_error().raw_os_error();
+        if matches!(errno, Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS)) {
+            NOWAIT_REFUSED.store(true, Ordering::Relaxed);
+        }
+        // Not cached (EAGAIN), or a failure the ring reports as it would.
+        return false;
+    };
+    // SAFETY: the kernel wrote the `n` bytes it reports.
+    #[expect(unsafe_code, reason = "see safety")]
+    unsafe {
+        read.buf.assume_written(n);
+    }
+    // Nothing read is the end of the file; the rest of a part read may only
+    // be out of the cache.
+    read.buf.is_full() || n == 0
 }
 
 /// `read` handed back with `result`.
