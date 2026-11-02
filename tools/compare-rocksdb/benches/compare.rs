@@ -1106,6 +1106,7 @@ fn point_read_variant(
         // repeat point read skips the index walk + data-block decode entirely.
         series.push(("ours-row-cache", Engine::Ours, IndexStrategy::Binary, true));
     }
+    series.retain(|&(label, ..)| run.wants_engine(label));
 
     for &n in spec.sizes {
         let inputs = WorkloadInputs::of(n, spec.values);
@@ -1529,10 +1530,9 @@ fn multi_get_variant(
         return;
     }
     // Only engines with a real batch-get API overlay here (SurrealKV has none).
-    let engines: Vec<Engine> = spec
-        .engines
-        .iter()
-        .copied()
+    let engines: Vec<Engine> = run
+        .engines_of(spec.engines)
+        .into_iter()
         .filter(|engine| !matches!(engine, Engine::SurrealKv))
         .collect();
 
@@ -1690,10 +1690,10 @@ fn warm_read_group(
     }
     for &n in spec.sizes {
         let inputs = WorkloadInputs::of(n, spec.values);
-        let warm: Vec<(Engine, WarmEngine)> = spec
-            .engines
-            .iter()
-            .map(|&engine| {
+        let warm: Vec<(Engine, WarmEngine)> = run
+            .engines_of(spec.engines)
+            .into_iter()
+            .map(|engine| {
                 let warm = WarmEngine::build(
                     engine,
                     compression,
@@ -1914,10 +1914,10 @@ fn overwrite_variant(
         let inputs = WorkloadInputs::of(n, spec.values);
         // Every seed written before the rounds; SurrealKV is not seeded (see
         // `SeedStates`) and writes its first copy per iteration instead.
-        let seeded: Vec<(Engine, Option<PathBuf>)> = spec
-            .engines
-            .iter()
-            .map(|&engine| {
+        let seeded: Vec<(Engine, Option<PathBuf>)> = run
+            .engines_of(spec.engines)
+            .into_iter()
+            .map(|engine| {
                 let seed = (engine != Engine::SurrealKv).then(|| {
                     seeds
                         .seed(engine, compression, IndexStrategy::Binary, &inputs)
@@ -2957,6 +2957,9 @@ struct Run {
     /// and no summary is written, so a test run neither takes the minutes a
     /// measurement does nor replaces the last measurement's summary.
     measuring: bool,
+    /// Only arms with these labels run, from `COMPARE_ENGINES` (comma
+    /// separated): one engine's profile or system calls without the others'.
+    engines: Option<Vec<String>>,
     results: Vec<paired::ArmResult>,
 }
 
@@ -3033,10 +3036,14 @@ impl Run {
             "rounds: need 1 <= --min-rounds <= --max-rounds\n{}",
             Self::USAGE
         );
+        let engines = std::env::var("COMPARE_ENGINES")
+            .ok()
+            .map(|list| list.split(',').map(|e| e.trim().to_owned()).collect());
         Self {
             settings,
             filter,
             measuring,
+            engines,
             results: Vec::new(),
         }
     }
@@ -3045,7 +3052,28 @@ impl Run {
         self.filter.as_deref().is_none_or(|f| group.contains(f))
     }
 
-    fn measure(&mut self, group: &str, n: u64, arms: Vec<paired::Arm<'_>>) {
+    /// Whether the arm labelled `label` runs.
+    fn wants_engine(&self, label: &str) -> bool {
+        self.engines
+            .as_ref()
+            .is_none_or(|engines| engines.iter().any(|e| e == label))
+    }
+
+    /// The engines of `engines` that run, so a filtered run does not set up
+    /// the states of the arms it leaves out.
+    fn engines_of(&self, engines: &[Engine]) -> Vec<Engine> {
+        engines
+            .iter()
+            .copied()
+            .filter(|engine| self.wants_engine(engine.label()))
+            .collect()
+    }
+
+    fn measure(&mut self, group: &str, n: u64, mut arms: Vec<paired::Arm<'_>>) {
+        arms.retain(|arm| self.wants_engine(arm.label));
+        if arms.is_empty() {
+            return;
+        }
         let results = paired::run(group, n, BASELINE.label(), arms, &self.settings);
         self.results.extend(results);
     }
