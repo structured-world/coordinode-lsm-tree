@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793695265191,
+  "lastUpdate": 1793702840451,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66892,6 +66892,90 @@ window.BENCHMARK_DATA = {
             "value": 343727.1644321236,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 17.2us | P99.9: 89.6us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "27f3eec8aecb6be1028cd6fbaaefdbb46f37839d",
+          "message": "build: link x86_64 Linux through mold (#1048)\n\n## Summary\n- x86_64 Linux links through mold where it is installed: a full test\nbuild on a Linux runner writes 3.1 GB instead of 22.4 GB with rust-lld,\nin 10:41 instead of 12:06.\n- Where mold is absent (a cross container, a machine without it) the\nbuild links as before, with rustc's lld. macOS and Windows are\nunchanged.\n\n## Changes\n- `.cargo/config.toml` + `.cargo/cc-mold.sh`: the\n`x86_64-unknown-linux-gnu` linker driver, `cc -fuse-ld=mold` when mold\nis on PATH, plain `cc` otherwise.\n- `.github/actions/setup-mold`: installs mold with apt on Linux runners,\na no-op elsewhere; referenced as `$/.github/actions/setup-mold` by the\nLinux build jobs of the CI workflow and by the release publish job.\n- The heal fuzzer job builds only the library's tests (`--lib`): the\nfuzzer is a unit test, and building every integration test binary in\ndebug filled the hosted runner's disk.\n\n## Testing\nOn a Linux runner: the crate's test binaries carry mold in `.comment`, a\nbuild with mold off PATH links with lld, and `tools/compare-rocksdb`\nwith RocksDB's C++ links through mold; the full suite passed on\nmold-linked binaries (5579/5579).\n\nCloses #1045",
+          "timestamp": "2026-11-03T10:28:55Z",
+          "tree_id": "2fa730b3451ce64503c16ff7a07ca7711ef0e461",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/27f3eec8aecb6be1028cd6fbaaefdbb46f37839d"
+        },
+        "date": 1793702839271,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 134946.05598980642,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 17.2us | P99.9: 28.8us\nthreads: 1 | elapsed: 3.97s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2801515.328435089,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 718524.5575311404,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.9us | P99.9: 12.7us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 430564.278728042,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 7.4us | P99.9: 28.5us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3198911.1418298995,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 317645.0684034758,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.5us | P99.9: 16.9us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 189448.6670952551,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.0us | P99.9: 27.7us\nthreads: 1 | elapsed: 1.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 784621.0630990847,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.5us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 972110.1547982864,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 348355.7172957217,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 13.8us | P99.9: 82.9us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
           }
         ]
       }
