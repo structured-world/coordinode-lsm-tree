@@ -52,7 +52,13 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-#[global_allocator]
+// A program links one global allocator, and the crate's `mimalloc` feature
+// installs its own: built with it, this one counts nothing.
+#[cfg_attr(not(feature = "mimalloc"), global_allocator)]
+#[cfg_attr(
+    feature = "mimalloc",
+    expect(dead_code, reason = "not the global allocator")
+)]
 static ALLOCATOR: Counting = Counting;
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -196,6 +202,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    #[cfg(feature = "mimalloc")]
+    eprintln!(
+        "multi_get_metadata_budget: built with the mimalloc feature, allocation counts read zero"
+    );
     if let Err(error) = run() {
         eprintln!("multi_get_metadata_budget failed: {error}");
         std::process::exit(1);

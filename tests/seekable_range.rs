@@ -74,7 +74,14 @@ fn bump_if_measuring() {
     });
 }
 
-#[global_allocator]
+// The crate's `mimalloc` feature installs its own global allocator, and a
+// program links one: built with it, this one counts nothing and the
+// allocation test below is left out (CI runs it without the feature).
+#[cfg_attr(not(feature = "mimalloc"), global_allocator)]
+#[cfg_attr(
+    feature = "mimalloc",
+    expect(dead_code, reason = "not the global allocator")
+)]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// An explicit `(start, end)` bound pair used to build excluded-bound ranges.
@@ -533,6 +540,7 @@ fn seekable_sealed_memtable_and_excluded_bounds() -> lsm_tree::Result<()> {
 
 /// Count heap allocations made by a tight `seek_to` loop over `targets`, after a
 /// one-time warm-up that builds the merge stack (the allocation #504 exempts).
+#[cfg(not(feature = "mimalloc"))]
 fn seek_loop_alloc_count(tree: &lsm_tree::AnyTree, targets: &[Vec<u8>]) -> usize {
     let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
     // Warm up: first seek + pull builds the merge stack once.
@@ -558,6 +566,7 @@ fn seek_loop_alloc_count(tree: &lsm_tree::AnyTree, targets: &[Vec<u8>]) -> usize
 
 /// A single-SST tree (one disk run) plus a non-empty active memtable: the
 /// narrowest non-trivial merge stack (two leaf sources).
+#[cfg(not(feature = "mimalloc"))]
 fn build_narrow_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir)> {
     let folder = get_tmp_folder();
     let tree = Config::new(
@@ -583,6 +592,7 @@ fn build_narrow_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir
 /// disk run, plus the active memtable. Many more leaf sources than
 /// [`build_narrow_tree`], so a per-source merge-stack rebuild would allocate
 /// visibly more per seek here.
+#[cfg(not(feature = "mimalloc"))]
 fn build_wide_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir)> {
     let folder = get_tmp_folder();
     let tree = Config::new(
@@ -622,6 +632,7 @@ fn build_wide_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir)>
 /// The shared input-key cost cancels; any residual difference is per-source
 /// rebuild traffic, which must be zero.
 #[test]
+#[cfg(not(feature = "mimalloc"))]
 fn tight_seek_loop_allocation_is_width_invariant() -> lsm_tree::Result<()> {
     // Disjoint targets spread across the key span, so each reposition genuinely
     // moves every leaf cursor rather than no-op'ing on an unchanged bound.

@@ -128,6 +128,13 @@ bytes_1 = ["dep:bytes"]
 # The `crc32c` crate needs `std`, so the feature brings it.
 crc32c = ["dep:crc32c", "std"]
 metrics = []
+# Installs mimalloc as the global allocator of the binary this crate is built
+# into. Off by default: it keeps freed memory for reuse, which spares a process
+# holding large values the system allocator's return of the heap to the kernel
+# and its refaulting (16 values of 4 MiB read 5x faster), at about a third more
+# peak RSS. A binary that sets its own `#[global_allocator]` leaves it off; two
+# do not link.
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys", "std"]
 # Process-wide counts of key copies and reference count operations, for benches
 # to price a change. Not `metrics`: these sit on every key clone and drop, so no
 # deployment should pay for them. No stability promise.
@@ -280,6 +287,10 @@ reed-solomon-simd = { version = "3", optional = true, default-features = false }
 # rayon is just the default executor, not a hard dependency. Optional + gated so
 # minimal / no-std builds drop it.
 rayon = { version = "1.10", optional = true }
+# The global allocator the `mimalloc` feature installs; the `-sys` crate is
+# named so a test can ask mimalloc whether memory is its own.
+mimalloc = { version = "0.1", optional = true }
+libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 
 [target.'cfg(any(target_arch = "x86_64", target_arch = "x86"))'.dependencies]
 # `cpufeatures` is a `#![no_std]` runtime CPU-feature detector (cached CPUID

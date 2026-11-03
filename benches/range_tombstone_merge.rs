@@ -51,7 +51,13 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-#[global_allocator]
+// A program links one global allocator, and the crate's `mimalloc` feature
+// installs its own: built with it, this one counts nothing.
+#[cfg_attr(not(feature = "mimalloc"), global_allocator)]
+#[cfg_attr(
+    feature = "mimalloc",
+    expect(dead_code, reason = "not the global allocator")
+)]
 static ALLOCATOR: Counting = Counting;
 
 const KEYS: u32 = 20_000;
@@ -154,6 +160,10 @@ fn timed(
 }
 
 fn main() -> lsm_tree::Result<()> {
+    #[cfg(feature = "mimalloc")]
+    eprintln!(
+        "range_tombstone_merge: built with the mimalloc feature, allocation counts read zero"
+    );
     let passes = std::env::var("RT_MERGE_SAMPLES")
         .ok()
         .and_then(|value| value.parse().ok())

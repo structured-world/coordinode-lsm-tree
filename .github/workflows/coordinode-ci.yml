@@ -397,6 +397,11 @@ jobs:
           PROPTEST_CASES: "32"
           PROPTEST_MAX_SHRINK: "100"
         run: cargo nextest run --profile ci --all-features
+      # A program links one global allocator: under --all-features the
+      # `mimalloc` feature's takes the place of the counting one an allocation
+      # test installs, so that test runs here, without it.
+      - name: Run the allocation-counting tests without mimalloc
+        run: cargo nextest run --profile ci --test seekable_range
       - name: Run doc tests
         run: cargo test --doc --features lz4
       - name: Run the raw io_uring backend as a 32-bit x86 binary
