@@ -1974,11 +1974,16 @@ fn overwrite_variant(
             .collect();
         // The deferred-log arm answers SurrealKV's one-sync commit on the
         // groups SurrealKV's charts share; the blob groups compare blob paths.
-        let ours_seed = seeded
-            .iter()
-            .find_map(|(engine, seed)| (*engine == Engine::Ours).then(|| seed.clone()))
-            .flatten()
-            .filter(|_| spec.values == Values::Pool);
+        // It starts from our engine's seed whether or not the plain `ours` arm
+        // runs too, so `COMPARE_ENGINES=ours-deferred-wal` runs it alone.
+        let ours_seed = (spec.values == Values::Pool
+            && spec.engines.contains(&Engine::Ours)
+            && run.wants_engine("ours-deferred-wal"))
+        .then(|| {
+            seeds
+                .seed(Engine::Ours, compression, IndexStrategy::Binary, &inputs)
+                .to_path_buf()
+        });
         let mut arms: Vec<_> = seeded
             .into_iter()
             .map(|(engine, seed)| {
