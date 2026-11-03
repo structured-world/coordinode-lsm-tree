@@ -293,7 +293,7 @@ impl<'a, K: AsRef<[u8]>> LevelResolve<'a, K> {
     /// Takes back a finished block read.
     pub(super) fn read_done(&mut self, done: crate::fs::ReadDone) {
         match &mut self.phase {
-            Phase::Stages(stages) => stages.complete(done.tag, done.result, &done.buf),
+            Phase::Stages(stages) => stages.complete(done.tag, done.result, done.buf),
             Phase::Chunks(chunks) => chunks.read_done(done),
             _ => debug_assert!(
                 false,
@@ -502,13 +502,17 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             return;
         };
         current.reads -= 1;
-        match done.result {
-            Ok(()) => current.read.read(
+        match done.result.map(|()| done.buf.into_slice()) {
+            Ok(Some(frame)) => current.read.read(
                 &self.tasks[self.start..current.end],
                 done.tag,
-                done.buf,
+                frame,
                 &mut self.keep_room,
             ),
+            Ok(None) => {
+                log::debug!("a batched level read came back short, the level is read serially");
+                current.failed = true;
+            }
             Err(error) => {
                 log::debug!("a batched level read failed, the level is read serially: {error}");
                 current.failed = true;

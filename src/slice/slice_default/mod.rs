@@ -23,6 +23,22 @@ impl UnfilledSlice {
         crate::fs::ReadBuf::uninit(self.0.unfilled_mut())
     }
 
+    /// The whole allocation, as memory that may be uninitialized.
+    pub(crate) fn uninit_mut(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
+        self.0.unfilled_mut()
+    }
+
+    /// [`Self::uninit_mut`], shared.
+    pub(crate) fn uninit(&self) -> &[core::mem::MaybeUninit<u8>] {
+        self.0.unfilled()
+    }
+
+    /// Whether the bytes move when this value does: a short slice is held
+    /// inline, so a read in flight into it must not see it moved.
+    pub(crate) fn bytes_move_with_it(&self) -> bool {
+        self.0.holds_bytes_inline()
+    }
+
     /// The slice.
     ///
     /// # Safety
@@ -66,12 +82,6 @@ impl Slice {
         // SAFETY: callers opt into the uninitialized builder contract via this
         // unsafe API and must fully initialize the returned buffer before any read.
         unsafe { ByteView::builder_unzeroed(len) }
-    }
-
-    /// A zeroed buffer to fill in place and freeze, without a copy.
-    #[must_use]
-    pub(crate) fn builder(len: usize) -> Builder {
-        ByteView::builder(len)
     }
 
     pub(crate) fn slice(&self, range: impl core::ops::RangeBounds<usize>) -> Self {

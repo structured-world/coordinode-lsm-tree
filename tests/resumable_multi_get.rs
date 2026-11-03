@@ -22,16 +22,7 @@ fn drive(mut step: Step) -> lsm_tree::Result<Vec<Option<UserValue>>> {
             read.complete_job(outcome);
         }
         for mut block in read.take_reads() {
-            let result = block
-                .file
-                .read_at(&mut block.buf, block.offset)
-                .and_then(|n| {
-                    if n == block.buf.len() {
-                        Ok(())
-                    } else {
-                        Err(io::ErrorKind::UnexpectedEof.into())
-                    }
-                });
+            let result = block.buf.read_from(block.file.as_ref(), block.offset);
             read.complete_read(block.tag, result, block.buf);
         }
         step = read.resume();
@@ -177,7 +168,7 @@ fn a_resumable_merge_reads_its_separated_base_in_a_job() -> lsm_tree::Result<()>
         }
         for mut block in read.take_reads() {
             injector.clear();
-            let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+            let result = block.buf.read_from(block.file.as_ref(), block.offset);
             forbid();
             read.complete_read(block.tag, result, block.buf);
         }
@@ -236,7 +227,7 @@ fn a_suspended_read_answers_at_its_snapshot_across_a_compaction() -> lsm_tree::R
         read.complete_job(outcome);
     }
     for mut block in reads {
-        let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+        let result = block.buf.read_from(block.file.as_ref(), block.offset);
         read.complete_read(block.tag, result, block.buf);
     }
     assert_eq!(drive(read.resume())?, before);
@@ -340,7 +331,7 @@ fn a_suspended_blob_read_answers_at_its_snapshot_across_blob_gc() -> lsm_tree::R
         read.complete_job(outcome);
     }
     for mut block in reads {
-        let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+        let result = block.buf.read_from(block.file.as_ref(), block.offset);
         read.complete_read(block.tag, result, block.buf);
     }
     assert_eq!(drive(read.resume())?, before);

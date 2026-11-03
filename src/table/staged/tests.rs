@@ -52,7 +52,8 @@ fn a_read_holds_its_blocks_at_their_decoded_size() {
                 .get(start..)
                 .and_then(|rest| rest.get(..handle.size() as usize))
                 .expect("the block lies in the table file");
-            read.supply(handle, bytes).expect("supply");
+            read.supply(handle, crate::Slice::from(bytes))
+                .expect("supply");
             read_as += u64::from(handle.size());
         }
         read_as
@@ -150,7 +151,7 @@ fn a_stage_takes_blocks_cached_while_it_waited() {
             .and_then(|rest| rest.get(..handle.size() as usize))
             .expect("the block lies in the table file");
         let block = table
-            .decode_block_from_bytes(bytes, *handle.offset(), block_type)
+            .decode_block_from_frame(crate::Slice::from(bytes), *handle.offset(), block_type)
             .expect("decode");
         table
             .cache
@@ -265,7 +266,8 @@ fn drive(table: &Table, keys: &[(&[u8], u64)]) -> Option<Driven> {
                 .get(start..)
                 .and_then(|rest| rest.get(..handle.size() as usize))
                 .expect("the block lies in the table file");
-            read.supply(handle, bytes).expect("supply");
+            read.supply(handle, crate::Slice::from(bytes))
+                .expect("supply");
         }
         if read.is_done() {
             break;

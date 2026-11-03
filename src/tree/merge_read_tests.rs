@@ -96,8 +96,8 @@ fn a_merge_block_of_a_size_no_block_can_have_is_refused_before_its_buffer() -> c
             read.job_done(done, &mut work);
         }
         for mut block in core::mem::take(&mut work.reads) {
-            largest = largest.max(block.buf.len());
-            let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+            largest = largest.max(block.buf.capacity());
+            let result = block.buf.read_from(block.file.as_ref(), block.offset);
             read.read_done(crate::fs::ReadDone {
                 tag: block.tag,
                 buf: block.buf,

@@ -23,7 +23,7 @@ use super::{Block, BlockHandle, BlockType, FilterSource, IndexBlock, KeyedBlockH
 use crate::SeqNo;
 
 /// How a table enters a staged read of a key batch.
-pub enum StagedStart<'t> {
+pub(crate) enum StagedStart<'t> {
     /// The table holds nothing any key of the batch can read: the batch is
     /// empty, or the table lies above the snapshot.
     Nothing,
@@ -48,7 +48,7 @@ enum Stage {
 }
 
 /// A staged read of one table for a key batch; see the module docs.
-pub struct StagedRead<'t> {
+pub(crate) struct StagedRead<'t> {
     table: &'t Table,
     /// The snapshot in the table's local seqno space.
     table_seqno: SeqNo,
@@ -155,19 +155,19 @@ impl<'t> StagedRead<'t> {
             .sum()
     }
 
-    /// Holds `bytes`, the on-disk bytes of the needed block at `handle`, and
+    /// Holds `frame`, the on-disk bytes of the needed block at `handle`, and
     /// puts the decoded block in the cache.
     ///
     /// # Errors
     ///
     /// Propagates a decode or corruption error; the read is then to be done
     /// serially.
-    pub(crate) fn supply(&mut self, handle: BlockHandle, bytes: &[u8]) -> crate::Result<()> {
+    pub(crate) fn supply(&mut self, handle: BlockHandle, frame: crate::Slice) -> crate::Result<()> {
         let (block_type, _) = self.need();
         let offset = *handle.offset();
         let block = self
             .table
-            .decode_block_from_bytes(bytes, offset, block_type)?;
+            .decode_block_from_frame(frame, offset, block_type)?;
         self.table
             .cache
             .insert_block(self.table.global_id(), handle.offset(), block.clone());

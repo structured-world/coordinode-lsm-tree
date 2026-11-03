@@ -4983,7 +4983,11 @@ fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -
     let decoded_before = metrics.bytes_decoded();
     assert!(
         table
-            .decode_block_from_bytes(&tampered, table.regions.tli.offset().0, BlockType::Index)
+            .decode_block_from_frame(
+                crate::Slice::from(&tampered),
+                table.regions.tli.offset().0,
+                BlockType::Index
+            )
             .is_err(),
         "the staged read refuses the block too",
     );
@@ -4996,7 +5000,12 @@ fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -
     let decoded_before = metrics.bytes_decoded();
     assert!(
         table
-            .decode_data_block_keeping(&tampered, &table.regions.tli, &mut 0, None)
+            .decode_data_block_keeping(
+                crate::Slice::from(&tampered),
+                &table.regions.tli,
+                &mut 0,
+                None
+            )
             .is_err(),
         "the chunked resolver refuses the block too",
     );
@@ -5223,8 +5232,11 @@ fn a_staged_block_rejected_for_its_role_counts_what_its_transform_decoded() -> c
     let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
 
     let decoded_before = metrics.bytes_decoded();
-    let result =
-        table.decode_block_from_bytes(&frame, table.regions.tli.offset().0, BlockType::Filter);
+    let result = table.decode_block_from_frame(
+        crate::Slice::from(&frame),
+        table.regions.tli.offset().0,
+        BlockType::Filter,
+    );
     assert!(
         matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
         "the index block must be refused as a filter block",
@@ -5248,7 +5260,12 @@ fn a_chunk_decoded_block_rejected_for_its_role_counts_what_its_transform_decoded
     let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
 
     let decoded_before = metrics.bytes_decoded();
-    let result = table.decode_data_block_keeping(&frame, &table.regions.tli, &mut 0, None);
+    let result = table.decode_data_block_keeping(
+        crate::Slice::from(&frame),
+        &table.regions.tli,
+        &mut 0,
+        None,
+    );
     assert!(
         matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
         "the index block must be refused as a data block",

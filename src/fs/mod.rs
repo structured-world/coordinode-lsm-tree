@@ -43,6 +43,7 @@ mod open_flags;
 // `crate::io` `Fs` trait): it stays unconditional so a `no_std` consumer has a
 // working `Fs` implementation to use and to copy for a real backend.
 mod mem_fs;
+mod queued_buf;
 mod read_buf;
 // Programmable fault-injection backend for crash / error-path testing.
 // std-gated test/dev surface: it wraps an inner Fs and implements the std
@@ -84,6 +85,7 @@ pub(crate) use fault_fs::ReadHook;
 #[cfg(feature = "std")]
 pub use fault_fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule, SyncKind};
 pub use mem_fs::MemFs;
+pub use queued_buf::QueuedBuf;
 pub use read_buf::{ReadBuf, ReadResult};
 #[cfg(feature = "std")]
 pub use std_fs::StdFs;
@@ -138,6 +140,7 @@ use crate::io::{self, Read, Seek, Write};
 use crate::path::{Path, PathBuf};
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, vec::Vec};
+use core::mem::MaybeUninit;
 
 /// Options for opening a file through the [`Fs`] trait.
 ///
@@ -832,16 +835,29 @@ pub struct BlockRead<'a> {
 /// [`advance`](Self::advance). The caller checks [`is_full`](Self::is_full) and
 /// refuses a short request.
 ///
-/// The memory is INITIALIZED, and this type is entirely safe. Handing out
-/// uninitialized bytes would save the caller a memset per block, but they would
-/// have to reach [`FsFile::read_at`], which takes a `&mut [u8]` and is itself
-/// safe and publicly implementable: forming that reference over uninitialized
-/// memory is undefined behaviour on its own, and an otherwise valid
-/// implementation is entitled to read its input buffer before writing to it.
-/// Nothing on this side can close that, so the memset is paid, and what this
-/// type buys is the counting.
+/// The memory may start uninitialized: a [`QueuedBuf`] hands its allocation
+/// out unzeroed, and the block is read straight into the slice it becomes.
+/// Safe code only ever sees initialized bytes: [`unfilled_mut`](Self::unfilled_mut)
+/// zeroes what was never written the first time it is asked for, because
+/// [`FsFile::read_at`] takes a `&mut [u8]` and a safe implementation of it is
+/// entitled to read that slice. A backend whose read only writes (a `pread`,
+/// a kernel ring read) skips the zeroing through
+/// [`unfilled_uninit_mut`](Self::unfilled_uninit_mut) and says what it wrote
+/// with [`assume_written`](Self::assume_written).
 pub struct BlockBuf<'a> {
-    buf: &'a mut [u8],
+    buf: &'a mut [MaybeUninit<u8>],
+    /// The bytes from the start known to be initialized, never fewer than
+    /// `filled`.
+    init: usize,
+    filled: usize,
+}
+
+/// Where a [`BlockBuf`] over a [`QueuedBuf`]'s allocation ended: which
+/// memory it was over, and how far it was initialized and filled.
+pub(crate) struct BlockProgress {
+    at: *const MaybeUninit<u8>,
+    len: usize,
+    init: usize,
     filled: usize,
 }
 
@@ -849,7 +865,29 @@ impl<'a> BlockBuf<'a> {
     /// Wraps a buffer as an empty destination.
     #[must_use]
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, filled: 0 }
+        let init = buf.len();
+        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and nothing here
+        // ever writes an uninitialized byte, so the bytes stay initialized
+        // for the caller who lent them.
+        #[expect(unsafe_code, reason = "see safety")]
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<MaybeUninit<u8>>(), buf.len())
+        };
+        Self {
+            buf,
+            init,
+            filled: 0,
+        }
+    }
+
+    /// A destination over memory of which the first `init` bytes are
+    /// initialized and the first `filled` of those filled.
+    pub(crate) fn resume(buf: &'a mut [MaybeUninit<u8>], init: usize, filled: usize) -> Self {
+        debug_assert!(
+            filled <= init && init <= buf.len(),
+            "progress past the buffer"
+        );
+        Self { buf, init, filled }
     }
 
     /// How many bytes the request wants.
@@ -873,11 +911,13 @@ impl<'a> BlockBuf<'a> {
     /// The bytes written so far: the whole block once [`is_full`](Self::is_full).
     #[must_use]
     pub fn filled_bytes(&self) -> &[u8] {
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "filled <= buf.len() is the type's invariant"
-        )]
-        &self.buf[..self.filled]
+        // SAFETY: the first `filled` bytes are initialized (`filled <= init`
+        // is the type's invariant), and `MaybeUninit<u8>` has the layout of
+        // `u8`.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            core::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.filled)
+        }
     }
 
     /// Copies `bytes` into the unfilled part and counts them.
@@ -893,13 +933,14 @@ impl<'a> BlockBuf<'a> {
             .skip(self.filled)
             .zip(bytes.iter().take(n))
         {
-            *slot = *byte;
+            slot.write(*byte);
         }
         self.filled += n;
+        self.init = self.init.max(self.filled);
         n
     }
 
-    /// The part still to be filled.
+    /// The part still to be filled, initialized.
     ///
     /// For an implementation that reads into the destination rather than
     /// through a buffer of its own: read into this, then say how much arrived
@@ -908,31 +949,111 @@ impl<'a> BlockBuf<'a> {
     /// [`capacity`](Self::capacity) instead would describe a region starting at
     /// the fill point and running to the end of the whole buffer, which is
     /// longer than what is left whenever anything has been written.
+    ///
+    /// Bytes never written are zeroed here the first time, so a read that
+    /// looks at its buffer before writing it sees zeroes.
     pub fn unfilled_mut(&mut self) -> &mut [u8] {
-        let filled = self.filled;
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "filled <= buf.len() is the type's invariant"
-        )]
-        &mut self.buf[filled..]
+        // `init` never passes the end, so the rest is always there.
+        let rest = self.buf.get_mut(self.init..).unwrap_or_default();
+        rest.fill(MaybeUninit::new(0));
+        self.init = self.buf.len();
+        let rest = self.buf.get_mut(self.filled..).unwrap_or_default();
+        // SAFETY: every byte from the fill point on is initialized as of the
+        // zeroing above, and `MaybeUninit<u8>` has the layout of `u8`.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            core::slice::from_raw_parts_mut(rest.as_mut_ptr().cast::<u8>(), rest.len())
+        }
     }
 
-    /// Counts `n` more bytes as filled.
+    /// The part still to be filled, whether initialized or not, for a read
+    /// that only writes it: a kernel read given its pointer writes the bytes
+    /// in place, nothing zeroes them first.
     ///
-    /// Over-counting cannot break memory safety here, since the bytes were
-    /// initialized to begin with; it makes the request look complete when it is
+    /// Not a `&mut [u8]`: a byte slice over memory never written is not one,
+    /// whether or not anything reads it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not write `MaybeUninit::uninit()` into it: the bytes
+    /// counted initialized must stay so, as [`advance`](Self::advance) and
+    /// the memory a [`BlockBuf::new`] was lent rely on them.
+    #[must_use]
+    pub unsafe fn unfilled_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        // `filled` never passes the end, so the rest is always there.
+        self.buf.get_mut(self.filled..).unwrap_or_default()
+    }
+
+    /// Counts `n` more bytes as filled, written through
+    /// [`unfilled_uninit_mut`](Self::unfilled_uninit_mut). Clamped at the
+    /// capacity.
+    ///
+    /// # Safety
+    ///
+    /// The `n` bytes after those filled so far must have been written.
+    pub unsafe fn assume_written(&mut self, n: usize) {
+        let remaining = self.buf.len() - self.filled;
+        self.filled += n.min(remaining);
+        self.init = self.init.max(self.filled);
+    }
+
+    /// Counts `n` more bytes as filled, written through
+    /// [`unfilled_mut`](Self::unfilled_mut).
+    ///
+    /// Over-counting cannot break memory safety here: the count stops at the
+    /// bytes known initialized. It makes the request look complete when it is
     /// not, and the block decoded from it then fails its checksum. Clamped at
     /// the capacity so the fill point stays inside the buffer.
     pub fn advance(&mut self, n: usize) {
         // Clamp BEFORE adding: `filled + n` computed first would panic in
         // debug builds and wrap `filled` backwards in release builds for an
         // oversized `n`.
-        let remaining = self.buf.len() - self.filled;
+        let remaining = self.init - self.filled;
         self.filled += n.min(remaining);
+    }
+
+    /// Fills the unfilled part through `read`, given it as a [`ReadBuf`], and
+    /// counts what `read` filled there: one [`FsFile::read_at_buf`] reads it
+    /// without zeroing where the file only writes.
+    ///
+    /// # Errors
+    ///
+    /// The error of `read`.
+    pub(crate) fn fill_unfilled(
+        &mut self,
+        read: impl FnOnce(&mut ReadBuf<'_>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let filled = self.filled;
+        let init = self.init - filled;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "filled <= buf.len() is the type's invariant"
+        )]
+        let mut target = ReadBuf::partly_init(&mut self.buf[filled..], init);
+        let result = read(&mut target);
+        let (got, now_init) = (target.filled(), target.initialized());
+        self.init = self.init.max(filled + now_init);
+        // SAFETY: `ReadBuf` counts filled only bytes it holds initialized,
+        // which the line above counts here.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            self.assume_written(got);
+        }
+        result
+    }
+
+    /// Where this destination ended, for the [`QueuedBuf`] it was lent from.
+    pub(crate) fn progress(&self) -> BlockProgress {
+        BlockProgress {
+            at: self.buf.as_ptr(),
+            len: self.buf.len(),
+            init: self.init,
+            filled: self.filled,
+        }
     }
 }
 
-/// One read handed to a [`ReadQueue`]: `buf.len()` bytes of `file` from
+/// One read handed to a [`ReadQueue`]: `buf.capacity()` bytes of `file` from
 /// `offset`.
 ///
 /// The queue owns the buffer from [`submit`](ReadQueue::submit) until it hands
@@ -945,8 +1066,9 @@ pub struct QueuedRead {
     pub file: alloc::sync::Arc<dyn FsFile>,
     /// Byte offset within `file`.
     pub offset: u64,
-    /// Destination, exactly as long as the read.
-    pub buf: Vec<u8>,
+    /// Destination, exactly as long as the read; it becomes the block's
+    /// [`Slice`](crate::Slice) without a copy.
+    pub buf: QueuedBuf,
 }
 
 /// A [`QueuedRead`] the queue is done with: its buffer, and whether every byte
@@ -955,7 +1077,7 @@ pub struct ReadDone {
     /// The tag the read was submitted with.
     pub tag: usize,
     /// The destination; the whole block when `result` is `Ok`.
-    pub buf: Vec<u8>,
+    pub buf: QueuedBuf,
     /// `Ok` once every byte was read; a short read is
     /// [`io::ErrorKind::UnexpectedEof`].
     pub result: io::Result<()>,
@@ -968,7 +1090,7 @@ pub struct ReadDone {
 /// # Examples
 ///
 /// ```
-/// use lsm_tree::fs::{Fs, FsFile, FsOpenOptions, MemFs, QueuedRead};
+/// use lsm_tree::fs::{Fs, FsFile, FsOpenOptions, MemFs, QueuedBuf, QueuedRead};
 /// use std::io::Write;
 /// use std::path::Path;
 /// use std::sync::Arc;
@@ -981,10 +1103,10 @@ pub struct ReadDone {
 /// let file: Arc<dyn FsFile> = Arc::from(fs.open(path, &FsOpenOptions::new().read(true))?);
 ///
 /// let mut queue = fs.read_queue();
-/// queue.submit(QueuedRead { tag: 7, file, offset: 7, buf: vec![0; 5] });
+/// queue.submit(QueuedRead { tag: 7, file, offset: 7, buf: QueuedBuf::new(5) });
 /// let mut read = Vec::new();
-/// queue.wait(1, &mut |done| read.push((done.tag, done.buf, done.result.is_ok())));
-/// assert_eq!(read, [(7, b"world".to_vec(), true)]);
+/// queue.wait(1, &mut |done| read.push((done.tag, done.buf.into_slice(), done.result.is_ok())));
+/// assert_eq!(read, [(7, Some(lsm_tree::Slice::from(b"world")), true)]);
 /// # Ok::<(), lsm_tree::io::Error>(())
 /// ```
 #[diagnostic::on_unimplemented(
@@ -1097,22 +1219,36 @@ impl<F: Fs + ?Sized> ReadQueue for BatchedReadQueue<'_, F> {
         }
         let mut reads = core::mem::take(&mut self.submitted);
         let mut filled = alloc::vec![false; reads.len()];
-        let outcome = {
+        let (outcome, progress) = {
             let mut reqs: Vec<BlockRead<'_>> = reads
                 .iter_mut()
-                .map(|read| BlockRead {
-                    file: read.file.as_ref(),
-                    offset: read.offset,
-                    buf: BlockBuf::new(&mut read.buf[..]),
+                .map(|read| {
+                    let QueuedRead {
+                        ref file,
+                        offset,
+                        ref mut buf,
+                        ..
+                    } = *read;
+                    BlockRead {
+                        file: file.as_ref(),
+                        offset,
+                        buf: buf.block_buf(),
+                    }
                 })
                 .collect();
-            self.fs
+            let outcome = self
+                .fs
                 .read_blocks_batched_each(&mut reqs, &mut |index, _| {
                     if let Some(slot) = filled.get_mut(index) {
                         *slot = true;
                     }
-                })
+                });
+            let progress: Vec<BlockProgress> = reqs.iter().map(|req| req.buf.progress()).collect();
+            (outcome, progress)
         };
+        for (read, progress) in reads.iter_mut().zip(&progress) {
+            read.buf.settle(progress);
+        }
         // A read not handed over failed: a failed call leaves the contents of
         // every buffer it did not hand over unspecified, even one it filled.
         // The first such read carries the call's error, the others its kind.
@@ -1134,7 +1270,9 @@ impl<F: Fs + ?Sized> ReadQueue for BatchedReadQueue<'_, F> {
             }
         };
         for (read, filled) in reads.into_iter().zip(filled) {
-            let result = if filled {
+            // A request filled through a buffer other than its own counts
+            // nothing here, and is short.
+            let result = if filled && read.buf.is_full() {
                 Ok(())
             } else {
                 Err(failure
@@ -1178,7 +1316,7 @@ pub trait Fs: Send + Sync + 'static {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>>;
 
     /// Reads several blocks, possibly from DIFFERENT files, in one batched
-    /// operation. The default reads each serially via [`FsFile::read_at`];
+    /// operation. The default reads each serially via [`FsFile::read_at_buf`];
     /// `io_uring` overrides it to submit every read across all the files to its
     /// one shared ring, so reads from many SSTs (and, on a multi-device layout,
     /// many devices) coalesce into one submission and overlap in flight, with
@@ -1190,11 +1328,13 @@ pub trait Fs: Send + Sync + 'static {
     /// already owns the block's first `filled` bytes, so the read covers the
     /// unfilled suffix starting at `offset + filled` in the file.
     ///
-    /// The destination is initialized memory whose fill count starts at zero,
-    /// so an implementation that reports success without filling a request
-    /// leaves that request short rather than making stale bytes look read: see
-    /// [`BlockBuf`]. The caller rejects a short request, which is why this
-    /// contract does not have to be trusted.
+    /// The destination's fill count starts at zero, so an implementation that
+    /// reports success without filling a request leaves that request short
+    /// rather than making stale bytes look read: see [`BlockBuf`]. The caller
+    /// rejects a short request, which is why this contract does not have to
+    /// be trusted. The memory may be uninitialized: read it through
+    /// [`BlockBuf::unfilled_mut`], or, for a read that only writes, through
+    /// [`BlockBuf::unfilled_uninit_mut`].
     ///
     /// # Errors
     ///
@@ -1214,11 +1354,10 @@ pub trait Fs: Send + Sync + 'static {
                         "read_blocks_batched: request offset overflows",
                     )
                 })?;
-            let dst = req.buf.unfilled_mut();
-            let want = dst.len();
-            let n = req.file.read_at(dst, offset)?;
-            req.buf.advance(n);
-            if n != want {
+            let file = req.file;
+            req.buf
+                .fill_unfilled(|target| file.read_at_buf(target, offset))?;
+            if !req.buf.is_full() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "read_blocks_batched: short read on a fixed-size block",

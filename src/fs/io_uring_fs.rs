@@ -184,12 +184,13 @@ impl IoUringFs {
                 ));
                 break;
             };
-            let dst = req.buf.unfilled_mut();
-            let want = dst.len();
-            match req.file.read_at(dst, offset) {
-                Ok(n) => {
-                    req.buf.advance(n);
-                    if n != want {
+            let file = req.file;
+            match req
+                .buf
+                .fill_unfilled(|target| file.read_at_buf(target, offset))
+            {
+                Ok(()) => {
+                    if !req.buf.is_full() {
                         serial_failure = Some((
                             *idx,
                             crate::io::Error::from(io::Error::new(
@@ -247,9 +248,6 @@ fn read_lone(
     req: &mut BlockRead<'_>,
     on_read: Option<OnRead<'_>>,
 ) -> crate::io::Result<()> {
-    use std::os::unix::fs::FileExt as _;
-    use std::os::unix::io::FromRawFd as _;
-
     // A partly filled destination owns the block's first `filled` bytes
     // already; complete it from `offset + filled`.
     let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
@@ -258,18 +256,63 @@ fn read_lone(
             "read_blocks_batched: request offset overflows",
         )));
     };
-    // SAFETY: `backing_fd` names a descriptor open for as long as the request
-    // borrows its file, and `ManuallyDrop` never closes it.
+    // SAFETY: `pread_exact` hands the span to the kernel, which only writes
+    // bytes into it.
     #[expect(unsafe_code, reason = "see safety")]
-    let file = core::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
-    let dst = req.buf.unfilled_mut();
-    let want = dst.len();
-    file.read_exact_at(dst, offset)?;
-    req.buf.advance(want);
+    let dst = unsafe { req.buf.unfilled_uninit_mut() };
+    let want = pread_exact(fd, dst, offset)?;
+    // SAFETY: `pread_exact` wrote all `want` bytes after those filled.
+    #[expect(unsafe_code, reason = "see safety")]
+    unsafe {
+        req.buf.assume_written(want);
+    }
     if let Some(on_read) = on_read {
         on_read(0, req);
     }
     Ok(())
+}
+
+/// Fills `dst` from `fd` at `offset` with `pread`, which only writes it, so
+/// memory never written needs no zeroing first; returns `dst.len()`.
+///
+/// # Errors
+///
+/// The read's error; a file ending before `dst` is full is
+/// [`io::ErrorKind::UnexpectedEof`], an offset past the largest a file can
+/// have [`io::ErrorKind::InvalidInput`].
+fn pread_exact(
+    fd: i32,
+    dst: &mut [core::mem::MaybeUninit<u8>],
+    offset: u64,
+) -> crate::io::Result<usize> {
+    let mut done = 0;
+    while let Some(rest) = dst.get_mut(done..).filter(|rest| !rest.is_empty()) {
+        let at = u64::try_from(done)
+            .ok()
+            .and_then(|done| offset.checked_add(done))
+            .and_then(|at| libc::off_t::try_from(at).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "read offset past the last file offset",
+                )
+            })?;
+        // SAFETY: the kernel writes at most `rest.len()` bytes of `rest`,
+        // memory the caller holds for the call, and reads none of it.
+        #[expect(unsafe_code, reason = "see safety")]
+        let n = unsafe { libc::pread(fd, rest.as_mut_ptr().cast(), rest.len(), at) };
+        match usize::try_from(n) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+            Ok(n) => done += n,
+            Err(_) => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+    Ok(done)
 }
 
 /// Makes `f` a callback over requests of any lifetime, which a closure only
@@ -883,6 +926,9 @@ struct SubmitCounts {
 struct RingThread {
     tx: Mutex<Option<mpsc::SyncSender<Submission>>>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Whether the kernel refused a read that must not wait (`RWF_NOWAIT`)
+    /// through this backend; once it has, every read goes to the ring.
+    nowait_refused: core::sync::atomic::AtomicBool,
     #[cfg(test)]
     counts: SubmitCounts,
 }
@@ -914,6 +960,7 @@ impl RingThread {
         Ok(Self {
             tx: Mutex::new(Some(tx)),
             handle: Mutex::new(Some(handle)),
+            nowait_refused: core::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             counts: SubmitCounts::default(),
         })
@@ -1356,9 +1403,16 @@ impl RingThread {
                 continue;
             };
             expected.push(req.buf.capacity() - req.buf.filled());
+            // SAFETY: the kernel only writes bytes into the span, never
+            // uninitialized ones; it is counted filled only once its
+            // completion reports it whole.
+            #[expect(unsafe_code, reason = "see safety")]
+            let dst = unsafe { req.buf.unfilled_uninit_mut() }
+                .as_mut_ptr()
+                .cast::<u8>();
             reads.push(BatchRead {
                 fd,
-                buf: UnsafeSendMutPtr(req.buf.unfilled_mut().as_mut_ptr()),
+                buf: UnsafeSendMutPtr(dst),
                 len,
                 offset,
             });
@@ -1374,7 +1428,12 @@ impl RingThread {
         // submission described.
         let count_filled = |req: &mut BlockRead<'r>| {
             let remaining = req.buf.capacity() - req.buf.filled();
-            req.buf.advance(remaining);
+            // SAFETY: called only for a request whose completion matched the
+            // length it asked for, or for an empty one.
+            #[expect(unsafe_code, reason = "see safety")]
+            unsafe {
+                req.buf.assume_written(remaining);
+            }
         };
 
         if let Some(on_read) = on_read {
@@ -1436,6 +1495,8 @@ struct UringReadQueue<'r> {
     /// on the calling thread, so only by a wait for at least one read, never
     /// by a look at what is ready.
     serial: Vec<QueuedRead>,
+    /// The smallest read whose cached bytes are read on the calling thread.
+    cached_min: usize,
 }
 
 impl<'r> UringReadQueue<'r> {
@@ -1451,16 +1512,33 @@ impl<'r> UringReadQueue<'r> {
             on_ring: 0,
             finished: Vec::new(),
             serial: Vec::new(),
+            cached_min: CACHED_MIN,
         }
+    }
+
+    /// A queue that reads the cached bytes of reads from `cached_min` up on
+    /// the calling thread; `usize::MAX` sends every read to the ring.
+    #[cfg(test)]
+    fn with_cached_min(ring: &'r RingThread, cached_min: usize) -> Self {
+        let mut queue = Self::new(ring);
+        queue.cached_min = cached_min;
+        queue
     }
 
     /// Reads the reads held for a serial read, each into its own buffer.
     fn read_serial(&mut self) {
         for mut read in core::mem::take(&mut self.serial) {
-            let want = read.buf.len();
-            let result = match read.file.read_at(&mut read.buf, read.offset) {
-                Ok(n) if n == want => Ok(()),
-                Ok(_) => Err(short_read()),
+            let Some(offset) = resume_offset(&read) else {
+                self.finished.push(done(read, Err(past_last_offset())));
+                continue;
+            };
+            let file = &read.file;
+            let result = read
+                .buf
+                .fill_with(|buf| buf.fill_unfilled(|target| file.read_at_buf(target, offset)));
+            let result = match result {
+                Ok(()) if read.buf.is_full() => Ok(()),
+                Ok(()) => Err(short_read()),
                 Err(error) => Err(error),
             };
             self.finished.push(done(read, result));
@@ -1485,7 +1563,7 @@ impl<'r> UringReadQueue<'r> {
         // The submission place of each read sent below, in order.
         let mut places: Vec<usize> = Vec::new();
         for (place, mut read) in core::mem::take(&mut self.submitted).into_iter().enumerate() {
-            if read.buf.is_empty() {
+            if read.buf.capacity() == 0 {
                 self.finished.push(done(read, Ok(())));
                 continue;
             }
@@ -1497,7 +1575,20 @@ impl<'r> UringReadQueue<'r> {
                 }
                 continue;
             };
-            let Ok(len) = i32::try_from(read.buf.len()) else {
+            // What the page cache holds is copied here, on the reader's core,
+            // so its bytes are checked while still in that core's cache and no
+            // thread is woken for it; what it lacks goes to the ring.
+            if read.buf.capacity() >= self.cached_min
+                && read_cached(fd, &mut read, &self.ring.nowait_refused)
+            {
+                self.finished.push(done(read, Ok(())));
+                continue;
+            }
+            let Some(offset) = resume_offset(&read) else {
+                self.finished.push(done(read, Err(past_last_offset())));
+                continue;
+            };
+            let Ok(len) = i32::try_from(read.buf.capacity() - read.buf.filled()) else {
                 self.finished.push(done(
                     read,
                     Err(crate::io::Error::from(io::Error::new(
@@ -1507,14 +1598,18 @@ impl<'r> UringReadQueue<'r> {
                 ));
                 continue;
             };
-            // The pointer is into the Vec's heap allocation, which moving the
-            // Vec into `sent` does not move; the buffer is not touched again
-            // until its completion is received (see the type's docs).
+            // The pointer is into the buffer's heap allocation, which moving
+            // the read into `sent` does not move; the buffer is not touched
+            // again until its completion is received (see the type's docs).
+            // SAFETY: the kernel only writes the span, and the buffer is
+            // counted filled only once its completion reports it whole.
+            #[expect(unsafe_code, reason = "see safety")]
+            let (dst, _) = unsafe { read.buf.unfilled_ptr() };
             reads.push(BatchRead {
                 fd,
-                buf: UnsafeSendMutPtr(read.buf.as_mut_ptr()),
+                buf: UnsafeSendMutPtr(dst),
                 len: len.unsigned_abs(),
-                offset: read.offset,
+                offset,
             });
             self.sent.push_back(Some(read));
             places.push(place);
@@ -1595,11 +1690,19 @@ impl<'r> UringReadQueue<'r> {
 
     /// The read at `position` with the ring's `result` for it.
     fn complete(&mut self, position: usize, result: i32) -> Option<ReadDone> {
-        let read = self.take_sent(position)?;
+        let mut read = self.take_sent(position)?;
         self.on_ring -= 1;
-        let want = read.buf.len();
+        let want = read.buf.capacity() - read.buf.filled();
         let result = match usize::try_from(result) {
-            Ok(n) if n == want => Ok(()),
+            Ok(n) if n == want => {
+                // SAFETY: the completion reports the kernel wrote all `want`
+                // bytes of the span it was given.
+                #[expect(unsafe_code, reason = "see safety")]
+                unsafe {
+                    read.buf.assume_written(want);
+                }
+                Ok(())
+            }
             Ok(_) => Err(short_read()),
             // A negative completion is `-errno`, never `i32::MIN`.
             Err(_) => Err(crate::io::Error::from(io::Error::from_raw_os_error(
@@ -1608,6 +1711,108 @@ impl<'r> UringReadQueue<'r> {
         };
         Some(done(read, result))
     }
+}
+
+/// The smallest read a queue copies from the page cache on the calling
+/// thread. Below it the syscall costs more than the copy, and the ring takes
+/// a batch of such reads in one submission: copying every read in place made
+/// a blob tree's multi-get of small values 1.7x dearer, a floor of 64 KiB
+/// left part of that, 256 KiB none.
+const CACHED_MIN: usize = 256 << 10;
+
+/// Where `read` goes on from: past what its buffer already holds, as a read
+/// handed back to wait its turn keeps what it was given before. `None` past
+/// the last offset a file can have.
+fn resume_offset(read: &QueuedRead) -> Option<u64> {
+    read.offset
+        .checked_add(u64::try_from(read.buf.filled()).ok()?)
+}
+
+/// A read whose resumed offset passes the last one a file can have.
+fn past_last_offset() -> crate::io::Error {
+    crate::io::Error::from(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "read offset past the last file offset",
+    ))
+}
+
+/// Copies into `read` what the page cache holds of it, without waiting for
+/// the device: `true` when the buffer is full, `false` when the rest is for
+/// the ring, which also tells the end of the file apart. A kernel refusing
+/// such reads sets `refused`, and every later read of the backend goes to
+/// the ring.
+fn read_cached(fd: i32, read: &mut QueuedRead, refused: &core::sync::atomic::AtomicBool) -> bool {
+    use core::sync::atomic::Ordering;
+    if refused.load(Ordering::Relaxed) {
+        return false;
+    }
+    // The whole span must lie below the largest offset: a kernel answers a
+    // read ending past it with `EINVAL`, which would read as a refusal of
+    // reads that must not wait and turn the fast path off.
+    let rest = read.buf.capacity() - read.buf.filled();
+    let Some(offset) = resume_offset(read)
+        .filter(|&at| {
+            u64::try_from(rest)
+                .ok()
+                .and_then(|rest| at.checked_add(rest))
+                .is_some_and(|end| libc::c_long::try_from(end).is_ok())
+        })
+        .and_then(|offset| libc::c_long::try_from(offset).ok())
+    else {
+        return false;
+    };
+    // A file read past the page cache would wait for the device here: the
+    // ring overlaps those.
+    // SAFETY: F_GETFL only reads the descriptor's flags.
+    #[expect(unsafe_code, reason = "see safety")]
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_DIRECT != 0 {
+        return false;
+    }
+    // SAFETY: the kernel only writes the span, and only the bytes it reports
+    // are counted filled below.
+    #[expect(unsafe_code, reason = "see safety")]
+    let (dst, len) = unsafe { read.buf.unfilled_ptr() };
+    let iov = libc::iovec {
+        iov_base: dst.cast(),
+        iov_len: len,
+    };
+    // The system call, not glibc's `preadv2` wrapper: the wrapper only exists
+    // from glibc 2.26, and the ring itself needs nothing of the C library. On
+    // the 64-bit targets this backend builds for, the kernel takes the whole
+    // offset from `pos_l` and ignores `pos_h` (`pos_from_hilo`, fs/read_write.c).
+    // SAFETY: `iov` names `len` writable bytes of the buffer, alive for the
+    // call.
+    #[expect(unsafe_code, reason = "see safety")]
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_preadv2,
+            libc::c_long::from(fd),
+            &raw const iov,
+            libc::c_long::from(1u8),
+            offset,
+            libc::c_long::from(0u8),
+            libc::c_long::from(libc::RWF_NOWAIT),
+        )
+    };
+    let Ok(n) = usize::try_from(n) else {
+        let errno = io::Error::last_os_error().raw_os_error();
+        if matches!(errno, Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS)) {
+            refused.store(true, Ordering::Relaxed);
+        }
+        // Not cached (EAGAIN), or a failure the ring reports as it would.
+        return false;
+    };
+    // SAFETY: the kernel wrote the `n` bytes it reports.
+    #[expect(unsafe_code, reason = "see safety")]
+    unsafe {
+        read.buf.assume_written(n);
+    }
+    // A part read, or nothing, may only be the rest being out of the cache:
+    // some kernels (5.9, 5.10) answer a read that must not wait with zero
+    // bytes before the end of the file. The ring reads on, and reports the
+    // end of the file as a short read.
+    read.buf.is_full()
 }
 
 /// `read` handed back with `result`.

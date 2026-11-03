@@ -653,16 +653,7 @@ fn a_resumable_multi_get_counts_each_key_once() -> crate::Result<()> {
                 read.complete_job(outcome);
             }
             for mut block in read.take_reads() {
-                let result = block
-                    .file
-                    .read_at(&mut block.buf, block.offset)
-                    .and_then(|n| {
-                        if n == block.buf.len() {
-                            Ok(())
-                        } else {
-                            Err(crate::io::ErrorKind::UnexpectedEof.into())
-                        }
-                    });
+                let result = block.buf.read_from(block.file.as_ref(), block.offset);
                 read.complete_read(block.tag, result, block.buf);
             }
             step = read.resume();

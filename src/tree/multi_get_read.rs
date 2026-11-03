@@ -144,7 +144,19 @@ pub(super) struct MultiGetRead<'a, K> {
     /// What the merges' blocks may still take of the cache, as a level read
     /// keeps its blocks within half of it; set by the first block back.
     merge_room: Option<u64>,
+    /// Value reads whose blob file is open, by tag, not yet handed out.
+    blobs_ready: VecDeque<usize>,
+    /// The bytes of the value reads out.
+    blob_bytes_out: usize,
 }
+
+/// The most bytes of separated values out at once, one value always let out:
+/// each value is checked as it is back, while what the read just copied is
+/// still in the processor's cache, instead of after a batch larger than that
+/// cache. Measured on 64 values of 1 MiB and 16 of 4 MiB: 8 MiB takes the
+/// checksum's cache misses from 48.8M to 3.7M; 1 and 2 MiB windows read
+/// slower than none.
+pub(crate) const BLOB_WINDOW: usize = 8 << 20;
 
 impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
     /// The multi-get of `ctx`'s keys: the memtables are read here, and the
@@ -210,6 +222,48 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             merge_blocks_out: crate::HashMap::default(),
             merge_bytes_out: 0,
             merge_room: None,
+            blobs_ready: VecDeque::new(),
+            blob_bytes_out: 0,
+        }
+    }
+
+    /// Hands out the value reads whose file is open, first come first, while
+    /// the bytes out stay within the window; one read is always let out.
+    fn issue_blobs(&mut self, out: &mut impl ReadSink<'a>) {
+        let ctx = self.ctx;
+        let Values::Blob(source) = &ctx.values else {
+            return;
+        };
+        let version = ctx.version();
+        while let Some(&tag) = self.blobs_ready.front() {
+            let Some(Some(ValueReadOut::Blob(pending))) = self.reads.get(tag) else {
+                self.blobs_ready.pop_front();
+                continue;
+            };
+            let len = pending.read.len;
+            if self.blob_bytes_out > 0 && self.blob_bytes_out + len > BLOB_WINDOW {
+                return;
+            }
+            let Some(file) = self
+                .blob_files
+                .get(pending.slot)
+                .and_then(|slot| slot.file.as_ref())
+                .map(Arc::clone)
+            else {
+                self.blobs_ready.pop_front();
+                continue;
+            };
+            source.count_issued(version, &pending.read);
+            out.read(BlockRequest {
+                tag,
+                fs: &pending.read.blob_file.0.fs,
+                cache: &source.cache,
+                file,
+                offset: pending.read.vhandle.offset,
+                buf: crate::fs::QueuedBuf::new(len),
+            });
+            self.blob_bytes_out += len;
+            self.blobs_ready.pop_front();
         }
     }
 
@@ -320,11 +374,10 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         file: crate::Result<Arc<dyn FsFile>>,
         out: &mut S,
     ) {
-        let Values::Blob(source) = &self.ctx.values else {
+        let Values::Blob(_) = &self.ctx.values else {
             debug_assert!(false, "a blob file opened for a read of inline values");
             return;
         };
-        let version = self.ctx.version();
         let Ok(file) = file else {
             for pending in &mut self.reads {
                 if let Some(ValueReadOut::Blob(read)) = pending.take_if(
@@ -344,15 +397,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             if pending.slot != slot {
                 continue;
             }
-            source.count_issued(version, &pending.read);
-            out.read(BlockRequest {
-                tag,
-                fs: &pending.read.blob_file.0.fs,
-                cache: &source.cache,
-                file: Arc::clone(&file),
-                offset: pending.read.vhandle.offset,
-                buf: alloc::vec![0u8; pending.read.len],
-            });
+            self.blobs_ready.push_back(tag);
             issued += 1;
         }
         // Held until its last read is back.
@@ -360,6 +405,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             held.reads_out = issued;
             if issued > 0 {
                 held.file = Some(file);
+                self.issue_blobs(out);
                 return;
             }
         }
@@ -374,7 +420,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 table,
                 handle,
                 waiters,
-            }) => self.merge_block_done(table, &handle, &waiters, &done),
+            }) => self.merge_block_done(table, &handle, &waiters, done),
             None => debug_assert!(false, "a read handed back twice or never asked for"),
         }
     }
@@ -382,18 +428,25 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
     /// Takes back a value read: checked and taken as the key's value, or, when
     /// it failed or does not check out, left to the value's own path.
     fn blob_read_done(&mut self, pending: BlobRead<'a>, done: crate::fs::ReadDone) {
+        self.blob_bytes_out -= pending.read.len;
         let file = self
             .blob_files
             .get(pending.slot)
             .and_then(|slot| slot.file.as_ref());
-        let value = match (&self.ctx.values, file, done.result) {
-            (Values::Blob(source), Some(file), Ok(())) => source
+        // A read reported done and left short goes on its own path, as a
+        // failed one does.
+        let record = match done.result {
+            Ok(()) => done.buf.into_slice(),
+            Err(_) => None,
+        };
+        let value = match (&self.ctx.values, file, record) {
+            (Values::Blob(source), Some(file), Some(record)) => source
                 .finish_value(
                     self.ctx.version(),
                     &pending.item.key.user_key,
                     &pending.read,
                     file.as_ref(),
-                    &crate::Slice::from(done.buf),
+                    &record,
                 )
                 .ok(),
             _ => None,
@@ -638,7 +691,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 file,
                 offset: *handle.offset(),
                 // Its size is checked above.
-                buf: alloc::vec![0u8; handle.size() as usize],
+                buf: crate::fs::QueuedBuf::new(handle.size() as usize),
             });
             self.merge_bytes_out += size;
             self.merge_blocks_out.insert(place, tag);
@@ -682,22 +735,23 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         table: &'a Table,
         handle: &BlockHandle,
         waiters: &[usize],
-        done: &crate::fs::ReadDone,
+        done: crate::fs::ReadDone,
     ) {
         self.merge_blocks_out
             .remove(&(table.global_id(), *handle.offset()));
         self.merge_bytes_out -= u64::from(handle.size());
-        let block = match &done.result {
-            Ok(()) => {
-                let room = self
-                    .merge_room
-                    .get_or_insert_with(|| table.cache_capacity() / 2);
-                table
-                    .decode_data_block_keeping(&done.buf, handle, room, None)
-                    .ok()
-            }
+        let frame = match done.result {
+            Ok(()) => done.buf.into_slice(),
             Err(_) => None,
         };
+        let block = frame.and_then(|frame| {
+            let room = self
+                .merge_room
+                .get_or_insert_with(|| table.cache_capacity() / 2);
+            table
+                .decode_data_block_keeping(frame, handle, room, None)
+                .ok()
+        });
         let ctx = self.ctx;
         for &slot in waiters {
             let Some(merge) = self.merges.get_mut(slot).and_then(Option::as_mut) else {
@@ -794,6 +848,7 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
         }
         self.move_merges(out);
         self.open_files(out);
+        self.issue_blobs(out);
         if self.jobs > 0 {
             return None;
         }

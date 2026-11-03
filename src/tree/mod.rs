@@ -3474,9 +3474,7 @@ impl Tree {
     ///         read.complete_job(outcome);
     ///     }
     ///     for mut block in read.take_reads() {
-    ///         let result = block.file.read_at(&mut block.buf, block.offset).and_then(|n| {
-    ///             if n == block.buf.len() { Ok(()) } else { Err(lsm_tree::io::ErrorKind::UnexpectedEof.into()) }
-    ///         });
+    ///         let result = block.buf.read_from(block.file.as_ref(), block.offset);
     ///         read.complete_read(block.tag, result, block.buf);
     ///     }
     ///     step = read.resume();
@@ -4545,7 +4543,7 @@ impl Tree {
     fn resolve_block_task<K: AsRef<[u8]>>(
         task: &BlockTask<'_>,
         index: usize,
-        bytes: &[u8],
+        frame: crate::Slice,
         keep_room: &mut u64,
         lead: Option<crate::cache::BlockLead>,
         keys: &[K],
@@ -4553,7 +4551,7 @@ impl Tree {
     ) -> crate::Result<()> {
         let block = task
             .table
-            .decode_data_block_keeping(bytes, &task.handle, keep_room, lead)?;
+            .decode_data_block_keeping(frame, &task.handle, keep_room, lead)?;
         Self::read_task_keys(task, index, &block, keys, hits)
     }
 

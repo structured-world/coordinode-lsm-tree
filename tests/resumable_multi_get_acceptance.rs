@@ -178,17 +178,7 @@ fn drive_on_a_pool(mut step: Step) -> lsm_tree::Result<Vec<Option<UserValue>>> {
                 let blocks: Vec<_> = reads
                     .into_iter()
                     .map(|mut block| {
-                        let result =
-                            block
-                                .file
-                                .read_at(&mut block.buf, block.offset)
-                                .and_then(|n| {
-                                    if n == block.buf.len() {
-                                        Ok(())
-                                    } else {
-                                        Err(io::ErrorKind::UnexpectedEof.into())
-                                    }
-                                });
+                        let result = block.buf.read_from(block.file.as_ref(), block.offset);
                         (block.tag, result, block.buf)
                     })
                     .collect();
@@ -479,17 +469,7 @@ fn reads_dropped_mid_flight_under_injected_faults_stay_sound() -> lsm_tree::Resu
                 reads
                     .into_iter()
                     .map(|mut block| {
-                        let result =
-                            block
-                                .file
-                                .read_at(&mut block.buf, block.offset)
-                                .and_then(|n| {
-                                    if n == block.buf.len() {
-                                        Ok(())
-                                    } else {
-                                        Err(io::ErrorKind::UnexpectedEof.into())
-                                    }
-                                });
+                        let result = block.buf.read_from(block.file.as_ref(), block.offset);
                         (block.tag, result, block.buf, block.file, block.offset)
                     })
                     .collect::<Vec<_>>()
@@ -507,11 +487,12 @@ fn reads_dropped_mid_flight_under_injected_faults_stay_sound() -> lsm_tree::Resu
                     if result.is_err() {
                         continue;
                     }
-                    let mut block = vec![0u8; buf.len()];
+                    let mut block = vec![0u8; buf.capacity()];
                     let read = file.read_at(&mut block, *offset);
                     if read.as_ref().is_ok_and(|&n| n == block.len()) {
                         assert_eq!(
-                            buf, &block,
+                            buf.filled_bytes(),
+                            &block[..],
                             "a read still running finished into its own buffer"
                         );
                         checked += 1;
@@ -571,8 +552,8 @@ fn dropping_a_suspended_read_leaves_its_buffers_to_the_caller() -> lsm_tree::Res
         let _ = job.run();
     }
     for block in &mut reads {
-        let read = block.file.read_at(&mut block.buf, block.offset)?;
-        assert_eq!(read, block.buf.len());
+        block.buf.read_from(block.file.as_ref(), block.offset)?;
+        assert!(block.buf.is_full());
     }
     Ok(())
 }

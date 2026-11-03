@@ -569,6 +569,41 @@ fn a_refused_uncompressed_block_still_reports_what_it_produced() -> crate::Resul
     Ok(())
 }
 
+/// A frame cut short of the payload its header declares is refused as an
+/// unexpected end of input, instead of handing out a view past its bytes.
+#[test]
+fn a_frame_shorter_than_its_header_declares_is_refused() -> crate::Result<()> {
+    let transform = BlockTransform::from_parts(
+        CompressionType::None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    let mut frame = vec![];
+    Block::write_into(
+        &mut frame,
+        b"a payload the frame is cut short of",
+        BlockIdentity::for_test(0, BlockType::Data),
+        &transform,
+        HERE,
+    )?;
+    frame.truncate(frame.len() - 4);
+
+    let result = Block::from_frame_counting(
+        Slice::from(frame),
+        BlockIdentity::for_test(0, BlockType::Data),
+        &transform,
+        HERE,
+        &mut 0,
+    );
+    assert!(
+        matches!(&result, Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::UnexpectedEof),
+        "a cut frame is an unexpected end, got: {:?}",
+        result.err(),
+    );
+    Ok(())
+}
+
 /// The file read path reports the same for a compressed block: lz4 wrote its
 /// output before the length check refused it.
 #[test]

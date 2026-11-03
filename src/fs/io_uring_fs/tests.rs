@@ -8,6 +8,7 @@
 )]
 
 use super::*;
+use crate::fs::QueuedBuf;
 use std::io::{Read, Write};
 use std::sync::Arc;
 // Shadows #[test] to enable log capture in test output.
@@ -23,6 +24,330 @@ fn try_io_uring() -> Option<IoUringFs> {
     }
     // Kernel supports io_uring — constructor failures are real bugs.
     Some(IoUringFs::new().expect("io_uring available but IoUringFs::new() failed"))
+}
+
+/// A read queue on `fs` that sends every read to the ring, so a test of the
+/// ring's own handling is not answered from the page cache.
+fn ring_queue(fs: &IoUringFs) -> Box<dyn ReadQueue + '_> {
+    Box::new(UringReadQueue::with_cached_min(&fs.inner, usize::MAX))
+}
+
+/// Reads of at least [`CACHED_MIN`] bytes the page cache holds are read on
+/// the calling thread, handed back by a wait for none with no wake from the
+/// ring; a smaller read still goes to the ring, which batches those.
+#[test]
+fn a_read_queue_reads_large_cached_reads_without_the_ring() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    // Just written, so in the page cache.
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 4 * CACHED_MIN)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let wake = Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
+    let mut queue = fs.read_queue();
+    assert!(queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
+    // (tag, file, offset, len): four large reads and one small one.
+    let reads: Vec<(usize, usize, usize, usize)> = (0..4usize)
+        .map(|tag| (tag, tag % 2, tag * CACHED_MIN, CACHED_MIN))
+        .chain([(4, 1, 100, 64)])
+        .collect();
+    for &(tag, file, offset, len) in &reads {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(&files[file]),
+            offset: offset as u64,
+            buf: QueuedBuf::new(len),
+        });
+    }
+    let mut got = Vec::new();
+    queue.wait(0, &mut |done| {
+        assert!(done.result.is_ok(), "read {} failed", done.tag);
+        got.push((done.tag, done.buf.filled_bytes().to_vec()));
+    });
+    // A file system refusing reads that must not wait sends every read to
+    // the ring: what comes back is still checked, but not how.
+    let in_place = !fs.inner.nowait_refused.load(SeqCst);
+    // The small read, on the ring, may be back by then too.
+    let first: Vec<usize> = got.iter().map(|(tag, _)| *tag).collect();
+    if in_place {
+        assert!(
+            (0..4).all(|tag| first.contains(&tag)),
+            "a wait for none hands back every large cached read at once: {first:?}"
+        );
+    }
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| {
+            assert!(done.result.is_ok(), "read {} failed", done.tag);
+            got.push((done.tag, done.buf.filled_bytes().to_vec()));
+        });
+    }
+    for (tag, bytes) in got {
+        let (_, file, offset, len) = reads[tag];
+        let expected: Vec<u8> = (offset..offset + len)
+            .map(|i| u8::try_from((i + file) % 251).expect("below 251"))
+            .collect();
+        assert!(bytes == expected, "read {tag} holds its span of its file");
+    }
+    let wakes = wake.0.load(SeqCst);
+    if in_place {
+        assert_eq!(wakes, 1, "only the small read went to the ring");
+    } else {
+        assert_eq!(wakes, 5, "every read went to the ring");
+    }
+    Ok(())
+}
+
+/// A cached read taken up again with part of its buffer filled reads on from
+/// where that part ends, not from the read's start again: a read handed back
+/// to wait its turn keeps what the page cache already gave it.
+#[test]
+fn a_cached_read_resumed_reads_past_its_filled_part() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("grow.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    let bytes: Vec<u8> = (0..128usize)
+        .map(|i| u8::try_from(i).expect("below 128"))
+        .collect();
+    file.write_all(&bytes[..100])?;
+    let file: Arc<dyn FsFile> = Arc::from(file);
+    let Some(fd) = file.backing_fd() else {
+        panic!("an io_uring file has a descriptor");
+    };
+    let mut read = QueuedRead {
+        tag: 0,
+        file: Arc::clone(&file),
+        offset: 64,
+        buf: QueuedBuf::new(64),
+    };
+    // The file ends 36 bytes into the read: those are taken, the rest waits.
+    let refused = &fs.inner.nowait_refused;
+    assert!(
+        !read_cached(fd, &mut read, refused),
+        "the read is not over yet"
+    );
+    if read.buf.filled() == 0 {
+        // This file system refuses reads that must not wait.
+        return Ok(());
+    }
+    assert_eq!(read.buf.filled(), 36);
+    let mut appended = fs.open(&path, &FsOpenOptions::new().append(true))?;
+    appended.write_all(&bytes[100..])?;
+
+    assert!(
+        read_cached(fd, &mut read, refused),
+        "the rest is in the cache now"
+    );
+    assert!(read.buf.is_full());
+    assert!(
+        read.buf.filled_bytes() == &bytes[64..128],
+        "the second part continues where the first ended"
+    );
+    Ok(())
+}
+
+/// A read of `len` bytes at `offset` of a fresh 64-byte file, which the page
+/// cache holds whole, and the file's descriptor.
+fn cached_read(
+    fs: &IoUringFs,
+    dir: &Path,
+    offset: u64,
+    len: usize,
+) -> io::Result<(QueuedRead, i32)> {
+    let path = dir.join("cached.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    file.write_all(&[7u8; 64])?;
+    let file: Arc<dyn FsFile> = Arc::from(file);
+    let Some(fd) = file.backing_fd() else {
+        panic!("an io_uring file has a descriptor");
+    };
+    let read = QueuedRead {
+        tag: 0,
+        file,
+        offset,
+        buf: QueuedBuf::new(len),
+    };
+    Ok((read, fd))
+}
+
+/// A descriptor whose flags cannot be read leaves the read to the ring,
+/// which reports the failure as it would for any read.
+#[test]
+fn a_cached_read_of_a_descriptor_without_flags_goes_to_the_ring() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut read, _) = cached_read(&fs, dir.path(), 0, 16)?;
+    let refused = &fs.inner.nowait_refused;
+    assert!(
+        !read_cached(-1, &mut read, refused),
+        "no flags, no read in place"
+    );
+    assert_eq!(read.buf.filled(), 0);
+    assert!(!refused.load(SeqCst), "a bad descriptor is no refusal");
+    Ok(())
+}
+
+/// A read the kernel fails for its own reasons (here a descriptor open only
+/// for writing) goes to the ring unread, and does not count as the kernel
+/// refusing reads that must not wait.
+#[test]
+fn a_cached_read_the_kernel_fails_goes_to_the_ring() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut read, _) = cached_read(&fs, dir.path(), 0, 16)?;
+    let write_only = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("cached.bin"))?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&write_only);
+    let refused = &fs.inner.nowait_refused;
+    assert!(
+        !read_cached(fd, &mut read, refused),
+        "EBADF leaves the read to the ring"
+    );
+    assert_eq!(read.buf.filled(), 0);
+    assert!(!refused.load(SeqCst), "EBADF is no refusal");
+    Ok(())
+}
+
+/// A read resumed past the largest offset the system call takes goes to the
+/// ring, which reports it, instead of passing a wrapped offset to the kernel.
+#[test]
+fn a_cached_read_past_the_largest_offset_goes_to_the_ring() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut read, fd) = cached_read(&fs, dir.path(), u64::MAX - 8, 16)?;
+    assert!(!read_cached(fd, &mut read, &fs.inner.nowait_refused));
+    assert_eq!(read.buf.filled(), 0);
+    Ok(())
+}
+
+/// A read that starts below the largest offset but ends past it goes to the
+/// ring without asking the kernel, which would answer `EINVAL`: that answer
+/// is no refusal of reads that must not wait, and must not turn the fast
+/// path off for the backend's other reads.
+#[test]
+fn a_cached_read_ending_past_the_largest_offset_is_no_refusal() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let start = u64::try_from(i64::MAX).expect("positive") - 8;
+    let (mut read, fd) = cached_read(&fs, dir.path(), start, 16)?;
+    let refused = &fs.inner.nowait_refused;
+    assert!(!read_cached(fd, &mut read, refused));
+    assert_eq!(read.buf.filled(), 0);
+    assert!(
+        !refused.load(SeqCst),
+        "an overflowing span keeps the fast path on"
+    );
+    Ok(())
+}
+
+/// Once the kernel refuses a read that must not wait (a `/proc` file has no
+/// such reads), every later read of that backend goes to the ring, a cached
+/// one too; another backend still reads in place.
+#[test]
+fn a_kernel_refusing_reads_that_must_not_wait_sends_every_read_to_the_ring() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut cached, fd) = cached_read(&fs, dir.path(), 0, 16)?;
+    let proc_file = std::fs::File::open("/proc/self/stat")?;
+    let (mut proc_read, _) = cached_read(&fs, dir.path(), 0, 16)?;
+    let proc_fd = std::os::fd::AsRawFd::as_raw_fd(&proc_file);
+
+    let refused = &fs.inner.nowait_refused;
+    assert!(
+        !read_cached(proc_fd, &mut proc_read, refused),
+        "procfs refuses"
+    );
+    assert!(refused.load(SeqCst), "the refusal is remembered");
+    assert!(
+        !read_cached(fd, &mut cached, refused),
+        "a cached read goes to the ring now"
+    );
+    assert_eq!(cached.buf.filled(), 0);
+
+    let Some(other) = try_io_uring() else {
+        return Ok(());
+    };
+    assert!(
+        !other.inner.nowait_refused.load(SeqCst),
+        "another backend keeps its fast path"
+    );
+    // Its read is in place, unless the test directory's own file system
+    // refuses reads that must not wait: then this backend records its own
+    // refusal, which is not the first backend's.
+    if read_cached(fd, &mut cached, &other.inner.nowait_refused) {
+        assert!(cached.buf.is_full(), "the cached bytes are read in place");
+    } else {
+        assert!(
+            other.inner.nowait_refused.load(SeqCst),
+            "only its own file system's refusal leaves the read to the ring"
+        );
+    }
+    Ok(())
+}
+
+/// A cached read that runs past the end of its file fails as short, as the
+/// ring reports it, instead of handing back a part of the block.
+#[test]
+fn a_cached_read_past_the_end_fails_as_short() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 100)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    // Every read on the calling thread, so these small ones are too.
+    let mut queue = UringReadQueue::with_cached_min(&fs.inner, 0);
+    for (tag, offset) in [(0usize, 64u64), (1, 100)] {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(&files[0]),
+            offset,
+            buf: QueuedBuf::new(64),
+        });
+    }
+    let mut kinds = Vec::new();
+    queue.wait(2, &mut |done| {
+        kinds.push((done.tag, done.result.map_err(|error| error.kind())));
+    });
+    kinds.sort_unstable_by_key(|(tag, _)| *tag);
+    assert_eq!(
+        kinds,
+        [
+            (0, Err(crate::io::ErrorKind::UnexpectedEof)),
+            (1, Err(crate::io::ErrorKind::UnexpectedEof)),
+        ]
+    );
+    Ok(())
 }
 
 #[test]
@@ -754,7 +1079,7 @@ fn a_read_queue_hands_back_reads_of_several_submissions() -> io::Result<()> {
         .into_iter()
         .map(Arc::from)
         .collect();
-    let mut queue = fs.read_queue();
+    let mut queue = ring_queue(&fs);
     let mut got: Vec<(usize, Vec<u8>)> = Vec::new();
     for round in 0..4usize {
         for i in 0..16usize {
@@ -763,19 +1088,19 @@ fn a_read_queue_hands_back_reads_of_several_submissions() -> io::Result<()> {
                 tag,
                 file: Arc::clone(&files[tag % 2]),
                 offset: (tag * 64) as u64,
-                buf: vec![0; 64],
+                buf: QueuedBuf::new(64),
             });
         }
         // Issues this round's reads and takes whatever has come back.
         queue.wait(0, &mut |done| {
             assert!(done.result.is_ok(), "read {} failed", done.tag);
-            got.push((done.tag, done.buf));
+            got.push((done.tag, done.buf.filled_bytes().to_vec()));
         });
     }
     while queue.outstanding() > 0 {
         queue.wait(1, &mut |done| {
             assert!(done.result.is_ok(), "read {} failed", done.tag);
-            got.push((done.tag, done.buf));
+            got.push((done.tag, done.buf.filled_bytes().to_vec()));
         });
     }
     got.sort_unstable_by_key(|(tag, _)| *tag);
@@ -805,12 +1130,12 @@ fn a_wait_for_none_keeps_a_read_without_a_descriptor_for_take_kept() -> io::Resu
         Arc::from(mem.open(Path::new("/d/f"), &FsOpenOptions::new().read(true))?);
     assert!(file.backing_fd().is_none(), "self-check: no descriptor");
 
-    let mut queue = fs.read_queue();
+    let mut queue = ring_queue(&fs);
     queue.submit(QueuedRead {
         tag: 3,
         file,
         offset: 0,
-        buf: vec![0; 16],
+        buf: QueuedBuf::new(16),
     });
     let mut done = Vec::new();
     queue.wait(0, &mut |read| done.push(read));
@@ -828,7 +1153,7 @@ fn a_wait_for_none_keeps_a_read_without_a_descriptor_for_take_kept() -> io::Resu
     }
     queue.wait(1, &mut |read| done.push(read));
     assert_eq!(done.len(), 1);
-    assert_eq!(done[0].buf, vec![7; 16]);
+    assert_eq!(done[0].buf.filled_bytes(), [7; 16]);
     Ok(())
 }
 
@@ -857,14 +1182,14 @@ fn a_read_queue_wakes_once_a_read_is_ready_to_hand_over() -> io::Result<()> {
         .map(Arc::from)
         .collect();
     let wake = Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
-    let mut queue = fs.read_queue();
+    let mut queue = ring_queue(&fs);
     assert!(queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
     for tag in 0..32usize {
         queue.submit(QueuedRead {
             tag,
             file: Arc::clone(&files[tag % 2]),
             offset: (tag * 64) as u64,
-            buf: vec![0; 64],
+            buf: QueuedBuf::new(64),
         });
     }
     let mut handed = 0usize;
@@ -908,20 +1233,115 @@ fn a_read_without_a_descriptor_waits_for_a_wait_for_one() -> io::Result<()> {
         "an in-memory file has no descriptor"
     );
 
-    let mut queue = fs.read_queue();
+    let mut queue = ring_queue(&fs);
     queue.submit(QueuedRead {
         tag: 1,
         file,
         offset: 7,
-        buf: vec![0; 5],
+        buf: QueuedBuf::new(5),
     });
     let mut got = Vec::new();
-    queue.wait(0, &mut |done| got.push(done.buf));
+    queue.wait(0, &mut |done| got.push(done.buf.filled_bytes().to_vec()));
     assert!(got.is_empty(), "a wait for none reads nothing");
     assert_eq!((queue.outstanding(), queue.held()), (1, 1));
-    queue.wait(1, &mut |done| got.push(done.buf));
+    queue.wait(1, &mut |done| got.push(done.buf.filled_bytes().to_vec()));
     assert_eq!(got, [b"world".to_vec()]);
     assert_eq!((queue.outstanding(), queue.held()), (0, 0));
+    Ok(())
+}
+
+/// A read without a descriptor that comes with part of its buffer filled is
+/// read on from where that part ends, as the ring and the cached read resume
+/// it, not from the read's start again.
+#[test]
+fn a_serial_read_resumes_past_its_filled_part() -> io::Result<()> {
+    use crate::fs::MemFs;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let mem = MemFs::new();
+    let path = Path::new("/grow");
+    mem.open(path, &FsOpenOptions::new().write(true).create(true))?
+        .write_all(b"hello")?;
+    let file: Arc<dyn FsFile> = Arc::from(mem.open(path, &FsOpenOptions::new().read(true))?);
+    // Bytes 3..8 of the file, of which "lo" is there yet.
+    let mut buf = QueuedBuf::new(5);
+    buf.fill_with(|buf| buf.fill_unfilled(|target| file.read_at_buf(target, 3)))?;
+    assert_eq!(buf.filled_bytes(), b"lo");
+    mem.open(path, &FsOpenOptions::new().append(true))?
+        .write_all(b", world")?;
+
+    let mut queue = ring_queue(&fs);
+    queue.submit(QueuedRead {
+        tag: 0,
+        file,
+        offset: 3,
+        buf,
+    });
+    let mut got = Vec::new();
+    queue.wait(1, &mut |done| {
+        assert!(done.result.is_ok(), "the read failed");
+        got.push(done.buf.filled_bytes().to_vec());
+    });
+    assert_eq!(got, [b"lo, w".to_vec()], "the rest follows the filled part");
+    Ok(())
+}
+
+/// A partly filled read whose resumed offset would pass `u64::MAX` fails as
+/// invalid input, on the serial path and on the ring alike, instead of
+/// overflowing into a wrong file position.
+#[test]
+fn a_resumed_read_past_the_last_offset_fails_as_invalid_input() -> io::Result<()> {
+    use crate::fs::MemFs;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    // A source to fill the first bytes of each buffer from.
+    let mem = MemFs::new();
+    let path = Path::new("/src");
+    mem.open(path, &FsOpenOptions::new().write(true).create(true))?
+        .write_all(b"abcd")?;
+    let source: Arc<dyn FsFile> = Arc::from(mem.open(path, &FsOpenOptions::new().read(true))?);
+    let part_filled = || -> io::Result<QueuedBuf> {
+        let mut buf = QueuedBuf::new(8);
+        buf.fill_with(|buf| buf.fill_unfilled(|target| source.read_at_buf(target, 0)))?;
+        assert_eq!(buf.filled(), 4);
+        Ok(buf)
+    };
+    let dir = tempfile::tempdir()?;
+    let on_disk: Arc<dyn FsFile> = Arc::from(
+        two_files(&fs, dir.path(), 64)?
+            .into_iter()
+            .next()
+            .expect("two files"),
+    );
+
+    let mut queue = ring_queue(&fs);
+    // Serial (no descriptor), then the ring.
+    for (tag, file) in [(0usize, Arc::clone(&source)), (1, on_disk)] {
+        queue.submit(QueuedRead {
+            tag,
+            file,
+            offset: u64::MAX - 2,
+            buf: part_filled()?,
+        });
+    }
+    let mut kinds = Vec::new();
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| {
+            kinds.push((done.tag, done.result.map_err(|error| error.kind())));
+        });
+    }
+    kinds.sort_unstable_by_key(|(tag, _)| *tag);
+    assert_eq!(
+        kinds,
+        [
+            (0, Err(crate::io::ErrorKind::InvalidInput)),
+            (1, Err(crate::io::ErrorKind::InvalidInput)),
+        ]
+    );
     Ok(())
 }
 
@@ -951,18 +1371,18 @@ fn a_wait_for_none_does_not_wait_for_room_on_the_ring() -> io::Result<()> {
         tag: 0,
         file: Arc::clone(file),
         offset: 0,
-        buf: vec![0; len],
+        buf: QueuedBuf::new(len),
     };
 
     // The ring thread takes this read and waits on it.
-    let mut held = fs.read_queue();
+    let mut held = ring_queue(&fs);
     held.submit(read_of(&pipe, 1));
     held.wait(0, &mut |_| {});
     std::thread::sleep(std::time::Duration::from_millis(200));
     // Nothing drains the channel now: these fill it.
     let mut filling: Vec<_> = (0..ENTRIES)
         .map(|_| {
-            let mut queue = fs.read_queue();
+            let mut queue = ring_queue(&fs);
             queue.submit(read_of(&files[0], 64));
             queue.wait(0, &mut |_| {});
             queue
@@ -971,7 +1391,7 @@ fn a_wait_for_none_does_not_wait_for_room_on_the_ring() -> io::Result<()> {
 
     // The queue itself, which a thread can take, rather than the trait
     // object `read_queue` hands out.
-    let mut late = UringReadQueue::new(&fs.inner);
+    let mut late = UringReadQueue::with_cached_min(&fs.inner, usize::MAX);
     late.submit(read_of(&files[1], 64));
     std::thread::scope(|scope| {
         let (returned, polled) = std::sync::mpsc::channel();
@@ -1028,12 +1448,12 @@ fn a_wait_for_none_does_not_wait_for_the_submission_lock() -> io::Result<()> {
         .into_iter()
         .map(Arc::from)
         .collect();
-    let mut queue = UringReadQueue::new(&fs.inner);
+    let mut queue = UringReadQueue::with_cached_min(&fs.inner, usize::MAX);
     queue.submit(QueuedRead {
         tag: 0,
         file: Arc::clone(&files[0]),
         offset: 0,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
 
     let lock = fs
@@ -1078,12 +1498,12 @@ fn a_wake_asked_for_with_reads_in_flight_is_declined() -> io::Result<()> {
         .map(Arc::from)
         .collect();
     let wake = Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
-    let mut queue = UringReadQueue::new(&fs.inner);
+    let mut queue = UringReadQueue::with_cached_min(&fs.inner, usize::MAX);
     queue.submit(QueuedRead {
         tag: 0,
         file: Arc::clone(&files[0]),
         offset: 0,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
     queue.issue(true);
     assert!(!queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
@@ -1109,14 +1529,14 @@ fn a_reused_read_queue_keeps_no_slot_for_a_read_handed_back() -> io::Result<()> 
         .into_iter()
         .map(Arc::from)
         .collect();
-    let mut queue = UringReadQueue::new(&fs.inner);
+    let mut queue = UringReadQueue::with_cached_min(&fs.inner, usize::MAX);
     for round in 0..100usize {
         for i in 0..8usize {
             queue.submit(QueuedRead {
                 tag: round * 8 + i,
                 file: Arc::clone(&files[i % 2]),
                 offset: (i * 64) as u64,
-                buf: vec![0; 64],
+                buf: QueuedBuf::new(64),
             });
         }
         while queue.outstanding() > 0 {
@@ -1158,26 +1578,27 @@ fn a_read_queue_hands_back_reads_the_ring_cannot_take() -> io::Result<()> {
         .into_iter()
         .map(Arc::from)
         .collect();
-    let mut queue = fs.read_queue();
+    let mut queue = ring_queue(&fs);
     queue.submit(QueuedRead {
         tag: 0,
         file: Arc::clone(&files[0]),
         offset: 0,
-        buf: Vec::new(),
+        buf: QueuedBuf::new(0),
     });
-    // Zeroed and never touched, so it costs address space, not memory.
+    // Allocated unzeroed and never touched, so it costs address space, not
+    // memory.
     let too_long = usize::try_from(i32::MAX).expect("fits") + 1;
     queue.submit(QueuedRead {
         tag: 1,
         file: Arc::clone(&files[0]),
         offset: 0,
-        buf: vec![0; too_long],
+        buf: QueuedBuf::new(too_long),
     });
     queue.submit(QueuedRead {
         tag: 2,
         file: Arc::clone(&files[0]),
         offset: 64,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
     assert_eq!(
         drain_results(&mut *queue),
@@ -1212,18 +1633,18 @@ fn a_serial_read_reports_a_short_read_and_a_refused_one() -> io::Result<()> {
     ));
     let refused: Arc<dyn FsFile> = Arc::from(faulty.open(path, &FsOpenOptions::new().read(true))?);
 
-    let mut queue = fs.read_queue();
+    let mut queue = ring_queue(&fs);
     queue.submit(QueuedRead {
         tag: 0,
         file: short,
         offset: 7,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
     queue.submit(QueuedRead {
         tag: 1,
         file: refused,
         offset: 0,
-        buf: vec![0; 5],
+        buf: QueuedBuf::new(5),
     });
     assert_eq!(
         drain_results(&mut *queue),
@@ -1256,12 +1677,12 @@ fn a_read_queue_fails_its_reads_once_the_ring_thread_is_gone() -> io::Result<()>
             .take(),
     );
     for min in [0usize, 1] {
-        let mut queue = fs.read_queue();
+        let mut queue = ring_queue(&fs);
         queue.submit(QueuedRead {
             tag: 0,
             file: Arc::clone(&files[0]),
             offset: 0,
-            buf: vec![0; 64],
+            buf: QueuedBuf::new(64),
         });
         let mut got = Vec::new();
         queue.wait(min, &mut |done| {
@@ -1302,12 +1723,12 @@ fn a_poisoned_submission_lock_still_sends() -> io::Result<()> {
     });
     assert!(fs.inner.tx.is_poisoned(), "the lock is poisoned");
 
-    let mut queue = fs.read_queue();
+    let mut queue = ring_queue(&fs);
     queue.submit(QueuedRead {
         tag: 0,
         file: Arc::clone(&files[0]),
         offset: 64,
-        buf: vec![0; 64],
+        buf: QueuedBuf::new(64),
     });
     let mut got = Vec::new();
     while queue.outstanding() > 0 {
@@ -1332,14 +1753,14 @@ fn a_read_queue_hands_back_completions_in_any_order() -> io::Result<()> {
         .into_iter()
         .map(Arc::from)
         .collect();
-    let mut queue = UringReadQueue::new(&fs.inner);
+    let mut queue = UringReadQueue::with_cached_min(&fs.inner, usize::MAX);
     // Two reads as if on the ring, at positions 0 and 1.
     for tag in 0..2usize {
         queue.sent.push_back(Some(QueuedRead {
             tag,
             file: Arc::clone(&files[0]),
             offset: 0,
-            buf: vec![0; 64],
+            buf: QueuedBuf::new(64),
         }));
     }
     queue.on_ring = 2;
@@ -1386,13 +1807,13 @@ fn dropping_a_read_queue_with_reads_in_flight_leaves_the_backend_usable() -> io:
         .map(Arc::from)
         .collect();
     for _ in 0..50 {
-        let mut queue = fs.read_queue();
+        let mut queue = ring_queue(&fs);
         for tag in 0..128usize {
             queue.submit(QueuedRead {
                 tag,
                 file: Arc::clone(&files[tag % 2]),
                 offset: (tag * 64) as u64,
-                buf: vec![0; 64],
+                buf: QueuedBuf::new(64),
             });
         }
         // Puts every read on the ring without waiting for any.
@@ -1533,11 +1954,15 @@ fn a_fault_rule_fires_on_reads_through_the_wrapped_ring_queue() -> io::Result<()
                 tag,
                 file: Arc::clone(&file),
                 offset: (tag * 64) as u64,
-                buf: vec![0; 64],
+                buf: QueuedBuf::new(64),
             });
         }
         queue.wait(8, &mut |read| {
-            done.push((read.tag, read.buf, read.result.err().map(|e| e.kind())));
+            done.push((
+                read.tag,
+                read.buf.filled_bytes().to_vec(),
+                read.result.err().map(|e| e.kind()),
+            ));
         });
     }
     assert_eq!(

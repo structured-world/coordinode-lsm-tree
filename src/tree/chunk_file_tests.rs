@@ -72,9 +72,11 @@ fn a_chunk_on_another_table_closes_the_carried_file_before_asking_for_its_own() 
     let asked = chunk.take_reads(&tasks, &mut carried, &mut work)?;
     assert_eq!(asked, work.reads.len(), "every read asked for is counted");
     for mut read in core::mem::take(&mut work.reads) {
-        let filled = read.file.read_at(&mut read.buf, read.offset)?;
-        assert_eq!(filled, read.buf.len(), "the whole block is read");
-        chunk.read(&tasks, read.tag, read.buf, &mut keep_room);
+        read.buf.read_from(read.file.as_ref(), read.offset)?;
+        let Some(frame) = read.buf.into_slice() else {
+            panic!("the whole block is read");
+        };
+        chunk.read(&tasks, read.tag, frame, &mut keep_room);
     }
     let mut results: Vec<Option<InternalValue>> = alloc::vec![None];
     chunk.finish(&tasks, &mut results, None)?;
