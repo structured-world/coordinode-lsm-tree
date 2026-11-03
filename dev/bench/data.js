@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793702845938,
+  "lastUpdate": 1793702850136,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -101520,6 +101520,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.404526625,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "27f3eec8aecb6be1028cd6fbaaefdbb46f37839d",
+          "message": "build: link x86_64 Linux through mold (#1048)\n\n## Summary\n- x86_64 Linux links through mold where it is installed: a full test\nbuild on a Linux runner writes 3.1 GB instead of 22.4 GB with rust-lld,\nin 10:41 instead of 12:06.\n- Where mold is absent (a cross container, a machine without it) the\nbuild links as before, with rustc's lld. macOS and Windows are\nunchanged.\n\n## Changes\n- `.cargo/config.toml` + `.cargo/cc-mold.sh`: the\n`x86_64-unknown-linux-gnu` linker driver, `cc -fuse-ld=mold` when mold\nis on PATH, plain `cc` otherwise.\n- `.github/actions/setup-mold`: installs mold with apt on Linux runners,\na no-op elsewhere; referenced as `$/.github/actions/setup-mold` by the\nLinux build jobs of the CI workflow and by the release publish job.\n- The heal fuzzer job builds only the library's tests (`--lib`): the\nfuzzer is a unit test, and building every integration test binary in\ndebug filled the hosted runner's disk.\n\n## Testing\nOn a Linux runner: the crate's test binaries carry mold in `.comment`, a\nbuild with mold off PATH links with lld, and `tools/compare-rocksdb`\nwith RocksDB's C++ links through mold; the full suite passed on\nmold-linked binaries (5579/5579).\n\nCloses #1045",
+          "timestamp": "2026-11-03T10:28:55Z",
+          "tree_id": "2fa730b3451ce64503c16ff7a07ca7711ef0e461",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/27f3eec8aecb6be1028cd6fbaaefdbb46f37839d"
+        },
+        "date": 1793702848877,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 733.449,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 186.777883ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 361.414,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 187.230882ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1663.71,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 307.56203ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4923.31,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 21425.038,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.743,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 50.692095,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.41589691,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.959,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 51.740671,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.409791016,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
