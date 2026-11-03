@@ -144,6 +144,10 @@ fn std_positioned_reads_racing_on_an_overlapped_handle_get_their_own_bytes() -> 
         .open(&path)?;
 
     std::thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "every reader is spawned before any is joined, so they race"
+        )]
         let readers: Vec<_> = (0..8)
             .map(|reader| {
                 let (file, content) = (&file, &content);
