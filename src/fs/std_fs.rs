@@ -183,68 +183,18 @@ impl FsFile for File {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        // Fill-or-EOF loop: retry on short reads and EINTR so that callers
-        // see either a full buffer or a short read that signals EOF.
-        let mut filled = 0usize;
-
-        while filled < buf.len() {
-            // SAFETY: loop guard `filled < buf.len()` ensures this is in-bounds.
-            #[expect(clippy::expect_used, reason = "filled < buf.len() by loop guard")]
-            let remaining = buf.get_mut(filled..).expect("filled < buf.len()");
-            // `offset` is caller-supplied (not bounded by the file size), so a
-            // value near u64::MAX plus the bytes filled so far could overflow on
-            // a looping short read. Reject that explicitly, mirroring the
-            // io_uring backend, rather than wrapping to a wrong low offset.
-            let off = offset.checked_add(filled as u64).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow")
-            })?;
-
-            let n = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::FileExt;
-                    match FileExt::read_at(self, remaining, off) {
-                        Ok(n) => n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::FileExt;
-                    match FileExt::seek_read(self, remaining, off) {
-                        Ok(n) => n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-
-                #[cfg(not(any(unix, windows)))]
-                {
-                    let _ = (remaining, off);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "read_at is not supported on this platform",
-                    ));
-                }
-            };
-
-            if n == 0 {
-                break; // EOF
-            }
-            filled += n;
-        }
-
-        Ok(filled)
+        // SAFETY: the positioned read only has the kernel write the bytes.
+        #[expect(unsafe_code, reason = "see safety")]
+        let memory = unsafe { super::read_buf::as_uninit_mut(buf) };
+        read_uninit_at(self, memory, offset)
     }
 
     fn read_at_buf(&self, buf: &mut ReadBuf<'_>, offset: u64) -> io::Result<()> {
-        // SAFETY: `read_at` only hands the slice to the kernel to write, and
-        // returns how much of it was.
+        // SAFETY: the positioned read only has the kernel write the bytes,
+        // and returns how many from the start it wrote.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+            buf.fill_with(|memory| read_uninit_at(self, memory, offset))
         }
     }
 
@@ -794,6 +744,163 @@ pub(crate) fn is_cross_device(err: &io::Error) -> bool {
         err.kind(),
         io::ErrorKind::CrossesDevices | io::ErrorKind::Unsupported
     )
+}
+
+// ---------------------------------------------------------------------------
+// Positioned reads into memory that may be uninitialized
+// ---------------------------------------------------------------------------
+
+/// Reads `memory` from `file` at `offset` until it is full or the file ends,
+/// returning the bytes read from its start: fewer only at the end of the file.
+/// The kernel writes the memory through its pointer, so memory nothing has
+/// written needs no zeroing first and is never taken for bytes.
+///
+/// # Errors
+///
+/// The read's error, retried while interrupted; an offset past the largest a
+/// file can have is [`io::ErrorKind::InvalidInput`].
+pub(crate) fn read_uninit_at(
+    file: &File,
+    memory: &mut [core::mem::MaybeUninit<u8>],
+    offset: u64,
+) -> io::Result<usize> {
+    let mut filled = 0usize;
+    while let Some(rest) = memory.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+        // `offset` is the caller's, not bounded by the file size, so offset +
+        // filled can overflow on a looping short read: refused, not wrapped
+        // to a wrong low offset.
+        let at = offset
+            .checked_add(filled as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
+        match positioned_read(file, rest, at) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(filled)
+}
+
+/// One `pread` of `memory` at `offset`: the bytes it wrote from the start.
+#[cfg(unix)]
+fn positioned_read(
+    file: &File,
+    memory: &mut [core::mem::MaybeUninit<u8>],
+    offset: u64,
+) -> std::io::Result<usize> {
+    // A 32-bit Linux or Android target's `pread` takes a 32-bit offset;
+    // `pread64` takes the whole one. Elsewhere `off_t` is 64-bit.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    use libc::{off_t as Offset, pread};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use libc::{off64_t as Offset, pread64 as pread};
+    use std::os::unix::io::AsRawFd as _;
+
+    // The most one read may ask for: Darwin refuses more than `INT_MAX`
+    // bytes, elsewhere the kernel takes up to `isize::MAX`.
+    #[cfg(target_vendor = "apple")]
+    const READ_LIMIT: usize = libc::c_int::MAX.unsigned_abs() as usize - 1;
+    #[cfg(not(target_vendor = "apple"))]
+    const READ_LIMIT: usize = isize::MAX.unsigned_abs();
+
+    let offset = Offset::try_from(offset).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "read offset past the largest file offset",
+        )
+    })?;
+    let len = memory.len().min(READ_LIMIT);
+    // SAFETY: the descriptor is `file`'s, open for the call; the kernel writes
+    // at most `len` bytes of `memory`, which the call borrows, and reads none.
+    #[expect(unsafe_code, reason = "see safety")]
+    let n = unsafe { pread(file.as_raw_fd(), memory.as_mut_ptr().cast(), len, offset) };
+    usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
+}
+
+/// One `ReadFile` of `memory` at `offset`: the bytes it wrote from the start,
+/// none at the end of the file.
+#[cfg(windows)]
+fn positioned_read(
+    file: &File,
+    memory: &mut [core::mem::MaybeUninit<u8>],
+    offset: u64,
+) -> std::io::Result<usize> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile:
+    // a read at or past the end of a file opened for synchronous I/O with an
+    // OVERLAPPED offset fails with ERROR_HANDLE_EOF.
+    const ERROR_HANDLE_EOF: i32 = 38;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: *mut std::ffi::c_void,
+    }
+
+    // SAFETY: declaration matches the Windows `ReadFile` ABI and the
+    // `OVERLAPPED` layout.
+    #[allow(non_snake_case, reason = "FFI name matches Windows API")]
+    unsafe extern "system" {
+        fn ReadFile(
+            h_file: *mut std::ffi::c_void,
+            lp_buffer: *mut std::ffi::c_void,
+            n_number_of_bytes_to_read: u32,
+            lp_number_of_bytes_read: *mut u32,
+            lp_overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    let len = u32::try_from(memory.len()).unwrap_or(u32::MAX);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the offset is split into its low and high 32 bits"
+    )]
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: offset as u32,
+        offset_high: (offset >> 32) as u32,
+        h_event: core::ptr::null_mut(),
+    };
+    let mut read = 0u32;
+    // SAFETY: the handle is `file`'s, open for the call; the kernel writes at
+    // most `len` bytes of `memory`, which the call borrows, and reads none.
+    #[expect(unsafe_code, reason = "see safety")]
+    let ok = unsafe {
+        ReadFile(
+            file.as_raw_handle(),
+            memory.as_mut_ptr().cast(),
+            len,
+            &raw mut read,
+            &raw mut overlapped,
+        )
+    };
+    if ok == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_HANDLE_EOF) {
+            return Ok(0);
+        }
+        return Err(error);
+    }
+    usize::try_from(read).map_err(|_| std::io::Error::other("read count past usize"))
+}
+
+/// No positioned reads here.
+#[cfg(not(any(unix, windows)))]
+fn positioned_read(
+    _file: &File,
+    _memory: &mut [core::mem::MaybeUninit<u8>],
+    _offset: u64,
+) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "read_at is not supported on this platform",
+    ))
 }
 
 // ---------------------------------------------------------------------------

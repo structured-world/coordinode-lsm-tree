@@ -1707,16 +1707,15 @@ impl IoUringRawFile {
     ) -> crate::io::Result<()> {
         let mut reads = Vec::with_capacity(regions.len());
         for region in regions.iter_mut() {
-            // SAFETY: the bytes go only to the kernel, which only writes them.
-            #[expect(unsafe_code, reason = "see safety")]
-            let (offset, buf) = unsafe { region.target() };
-            if buf.is_empty() {
+            // The kernel only writes the memory the pointer names.
+            let (offset, buf, len) = region.target();
+            if len == 0 {
                 continue;
             }
             reads.push(RawRead {
                 fd: self.fd,
-                buf: buf.as_mut_ptr(),
-                len: batch_read_len(buf.len())?,
+                buf,
+                len: batch_read_len(len)?,
                 offset,
             });
         }
@@ -1730,6 +1729,33 @@ impl IoUringRawFile {
             .iter()
             .zip(results)
             .try_for_each(|(read, res)| read_verdict(res, read.len))
+    }
+
+    /// Reads `memory` at `offset` through the ring until it is full or the
+    /// file ends, retrying an interrupted read: the bytes read from its start.
+    fn read_fill(
+        &self,
+        memory: &mut [core::mem::MaybeUninit<u8>],
+        offset: u64,
+    ) -> crate::io::Result<usize> {
+        let mut total = 0usize;
+        while let Some(remaining) = memory.get_mut(total..).filter(|rest| !rest.is_empty()) {
+            let at = offset
+                .checked_add(total as u64)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "read_at offset overflow"))?;
+            let n = loop {
+                match self.ring.lock().read_uninit_at(self.fd, remaining, at) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        Ok(total)
     }
 
     /// Wraps an open descriptor `fd` (from [`open_raw`]) with the shared `ring`.
@@ -1835,32 +1861,10 @@ impl FsFile for IoUringRawFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // Fill-or-EOF: loop until the buffer is full or a 0-byte read signals
-        // EOF, retrying the ring op on EINTR (mirrors the std io_uring backend).
-        let mut total = 0usize;
-        while total < buf.len() {
-            let remaining = buf
-                .get_mut(total..)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "read_at slice out of range"))?;
-            let at = offset
-                .checked_add(total as u64)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "read_at offset overflow"))?;
-            let n = loop {
-                match self.ring.lock().read_at(self.fd, remaining, at) {
-                    Ok(n) => break n,
-                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
-                }
-            };
-            if n == 0 {
-                break;
-            }
-            total += n;
-        }
-        Ok(total)
+        // SAFETY: the ring only has the kernel write bytes into the memory.
+        #[expect(unsafe_code, reason = "see safety")]
+        let memory = unsafe { super::read_buf::as_uninit_mut(buf) };
+        self.read_fill(memory, offset)
     }
 
     // Every region goes to the ring in one batch instead of the trait's serial
@@ -1870,11 +1874,11 @@ impl FsFile for IoUringRawFile {
     }
 
     fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> crate::io::Result<()> {
-        // SAFETY: the ring only has the kernel write the slice, and `read_at`
-        // returns how much of it was.
+        // SAFETY: the ring only has the kernel write the memory, and
+        // `read_fill` returns how many bytes from its start it wrote.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+            buf.fill_with(|memory| self.read_fill(memory, offset))
         }
     }
 
@@ -2730,6 +2734,20 @@ impl IoUringRaw {
     /// # Errors
     /// Returns an [`Error`] if the read completes with a negative `-errno`.
     pub fn read_at(&mut self, fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        // SAFETY: the kernel only writes bytes into the memory.
+        #[expect(unsafe_code, reason = "see safety")]
+        let memory = unsafe { super::read_buf::as_uninit_mut(buf) };
+        self.read_uninit_at(fd, memory, offset)
+    }
+
+    /// [`Self::read_at`] into memory that may be uninitialized: the kernel
+    /// writes it through its pointer, so it needs no zeroing first.
+    pub(crate) fn read_uninit_at(
+        &mut self,
+        fd: i32,
+        buf: &mut [core::mem::MaybeUninit<u8>],
+        offset: u64,
+    ) -> Result<usize, Error> {
         let len = u32::try_from(buf.len()).map_err(|_| {
             Error::new(
                 ErrorKind::InvalidInput,
