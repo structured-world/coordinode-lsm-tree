@@ -495,6 +495,55 @@ fn file_write_fsync_read_round_trips_through_the_ring() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The ring reads offset `-1` as "the descriptor's own position": a write or
+/// read at `u64::MAX` is refused before it reaches the kernel, instead of
+/// landing at the start of the file.
+#[test]
+fn ring_io_past_the_largest_file_offset_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("largest.bin");
+    let cpath = std::ffi::CString::new(path.to_str().expect("utf8 path"))
+        .expect("path has no interior NUL");
+    let fd = open_raw(&cpath, O_CREAT | O_RDWR | O_TRUNC, 0o600).expect("open");
+    let mut ring = IoUringRaw::new(4).expect("ring setup");
+    ring.write_at(fd, b"original", 0).expect("write");
+
+    let err = ring
+        .write_at(fd, b"clobber!", u64::MAX)
+        .expect_err("past the largest file offset");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let mut bytes = [0u8; 8];
+    let err = ring
+        .read_at(fd, &mut bytes, u64::MAX)
+        .expect_err("past the largest file offset");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+    assert_eq!(ring.read_at(fd, &mut bytes, 0).expect("read"), 8);
+    assert_eq!(&bytes, b"original", "nothing was written");
+    close_raw(fd).expect("close");
+}
+
+/// A positioned read through a file the backend opened for writing only
+/// fails with the kernel's error, not as an end of file.
+#[cfg(feature = "std")]
+#[test]
+fn a_raw_read_of_a_write_only_file_reports_its_error() {
+    use std::io::Write as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(4).expect("ring setup");
+    let path = Path::new(tmp.path().to_str().expect("utf8 path")).join("write-only.bin");
+    let mut file = fs
+        .open(&path, &FsOpenOptions::new().write(true).create(true))
+        .expect("open");
+    file.write_all(b"bytes").expect("write");
+    let mut bytes = [0u8; 4];
+    let err = file
+        .read_at(&mut bytes, 0)
+        .expect_err("the descriptor is not open for reading");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput); // EBADF -> InvalidInput
+}
+
 #[test]
 fn errno_maps_to_expected_error_kinds() {
     // Every explicitly-mapped errno lands on its kind; anything else folds

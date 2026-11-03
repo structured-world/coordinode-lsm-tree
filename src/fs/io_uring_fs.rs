@@ -1066,6 +1066,14 @@ impl RingThread {
         read: &BatchRead,
         completion: Completion,
     ) {
+        // No file reaches past `i64::MAX`, and the ring reads offset `-1` as
+        // the descriptor's own position: such a read fails as `pread` would
+        // instead of reading the wrong bytes.
+        if i64::try_from(read.offset).is_err() {
+            completion.deliver(-libc::EINVAL);
+            return;
+        }
+
         let id = *next_id;
         *next_id = next_id.wrapping_add(1);
 

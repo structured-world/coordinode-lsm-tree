@@ -231,7 +231,8 @@ fn every_backend_fills_an_uninitialized_buffer() -> crate::Result<()> {
 
 /// The crate's own backends fill memory nobody wrote without zeroing it: a
 /// read that ends at the end of the file leaves initialized exactly what it
-/// read, where the trait's zeroing default would have initialized it all.
+/// read, where the trait's zeroing default would have initialized it all. The
+/// `io_uring` backends are held to the same by their conformance tests.
 #[test]
 fn every_builtin_backend_reads_without_zeroing() -> crate::Result<()> {
     use core::mem::MaybeUninit;

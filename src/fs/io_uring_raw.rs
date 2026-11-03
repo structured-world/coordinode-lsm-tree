@@ -1740,9 +1740,9 @@ impl IoUringRawFile {
     ) -> crate::io::Result<usize> {
         let mut total = 0usize;
         while let Some(remaining) = memory.get_mut(total..).filter(|rest| !rest.is_empty()) {
-            let at = offset
-                .checked_add(total as u64)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "read_at offset overflow"))?;
+            // No overflow: a first read past `i64::MAX` is refused before
+            // `total` grows, and `total` stays within the slice's `isize::MAX`.
+            let at = offset + total as u64;
             let n = loop {
                 match self.ring.lock().read_uninit_at(self.fd, remaining, at) {
                     Ok(n) => break n,
@@ -2227,6 +2227,19 @@ fn batch_read_len(len: usize) -> Result<u32, Error> {
     i32::try_from(len)
         .map(i32::unsigned_abs)
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))
+}
+
+/// `offset` as an SQE takes it: no file reaches past `i64::MAX`, and the ring
+/// reads offset `-1` as the descriptor's own position, so a larger one would
+/// land at the wrong place instead of failing.
+fn ring_offset(offset: u64) -> Result<u64, Error> {
+    if i64::try_from(offset).is_err() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "offset past the largest file offset",
+        ));
+    }
+    Ok(offset)
 }
 
 /// What a batched read's completion `res` says about its fixed-size block of
@@ -2759,7 +2772,7 @@ impl IoUringRaw {
             fd,
             addr: buf.as_mut_ptr() as u64,
             len,
-            off: offset,
+            off: ring_offset(offset)?,
             ..IoUringSqe::default()
         };
         let res = self.submit_and_reap_one(&sqe)?;
@@ -2783,7 +2796,7 @@ impl IoUringRaw {
             fd,
             addr: buf.as_ptr() as u64,
             len,
-            off: offset,
+            off: ring_offset(offset)?,
             ..IoUringSqe::default()
         };
         let res = self.submit_and_reap_one(&sqe)?;
@@ -2809,7 +2822,8 @@ impl IoUringRaw {
 
     /// Reads every one of `reads` through the ring, as many in flight at once
     /// as the rings hold, and stores each one's completion in `results` at its
-    /// index: the byte count, or `-errno`.
+    /// index: the byte count, or `-errno`; `-EINVAL` for one at an offset
+    /// [`ring_offset`] refuses, which never reaches the kernel.
     ///
     /// Every read has completed when this returns, so the buffers are the
     /// caller's again; no caller code runs while any is in flight.
@@ -2821,12 +2835,13 @@ impl IoUringRaw {
         unsafe {
             self.submit_all(
                 &mut |at| {
-                    reads.get(at).map(|read| IoUringSqe {
+                    let read = reads.get(at)?;
+                    Some(IoUringSqe {
                         opcode: IORING_OP_READ,
                         fd: read.fd,
                         addr: read.buf as u64,
                         len: read.len,
-                        off: read.offset,
+                        off: ring_offset(read.offset).ok()?,
                         ..IoUringSqe::default()
                     })
                 },

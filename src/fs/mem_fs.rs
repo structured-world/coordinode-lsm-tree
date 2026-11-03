@@ -331,12 +331,9 @@ impl MemFile {
         if !self.readable {
             return Err(io::Error::other("read_at requires read access"));
         }
-        let offset = usize::try_from(offset).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "read_at offset exceeds usize::MAX",
-            )
-        })?;
+        // A file in memory holds at most `usize::MAX` bytes, so an offset past
+        // that is past its end: nothing to read.
+        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
         let data = lock(&self.data)?;
         Ok(copy_from_data(memory, &data, offset))
     }

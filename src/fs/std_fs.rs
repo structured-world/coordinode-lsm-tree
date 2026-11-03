@@ -766,12 +766,10 @@ pub(crate) fn read_uninit_at(
 ) -> io::Result<usize> {
     let mut filled = 0usize;
     while let Some(rest) = memory.get_mut(filled..).filter(|rest| !rest.is_empty()) {
-        // `offset` is the caller's, not bounded by the file size, so offset +
-        // filled can overflow on a looping short read: refused, not wrapped
-        // to a wrong low offset.
-        let at = offset
-            .checked_add(filled as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
+        // No overflow: `positioned_read` refuses a first read past `i64::MAX`
+        // before `filled` grows, and `filled` stays within the slice's
+        // `isize::MAX`.
+        let at = offset + filled as u64;
         match positioned_read(file, rest, at) {
             Ok(0) => break,
             Ok(n) => filled += n,
@@ -855,6 +853,14 @@ fn positioned_read(
         ) -> i32;
     }
 
+    // No file reaches past `i64::MAX`; refused here as on Unix, not left to
+    // whatever `ReadFile` makes of a negative offset.
+    if i64::try_from(offset).is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "read offset past the largest file offset",
+        ));
+    }
     let len = u32::try_from(memory.len()).unwrap_or(u32::MAX);
     #[expect(
         clippy::cast_possible_truncation,
