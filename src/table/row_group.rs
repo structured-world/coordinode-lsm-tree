@@ -28,7 +28,7 @@ use crate::metrics::Metrics;
 
 /// A columnar row group as read: its directory and the pages that were
 /// fetched, each verified and cached as the block it is.
-pub struct RowGroupBlocks {
+pub(crate) struct RowGroupBlocks {
     /// The group's directory, shared with the cache that keeps it decoded.
     pub directory: Arc<PageDirectory>,
     /// The row pages the read selected.
@@ -41,7 +41,7 @@ impl RowGroupBlocks {
     /// Every page of the group, `pages` holding one block per directory entry
     /// in the directory's order.
     #[must_use]
-    pub fn whole(directory: Arc<PageDirectory>, pages: Vec<Block>) -> Self {
+    pub(crate) fn whole(directory: Arc<PageDirectory>, pages: Vec<Block>) -> Self {
         let row_pages = RowPageSet::every(&directory);
         let pages = (0..)
             .zip(pages)
@@ -60,7 +60,7 @@ impl RowGroupBlocks {
 
 /// One page as [`RowGroupBlocks::page_encodings`] describes it.
 #[cfg(feature = "std")]
-pub struct PageDescription {
+pub(crate) struct PageDescription {
     /// The page's directory entry.
     pub entry: PageEntry,
     /// The rows of its row page.
@@ -73,7 +73,7 @@ pub struct PageDescription {
 
 /// A page a read wanted: its place in the directory's entries and its block
 /// once fetched.
-pub struct PageSlot {
+pub(crate) struct PageSlot {
     /// The page's index into [`PageDirectory::entries`].
     pub index: usize,
     /// The page's block, `None` until it is fetched.
@@ -82,7 +82,7 @@ pub struct PageSlot {
 
 /// The row pages of a group a read selected, in row order.
 #[derive(Clone, Debug)]
-pub enum RowPageSet {
+pub(crate) enum RowPageSet {
     /// A run of consecutive row pages.
     Range(core::ops::Range<u16>),
     /// Row pages picked one by one, ascending.
@@ -113,7 +113,7 @@ impl RowPageSet {
 
 /// Which row pages of a group a read wants.
 #[derive(Clone, Debug, Default)]
-pub enum RowPageSelect<'a> {
+pub(crate) enum RowPageSelect<'a> {
     /// Every row page.
     #[default]
     All,
@@ -136,7 +136,7 @@ pub enum RowPageSelect<'a> {
 /// The pages a read of a row group wants: the columns it projects, times the
 /// row pages that hold the rows it asks for.
 #[derive(Clone, Debug, Default)]
-pub struct PageWant<'a> {
+pub(crate) struct PageWant<'a> {
     /// The column ids read, or every column when `None`.
     pub columns: Option<&'a [u16]>,
     /// The row pages read.
@@ -149,7 +149,7 @@ pub struct PageWant<'a> {
 
 impl<'a> PageWant<'a> {
     /// Every page of the group.
-    pub const ALL: Self = Self {
+    pub(crate) const ALL: Self = Self {
         columns: None,
         row_pages: RowPageSelect::All,
         whole: true,
@@ -158,7 +158,7 @@ impl<'a> PageWant<'a> {
     /// The pages of `columns` on the row pages `row_pages` selects, read
     /// directory first.
     #[must_use]
-    pub const fn projected(columns: &'a [u16], row_pages: RowPageSelect<'a>) -> Self {
+    pub(crate) const fn projected(columns: &'a [u16], row_pages: RowPageSelect<'a>) -> Self {
         Self {
             columns: Some(columns),
             row_pages,
@@ -301,7 +301,7 @@ impl Wanted<'_> {
 /// A row group decoded row page by row page: one batch per row page read, in
 /// row order, each holding the columns the read projected.
 #[derive(Debug)]
-pub struct RowPages {
+pub(crate) struct RowPages {
     /// Each row page's ordinal, one per batch.
     pub ordinals: Vec<u16>,
     /// One batch per row page read, in row order.
@@ -311,7 +311,7 @@ pub struct RowPages {
 impl RowPages {
     /// The rows the batches hold between them.
     #[must_use]
-    pub fn row_count(&self) -> u32 {
+    pub(crate) fn row_count(&self) -> u32 {
         // The directory proved the row pages sum to the group's `u32` row
         // count, so a subset of them cannot overflow.
         self.batches.iter().map(|b| b.row_count).sum()
@@ -325,7 +325,7 @@ impl RowPages {
     /// # Errors
     ///
     /// As [`ColumnBatch::concat`].
-    pub fn into_batch(self) -> crate::Result<crate::table::columnar::ColumnBatch> {
+    pub(crate) fn into_batch(self) -> crate::Result<crate::table::columnar::ColumnBatch> {
         crate::table::columnar::ColumnBatch::concat(self.batches)
     }
 }
@@ -333,7 +333,7 @@ impl RowPages {
 /// Everything a row group read needs to fetch, verify, count and cache the
 /// blocks of one group: the context [`crate::table::util::load_block`] takes
 /// for one block, plus the group's index entry.
-pub struct GroupRead<'a> {
+pub(crate) struct GroupRead<'a> {
     pub table_id: GlobalTableId,
     pub path: &'a Path,
     pub file_accessor: &'a FileAccessor,
@@ -1576,7 +1576,7 @@ impl RowGroupBlocks {
 /// read in this one's place, would otherwise be taken for this group's: every
 /// read of a group's blocks (an indexed read, a scan, verification, salvage)
 /// checks it before trusting anything the directory says.
-pub fn check_group_tag(
+pub(crate) fn check_group_tag(
     expected: Option<core::num::NonZeroU64>,
     directory: &PageDirectory,
 ) -> crate::Result<()> {
@@ -1597,7 +1597,7 @@ pub fn check_group_tag(
 ///
 /// [`crate::Error::InvalidHeader`] when the entry names no row group, which a
 /// columnar table's entries always do.
-pub fn indexed_directory_len(group: &BlockHandle) -> crate::Result<u32> {
+pub(crate) fn indexed_directory_len(group: &BlockHandle) -> crate::Result<u32> {
     group
         .row_group()
         .map(|group| group.directory_len.get())
@@ -1614,7 +1614,7 @@ pub fn indexed_directory_len(group: &BlockHandle) -> crate::Result<u32> {
 /// # Errors
 ///
 /// [`crate::Error::InvalidHeader`] when they differ.
-pub fn check_directory_len(indexed: u32, found: u32) -> crate::Result<()> {
+pub(crate) fn check_directory_len(indexed: u32, found: u32) -> crate::Result<()> {
     if indexed == found {
         Ok(())
     } else {
@@ -1633,7 +1633,10 @@ pub fn check_directory_len(indexed: u32, found: u32) -> crate::Result<()> {
 ///
 /// [`crate::Error::InvalidHeader`] when they differ, or when the entry names
 /// no row group.
-pub fn check_head_zones_len(group: &BlockHandle, directory: &PageDirectory) -> crate::Result<()> {
+pub(crate) fn check_head_zones_len(
+    group: &BlockHandle,
+    directory: &PageDirectory,
+) -> crate::Result<()> {
     let Some(indexed) = group.row_group().map(|group| group.head_zones_len) else {
         return Err(crate::Error::InvalidHeader(
             "columnar: the index entry names no row group",
@@ -1656,7 +1659,7 @@ pub fn check_head_zones_len(group: &BlockHandle, directory: &PageDirectory) -> c
 /// the group ends. A writer makes them agree by construction, so a
 /// disagreement is corruption, and it is refused before any page offset
 /// derived from the directory is used to slice the group.
-pub fn check_group_extent(
+pub(crate) fn check_group_extent(
     group: &BlockHandle,
     directory_len: u32,
     directory: &PageDirectory,

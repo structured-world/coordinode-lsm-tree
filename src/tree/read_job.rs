@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// How a key's newest version becomes its value.
-pub enum Values {
+pub(crate) enum Values {
     /// Stored inline: the version is the value.
     Inline,
     /// A blob tree's: an indirection is followed into the value log.
@@ -28,7 +28,7 @@ pub enum Values {
 
 /// What a read is about: the version it holds for its whole life, its keys,
 /// and how it reads them.
-pub struct ReadCtx<K> {
+pub(crate) struct ReadCtx<K> {
     pub super_version: SnapshotRef,
     pub keys: Vec<K>,
     pub seqno: SeqNo,
