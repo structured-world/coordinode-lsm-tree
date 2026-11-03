@@ -529,8 +529,11 @@ jobs:
         # either overwrite that dump or mask a real failure that does not replay.
         # `ignored-only` is the documented selector value; the shorter `only`
         # is a deprecated alias current nextest still accepts (this job ran
-        # fine on it) but newer releases may drop.
-        run: cargo nextest run --profile ci --all-features --run-ignored=ignored-only --retries 0 -E 'test(fuzz_heal_bitrot)'
+        # fine on it) but newer releases may drop. `--lib`: the fuzzer is a unit
+        # test of the library, so only that test binary is built, not the
+        # hundreds of integration-test binaries the filter would skip anyway
+        # and whose debug builds fill the runner's disk.
+        run: cargo nextest run --profile ci --all-features --lib --run-ignored=ignored-only --retries 0 -E 'test(fuzz_heal_bitrot)'
       - name: Dump reproducer on failure
         if: failure()
         # The corpus is not byte-deterministic (encrypted / timestamped SSTs), so
