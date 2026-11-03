@@ -1484,9 +1484,11 @@ impl<'r> UringReadQueue<'r> {
     /// Reads the reads held for a serial read, each into its own buffer.
     fn read_serial(&mut self) {
         for mut read in core::mem::take(&mut self.serial) {
-            // Past what is already filled, as the ring and a cached read
-            // resume a read; within the span the read asks for.
-            let (file, offset) = (&read.file, read.offset + read.buf.filled() as u64);
+            let Some(offset) = resume_offset(&read) else {
+                self.finished.push(done(read, Err(past_last_offset())));
+                continue;
+            };
+            let file = &read.file;
             let result = read
                 .buf
                 .fill_with(|buf| buf.fill_unfilled(|target| file.read_at_buf(target, offset)));
@@ -1533,14 +1535,13 @@ impl<'r> UringReadQueue<'r> {
             // so its bytes are checked while still in that core's cache and no
             // thread is woken for it; what it lacks goes to the ring.
             if read.buf.capacity() >= self.cached_min && read_cached(fd, &mut read) {
-                let result = if read.buf.is_full() {
-                    Ok(())
-                } else {
-                    Err(short_read())
-                };
-                self.finished.push(done(read, result));
+                self.finished.push(done(read, Ok(())));
                 continue;
             }
+            let Some(offset) = resume_offset(&read) else {
+                self.finished.push(done(read, Err(past_last_offset())));
+                continue;
+            };
             let Ok(len) = i32::try_from(read.buf.capacity() - read.buf.filled()) else {
                 self.finished.push(done(
                     read,
@@ -1562,8 +1563,7 @@ impl<'r> UringReadQueue<'r> {
                 fd,
                 buf: UnsafeSendMutPtr(dst),
                 len: len.unsigned_abs(),
-                // Past what the page cache already gave.
-                offset: read.offset + read.buf.filled() as u64,
+                offset,
             });
             self.sent.push_back(Some(read));
             places.push(place);
@@ -1678,20 +1678,31 @@ static NOWAIT_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// left part of that, 256 KiB none.
 const CACHED_MIN: usize = 256 << 10;
 
+/// Where `read` goes on from: past what its buffer already holds, as a read
+/// handed back to wait its turn keeps what it was given before. `None` past
+/// the last offset a file can have.
+fn resume_offset(read: &QueuedRead) -> Option<u64> {
+    read.offset
+        .checked_add(u64::try_from(read.buf.filled()).ok()?)
+}
+
+/// A read whose resumed offset passes the last one a file can have.
+fn past_last_offset() -> crate::io::Error {
+    crate::io::Error::from(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "read offset past the last file offset",
+    ))
+}
+
 /// Copies into `read` what the page cache holds of it, without waiting for
-/// the device: `true` when the read is over, filled or at the end of the
-/// file, `false` when the rest is for the ring.
+/// the device: `true` when the buffer is full, `false` when the rest is for
+/// the ring, which also tells the end of the file apart.
 fn read_cached(fd: i32, read: &mut QueuedRead) -> bool {
     use core::sync::atomic::Ordering;
     if NOWAIT_REFUSED.load(Ordering::Relaxed) {
         return false;
     }
-    // Past what is already filled: a read handed back to wait its turn keeps
-    // what the page cache gave it before.
-    let Some(offset) = u64::try_from(read.buf.filled())
-        .ok()
-        .and_then(|filled| read.offset.checked_add(filled))
-        .and_then(|offset| libc::off_t::try_from(offset).ok())
+    let Some(offset) = resume_offset(read).and_then(|offset| libc::off_t::try_from(offset).ok())
     else {
         return false;
     };
@@ -1728,9 +1739,11 @@ fn read_cached(fd: i32, read: &mut QueuedRead) -> bool {
     unsafe {
         read.buf.assume_written(n);
     }
-    // Nothing read is the end of the file; the rest of a part read may only
-    // be out of the cache.
-    read.buf.is_full() || n == 0
+    // A part read, or nothing, may only be the rest being out of the cache:
+    // some kernels (5.9, 5.10) answer a read that must not wait with zero
+    // bytes before the end of the file. The ring reads on, and reports the
+    // end of the file as a short read.
+    read.buf.is_full()
 }
 
 /// `read` handed back with `result`.

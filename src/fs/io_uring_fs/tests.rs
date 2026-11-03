@@ -1122,6 +1122,63 @@ fn a_serial_read_resumes_past_its_filled_part() -> io::Result<()> {
     Ok(())
 }
 
+/// A partly filled read whose resumed offset would pass `u64::MAX` fails as
+/// invalid input, on the serial path and on the ring alike, instead of
+/// overflowing into a wrong file position.
+#[test]
+fn a_resumed_read_past_the_last_offset_fails_as_invalid_input() -> io::Result<()> {
+    use crate::fs::MemFs;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    // A source to fill the first bytes of each buffer from.
+    let mem = MemFs::new();
+    let path = Path::new("/src");
+    mem.open(path, &FsOpenOptions::new().write(true).create(true))?
+        .write_all(b"abcd")?;
+    let source: Arc<dyn FsFile> = Arc::from(mem.open(path, &FsOpenOptions::new().read(true))?);
+    let part_filled = || -> io::Result<QueuedBuf> {
+        let mut buf = QueuedBuf::new(8);
+        buf.fill_with(|buf| buf.fill_unfilled(|target| source.read_at_buf(target, 0)))?;
+        assert_eq!(buf.filled(), 4);
+        Ok(buf)
+    };
+    let dir = tempfile::tempdir()?;
+    let on_disk: Arc<dyn FsFile> = Arc::from(
+        two_files(&fs, dir.path(), 64)?
+            .into_iter()
+            .next()
+            .expect("two files"),
+    );
+
+    let mut queue = ring_queue(&fs);
+    // Serial (no descriptor), then the ring.
+    for (tag, file) in [(0usize, Arc::clone(&source)), (1, on_disk)] {
+        queue.submit(QueuedRead {
+            tag,
+            file,
+            offset: u64::MAX - 2,
+            buf: part_filled()?,
+        });
+    }
+    let mut kinds = Vec::new();
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| {
+            kinds.push((done.tag, done.result.map_err(|error| error.kind())));
+        });
+    }
+    kinds.sort_unstable_by_key(|(tag, _)| *tag);
+    assert_eq!(
+        kinds,
+        [
+            (0, Err(crate::io::ErrorKind::InvalidInput)),
+            (1, Err(crate::io::ErrorKind::InvalidInput)),
+        ]
+    );
+    Ok(())
+}
+
 /// A wait for none never blocks on the ring's submission channel: with the
 /// ring thread held on a read that has no data yet and the channel full, it
 /// keeps its reads and returns, and a later wait for one sends and reads them.
