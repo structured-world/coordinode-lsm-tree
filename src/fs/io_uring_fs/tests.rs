@@ -299,10 +299,17 @@ fn a_kernel_refusing_reads_that_must_not_wait_sends_every_read_to_the_ring() -> 
         !other.inner.nowait_refused.load(SeqCst),
         "another backend keeps its fast path"
     );
-    assert!(
-        read_cached(fd, &mut cached, &other.inner.nowait_refused),
-        "and reads the cached bytes in place"
-    );
+    // Its read is in place, unless the test directory's own file system
+    // refuses reads that must not wait: then this backend records its own
+    // refusal, which is not the first backend's.
+    if read_cached(fd, &mut cached, &other.inner.nowait_refused) {
+        assert!(cached.buf.is_full(), "the cached bytes are read in place");
+    } else {
+        assert!(
+            other.inner.nowait_refused.load(SeqCst),
+            "only its own file system's refusal leaves the read to the ring"
+        );
+    }
     Ok(())
 }
 
