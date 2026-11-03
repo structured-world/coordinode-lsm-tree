@@ -356,7 +356,9 @@ impl PerfControl {
 
 fn main() -> lsm_tree::Result<()> {
     #[cfg(feature = "mimalloc")]
-    eprintln!("compaction_merge: built with the mimalloc feature, allocation counts read zero");
+    eprintln!(
+        "compaction_merge: built with the mimalloc feature, allocation counts, bytes and peak heap read zero"
+    );
     let mut perf = PerfControl::from_env()?;
     // `cargo test` runs a bench target too: one small round then.
     let measuring = std::env::args().any(|a| a == "--bench");

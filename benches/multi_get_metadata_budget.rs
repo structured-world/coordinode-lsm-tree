@@ -204,7 +204,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn main() {
     #[cfg(feature = "mimalloc")]
     eprintln!(
-        "multi_get_metadata_budget: built with the mimalloc feature, allocation counts read zero"
+        "multi_get_metadata_budget: built with the mimalloc feature, allocation counts, bytes and peak heap read zero"
     );
     if let Err(error) = run() {
         eprintln!("multi_get_metadata_budget failed: {error}");

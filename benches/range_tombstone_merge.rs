@@ -162,7 +162,7 @@ fn timed(
 fn main() -> lsm_tree::Result<()> {
     #[cfg(feature = "mimalloc")]
     eprintln!(
-        "range_tombstone_merge: built with the mimalloc feature, allocation counts read zero"
+        "range_tombstone_merge: built with the mimalloc feature, allocation counts, bytes and peak heap read zero"
     );
     let passes = std::env::var("RT_MERGE_SAMPLES")
         .ok()

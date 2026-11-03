@@ -305,7 +305,9 @@ fn layouts() -> lsm_tree::Result<()> {
 
 fn main() -> lsm_tree::Result<()> {
     #[cfg(feature = "mimalloc")]
-    eprintln!("filter_build: built with the mimalloc feature, allocation counts read zero");
+    eprintln!(
+        "filter_build: built with the mimalloc feature, allocation counts, bytes and peak heap read zero"
+    );
     // `cargo bench` passes `--bench`; a filter argument selects one part.
     let only: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     if only.as_deref().is_none_or(|o| "filters".contains(o)) {
