@@ -71,7 +71,7 @@ fn a_read_queue_reads_large_cached_reads_without_the_ring() -> io::Result<()> {
     });
     // A file system refusing reads that must not wait sends every read to
     // the ring: what comes back is still checked, but not how.
-    let in_place = !NOWAIT_REFUSED.load(SeqCst);
+    let in_place = !fs.inner.nowait_refused.load(SeqCst);
     // The small read, on the ring, may be back by then too.
     let first: Vec<usize> = got.iter().map(|(tag, _)| *tag).collect();
     if in_place {
@@ -129,7 +129,11 @@ fn a_cached_read_resumed_reads_past_its_filled_part() -> io::Result<()> {
         buf: QueuedBuf::new(64),
     };
     // The file ends 36 bytes into the read: those are taken, the rest waits.
-    assert!(!read_cached(fd, &mut read), "the read is not over yet");
+    let refused = &fs.inner.nowait_refused;
+    assert!(
+        !read_cached(fd, &mut read, refused),
+        "the read is not over yet"
+    );
     if read.buf.filled() == 0 {
         // This file system refuses reads that must not wait.
         return Ok(());
@@ -138,7 +142,10 @@ fn a_cached_read_resumed_reads_past_its_filled_part() -> io::Result<()> {
     let mut appended = fs.open(&path, &FsOpenOptions::new().append(true))?;
     appended.write_all(&bytes[100..])?;
 
-    assert!(read_cached(fd, &mut read), "the rest is in the cache now");
+    assert!(
+        read_cached(fd, &mut read, refused),
+        "the rest is in the cache now"
+    );
     assert!(read.buf.is_full());
     assert!(
         read.buf.filled_bytes() == &bytes[64..128],
@@ -183,12 +190,13 @@ fn a_cached_read_of_a_descriptor_without_flags_goes_to_the_ring() -> io::Result<
     };
     let dir = tempfile::tempdir()?;
     let (mut read, _) = cached_read(&fs, dir.path(), 0, 16)?;
-    assert!(!read_cached(-1, &mut read), "no flags, no read in place");
-    assert_eq!(read.buf.filled(), 0);
+    let refused = &fs.inner.nowait_refused;
     assert!(
-        !NOWAIT_REFUSED.load(SeqCst),
-        "a bad descriptor is no refusal"
+        !read_cached(-1, &mut read, refused),
+        "no flags, no read in place"
     );
+    assert_eq!(read.buf.filled(), 0);
+    assert!(!refused.load(SeqCst), "a bad descriptor is no refusal");
     Ok(())
 }
 
@@ -208,12 +216,13 @@ fn a_cached_read_the_kernel_fails_goes_to_the_ring() -> io::Result<()> {
         .write(true)
         .open(dir.path().join("cached.bin"))?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&write_only);
+    let refused = &fs.inner.nowait_refused;
     assert!(
-        !read_cached(fd, &mut read),
+        !read_cached(fd, &mut read, refused),
         "EBADF leaves the read to the ring"
     );
     assert_eq!(read.buf.filled(), 0);
-    assert!(!NOWAIT_REFUSED.load(SeqCst), "EBADF is no refusal");
+    assert!(!refused.load(SeqCst), "EBADF is no refusal");
     Ok(())
 }
 
@@ -226,14 +235,38 @@ fn a_cached_read_past_the_largest_offset_goes_to_the_ring() -> io::Result<()> {
     };
     let dir = tempfile::tempdir()?;
     let (mut read, fd) = cached_read(&fs, dir.path(), u64::MAX - 8, 16)?;
-    assert!(!read_cached(fd, &mut read));
+    assert!(!read_cached(fd, &mut read, &fs.inner.nowait_refused));
     assert_eq!(read.buf.filled(), 0);
     Ok(())
 }
 
+/// A read that starts below the largest offset but ends past it goes to the
+/// ring without asking the kernel, which would answer `EINVAL`: that answer
+/// is no refusal of reads that must not wait, and must not turn the fast
+/// path off for the backend's other reads.
+#[test]
+fn a_cached_read_ending_past_the_largest_offset_is_no_refusal() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let start = u64::try_from(i64::MAX).expect("positive") - 8;
+    let (mut read, fd) = cached_read(&fs, dir.path(), start, 16)?;
+    let refused = &fs.inner.nowait_refused;
+    assert!(!read_cached(fd, &mut read, refused));
+    assert_eq!(read.buf.filled(), 0);
+    assert!(
+        !refused.load(SeqCst),
+        "an overflowing span keeps the fast path on"
+    );
+    Ok(())
+}
+
 /// Once the kernel refuses a read that must not wait (a `/proc` file has no
-/// such reads), every later read goes to the ring, a cached one too. The
-/// flag is process-wide; each test runs in a process of its own.
+/// such reads), every later read of that backend goes to the ring, a cached
+/// one too; another backend still reads in place.
 #[test]
 fn a_kernel_refusing_reads_that_must_not_wait_sends_every_read_to_the_ring() -> io::Result<()> {
     use core::sync::atomic::Ordering::SeqCst;
@@ -247,14 +280,29 @@ fn a_kernel_refusing_reads_that_must_not_wait_sends_every_read_to_the_ring() -> 
     let (mut proc_read, _) = cached_read(&fs, dir.path(), 0, 16)?;
     let proc_fd = std::os::fd::AsRawFd::as_raw_fd(&proc_file);
 
-    assert!(!read_cached(proc_fd, &mut proc_read), "procfs refuses");
-    assert!(NOWAIT_REFUSED.load(SeqCst), "the refusal is remembered");
+    let refused = &fs.inner.nowait_refused;
     assert!(
-        !read_cached(fd, &mut cached),
+        !read_cached(proc_fd, &mut proc_read, refused),
+        "procfs refuses"
+    );
+    assert!(refused.load(SeqCst), "the refusal is remembered");
+    assert!(
+        !read_cached(fd, &mut cached, refused),
         "a cached read goes to the ring now"
     );
     assert_eq!(cached.buf.filled(), 0);
-    NOWAIT_REFUSED.store(false, SeqCst);
+
+    let Some(other) = try_io_uring() else {
+        return Ok(());
+    };
+    assert!(
+        !other.inner.nowait_refused.load(SeqCst),
+        "another backend keeps its fast path"
+    );
+    assert!(
+        read_cached(fd, &mut cached, &other.inner.nowait_refused),
+        "and reads the cached bytes in place"
+    );
     Ok(())
 }
 

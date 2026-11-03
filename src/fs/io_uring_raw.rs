@@ -2126,9 +2126,9 @@ impl IoUringRawFs {
             // bytes already, so its read covers the suffix from there; the
             // check above proved the offset and the length fit.
             let offset = req.offset + req.buf.filled() as u64;
-            // SAFETY: the kernel only writes the span, and it is counted
-            // filled only once its completion reports it whole.
-            let buf = unsafe { req.buf.unfilled_uninit_mut() }.as_mut_ptr();
+            // The kernel only writes the span, and it is counted filled only
+            // once its completion reports it whole.
+            let buf = req.buf.unfilled_uninit_mut().as_mut_ptr().cast::<u8>();
             reads.push(RawRead {
                 fd,
                 buf,

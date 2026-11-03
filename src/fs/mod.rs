@@ -957,34 +957,25 @@ impl<'a> BlockBuf<'a> {
         let rest = self.buf.get_mut(self.init..).unwrap_or_default();
         rest.fill(MaybeUninit::new(0));
         self.init = self.buf.len();
-        // SAFETY: every byte is initialized as of the line above.
-        #[expect(unsafe_code, reason = "see safety")]
-        unsafe {
-            self.unfilled_uninit_mut()
-        }
-    }
-
-    /// The part still to be filled, whether initialized or not, for a read
-    /// that only writes it.
-    ///
-    /// # Safety
-    ///
-    /// The caller must not read a byte of it before writing that byte, nor
-    /// hand it to code that might.
-    #[must_use]
-    pub unsafe fn unfilled_uninit_mut(&mut self) -> &mut [u8] {
-        let filled = self.filled;
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "filled <= buf.len() is the type's invariant"
-        )]
-        let rest = &mut self.buf[filled..];
-        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and the caller
-        // promises to read nothing it did not write.
+        let rest = self.unfilled_uninit_mut();
+        // SAFETY: every byte from the fill point on is initialized as of the
+        // zeroing above, and `MaybeUninit<u8>` has the layout of `u8`.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
             core::slice::from_raw_parts_mut(rest.as_mut_ptr().cast::<u8>(), rest.len())
         }
+    }
+
+    /// The part still to be filled, whether initialized or not, for a read
+    /// that only writes it: a kernel read given its pointer writes the bytes
+    /// in place, nothing zeroes them first.
+    ///
+    /// Not a `&mut [u8]`: a byte slice over memory never written is not one,
+    /// whether or not anything reads it.
+    #[must_use]
+    pub fn unfilled_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        // `filled` never passes the end, so the rest is always there.
+        self.buf.get_mut(self.filled..).unwrap_or_default()
     }
 
     /// Counts `n` more bytes as filled, written through
