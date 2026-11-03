@@ -835,6 +835,10 @@ fn positioned_read(
     // flight when ReadFile returns; the kernel keeps writing `memory` and the
     // OVERLAPPED until it completes, so the read is waited for here.
     const ERROR_IO_PENDING: i32 = 997;
+    // With no event in the OVERLAPPED the wait is on the file handle, which
+    // any other read of the handle signals too; the read is then still in
+    // flight and GetOverlappedResult says so with ERROR_IO_INCOMPLETE.
+    const ERROR_IO_INCOMPLETE: i32 = 996;
 
     #[repr(C)]
     struct Overlapped {
@@ -898,15 +902,26 @@ fn positioned_read(
         )
     };
     let mut error = (ok == 0).then(std::io::Error::last_os_error);
-    if error.as_ref().and_then(std::io::Error::raw_os_error) == Some(ERROR_IO_PENDING) {
+    // Waits until this read itself completed: a wait woken by another read of
+    // the handle reports this one incomplete and is taken again, so neither
+    // `memory` nor `overlapped` is released while the kernel may still write
+    // them. An event per read would cost a kernel object on every read of
+    // every handle, while only a handle opened for overlapped I/O, which this
+    // backend never opens itself, ever goes pending.
+    while matches!(
+        error.as_ref().and_then(std::io::Error::raw_os_error),
+        Some(ERROR_IO_PENDING | ERROR_IO_INCOMPLETE)
+    ) {
         // SAFETY: `overlapped` is the one the pending read was issued with,
-        // and the call returns only once the read completed, so neither it nor
-        // `memory` is released while the kernel may still write them.
+        // and it and `memory` stay borrowed until the loop sees it complete.
         #[expect(unsafe_code, reason = "see safety")]
         let done = unsafe {
             GetOverlappedResult(file.as_raw_handle(), &raw mut overlapped, &raw mut read, 1)
         };
         error = (done == 0).then(std::io::Error::last_os_error);
+        if error.as_ref().and_then(std::io::Error::raw_os_error) == Some(ERROR_IO_INCOMPLETE) {
+            std::thread::yield_now();
+        }
     }
     if let Some(error) = error {
         if error.raw_os_error() == Some(ERROR_HANDLE_EOF) {
