@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793576193687,
+  "lastUpdate": 1793695256413,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66808,6 +66808,90 @@ window.BENCHMARK_DATA = {
             "value": 351541.4632644831,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 12.2us | P99.9: 90.6us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5c3af0c3c6741c4c325fc312b11b968c50e3336f",
+          "message": "feat: opt-in mimalloc global allocator (#1047)\n\n## Summary\n- Opt-in `mimalloc` feature, off by default: installs mimalloc as the\nglobal allocator of the binary the crate is built into.\n- Under glibc's allocator a process holding large values pays on every\npass for the heap going back to the kernel and faulting in again; with\nmimalloc, 16 values of 4 MiB read in 1149 us per key instead of 5926 us.\nThe allocator comparison behind the choice (system, jemalloc, mimalloc\nv2/v3, Google and gperftools TCMalloc, snmalloc, rpmalloc) is in #1046.\n\n## Changes\n- `Cargo.toml`: `mimalloc` feature with optional `mimalloc` and\n`libmimalloc-sys`; crate docs describe it and its limit (a program links\none global allocator).\n- `src/lib.rs`: the global allocator under the feature;\n`src/mimalloc_tests.rs` checks that small and large allocations come\nfrom mimalloc.\n- `tests/seekable_range.rs` and four benches keep their counting\nallocator without the feature; under it the allocation test is left out\nand the benches say their counts read zero.\n- CI runs the allocation-counting test without the feature beside the\nall-features suite.\n\n## Testing\nfmt, clippy (all features and default), the full nextest suite with all\nfeatures, the allocation-counting test without the feature and doc tests\npass on Linux.\n\nCloses #1046\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added an opt-in memory allocator configuration that can change\napplication memory usage and performance.\n* **Benchmarks**\n* Allocation-count results are unavailable when the alternate allocator\nis enabled; benchmarks now display a notice.\n* **Tests**\n* Added checks for builds using the alternate allocator and expanded\nrange-query test coverage under the default allocator.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-03T08:18:46Z",
+          "tree_id": "37e34a3ed6de1fb5b325a8355538f41528432ba5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5c3af0c3c6741c4c325fc312b11b968c50e3336f"
+        },
+        "date": 1793695255171,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 135130.94870466727,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.9us | P99.9: 25.1us\nthreads: 1 | elapsed: 3.96s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3018170.1691424814,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 835660.8158376042,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 12.4us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 467384.1181137996,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 7.1us | P99.9: 29.8us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3184486.810715441,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 319139.7534330733,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.6us | P99.9: 16.7us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 191121.6348119587,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.9us | P99.9: 20.9us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 815623.4199462739,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.3us | P99.9: 12.4us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 981734.1152119078,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 343727.1644321236,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 17.2us | P99.9: 89.6us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
           }
         ]
       }
