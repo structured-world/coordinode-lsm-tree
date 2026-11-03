@@ -421,10 +421,10 @@ jobs:
         # Runs whatever the db_bench pass did, so a host that cannot build
         # RocksDB still reaches the db_bench publishing below.
         if: ${{ !cancelled() }}
-        # ~16 min on an idle host, about half of it the sustained overwrite at
-        # zstd 22 (compaction run to rest every round); the limit leaves room
-        # for a loaded one.
-        timeout-minutes: 25
+        # ~17 min on an idle host, about half of it the sustained overwrite at
+        # zstd 22 (compaction run to rest every round) and a few minutes the
+        # blob groups; the limit leaves room for a loaded one.
+        timeout-minutes: 35
         # Pin the published dashboard to the RocksDbParity preset (the apples-to-
         # apples comparison): every lsm-tree-only on-disk opt-in is OFF so the
         # numbers are not paying for protection RocksDB has no equivalent for.
