@@ -176,6 +176,8 @@ fn cached_read(
 /// which reports the failure as it would for any read.
 #[test]
 fn a_cached_read_of_a_descriptor_without_flags_goes_to_the_ring() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
     let Some(fs) = try_io_uring() else {
         return Ok(());
     };
@@ -195,6 +197,8 @@ fn a_cached_read_of_a_descriptor_without_flags_goes_to_the_ring() -> io::Result<
 /// refusing reads that must not wait.
 #[test]
 fn a_cached_read_the_kernel_fails_goes_to_the_ring() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
     let Some(fs) = try_io_uring() else {
         return Ok(());
     };
@@ -232,6 +236,8 @@ fn a_cached_read_past_the_largest_offset_goes_to_the_ring() -> io::Result<()> {
 /// flag is process-wide; each test runs in a process of its own.
 #[test]
 fn a_kernel_refusing_reads_that_must_not_wait_sends_every_read_to_the_ring() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
     let Some(fs) = try_io_uring() else {
         return Ok(());
     };
