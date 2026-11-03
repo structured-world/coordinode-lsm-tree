@@ -1172,8 +1172,26 @@ fn verify_point_reads(warm: &WarmEngine, inputs: &WorkloadInputs) {
 }
 
 /// One `get` per stored key, timed.
+///
+/// With `COMPARE_HOLD` set, ours and RocksDB keep every value of a pass
+/// alive until it ends, as a batched read does. Dropped one by one, each
+/// value hands its just-freed buffer to the next read, so a point read is
+/// compared with `multi_get` on equal work only when it holds them too.
 fn point_read_routine<'a>(warm: &'a WarmEngine, inputs: &'a WorkloadInputs) -> paired::Routine<'a> {
     match warm {
+        WarmEngine::Ours { tree, .. } if std::env::var_os("COMPARE_HOLD").is_some() => {
+            Box::new(move |iters| {
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let mut held = Vec::with_capacity(inputs.keys.len());
+                    for key in &inputs.keys {
+                        held.push(tree.get(key, MAX_SEQNO).expect("ours: get"));
+                    }
+                    std::hint::black_box(held);
+                }
+                start.elapsed()
+            })
+        }
         WarmEngine::Ours { tree, .. } => Box::new(move |iters| {
             let start = std::time::Instant::now();
             for _ in 0..iters {
@@ -1184,6 +1202,19 @@ fn point_read_routine<'a>(warm: &'a WarmEngine, inputs: &'a WorkloadInputs) -> p
             }
             start.elapsed()
         }),
+        WarmEngine::RocksDb { db, .. } if std::env::var_os("COMPARE_HOLD").is_some() => {
+            Box::new(move |iters| {
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let mut held = Vec::with_capacity(inputs.keys.len());
+                    for key in &inputs.keys {
+                        held.push(db.get_pinned(key).expect("rocksdb: get"));
+                    }
+                    std::hint::black_box(held);
+                }
+                start.elapsed()
+            })
+        }
         // `get_pinned` hands back a view of the block, as our `get` does;
         // plain `get` would copy every value into a fresh `Vec` and charge
         // RocksDB an allocation ours never pays.
