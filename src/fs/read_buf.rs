@@ -3,12 +3,13 @@
 
 //! A read target that may start uninitialized.
 //!
-//! `FsFile::read_at` takes `&mut [u8]`, and a safe implementation may read that
-//! slice, so handing it unwritten memory would be undefined behaviour reachable
-//! from safe code. A [`ReadBuf`] keeps count of what is initialized: safe code
-//! can only ask for zeroed bytes and mark as filled what it was given, so the
+//! `FsFile::read_at` takes `&mut [u8]`, and a byte slice over memory nothing
+//! has written is not one, so a [`ReadBuf`] hands unwritten memory out only as
+//! `MaybeUninit` bytes. It keeps count of what is initialized: safe code can
+//! only ask for zeroed bytes and mark as filled what it was given, so the
 //! zeroing happens only where the code doing the read is unknown, and a backend
-//! known to only write skips it through the `unsafe` methods.
+//! whose read only writes (a `pread`, a kernel ring read, a copy) fills the
+//! memory as it is, through [`ReadBuf::fill_with`].
 
 use core::mem::MaybeUninit;
 
@@ -32,12 +33,12 @@ pub type ReadResult = io::Result<()>;
 /// use lsm_tree::fs::ReadBuf;
 ///
 /// fn read_at_buf(buf: &mut ReadBuf<'_>, device: &[u8]) -> lsm_tree::fs::ReadResult {
-///     // SAFETY: the closure writes the slice, reads none of it, and returns
-///     // how much it wrote.
+///     // SAFETY: the closure writes only initialized bytes, and the first `n`
+///     // of them, which it returns.
 ///     unsafe {
-///         buf.fill_with(|bytes| {
-///             let n = bytes.len().min(device.len());
-///             bytes[..n].copy_from_slice(&device[..n]);
+///         buf.fill_with(|memory| {
+///             let n = memory.len().min(device.len());
+///             memory[..n].write_copy_of_slice(&device[..n]);
 ///             Ok(n)
 ///         })
 ///     }
@@ -86,14 +87,15 @@ impl<'a> ReadBuf<'a> {
 
     /// The whole buffer as initialized bytes, zeroing what is not yet.
     pub fn init_mut(&mut self) -> &mut [u8] {
-        if let Some(rest) = self.buf.get_mut(self.init..) {
-            rest.fill(MaybeUninit::new(0));
-        }
+        // `init` never passes the end, so the rest is always there.
+        let rest = self.buf.get_mut(self.init..).unwrap_or_default();
+        rest.fill(MaybeUninit::new(0));
         self.init = self.buf.len();
-        // SAFETY: every byte is initialized as of the line above.
+        // SAFETY: every byte is initialized as of the line above, and
+        // `MaybeUninit<u8>` has the layout of `u8`.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            self.bytes_mut_unchecked()
+            core::slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<u8>(), self.buf.len())
         }
     }
 
@@ -114,22 +116,6 @@ impl<'a> ReadBuf<'a> {
         Ok(())
     }
 
-    /// The whole buffer as bytes, whether initialized or not.
-    ///
-    /// # Safety
-    ///
-    /// The caller must not read a byte of it before writing that byte, nor
-    /// hand it to code that might.
-    #[must_use]
-    pub unsafe fn bytes_mut_unchecked(&mut self) -> &mut [u8] {
-        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and the caller
-        // promises to read nothing it did not write.
-        #[expect(unsafe_code, reason = "see safety")]
-        unsafe {
-            core::slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<u8>(), self.buf.len())
-        }
-    }
-
     /// Marks the first `filled` bytes as filled and initialized.
     ///
     /// # Safety
@@ -142,24 +128,24 @@ impl<'a> ReadBuf<'a> {
         self.init = self.init.max(filled);
     }
 
-    /// Fills the buffer with `read`, which returns the bytes it wrote, without
-    /// zeroing it first.
+    /// Fills the buffer with `read`, which is given the whole buffer as it is,
+    /// initialized or not, and returns the bytes it wrote from its start.
     ///
     /// # Safety
     ///
-    /// `read` must only write the slice it is given, and must have written as
-    /// many bytes from its start as it returns.
+    /// `read` must write only initialized bytes into the memory it is given
+    /// (never `MaybeUninit::uninit()`, which would undo bytes counted
+    /// initialized), and must have written as many bytes from its start as
+    /// it returns.
     ///
     /// # Errors
     ///
     /// The error of `read`.
     pub unsafe fn fill_with(
         &mut self,
-        read: impl FnOnce(&mut [u8]) -> io::Result<usize>,
+        read: impl FnOnce(&mut [MaybeUninit<u8>]) -> io::Result<usize>,
     ) -> io::Result<()> {
-        // SAFETY: the caller promises `read` only writes.
-        #[expect(unsafe_code, reason = "see safety")]
-        let filled = read(unsafe { self.bytes_mut_unchecked() })?;
+        let filled = read(&mut *self.buf)?;
         // SAFETY: the caller promises `read` wrote `filled` bytes.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
@@ -233,28 +219,43 @@ pub(crate) fn read_each(
 /// uninitialized regions alike without gathering them into another list.
 #[cfg(any(io_uring_fs, all(target_os = "linux", feature = "io-uring-raw")))]
 pub(crate) trait ReadRegion {
-    /// The region's file offset and bytes.
-    ///
-    /// # Safety
-    ///
-    /// The caller must only write the bytes, as a kernel read does.
-    unsafe fn target(&mut self) -> (u64, &mut [u8]);
+    /// The region's file offset, and where and how long its memory is: a
+    /// pointer for the kernel to write, never a byte slice over memory that
+    /// may not be initialized.
+    fn target(&mut self) -> (u64, *mut u8, usize);
 }
 
 #[cfg(any(io_uring_fs, all(target_os = "linux", feature = "io-uring-raw")))]
 impl ReadRegion for (u64, &mut [u8]) {
-    unsafe fn target(&mut self) -> (u64, &mut [u8]) {
-        (self.0, &mut *self.1)
+    fn target(&mut self) -> (u64, *mut u8, usize) {
+        (self.0, self.1.as_mut_ptr(), self.1.len())
     }
 }
 
 #[cfg(any(io_uring_fs, all(target_os = "linux", feature = "io-uring-raw")))]
 impl ReadRegion for (u64, ReadBuf<'_>) {
-    unsafe fn target(&mut self) -> (u64, &mut [u8]) {
-        // SAFETY: the caller only writes the bytes.
-        #[expect(unsafe_code, reason = "see safety")]
-        let bytes = unsafe { self.1.bytes_mut_unchecked() };
-        (self.0, bytes)
+    fn target(&mut self) -> (u64, *mut u8, usize) {
+        (
+            self.0,
+            self.1.buf.as_mut_ptr().cast::<u8>(),
+            self.1.buf.len(),
+        )
+    }
+}
+
+/// `bytes` as memory a read may write, for a backend whose read of
+/// [`MaybeUninit`] memory serves its `read_at` too.
+///
+/// # Safety
+///
+/// The caller must write only initialized bytes into it: the caller of
+/// `read_at` lent initialized bytes and may read them all afterwards.
+pub(crate) unsafe fn as_uninit_mut(bytes: &mut [u8]) -> &mut [MaybeUninit<u8>] {
+    // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and the caller writes
+    // nothing uninitialized.
+    #[expect(unsafe_code, reason = "see safety")]
+    unsafe {
+        core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<MaybeUninit<u8>>(), bytes.len())
     }
 }
 

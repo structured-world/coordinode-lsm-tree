@@ -229,6 +229,92 @@ fn every_backend_fills_an_uninitialized_buffer() -> crate::Result<()> {
     Ok(())
 }
 
+/// The crate's own backends fill memory nobody wrote without zeroing it: a
+/// read that ends at the end of the file leaves initialized exactly what it
+/// read, where the trait's zeroing default would have initialized it all. The
+/// `io_uring` backends are held to the same by their conformance tests.
+#[test]
+fn every_builtin_backend_reads_without_zeroing() -> crate::Result<()> {
+    use core::mem::MaybeUninit;
+
+    let dir = tempfile::tempdir()?;
+    let content: Vec<u8> = (0..100).collect();
+    let fs: [(Arc<dyn Fs>, &str); 2] = [(Arc::new(MemFs::new()), "/mem"), (Arc::new(StdFs), "std")];
+    for (fs, name) in fs {
+        let path = if name.starts_with('/') {
+            Path::new(name).to_path_buf()
+        } else {
+            dir.path().join(name)
+        };
+        let file = file_of(&*fs, &path, &content)?;
+        let mut memory = [MaybeUninit::<u8>::uninit(); 256];
+        let mut buf = ReadBuf::uninit(&mut memory);
+        file.read_at_buf(&mut buf, 60)?;
+        assert_eq!(buf.filled(), 40, "{name}: the file ends 40 bytes in");
+        assert_eq!(
+            buf.initialized(),
+            40,
+            "{name}: nothing past what was read is zeroed"
+        );
+    }
+    Ok(())
+}
+
+/// A positioned read stops at the end of the file, reads nothing past it,
+/// takes an empty destination as read, and refuses an offset no file can
+/// have instead of wrapping it.
+#[test]
+fn std_positioned_reads_stop_at_the_end_and_refuse_impossible_offsets() -> crate::Result<()> {
+    use core::mem::MaybeUninit;
+
+    let dir = tempfile::tempdir()?;
+    let content: Vec<u8> = (0..64).collect();
+    let path = dir.path().join("f");
+    let file = file_of(&StdFs, &path, &content)?;
+
+    let mut memory = [MaybeUninit::<u8>::uninit(); 16];
+    let mut buf = ReadBuf::uninit(&mut memory);
+    file.read_at_buf(&mut buf, 64)?;
+    assert_eq!(buf.filled(), 0, "at the end of the file nothing is read");
+
+    let mut empty: [MaybeUninit<u8>; 0] = [];
+    let mut buf = ReadBuf::uninit(&mut empty);
+    file.read_at_buf(&mut buf, 0)?;
+    assert_eq!(buf.filled(), 0);
+
+    let mut bytes = [0u8; 16];
+    let error = file
+        .read_at(&mut bytes, u64::MAX - 4)
+        .expect_err("past the largest file offset");
+    assert_eq!(error.kind(), crate::io::ErrorKind::InvalidInput);
+    Ok(())
+}
+
+/// Every built-in backend refuses a read past the largest file offset, so a
+/// test on the in-memory backend sees what a real one would do; an empty read
+/// there still reads nothing, as everywhere.
+#[test]
+fn every_builtin_backend_refuses_a_read_past_the_largest_file_offset() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let content: Vec<u8> = (0..64).collect();
+    let fs: [(Arc<dyn Fs>, &str); 2] = [(Arc::new(MemFs::new()), "/mem"), (Arc::new(StdFs), "std")];
+    for (fs, name) in fs {
+        let path = if name.starts_with('/') {
+            Path::new(name).to_path_buf()
+        } else {
+            dir.path().join(name)
+        };
+        let file = file_of(&*fs, &path, &content)?;
+        let mut bytes = [0u8; 16];
+        let error = file
+            .read_at(&mut bytes, u64::MAX)
+            .expect_err("past the largest file offset");
+        assert_eq!(error.kind(), crate::io::ErrorKind::InvalidInput, "{name}");
+        assert_eq!(file.read_at(&mut [], u64::MAX)?, 0, "{name}");
+    }
+    Ok(())
+}
+
 /// A safe reader is never shown memory nobody wrote either.
 #[test]
 fn from_reader_shows_a_safe_reader_only_zeroes() -> std::io::Result<()> {

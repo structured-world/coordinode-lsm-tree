@@ -822,6 +822,23 @@ pub struct BlockRead<'a> {
     pub buf: BlockBuf<'a>,
 }
 
+impl BlockRead<'_> {
+    /// Where the read resumes: `offset` plus the bytes `buf` already holds,
+    /// which a partly filled destination owns. Refused past the largest file
+    /// offset (`i64::MAX`), which no file reaches.
+    pub(crate) fn resume_offset(&self) -> io::Result<u64> {
+        self.offset
+            .checked_add(self.buf.filled() as u64)
+            .filter(|&at| i64::try_from(at).is_ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "block read offset past the largest file offset",
+                )
+            })
+    }
+}
+
 /// The destination of one [`BlockRead`]: the bytes to fill, plus a count of how
 /// much of it an implementation actually filled.
 ///
@@ -1345,15 +1362,7 @@ pub trait Fs: Send + Sync + 'static {
             // A destination that arrives partly filled already owns the
             // block's first `filled` bytes; the read owes the unfilled
             // suffix, which starts `filled` bytes into the block on disk.
-            let offset = req
-                .offset
-                .checked_add(req.buf.filled() as u64)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "read_blocks_batched: request offset overflows",
-                    )
-                })?;
+            let offset = req.resume_offset()?;
             let file = req.file;
             req.buf
                 .fill_unfilled(|target| file.read_at_buf(target, offset))?;
@@ -1426,9 +1435,10 @@ pub trait Fs: Send + Sync + 'static {
     /// every request through `read_at`. `io_uring` answers `true`.
     ///
     /// A backend answering `true` validates every descriptor-backed request
-    /// of a batch (its `offset` plus the bytes already filled fits a `u64`)
-    /// before it issues any descriptor read: a wrapper screens the batch as
-    /// a whole, and a batch it would refuse must read nothing.
+    /// of a batch (its `offset` plus the bytes already filled is a file
+    /// offset, at most `i64::MAX`) before it issues any descriptor read: a
+    /// wrapper screens the batch as a whole, and a batch it would refuse must
+    /// read nothing.
     fn reads_by_descriptor(&self) -> bool {
         false
     }
@@ -1439,8 +1449,8 @@ pub trait Fs: Send + Sync + 'static {
     /// stands now. A wrapper that takes each read through checks of its own
     /// asks this first, so no check is spent on a batch that reads nothing.
     ///
-    /// The default refuses nothing. `io_uring` refuses an offset that
-    /// overflows and a request longer than one read submits.
+    /// The default refuses nothing. `io_uring` refuses an offset past the
+    /// largest file offset and a request longer than one read submits.
     ///
     /// # Errors
     ///

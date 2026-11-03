@@ -172,17 +172,12 @@ impl IoUringFs {
 
         let mut serial_failure: Option<(usize, crate::io::Error)> = None;
         for (idx, req) in &mut serial {
-            // A partly filled destination owns the block's first `filled`
-            // bytes already; complete it from `offset + filled`.
-            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-                serial_failure = Some((
-                    *idx,
-                    crate::io::Error::from(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "read_blocks_batched: request offset overflows",
-                    )),
-                ));
-                break;
+            let offset = match req.resume_offset() {
+                Ok(offset) => offset,
+                Err(e) => {
+                    serial_failure = Some((*idx, e));
+                    break;
+                }
             };
             let file = req.file;
             match req
@@ -248,20 +243,24 @@ fn read_lone(
     req: &mut BlockRead<'_>,
     on_read: Option<OnRead<'_>>,
 ) -> crate::io::Result<()> {
-    // A partly filled destination owns the block's first `filled` bytes
-    // already; complete it from `offset + filled`.
-    let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-        return Err(crate::io::Error::from(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "read_blocks_batched: request offset overflows",
-        )));
-    };
-    // SAFETY: `pread_exact` hands the span to the kernel, which only writes
-    // bytes into it.
+    let offset = req.resume_offset()?;
+    use std::os::unix::io::FromRawFd as _;
+
+    // SAFETY: `backing_fd` names a descriptor open for as long as the request
+    // borrows its file, and `ManuallyDrop` never closes it.
+    #[expect(unsafe_code, reason = "see safety")]
+    let file = core::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    // SAFETY: the positioned read hands the span to the kernel, which only
+    // writes bytes into it.
     #[expect(unsafe_code, reason = "see safety")]
     let dst = unsafe { req.buf.unfilled_uninit_mut() };
-    let want = pread_exact(fd, dst, offset)?;
-    // SAFETY: `pread_exact` wrote all `want` bytes after those filled.
+    let want = dst.len();
+    if super::std_fs::read_uninit_at(&file, dst, offset)? != want {
+        return Err(crate::io::Error::from(io::Error::from(
+            io::ErrorKind::UnexpectedEof,
+        )));
+    }
+    // SAFETY: the read wrote all `want` bytes after those filled.
     #[expect(unsafe_code, reason = "see safety")]
     unsafe {
         req.buf.assume_written(want);
@@ -270,49 +269,6 @@ fn read_lone(
         on_read(0, req);
     }
     Ok(())
-}
-
-/// Fills `dst` from `fd` at `offset` with `pread`, which only writes it, so
-/// memory never written needs no zeroing first; returns `dst.len()`.
-///
-/// # Errors
-///
-/// The read's error; a file ending before `dst` is full is
-/// [`io::ErrorKind::UnexpectedEof`], an offset past the largest a file can
-/// have [`io::ErrorKind::InvalidInput`].
-fn pread_exact(
-    fd: i32,
-    dst: &mut [core::mem::MaybeUninit<u8>],
-    offset: u64,
-) -> crate::io::Result<usize> {
-    let mut done = 0;
-    while let Some(rest) = dst.get_mut(done..).filter(|rest| !rest.is_empty()) {
-        let at = u64::try_from(done)
-            .ok()
-            .and_then(|done| offset.checked_add(done))
-            .and_then(|at| libc::off_t::try_from(at).ok())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "read offset past the last file offset",
-                )
-            })?;
-        // SAFETY: the kernel writes at most `rest.len()` bytes of `rest`,
-        // memory the caller holds for the call, and reads none of it.
-        #[expect(unsafe_code, reason = "see safety")]
-        let n = unsafe { libc::pread(fd, rest.as_mut_ptr().cast(), rest.len(), at) };
-        match usize::try_from(n) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            Ok(n) => done += n,
-            Err(_) => {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error.into());
-                }
-            }
-        }
-    }
-    Ok(done)
 }
 
 /// Makes `f` a callback over requests of any lifetime, which a closure only
@@ -415,12 +371,7 @@ impl Fs for IoUringFs {
                     "buffer exceeds i32::MAX",
                 )));
             }
-            if req.offset.checked_add(req.buf.filled() as u64).is_none() {
-                return Err(crate::io::Error::from(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "submit_reads_multi: request offset overflows",
-                )));
-            }
+            req.resume_offset()?;
         }
         Ok(())
     }
@@ -679,11 +630,11 @@ impl FsFile for IoUringFile {
     }
 
     fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> crate::io::Result<()> {
-        // SAFETY: `read_at` is `File::read_at`, which only has the kernel write
-        // the slice and returns how much of it was.
+        // SAFETY: the positioned read only has the kernel write the memory,
+        // and returns how many bytes from its start it wrote.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+            buf.fill_with(|memory| super::std_fs::read_uninit_at(&self.file, memory, offset))
         }
     }
 
@@ -1098,6 +1049,14 @@ impl RingThread {
         read: &BatchRead,
         completion: Completion,
     ) {
+        // No file reaches past `i64::MAX`, and the ring reads offset `-1` as
+        // the descriptor's own position: such a read fails as `pread` would
+        // instead of reading the wrong bytes.
+        if i64::try_from(read.offset).is_err() {
+            completion.deliver(-libc::EINVAL);
+            return;
+        }
+
         let id = *next_id;
         *next_id = next_id.wrapping_add(1);
 
@@ -1254,15 +1213,21 @@ impl RingThread {
         // whole, so there is no later point at which to refuse one read of it.
         // (SQE length is u32, CQE result i32 — block reads are KBs, never near
         // the cap, so this only fires on misuse of the general API.)
+        // A read past the largest file offset is refused here too: the ring
+        // reads `-1` as the descriptor's own position.
         let mut lens: Vec<u32> = Vec::with_capacity(regions.len());
         for region in regions.iter_mut() {
-            // SAFETY: the bytes go only to the kernel, which only writes them.
-            #[expect(unsafe_code, reason = "see safety")]
-            let (_, buf) = unsafe { region.target() };
-            let len = if buf.is_empty() {
+            let (offset, _, region_len) = region.target();
+            if region_len != 0 && i64::try_from(offset).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "read offset past the largest file offset",
+                ));
+            }
+            let len = if region_len == 0 {
                 0
             } else {
-                i32::try_from(buf.len())
+                i32::try_from(region_len)
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
                     })?
@@ -1276,19 +1241,18 @@ impl RingThread {
         let mut reads = Vec::with_capacity(regions.len());
         let mut expected = Vec::with_capacity(regions.len());
         for (region, &len) in regions.iter_mut().zip(&lens) {
-            // SAFETY: as above.
-            #[expect(unsafe_code, reason = "see safety")]
-            let (offset, buf) = unsafe { region.target() };
-            if buf.is_empty() {
+            // The kernel only writes the memory the pointer names.
+            let (offset, buf, region_len) = region.target();
+            if region_len == 0 {
                 continue;
             }
             reads.push(BatchRead {
                 fd,
-                buf: UnsafeSendMutPtr(buf.as_mut_ptr()),
+                buf: UnsafeSendMutPtr(buf),
                 len,
                 offset,
             });
-            expected.push(buf.len());
+            expected.push(region_len);
         }
         self.submit_batch(
             reads,
@@ -1355,18 +1319,7 @@ impl RingThread {
             // already, so the suffix the SQE describes lives `filled` bytes into
             // the block on disk. Submitting the original offset would duplicate
             // the block's beginning into the suffix instead.
-            let offset = req
-                .offset
-                .checked_add(req.buf.filled() as u64)
-                .ok_or_else(|| {
-                    (
-                        at,
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "submit_reads_multi: request offset overflows",
-                        ),
-                    )
-                })?;
+            let offset = req.resume_offset().map_err(|e| (at, io::Error::from(e)))?;
             metas.push(Some((fd, len, offset)));
         }
 

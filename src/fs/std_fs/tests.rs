@@ -86,6 +86,95 @@ fn std_fs_remove_file_long_hold_on_windows_returns_error() -> io::Result<()> {
     Ok(())
 }
 
+/// Windows: a positioned read through a handle opened for overlapped I/O,
+/// whose `ReadFile` may return before the read completes, hands back the
+/// file's bytes and stops at its end, not an error while the kernel still
+/// writes the memory.
+#[cfg(windows)]
+#[test]
+fn std_positioned_read_waits_for_an_overlapped_handle() -> io::Result<()> {
+    use core::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("overlapped");
+    let content: Vec<u8> = (0..1u32 << 20)
+        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .collect();
+    std::fs::write(&path, &content)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OVERLAPPED)
+        .open(&path)?;
+
+    let mut memory = vec![MaybeUninit::<u8>::uninit(); 1 << 16];
+    let at = content.len() - 1000;
+    let n = read_uninit_at(&file, &mut memory, at as u64)?;
+    assert_eq!(n, 1000, "the read stops at the end of the file");
+    // SAFETY: the read reported its first `n` bytes written.
+    #[expect(unsafe_code, reason = "see safety")]
+    let read = unsafe { core::slice::from_raw_parts(memory.as_ptr().cast::<u8>(), n) };
+    assert_eq!(Some(read), content.get(at..));
+    assert_eq!(read_uninit_at(&file, &mut memory, content.len() as u64)?, 0);
+    Ok(())
+}
+
+/// Windows: reads racing on one overlapped handle each wait for their own
+/// completion, though another read's completion signals the same handle: every
+/// reader gets the bytes at its own offset.
+#[cfg(windows)]
+#[test]
+fn std_positioned_reads_racing_on_an_overlapped_handle_get_their_own_bytes() -> io::Result<()> {
+    use core::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    const CHUNK: usize = 1 << 16;
+    const CHUNKS: usize = 64;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("overlapped-race");
+    let content: Vec<u8> = (0..u32::try_from(CHUNK * CHUNKS).unwrap_or_default())
+        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .collect();
+    std::fs::write(&path, &content)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OVERLAPPED)
+        .open(&path)?;
+
+    std::thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "every reader is spawned before any is joined, so they race"
+        )]
+        let readers: Vec<_> = (0..8)
+            .map(|reader| {
+                let (file, content) = (&file, &content);
+                scope.spawn(move || -> io::Result<()> {
+                    let mut memory = vec![MaybeUninit::<u8>::uninit(); CHUNK];
+                    for round in 0..CHUNKS {
+                        let at = ((reader * 7 + round) % CHUNKS) * CHUNK;
+                        assert_eq!(read_uninit_at(file, &mut memory, at as u64)?, CHUNK);
+                        // SAFETY: the read reported the whole chunk written.
+                        #[expect(unsafe_code, reason = "see safety")]
+                        let read = unsafe {
+                            core::slice::from_raw_parts(memory.as_ptr().cast::<u8>(), CHUNK)
+                        };
+                        assert_eq!(Some(read), content.get(at..at + CHUNK), "chunk at {at}");
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        readers.into_iter().try_for_each(|reader| {
+            reader
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("reader panicked")))
+        })
+    })
+}
+
 /// Linux: `fallocate(PUNCH_HOLE)` frees a mid-file range and reads it back
 /// as zeros, leaving the logical length unchanged. Skips cleanly on a mount
 /// that does not advertise the capability (e.g. overlayfs in CI), so the

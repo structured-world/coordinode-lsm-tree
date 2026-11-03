@@ -228,6 +228,108 @@ macro_rules! batched_read_conformance {
                 Ok(())
             }
 
+            /// A read that ends at the end of the file leaves initialized
+            /// exactly what it read: the backend fills memory nobody wrote
+            /// without zeroing it first.
+            #[test_log::test]
+            fn a_read_into_memory_nobody_wrote_initializes_only_what_it_read()
+            -> $crate::io::Result<()> {
+                use core::mem::MaybeUninit;
+
+                let Some(fs) = $make else {
+                    return Ok(());
+                };
+                let dir = tempfile::tempdir()?;
+                let files = two_files(&fs, dir.path(), 100)?;
+                let mut memory = [MaybeUninit::<u8>::uninit(); 256];
+                let mut buf = $crate::fs::ReadBuf::uninit(&mut memory);
+                files[0].read_at_buf(&mut buf, 60)?;
+                assert_eq!(buf.filled(), 40, "the file ends 40 bytes in");
+                assert_eq!(
+                    buf.initialized(),
+                    40,
+                    "nothing past what was read is zeroed"
+                );
+                assert_eq!(&buf.init_mut()[..40], &expected_bytes(0, 60, 40)[..]);
+                Ok(())
+            }
+
+            /// An offset no file can have is refused, alone or in a batch: the
+            /// ring reads offset `-1` as "the descriptor's own position", so
+            /// handing `u64::MAX` through would read the wrong bytes instead.
+            #[test_log::test]
+            fn a_read_past_the_largest_file_offset_is_refused() -> $crate::io::Result<()> {
+                let Some(fs) = $make else {
+                    return Ok(());
+                };
+                let dir = tempfile::tempdir()?;
+                let files = two_files(&fs, dir.path(), 100)?;
+                let file = files[0].as_ref();
+
+                let mut bytes = [0u8; 16];
+                let error = file
+                    .read_at(&mut bytes, u64::MAX)
+                    .expect_err("past the largest file offset");
+                assert_eq!(error.kind(), $crate::io::ErrorKind::InvalidInput);
+
+                let Err(error) = $crate::file::read_exact_many(file, &[(0, 16), (u64::MAX, 16)])
+                else {
+                    panic!("a batched read past the largest file offset must fail");
+                };
+                assert_eq!(error.kind(), $crate::io::ErrorKind::InvalidInput);
+                Ok(())
+            }
+
+            /// A batch holding a read past the largest file offset is refused
+            /// whole, as a wrapper screening it first is promised: the reads
+            /// before it read nothing.
+            #[test_log::test]
+            fn a_batch_past_the_largest_file_offset_reads_nothing() -> $crate::io::Result<()> {
+                let Some(fs) = $make else {
+                    return Ok(());
+                };
+                let dir = tempfile::tempdir()?;
+                let files = two_files(&fs, dir.path(), 100)?;
+                let file = files[0].as_ref();
+
+                let mut b0 = [0xAAu8; 16];
+                let mut b1 = [0xAAu8; 16];
+                let mut regions: Vec<(u64, &mut [u8])> =
+                    vec![(0, &mut b0[..]), (u64::MAX, &mut b1[..])];
+                let error = file
+                    .read_many(&mut regions)
+                    .expect_err("past the largest file offset");
+                assert_eq!(error.kind(), $crate::io::ErrorKind::InvalidInput);
+                drop(regions);
+                assert_eq!(b0, [0xAA; 16], "the batch read nothing");
+
+                let mut c0 = [0xAAu8; 16];
+                let mut c1 = [0xAAu8; 16];
+                let mut reqs = vec![
+                    BlockRead {
+                        file,
+                        offset: 0,
+                        buf: BlockBuf::new(&mut c0),
+                    },
+                    BlockRead {
+                        file,
+                        offset: u64::MAX - 64,
+                        buf: BlockBuf::new(&mut c1),
+                    },
+                ];
+                let error = fs
+                    .check_descriptor_batch(&reqs)
+                    .expect_err("screened as refused");
+                assert_eq!(error.kind(), $crate::io::ErrorKind::InvalidInput);
+                let error = fs
+                    .read_blocks_batched(&mut reqs)
+                    .expect_err("past the largest file offset");
+                assert_eq!(error.kind(), $crate::io::ErrorKind::InvalidInput);
+                drop(reqs);
+                assert_eq!(c0, [0xAA; 16], "the batch read nothing");
+                Ok(())
+            }
+
             #[test_log::test]
             fn read_blocks_batched_across_files() -> $crate::io::Result<()> {
                 let Some(fs) = $make else {

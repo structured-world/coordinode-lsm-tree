@@ -295,14 +295,24 @@ struct MemFile {
     has_punches: Arc<portable_atomic::AtomicBool>,
 }
 
-/// Copies bytes from `data[pos..]` into `buf`, returning byte count.
-fn copy_from_data(buf: &mut [u8], data: &[u8], pos: usize) -> usize {
+/// Copies bytes from `data[pos..]` into `memory`, returning byte count. It
+/// writes only initialized bytes, so the memory may start uninitialized.
+fn copy_from_data(memory: &mut [core::mem::MaybeUninit<u8>], data: &[u8], pos: usize) -> usize {
     let available = data.get(pos..).unwrap_or_default();
-    let n = buf.len().min(available.len());
-    if let (Some(dst), Some(src)) = (buf.get_mut(..n), available.get(..n)) {
-        dst.copy_from_slice(src);
+    let n = memory.len().min(available.len());
+    if let (Some(dst), Some(src)) = (memory.get_mut(..n), available.get(..n)) {
+        dst.write_copy_of_slice(src);
     }
     n
+}
+
+/// `buf` as memory [`copy_from_data`] fills.
+fn copy_target(buf: &mut [u8]) -> &mut [core::mem::MaybeUninit<u8>] {
+    // SAFETY: `copy_from_data` writes only initialized bytes.
+    #[expect(unsafe_code, reason = "see safety")]
+    unsafe {
+        super::read_buf::as_uninit_mut(buf)
+    }
 }
 
 // Bodies live on inherent `*_impl` methods returning `crate::io::Result`; the
@@ -311,6 +321,31 @@ fn copy_from_data(buf: &mut [u8], data: &[u8], pos: usize) -> usize {
 // `std::io::*`), so the real impl must target `std::io::*` there and bridge the
 // error back via `Into`; under `no_std` it targets the native `crate::io::*`.
 impl MemFile {
+    /// Copies the file's bytes at `offset` into `memory`, initialized or not:
+    /// the bytes copied from its start.
+    fn read_uninit_at(
+        &self,
+        memory: &mut [core::mem::MaybeUninit<u8>],
+        offset: u64,
+    ) -> io::Result<usize> {
+        if !self.readable {
+            return Err(io::Error::other("read_at requires read access"));
+        }
+        // No file reaches past `i64::MAX`: refused as the other backends
+        // refuse it, so a test on this backend sees what they would do.
+        if !memory.is_empty() && i64::try_from(offset).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read offset past the largest file offset",
+            ));
+        }
+        // A file in memory holds at most `usize::MAX` bytes, so an offset past
+        // that is past its end: nothing to read.
+        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+        let data = lock(&self.data)?;
+        Ok(copy_from_data(memory, &data, offset))
+    }
+
     fn read_impl(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if !self.readable {
             return Err(io::Error::other("file not opened for reading"));
@@ -322,7 +357,7 @@ impl MemFile {
                 "cursor exceeds addressable memory",
             )
         })?;
-        let n = copy_from_data(buf, &data, pos);
+        let n = copy_from_data(copy_target(buf), &data, pos);
         drop(data);
         self.cursor += n as u64;
         Ok(n)
@@ -552,24 +587,15 @@ impl FsFile for MemFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        if !self.readable {
-            return Err(io::Error::other("read_at requires read access"));
-        }
-        let offset = usize::try_from(offset).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "read_at offset exceeds usize::MAX",
-            )
-        })?;
-        let data = lock(&self.data)?;
-        Ok(copy_from_data(buf, &data, offset))
+        self.read_uninit_at(copy_target(buf), offset)
     }
 
     fn read_at_buf(&self, buf: &mut ReadBuf<'_>, offset: u64) -> io::Result<()> {
-        // SAFETY: `read_at` only copies into the slice, and returns how much.
+        // SAFETY: the closure copies the file's bytes into the memory, and
+        // returns how many from its start.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+            buf.fill_with(|memory| self.read_uninit_at(memory, offset))
         }
     }
 

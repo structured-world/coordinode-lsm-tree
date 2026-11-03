@@ -1707,17 +1707,18 @@ impl IoUringRawFile {
     ) -> crate::io::Result<()> {
         let mut reads = Vec::with_capacity(regions.len());
         for region in regions.iter_mut() {
-            // SAFETY: the bytes go only to the kernel, which only writes them.
-            #[expect(unsafe_code, reason = "see safety")]
-            let (offset, buf) = unsafe { region.target() };
-            if buf.is_empty() {
+            // The kernel only writes the memory the pointer names.
+            let (offset, buf, len) = region.target();
+            if len == 0 {
                 continue;
             }
+            // Refused before any read is submitted, so a refused batch reads
+            // nothing.
             reads.push(RawRead {
                 fd: self.fd,
-                buf: buf.as_mut_ptr(),
-                len: batch_read_len(buf.len())?,
-                offset,
+                buf,
+                len: batch_read_len(len)?,
+                offset: ring_offset(offset)?,
             });
         }
         let mut results = alloc::vec![0i32; reads.len()];
@@ -1730,6 +1731,33 @@ impl IoUringRawFile {
             .iter()
             .zip(results)
             .try_for_each(|(read, res)| read_verdict(res, read.len))
+    }
+
+    /// Reads `memory` at `offset` through the ring until it is full or the
+    /// file ends, retrying an interrupted read: the bytes read from its start.
+    fn read_fill(
+        &self,
+        memory: &mut [core::mem::MaybeUninit<u8>],
+        offset: u64,
+    ) -> crate::io::Result<usize> {
+        let mut total = 0usize;
+        while let Some(remaining) = memory.get_mut(total..).filter(|rest| !rest.is_empty()) {
+            // No overflow: a first read past `i64::MAX` is refused before
+            // `total` grows, and `total` stays within the slice's `isize::MAX`.
+            let at = offset + total as u64;
+            let n = loop {
+                match self.ring.lock().read_uninit_at(self.fd, remaining, at) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        Ok(total)
     }
 
     /// Wraps an open descriptor `fd` (from [`open_raw`]) with the shared `ring`.
@@ -1772,13 +1800,13 @@ impl IoUringRawFile {
             return Ok(0);
         }
         if self.is_append {
-            // O_APPEND: write with the io_uring "use the file offset" sentinel
-            // (`-1`), so the kernel performs the append atomically against the
-            // O_APPEND descriptor. Resolving the offset in userspace
-            // (`lseek` + positioned write) would race with other appenders,
-            // because a positioned write ignores O_APPEND and two writers could
-            // land at the same offset, silently losing one.
-            return self.ring.lock().write_at(self.fd, buf, u64::MAX);
+            // O_APPEND: write at the descriptor's own position, so the kernel
+            // performs the append atomically against the O_APPEND descriptor.
+            // Resolving the offset in userspace (`lseek` + positioned write)
+            // would race with other appenders, because a positioned write
+            // ignores O_APPEND and two writers could land at the same offset,
+            // silently losing one.
+            return self.ring.lock().append(self.fd, buf);
         }
         let n = self.ring.lock().write_at(self.fd, buf, self.cursor)?;
         // The cursor is bounded by the file size (n is the bytes just
@@ -1835,32 +1863,10 @@ impl FsFile for IoUringRawFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // Fill-or-EOF: loop until the buffer is full or a 0-byte read signals
-        // EOF, retrying the ring op on EINTR (mirrors the std io_uring backend).
-        let mut total = 0usize;
-        while total < buf.len() {
-            let remaining = buf
-                .get_mut(total..)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "read_at slice out of range"))?;
-            let at = offset
-                .checked_add(total as u64)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "read_at offset overflow"))?;
-            let n = loop {
-                match self.ring.lock().read_at(self.fd, remaining, at) {
-                    Ok(n) => break n,
-                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
-                }
-            };
-            if n == 0 {
-                break;
-            }
-            total += n;
-        }
-        Ok(total)
+        // SAFETY: the ring only has the kernel write bytes into the memory.
+        #[expect(unsafe_code, reason = "see safety")]
+        let memory = unsafe { super::read_buf::as_uninit_mut(buf) };
+        self.read_fill(memory, offset)
     }
 
     // Every region goes to the ring in one batch instead of the trait's serial
@@ -1870,11 +1876,11 @@ impl FsFile for IoUringRawFile {
     }
 
     fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> crate::io::Result<()> {
-        // SAFETY: the ring only has the kernel write the slice, and `read_at`
-        // returns how much of it was.
+        // SAFETY: the ring only has the kernel write the memory, and
+        // `read_fill` returns how many bytes from its start it wrote.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+            buf.fill_with(|memory| self.read_fill(memory, offset))
         }
     }
 
@@ -2175,15 +2181,12 @@ impl IoUringRawFs {
             if failure.as_ref().is_some_and(|(held, _)| *held < at) {
                 break;
             }
-            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-                failure = Some((
-                    at,
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "read_blocks_batched: request offset overflows",
-                    ),
-                ));
-                break;
+            let offset = match req.resume_offset() {
+                Ok(offset) => offset,
+                Err(error) => {
+                    failure = Some((at, error));
+                    break;
+                }
             };
             let file = req.file;
             match req
@@ -2223,6 +2226,19 @@ fn batch_read_len(len: usize) -> Result<u32, Error> {
     i32::try_from(len)
         .map(i32::unsigned_abs)
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))
+}
+
+/// `offset` as an SQE takes it: no file reaches past `i64::MAX`, and the ring
+/// reads offset `-1` as the descriptor's own position, so a larger one would
+/// land at the wrong place instead of failing.
+fn ring_offset(offset: u64) -> Result<u64, Error> {
+    if i64::try_from(offset).is_err() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "offset past the largest file offset",
+        ));
+    }
+    Ok(offset)
 }
 
 /// What a batched read's completion `res` says about its fixed-size block of
@@ -2275,12 +2291,7 @@ impl Fs for IoUringRawFs {
                 continue;
             }
             batch_read_len(want)?;
-            if req.offset.checked_add(req.buf.filled() as u64).is_none() {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "read_blocks_batched: request offset overflows",
-                ));
-            }
+            req.resume_offset()?;
         }
         Ok(())
     }
@@ -2730,6 +2741,20 @@ impl IoUringRaw {
     /// # Errors
     /// Returns an [`Error`] if the read completes with a negative `-errno`.
     pub fn read_at(&mut self, fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        // SAFETY: the kernel only writes bytes into the memory.
+        #[expect(unsafe_code, reason = "see safety")]
+        let memory = unsafe { super::read_buf::as_uninit_mut(buf) };
+        self.read_uninit_at(fd, memory, offset)
+    }
+
+    /// [`Self::read_at`] into memory that may be uninitialized: the kernel
+    /// writes it through its pointer, so it needs no zeroing first.
+    pub(crate) fn read_uninit_at(
+        &mut self,
+        fd: i32,
+        buf: &mut [core::mem::MaybeUninit<u8>],
+        offset: u64,
+    ) -> Result<usize, Error> {
         let len = u32::try_from(buf.len()).map_err(|_| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -2741,7 +2766,7 @@ impl IoUringRaw {
             fd,
             addr: buf.as_mut_ptr() as u64,
             len,
-            off: offset,
+            off: ring_offset(offset)?,
             ..IoUringSqe::default()
         };
         let res = self.submit_and_reap_one(&sqe)?;
@@ -2752,8 +2777,21 @@ impl IoUringRaw {
     /// ring, returning the number of bytes written.
     ///
     /// # Errors
-    /// Returns an [`Error`] if the write completes with a negative `-errno`.
+    /// Returns an [`Error`] if `offset` is past the largest file offset or the
+    /// write completes with a negative `-errno`.
     pub fn write_at(&mut self, fd: i32, buf: &[u8], offset: u64) -> Result<usize, Error> {
+        self.write_sqe(fd, buf, ring_offset(offset)?)
+    }
+
+    /// Writes `buf` at the descriptor's own position, which on an `O_APPEND`
+    /// descriptor the kernel moves to the end of the file atomically.
+    pub(crate) fn append(&mut self, fd: i32, buf: &[u8]) -> Result<usize, Error> {
+        // The SQE offset `-1` is io_uring's "use the file position".
+        self.write_sqe(fd, buf, u64::MAX)
+    }
+
+    /// One write SQE of `buf` to `fd` at the SQE offset `off`.
+    fn write_sqe(&mut self, fd: i32, buf: &[u8], off: u64) -> Result<usize, Error> {
         let len = u32::try_from(buf.len()).map_err(|_| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -2765,7 +2803,7 @@ impl IoUringRaw {
             fd,
             addr: buf.as_ptr() as u64,
             len,
-            off: offset,
+            off,
             ..IoUringSqe::default()
         };
         let res = self.submit_and_reap_one(&sqe)?;
@@ -2791,7 +2829,8 @@ impl IoUringRaw {
 
     /// Reads every one of `reads` through the ring, as many in flight at once
     /// as the rings hold, and stores each one's completion in `results` at its
-    /// index: the byte count, or `-errno`.
+    /// index: the byte count, or `-errno`; `-EINVAL` for one at an offset
+    /// [`ring_offset`] refuses, which never reaches the kernel.
     ///
     /// Every read has completed when this returns, so the buffers are the
     /// caller's again; no caller code runs while any is in flight.
@@ -2803,12 +2842,13 @@ impl IoUringRaw {
         unsafe {
             self.submit_all(
                 &mut |at| {
-                    reads.get(at).map(|read| IoUringSqe {
+                    let read = reads.get(at)?;
+                    Some(IoUringSqe {
                         opcode: IORING_OP_READ,
                         fd: read.fd,
                         addr: read.buf as u64,
                         len: read.len,
-                        off: read.offset,
+                        off: ring_offset(read.offset).ok()?,
                         ..IoUringSqe::default()
                     })
                 },
