@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793713000078,
+  "lastUpdate": 1793713004923,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -102540,6 +102540,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.409791016,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1199f642bf57232d20c427afbb92e15418b99eca",
+          "message": "feat(bench): race the blob tree against RocksDB blob files (#1049)\n\n## Summary\n- The head-to-head harness compares the blob tree with RocksDB's own\nblob files, not with RocksDB keeping values inline, and on values large\nenough for separation to pay (1 MiB and 4 MiB) as well as 256 bytes.\n- Every engine's starting state is written back to disk outside the\ntimed window, so one arm no longer pays for the write-back the previous\narm left behind.\n\n## Changes\n- `rocksdb_blob` engine: RocksDB with `enable_blob_files`,\n`min_blob_size` at our separation threshold, the same blob compression,\nno blob cache; it runs beside `blob_tree` in every uncompressed group,\nwith every key checked before timing.\n- The value size is a property of a group. Blob groups (write,\noverwrite, point read, batched read, scan) on 64 values of 1 MiB and 16\nof 4 MiB of random bytes, generated at start-up before any timing and\nnever stored in the repository.\n- Copies and removals of an engine's state are `sync`ed outside the\ntimed window.\n- `COMPARE_ENGINES` (comma-separated labels) runs only the named arms;\n`COMPARE_HOLD` makes point reads keep every value of a pass alive, as a\nbatched read does, so the two compare on equal work.\n- The comparison page draws the new engine and labels the value size;\nthe benchmark job gets the time the blob groups need.\n\n## Testing\nThe harness builds and lints clean (`cargo clippy --all-targets -D\nwarnings`, `cargo fmt --check`); the groups ran on the Linux benchmark\nhost, numbers in #1042.\n\n## Related\n- #1043: batched reads of large values, the one scenario where ours\ntrails.\n\nCloses #1042",
+          "timestamp": "2026-11-03T13:09:16Z",
+          "tree_id": "51d4663bc2eaec59e07c3d6819b8613c707a2662",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1199f642bf57232d20c427afbb92e15418b99eca"
+        },
+        "date": 1793713003213,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 675.838,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 184.564814ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 303.21500000000003,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 240.647373ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1463.1589999999999,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 301.382882ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 6083.341,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 22647.684,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.071,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 51.216383,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.420484027,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 24.559,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 54.329343,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.42169557,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
