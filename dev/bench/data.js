@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793717937861,
+  "lastUpdate": 1793717942338,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103565,6 +103565,98 @@ window.BENCHMARK_DATA = {
             "name": "leveled-sustained / size-only / compaction bytes per step p99",
             "value": 5894143,
             "unit": "bytes",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      }
+    ],
+    "lsm-tree db_bench timings 8.x · Linux · runner1-sw": [
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4bfff2c189fed973e5648db0fef311d87fd3f274",
+          "message": "perf(fs)!: fill batched reads in place and keep values cached (#1044)\n\n## Summary\n- A batched read fills its destination in place, unzeroed, and the block\nor value it answers with is the read's own memory, not a copy.\n- A multi-get of separated values keeps the value reads it has out\nwithin 8 MiB, so each value is checked while still in the processor\ncache.\n- The `io_uring` read queue copies what the page cache holds of a read\nof 256 KiB or more on the calling thread, sending only the rest, smaller\nreads and `O_DIRECT` files to the ring.\n\nOn one Linux host, default glibc, per key: multi-get of 64 values of 1\nMiB 325 us (was 801) for a tree with inline values and 353 us (was 612)\nfor a blob tree, against 1604 us for RocksDB; 16 values of 4 MiB 6059 us\n(was 7749) and 5885 us (was 7474). Multi-get now costs no more than\npoint reads that keep their values (within 3% at 4 MiB). Details and the\nequal-work comparison are in #1043.\n\n## Changes\n- `fs::QueuedBuf`: the destination of a queued read, allocated unzeroed,\nfilled in place, turned into the block's `Slice` without a copy; it\ncounts initialized and filled bytes.\n- `BlockBuf` over `MaybeUninit` memory: safe callers get the unfilled\npart zeroed on first use; a backend that only writes fills it through an\nunsafe accessor and declares what it wrote; `fill_unfilled` reads\nthrough `FsFile::read_at_buf`.\n- Data, Page-ECC, columnar and merge-base blocks and blob values decode\nfrom the read's `Slice`.\n- Multi-get value reads go out through a byte window (`BLOB_WINDOW`, 8\nMiB), one value always let out.\n- `io_uring` queue: `preadv2(RWF_NOWAIT)` on the calling thread for\nreads from 256 KiB, what is not cached going to the ring; a kernel\nrefusing `RWF_NOWAIT` sends everything to the ring.\n\n## Testing\nfmt, clippy (all features and default), the full nextest suite and doc\ntests pass on Linux, including the `io_uring` backend; new tests cover\nzero-copy answers by address, the value window, and cached reads beside\nthe ring.\n\nBREAKING CHANGE: QueuedRead::buf, ReadDone::buf, resumable\nBlockRequest::buf and ResumableMultiGet::complete_read take\nfs::QueuedBuf instead of Vec<u8>; fill it with QueuedBuf::read_from or\nQueuedBuf::fill_with.\n\nCloses #1043\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Large queued reads can use cached data when available, while reads\navoid unnecessary buffer initialization and copying.\n* Multi-value reads limit outstanding separated-value data to reduce\npeak memory use.\n  * Completed block data can be processed without an extra copy.\n* **Reliability**\n* Incomplete reads are treated as failed blocks and fall back to serial\nresolution.\n* **New Features**\n* Added a queued-read buffer for tracking read progress and accessing\ncompleted data.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-03T14:35:44Z",
+          "tree_id": "082fa0ae8efd437e17e6d52ffd2b41a1bb739484",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4bfff2c189fed973e5648db0fef311d87fd3f274"
+        },
+        "date": 1793717940991,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 609.8629999999999,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 210.566487ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 213.61,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 141.49179ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 991.257,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 293.65813ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 6359.498,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 21179.170000000002,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.967,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 52.953087,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.455667407,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 24.127,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 53.018623,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.449005416,
+            "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
         ]
