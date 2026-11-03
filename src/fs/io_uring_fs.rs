@@ -1702,7 +1702,7 @@ fn read_cached(fd: i32, read: &mut QueuedRead) -> bool {
     if NOWAIT_REFUSED.load(Ordering::Relaxed) {
         return false;
     }
-    let Some(offset) = resume_offset(read).and_then(|offset| libc::off_t::try_from(offset).ok())
+    let Some(offset) = resume_offset(read).and_then(|offset| libc::c_long::try_from(offset).ok())
     else {
         return false;
     };
@@ -1722,10 +1722,24 @@ fn read_cached(fd: i32, read: &mut QueuedRead) -> bool {
         iov_base: dst.cast(),
         iov_len: len,
     };
+    // The system call, not glibc's `preadv2` wrapper: the wrapper only exists
+    // from glibc 2.26, and the ring itself needs nothing of the C library. On
+    // the 64-bit targets this backend builds for, the kernel takes the whole
+    // offset from `pos_l` and ignores `pos_h` (`pos_from_hilo`, fs/read_write.c).
     // SAFETY: `iov` names `len` writable bytes of the buffer, alive for the
     // call.
     #[expect(unsafe_code, reason = "see safety")]
-    let n = unsafe { libc::preadv2(fd, &raw const iov, 1, offset, libc::RWF_NOWAIT) };
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_preadv2,
+            libc::c_long::from(fd),
+            &raw const iov,
+            libc::c_long::from(1u8),
+            offset,
+            libc::c_long::from(0u8),
+            libc::c_long::from(libc::RWF_NOWAIT),
+        )
+    };
     let Ok(n) = usize::try_from(n) else {
         let errno = io::Error::last_os_error().raw_os_error();
         if matches!(errno, Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS)) {
