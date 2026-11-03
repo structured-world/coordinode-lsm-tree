@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793695260931,
+  "lastUpdate": 1793695265191,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -100500,6 +100500,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.416502797,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5c3af0c3c6741c4c325fc312b11b968c50e3336f",
+          "message": "feat: opt-in mimalloc global allocator (#1047)\n\n## Summary\n- Opt-in `mimalloc` feature, off by default: installs mimalloc as the\nglobal allocator of the binary the crate is built into.\n- Under glibc's allocator a process holding large values pays on every\npass for the heap going back to the kernel and faulting in again; with\nmimalloc, 16 values of 4 MiB read in 1149 us per key instead of 5926 us.\nThe allocator comparison behind the choice (system, jemalloc, mimalloc\nv2/v3, Google and gperftools TCMalloc, snmalloc, rpmalloc) is in #1046.\n\n## Changes\n- `Cargo.toml`: `mimalloc` feature with optional `mimalloc` and\n`libmimalloc-sys`; crate docs describe it and its limit (a program links\none global allocator).\n- `src/lib.rs`: the global allocator under the feature;\n`src/mimalloc_tests.rs` checks that small and large allocations come\nfrom mimalloc.\n- `tests/seekable_range.rs` and four benches keep their counting\nallocator without the feature; under it the allocation test is left out\nand the benches say their counts read zero.\n- CI runs the allocation-counting test without the feature beside the\nall-features suite.\n\n## Testing\nfmt, clippy (all features and default), the full nextest suite with all\nfeatures, the allocation-counting test without the feature and doc tests\npass on Linux.\n\nCloses #1046\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added an opt-in memory allocator configuration that can change\napplication memory usage and performance.\n* **Benchmarks**\n* Allocation-count results are unavailable when the alternate allocator\nis enabled; benchmarks now display a notice.\n* **Tests**\n* Added checks for builds using the alternate allocator and expanded\nrange-query test coverage under the default allocator.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-03T08:18:46Z",
+          "tree_id": "37e34a3ed6de1fb5b325a8355538f41528432ba5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5c3af0c3c6741c4c325fc312b11b968c50e3336f"
+        },
+        "date": 1793695263827,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 638.188,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 177.056766ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 350.26399999999995,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 223.386433ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1277.6879999999999,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 242.726119ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5308.694,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 24219.012000000002,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.607,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 50.724863,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.414819697,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.191,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 53.706751,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.404526625,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
