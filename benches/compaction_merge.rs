@@ -116,7 +116,13 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-#[global_allocator]
+// A program links one global allocator, and the crate's `mimalloc` feature
+// installs its own: built with it, this one counts nothing.
+#[cfg_attr(not(feature = "mimalloc"), global_allocator)]
+#[cfg_attr(
+    feature = "mimalloc",
+    expect(dead_code, reason = "not the global allocator")
+)]
 static GLOBAL: Counting = Counting;
 
 /// Bytes per value by default: small, so the per-row key work is what the time
@@ -349,6 +355,10 @@ impl PerfControl {
 }
 
 fn main() -> lsm_tree::Result<()> {
+    #[cfg(feature = "mimalloc")]
+    eprintln!(
+        "compaction_merge: built with the mimalloc feature, allocation counts, bytes and peak heap read zero"
+    );
     let mut perf = PerfControl::from_env()?;
     // `cargo test` runs a bench target too: one small round then.
     let measuring = std::env::args().any(|a| a == "--bench");
