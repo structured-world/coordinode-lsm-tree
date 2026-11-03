@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793713004923,
+  "lastUpdate": 1793717933105,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -102632,6 +102632,92 @@ window.BENCHMARK_DATA = {
             "value": 0.42169557,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      }
+    ],
+    "lsm-tree db_bench 8.x · Linux · runner1-sw": [
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4bfff2c189fed973e5648db0fef311d87fd3f274",
+          "message": "perf(fs)!: fill batched reads in place and keep values cached (#1044)\n\n## Summary\n- A batched read fills its destination in place, unzeroed, and the block\nor value it answers with is the read's own memory, not a copy.\n- A multi-get of separated values keeps the value reads it has out\nwithin 8 MiB, so each value is checked while still in the processor\ncache.\n- The `io_uring` read queue copies what the page cache holds of a read\nof 256 KiB or more on the calling thread, sending only the rest, smaller\nreads and `O_DIRECT` files to the ring.\n\nOn one Linux host, default glibc, per key: multi-get of 64 values of 1\nMiB 325 us (was 801) for a tree with inline values and 353 us (was 612)\nfor a blob tree, against 1604 us for RocksDB; 16 values of 4 MiB 6059 us\n(was 7749) and 5885 us (was 7474). Multi-get now costs no more than\npoint reads that keep their values (within 3% at 4 MiB). Details and the\nequal-work comparison are in #1043.\n\n## Changes\n- `fs::QueuedBuf`: the destination of a queued read, allocated unzeroed,\nfilled in place, turned into the block's `Slice` without a copy; it\ncounts initialized and filled bytes.\n- `BlockBuf` over `MaybeUninit` memory: safe callers get the unfilled\npart zeroed on first use; a backend that only writes fills it through an\nunsafe accessor and declares what it wrote; `fill_unfilled` reads\nthrough `FsFile::read_at_buf`.\n- Data, Page-ECC, columnar and merge-base blocks and blob values decode\nfrom the read's `Slice`.\n- Multi-get value reads go out through a byte window (`BLOB_WINDOW`, 8\nMiB), one value always let out.\n- `io_uring` queue: `preadv2(RWF_NOWAIT)` on the calling thread for\nreads from 256 KiB, what is not cached going to the ring; a kernel\nrefusing `RWF_NOWAIT` sends everything to the ring.\n\n## Testing\nfmt, clippy (all features and default), the full nextest suite and doc\ntests pass on Linux, including the `io_uring` backend; new tests cover\nzero-copy answers by address, the value window, and cached reads beside\nthe ring.\n\nBREAKING CHANGE: QueuedRead::buf, ReadDone::buf, resumable\nBlockRequest::buf and ResumableMultiGet::complete_read take\nfs::QueuedBuf instead of Vec<u8>; fill it with QueuedBuf::read_from or\nQueuedBuf::fill_with.\n\nCloses #1043\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Large queued reads can use cached data when available, while reads\navoid unnecessary buffer initialization and copying.\n* Multi-value reads limit outstanding separated-value data to reduce\npeak memory use.\n  * Completed block data can be processed without an extra copy.\n* **Reliability**\n* Incomplete reads are treated as failed blocks and fall back to serial\nresolution.\n* **New Features**\n* Added a queued-read buffer for tracking read progress and accessing\ncompleted data.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-03T14:35:44Z",
+          "tree_id": "082fa0ae8efd437e17e6d52ffd2b41a1bb739484",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4bfff2c189fed973e5648db0fef311d87fd3f274"
+        },
+        "date": 1793717931702,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 75946.36678758563,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 17.4us | P99.9: 30.6us\nthreads: 1 | elapsed: 7.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2885115.910613627,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 784486.0786198768,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.5us | P99.9: 12.1us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 451429.9966059687,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 7.3us | P99.9: 33.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3202227.777055586,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 308488.3780882796,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.4us | P99.9: 15.2us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 184370.77304651812,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.7us | P99.9: 23.0us\nthreads: 1 | elapsed: 1.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 717198.3361328513,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 3.1us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 978136.468680662,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 335725.33944710664,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 13.6us | P99.9: 92.5us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
           }
         ]
       }
