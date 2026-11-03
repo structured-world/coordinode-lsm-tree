@@ -1,0 +1,12 @@
+name: Set up mold
+description: Installs the mold linker on a Linux runner, which the x86_64 Linux build links through (.cargo/cc-mold.sh); a no-op elsewhere.
+runs:
+  using: composite
+  steps:
+    - if: runner.os == 'Linux'
+      shell: bash
+      # The image's package index is used first; a stale one is refreshed.
+      run: |
+        sudo apt-get install -y --no-install-recommends mold \
+          || { sudo apt-get update && sudo apt-get install -y --no-install-recommends mold; }
+        mold --version
