@@ -77,7 +77,7 @@
   "use strict";
   // One colour per engine on every chart.
   const COLORS = {
-    "ours": "#58a6ff", "rocksdb": "#f78166", "surrealkv": "#3fb950", "blob_tree": "#d2a8ff",
+    "ours": "#58a6ff", "rocksdb": "#f78166", "surrealkv": "#3fb950", "blob_tree": "#d2a8ff", "rocksdb_blob": "#ffb77a",
     "ours-hash-index": "#79c0ff", "rocksdb-hash-index": "#ffa198", "ours-ribbon": "#e3b341", "ours-row-cache": "#56d4dd",
     "ours-deferred-wal": "#a5d6ff",
   };
@@ -126,11 +126,17 @@
       (groups[r.group] = groups[r.group] || {});
       (groups[r.group][r.engine] = groups[r.group][r.engine] || {})[r.n] = r;
     });
-    const base = function (group) { return group.replace(/_zstd22$/, ""); };
+    // A group's scenario, without its codec or blob-size suffix.
+    const base = function (group) { return group.replace(/_zstd22$/, "").replace(/_blobs_\d+mib$/, ""); };
     const codecOf = function (group) { return /_zstd22$/.test(group) ? "zstd22" : "none"; };
+    const blobsOf = function (group) {
+      const m = /_blobs_(\d+)mib$/.exec(group);
+      return m ? " · " + m[1] + " MiB blobs" : "";
+    };
     const ordered = Object.keys(groups).sort(function (a, b) {
       const order = Object.keys(KIND);
-      return order.indexOf(base(a)) - order.indexOf(base(b)) || codecOf(a).localeCompare(codecOf(b));
+      return order.indexOf(base(a)) - order.indexOf(base(b)) || codecOf(a).localeCompare(codecOf(b))
+        || blobsOf(a).localeCompare(blobsOf(b), undefined, { numeric: true });
     });
 
     const charts = [];
@@ -186,7 +192,7 @@
         const card = document.createElement("div");
         card.className = "card";
         const h3 = document.createElement("h3");
-        h3.textContent = base(group) + (codecOf(group) === "zstd22" ? " · zstd-22" : kind === "compaction" ? "" : " · uncompressed");
+        h3.textContent = base(group) + (codecOf(group) === "zstd22" ? " · zstd-22" : kind === "compaction" ? "" : " · uncompressed") + blobsOf(group);
         const p = document.createElement("p");
         p.textContent = notes[base(group)] || "";
         const wrap = document.createElement("div");
