@@ -147,6 +147,111 @@ fn a_cached_read_resumed_reads_past_its_filled_part() -> io::Result<()> {
     Ok(())
 }
 
+/// A read of `len` bytes at `offset` of a fresh 64-byte file, which the page
+/// cache holds whole, and the file's descriptor.
+fn cached_read(
+    fs: &IoUringFs,
+    dir: &Path,
+    offset: u64,
+    len: usize,
+) -> io::Result<(QueuedRead, i32)> {
+    let path = dir.join("cached.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    file.write_all(&[7u8; 64])?;
+    let file: Arc<dyn FsFile> = Arc::from(file);
+    let Some(fd) = file.backing_fd() else {
+        panic!("an io_uring file has a descriptor");
+    };
+    let read = QueuedRead {
+        tag: 0,
+        file,
+        offset,
+        buf: QueuedBuf::new(len),
+    };
+    Ok((read, fd))
+}
+
+/// A descriptor whose flags cannot be read leaves the read to the ring,
+/// which reports the failure as it would for any read.
+#[test]
+fn a_cached_read_of_a_descriptor_without_flags_goes_to_the_ring() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut read, _) = cached_read(&fs, dir.path(), 0, 16)?;
+    assert!(!read_cached(-1, &mut read), "no flags, no read in place");
+    assert_eq!(read.buf.filled(), 0);
+    assert!(
+        !NOWAIT_REFUSED.load(SeqCst),
+        "a bad descriptor is no refusal"
+    );
+    Ok(())
+}
+
+/// A read the kernel fails for its own reasons (here a descriptor open only
+/// for writing) goes to the ring unread, and does not count as the kernel
+/// refusing reads that must not wait.
+#[test]
+fn a_cached_read_the_kernel_fails_goes_to_the_ring() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut read, _) = cached_read(&fs, dir.path(), 0, 16)?;
+    let write_only = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("cached.bin"))?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&write_only);
+    assert!(
+        !read_cached(fd, &mut read),
+        "EBADF leaves the read to the ring"
+    );
+    assert_eq!(read.buf.filled(), 0);
+    assert!(!NOWAIT_REFUSED.load(SeqCst), "EBADF is no refusal");
+    Ok(())
+}
+
+/// A read resumed past the largest offset the system call takes goes to the
+/// ring, which reports it, instead of passing a wrapped offset to the kernel.
+#[test]
+fn a_cached_read_past_the_largest_offset_goes_to_the_ring() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut read, fd) = cached_read(&fs, dir.path(), u64::MAX - 8, 16)?;
+    assert!(!read_cached(fd, &mut read));
+    assert_eq!(read.buf.filled(), 0);
+    Ok(())
+}
+
+/// Once the kernel refuses a read that must not wait (a `/proc` file has no
+/// such reads), every later read goes to the ring, a cached one too. The
+/// flag is process-wide; each test runs in a process of its own.
+#[test]
+fn a_kernel_refusing_reads_that_must_not_wait_sends_every_read_to_the_ring() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut cached, fd) = cached_read(&fs, dir.path(), 0, 16)?;
+    let proc_file = std::fs::File::open("/proc/self/stat")?;
+    let (mut proc_read, _) = cached_read(&fs, dir.path(), 0, 16)?;
+    let proc_fd = std::os::fd::AsRawFd::as_raw_fd(&proc_file);
+
+    assert!(!read_cached(proc_fd, &mut proc_read), "procfs refuses");
+    assert!(NOWAIT_REFUSED.load(SeqCst), "the refusal is remembered");
+    assert!(
+        !read_cached(fd, &mut cached),
+        "a cached read goes to the ring now"
+    );
+    assert_eq!(cached.buf.filled(), 0);
+    NOWAIT_REFUSED.store(false, SeqCst);
+    Ok(())
+}
+
 /// A cached read that runs past the end of its file fails as short, as the
 /// ring reports it, instead of handing back a part of the block.
 #[test]

@@ -14,17 +14,37 @@ use lsm_tree::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A backend over [`StdFs`] whose queue reads what it holds when waited on,
-/// recording the most bytes it held at once.
-struct PeakFs(Arc<AtomicUsize>);
+/// recording the most bytes it held at once. With `fail_value` set, the first
+/// read of a value (at least [`VALUE_READ`] bytes) fails instead; with
+/// `short_block` set, the first read of a table block is reported done
+/// without a byte read, as a backend breaking its contract would.
+struct PeakFs {
+    peak: Arc<AtomicUsize>,
+    fail_value: Arc<AtomicBool>,
+    short_block: Arc<AtomicBool>,
+}
 
 /// The queue of a [`PeakFs`].
 struct PeakQueue {
     held: Vec<QueuedRead>,
     peak: Arc<AtomicUsize>,
+    fail_value: Arc<AtomicBool>,
+    short_block: Arc<AtomicBool>,
 }
+
+/// What a [`PeakFs`] does wrong once, if anything.
+#[derive(Clone, Copy)]
+enum Inject {
+    Nothing,
+    FailValue,
+    ShortBlock,
+}
+
+/// The size from which a queued read is a value's: table blocks are smaller.
+const VALUE_READ: usize = 1 << 20;
 
 impl ReadQueue for PeakQueue {
     fn submit(&mut self, read: QueuedRead) {
@@ -42,7 +62,17 @@ impl ReadQueue for PeakQueue {
         let bytes: usize = self.held.iter().map(|read| read.buf.capacity()).sum();
         self.peak.fetch_max(bytes, Ordering::SeqCst);
         for mut read in core::mem::take(&mut self.held) {
-            let result = read.buf.read_from(read.file.as_ref(), read.offset);
+            let value = read.buf.capacity() >= VALUE_READ;
+            let result = if value && self.fail_value.swap(false, Ordering::SeqCst) {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected value read failure",
+                ))
+            } else if !value && self.short_block.swap(false, Ordering::SeqCst) {
+                Ok(())
+            } else {
+                read.buf.read_from(read.file.as_ref(), read.offset)
+            };
             on_done(ReadDone {
                 tag: read.tag,
                 buf: read.buf,
@@ -61,7 +91,9 @@ impl Fs for PeakFs {
     fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
         Box::new(PeakQueue {
             held: Vec::new(),
-            peak: Arc::clone(&self.0),
+            peak: Arc::clone(&self.peak),
+            fail_value: Arc::clone(&self.fail_value),
+            short_block: Arc::clone(&self.short_block),
         })
     }
 
@@ -113,11 +145,17 @@ fn value(i: usize, len: usize) -> Vec<u8> {
 
 /// Writes `rows` separated values of `len` bytes, multi-gets them all with no
 /// cache, checks every value, and returns the most bytes the queue held at
-/// once.
-fn peak_of_multi_get(rows: usize, len: usize) -> lsm_tree::Result<usize> {
+/// once. `inject` is what the queue does wrong once, after the writes.
+fn peak_of_multi_get(rows: usize, len: usize, inject: Inject) -> lsm_tree::Result<usize> {
     let dir = tempfile::tempdir()?;
     let peak = Arc::new(AtomicUsize::new(0));
-    let fs: Arc<dyn Fs> = Arc::new(PeakFs(Arc::clone(&peak)));
+    let fail_value = Arc::new(AtomicBool::new(false));
+    let short_block = Arc::new(AtomicBool::new(false));
+    let fs: Arc<dyn Fs> = Arc::new(PeakFs {
+        peak: Arc::clone(&peak),
+        fail_value: Arc::clone(&fail_value),
+        short_block: Arc::clone(&short_block),
+    });
     let config = || {
         Config::new(
             dir.path(),
@@ -140,10 +178,16 @@ fn peak_of_multi_get(rows: usize, len: usize) -> lsm_tree::Result<usize> {
     }
     let tree = config().open()?;
     peak.store(0, Ordering::SeqCst);
+    fail_value.store(matches!(inject, Inject::FailValue), Ordering::SeqCst);
+    short_block.store(matches!(inject, Inject::ShortBlock), Ordering::SeqCst);
     let names: Vec<String> = (0..rows).map(|i| format!("k{i:04}")).collect();
 
     let values = tree.multi_get(&names, SeqNo::MAX)?;
 
+    assert!(
+        !fail_value.load(Ordering::SeqCst) && !short_block.load(Ordering::SeqCst),
+        "the injected fault, when asked for, was taken"
+    );
     for (i, got) in values.iter().enumerate() {
         let Some(got) = got else {
             panic!("k{i:04} was written");
@@ -158,7 +202,7 @@ fn peak_of_multi_get(rows: usize, len: usize) -> lsm_tree::Result<usize> {
 #[test]
 fn a_multi_get_keeps_its_value_reads_within_the_window() -> lsm_tree::Result<()> {
     let len = 3 << 20;
-    let peak = peak_of_multi_get(6, len)?;
+    let peak = peak_of_multi_get(6, len, Inject::Nothing)?;
     assert!(peak <= WINDOW, "{peak} bytes out at once, above the window");
     assert!(
         peak >= 2 * len,
@@ -172,11 +216,27 @@ fn a_multi_get_keeps_its_value_reads_within_the_window() -> lsm_tree::Result<()>
 #[test]
 fn values_two_of_which_overflow_the_window_are_read_one_at_a_time() -> lsm_tree::Result<()> {
     let len = 5 << 20;
-    let peak = peak_of_multi_get(3, len)?;
+    let peak = peak_of_multi_get(3, len, Inject::Nothing)?;
     // A read is the value's record: the value and its header.
     assert!(
         (len..2 * len).contains(&peak),
         "{peak} bytes out at once: each value goes out on its own"
     );
+    Ok(())
+}
+
+/// A value whose batched read fails is read again on its own path: the
+/// multi-get still hands back every value, the failed one included.
+#[test]
+fn a_value_whose_batched_read_fails_is_read_on_its_own() -> lsm_tree::Result<()> {
+    peak_of_multi_get(4, 2 << 20, Inject::FailValue)?;
+    Ok(())
+}
+
+/// A table block a backend reports read without a byte in it sends the level
+/// to the serial read, which still finds every key.
+#[test]
+fn a_block_read_reported_done_short_reads_the_level_serially() -> lsm_tree::Result<()> {
+    peak_of_multi_get(4, 2 << 20, Inject::ShortBlock)?;
     Ok(())
 }

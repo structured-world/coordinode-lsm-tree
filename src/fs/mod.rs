@@ -953,9 +953,9 @@ impl<'a> BlockBuf<'a> {
     /// Bytes never written are zeroed here the first time, so a read that
     /// looks at its buffer before writing it sees zeroes.
     pub fn unfilled_mut(&mut self) -> &mut [u8] {
-        if let Some(rest) = self.buf.get_mut(self.init..) {
-            rest.fill(MaybeUninit::new(0));
-        }
+        // `init` never passes the end, so the rest is always there.
+        let rest = self.buf.get_mut(self.init..).unwrap_or_default();
+        rest.fill(MaybeUninit::new(0));
         self.init = self.buf.len();
         // SAFETY: every byte is initialized as of the line above.
         #[expect(unsafe_code, reason = "see safety")]

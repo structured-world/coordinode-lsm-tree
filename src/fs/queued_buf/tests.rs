@@ -1,6 +1,68 @@
 use super::QueuedBuf;
-use crate::fs::BlockBuf;
+use crate::fs::{BlockBuf, Fs, FsFile, FsOpenOptions, MemFs};
+use std::io::Write;
+use std::path::Path;
 use test_log::test;
+
+/// A file holding `bytes`, opened for reading.
+fn file_of(bytes: &[u8]) -> Box<dyn FsFile> {
+    let fs = MemFs::new();
+    let path = Path::new("/f");
+    let mut file = fs
+        .open(path, &FsOpenOptions::new().write(true).create(true))
+        .expect("create");
+    file.write_all(bytes).expect("write");
+    fs.open(path, &FsOpenOptions::new().read(true))
+        .expect("open")
+}
+
+/// A read that resumes past the last offset a file can have fails as an
+/// invalid input, before anything is read, instead of wrapping around to
+/// the start of the file.
+#[test]
+fn read_from_past_the_last_offset_fails_as_invalid_input() {
+    let file = file_of(b"abcd");
+    let mut buf = QueuedBuf::new(4);
+    buf.fill_with(|block| block.append(b"a"));
+    let err = buf
+        .read_from(file.as_ref(), u64::MAX)
+        .expect_err("offset + filled overflows");
+    assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput);
+    assert_eq!(buf.filled(), 1, "nothing was read");
+}
+
+/// A file ending before the block does fails as an unexpected end of file,
+/// keeping the bytes it did hold.
+#[test]
+fn read_from_a_file_shorter_than_the_block_fails_as_eof() {
+    let file = file_of(b"abc");
+    let mut buf = QueuedBuf::new(8);
+    let err = buf
+        .read_from(file.as_ref(), 0)
+        .expect_err("the file ends at 3 bytes");
+    assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof);
+    assert_eq!(buf.filled_bytes(), b"abc");
+    assert!(buf.into_slice().is_none());
+}
+
+/// A read resumed past the bytes already filled reads on from there.
+#[test]
+fn read_from_resumes_past_the_filled_part() {
+    let file = file_of(b"hello, world");
+    let mut buf = QueuedBuf::new(5);
+    buf.fill_with(|block| block.append(b"w"));
+    buf.read_from(file.as_ref(), 7).expect("read");
+    assert_eq!(buf.filled_bytes(), b"world");
+}
+
+/// The debug form names the buffer's sizes, never its bytes.
+#[test]
+fn the_debug_form_shows_capacity_init_and_filled() {
+    let mut buf = QueuedBuf::new(8);
+    buf.fill_with(|block| block.append(b"abc"));
+    let shown = format!("{buf:?}");
+    assert_eq!(shown, "QueuedBuf { capacity: 8, init: 3, filled: 3, .. }");
+}
 
 /// A buffer filled end to end becomes the block, its bytes in order.
 #[test]
