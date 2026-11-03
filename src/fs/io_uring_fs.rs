@@ -172,17 +172,12 @@ impl IoUringFs {
 
         let mut serial_failure: Option<(usize, crate::io::Error)> = None;
         for (idx, req) in &mut serial {
-            // A partly filled destination owns the block's first `filled`
-            // bytes already; complete it from `offset + filled`.
-            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-                serial_failure = Some((
-                    *idx,
-                    crate::io::Error::from(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "read_blocks_batched: request offset overflows",
-                    )),
-                ));
-                break;
+            let offset = match req.resume_offset() {
+                Ok(offset) => offset,
+                Err(e) => {
+                    serial_failure = Some((*idx, e));
+                    break;
+                }
             };
             let file = req.file;
             match req
@@ -248,14 +243,7 @@ fn read_lone(
     req: &mut BlockRead<'_>,
     on_read: Option<OnRead<'_>>,
 ) -> crate::io::Result<()> {
-    // A partly filled destination owns the block's first `filled` bytes
-    // already; complete it from `offset + filled`.
-    let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-        return Err(crate::io::Error::from(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "read_blocks_batched: request offset overflows",
-        )));
-    };
+    let offset = req.resume_offset()?;
     use std::os::unix::io::FromRawFd as _;
 
     // SAFETY: `backing_fd` names a descriptor open for as long as the request
@@ -383,12 +371,7 @@ impl Fs for IoUringFs {
                     "buffer exceeds i32::MAX",
                 )));
             }
-            if req.offset.checked_add(req.buf.filled() as u64).is_none() {
-                return Err(crate::io::Error::from(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "submit_reads_multi: request offset overflows",
-                )));
-            }
+            req.resume_offset()?;
         }
         Ok(())
     }
@@ -1230,9 +1213,17 @@ impl RingThread {
         // whole, so there is no later point at which to refuse one read of it.
         // (SQE length is u32, CQE result i32 — block reads are KBs, never near
         // the cap, so this only fires on misuse of the general API.)
+        // A read past the largest file offset is refused here too: the ring
+        // reads `-1` as the descriptor's own position.
         let mut lens: Vec<u32> = Vec::with_capacity(regions.len());
         for region in regions.iter_mut() {
-            let (_, _, region_len) = region.target();
+            let (offset, _, region_len) = region.target();
+            if region_len != 0 && i64::try_from(offset).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "read offset past the largest file offset",
+                ));
+            }
             let len = if region_len == 0 {
                 0
             } else {
@@ -1328,18 +1319,7 @@ impl RingThread {
             // already, so the suffix the SQE describes lives `filled` bytes into
             // the block on disk. Submitting the original offset would duplicate
             // the block's beginning into the suffix instead.
-            let offset = req
-                .offset
-                .checked_add(req.buf.filled() as u64)
-                .ok_or_else(|| {
-                    (
-                        at,
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "submit_reads_multi: request offset overflows",
-                        ),
-                    )
-                })?;
+            let offset = req.resume_offset().map_err(|e| (at, io::Error::from(e)))?;
             metas.push(Some((fd, len, offset)));
         }
 

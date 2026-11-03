@@ -830,6 +830,11 @@ fn positioned_read(
     // a read at or past the end of a file opened for synchronous I/O with an
     // OVERLAPPED offset fails with ERROR_HANDLE_EOF.
     const ERROR_HANDLE_EOF: i32 = 38;
+    // https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getoverlappedresult:
+    // on a handle opened with FILE_FLAG_OVERLAPPED the read may still be in
+    // flight when ReadFile returns; the kernel keeps writing `memory` and the
+    // OVERLAPPED until it completes, so the read is waited for here.
+    const ERROR_IO_PENDING: i32 = 997;
 
     #[repr(C)]
     struct Overlapped {
@@ -850,6 +855,12 @@ fn positioned_read(
             n_number_of_bytes_to_read: u32,
             lp_number_of_bytes_read: *mut u32,
             lp_overlapped: *mut Overlapped,
+        ) -> i32;
+        fn GetOverlappedResult(
+            h_file: *mut std::ffi::c_void,
+            lp_overlapped: *mut Overlapped,
+            lp_number_of_bytes_transferred: *mut u32,
+            b_wait: i32,
         ) -> i32;
     }
 
@@ -886,8 +897,18 @@ fn positioned_read(
             &raw mut overlapped,
         )
     };
-    if ok == 0 {
-        let error = std::io::Error::last_os_error();
+    let mut error = (ok == 0).then(std::io::Error::last_os_error);
+    if error.as_ref().and_then(std::io::Error::raw_os_error) == Some(ERROR_IO_PENDING) {
+        // SAFETY: `overlapped` is the one the pending read was issued with,
+        // and the call returns only once the read completed, so neither it nor
+        // `memory` is released while the kernel may still write them.
+        #[expect(unsafe_code, reason = "see safety")]
+        let done = unsafe {
+            GetOverlappedResult(file.as_raw_handle(), &raw mut overlapped, &raw mut read, 1)
+        };
+        error = (done == 0).then(std::io::Error::last_os_error);
+    }
+    if let Some(error) = error {
         if error.raw_os_error() == Some(ERROR_HANDLE_EOF) {
             return Ok(0);
         }

@@ -1712,11 +1712,13 @@ impl IoUringRawFile {
             if len == 0 {
                 continue;
             }
+            // Refused before any read is submitted, so a refused batch reads
+            // nothing.
             reads.push(RawRead {
                 fd: self.fd,
                 buf,
                 len: batch_read_len(len)?,
-                offset,
+                offset: ring_offset(offset)?,
             });
         }
         let mut results = alloc::vec![0i32; reads.len()];
@@ -2179,15 +2181,12 @@ impl IoUringRawFs {
             if failure.as_ref().is_some_and(|(held, _)| *held < at) {
                 break;
             }
-            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-                failure = Some((
-                    at,
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "read_blocks_batched: request offset overflows",
-                    ),
-                ));
-                break;
+            let offset = match req.resume_offset() {
+                Ok(offset) => offset,
+                Err(error) => {
+                    failure = Some((at, error));
+                    break;
+                }
             };
             let file = req.file;
             match req
@@ -2292,12 +2291,7 @@ impl Fs for IoUringRawFs {
                 continue;
             }
             batch_read_len(want)?;
-            if req.offset.checked_add(req.buf.filled() as u64).is_none() {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "read_blocks_batched: request offset overflows",
-                ));
-            }
+            req.resume_offset()?;
         }
         Ok(())
     }

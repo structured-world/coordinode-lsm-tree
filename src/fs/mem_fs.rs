@@ -331,6 +331,14 @@ impl MemFile {
         if !self.readable {
             return Err(io::Error::other("read_at requires read access"));
         }
+        // No file reaches past `i64::MAX`: refused as the other backends
+        // refuse it, so a test on this backend sees what they would do.
+        if !memory.is_empty() && i64::try_from(offset).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read offset past the largest file offset",
+            ));
+        }
         // A file in memory holds at most `usize::MAX` bytes, so an offset past
         // that is past its end: nothing to read.
         let offset = usize::try_from(offset).unwrap_or(usize::MAX);

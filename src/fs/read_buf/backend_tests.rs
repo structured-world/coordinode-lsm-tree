@@ -290,6 +290,31 @@ fn std_positioned_reads_stop_at_the_end_and_refuse_impossible_offsets() -> crate
     Ok(())
 }
 
+/// Every built-in backend refuses a read past the largest file offset, so a
+/// test on the in-memory backend sees what a real one would do; an empty read
+/// there still reads nothing, as everywhere.
+#[test]
+fn every_builtin_backend_refuses_a_read_past_the_largest_file_offset() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let content: Vec<u8> = (0..64).collect();
+    let fs: [(Arc<dyn Fs>, &str); 2] = [(Arc::new(MemFs::new()), "/mem"), (Arc::new(StdFs), "std")];
+    for (fs, name) in fs {
+        let path = if name.starts_with('/') {
+            Path::new(name).to_path_buf()
+        } else {
+            dir.path().join(name)
+        };
+        let file = file_of(&*fs, &path, &content)?;
+        let mut bytes = [0u8; 16];
+        let error = file
+            .read_at(&mut bytes, u64::MAX)
+            .expect_err("past the largest file offset");
+        assert_eq!(error.kind(), crate::io::ErrorKind::InvalidInput, "{name}");
+        assert_eq!(file.read_at(&mut [], u64::MAX)?, 0, "{name}");
+    }
+    Ok(())
+}
+
 /// A safe reader is never shown memory nobody wrote either.
 #[test]
 fn from_reader_shows_a_safe_reader_only_zeroes() -> std::io::Result<()> {

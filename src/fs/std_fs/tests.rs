@@ -86,6 +86,40 @@ fn std_fs_remove_file_long_hold_on_windows_returns_error() -> io::Result<()> {
     Ok(())
 }
 
+/// Windows: a positioned read through a handle opened for overlapped I/O,
+/// whose `ReadFile` may return before the read completes, hands back the
+/// file's bytes and stops at its end, not an error while the kernel still
+/// writes the memory.
+#[cfg(windows)]
+#[test]
+fn std_positioned_read_waits_for_an_overlapped_handle() -> io::Result<()> {
+    use core::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("overlapped");
+    let content: Vec<u8> = (0..1u32 << 20)
+        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .collect();
+    std::fs::write(&path, &content)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OVERLAPPED)
+        .open(&path)?;
+
+    let mut memory = vec![MaybeUninit::<u8>::uninit(); 1 << 16];
+    let at = content.len() - 1000;
+    let n = read_uninit_at(&file, &mut memory, at as u64)?;
+    assert_eq!(n, 1000, "the read stops at the end of the file");
+    // SAFETY: the read reported its first `n` bytes written.
+    #[expect(unsafe_code, reason = "see safety")]
+    let read = unsafe { core::slice::from_raw_parts(memory.as_ptr().cast::<u8>(), n) };
+    assert_eq!(Some(read), content.get(at..));
+    assert_eq!(read_uninit_at(&file, &mut memory, content.len() as u64)?, 0);
+    Ok(())
+}
+
 /// Linux: `fallocate(PUNCH_HOLE)` frees a mid-file range and reads it back
 /// as zeros, leaving the logical length unchanged. Skips cleanly on a mount
 /// that does not advertise the capability (e.g. overlayfs in CI), so the
