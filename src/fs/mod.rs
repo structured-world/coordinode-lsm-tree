@@ -957,7 +957,7 @@ impl<'a> BlockBuf<'a> {
         let rest = self.buf.get_mut(self.init..).unwrap_or_default();
         rest.fill(MaybeUninit::new(0));
         self.init = self.buf.len();
-        let rest = self.unfilled_uninit_mut();
+        let rest = self.buf.get_mut(self.filled..).unwrap_or_default();
         // SAFETY: every byte from the fill point on is initialized as of the
         // zeroing above, and `MaybeUninit<u8>` has the layout of `u8`.
         #[expect(unsafe_code, reason = "see safety")]
@@ -972,8 +972,14 @@ impl<'a> BlockBuf<'a> {
     ///
     /// Not a `&mut [u8]`: a byte slice over memory never written is not one,
     /// whether or not anything reads it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not write `MaybeUninit::uninit()` into it: the bytes
+    /// counted initialized must stay so, as [`advance`](Self::advance) and
+    /// the memory a [`BlockBuf::new`] was lent rely on them.
     #[must_use]
-    pub fn unfilled_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+    pub unsafe fn unfilled_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         // `filled` never passes the end, so the rest is always there.
         self.buf.get_mut(self.filled..).unwrap_or_default()
     }

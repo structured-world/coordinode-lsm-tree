@@ -256,7 +256,11 @@ fn read_lone(
             "read_blocks_batched: request offset overflows",
         )));
     };
-    let want = pread_exact(fd, req.buf.unfilled_uninit_mut(), offset)?;
+    // SAFETY: `pread_exact` hands the span to the kernel, which only writes
+    // bytes into it.
+    #[expect(unsafe_code, reason = "see safety")]
+    let dst = unsafe { req.buf.unfilled_uninit_mut() };
+    let want = pread_exact(fd, dst, offset)?;
     // SAFETY: `pread_exact` wrote all `want` bytes after those filled.
     #[expect(unsafe_code, reason = "see safety")]
     unsafe {
@@ -1399,9 +1403,13 @@ impl RingThread {
                 continue;
             };
             expected.push(req.buf.capacity() - req.buf.filled());
-            // The kernel only writes the span; it is counted filled only once
-            // its completion reports it whole.
-            let dst = req.buf.unfilled_uninit_mut().as_mut_ptr().cast::<u8>();
+            // SAFETY: the kernel only writes bytes into the span, never
+            // uninitialized ones; it is counted filled only once its
+            // completion reports it whole.
+            #[expect(unsafe_code, reason = "see safety")]
+            let dst = unsafe { req.buf.unfilled_uninit_mut() }
+                .as_mut_ptr()
+                .cast::<u8>();
             reads.push(BatchRead {
                 fd,
                 buf: UnsafeSendMutPtr(dst),
