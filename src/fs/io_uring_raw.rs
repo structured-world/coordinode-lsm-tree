@@ -1798,13 +1798,13 @@ impl IoUringRawFile {
             return Ok(0);
         }
         if self.is_append {
-            // O_APPEND: write with the io_uring "use the file offset" sentinel
-            // (`-1`), so the kernel performs the append atomically against the
-            // O_APPEND descriptor. Resolving the offset in userspace
-            // (`lseek` + positioned write) would race with other appenders,
-            // because a positioned write ignores O_APPEND and two writers could
-            // land at the same offset, silently losing one.
-            return self.ring.lock().write_at(self.fd, buf, u64::MAX);
+            // O_APPEND: write at the descriptor's own position, so the kernel
+            // performs the append atomically against the O_APPEND descriptor.
+            // Resolving the offset in userspace (`lseek` + positioned write)
+            // would race with other appenders, because a positioned write
+            // ignores O_APPEND and two writers could land at the same offset,
+            // silently losing one.
+            return self.ring.lock().append(self.fd, buf);
         }
         let n = self.ring.lock().write_at(self.fd, buf, self.cursor)?;
         // The cursor is bounded by the file size (n is the bytes just
@@ -2783,8 +2783,21 @@ impl IoUringRaw {
     /// ring, returning the number of bytes written.
     ///
     /// # Errors
-    /// Returns an [`Error`] if the write completes with a negative `-errno`.
+    /// Returns an [`Error`] if `offset` is past the largest file offset or the
+    /// write completes with a negative `-errno`.
     pub fn write_at(&mut self, fd: i32, buf: &[u8], offset: u64) -> Result<usize, Error> {
+        self.write_sqe(fd, buf, ring_offset(offset)?)
+    }
+
+    /// Writes `buf` at the descriptor's own position, which on an `O_APPEND`
+    /// descriptor the kernel moves to the end of the file atomically.
+    pub(crate) fn append(&mut self, fd: i32, buf: &[u8]) -> Result<usize, Error> {
+        // The SQE offset `-1` is io_uring's "use the file position".
+        self.write_sqe(fd, buf, u64::MAX)
+    }
+
+    /// One write SQE of `buf` to `fd` at the SQE offset `off`.
+    fn write_sqe(&mut self, fd: i32, buf: &[u8], off: u64) -> Result<usize, Error> {
         let len = u32::try_from(buf.len()).map_err(|_| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -2796,7 +2809,7 @@ impl IoUringRaw {
             fd,
             addr: buf.as_ptr() as u64,
             len,
-            off: ring_offset(offset)?,
+            off,
             ..IoUringSqe::default()
         };
         let res = self.submit_and_reap_one(&sqe)?;
