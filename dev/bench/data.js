@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793776158150,
+  "lastUpdate": 1793783360019,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -102970,6 +102970,90 @@ window.BENCHMARK_DATA = {
             "value": 365983.5016723552,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 11.6us | P99.9: 81.0us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bc074dbaedc5eec727ec5d60c06c20284b2cb91d",
+          "message": "bench(compare): take blob trees against RocksDB blob files (#1055)\n\n## Summary\n\n- The head-to-head page shows one value layout at a time: engines\nkeeping values in their tables, or engines keeping them in blob files.\n- Our tree with blob files is measured against RocksDB with blob files\nin the same rounds, not against plain RocksDB.\n\n## Changes\n\n- `paired::run` takes each arm against the baseline its label names; a\nresult records that baseline, and an arm whose baseline is not in the\ngroup reports no ratio.\n- The harness maps `blob_tree` and `rocksdb_blob` to the blob-file\nlayout with `rocksdb_blob` as its baseline, every other arm to plain\nRocksDB.\n- `summary.json` records each result's `values` layout and each layout's\nbaseline under `baselines`.\n- The page gets a `Values` selector, draws only the engines of the\nchosen layout, names that layout's baseline on the ratio axis, and says\nso when a selection has no results.\n- `docs/BENCHMARKING.md` describes the per-layout baseline.\n\n## Testing\n\nClippy (all targets) and the paired-runner tests pass for\n`tools/compare-rocksdb` on Linux; a short run of the harness writes the\nnew summary fields, and the page was checked in a browser against it in\nboth layouts.\n\nCloses #1054\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Benchmark comparisons can now be viewed separately for inline values\nand blob-file values, with results matched to the selected layout.\n* Comparison charts use the corresponding RocksDB baseline and identify\nit in the relative-time axis. A message appears when the selected layout\nhas no results.\n* **Documentation**\n* Updated benchmarking guidance to explain how comparisons and\nconfidence intervals differ between value layouts.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-04T08:47:43Z",
+          "tree_id": "1d08a202f53480e50a959585e2a955509d808965",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bc074dbaedc5eec727ec5d60c06c20284b2cb91d"
+        },
+        "date": 1793783358724,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 136587.63229500025,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.2us | P99.9: 28.7us\nthreads: 1 | elapsed: 3.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2921275.837424982,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 833873.7808285847,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 481200.9570961924,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.9us | P99.9: 30.1us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3141896.086217022,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 316763.5848937582,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.5us | P99.9: 15.4us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 190357.99429683833,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.3us | P99.9: 26.7us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 862736.9582005971,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.3us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 989153.041714102,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 344924.2286234844,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 12.4us | P99.9: 89.2us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
           }
         ]
       }
