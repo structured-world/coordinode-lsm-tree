@@ -309,6 +309,11 @@ jobs:
         # workspace gates above never lint it.
         working-directory: tools/v5-to-v6
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (blob-sweep)
+        # The sweep the blob file defaults are chosen from, a standalone crate
+        # the workspace gates do not reach either.
+        working-directory: tools/blob-sweep
+        run: cargo clippy --all-targets -- -D warnings
       - name: Docs
         # Broken and private intra-doc links fail the docs.rs build of a
         # release and nothing else catches them. Linux, with every feature,
@@ -446,6 +451,7 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo-tools
           workspaces: |
+            tools/blob-sweep -> target
             tools/db_bench -> target
             tools/sst-dump -> target
             tools/v5-to-v6 -> target
@@ -483,6 +489,12 @@ jobs:
         # 5.x crate and convert them, so every change to the 6.0 format that
         # the converter does not carry yet fails here.
         working-directory: tools/v5-to-v6
+        run: cargo nextest run
+      - name: Build + test blob-sweep crate
+        # Standalone crate (not in workspace). Its smoke test runs every kind
+        # of sweep run over a small corpus, so a change to the options or the
+        # metrics the sweep reads breaks here rather than on the bench host.
+        working-directory: tools/blob-sweep
         run: cargo nextest run
 
   fuzz-heal:
