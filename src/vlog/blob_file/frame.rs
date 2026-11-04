@@ -494,6 +494,143 @@ pub(crate) fn decode_frame(
     })
 }
 
+/// Checks a chunk stored as it is from its `header` and its `payload`, read
+/// apart from the header into where the value it is part of holds it: its
+/// shape, and the frame's checksum over the payload as read.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for a frame that is not a chunk stored as
+/// it is, of `payload`'s length; [`crate::Error::ChecksumMismatch`] when the
+/// payload does not check.
+pub(crate) fn check_stored_chunk(header: &FrameHeader, payload: &[u8]) -> crate::Result<()> {
+    let shape_ok = header.kind == FrameKind::Chunk
+        && header.entries_len == 0
+        && header.flags & FLAG_PLAIN == 0
+        && header.disk_len == header.raw_len
+        && header.raw_len as usize == payload.len();
+    if !shape_ok {
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
+    let checksum = frame_checksum(&[], payload, header.header_crc);
+    if checksum != header.checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: crate::Checksum::from_raw(checksum),
+            expected: crate::Checksum::from_raw(header.checksum),
+        });
+    }
+    Ok(())
+}
+
+/// Checks the chunk frame `bytes` holds whole and writes its payload, decoded
+/// under `compression`, into `out`, which takes exactly the chunk.
+///
+/// `decoded` receives the length the decompressor produced, as
+/// [`decode_frame`] does.
+///
+/// # Errors
+///
+/// As [`decode_frame`], and a frame that is not a chunk of `out`'s length.
+pub(crate) fn decode_chunk_into(
+    bytes: &[u8],
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    out: &mut [u8],
+    decoded: &mut usize,
+) -> crate::Result<()> {
+    let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    let (header, _) = check_frame(bytes)?;
+    if header.kind != FrameKind::Chunk || header.raw_len as usize != out.len() {
+        return Err(malformed());
+    }
+    let stored = bytes
+        .get(FRAME_HEADER_LEN + header.entries_len as usize..)
+        .ok_or_else(malformed)?;
+    #[cfg(zstd_any)]
+    let (compression, dictionary) = if header.flags & FLAG_PLAIN == 0 {
+        (compression, dictionary)
+    } else if let CompressionType::ZstdDict { level, .. } = compression {
+        (CompressionType::Zstd(level), None)
+    } else {
+        return Err(malformed());
+    };
+    #[cfg(not(zstd_any))]
+    if header.flags & FLAG_PLAIN != 0 {
+        return Err(malformed());
+    }
+    if header.is_raw() || compression == CompressionType::None {
+        *decoded = stored.len();
+        if stored.len() != out.len() {
+            return Err(malformed());
+        }
+        out.copy_from_slice(stored);
+        return Ok(());
+    }
+    decompress_to(
+        stored,
+        out,
+        compression,
+        #[cfg(zstd_any)]
+        dictionary,
+        decoded,
+    )
+}
+
+/// `stored` decompressed under `compression` into `out`: without a codec
+/// built in, nothing is compressed, so nothing decompresses.
+#[cfg(not(any(feature = "lz4", zstd_any)))]
+fn decompress_to(
+    _stored: &[u8],
+    _out: &mut [u8],
+    _compression: CompressionType,
+    _decoded: &mut usize,
+) -> crate::Result<()> {
+    Err(crate::Error::InvalidHeader("BlobFrame"))
+}
+
+/// `stored` decompressed under `compression` into `out`, exactly its length.
+#[cfg(any(feature = "lz4", zstd_any))]
+fn decompress_to(
+    stored: &[u8],
+    out: &mut [u8],
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    decoded: &mut usize,
+) -> crate::Result<()> {
+    let written = match compression {
+        CompressionType::None => return Err(crate::Error::InvalidHeader("BlobFrame")),
+
+        #[cfg(feature = "lz4")]
+        CompressionType::Lz4 => lz4_flex::block::decompress_into(stored, out)
+            .map_err(|_| crate::Error::Decompress(compression))?,
+
+        #[cfg(zstd_any)]
+        CompressionType::Zstd(_) => crate::compression::ZstdBackend::decompress_into(stored, out)
+            .map_err(|_| crate::Error::Decompress(compression))?,
+
+        #[cfg(zstd_any)]
+        CompressionType::ZstdDict { dict_id, .. } => {
+            let dict = dictionary.ok_or(crate::Error::ZstdDictMismatch {
+                expected: dict_id,
+                got: None,
+            })?;
+            let decompressed =
+                crate::compression::ZstdBackend::decompress_with_dict(stored, dict, out.len())
+                    .map_err(|_| crate::Error::Decompress(compression))?;
+            let target = out
+                .get_mut(..decompressed.len())
+                .ok_or(crate::Error::Decompress(compression))?;
+            target.copy_from_slice(&decompressed);
+            decompressed.len()
+        }
+    };
+    *decoded = written;
+    if written != out.len() {
+        return Err(crate::Error::Decompress(compression));
+    }
+    Ok(())
+}
+
 /// `stored` decompressed under `compression` into exactly `raw_len` bytes.
 #[cfg_attr(
     not(any(feature = "lz4", zstd_any)),

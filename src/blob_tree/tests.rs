@@ -3,8 +3,10 @@ use crate::coding::Encode;
 use crate::vlog::ValueHandle;
 use test_log::test;
 
-/// A blob tree of `keys` keys with 4 KiB values, every one in a blob file,
-/// over a cache of its own, and reading with `fill`.
+/// A blob tree of `keys` keys with 4 KiB values, every one in a frame of its
+/// own in a blob file, over a cache of its own, and reading with `fill`. Frames
+/// of their own are what the fill governs: a block a point read decodes is
+/// cached whatever it says.
 fn blob_tree_with_cache(
     folder: &tempfile::TempDir,
     keys: u32,
@@ -19,7 +21,7 @@ fn blob_tree_with_cache(
         crate::SequenceNumberCounter::default(),
     )
     .use_cache(Arc::clone(&cache))
-    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .with_kv_separation(Some(crate::KvSeparationOptions::default().block_size(0)))
     .blob_cache_fill(fill)
     .open()?
     else {

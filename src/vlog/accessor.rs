@@ -95,6 +95,15 @@ pub(crate) struct Accessor<'a> {
     metrics: Option<&'a Metrics>,
 }
 
+/// Whether a frame a read decoded goes into the cache under `fill`. A block
+/// of small values always does, as a data block does: the values beside the
+/// one read are read next as often as not, and a block decoded once per value
+/// costs each of them the whole block. A frame of one value, or a chunk,
+/// follows the fill.
+pub(crate) fn caches(fill: BlobCacheFill, frame: &DecodedFrame) -> bool {
+    fill.fills() || frame.header.kind == crate::vlog::blob_file::frame::FrameKind::Block
+}
+
 impl<'a> Accessor<'a> {
     pub(crate) fn new(
         blob_files: &'a BlobFileList,
@@ -205,7 +214,7 @@ impl<'a> Accessor<'a> {
                 // The read that led may not cache what it reads (its policy
                 // is its own, taken when it began): one whose policy does
                 // caches the shared frame itself.
-                if self.fill.fills() && !cache.contains_blob_frame(tree_id, at) {
+                if caches(self.fill, &shared) && !cache.contains_blob_frame(tree_id, at) {
                     cache.insert_blob_frame(tree_id, at, Arc::clone(&shared));
                 }
                 return Ok(shared);
@@ -243,8 +252,10 @@ impl<'a> Accessor<'a> {
         let frame = Arc::new(parsed?);
         cache.record_blob_load(tree_id, at, timer);
         match lead {
-            Some(lead) => lead.publish(cache, tree_id, at, &frame, self.fill.fills()),
-            None if self.fill.fills() => cache.insert_blob_frame(tree_id, at, Arc::clone(&frame)),
+            Some(lead) => lead.publish(cache, tree_id, at, &frame, caches(self.fill, &frame)),
+            None if caches(self.fill, &frame) => {
+                cache.insert_blob_frame(tree_id, at, Arc::clone(&frame));
+            }
             None => {}
         }
         Ok(frame)
@@ -305,6 +316,13 @@ impl<'a> Accessor<'a> {
         }
         check_key(&first, vhandle.index, key)?;
         let total = first.list.first().map_or(0, |e| u64::from(e.value_len));
+        // A whole value its read does not cache is built in place, its chunks
+        // read into it, and none decoded on its own.
+        if range.is_none() && !self.fill.fills() {
+            return self
+                .read_chunks_whole(tree_id, blob_file, &first, vhandle.frame)
+                .map(Some);
+        }
         let range = range.unwrap_or(0..total);
         check_range(&range, total)?;
         let all = chunk_frames(&first, vhandle.frame)?;
@@ -320,6 +338,91 @@ impl<'a> Accessor<'a> {
         let value = assemble(&first, &chunks, Some(&range))?;
         self.count_gather(value.len());
         Ok(Some(value))
+    }
+
+    /// The chunked value `head`, frame `head_frame` of `blob_file`, read whole
+    /// into one allocation: a chunk stored as it is has its payload read
+    /// straight into the place it takes in the value, its header beside it,
+    /// and a compressed one is read whole and decompressed into its place. No
+    /// chunk is held decoded on its own, so the value costs what a value of a
+    /// frame of its own does: one copy of its bytes out of the file.
+    ///
+    /// # Errors
+    ///
+    /// The blob file's open or read failures, and a chunk that does not check
+    /// or does not fit the head's table.
+    fn read_chunks_whole(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        head: &DecodedFrame,
+        head_frame: u32,
+    ) -> crate::Result<UserValue> {
+        use crate::vlog::blob_file::frame::{
+            FRAME_HEADER_LEN, check_stored_chunk, decode_chunk_into, parse_header,
+        };
+
+        let malformed = || crate::Error::InvalidHeader("Blob");
+        let (size, count) = head.chunk_table()?;
+        let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
+        let len = usize::try_from(total).map_err(|_| malformed())?;
+        let chunks = chunk_frames(head, head_frame)?;
+        if chunks.end - chunks.start != count {
+            return Err(malformed());
+        }
+        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
+        let (file, _) = blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
+        let compression = blob_file.0.meta.compression;
+
+        let mut value = crate::slice::UnfilledSlice::new(len);
+        let mut target = value.target();
+        for (at, frame) in (0_u32..).zip(chunks) {
+            let expected = if at + 1 == count {
+                total - u64::from(at) * u64::from(size)
+            } else {
+                u64::from(size)
+            };
+            let expected = usize::try_from(expected).map_err(|_| malformed())?;
+            let (start, end) = blob_file.frame_span(frame).ok_or_else(malformed)?;
+            let frame_len = usize::try_from(end - start).map_err(|_| malformed())?;
+            self.count_request(frame_len);
+            let mut part = target.portion(target.filled(), expected);
+            if frame_len == FRAME_HEADER_LEN + expected {
+                // As long as the chunk itself: stored as it is.
+                let header = crate::file::read_exact(file.as_ref(), start, FRAME_HEADER_LEN)?;
+                let header = parse_header(&header)?;
+                file.read_at_buf(&mut part, start + FRAME_HEADER_LEN as u64)?;
+                if part.filled() != expected {
+                    return Err(malformed());
+                }
+                check_stored_chunk(&header, part.init_mut())?;
+                self.count_decoded(expected);
+            } else {
+                let bytes = crate::file::read_exact(file.as_ref(), start, frame_len)?;
+                let mut decoded = 0;
+                let checked = decode_chunk_into(
+                    &bytes,
+                    compression,
+                    #[cfg(zstd_any)]
+                    blob_file.0.zstd_dictionary.as_deref(),
+                    part.init_mut(),
+                    &mut decoded,
+                );
+                self.count_decoded(decoded);
+                checked?;
+                part.set_filled(expected)?;
+            }
+            target.extend_from_portion(expected);
+        }
+        if target.filled() != len {
+            return Err(malformed());
+        }
+        // SAFETY: every byte of the value was filled above, chunk by chunk,
+        // as `target` counted them.
+        #[expect(unsafe_code, reason = "see safety")]
+        Ok(unsafe { value.assume_filled() })
     }
 
     /// Warms the cache, or the read's own store, with the frames a run of

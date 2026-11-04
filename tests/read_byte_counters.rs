@@ -455,7 +455,9 @@ fn a_blob_read_rejected_as_corrupt_still_counts_its_bytes() {
 }
 
 /// A key-value-separated tree of `n` 8 KiB values over a filesystem whose
-/// faults the returned injector arms, flushed so every value is in a blob file.
+/// faults the returned injector arms, flushed so every value is in a blob file,
+/// each in a frame of its own: a block a point read decodes is cached, and the
+/// next value of it would not reach the filesystem.
 fn faultable_blob_tree(
     n: u32,
 ) -> (
@@ -474,7 +476,7 @@ fn faultable_blob_tree(
         SequenceNumberCounter::default(),
     )
     .with_shared_fs(fs)
-    .with_kv_separation(Some(Default::default()))
+    .with_kv_separation(Some(lsm_tree::KvSeparationOptions::default().block_size(0)))
     .open()
     .expect("open");
     for i in 0..n {

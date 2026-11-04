@@ -162,6 +162,114 @@ fn a_large_value_read_through_the_cache_is_served_from_it_again() -> lsm_tree::R
     Ok(())
 }
 
+/// A large value read whole without the cache comes back as written under
+/// every codec, compressible chunks decompressed into place and incompressible
+/// ones read straight in, each byte decoded.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_large_value_read_whole_is_built_in_place() -> lsm_tree::Result<()> {
+    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+        let folder = get_tmp_folder();
+        let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
+        // Half compressible, half not: both kinds of chunk in one value.
+        let mut value: Vec<u8> = (0..600_000_u32).map(|i| (i % 7) as u8).collect();
+        value.extend(random(5, 600_000));
+        tree.insert("large", &value, 0);
+        tree.flush_active_memtable(0)?;
+
+        let m = tree.metrics();
+        let before = m.bytes_decoded();
+        assert_eq!(
+            tree.get("large", SeqNo::MAX)?.as_deref(),
+            Some(&*value),
+            "{compression:?}"
+        );
+        assert!(
+            m.bytes_decoded() - before >= value.len() as u64,
+            "{compression:?}: every byte of the value was decoded once"
+        );
+    }
+    Ok(())
+}
+
+/// A block of small values a point read decodes is cached like a data block,
+/// whatever the blob cache fill says: the values beside the one read are read
+/// from the cache, by `get` and by `multi_get` alike, not decoded again per
+/// value. A value of a frame of its own still follows the fill.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()> {
+    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+        let folder = get_tmp_folder();
+        let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
+        // Twenty values of 2,000 bytes: three blocks.
+        for i in 0..20 {
+            tree.insert(format!("k{i:02}"), random(i, 2_000), 0);
+        }
+        tree.insert("single", random(99, 100_000), 0);
+        tree.flush_active_memtable(0)?;
+
+        let m = tree.metrics();
+        for i in 0..20 {
+            assert_eq!(
+                tree.get(format!("k{i:02}"), SeqNo::MAX)?.as_deref(),
+                Some(&*random(i, 2_000))
+            );
+        }
+        let requests = m.blob_read_count();
+        assert!(
+            requests <= 3,
+            "{compression:?}: {requests} reads for three blocks"
+        );
+        let keys: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
+        let got = tree.multi_get(&keys, SeqNo::MAX)?;
+        assert!(got.iter().all(Option::is_some));
+        assert_eq!(
+            m.blob_read_count(),
+            requests,
+            "{compression:?}: the cached blocks serve the batch"
+        );
+
+        let _ = tree.get("single", SeqNo::MAX)?;
+        let once = m.blob_read_count();
+        let _ = tree.get("single", SeqNo::MAX)?;
+        assert_eq!(
+            m.blob_read_count(),
+            once + 1,
+            "{compression:?}: a value of its own is not cached under Never"
+        );
+    }
+    Ok(())
+}
+
+/// A batch whose values share blocks reads each block once, even when none
+/// is cached yet.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_batch_reads_each_block_it_needs_once() -> lsm_tree::Result<()> {
+    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+        let folder = get_tmp_folder();
+        let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
+        for i in 0..20 {
+            tree.insert(format!("k{i:02}"), random(i, 2_000), 0);
+        }
+        tree.flush_active_memtable(0)?;
+
+        let m = tree.metrics();
+        let keys: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
+        let got = tree.multi_get(&keys, SeqNo::MAX)?;
+        for (i, value) in got.iter().enumerate() {
+            assert_eq!(value.as_deref(), Some(&*random(i as u64, 2_000)));
+        }
+        let decoded_blocks = m.blob_read_count();
+        assert!(
+            decoded_blocks <= 3,
+            "{compression:?}: {decoded_blocks} reads for three blocks"
+        );
+    }
+    Ok(())
+}
+
 /// A dictionary that applies to blocks only leaves the other classes
 /// compressed without it, and every value reads back, after a reopen too,
 /// whichever way its frame was compressed.

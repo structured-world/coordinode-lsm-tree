@@ -385,11 +385,14 @@ pub enum BlobCacheFill {
     /// Every value read from a blob file is cached, and a scan reads its
     /// values ahead into the cache.
     Always,
-    /// No value read from a blob file is cached: values large enough to be
-    /// separated are mostly read once, and cached they would evict the index,
-    /// filter and data blocks of every tree sharing the cache. A scan still
-    /// reads its values ahead, into a store of its own holding at most one
-    /// coalesced read, from which it hands them out.
+    /// No value of a frame of its own read from a blob file is cached: values
+    /// large enough to be separated are mostly read once, and cached they
+    /// would evict the index, filter and data blocks of every tree sharing the
+    /// cache. A block of small values a point read decodes is cached all the
+    /// same, as a data block is: the values beside the one read are read as
+    /// often, and each would otherwise decode the whole block again. A scan
+    /// still reads its values ahead, into a store of its own holding at most
+    /// one coalesced read, from which it hands them out.
     #[default]
     Never,
 }

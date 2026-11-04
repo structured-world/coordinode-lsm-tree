@@ -394,7 +394,8 @@ impl BlobSource {
     /// caches what it reads. A chunked value read whole, head and chunks, is
     /// assembled out of them; `None` for one read only as far as its head,
     /// whose chunks are read on the value's own path, which finds the head
-    /// cached.
+    /// cached. The frame comes back beside the value when it holds values of
+    /// its own (a block or a single), for the other values of the batch in it.
     ///
     /// # Errors
     ///
@@ -407,7 +408,10 @@ impl BlobSource {
         key: &[u8],
         read: &ValueRead<'_>,
         bytes: &crate::Slice,
-    ) -> crate::Result<Option<UserValue>> {
+    ) -> crate::Result<(
+        Option<UserValue>,
+        Option<Arc<crate::vlog::blob_file::frame::DecodedFrame>>,
+    )> {
         use crate::vlog::blob_file::{frame::FrameKind, reader};
 
         let accessor = Accessor::new(
@@ -434,16 +438,17 @@ impl BlobSource {
             reader::Reader::decode(read.blob_file, &frame_bytes(start, end)?, &mut decoded);
         accessor.count_decoded(decoded);
         let frame = Arc::new(parsed?);
-        if self.fill.fills() {
+        if crate::vlog::accessor::caches(self.fill, &frame) {
             self.cache
                 .insert_blob_frame(self.tree_id, read.vhandle.frame_at(), Arc::clone(&frame));
         }
         if frame.header.kind != FrameKind::Head {
-            return reader::value_in(&frame, read.vhandle.index, key).map(Some);
+            let value = reader::value_in(&frame, read.vhandle.index, key)?;
+            return Ok((Some(value), Some(frame)));
         }
         reader::check_key(&frame, read.vhandle.index, key)?;
         if bytes.len() as u64 == end - start {
-            return Ok(None);
+            return Ok((None, None));
         }
         let all = reader::chunk_frames(&frame, read.vhandle.frame)?;
         let mut chunks = Vec::with_capacity((all.end - all.start) as usize);
@@ -461,7 +466,28 @@ impl BlobSource {
         }
         let value = reader::assemble(&frame, &chunks.iter().collect::<Vec<_>>(), None)?;
         accessor.count_gather(value.len());
-        Ok(Some(value))
+        Ok((Some(value), None))
+    }
+
+    /// The value `item` stands for, out of `frame`, the frame `at` names,
+    /// which a batch read for another of its values: `None` when `item` names
+    /// another frame or its entry there is not its key's, and then it is read
+    /// on its own path.
+    pub(crate) fn value_in_frame(
+        frame: &crate::vlog::blob_file::frame::DecodedFrame,
+        at: crate::cache::BlobFrameAt,
+        item: &InternalValue,
+    ) -> Option<UserValue> {
+        let indirection = BlobIndirection::decode_from(&mut &item.value[..]).ok()?;
+        if indirection.vhandle.frame_at() != at {
+            return None;
+        }
+        crate::vlog::blob_file::reader::value_in(
+            frame,
+            indirection.vhandle.index,
+            &item.key.user_key,
+        )
+        .ok()
     }
 
     /// Counts the read of `read`'s record as issued.
