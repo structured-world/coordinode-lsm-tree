@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793776153973,
+  "lastUpdate": 1793776158150,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -106626,6 +106626,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.439896361,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4b70d01b3dcb4248139fa9b6632b414fc03edb6c",
+          "message": "fix(fs)!: read into ReadBuf memory without a byte slice (#1051)\n\n## Summary\n- Memory a `ReadBuf` has not initialized leaves it only as `MaybeUninit`\nbytes, never as a `&mut [u8]`, which `from_raw_parts_mut` does not allow\nover unwritten memory whether or not it is read.\n- The built-in backends read into that memory through a pointer, so\nnothing is zeroed on their read paths.\n\n## Changes\n- `ReadBuf::fill_with` hands its closure `&mut [MaybeUninit<u8>]`;\n`ReadBuf::bytes_mut_unchecked` is removed. The ring backends' batch\nregions give a pointer and a length.\n- `StdFs`: one positioned read into `MaybeUninit` memory, `pread64` on\nLinux and Android, `pread` on other Unix, `ReadFile` with an\n`OVERLAPPED` offset on Windows; `read_at`, `read_at_buf` and\n`IoUringFs`'s single and lone-descriptor reads go through it.\n- Raw io_uring backend: reads into `MaybeUninit` memory through its\npointer. `MemFs`: copies with `write_copy_of_slice`.\n- An offset past `i64::MAX` is refused on every built-in backend,\nWindows and `MemFs` included. On both io_uring backends this also fixes\nreads and writes at `u64::MAX`: the ring reads offset `-1` as the\ndescriptor's own position, so they used to land at the start of the\nfile. A batch holding such a read is refused whole before any of it is\nsubmitted.\n- On Windows, a positioned read through a handle opened for overlapped\nI/O waits for a pending `ReadFile` before its memory is released.\n- Tests: a short read on every built-in backend leaves initialized\nexactly the bytes read; the positioned read stops at the end of the\nfile, takes an empty destination, and refuses an offset no file can\nhave, alone and in a batch.\n\n## Testing\nClippy with and without all features, the full test suite and the doc\ntests pass on Linux; the read tests, the doc test and the no-std check\npass on macOS. The Windows read path is checked by CI.\n\nBREAKING CHANGE: `ReadBuf::fill_with` takes a closure over `&mut\n[MaybeUninit<u8>]`, and `ReadBuf::bytes_mut_unchecked` is removed.\n\nCloses #1050\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Positioned and batched reads now handle end-of-file consistently,\nfilling only bytes actually read.\n* Reads and writes reject offsets that cannot be represented, rather\nthan risking incorrect results or modifying file contents.\n* Reads from write-only files report an access error instead of\nappearing to return end-of-file.\n* **Tests**\n* Expanded coverage for end-of-file behavior, invalid offsets, and reads\non supported platforms.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-03T22:16:23Z",
+          "tree_id": "12876d850c870ffe3e4f84dde0ae59de8c552eac",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4b70d01b3dcb4248139fa9b6632b414fc03edb6c"
+        },
+        "date": 1793776156837,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 652.99,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 179.044041ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 288.91700000000003,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 202.164844ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1338.385,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 263.721785ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 6155.255999999999,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 22858.159,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.631,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.545215,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.406429243,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.391,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 51.445759,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.401371561,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
