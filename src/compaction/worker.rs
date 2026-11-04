@@ -3323,6 +3323,7 @@ fn run_subcompaction(
                     opts.tree_id,
                 )
                 .with_drain_below(drain_below)
+                .with_block_copy_share(Some(blob_opts.block_copy_share()))
                 .with_fresh_values(FreshValues {
                     options: blob_opts.clone(),
                     compression: rc.blob_compression,
@@ -3622,10 +3623,6 @@ pub(crate) fn pick_blob_files_to_rewrite(
 struct BlobRewrite {
     files: Vec<BlobFile>,
     /// Some of `files` are relocated for locality rather than for staleness.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(dead_code, reason = "read only by the std merge-on-read fast path")
-    )]
     for_locality: bool,
 }
 
@@ -4247,6 +4244,7 @@ fn merge_tables(
             &pace,
         );
     }
+    let for_locality = blob_rewrite.for_locality;
     let blob_files_to_rewrite = blob_rewrite.files;
 
     // ---- Parallel sub-compaction (std only) ----
@@ -4694,6 +4692,10 @@ fn merge_tables(
                         opts.config.comparator.clone(),
                         opts.tree_id,
                     )
+                    // A pass that relocates for locality rewrites every value
+                    // in key order: a block copied whole would keep its
+                    // source's place among the files it interleaves with.
+                    .with_block_copy_share((!for_locality).then(|| blob_opts.block_copy_share()))
                     .with_fresh_values(FreshValues {
                         options: blob_opts.clone(),
                         compression: rc.blob_compression,

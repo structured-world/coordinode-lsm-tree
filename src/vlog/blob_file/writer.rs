@@ -861,6 +861,36 @@ impl Writer {
         })
     }
 
+    /// Writes `stored`, a block frame as stored under the codec this file
+    /// records, without encoding it again, and returns its frame number: each
+    /// of its values keeps its place in it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when `stored` is not a block, a frame
+    /// that does not check, and any IO error.
+    pub(crate) fn write_block_verbatim(&mut self, stored: &[u8]) -> crate::Result<u32> {
+        let (header, list) = super::frame::check_frame(stored)?;
+        if header.kind != FrameKind::Block {
+            return Err(crate::Error::InvalidHeader("verbatim blob block"));
+        }
+        let entries = stored
+            .get(super::frame::FRAME_HEADER_LEN..)
+            .unwrap_or_default();
+        self.close_block()?;
+        let frame = self.next_frame()?;
+        let before = self.offset;
+        self.put_frame(stored)?;
+        self.block_frame_bytes += self.offset - before;
+        for entry in &list {
+            let key = entries.get(entry.key.clone()).unwrap_or_default();
+            self.block_entry_bytes +=
+                (super::frame::ENTRY_HEADER_LEN + key.len()) as u64 + u64::from(entry.value_len);
+            self.note_key(key, entry.value_len);
+        }
+        Ok(frame)
+    }
+
     /// The bytes written since the offset was `before`: what the frames of
     /// one value take.
     #[expect(

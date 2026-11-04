@@ -573,6 +573,14 @@ impl KvSeparationOptions {
         self
     }
 
+    /// The live share of a block at or above which a relocation copies the
+    /// block whole: one whose dead share stays below the staleness that makes
+    /// a file worth collecting carries no more garbage than such a file holds.
+    #[must_use]
+    pub(crate) fn block_copy_share(&self) -> f32 {
+        (1.0 - self.staleness_threshold).clamp(0.0, 1.0)
+    }
+
     /// How the blob files written now size their frames.
     #[must_use]
     pub(crate) fn frame_sizes(&self) -> crate::vlog::blob_file::writer::FrameSizes {
@@ -805,9 +813,11 @@ impl KvSeparationOptions {
     /// Sets the staleness threshold percentage.
     ///
     /// The staleness percentage determines how much a blob file needs to be fragmented to be
-    /// picked up by the garbage collection.
+    /// picked up by the garbage collection. A relocation copies a block whole
+    /// while its dead share stays below it, and rewrites its live values
+    /// otherwise.
     ///
-    /// Defaults to 33%.
+    /// Defaults to 25%.
     #[must_use]
     pub fn staleness_threshold(mut self, ratio: f32) -> Self {
         self.staleness_threshold = ratio;
@@ -816,7 +826,7 @@ impl KvSeparationOptions {
 
     /// Sets the age cutoff threshold.
     ///
-    /// Defaults to 20%.
+    /// Defaults to 25%.
     #[must_use]
     pub fn age_cutoff(mut self, ratio: f32) -> Self {
         self.age_cutoff = ratio;

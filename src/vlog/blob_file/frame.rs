@@ -413,7 +413,7 @@ pub(crate) fn verify_frame(bytes: &[u8]) -> crate::Result<FrameHeader> {
 }
 
 /// [`verify_frame`]'s checks, the entries parsed kept.
-fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, Vec<FrameEntry>)> {
+pub(crate) fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, Vec<FrameEntry>)> {
     let header = parse_header(bytes)?;
     if header.frame_len() != bytes.len() as u64 {
         return Err(crate::Error::InvalidHeader("BlobFrame"));

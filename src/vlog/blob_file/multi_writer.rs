@@ -35,8 +35,13 @@ pub(crate) struct MultiWriter {
     /// The lifetime class the active writer's file holds.
     active_class: u8,
 
+    /// The source file whose blocks the active writer's file holds as they
+    /// were stored, if it is such a file (see [`Self::copy_block`]).
+    active_source: Option<crate::vlog::BlobFileId>,
+
     /// Writers for the other outputs a write has met, each still filling its
-    /// own file while the active one takes frames of its codec and class.
+    /// own file while the active one takes frames of its codec and class, by
+    /// codec, class and the source of the blocks it copies.
     ///
     /// A relocation merges its sources by key, so two compression generations
     /// over the same keys alternate on nearly every frame, and values of
@@ -44,8 +49,9 @@ pub(crate) struct MultiWriter {
     /// records one codec and one class, and closing it on every switch would
     /// produce a file per value; keeping one open per pair leaves every file
     /// as full as the size target allows. At most one entry per codec the
-    /// sources carry times [`Self::lifetime_groups`].
-    parked: Vec<(CompressionType, u8, Writer)>,
+    /// sources carry times [`Self::lifetime_groups`], and one per source a
+    /// relocation copies blocks of.
+    parked: Vec<(CompressionType, u8, Option<crate::vlog::BlobFileId>, Writer)>,
 
     /// How many lifetime classes the files are split into.
     lifetime_groups: crate::config::LifetimeGroups,
@@ -182,6 +188,7 @@ impl MultiWriter {
             active_writer: Writer::open(blob_file_path, blob_file_id, tree_id, &*fs, origin)?,
             origin,
             active_class: 0,
+            active_source: None,
             parked: Vec::new(),
             lifetime_groups: crate::config::LifetimeGroups::ONE,
 
@@ -237,7 +244,7 @@ impl MultiWriter {
         let crossed = domain.crosses(key, comparator.as_ref()).is_some();
         domain.enter(key, crossed);
         if crossed {
-            for (codec, _, writer) in core::mem::take(&mut self.parked) {
+            for (codec, _, _, writer) in core::mem::take(&mut self.parked) {
                 self.land(writer, codec)?;
             }
             if self.active_writer.item_count > 0 {
@@ -434,16 +441,30 @@ impl MultiWriter {
         compression: CompressionType,
         class: u8,
     ) -> crate::Result<()> {
+        self.select(compression, class, None)
+    }
+
+    /// Directs the next frames to the output of `compression`, `class` and
+    /// `source`, the file whose blocks it copies, if any.
+    fn select(
+        &mut self,
+        compression: CompressionType,
+        class: u8,
+        source: Option<crate::vlog::BlobFileId>,
+    ) -> crate::Result<()> {
         let class = self.lifetime_groups.cap(class);
-        if self.passthrough_compression == compression && self.active_class == class {
+        if self.passthrough_compression == compression
+            && self.active_class == class
+            && self.active_source == source
+        {
             return Ok(());
         }
         let next = if let Some(at) = self
             .parked
             .iter()
-            .position(|(c, k, _)| *c == compression && *k == class)
+            .position(|(c, k, s, _)| *c == compression && *k == class && *s == source)
         {
-            self.parked.swap_remove(at).2
+            self.parked.swap_remove(at).3
         } else if self.active_writer.item_count == 0 && self.active_writer.len_written() == 0 {
             // Nothing written constrains an untouched writer: restamp it.
             // Only a codec switch restamps the codec: a class switch keeps what
@@ -455,16 +476,52 @@ impl MultiWriter {
                 .set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
             self.passthrough_compression = compression;
             self.active_class = class;
+            self.active_source = source;
             return Ok(());
         } else {
             self.fresh_writer(compression, class)?
         };
         let previous = core::mem::replace(&mut self.active_writer, next);
-        self.parked
-            .push((self.passthrough_compression, self.active_class, previous));
+        self.parked.push((
+            self.passthrough_compression,
+            self.active_class,
+            self.active_source,
+            previous,
+        ));
         self.passthrough_compression = compression;
         self.active_class = class;
+        self.active_source = source;
         Ok(())
+    }
+
+    /// Writes `stored`, a block frame of `source` under `compression`, as it is
+    /// into a file of lifetime `class` that holds blocks of `source` alone, and
+    /// returns that file and the block's frame in it: each value keeps its
+    /// place in the block. `key` is one of the block's keys.
+    ///
+    /// A source's blocks reach this in the source's order, which is key order,
+    /// while the other values of the pass interleave with them: a file of its
+    /// own keeps every file's values in key order.
+    ///
+    /// # Errors
+    ///
+    /// `stored` is not a block frame that checks, or an IO error occurs.
+    pub(crate) fn copy_block(
+        &mut self,
+        key: &[u8],
+        source: crate::vlog::BlobFileId,
+        compression: CompressionType,
+        class: u8,
+        stored: &[u8],
+    ) -> crate::Result<(crate::vlog::BlobFileId, u32)> {
+        self.enter_key(key)?;
+        self.select(compression, class, Some(source))?;
+        let frame = self.active_writer.write_block_verbatim(stored)?;
+        let file = self.active_writer.blob_file_id();
+        if self.active_writer.len_written() >= self.target_size {
+            self.rotate()?;
+        }
+        Ok((file, frame))
     }
 
     /// A new writer for the next blob file of lifetime `class`, under output
@@ -811,7 +868,7 @@ impl MultiWriter {
             .chain(
                 self.parked
                     .into_iter()
-                    .map(|(codec, _, writer)| (codec, writer)),
+                    .map(|(codec, _, _, writer)| (codec, writer)),
             );
         while let Some((passthrough, writer)) = writers.next() {
             match Self::consume_writer(
