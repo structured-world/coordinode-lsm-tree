@@ -456,6 +456,18 @@ matching entry (and add one for a new subsystem).
   of zero bytes keeps its file. Enforced in `src/blob_tree/gc.rs`,
   `src/vlog/blob_file/meta.rs` and `src/vlog/blob_file/mod.rs`.
 
+- **A blob file holds its values in key order, and a block copied whole brings
+  its garbage charged.** A relocation's scan matches values to pointers by key,
+  so every file it reads must be in key order. A block a relocation copies as
+  it was stored therefore goes to a file holding only blocks of the same
+  source, which reach it in the source's order; its values keep their places,
+  and the values in it no pointer claimed are charged to the new file as it is
+  installed, so the file still dies once its live values do. A block is copied
+  whole only once all of its values were seen and its live share is at least
+  one minus the staleness threshold; otherwise its live values are written into
+  new blocks. Enforced in `src/compaction/flavour.rs` and
+  `src/vlog/blob_file/multi_writer.rs`; tested by `tests/blob_block_relocation.rs`.
+
 - **Only a value is separated, and a separated base merges like an inline one.**
   An indirection reads as a put, so merge operands stay inline whatever their size
   (flush and compaction-filter rewrites alike), or the key would stop merging onto
