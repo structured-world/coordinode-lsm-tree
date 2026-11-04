@@ -88,6 +88,8 @@ impl<'a> BlobIngestion<'a> {
                 .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                 .use_zstd_dictionaries(dicts)
         };
+        #[cfg(feature = "std")]
+        let blob = blob.use_parallel_compression(tree.index.config.parallel_compression());
 
         let separation_threshold = kv.separation_threshold;
         let cell_thresholds = kv.cell_separation_thresholds.clone();

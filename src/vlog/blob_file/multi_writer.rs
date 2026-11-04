@@ -71,6 +71,10 @@ pub(crate) struct MultiWriter {
     /// `Config::writeback_bytes`, stamped on every rotated blob writer.
     writeback_bytes: u64,
 
+    /// Where every file's large values compress their chunks.
+    #[cfg(feature = "std")]
+    parallel: Option<crate::table::writer::ParallelCompression>,
+
     /// Dictionary for `ZstdDict` compression, shared across all rotated writers.
     #[cfg(zstd_any)]
     zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
@@ -185,6 +189,8 @@ impl MultiWriter {
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
+            #[cfg(feature = "std")]
+            parallel: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -286,6 +292,21 @@ impl MultiWriter {
     pub(crate) fn use_writeback_bytes(mut self, bytes: u64) -> Self {
         self.writeback_bytes = bytes;
         self.active_writer = self.active_writer.use_writeback_bytes(bytes);
+        self
+    }
+
+    /// Compresses the chunks of large values on `parallel`'s workers in every
+    /// file this writer writes (active + rotated).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn use_parallel_compression(
+        mut self,
+        parallel: Option<crate::table::writer::ParallelCompression>,
+    ) -> Self {
+        self.active_writer = self
+            .active_writer
+            .use_parallel_compression(parallel.clone());
+        self.parallel = parallel;
         self
     }
 
@@ -447,6 +468,8 @@ impl MultiWriter {
             .use_writeback_bytes(self.writeback_bytes)
             .use_clock(self.clock.clone());
         w.durability = self.durability;
+        #[cfg(feature = "std")]
+        let mut w = w.use_parallel_compression(self.parallel.clone());
         w.set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
         #[cfg(zstd_any)]
         let w = w

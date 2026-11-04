@@ -352,6 +352,9 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
                     .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                     .use_zstd_dictionaries(dicts)
             };
+            #[cfg(feature = "std")]
+            let writer =
+                writer.use_parallel_compression(self.shared.opts.config.parallel_compression());
 
             blob_writer.insert(writer)
         };

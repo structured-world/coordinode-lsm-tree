@@ -2365,6 +2365,8 @@ impl AbstractTree for BlobTree {
                 .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
                 .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                 .use_zstd_dictionaries(dicts);
+            #[cfg(feature = "std")]
+            let w = w.use_parallel_compression(self.index.config.parallel_compression());
             w
         };
 

@@ -3660,10 +3660,10 @@ fn pick_blob_files_for_merge(
 /// the dictionary each output file records, and the dictionary of the
 /// snapshot's blob policy, with its two-pass setting, encodes the new values.
 #[cfg_attr(
-    not(zstd_any),
+    not(any(zstd_any, feature = "std")),
     expect(
         clippy::missing_const_for_fn,
-        reason = "the zstd build reads the dictionaries"
+        reason = "the zstd build reads the dictionaries, the std build the parallel workers"
     )
 )]
 fn with_fresh_encoding(
@@ -3671,6 +3671,10 @@ fn with_fresh_encoding(
     opts: &Options,
     rc: &crate::runtime_config::RuntimeConfig,
 ) -> BlobFileWriter {
+    // New values and the block values rewritten out of their blocks are
+    // compressed here; copied frames are not.
+    #[cfg(feature = "std")]
+    let writer = writer.use_parallel_compression(opts.config.parallel_compression());
     #[cfg(zstd_any)]
     {
         let dicts = opts.config.current_zstd_dictionaries();

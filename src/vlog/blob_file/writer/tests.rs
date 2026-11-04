@@ -429,3 +429,51 @@ fn the_frame_index_round_trips_and_refuses_damage() {
         &[0]
     );
 }
+
+/// Runs every task on a thread of its own.
+#[cfg(any(feature = "lz4", zstd_any))]
+struct ThreadSpawner;
+
+#[cfg(any(feature = "lz4", zstd_any))]
+impl crate::table::writer::CompactionSpawner for ThreadSpawner {
+    fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
+        std::thread::spawn(task);
+    }
+}
+
+/// Chunks compressed on workers come out as the writer's thread writes them
+/// one after another: the same frames in the same order, so the file's data
+/// is the same bytes.
+#[cfg(any(feature = "lz4", zstd_any))]
+#[test]
+fn chunks_compressed_on_workers_are_the_frames_written_serially() -> crate::Result<()> {
+    #[cfg(feature = "lz4")]
+    let codec = CompressionType::Lz4;
+    #[cfg(not(feature = "lz4"))]
+    let codec = CompressionType::Zstd(3);
+    // Twenty chunks of varied bytes, more than the workers hold in flight.
+    let value: Vec<u8> = (0..20 * 300_u32).map(|i| (i * 7 % 13) as u8).collect();
+    let data = |parallel: Option<crate::table::writer::ParallelCompression>| {
+        let folder = tempfile::tempdir()?;
+        let mut w = writer(&folder)?
+            .use_compression(codec)
+            .use_parallel_compression(parallel);
+        w.write(b"a", 0, b"small")?;
+        w.write(b"b", 0, &value)?;
+        w.write(b"c", 0, &value[..900])?;
+        let path = w.path.clone();
+        let (_, _, frames) = w.finish()?;
+        let bytes = std::fs::read(path)?;
+        let end = frames.last().copied().unwrap_or(0) as usize;
+        Ok::<_, crate::Error>((bytes[..end].to_vec(), frames))
+    };
+    let serial = data(None)?;
+    let parallel = data(Some(crate::table::writer::ParallelCompression {
+        spawner: alloc::sync::Arc::new(ThreadSpawner),
+        threads: 3,
+        inline_below: None,
+    }))?;
+    assert_eq!(serial.1, parallel.1, "the same frames at the same offsets");
+    assert!(serial.0 == parallel.0, "the same data bytes");
+    Ok(())
+}
