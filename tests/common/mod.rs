@@ -12,7 +12,7 @@ use lsm_tree::Guard;
 use proptest::test_runner::Config as ProptestConfig;
 
 /// Default compaction target size for property tests (64 MiB).
-pub const COMPACTION_TARGET: u64 = 64 * 1024 * 1024;
+pub(crate) const COMPACTION_TARGET: u64 = 64 * 1024 * 1024;
 
 /// Default `cases` budget when neither `PROPTEST_CASES` env var nor a
 /// per-suite override is set. 32 keeps the CI run quick; local runs
@@ -40,7 +40,7 @@ const DEFAULT_PROPTEST_MAX_SHRINK: u32 = 1000;
 ///
 /// `fork: false` matches every existing suite's prior config — these
 /// tests don't need process isolation.
-pub fn proptest_config() -> ProptestConfig {
+pub(crate) fn proptest_config() -> ProptestConfig {
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -63,7 +63,7 @@ pub fn proptest_config() -> ProptestConfig {
 /// Keep in sync with the copy in `tools/sst-dump/tests/repair_smoke.rs` (a
 /// separate crate, so the helper cannot be shared directly): both encode the
 /// manifest file-naming convention (`v{N}` + `edits-{N}`).
-pub fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -83,7 +83,7 @@ pub fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
 /// `v{N}` (a snapshot not yet installed carries a temporary name). Only the
 /// canonical decimal spelling counts, as in recovery: `v007`, `v00` and
 /// `v+5` name nothing.
-pub fn installed_snapshot_id(dir: &std::path::Path) -> std::io::Result<Option<u64>> {
+pub(crate) fn installed_snapshot_id(dir: &std::path::Path) -> std::io::Result<Option<u64>> {
     let mut installed = None;
     for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
@@ -101,7 +101,7 @@ pub fn installed_snapshot_id(dir: &std::path::Path) -> std::io::Result<Option<u6
 
 /// Returns the SST file paths under `<dir>/tables/`, sorted by id. The empty
 /// files the folder keeps for tables to come are no SSTs and are left out.
-pub fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("tables"))
         .expect("tables dir exists")
         .filter_map(Result::ok)
@@ -118,13 +118,13 @@ pub fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// Flips a byte a fixed depth into the SST's `data` section, so the SST still
 /// opens but one data block fails its checksum.
-pub fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
     corrupt_data_region_with(path, 0xFF)
 }
 
 /// [`corrupt_data_region`], flipping the bits of `mask` in that byte: one bit
 /// is a fault Page-ECC corrects.
-pub fn corrupt_data_region_with(path: &std::path::Path, mask: u8) -> std::io::Result<()> {
+pub(crate) fn corrupt_data_region_with(path: &std::path::Path, mask: u8) -> std::io::Result<()> {
     // Locate the `data` section through the SFA trailer TOC rather than assuming
     // it begins at offset 0: a byte a fixed depth into the section's payload is
     // stable against tail growth (the index / filter / meta / trailer that follow
@@ -157,11 +157,11 @@ pub fn corrupt_data_region_with(path: &std::path::Path, mask: u8) -> std::io::Re
 /// A backend delegating to [`lsm_tree::fs::StdFs`] that records, per batched
 /// read, how many requests it carried.
 #[derive(Clone, Default)]
-pub struct BatchCountFs(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+pub(crate) struct BatchCountFs(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
 
 impl BatchCountFs {
     /// The request counts recorded since the last take, forgotten.
-    pub fn take(&self) -> Vec<usize> {
+    pub(crate) fn take(&self) -> Vec<usize> {
         core::mem::take(
             &mut *self
                 .0
@@ -236,7 +236,7 @@ impl lsm_tree::fs::Fs for BatchCountFs {
 /// own; a larger one is a head (its entry and an 8-byte chunk table) and a
 /// frame per 256 KiB chunk. A value below the 8 KiB block size shares a
 /// block instead, see [`block_entry_len`].
-pub fn stored_len(key: &[u8], value_len: u64) -> u64 {
+pub(crate) fn stored_len(key: &[u8], value_len: u64) -> u64 {
     const HEADER: u64 = 40;
     const CHUNK: u64 = 256 * 1024;
     assert!(
@@ -253,7 +253,7 @@ pub fn stored_len(key: &[u8], value_len: u64) -> u64 {
 
 /// The entry a value below the default 8 KiB block size takes in the block
 /// it shares, uncompressed: what it is charged as block bytes once dropped.
-pub fn block_entry_len(key: &[u8], value_len: u64) -> u64 {
+pub(crate) fn block_entry_len(key: &[u8], value_len: u64) -> u64 {
     assert!(
         value_len < BLOCK,
         "a value of {value_len} bytes has frames of its own"
@@ -271,7 +271,7 @@ const BLOCK: u64 = 8 * 1024;
 ///
 /// Returns `Err` on I/O failure (e.g. BlobTree indirection read) instead
 /// of panicking, so property tests get a clear error message.
-pub fn guard_to_kv(guard: impl Guard) -> lsm_tree::Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn guard_to_kv(guard: impl Guard) -> lsm_tree::Result<(Vec<u8>, Vec<u8>)> {
     let (k, v) = guard.into_inner()?;
     Ok((k.to_vec(), v.to_vec()))
 }
