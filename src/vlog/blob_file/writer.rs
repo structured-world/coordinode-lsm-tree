@@ -405,7 +405,7 @@ impl Writer {
             zstd_two_pass_seed: true,
 
             sizes: FrameSizes::DEFAULT,
-            dictionary_classes: crate::config::DictionaryClasses::ALL,
+            dictionary_classes: crate::config::DictionaryClasses::DEFAULT,
             frames: Vec::new(),
             block: PendingBlock::default(),
             scratch: Vec::new(),
