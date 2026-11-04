@@ -556,14 +556,19 @@ pub(crate) struct Codec<'d> {
 }
 
 /// `payload` compressed under `codec`, or `None` when that saves nothing and
-/// the payload is stored as it is.
-#[cfg_attr(
-    not(any(feature = "lz4", zstd_any)),
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "without a codec built in, nothing is compressed and nothing fails"
-    )
+/// the payload is stored as it is: without a codec built in, always `None`.
+#[cfg(not(any(feature = "lz4", zstd_any)))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "without a codec built in, nothing is compressed and nothing fails"
 )]
+fn compress(_payload: &[u8], _codec: Codec<'_>) -> crate::Result<Option<Vec<u8>>> {
+    Ok(None)
+}
+
+/// `payload` compressed under `codec`, or `None` when that saves nothing and
+/// the payload is stored as it is.
+#[cfg(any(feature = "lz4", zstd_any))]
 fn compress(payload: &[u8], codec: Codec<'_>) -> crate::Result<Option<Vec<u8>>> {
     let compressed = match codec.compression {
         CompressionType::None => return Ok(None),
@@ -798,5 +803,10 @@ pub(crate) fn decoded_frame(values: &[(&[u8], &[u8])]) -> DecodedFrame {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "test code: fixture frames are small enough for every cast"
+)]
 mod tests;

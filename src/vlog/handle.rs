@@ -24,15 +24,15 @@ use varint_rs::{VarintReader, VarintWriter};
 /// the value is written, before the block it joins is compressed; the file's
 /// frame index maps numbers to offsets.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ValueHandle {
+pub(crate) struct ValueHandle {
     /// Blob file ID
-    pub blob_file_id: BlobFileId,
+    pub(crate) blob_file_id: BlobFileId,
 
     /// The frame that holds the value
-    pub frame: u32,
+    pub(crate) frame: u32,
 
     /// The value's place in the frame's list
-    pub index: u16,
+    pub(crate) index: u16,
 }
 
 impl ValueHandle {

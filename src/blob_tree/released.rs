@@ -37,7 +37,7 @@ type VersionId = u64;
 /// The objects one dropped table owned, as `(blob file, object)` sorted
 /// ascending (see [`ValueHandle::object`]): its `owned_blob_objects` section,
 /// kept as read.
-pub type OwnedObjects = Arc<[(BlobFileId, u64)]>;
+pub(crate) type OwnedObjects = Arc<[(BlobFileId, u64)]>;
 
 #[derive(Default)]
 struct Records {
@@ -75,14 +75,14 @@ fn note<K: core::hash::Hash + Eq>(map: &mut HashMap<K, VersionId>, key: K, versi
 
 /// The releases of one tree, shared by its reads and its installs.
 #[derive(Default)]
-pub struct ReleasedObjects {
+pub(crate) struct ReleasedObjects {
     records: Mutex<Records>,
 }
 
 impl ReleasedObjects {
     /// Registers a read of `version`; the read holds the returned token for
     /// as long as it holds the references it hands out.
-    pub fn register(self: &Arc<Self>, version: VersionId) -> ReaderToken {
+    pub(crate) fn register(self: &Arc<Self>, version: VersionId) -> ReaderToken {
         *self.records.lock().readers.entry(version).or_insert(0) += 1;
         ReaderToken {
             registry: Arc::clone(self),
@@ -94,14 +94,14 @@ impl ReleasedObjects {
     /// write lock, where no read can register, so every read held then is
     /// older than the version it publishes; with none, nothing it releases
     /// needs recording and it reads nothing to learn what that is.
-    pub fn holds_reads(&self) -> bool {
+    pub(crate) fn holds_reads(&self) -> bool {
         !self.records.lock().readers.is_empty()
     }
 
     /// Records what an install publishing `version` released: single
     /// `objects`, and the owned-object lists of the `tables` it dropped
     /// whole. Kept only while a held read is older than `version`.
-    pub fn record(
+    pub(crate) fn record(
         &self,
         version: VersionId,
         objects: impl IntoIterator<Item = ValueHandle>,
@@ -128,7 +128,7 @@ impl ReleasedObjects {
 
     /// Whether the object `handle` names was released in a version newer
     /// than `read`, the version a reference to it was read from.
-    pub fn released_since(&self, read: VersionId, handle: &ValueHandle) -> bool {
+    pub(crate) fn released_since(&self, read: VersionId, handle: &ValueHandle) -> bool {
         let records = self.records.lock();
         let object = (handle.blob_file_id, handle.object());
         records.objects.get(handle).is_some_and(|&at| at > read)
@@ -140,7 +140,7 @@ impl ReleasedObjects {
 }
 
 /// A held read's registration; dropping it lets the records it kept go.
-pub struct ReaderToken {
+pub(crate) struct ReaderToken {
     registry: Arc<ReleasedObjects>,
     version: VersionId,
 }
@@ -148,7 +148,7 @@ pub struct ReaderToken {
 impl ReaderToken {
     /// The version the read took.
     #[must_use]
-    pub fn version(&self) -> VersionId {
+    pub(crate) fn version(&self) -> VersionId {
         self.version
     }
 }

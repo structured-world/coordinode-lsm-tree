@@ -77,8 +77,8 @@ stays intact until the rebuilt snapshot's rename installs it.
 
 **Durable intermediate state, if it exists at all, records absolute facts —
 never deltas.** A journal replays block *contents* because only absolute
-writes are idempotent under repeated replay; a recorded `old offset -> new
-offset` mapping is a delta, and re-applying one to already-relocated handles
+writes are idempotent under repeated replay; a recorded `old place -> new
+place` mapping is a delta, and re-applying one to already-relocated handles
 destroys live data. Recovery therefore persists no relocation records. It also
 carries **nothing between runs**: a leftover from a crashed attempt cannot be
 validated against a tree that may have changed underneath it, so each run
@@ -273,23 +273,26 @@ file, `[data_start, frontier)`, and records the frontier in the manifest's
 blob-restrictions section — its only durable copy (blob files carry no
 sidecar). When the manifest is lost, recovery re-derives the frontier from the
 punch geometry itself. Unlike an SST's bound — a *key*, which the block-aligned
-punch cannot reproduce, hence the sidecar — the blob frontier is a *byte
-offset at a frame boundary*, so the geometry recovers it exactly: the punch
-zeroes precisely `[data_start, frontier)` and the first live frame's magic
-sits at the frontier.
+punch cannot reproduce, hence the sidecar — the blob frontier is the *start
+of a frame*, so the geometry recovers it exactly: the punch zeroes precisely
+`[data_start, frontier)` and the first live frame starts at the frontier. A
+block is punched only once every value it holds is consumed, so the frontier
+never falls inside one.
 
-Anchoring is structural, never length-based. A zeroed run counts only when a
-valid frame decodes at its end, so a zero-filled value payload inside the live
-suffix (stepped over by frame framing) can never move the frontier. A
-partially completed punch — intact-but-consumed frames between holes — is
-walked hole by hole, and the frontier is the end of the last anchored run.
-Non-zero bytes that fail to decode end the walk at the last anchored frontier:
-content corruption is not punch geometry and surfaces exactly as it would on
-an unpunched file. A file whose first data byte is non-zero recovers with
-frontier `0` (whole file) at zero extra read cost; this also covers the
-committed-but-unpunched crash window, whose redundant prefix is superseded by
-the relocated copies and reclaimed later — the same safe fallback as an SST
-slice that committed without its sidecar.
+Anchoring is structural, never length-based. The walk follows the file's frame
+index, whose checksum vouches for every frame's place: a frame either reads as
+zeros through its whole extent (punched) or verifies as a frame, and the
+frontier is the start of the first frame past the last zeroed one that does.
+A zero-filled value payload inside the live suffix sits inside a frame that
+verifies, so it can never move the frontier. A partially completed punch —
+intact-but-consumed frames between holes — is walked frame by frame, and the
+frontier is the end of the last zeroed run. A frame that is neither zeroed nor
+verifies ends the walk at the last anchored frontier: content corruption is
+not punch geometry and surfaces exactly as it would on an unpunched file. A
+file whose first frame is intact recovers with frontier `0` (whole file); this
+also covers the committed-but-unpunched crash window, whose redundant prefix
+is superseded by the relocated copies and reclaimed later — the same safe
+fallback as an SST slice that committed without its sidecar.
 
 The recovered file's digest covers the live region, `[frontier, end)`, and the
 rebuilt snapshot re-persists the restriction from the recovered frontier, so a
@@ -297,9 +300,11 @@ later relocation resumes exactly where the punch stopped. No resurrection
 question arises: blob bytes are reachable only through value handles, so a
 frontier recovered too low exposes nothing. The rebuilt manifest's garbage
 accounting is seeded with the punched prefix (whole-file metadata totals minus
-the validation scan's live-suffix totals): no future compaction can observe
-the consumed frames, so without the seed the file's stale count could never
-reach its metadata totals and blob GC could never retire it.
+the validation scan's live-suffix totals, the frames of values of their own
+and the entries of values in blocks each against its own total): no future
+compaction can observe the consumed frames, so without the seed the file's
+charged objects could never reach its item count and blob GC could never
+retire it.
 
 Zeros through the *whole* data section mean the punch consumed every frame:
 the relocation completed and only the file's removal lagged the crash.
@@ -355,22 +360,25 @@ frames cleanly, yet every live read fails); frame keys never regress under
 the tree comparator (individually-valid frames reordered on disk break the
 sorted-input contract the relocation merge scanner relies on); and, for an
 unpunched file, the metadata counters — item count, uncompressed byte total,
-key range — match the scanned frames (blob GC's dead-file arithmetic trusts
-those counters, so an understated total could reclaim a file whose uncounted
-frames are still referenced). A file that fails any of these is never blessed
-as-is. It is **salvaged**: every record whose checksum verifies
-— decompressed and re-compressed for a compressed file, proving the content
-round-trips — is re-emitted into a compacted replacement under a fresh id, and
-the per-record offset relocation is retained; the damaged original is removed
-once the manifest naming the replacement is durable. Records after the
-first damaged frame are conservatively surrendered (their boundaries are
-unprovable); a dictionary-compressed file is the one shape blob salvage cannot
-re-emit, and such a file is set aside whole with its referencing tables.
+the bytes of its frames and of its blocks, the entries its blocks hold, key
+range — match the scanned frames (blob GC's arithmetic trusts those counters,
+so an understated total could reclaim a file whose uncounted frames are still
+referenced). A file that fails any of these is never blessed as-is. It is
+**salvaged**: every frame that verifies and decodes is re-emitted into a
+compacted replacement under a fresh id (a value's own frames as they are, the
+values of a block into new blocks under the same codec, a file compressed
+against a dictionary under the dictionary its descriptor names, which the
+repair resolves from the tree's), and each record's place in the replacement is
+retained; the damaged original is removed once the manifest naming the
+replacement is durable. A damaged frame costs its own values when the frame
+index places the frames; when the index itself is damaged, the frames after
+the first damaged one are conservatively surrendered (their boundaries are
+unprovable).
 
 A salvaged blob file is compacted, so every surviving record lands at a new
-offset. The SSTs referencing it are then **rewritten** through the salvage
+place. The SSTs referencing it are then **rewritten** through the salvage
 pipeline rather than set aside: each indirection entry is re-targeted at its
-record's new offset, and only entries whose record was lost are dropped — the
+record's new place, and only entries whose record was lost are dropped — the
 lost key reads as absent afterwards, never as an error, and intact live data
 is never discarded over a reshaped dependency. The same rewrite drops a stale
 handle that points below a punched-but-intact blob file's frontier (a

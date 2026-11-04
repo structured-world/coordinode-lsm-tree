@@ -509,9 +509,9 @@ impl BlobSource {
         version: &Version,
         key: &[u8],
         indirection: &BlobIndirection,
-        local: &mut crate::vlog::Prefetched,
+        local: &crate::vlog::Prefetched,
     ) -> crate::Result<UserValue> {
-        match local.take(key, &indirection.vhandle) {
+        match local.get(key, &indirection.vhandle) {
             Some(object) => Ok(object),
             None => self.object(version, key, indirection),
         }
@@ -1321,9 +1321,9 @@ impl BlobTree {
 }
 
 /// The values `kv` reads from blob files that a scan read ahead into `local`,
-/// taken out of it for `kv`'s guard: its own value, or its cells' objects.
+/// for `kv`'s guard: its own value, or its cells' objects.
 fn take_prefetched(
-    local: &mut crate::vlog::Prefetched,
+    local: &crate::vlog::Prefetched,
     kv: &InternalValue,
 ) -> Vec<(crate::vlog::ValueHandle, UserValue)> {
     let key = &kv.key.user_key;
@@ -1335,7 +1335,7 @@ fn take_prefetched(
             .into_iter()
             .filter_map(|(vptr, _)| {
                 local
-                    .take(key, &vptr.vhandle)
+                    .get(key, &vptr.vhandle)
                     .map(|value| (vptr.vhandle, value))
             })
             .collect();
@@ -1348,7 +1348,7 @@ fn take_prefetched(
         return Vec::new();
     };
     local
-        .take(key, &vptr.vhandle)
+        .get(key, &vptr.vhandle)
         .map(|value| alloc::vec![(vptr.vhandle, value)])
         .unwrap_or_default()
 }
@@ -1443,9 +1443,6 @@ struct PrefetchScan<I> {
 impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
     /// Pulls the next window into `buf` and warms the values it points at.
     fn fill(&mut self) {
-        // What the window before left untaken (an item whose guard was
-        // dropped, a value it held twice) is no use to this one.
-        self.local.clear();
         // Sized here rather than at construction: a scan that never resolves a
         // value never refills, and should not pay for a window it will not use.
         // After the first refill the capacity persists, so this is a no-op.
@@ -1490,6 +1487,9 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             handles.push((&kv.key.user_key, vptr.vhandle, 0));
         }
 
+        // Of what the window before read ahead, only a block this one shares
+        // is of use to it: kept, it is not read again.
+        self.local.retain_for(&handles);
         if handles.len() < 2 {
             return;
         }
@@ -1525,9 +1525,9 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
         );
     }
 
-    fn guard(&mut self, item: crate::Result<InternalValue>) -> IterGuardImpl {
+    fn guard(&self, item: crate::Result<InternalValue>) -> IterGuardImpl {
         let prefetched = match &item {
-            Ok(kv) if !self.local.is_empty() => take_prefetched(&mut self.local, kv),
+            Ok(kv) if !self.local.is_empty() => take_prefetched(&self.local, kv),
             _ => Vec::new(),
         };
         let held = (!prefetched.is_empty()).then(|| {

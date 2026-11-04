@@ -199,7 +199,7 @@ fn chunks_must_be_the_heads() -> crate::Result<()> {
     let tail = reader.read_frame(handles[1].frame, &mut 0)?;
 
     // The last chunk (100 bytes) where the first (300) belongs.
-    assert!(assemble(&head, &[Box::new(last.clone())], Some(&(0..10))).is_err());
+    assert!(assemble(&head, &[Box::new(last)], Some(&(0..10))).is_err());
     // A block where a chunk belongs.
     assert!(assemble(&head, &[Box::new(tail)], Some(&(0..10))).is_err());
     // Too few chunks for the range.
@@ -274,7 +274,7 @@ fn blob_reader_reads_a_written_dictionary_blob_with_nothing_supplied() -> crate:
         .write(b"key", 0, b"value-to-compress-with-dict")?
         .vhandle;
     let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
+    let blob_file = blob_file.first().expect("one blob file written");
 
     let file = File::open(&blob_file.0.path)?;
     // The reader takes no dictionary at all: the file's handle carries it.
@@ -325,7 +325,7 @@ fn blob_reader_uses_the_dictionary_pinned_on_its_file() -> crate::Result<()> {
     let value = b"value-compressed-with-dict-a ".repeat(20);
     let handle = writer.write(b"key", 0, &value)?.vhandle;
     let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
+    let blob_file = blob_file.first().expect("one blob file written");
 
     let file = File::open(&blob_file.0.path)?;
     assert_eq!(

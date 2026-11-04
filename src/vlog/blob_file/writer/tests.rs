@@ -269,15 +269,15 @@ fn verbatim_frames_that_are_not_one_value_are_refused() -> crate::Result<()> {
     let refused =
         |result: crate::Result<FrameRef>| matches!(result, Err(crate::Error::InvalidHeader(_)));
     assert!(
-        refused(w.write_verbatim(b"a", &[block.clone()], 5)),
+        refused(w.write_verbatim(b"a", std::slice::from_ref(&block), 5)),
         "a block"
     );
     assert!(
-        refused(w.write_verbatim(b"big", &[chunk.clone()], 300)),
+        refused(w.write_verbatim(b"big", std::slice::from_ref(&chunk), 300)),
         "a chunk alone"
     );
     assert!(
-        refused(w.write_verbatim(b"other", &[head.clone(), chunk.clone()], 700)),
+        refused(w.write_verbatim(b"other", &[head.clone(), chunk], 700)),
         "another key"
     );
     assert!(

@@ -46,6 +46,11 @@ fn reconcile_clean(
 
 /// Where the frames of the blob file at `path` start, then its data end, by
 /// its frame index.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    reason = "test code: a test file fits in memory"
+)]
 fn blob_frame_starts(path: &std::path::Path) -> crate::Result<Vec<usize>> {
     let reader = crate::sfa::Reader::new(path)?;
     let Some(section) = reader.toc().section(b"frames") else {
@@ -59,6 +64,7 @@ fn blob_frame_starts(path: &std::path::Path) -> crate::Result<Vec<usize>> {
 
 /// Four records of a frame each, the second's length field rotted: caught by
 /// the header CRC.
+#[expect(clippy::indexing_slicing, reason = "test code")]
 fn write_four_with_a_rotted_second(
     source: &std::path::Path,
     fs: &Arc<dyn Fs>,
@@ -129,6 +135,11 @@ fn salvage_blob_file_by_its_index_drops_only_the_rotted_frame() -> crate::Result
 /// STICKY: the whole tail after the first resync is dropped (fail closed),
 /// not just the frame reached immediately by the scan.
 #[test]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    reason = "test code: a test file fits in memory"
+)]
 fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("blob_rot");
@@ -9442,6 +9453,7 @@ fn salvage_blob_file_keeps_a_preexisting_dest_on_open_failure() -> crate::Result
 /// dropped one, so a caller can re-target handles before swapping the file in.
 /// By the source's frame index, the damaged record is the only one lost.
 #[test]
+#[expect(clippy::indexing_slicing, reason = "test code")]
 fn salvage_blob_file_reports_a_remap_for_every_salvaged_record() -> crate::Result<()> {
     use super::BlobRecordPlace;
 
@@ -9537,6 +9549,7 @@ fn salvage_blob_file_reports_a_remap_for_every_salvaged_record() -> crate::Resul
 /// block of the recovered file, each to its own place; a damaged block loses
 /// the values it held, and only those.
 #[test]
+#[expect(clippy::indexing_slicing, reason = "test code")]
 fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::Result<()> {
     use crate::vlog::blob_file::writer::FrameSizes;
 

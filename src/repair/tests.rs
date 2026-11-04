@@ -6998,6 +6998,90 @@ fn repairing_a_columnar_table_in_a_superseded_layout_refuses_and_keeps_it() -> c
     Ok(())
 }
 
+/// A blob file of an earlier layout is a format this engine does not read: a
+/// repair refuses it as such and leaves it exactly as it found it, never
+/// grading it damaged and setting it aside with the values it holds.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repairing_a_blob_file_of_an_earlier_layout_refuses_and_keeps_it() -> crate::Result<()> {
+    use crate::vlog::blob_file::meta::{META_VERSION, Metadata};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..8_u32 {
+            tree.insert(format!("k{i:04}"), vec![b'a'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    remove_manifest(&StdFs, dir.path())?;
+
+    // The file's metadata stamped with the layout version before this one,
+    // its bytes otherwise as written.
+    let blob = dir.path().join(crate::file::BLOBS_FOLDER).join("0");
+    let mut bytes = std::fs::read(&blob)?;
+    let (pos, len) = {
+        let reader = crate::sfa::Reader::new(&blob)?;
+        let meta = reader
+            .toc()
+            .section(b"meta")
+            .expect("a blob file has metadata");
+        (
+            usize::try_from(meta.pos()).expect("fits"),
+            usize::try_from(meta.len()).expect("fits"),
+        )
+    };
+    let section = bytes
+        .get(pos..pos + len)
+        .expect("the section is in the file");
+    let mut meta = Metadata::from_slice(&crate::Slice::from(section))?;
+    meta.version = META_VERSION - 1;
+    let mut forged = Vec::new();
+    meta.encode_into(&mut forged)?;
+    assert_eq!(forged.len(), len, "the version is one byte either way");
+    bytes
+        .get_mut(pos..pos + len)
+        .expect("the section is in the file")
+        .copy_from_slice(&forged);
+    std::fs::write(&blob, &bytes)?;
+
+    let err = match config().repair() {
+        Ok(report) => panic!(
+            "repair must refuse a blob file it cannot read rather than rebuild without it: \
+             {report:?}",
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::BlobFiles,
+                found: Some(found),
+                ..
+            } if found == META_VERSION - 1
+        ),
+        "repair must propagate the format refusal, not grade the file as damaged: {err:?}",
+    );
+    assert_eq!(
+        std::fs::read(&blob)?,
+        bytes,
+        "repair must leave the refused blob file exactly as it found it",
+    );
+    Ok(())
+}
+
 /// `repair_with_salvage` must QUARANTINE (not salvage) an SST whose TOC HIDES a
 /// deletion section: an omitted `range_tombstones` entry makes the parsed table
 /// report NO tombstones, so the positional salvage walk would re-emit the keys
@@ -7791,7 +7875,11 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     let garbage = vec![0xA5u8; frame_bytes.len() - entries_end];
     let restamped = {
         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-        hasher.update(&frame_bytes[crate::vlog::blob_file::frame::FRAME_HEADER_LEN..entries_end]);
+        hasher.update(
+            frame_bytes
+                .get(crate::vlog::blob_file::frame::FRAME_HEADER_LEN..entries_end)
+                .expect("the frame holds its entries"),
+        );
         hasher.update(&garbage);
         hasher.update(&header.header_crc.to_le_bytes());
         hasher.digest128()
@@ -14871,8 +14959,6 @@ fn a_wholly_zeroed_blob_section_without_holes_is_not_fully_consumed() -> crate::
     Ok(())
 }
 
-/// Builds a one-blob tree with its manifest removed, ready for a repair.
-#[expect(clippy::expect_used, reason = "test code")]
 /// Separation of every value from 16 bytes, each into a frame of its own: a
 /// fixture whose damage to one value's frame is damage to that value alone,
 /// what the frame-level repair tests probe.
@@ -14882,6 +14968,8 @@ fn frame_per_value() -> crate::KvSeparationOptions {
         .block_size(0)
 }
 
+/// Builds a one-blob tree with its manifest removed, ready for a repair.
+#[expect(clippy::expect_used, reason = "test code")]
 fn blob_tree_without_manifest(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
     root: &std::path::Path,

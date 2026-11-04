@@ -99,9 +99,8 @@ impl Scanner {
         start: Option<u64>,
         pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
-        let start = start
-            .unwrap_or(blob_file.live_data_start())
-            .max(blob_file.live_data_start());
+        let live = blob_file.live_data_start();
+        let start = start.map_or(live, |start| start.max(live));
         Self::open_with(
             &blob_file.0.path,
             &*blob_file.0.fs,
@@ -559,5 +558,10 @@ impl Iterator for Scanner {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
+#[expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "test code: fixture files are small enough for every cast"
+)]
 mod tests;

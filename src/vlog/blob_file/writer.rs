@@ -159,8 +159,10 @@ pub(crate) fn decode_frame_index(bytes: &[u8]) -> crate::Result<alloc::sync::Arc
         return Err(malformed());
     }
     let offsets: Vec<u64> = rest
-        .chunks_exact(8)
-        .filter_map(|word| word.try_into().ok().map(u64::from_le_bytes))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|word| u64::from_le_bytes(*word))
         .collect();
     if offsets.windows(2).any(|pair| pair.first() >= pair.get(1)) {
         return Err(malformed());
@@ -775,5 +777,10 @@ impl Writer {
 }
 
 #[cfg(test)]
-#[expect(clippy::indexing_slicing, clippy::expect_used, reason = "test code")]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    reason = "test code: fixture files are small enough for every cast"
+)]
 mod tests;

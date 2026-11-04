@@ -1541,22 +1541,19 @@ fn rewrite_block_indirections(
             out.push(entry);
             continue;
         };
-        match rule.apply(&ind) {
-            // The handle, the file it names and what it takes all follow the
-            // record: the replacement is a new file, and garbage accounting
-            // charges what the copy takes.
-            Some(moved) => {
-                if matches!(rule, BlobFileRewrite::Remap { .. }) {
-                    let mut buf = Vec::new();
-                    moved.encode_into(&mut buf)?;
-                    entry.value = buf.into();
-                }
-                out.push(entry);
+        // The handle, the file it names and what it takes all follow the
+        // record: the replacement is a new file, and garbage accounting
+        // charges what the copy takes.
+        if let Some(moved) = rule.apply(&ind) {
+            if matches!(rule, BlobFileRewrite::Remap { .. }) {
+                let mut buf = Vec::new();
+                moved.encode_into(&mut buf)?;
+                entry.value = buf.into();
             }
-            None => {
-                *dropped_entries += 1;
-                headless = Some(entry.key.user_key);
-            }
+            out.push(entry);
+        } else {
+            *dropped_entries += 1;
+            headless = Some(entry.key.user_key);
         }
     }
     Ok((out, headless))

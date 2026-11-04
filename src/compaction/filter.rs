@@ -248,7 +248,7 @@ pub(crate) struct StreamFilterAdapter<'a, 'b: 'a> {
 }
 
 impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
-    pub fn new(
+    pub(crate) fn new(
         filter: Option<&'a mut (dyn CompactionFilter + 'b)>,
         opts: &'a Options,
         version: &'a Version,

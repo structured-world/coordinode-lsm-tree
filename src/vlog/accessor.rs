@@ -19,7 +19,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{string::ToString, vec::Vec};
+use alloc::vec::Vec;
 use core::ops::Range;
 
 /// Frames a read fetched ahead for itself, held by that read instead of the
@@ -33,8 +33,9 @@ pub(crate) struct Prefetched {
 }
 
 impl Prefetched {
-    /// The value read ahead for `vhandle` under `key`, if its frame was.
-    pub(crate) fn take(&mut self, key: &[u8], vhandle: &ValueHandle) -> Option<UserValue> {
+    /// The value read ahead for `vhandle` under `key`, if its frame was: a
+    /// view into the frame, which stays for the other values it holds.
+    pub(crate) fn get(&self, key: &[u8], vhandle: &ValueHandle) -> Option<UserValue> {
         let frame = self.frames.get(&vhandle.frame_at())?;
         if frame.header.kind == FrameKind::Head {
             return None;
@@ -47,15 +48,9 @@ impl Prefetched {
         self.frames.is_empty()
     }
 
-    /// Drops what it holds.
-    pub(crate) fn clear(&mut self) {
-        self.frames.clear();
-    }
-
     /// Keeps only the frames the values `items` name lie in: a read that
     /// holds its store across batches keeps a block the next batch shares and
     /// lets the rest go, so the store stays one read's worth.
-    #[cfg(feature = "columnar")]
     pub(crate) fn retain_for(&mut self, items: &[(&[u8], ValueHandle, usize)]) {
         if self.frames.is_empty() {
             return;

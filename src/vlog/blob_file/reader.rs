@@ -276,9 +276,9 @@ pub(crate) fn assemble<C: core::ops::Deref<Target = DecodedFrame>>(
 
 #[cfg(test)]
 #[expect(
-    clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    reason = "test code"
+    clippy::cast_possible_truncation,
+    reason = "test code: fixture files are small enough for every cast"
 )]
 mod tests;

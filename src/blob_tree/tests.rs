@@ -203,7 +203,7 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
     let damaged = |value_type| InternalValue::from_components("k", vec![0xff_u8; 3], 0, value_type);
     for value_type in [crate::ValueType::Indirection, crate::ValueType::CellRow] {
         assert!(
-            take_prefetched(&mut store, &damaged(value_type)).is_empty(),
+            take_prefetched(&store, &damaged(value_type)).is_empty(),
             "{value_type:?} that does not decode takes nothing"
         );
     }
@@ -215,7 +215,7 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
         0,
         crate::ValueType::Indirection,
     );
-    let taken = take_prefetched(&mut store, &row);
+    let taken = take_prefetched(&store, &row);
     let [(handle, value)] = taken.as_slice() else {
         panic!("one value taken, got {}", taken.len());
     };
@@ -230,7 +230,7 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
         0,
         crate::ValueType::Indirection,
     );
-    assert!(take_prefetched(&mut store, &other).is_empty());
+    assert_eq!(take_prefetched(&store, &other), Vec::new());
 }
 
 /// A scan that does not cache hands each guard the values read ahead for it.

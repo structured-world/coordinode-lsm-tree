@@ -176,7 +176,7 @@ fn chunk_frame_has_no_entries() {
     encode_frame(FrameKind::Chunk, &[], b"chunk bytes", plain(), &mut out).unwrap();
     let frame = decode(&out, CompressionType::None).unwrap();
     assert_eq!(frame.header.kind, FrameKind::Chunk);
-    assert!(frame.list.is_empty());
+    assert_eq!(frame.list.len(), 0);
     assert_eq!(&*frame.payload, b"chunk bytes");
     assert!(frame.chunk_table().is_err());
 }
@@ -251,7 +251,7 @@ fn frame_must_be_the_whole_buffer() {
     let out = sample_block();
     assert!(parse_header(&out[..FRAME_HEADER_LEN - 1]).is_err());
     assert!(decode(&out[..out.len() - 1], CompressionType::None).is_err());
-    let mut longer = out.clone();
+    let mut longer = out;
     longer.push(0);
     assert!(decode(&longer, CompressionType::None).is_err());
 }

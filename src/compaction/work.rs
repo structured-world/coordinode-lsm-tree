@@ -127,17 +127,17 @@ impl WorkReport {
 /// of them copied rather than encoded, and the bytes read outside the run's
 /// paced input reads.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Installed {
-    pub written: u64,
-    pub carried: u64,
-    pub read: u64,
+pub(crate) struct Installed {
+    pub(crate) written: u64,
+    pub(crate) carried: u64,
+    pub(crate) read: u64,
 }
 
 /// The work of one compaction run as it goes: the estimate it was planned
 /// against, the bytes its reads returned and what its installs put in the
 /// version. Shared by every thread of the run.
 #[derive(Default)]
-pub struct WorkLedger {
+pub(crate) struct WorkLedger {
     estimate: Mutex<WorkEstimate>,
     moved: AtomicU64,
     carried: AtomicU64,
@@ -198,7 +198,7 @@ impl WorkLedger {
 /// rate. Active while the limiter has a backoff to steer, so without one the
 /// reads go as they would unpaced. Every read it hears of is counted to the
 /// run's work.
-pub struct InputPacer {
+pub(crate) struct InputPacer {
     // no-std: reads are timed only with std (see `ReadPacer::read_took`)
     #[cfg(feature = "std")]
     limiter: Arc<crate::rate_limiter::RateLimiter>,
@@ -242,7 +242,7 @@ impl crate::table::util::ReadPacer for InputPacer {
 }
 
 /// The work of giving `tables` another level where they lie.
-pub fn estimate_move<'a>(tables: impl IntoIterator<Item = &'a Table>) -> WorkEstimate {
+pub(crate) fn estimate_move<'a>(tables: impl IntoIterator<Item = &'a Table>) -> WorkEstimate {
     WorkEstimate::exact(Work {
         moved: tables.into_iter().map(Table::file_len).sum(),
         ..Work::default()
@@ -250,20 +250,20 @@ pub fn estimate_move<'a>(tables: impl IntoIterator<Item = &'a Table>) -> WorkEst
 }
 
 /// What a merge's estimate is worked out from.
-pub struct MergePlan<'a> {
+pub(crate) struct MergePlan<'a> {
     /// The tables merged.
-    pub inputs: &'a [Table],
+    pub(crate) inputs: &'a [Table],
     /// The blob files the merge relocates.
-    pub blob_files: &'a [BlobFile],
+    pub(crate) blob_files: &'a [BlobFile],
     /// The garbage the version charged to each blob file.
-    pub gc_stats: &'a FragmentationMap,
+    pub(crate) gc_stats: &'a FragmentationMap,
     /// Whether the rows pass through user code, a compaction filter or a
     /// merge operator, that may change any of them.
-    pub user_code: bool,
+    pub(crate) user_code: bool,
     /// The range tombstones the merge deletes the keys they cover by.
-    pub range_tombstones: &'a [RangeTombstone],
+    pub(crate) range_tombstones: &'a [RangeTombstone],
     /// The tree's key order.
-    pub comparator: &'a dyn UserComparator,
+    pub(crate) comparator: &'a dyn UserComparator,
 }
 
 /// The work of the merge `plan` describes, with `carries` saying whether the
@@ -275,7 +275,10 @@ pub struct MergePlan<'a> {
 /// applies covers any of its keys and no user code sees its rows. The rest of
 /// the inputs is expected to be written again whole, and every frame of a
 /// relocated blob file that the version did not charge as garbage copied.
-pub fn estimate_merge(plan: &MergePlan<'_>, carries: impl Fn(&Table) -> bool) -> WorkEstimate {
+pub(crate) fn estimate_merge(
+    plan: &MergePlan<'_>,
+    carries: impl Fn(&Table) -> bool,
+) -> WorkEstimate {
     let mut expected = Work::<u64>::default();
     let mut carried_ceiling = 0;
     for (at, table) in plan.inputs.iter().enumerate() {

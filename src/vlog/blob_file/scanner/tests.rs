@@ -308,7 +308,7 @@ fn without_its_index_header_rot_resyncs_to_the_next_frame() -> crate::Result<()>
     let dir = tempdir()?;
     let path = three_singles(dir.path())?;
     edit(&path, |bytes| {
-        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes())
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
     })?;
     break_index(&path)?;
     let mut scanner = Scanner::new(&path, &StdFs, 0)?;
@@ -475,7 +475,7 @@ fn a_frame_rotted_into_meta_is_not_a_silent_end() -> crate::Result<()> {
     let path = three_singles(dir.path())?;
     let index = index_of(&path)?;
     edit(&path, |bytes| {
-        bytes[index[1]..index[1] + 4].copy_from_slice(b"META")
+        bytes[index[1]..index[1] + 4].copy_from_slice(b"META");
     })?;
     let mut scanner = Scanner::new(&path, &StdFs, 0)?;
     assert!(scanner.next().expect("aaa").is_ok());
