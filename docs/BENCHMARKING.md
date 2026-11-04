@@ -97,7 +97,10 @@ engine:
 
 - **the ratio to RocksDB**: the median over the rounds of this engine's time
   over RocksDB's in the same round, with a distribution-free 95% confidence
-  interval (the order statistics a Binomial(rounds, 1/2) count bounds);
+  interval (the order statistics a Binomial(rounds, 1/2) count bounds). Our
+  tree with blob files is taken against RocksDB with blob files, every other
+  engine against plain RocksDB, and the page shows the two value layouts one
+  at a time;
 - **the time per operation**: the median over the rounds, with the same kind
   of interval.
 
