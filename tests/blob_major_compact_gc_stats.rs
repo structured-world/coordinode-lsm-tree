@@ -4,6 +4,8 @@ use lsm_tree::{
 };
 use test_log::test;
 
+mod common;
+
 #[test]
 fn blob_tree_major_compact_gc_stats() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -99,7 +101,8 @@ fn blob_tree_major_compact_gc_stats_2() -> lsm_tree::Result<()> {
             &{
                 let mut map = lsm_tree::HashMap::default();
                 let size = big_value.len() as u64;
-                map.insert(0, FragmentationEntry::new(4, size * 4, size * 4));
+                let stored = common::stored_len(b"big", size);
+                map.insert(0, FragmentationEntry::new(4, size * 4, stored * 4));
                 map
             },
             &*gc_stats,
@@ -148,7 +151,9 @@ fn blob_tree_major_compact_gc_stats_tombstone() -> lsm_tree::Result<()> {
             Some(vec![lsm_tree::table::writer::LinkedFile {
                 blob_file_id: 0,
                 bytes: 2 * big_value.len() as u64,
-                on_disk_bytes: 2 * big_value.len() as u64,
+                on_disk_bytes: common::stored_len(b"another_big", big_value.len() as u64)
+                    + common::stored_len(b"big", big_value.len() as u64),
+                block_bytes: 0,
                 len: 2,
                 first_key: "another_big".into(),
                 last_key: "big".into(),
@@ -173,7 +178,8 @@ fn blob_tree_major_compact_gc_stats_tombstone() -> lsm_tree::Result<()> {
             &{
                 let mut map = lsm_tree::HashMap::default();
                 let size = big_value.len() as u64;
-                map.insert(0, FragmentationEntry::new(1, size, size));
+                let stored = common::stored_len(b"big", size);
+                map.insert(0, FragmentationEntry::new(1, size, stored));
                 map
             },
             &*gc_stats,
@@ -184,7 +190,8 @@ fn blob_tree_major_compact_gc_stats_tombstone() -> lsm_tree::Result<()> {
             Some(vec![lsm_tree::table::writer::LinkedFile {
                 blob_file_id: 0,
                 bytes: big_value.len() as u64,
-                on_disk_bytes: big_value.len() as u64,
+                on_disk_bytes: common::stored_len(b"another_big", big_value.len() as u64),
+                block_bytes: 0,
                 len: 1,
                 first_key: "another_big".into(),
                 last_key: "another_big".into(),

@@ -11,14 +11,15 @@ fn u32_le() -> TypeTag {
     TypeTag::Number(Number::new(NumberKind::Unsigned, 4, ByteOrder::Little).unwrap())
 }
 
-fn indirection(offset: u64, size: u32) -> BlobIndirection {
+fn indirection(frame: u32, size: u32) -> BlobIndirection {
     BlobIndirection {
         vhandle: ValueHandle {
             blob_file_id: 9,
-            offset,
-            on_disk_size: size,
+            frame,
+            index: 0,
         },
         size,
+        stored: crate::blob_tree::handle::Stored::Frames(size),
     }
 }
 
@@ -63,7 +64,7 @@ fn a_mixed_group_gives_every_row_back_as_written() {
             &[RowField::bytes(
                 BODY,
                 RowCell::Ref {
-                    indirection: indirection(4_096, 100),
+                    indirection: indirection(1, 100),
                     owner: false,
                 },
             )],
@@ -71,7 +72,7 @@ fn a_mixed_group_gives_every_row_back_as_written() {
         cell_row("d", 2, &[]),
         InternalValue::from_components(
             "e",
-            indirection(9_000, 2_000).encode_into_vec(),
+            indirection(2, 2_000).encode_into_vec(),
             1,
             ValueType::Indirection,
         ),
@@ -108,7 +109,7 @@ fn a_cells_group_round_trips_through_its_encoding() {
                 RowField::bytes(
                     BODY,
                     RowCell::Ref {
-                        indirection: indirection(64, 10),
+                        indirection: indirection(3, 10),
                         owner: true,
                     },
                 ),
@@ -165,18 +166,18 @@ fn a_cell_row_that_does_not_fit_the_columns_is_kept_whole() {
 /// mistyped for a type its own row never had.
 #[test]
 fn a_reference_of_another_type_than_its_column_is_kept_whole() {
-    let fixed = |column: u16, offset: u64| RowField {
+    let fixed = |column: u16, frame: u32| RowField {
         column,
         tag: TypeTag::Fixed(4),
         cell: RowCell::Ref {
-            indirection: indirection(offset, 4),
+            indirection: indirection(frame, 4),
             owner: true,
         },
     };
     let entries = alloc::vec![
         cell_row("a", 1, &[RowField::bytes(SCORE, RowCell::Value(b"text"))]),
         cell_row("b", 1, &[fixed(SCORE, 0)]),
-        cell_row("c", 1, &[fixed(STATUS, 64)]),
+        cell_row("c", 1, &[fixed(STATUS, 3)]),
         cell_row("d", 1, &[RowField::bytes(STATUS, RowCell::Value(b"text"))]),
     ];
     let batch = entries_to_cells_batch(&entries).unwrap();

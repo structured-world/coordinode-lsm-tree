@@ -2,160 +2,277 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-// Format constants live in writer (the blob-format definition site). The
-// scalar cap is shared from there; the scanner enforces it BEFORE allocating:
-// a CRC-valid fake header inside a damaged record's user-controlled bytes can
-// declare a near-`u32::MAX` length that still fits a large data section, and
-// without the cap the salvage walk would attempt a multi-gigabyte allocation
-// before the candidate's checksum rejection.
-use super::writer::{BLOB_HEADER_MAGIC, MAX_DECOMPRESSION_SIZE, validate_header_crc};
+use super::frame::{
+    DecodedFrame, FRAME_HEADER_LEN, FRAME_MAGIC, FrameKind, decode_frame, parse_header,
+};
+use super::reader::assemble;
 use crate::fs::{Fs, FsOpenOptions};
 use crate::io::BufReader;
-use crate::io::{LittleEndian, ReadBytesExt};
 #[cfg(not(feature = "std"))]
 use crate::io::{Read, Seek, SeekFrom};
 use crate::path::Path;
-use crate::{Checksum, SeqNo, UserKey, UserValue, vlog::BlobFileId};
+use crate::{CompressionType, SeqNo, Slice, UserKey, UserValue, vlog::BlobFileId};
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::{Read, Seek, SeekFrom};
 
-/// Reads through a blob file in order.
+/// What a scanner decodes frames with: the file's codec and, for a dictionary
+/// codec, the dictionary.
+#[derive(Clone)]
+pub(crate) struct ScanCodec {
+    pub(crate) compression: CompressionType,
+    #[cfg(zstd_any)]
+    pub(crate) dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+}
+
+impl ScanCodec {
+    /// The codec `blob_file` records, with its pinned dictionary.
+    pub(crate) fn of(blob_file: &crate::BlobFile) -> Self {
+        Self {
+            compression: blob_file.compression(),
+            #[cfg(zstd_any)]
+            dictionary: blob_file.0.zstd_dictionary.clone(),
+        }
+    }
+}
+
+/// How the scanner finds where each frame starts.
+enum Bounds {
+    /// From the file's frame index: each frame's start, then the data end.
+    /// A damaged frame costs that frame alone: the next one is where the
+    /// index puts it.
+    Index(Arc<[u64]>),
+    /// Without a readable index: each frame from the length the one before
+    /// declares, and past damage from a byte-wise search for the next magic.
+    Chain,
+}
+
+/// Reads through a blob file in order, one value at a time.
 ///
-/// Termination is determined by the SFA table-of-contents: the scanner
-/// stops when the read position reaches the end of the "data" section,
-/// not when it encounters specific magic bytes. This avoids silent data
-/// loss if corrupted frame bytes happen to match the metadata header
-/// magic (`META`).
+/// Termination is determined by the SFA table-of-contents: the scanner stops
+/// when the read position reaches the end of the "data" section, not when it
+/// meets particular bytes.
 pub(crate) struct Scanner {
-    pub(crate) blob_file_id: BlobFileId, // TODO: remove unused?
+    pub(crate) blob_file_id: BlobFileId,
     inner: BufReader<crate::table::util::TimedFile>,
     is_terminated: bool,
 
     /// Byte offset where the "data" section ends (from the SFA TOC).
     data_end: u64,
 
-    /// Set when [`resync_to_next_frame`](Self::resync_to_next_frame) lands on a
-    /// magic, and STICKY thereafter: every frame read once this is set is marked
-    /// `resynced`. The resync magic was found by a byte-wise search after a
-    /// damaged frame, so it may be an original boundary OR a checksum-valid
-    /// `BLO4` frame nested inside the damaged frame's user-controlled bytes; the
-    /// two are byte-for-byte indistinguishable. Crucially, a frame CHAINED past
-    /// the resync inherits that unproven anchor: its start comes from the resync
-    /// frame's own length, so a fabricated chain can plant one checksum-valid
-    /// frame after another. There is no independent anchor mid-stream to
-    /// re-establish trust, so the taint never lifts. Callers that must not
-    /// fabricate data (salvage) treat every `resynced` entry as untrusted.
+    bounds: Bounds,
+
+    /// The number of the next frame to read.
+    next_frame: u32,
+
+    codec: ScanCodec,
+
+    /// Values of the block read last that are still to be yielded.
+    pending: VecDeque<ScanEntry>,
+
+    /// Set when the chain walk resynchronized at a magic found by a byte-wise
+    /// search after a damaged frame, and STICKY thereafter: every value read
+    /// once this is set is marked `resynced`. The magic may be an original
+    /// boundary OR a checksum-valid frame nested inside the damaged frame's
+    /// user-controlled bytes; the two are byte-for-byte indistinguishable, and
+    /// every frame chained past it inherits that unproven anchor, so the taint
+    /// never lifts. Callers that must not fabricate data (salvage) treat every
+    /// `resynced` entry as untrusted. An index walk never sets it: its
+    /// boundaries come from the checksummed index, not from the damaged bytes.
     resync_tainted: bool,
 }
 
 impl Scanner {
-    /// Initializes a new blob file reader.
-    ///
-    /// Reads the SFA table-of-contents to determine the "data" section
-    /// boundary, then positions the reader at the start of the data
-    /// section.
+    /// Scans `blob_file` from the frame starting at `start` (a frame boundary a
+    /// previous scan's [`ScanEntry::frame_end`] gave, or the file's frontier),
+    /// or from its first live frame, `pace` told how long each read takes.
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs or the blob file lacks
-    /// a "data" section.
+    /// [`crate::Error::InvalidHeader`] for a `start` that is not a frame
+    /// boundary, and any IO error.
+    pub(crate) fn of_paced(
+        blob_file: &crate::BlobFile,
+        start: Option<u64>,
+        pace: Option<crate::table::util::Pacer>,
+    ) -> crate::Result<Self> {
+        let start = start
+            .unwrap_or(blob_file.live_data_start())
+            .max(blob_file.live_data_start());
+        Self::open_with(
+            &blob_file.0.path,
+            &*blob_file.0.fs,
+            blob_file.id(),
+            ScanCodec::of(blob_file),
+            Some(Arc::clone(&blob_file.0.frames)),
+            (start != 0).then_some(start),
+            pace,
+        )
+    }
+
+    /// Scans the blob file at `path` from `start`, or from the data start,
+    /// reading its frame index from the file and walking the frames' own
+    /// lengths when the index is unreadable: for a file that may be damaged
+    /// (salvage, repair), whose index is not taken on trust.
+    ///
+    /// # Errors
+    ///
+    /// The file lacks a "data" section, `start` lies outside it, or an IO
+    /// error occurs.
+    pub(crate) fn open<P: AsRef<Path>>(
+        path: P,
+        fs: &dyn Fs,
+        blob_file_id: BlobFileId,
+        codec: ScanCodec,
+        start: Option<u64>,
+    ) -> crate::Result<Self> {
+        Self::open_with(path.as_ref(), fs, blob_file_id, codec, None, start, None)
+    }
+
+    /// [`Self::open`] from the data start, under the codec the file's
+    /// metadata records and no dictionary.
+    #[cfg(test)]
     pub(crate) fn new<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
     ) -> crate::Result<Self> {
-        Self::open_paced(path, fs, blob_file_id, None, None)
+        Self::resume_at(path, fs, blob_file_id, None)
     }
 
-    /// Re-opens a blob file mid-stream, positioning the reader at `start_offset`
-    /// (an absolute data-section frame boundary captured from a previous scan's
-    /// [`ScanEntry::frame_end`]), or at the committed frontier of a restricted
-    /// file. Relocation resumes there instead of re-reading a prefix that has
-    /// already been hole-punched.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if an IO error occurs, the blob file lacks a "data" section,
-    /// or `start_offset` falls outside the data section.
+    /// [`Self::open`] from the frame at `start`, under the codec the file's
+    /// metadata records and no dictionary.
+    #[cfg(test)]
     pub(crate) fn resume<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
-        start_offset: u64,
+        start: u64,
     ) -> crate::Result<Self> {
-        Self::open_paced(path, fs, blob_file_id, Some(start_offset), None)
+        Self::resume_at(path, fs, blob_file_id, Some(start))
     }
 
-    /// Reads the SFA TOC to bound the "data" section, then positions the reader
-    /// at `start` if given (validated to lie within `[data_start, data_end]`) or
-    /// at the data-section start otherwise. `pace` is told how long each read
-    /// from the file takes, from the trailer on.
-    pub(crate) fn open_paced<P: AsRef<Path>>(
+    #[cfg(test)]
+    fn resume_at<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
         start: Option<u64>,
+    ) -> crate::Result<Self> {
+        // The metadata alone: the frame index may be what a test damaged.
+        let meta = crate::vlog::read_blob_meta(path.as_ref(), fs, blob_file_id)?;
+        let codec = ScanCodec {
+            compression: meta.compression,
+            #[cfg(zstd_any)]
+            dictionary: None,
+        };
+        Self::open(path, fs, blob_file_id, codec, start)
+    }
+
+    fn open_with(
+        path: &Path,
+        fs: &dyn Fs,
+        blob_file_id: BlobFileId,
+        codec: ScanCodec,
+        frames: Option<Arc<[u64]>>,
+        start: Option<u64>,
         pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
-        let path = path.as_ref();
-
         let mut file =
             crate::table::util::TimedFile::new(fs.open(path, &FsOpenOptions::new().read(true))?);
         if let Some(pace) = pace {
             file.set_pace(pace);
         }
-        let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
-        let data_section = sfa_reader.toc().section(b"data").ok_or_else(|| {
-            log::error!("BlobFile: SFA TOC has no \"data\" section");
-            crate::Error::InvalidHeader("BlobFile")
-        })?;
-        let data_start = data_section.pos();
-        let data_end = data_start.checked_add(data_section.len()).ok_or_else(|| {
-            log::error!(
-                "BlobFile: data section offset overflow (pos={data_start}, len={})",
-                data_section.len()
-            );
-            crate::Error::InvalidHeader("BlobFile")
-        })?;
-
-        let seek_to = match start {
-            None => data_start,
-            Some(off) if off >= data_start && off <= data_end => off,
-            Some(off) => {
+        let (data_start, data_end, index_at) = {
+            let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
+            let toc = sfa_reader.toc();
+            let data = toc.section(b"data").ok_or_else(|| {
+                log::error!("BlobFile: SFA TOC has no \"data\" section");
+                crate::Error::InvalidHeader("BlobFile")
+            })?;
+            let data_start = data.pos();
+            let data_end = data_start.checked_add(data.len()).ok_or_else(|| {
                 log::error!(
-                    "BlobFile: resume offset {off} outside data section [{data_start}, {data_end}]"
+                    "BlobFile: data section offset overflow (pos={data_start}, len={})",
+                    data.len()
                 );
-                return Err(crate::Error::InvalidHeader("BlobFile"));
+                crate::Error::InvalidHeader("BlobFile")
+            })?;
+            let index_at = toc
+                .section(b"frames")
+                .map(|entry| (entry.pos(), entry.len()));
+            (data_start, data_end, index_at)
+        };
+
+        // The index the caller trusts, else the one the file holds if it
+        // reads and fits the data, else the chain.
+        let frames = match frames {
+            Some(frames) => Some(frames),
+            None => index_at.and_then(|(pos, len)| {
+                let len = usize::try_from(len).ok()?;
+                let mut bytes = alloc::vec![0_u8; len];
+                file.seek(SeekFrom::Start(pos)).ok()?;
+                file.read_exact(&mut bytes).ok()?;
+                let frames = super::writer::decode_frame_index(&bytes).ok()?;
+                let fits = frames.first().is_some_and(|&first| first >= data_start)
+                    && frames.last() == Some(&data_end);
+                fits.then_some(frames)
+            }),
+        };
+
+        let seek_to = start.unwrap_or(data_start);
+        if seek_to < data_start || seek_to > data_end {
+            log::error!(
+                "BlobFile: resume offset {seek_to} outside data section [{data_start}, {data_end}]"
+            );
+            return Err(crate::Error::InvalidHeader("BlobFile"));
+        }
+        let (bounds, next_frame) = match frames {
+            Some(frames) => {
+                let starts = frames.get(..frames.len() - 1).unwrap_or_default();
+                // At the data end there is nothing left; elsewhere `start` must
+                // be a frame's own start.
+                let next = match starts.binary_search(&seek_to) {
+                    Ok(at) => at,
+                    Err(at) if seek_to == data_end || (start.is_none() && at == 0) => at,
+                    Err(_) => return Err(crate::Error::InvalidHeader("BlobFile")),
+                };
+                let next =
+                    u32::try_from(next).map_err(|_| crate::Error::InvalidHeader("BlobFile"))?;
+                (Bounds::Index(frames), next)
             }
+            // Without an index a frame's number is its place from the data
+            // start, which a resumed chain walk cannot know.
+            None if seek_to == data_start => (Bounds::Chain, 0),
+            None => return Err(crate::Error::InvalidHeader("BlobFile")),
+        };
+        let seek_to = match &bounds {
+            Bounds::Index(frames) => frames.get(next_frame as usize).copied().unwrap_or(data_end),
+            Bounds::Chain => seek_to,
         };
 
         file.seek(SeekFrom::Start(seek_to))?;
-        let file_reader = BufReader::with_capacity(32_000, file);
-
         Ok(Self {
             blob_file_id,
-            inner: file_reader,
+            inner: BufReader::with_capacity(32_000, file),
             is_terminated: false,
             data_end,
+            bounds,
+            next_frame,
+            codec,
+            pending: VecDeque::new(),
             resync_tainted: false,
         })
     }
-    // No `with_reader` constructor: Scanner is crate-private (parent
-    // `vlog` module is not re-exported from lib.rs), so there are no
-    // external callers. All internal usage goes through `new()` / `resume()`
-    // / `open_paced()`.
-}
 
-impl Scanner {
     /// Repositions the reader at the next frame magic strictly AFTER
-    /// `frame_offset`, or at the data-section end when none remains. Used
-    /// after HEADER rot (bad magic, header-CRC mismatch), where the frame's
-    /// lengths cannot be trusted to locate the next frame — without the
-    /// forward magic scan one rotted header would cost every readable later
-    /// frame. A false match inside a value payload fails its own header CRC
-    /// or payload checksum and resynchronizes again, strictly forward.
+    /// `frame_offset`, or at the data-section end when none remains: the
+    /// chain walk's way past a frame whose lengths cannot be trusted.
     fn resync_to_next_frame(&mut self, frame_offset: u64) -> crate::Result<()> {
-        const MAGIC_LEN: usize = BLOB_HEADER_MAGIC.len();
+        const MAGIC_LEN: usize = FRAME_MAGIC.len();
 
         // Scan in chunks, overlapping by MAGIC_LEN - 1 bytes so a magic
         // straddling two chunks is still found.
@@ -175,15 +292,8 @@ impl Scanner {
                 break;
             };
             self.inner.read_exact(window)?;
-            if let Some(hit) = window
-                .windows(MAGIC_LEN)
-                .position(|w| w == BLOB_HEADER_MAGIC)
-            {
+            if let Some(hit) = window.windows(MAGIC_LEN).position(|w| w == FRAME_MAGIC) {
                 self.inner.seek(SeekFrom::Start(pos + hit as u64))?;
-                // The next frame read starts at a magic found by a byte scan,
-                // NOT at a boundary vouched for by a chained frame's length: its
-                // provenance is unproven, and so is every frame chained after it
-                // (see the field doc). Arm the sticky taint.
                 self.resync_tainted = true;
                 return Ok(());
             }
@@ -197,212 +307,257 @@ impl Scanner {
         self.inner.seek(SeekFrom::Start(self.data_end))?;
         Ok(())
     }
+
+    /// Where the frame at `offset` ends, by the index, or `None` in a chain
+    /// walk.
+    fn indexed_end(&self, frame: u32) -> Option<u64> {
+        match &self.bounds {
+            Bounds::Index(frames) => frames.get(frame as usize + 1).copied(),
+            Bounds::Chain => None,
+        }
+    }
+
+    /// Moves to frame `frame` when the index places it, past the frames before
+    /// it; in a chain walk, which knows no frame's place ahead, stays where
+    /// the walk already is.
+    fn skip_to_frame(&mut self, frame: u32) -> crate::Result<()> {
+        if let Bounds::Index(frames) = &self.bounds {
+            let at = frames.get(frame as usize).copied().unwrap_or(self.data_end);
+            self.next_frame = frame;
+            self.inner.seek(SeekFrom::Start(at))?;
+        }
+        Ok(())
+    }
+
+    /// Moves past a frame that did not check: to where the index says the next
+    /// one starts, or by a byte-wise search in a chain walk.
+    fn skip_damaged(&mut self, frame: u32, offset: u64) -> crate::Result<()> {
+        self.next_frame = frame + 1;
+        match self.indexed_end(frame) {
+            Some(end) => {
+                self.inner.seek(SeekFrom::Start(end))?;
+                Ok(())
+            }
+            None => self.resync_to_next_frame(offset),
+        }
+    }
+
+    /// Reads the frame at the current position whole: its bytes as stored and
+    /// its number, checked and decoded.
+    fn read_one(&mut self) -> Option<crate::Result<(u32, u64, Slice, DecodedFrame)>> {
+        let offset = fail_iter!(self.inner.stream_position());
+        if offset >= self.data_end {
+            self.is_terminated = true;
+            return None;
+        }
+        let frame = self.next_frame;
+        let damaged = |this: &mut Self, e: crate::Error| {
+            if let Err(seek) = this.skip_damaged(frame, offset) {
+                this.is_terminated = true;
+                return Some(Err(seek));
+            }
+            Some(Err(e))
+        };
+
+        // The span to read: the index's, else the header's declared length,
+        // bounded by the section either way.
+        let len = match self.indexed_end(frame) {
+            Some(end) if end > offset && end <= self.data_end => end - offset,
+            Some(_) => return damaged(self, crate::Error::InvalidHeader("BlobFrame")),
+            None => {
+                if offset + FRAME_HEADER_LEN as u64 > self.data_end {
+                    self.is_terminated = true;
+                    return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+                }
+                let mut header = [0_u8; FRAME_HEADER_LEN];
+                if let Err(e) = self.inner.read_exact(&mut header) {
+                    self.is_terminated = true;
+                    return Some(Err(e.into()));
+                }
+                let declared = match parse_header(&header) {
+                    Ok(header) => header.frame_len(),
+                    Err(e) => return damaged(self, e),
+                };
+                if offset + declared > self.data_end {
+                    return damaged(self, crate::Error::InvalidHeader("BlobFrame"));
+                }
+                if let Err(e) = self.inner.seek(SeekFrom::Start(offset)) {
+                    self.is_terminated = true;
+                    return Some(Err(e.into()));
+                }
+                declared
+            }
+        };
+        let Ok(len) = usize::try_from(len) else {
+            return damaged(self, crate::Error::InvalidHeader("BlobFrame"));
+        };
+        let mut bytes = alloc::vec![0_u8; len];
+        if let Err(e) = self.inner.read_exact(&mut bytes) {
+            self.is_terminated = true;
+            return Some(Err(e.into()));
+        }
+        let bytes = Slice::from(bytes);
+        let mut decoded = 0;
+        let parsed = decode_frame(
+            &bytes,
+            self.codec.compression,
+            #[cfg(zstd_any)]
+            self.codec.dictionary.as_deref(),
+            &mut decoded,
+        );
+        match parsed {
+            Ok(decoded) => {
+                self.next_frame = frame + 1;
+                Some(Ok((frame, offset, bytes, decoded)))
+            }
+            Err(e) => damaged(self, e),
+        }
+    }
+
+    /// The values of the next frame, queued; `None` at the data end.
+    fn fill(&mut self) -> Option<crate::Result<()>> {
+        let (frame, offset, bytes, decoded) = match self.read_one()? {
+            Ok(read) => read,
+            Err(e) => return Some(Err(e)),
+        };
+        let resynced = self.resync_tainted;
+        let frame_end = offset + bytes.len() as u64;
+        match decoded.header.kind {
+            FrameKind::Single | FrameKind::Block => {
+                let last = decoded.list.len() - 1;
+                for (at, entry) in decoded.list.iter().enumerate() {
+                    let (Some(key), Some(value)) = (decoded.key(at), decoded.value(at)) else {
+                        return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+                    };
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a frame lists at most u16::MAX values"
+                    )]
+                    let index = at as u16;
+                    let whole = decoded.header.kind == FrameKind::Single;
+                    self.pending.push_back(ScanEntry {
+                        key: UserKey::from(key),
+                        seqno: entry.seqno,
+                        // A view into the frame: a block's values are taken
+                        // together, as the scan yields them in a row.
+                        value,
+                        frame,
+                        index,
+                        offset,
+                        uncompressed_len: entry.value_len,
+                        // A block is consumed once its last value is: until
+                        // then the frontier stays at its start.
+                        frame_end: if at == last { frame_end } else { offset },
+                        resynced,
+                        frames: whole.then(|| alloc::vec![bytes.clone()]),
+                    });
+                }
+                Some(Ok(()))
+            }
+            FrameKind::Head => {
+                let Ok(chunks) = super::reader::chunk_frames(&decoded, frame) else {
+                    return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+                };
+                let mut stored = alloc::vec![bytes];
+                let mut parts = Vec::with_capacity((chunks.end - chunks.start) as usize);
+                let mut end = frame_end;
+                for _ in chunks.clone() {
+                    let failure = match self.read_one() {
+                        Some(Ok((_, at, chunk_bytes, chunk)))
+                            if chunk.header.kind == FrameKind::Chunk =>
+                        {
+                            end = at + chunk_bytes.len() as u64;
+                            stored.push(chunk_bytes);
+                            parts.push(alloc::boxed::Box::new(chunk));
+                            continue;
+                        }
+                        Some(Ok(_)) | None => crate::Error::InvalidHeader("BlobFrame"),
+                        Some(Err(e)) => e,
+                    };
+                    // By the index, the value's damage ends with its chunks:
+                    // the walk goes on at the frame after them, so the chunks
+                    // left do not each read as a chunk without its head.
+                    if let Err(e) = self.skip_to_frame(chunks.end) {
+                        self.is_terminated = true;
+                        return Some(Err(e));
+                    }
+                    return Some(Err(failure));
+                }
+                let (Some(entry), Some(key)) = (decoded.list.first(), decoded.key(0)) else {
+                    return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+                };
+                let value = match assemble(&decoded, &parts, None) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                };
+                self.pending.push_back(ScanEntry {
+                    key: UserKey::from(key),
+                    seqno: entry.seqno,
+                    value,
+                    frame,
+                    index: 0,
+                    offset,
+                    uncompressed_len: entry.value_len,
+                    frame_end: end,
+                    resynced: self.resync_tainted,
+                    frames: Some(stored),
+                });
+                Some(Ok(()))
+            }
+            // A chunk without its head is damage: the head before it was lost.
+            FrameKind::Chunk => Some(Err(crate::Error::InvalidHeader("BlobFrame"))),
+        }
+    }
 }
 
+/// One value a scan reads.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ScanEntry {
     pub key: UserKey,
     pub seqno: SeqNo,
+    /// The value, decoded.
     pub value: UserValue,
+    /// The frame that holds the value (a chunked value's head).
+    pub frame: u32,
+    /// The value's place in its frame.
+    pub index: u16,
+    /// Where that frame starts.
     pub offset: u64,
     pub uncompressed_len: u32,
-    /// Absolute data-section position immediately AFTER this frame (the start of
-    /// the next frame, or the data-section end for the last frame). The
-    /// tight-space relocation loop uses it as the exact punch / resume boundary:
-    /// once an entry is consumed, `[data_start, frame_end)` is reclaimable and a
-    /// resumed scan opens here.
+    /// Where the data this entry consumes ends: the start of the next frame
+    /// once the value's frames are consumed whole, its frame's start for a
+    /// value a block still shares with later ones. The tight-space relocation
+    /// loop uses it as the exact punch / resume boundary.
     pub frame_end: u64,
-    /// Whether the scanner has RESYNCED at or before this frame. Set on the frame
-    /// reached immediately by the byte-wise resync AND on every frame after it:
-    /// once the stream resyncs, this frame's boundary is UNPROVEN, either because
-    /// it IS the resync frame (the magic may be an original boundary or a
-    /// checksum-valid `BLO4` frame nested inside the damaged frame's bytes) or
-    /// because it is chained from one whose length is equally unanchored. The
-    /// taint is STICKY to EOF: no independent anchor exists mid-stream to
-    /// re-establish trust. Salvage must NOT re-emit a resynced frame as a genuine
-    /// record (doing so would fabricate data), so it drops the whole tainted
-    /// tail (fail closed) rather than trust an unanchored candidate.
+    /// Whether the chain walk had resynchronized at or before this value's
+    /// frame: its boundary is unproven, and so is every one after it. Salvage
+    /// must NOT re-emit such a value as a genuine record.
     pub resynced: bool,
+    /// The value's frames as stored, for a value that has frames of its own (a
+    /// single frame, or a head and its chunks): what a copy under the same
+    /// codec writes as it is. `None` for a value that shares a block.
+    pub frames: Option<Vec<Slice>>,
 }
 
 impl Iterator for Scanner {
     type Item = crate::Result<ScanEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.is_terminated {
-            return None;
-        }
-
-        // Read the sticky resync taint for THIS frame. Once any prior call ended
-        // by resyncing to a magic, this frame's boundary is unproven: either it
-        // IS the resync frame or it is chained from one, and both anchors trace
-        // back to the same byte-scanned magic. The taint never clears: there is
-        // no independent anchor mid-stream to re-establish trust, so every frame
-        // to EOF stays tainted (fail closed).
-        let was_resynced = self.resync_tainted;
-
-        let offset = fail_iter!(self.inner.stream_position());
-
-        // Terminate when the read position reaches the end of the "data"
-        // section (from the SFA TOC), not when magic bytes match META.
-        if offset >= self.data_end {
-            self.is_terminated = true;
-            return None;
-        }
-
-        // A frame header is a fixed BLOB_HEADER_LEN bytes. A magic found within
-        // fewer than that of the data-section end (e.g. a resync landing near
-        // EOF) would let the fixed-header reads below consume bytes from the
-        // FOLLOWING SFA section. Reject the incomplete tail here, before the
-        // first read: no whole frame can start this close to the boundary. (The
-        // span check further down still rejects a full-but-overrunning frame;
-        // this only stops the header read itself from crossing the section.)
-        if offset
-            .checked_add(super::writer::BLOB_HEADER_LEN as u64)
-            .is_none_or(|end| end > self.data_end)
-        {
-            self.is_terminated = true;
-            return Some(Err(crate::Error::InvalidHeader("Blob")));
-        }
-
-        {
-            let mut buf = [0; BLOB_HEADER_MAGIC.len()];
-            fail_iter!(self.inner.read_exact(&mut buf));
-
-            if buf != BLOB_HEADER_MAGIC {
-                // Header rot: the frame's lengths are unreadable, so the
-                // next frame cannot be located from this one. Resynchronize
-                // at the next frame magic so one rotted header does not
-                // cost every readable later frame (record-granular
-                // salvage); the frame itself is lost either way.
-                if let Err(e) = self.resync_to_next_frame(offset) {
-                    self.is_terminated = true;
-                    return Some(Err(e));
-                }
-                return Some(Err(crate::Error::InvalidHeader("Blob")));
+        loop {
+            if let Some(entry) = self.pending.pop_front() {
+                return Some(Ok(entry));
+            }
+            if self.is_terminated {
+                return None;
+            }
+            match self.fill()? {
+                Ok(()) => {}
+                Err(e) => return Some(Err(e)),
             }
         }
-
-        let expected_checksum = fail_iter!(self.inner.read_u128::<LittleEndian>());
-        let seqno = fail_iter!(self.inner.read_u64::<LittleEndian>());
-
-        let key_len = fail_iter!(self.inner.read_u16::<LittleEndian>());
-
-        let real_val_len = fail_iter!(self.inner.read_u32::<LittleEndian>());
-
-        let on_disk_val_len = fail_iter!(self.inner.read_u32::<LittleEndian>());
-
-        // Read and validate the header CRC. On a mismatch the consumed
-        // lengths are untrusted (any of them may be the rotted field), so
-        // resynchronize at the next frame magic instead of terminating —
-        // continuing from a length-derived position could desynchronize,
-        // and stopping would drop every readable later frame.
-        let stored_header_crc = {
-            let crc = fail_iter!(self.inner.read_u32::<LittleEndian>());
-            if let Err(e) = validate_header_crc(seqno, key_len, real_val_len, on_disk_val_len, crc)
-            {
-                if let Err(e2) = self.resync_to_next_frame(offset) {
-                    self.is_terminated = true;
-                    return Some(Err(e2));
-                }
-                return Some(Err(e));
-            }
-            crc
-        };
-
-        // Verify the declared frame payload fits within the data section
-        // before allocating buffers. A declared payload that overruns the
-        // data section or the 256 MiB cap makes the span UNTRUSTWORTHY, so
-        // resynchronize at the next
-        // real frame regardless of how this position was reached. A resync
-        // candidate's magic may sit inside a damaged record's
-        // user-controlled bytes; a writer-chained frame's header CRC vouches
-        // for its lengths at parse time, but a re-stamped length that
-        // recomputes the header CRC passes that check and can declare past
-        // the section — terminating would then leave every intact later
-        // frame uninspected. Resync parks at the section end when no further
-        // magic exists, so a genuine truncation still terminates cleanly on
-        // the next call.
-        {
-            let header_len = super::writer::BLOB_HEADER_LEN as u64;
-            // `key_len` / `on_disk_val_len` come from the on-disk frame header and
-            // may be corrupt. Use checked adds so a value that overflows u64 fails
-            // loudly here (treated as "does not fit") instead of saturating to
-            // u64::MAX and relying on the `> data_end` compare to reject it.
-            let frame_end = offset
-                .checked_add(header_len)
-                .and_then(|x| x.checked_add(u64::from(key_len)))
-                .and_then(|x| x.checked_add(u64::from(on_disk_val_len)));
-            // Same 256 MiB value cap as the writer / ordinary reader,
-            // checked BEFORE the buffers below are allocated: no
-            // legitimate frame exceeds it, so an over-cap declared length
-            // is corruption regardless of whether it fits the section.
-            let over_cap = u64::from(real_val_len) > MAX_DECOMPRESSION_SIZE as u64
-                || u64::from(on_disk_val_len) > MAX_DECOMPRESSION_SIZE as u64;
-            if over_cap || frame_end.is_none_or(|end| end > self.data_end) {
-                if let Err(e) = self.resync_to_next_frame(offset) {
-                    self.is_terminated = true;
-                    return Some(Err(e));
-                }
-                return Some(Err(crate::Error::InvalidHeader("Blob")));
-            }
-        }
-
-        let key = fail_iter!(UserKey::from_reader(&mut self.inner, key_len as usize));
-
-        let value = fail_iter!(UserValue::from_reader(
-            &mut self.inner,
-            on_disk_val_len as usize
-        ));
-
-        {
-            let checksum = super::writer::record_checksum(&key, &value, stored_header_crc);
-
-            if expected_checksum != checksum {
-                log::error!(
-                    "Checksum mismatch for blob>{}@{offset}, got={checksum}, expected={expected_checksum}",
-                    self.blob_file_id,
-                );
-
-                // A checksum rejection means the DECLARED SPAN is not
-                // trustworthy, so resume the magic search strictly past this
-                // frame's start regardless of how the position was reached.
-                // A resync candidate's magic came from user-controlled value
-                // bytes (a CRC-valid fake header can declare an end past
-                // intact records); a WRITER-CHAINED frame's header CRC
-                // vouches for its lengths at parse time, but a re-stamped
-                // length that recomputes the header CRC passes that check
-                // and can consume one or more intact later frames before the
-                // payload checksum fails — trusting its declared end would
-                // then skip those frames without reporting the loss. Both
-                // resynchronize at the next real frame instead.
-                if let Err(e) = self.resync_to_next_frame(offset) {
-                    self.is_terminated = true;
-                    return Some(Err(e));
-                }
-                return Some(Err(crate::Error::ChecksumMismatch {
-                    got: Checksum::from_raw(checksum),
-                    expected: Checksum::from_raw(expected_checksum),
-                }));
-            }
-        }
-
-        // The reader is now positioned at the next frame: capture it as the exact
-        // punch / resume boundary for this frame.
-        let frame_end = fail_iter!(self.inner.stream_position());
-
-        Some(Ok(ScanEntry {
-            key,
-            seqno,
-            value,
-            offset,
-            uncompressed_len: real_val_len,
-            frame_end,
-            resynced: was_resynced,
-        }))
     }
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
+#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 mod tests;

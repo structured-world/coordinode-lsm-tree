@@ -16,38 +16,63 @@ use std::io::{Read, Write};
 #[cfg(feature = "std")]
 use varint_rs::{VarintReader, VarintWriter};
 
-/// A value handle points into the value log
+/// A value handle points into the value log: the blob file, the frame that
+/// holds the value (a chunked value's head) and the value's place in the
+/// frame's list.
+///
+/// A frame number, not a byte offset, so the handle of a value is known when
+/// the value is written, before the block it joins is compressed; the file's
+/// frame index maps numbers to offsets.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ValueHandle {
     /// Blob file ID
     pub blob_file_id: BlobFileId,
 
-    /// Offset in file
-    pub offset: u64,
+    /// The frame that holds the value
+    pub frame: u32,
 
-    /// On-disk size
-    pub on_disk_size: u32,
+    /// The value's place in the frame's list
+    pub index: u16,
+}
+
+impl ValueHandle {
+    /// The frame this handle names.
+    #[must_use]
+    pub(crate) fn frame_at(&self) -> crate::cache::BlobFrameAt {
+        crate::cache::BlobFrameAt {
+            blob_file_id: self.blob_file_id,
+            frame: self.frame,
+        }
+    }
+
+    /// The value's place in its blob file as one number, ordered as the
+    /// values lie: the frame above the index. What names an object a cell
+    /// row owns.
+    #[must_use]
+    pub(crate) fn object(&self) -> u64 {
+        (u64::from(self.frame) << 16) | u64::from(self.index)
+    }
 }
 
 impl Encode for ValueHandle {
     fn encode_into<W: Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
-        writer.write_u64_varint(self.offset)?;
         writer.write_u64_varint(self.blob_file_id)?;
-        writer.write_u32_varint(self.on_disk_size)?;
+        writer.write_u32_varint(self.frame)?;
+        writer.write_u16_varint(self.index)?;
         Ok(())
     }
 }
 
 impl Decode for ValueHandle {
     fn decode_from<R: Read>(reader: &mut R) -> Result<Self, crate::Error> {
-        let offset = reader.read_u64_varint()?;
         let blob_file_id = reader.read_u64_varint()?;
-        let on_disk_size = reader.read_u32_varint()?;
+        let frame = reader.read_u32_varint()?;
+        let index = reader.read_u16_varint()?;
 
         Ok(Self {
             blob_file_id,
-            offset,
-            on_disk_size,
+            frame,
+            index,
         })
     }
 }

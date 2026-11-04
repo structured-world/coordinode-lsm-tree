@@ -2,12 +2,12 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+pub(crate) mod frame;
 pub(crate) mod merge;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
 pub(crate) mod reader;
 pub(crate) mod scanner;
-pub(crate) mod value_encoder;
 pub(crate) mod writer;
 
 use crate::path::{Path, PathBuf};
@@ -86,6 +86,11 @@ pub(crate) struct Inner {
     /// file as corrupt. Persisted per version edit, the blob analogue of a
     /// table's restriction bound.
     pub(crate) live_data_start: u64,
+
+    /// Where each frame starts, then where the data ends: one more entry than
+    /// the file has frames. A handle names a frame by its number, and this is
+    /// how a read finds its bytes.
+    pub(crate) frames: Arc<[u64]>,
 
     pub(crate) file_accessor: FileAccessor,
 
@@ -613,6 +618,47 @@ impl BlobFile {
         self.0.checksum
     }
 
+    /// Where frame `frame` lies: its first byte and the byte past it, or
+    /// `None` for a frame the file does not have.
+    #[must_use]
+    pub(crate) fn frame_span(&self, frame: u32) -> Option<(u64, u64)> {
+        let at = frame as usize;
+        let start = *self.0.frames.get(at)?;
+        let end = *self.0.frames.get(at + 1)?;
+        Some((start, end))
+    }
+
+    /// Whether this view still holds frame `frame`: the file has it, and it
+    /// lies at or past the live start, not in a reclaimed prefix.
+    #[must_use]
+    pub(crate) fn holds_frame(&self, frame: u32) -> bool {
+        self.frame_span(frame)
+            .is_some_and(|(start, _)| start >= self.0.live_data_start)
+    }
+
+    /// How many frames the file holds.
+    #[must_use]
+    pub(crate) fn frame_count(&self) -> usize {
+        // The index always ends with the data end: a written and a decoded one
+        // both carry it, so it holds at least that one entry.
+        self.0.frames.len() - 1
+    }
+
+    /// Whether a frame of this file starts at `offset`, or its data ends
+    /// there.
+    #[must_use]
+    pub(crate) fn is_frame_boundary(&self, offset: u64) -> bool {
+        self.0.frames.binary_search(&offset).is_ok()
+    }
+
+    /// The number of the frame that starts at `offset`, if one does.
+    #[must_use]
+    pub(crate) fn frame_at_offset(&self, offset: u64) -> Option<u32> {
+        let starts = self.0.frames.get(..self.frame_count())?;
+        let at = starts.binary_search(&offset).ok()?;
+        u32::try_from(at).ok()
+    }
+
     /// The compression applied to this blob file's values (the descriptor a
     /// reader uses to decode each record's on-disk bytes).
     #[must_use]
@@ -690,12 +736,13 @@ impl BlobFile {
     }
 
     /// Returns `true` if the blob file has no more incoming references, and can be safely removed from a Version.
+    ///
+    /// Every object of the file is charged: counted by objects, not bytes, so
+    /// a live object of zero bytes keeps its file alive.
     pub(crate) fn is_dead(&self, frag_map: &FragmentationMap) -> bool {
-        frag_map.get(&self.id()).is_some_and(|x| {
-            let stale_bytes = x.bytes;
-            let all_bytes = self.0.meta.total_uncompressed_bytes;
-            stale_bytes == all_bytes
-        })
+        frag_map
+            .get(&self.id())
+            .is_some_and(|x| x.len as u64 == self.0.meta.item_count)
     }
 
     /// [`Self::is_dead`] against `stats` with `pass`, the charges of an
@@ -707,9 +754,9 @@ impl BlobFile {
         if before.is_none() && now.is_none() {
             return false;
         }
-        // Each charge is at most the file's size, far below `u64::MAX`, so the
-        // sum cannot overflow.
-        let charged = before.map_or(0, |e| e.bytes) + now.map_or(0, |e| e.bytes);
-        charged == self.0.meta.total_uncompressed_bytes
+        // Each count is at most the file's objects, far below `u64::MAX`, so
+        // the sum cannot overflow.
+        let charged = before.map_or(0, |e| e.len as u64) + now.map_or(0, |e| e.len as u64);
+        charged == self.0.meta.item_count
     }
 }

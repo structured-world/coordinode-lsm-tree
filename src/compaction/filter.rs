@@ -333,6 +333,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             .use_sync_mode(self.shared.opts.config.sync_mode)
             .use_writeback_bytes(self.shared.opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
+            .use_frame_sizes(blob_opts.frame_sizes())
             .use_clock(self.shared.opts.config.clock.clone())
             .use_key_domains(
                 self.shared.opts.config.key_domains.clone(),
@@ -361,12 +362,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
                 .lifetime_classifier()
                 .class_of(&prev_key.user_key, false),
         )?;
-        let vhandle = writer.write(&prev_key.user_key, prev_key.seqno, &new_value)?;
-
-        let indirection = BlobIndirection {
-            vhandle,
-            size: value_size,
-        };
+        let indirection = writer.write(&prev_key.user_key, prev_key.seqno, &new_value)?;
 
         Ok((ValueType::Indirection, indirection.encode_into_vec().into()))
     }

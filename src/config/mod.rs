@@ -284,6 +284,16 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub separation_threshold: u32,
 
+    /// Values below it share compressed blocks in a blob file. See
+    /// [`Self::block_size`].
+    #[doc(hidden)]
+    pub block_size: u32,
+
+    /// Values above it are stored in chunks of this size. See
+    /// [`Self::chunk_size`].
+    #[doc(hidden)]
+    pub chunk_size: core::num::NonZeroU32,
+
     /// Separation thresholds of the fields of rows written as cells, as
     /// `(column, bytes)` pairs; a column without one uses
     /// `separation_threshold`. See [`Self::cell_separation_threshold`].
@@ -379,6 +389,15 @@ impl Default for KvSeparationOptions {
         Self {
             file_target_size: /* 64 MiB */ 64 * 1_024 * 1_024,
             separation_threshold: /* 1 KiB */ 1_024,
+            block_size: crate::vlog::blob_file::writer::FrameSizes::DEFAULT.block_target,
+            #[expect(
+                clippy::expect_used,
+                reason = "the default chunk size is a non-zero constant"
+            )]
+            chunk_size: core::num::NonZeroU32::new(
+                crate::vlog::blob_file::writer::FrameSizes::DEFAULT.chunk_size,
+            )
+            .expect("the default chunk size is not zero"),
             cell_separation_thresholds: alloc::vec::Vec::new(),
 
             staleness_threshold: 0.25,
@@ -423,6 +442,73 @@ impl KvSeparationOptions {
     pub fn separation_threshold(mut self, bytes: u32) -> Self {
         self.separation_threshold = bytes;
         self
+    }
+
+    /// Sets the size below which separated values share a block in a blob
+    /// file, compressed together.
+    ///
+    /// A value compressed alone gains little from the bytes around it, so a
+    /// small value is packed with its neighbours in key order; a read of one
+    /// of them decompresses the block. A block closes once it holds 90% of
+    /// this size and the next value would take it past. `0` packs nothing:
+    /// every value up to [`Self::chunk_size`] is compressed on its own.
+    ///
+    /// Only new blob files take it; a file records the frames it was written
+    /// with.
+    ///
+    /// Defaults to 16 KiB.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::KvSeparationOptions;
+    ///
+    /// // Values below 32 KiB are compressed in blocks of about that size.
+    /// let opts = KvSeparationOptions::default().block_size(32 * 1024);
+    /// assert_eq!(opts.block_size, 32 * 1024);
+    /// ```
+    #[must_use]
+    pub fn block_size(mut self, bytes: u32) -> Self {
+        self.block_size = bytes;
+        self
+    }
+
+    /// Sets the size above which a separated value is stored in chunks of
+    /// this many bytes, each compressed on its own.
+    ///
+    /// A read of part of such a value
+    /// ([`BlobTree::get_range`](crate::BlobTree::get_range)) reads and
+    /// decompresses only the chunks the part covers; a value up to this size
+    /// is one frame.
+    ///
+    /// Only new blob files take it; a file records the frames it was written
+    /// with.
+    ///
+    /// Defaults to 256 KiB.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::num::NonZeroU32;
+    /// use lsm_tree::KvSeparationOptions;
+    ///
+    /// let chunk = NonZeroU32::new(1 << 20).expect("non-zero");
+    /// let opts = KvSeparationOptions::default().chunk_size(chunk);
+    /// assert_eq!(opts.chunk_size, chunk);
+    /// ```
+    #[must_use]
+    pub fn chunk_size(mut self, bytes: core::num::NonZeroU32) -> Self {
+        self.chunk_size = bytes;
+        self
+    }
+
+    /// How the blob files written now size their frames.
+    #[must_use]
+    pub(crate) fn frame_sizes(&self) -> crate::vlog::blob_file::writer::FrameSizes {
+        crate::vlog::blob_file::writer::FrameSizes {
+            block_target: self.block_size,
+            chunk_size: self.chunk_size.get(),
+        }
     }
 
     /// Sets the separation threshold of `column` in rows written as cells

@@ -1,11 +1,11 @@
 use super::*;
 use test_log::test;
 
-fn handle(blob_file_id: u64, offset: u64) -> ValueHandle {
+fn handle(blob_file_id: u64, frame: u32) -> ValueHandle {
     ValueHandle {
         blob_file_id,
-        offset,
-        on_disk_size: 10,
+        frame,
+        index: 0,
     }
 }
 
@@ -43,9 +43,35 @@ fn only_a_release_after_the_read_makes_its_reference_stale() {
     drop(early);
 }
 
-/// The objects a dropped table owned, as its section lists them.
-fn owned(objects: &[(u64, u64)]) -> OwnedObjects {
-    OwnedObjects::from(objects)
+/// The objects a dropped table owned, as its section lists them: sorted, each
+/// as its blob file and place.
+fn owned(objects: &[ValueHandle]) -> OwnedObjects {
+    let mut listed: Vec<(u64, u64)> = objects
+        .iter()
+        .map(|handle| (handle.blob_file_id, handle.object()))
+        .collect();
+    listed.sort_unstable();
+    OwnedObjects::from(listed)
+}
+
+/// Two values of one block are two objects: releasing one leaves the other.
+#[test]
+fn a_release_names_one_value_of_a_block() {
+    let registry = Arc::new(ReleasedObjects::default());
+    let _held = registry.register(2);
+    let first = ValueHandle {
+        blob_file_id: 1,
+        frame: 4,
+        index: 0,
+    };
+    let second = ValueHandle { index: 1, ..first };
+    registry.record(3, [first], [owned(&[ValueHandle { index: 2, ..first }])]);
+    assert!(registry.released_since(2, &first));
+    assert!(
+        !registry.released_since(2, &second),
+        "another value of the block"
+    );
+    assert!(registry.released_since(2, &ValueHandle { index: 2, ..first }));
 }
 
 /// An object released twice is judged by its newest release: a read between
@@ -54,9 +80,9 @@ fn owned(objects: &[(u64, u64)]) -> OwnedObjects {
 fn a_second_release_after_the_read_makes_its_reference_stale() {
     let registry = Arc::new(ReleasedObjects::default());
     let _held = registry.register(2);
-    registry.record(3, [handle(1, 0)], [owned(&[(7, 50)])]);
-    registry.record(6, [handle(1, 0)], [owned(&[(7, 50)])]);
-    registry.record(5, [handle(1, 0)], [owned(&[(7, 50)])]);
+    registry.record(3, [handle(1, 0)], [owned(&[handle(7, 50)])]);
+    registry.record(6, [handle(1, 0)], [owned(&[handle(7, 50)])]);
+    registry.record(5, [handle(1, 0)], [owned(&[handle(7, 50)])]);
     assert!(registry.released_since(4, &handle(1, 0)));
     assert!(registry.released_since(4, &handle(7, 50)));
     assert!(!registry.released_since(6, &handle(1, 0)));
@@ -69,7 +95,11 @@ fn a_second_release_after_the_read_makes_its_reference_stale() {
 fn a_table_drop_releases_only_the_objects_it_owned() {
     let registry = Arc::new(ReleasedObjects::default());
     let _held = registry.register(2);
-    registry.record(3, [], [owned(&[(7, 0), (7, 900), (9, 10)])]);
+    registry.record(
+        3,
+        [],
+        [owned(&[handle(7, 0), handle(7, 900), handle(9, 10)])],
+    );
     assert!(registry.released_since(2, &handle(7, 0)));
     assert!(registry.released_since(2, &handle(7, 900)));
     assert!(registry.released_since(2, &handle(9, 10)));
@@ -99,7 +129,7 @@ fn records_go_with_the_last_read_older_than_them() {
     let registry = Arc::new(ReleasedObjects::default());
     let old = registry.register(2);
     let newer = registry.register(4);
-    registry.record(3, [handle(1, 0)], [owned(&[(9, 0)])]);
+    registry.record(3, [handle(1, 0)], [owned(&[handle(9, 0)])]);
     registry.record(5, [handle(1, 10)], []);
     drop(old);
     assert_eq!(

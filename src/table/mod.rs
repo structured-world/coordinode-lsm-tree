@@ -790,13 +790,25 @@ impl Table {
         }
     }
 
-    /// On-disk bytes of the blob values this table references.
+    /// On-disk bytes of the blob values this table references in the blob
+    /// files of `blob_files`.
     ///
     /// # Errors
     ///
     /// When the table's `linked_blob_files` section cannot be read or parsed.
-    pub fn referenced_blob_bytes(&self) -> crate::Result<u64> {
-        Ok(self.blob_links()?.iter().map(|f| f.on_disk_bytes).sum())
+    pub(crate) fn referenced_blob_bytes(
+        &self,
+        blob_files: &crate::version::BlobFileList,
+    ) -> crate::Result<u64> {
+        Ok(self
+            .blob_links()?
+            .iter()
+            .filter_map(|link| {
+                blob_files
+                    .get(link.blob_file_id)
+                    .map(|file| link.on_disk(file.meta()))
+            })
+            .sum())
     }
 
     /// The blob files this table references, with the key span each is
@@ -845,8 +857,8 @@ impl Table {
         })
     }
 
-    /// The blob objects this table's cell rows own, as `(blob file, offset)`
-    /// sorted ascending: read from the `owned_blob_objects` section, not kept.
+    /// The blob objects this table's cell rows own, as `(blob file, object)`
+    /// (see [`crate::vlog::ValueHandle::object`]) sorted ascending: read from the `owned_blob_objects` section, not kept.
     /// Empty for a table that owns none. What dropping the whole table
     /// releases, learned without reading its data.
     ///
@@ -4191,12 +4203,14 @@ impl Table {
         // consults `list_blob_file_references()` to decide whether other tables
         // reference a blob, so an accepted table with hidden indirections lets
         // GC rewrite / drop a blob file this table still points into.
-        // (len, bytes, on_disk_bytes, first key, last key) per blob id,
-        // accumulated exactly the way the writer folds them from indirections:
-        // the scan yields keys in order, so the first key seen is the first
-        // and the latest the last.
-        let mut derived: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64, UserKey, UserKey)> =
-            BTreeMap::new();
+        // (len, bytes, on_disk_bytes, block_bytes, first key, last key) per
+        // blob id, accumulated exactly the way the writer folds them from
+        // indirections: the scan yields keys in order, so the first key seen
+        // is the first and the latest the last.
+        let mut derived: BTreeMap<
+            crate::vlog::BlobFileId,
+            (usize, u64, u64, u64, UserKey, UserKey),
+        > = BTreeMap::new();
         // The objects the cell rows own, as the `owned_blob_objects` section
         // lists them.
         let mut derived_owned: Vec<(crate::vlog::BlobFileId, u64)> = Vec::new();
@@ -4208,13 +4222,15 @@ impl Table {
                 |ind: &crate::blob_tree::handle::BlobIndirection, owned: bool, key: &UserKey| {
                     let slot = derived
                         .entry(ind.vhandle.blob_file_id)
-                        .or_insert_with(|| (0, 0, 0, key.clone(), key.clone()));
+                        .or_insert_with(|| (0, 0, 0, 0, key.clone(), key.clone()));
                     if owned {
+                        let (frame_bytes, block_bytes) = ind.stored.split();
                         slot.0 += 1;
                         slot.1 += u64::from(ind.size);
-                        slot.2 += u64::from(ind.vhandle.on_disk_size);
+                        slot.2 += frame_bytes;
+                        slot.3 += block_bytes;
                     }
-                    slot.4.clone_from(key);
+                    slot.5.clone_from(key);
                 };
             let mut accumulate = |kv: InternalValue| -> crate::Result<()> {
                 if kv.key.value_type == crate::ValueType::Indirection {
@@ -4225,7 +4241,7 @@ impl Table {
                     for (ind, owned) in crate::blob_tree::field_row::row_refs(&kv.value)? {
                         add(&ind, owned, &kv.key.user_key);
                         if owned {
-                            derived_owned.push((ind.vhandle.blob_file_id, ind.vhandle.offset));
+                            derived_owned.push((ind.vhandle.blob_file_id, ind.vhandle.object()));
                         }
                     }
                 }
@@ -4276,7 +4292,7 @@ impl Table {
         }
         let mut recorded_map: BTreeMap<
             crate::vlog::BlobFileId,
-            (usize, u64, u64, UserKey, UserKey),
+            (usize, u64, u64, u64, UserKey, UserKey),
         > = BTreeMap::new();
         for link in recorded {
             if recorded_map
@@ -4286,6 +4302,7 @@ impl Table {
                         link.len,
                         link.bytes,
                         link.on_disk_bytes,
+                        link.block_bytes,
                         link.first_key,
                         link.last_key,
                     ),
@@ -4313,9 +4330,10 @@ impl Table {
                         if rec.0 >= derived_counts.0
                             && rec.1 >= derived_counts.1
                             && rec.2 >= derived_counts.2
-                            && cmp.compare(&rec.3, &derived_counts.3)
-                                != core::cmp::Ordering::Greater
+                            && rec.3 >= derived_counts.3
                             && cmp.compare(&rec.4, &derived_counts.4)
+                                != core::cmp::Ordering::Greater
+                            && cmp.compare(&rec.5, &derived_counts.5)
                                 != core::cmp::Ordering::Less => {}
                     _ => {
                         return Err(crate::Error::InvalidHeader(

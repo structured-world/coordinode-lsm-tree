@@ -297,7 +297,7 @@ pub fn estimate_merge(plan: &MergePlan<'_>, carries: impl Fn(&Table) -> bool) ->
         let garbage = plan
             .gc_stats
             .get(&blob_file.id())
-            .map_or(0, |entry| entry.on_disk_bytes);
+            .map_or(0, |entry| entry.on_disk(blob_file.meta()));
         // A file charged past its frames holds no live frame: zero is the
         // answer, not a bound hit.
         let live = frames.saturating_sub(garbage);

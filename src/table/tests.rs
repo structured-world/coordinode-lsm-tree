@@ -964,10 +964,11 @@ fn verify_blob_links_rejects_a_narrowed_key_span() -> crate::Result<()> {
             for i in 0u64..10 {
                 let value = BlobIndirection {
                     size: 1000,
+                    stored: crate::blob_tree::handle::Stored::Frames(500),
                     vhandle: ValueHandle {
                         blob_file_id: 0,
-                        on_disk_size: 500,
-                        offset: i * 500,
+                        frame: u32::try_from(i).expect("ten frames"),
+                        index: 0,
                     },
                 }
                 .encode_into_vec();
@@ -983,6 +984,7 @@ fn verify_blob_links_rejects_a_narrowed_key_span() -> crate::Result<()> {
                 len: 10,
                 bytes: 10_000,
                 on_disk_bytes: 5_000,
+                block_bytes: 0,
                 first_key: b"key00000".into(),
                 last_key: last_key.as_bytes().into(),
             });
@@ -1040,10 +1042,11 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
         for i in 0u64..10 {
             let value = BlobIndirection {
                 size: 1000,
+                stored: crate::blob_tree::handle::Stored::Frames(500),
                 vhandle: ValueHandle {
                     blob_file_id: i,
-                    on_disk_size: 500,
-                    offset: 0,
+                    frame: 0,
+                    index: 0,
                 },
             }
             .encode_into_vec();
@@ -1062,6 +1065,7 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
                 len: 1,
                 bytes,
                 on_disk_bytes: 500,
+                block_bytes: 0,
                 first_key: key.clone(),
                 last_key: key,
             });
@@ -1084,6 +1088,70 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
     assert!(
         restricted.verify_blob_links().is_err(),
         "the restricted containment check must reject a suffix id the section under-counts",
+    );
+    Ok(())
+}
+
+/// The block half of a link is checked as its frame half is: a section that
+/// under-counts the block entries of values that share a block, which garbage
+/// accounting turns into their share of the file's blocks, is refused by the
+/// exact check and by a restricted view's containment check.
+#[cfg(feature = "std")]
+#[test]
+fn verify_blob_links_rejects_undercounted_block_bytes() -> crate::Result<()> {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::coding::Encode;
+    use crate::table::Writer;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..10 {
+            let value = BlobIndirection {
+                size: 100,
+                stored: Stored::InBlock(120),
+                vhandle: ValueHandle {
+                    blob_file_id: i,
+                    frame: 0,
+                    index: 0,
+                },
+            }
+            .encode_into_vec();
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                value,
+                i + 1,
+                ValueType::Indirection,
+            ))?;
+        }
+        for i in 0u64..10 {
+            let key = crate::UserKey::from(format!("key{i:05}").into_bytes());
+            w.link_blob_file(crate::table::writer::LinkedFile {
+                blob_file_id: i,
+                len: 1,
+                bytes: 100,
+                on_disk_bytes: 0,
+                block_bytes: if i == 9 { 1 } else { 120 },
+                first_key: key.clone(),
+                last_key: key,
+            });
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+
+    let recover =
+        || -> crate::Result<Table> { Table::recover(test_recover_params(file.clone(), checksum)) };
+    assert!(
+        recover()?.verify_blob_links().is_err(),
+        "the exact check must reject the under-counted block bytes",
+    );
+    let restricted = recover()?.reopen_restricted(crate::UserKey::from(&b"key00005"[..]))?;
+    assert!(
+        restricted.verify_blob_links().is_err(),
+        "the containment check must reject the under-counted block bytes",
     );
     Ok(())
 }
@@ -1152,10 +1220,11 @@ fn verify_blob_links_on_a_restricted_view_counts_and_caches_nothing() -> crate::
         for i in 0u64..10 {
             let value = BlobIndirection {
                 size: 1000,
+                stored: crate::blob_tree::handle::Stored::Frames(500),
                 vhandle: ValueHandle {
                     blob_file_id: i,
-                    on_disk_size: 500,
-                    offset: 0,
+                    frame: 0,
+                    index: 0,
                 },
             }
             .encode_into_vec();
@@ -1171,6 +1240,7 @@ fn verify_blob_links_on_a_restricted_view_counts_and_caches_nothing() -> crate::
                 len: 1,
                 bytes: 1000,
                 on_disk_bytes: 500,
+                block_bytes: 0,
                 first_key: key.clone(),
                 last_key: key,
             });
@@ -1228,10 +1298,11 @@ fn verify_blob_links_leaves_the_descriptor_table_as_it_found_it() -> crate::Resu
         for i in 0u64..10 {
             let value = BlobIndirection {
                 size: 1000,
+                stored: crate::blob_tree::handle::Stored::Frames(500),
                 vhandle: ValueHandle {
                     blob_file_id: i,
-                    on_disk_size: 500,
-                    offset: 0,
+                    frame: 0,
+                    index: 0,
                 },
             }
             .encode_into_vec();
@@ -1247,6 +1318,7 @@ fn verify_blob_links_leaves_the_descriptor_table_as_it_found_it() -> crate::Resu
                 len: 1,
                 bytes: 1000,
                 on_disk_bytes: 500,
+                block_bytes: 0,
                 first_key: key.clone(),
                 last_key: key,
             });

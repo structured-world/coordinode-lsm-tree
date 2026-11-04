@@ -124,7 +124,7 @@ fn successive_blob_views_punch_only_above_what_the_last_one_finished() -> crate:
     let path = root.join("0");
     {
         let fs_dyn: Arc<dyn Fs> = Arc::new(memfs.clone());
-        let mut w = super::blob_file::writer::Writer::new(path.clone(), 0, 0, &*fs_dyn)?;
+        let mut w = super::blob_file::writer::Writer::one_frame_each(path.clone(), 0, 0, &*fs_dyn)?;
         for i in 0..3_000u32 {
             w.write(
                 format!("k{i:06}").as_bytes(),
@@ -198,7 +198,7 @@ fn blob_punch_on_drop_retains_the_reclaim_when_the_link_probe_cannot_answer() ->
     let path = root.join("0");
     {
         let fs_dyn: Arc<dyn Fs> = Arc::new(memfs.clone());
-        let mut w = super::blob_file::writer::Writer::new(path.clone(), 0, 0, &*fs_dyn)?;
+        let mut w = super::blob_file::writer::Writer::one_frame_each(path.clone(), 0, 0, &*fs_dyn)?;
         w.write(b"a", 1, &[b'x'; 64])?;
         w.write(b"b", 2, &[b'y'; 64])?;
         w.finish()?;
@@ -276,7 +276,7 @@ fn a_pinned_blob_file_waits_for_its_pin() -> crate::Result<()> {
     memfs.create_dir_all(&root)?;
     let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
     let write = |path: &std::path::Path| -> crate::Result<()> {
-        let mut w = super::blob_file::writer::Writer::new(path, 0, 0, &*fs)?;
+        let mut w = super::blob_file::writer::Writer::one_frame_each(path, 0, 0, &*fs)?;
         w.write(b"a", 1, &[b'x'; 64])?;
         w.write(b"b", 2, &[b'y'; 64])?;
         w.finish()?;
@@ -670,8 +670,11 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
+        // Blocks of sixteen values, so the file holds four.
         .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(64),
+            KvSeparationOptions::default()
+                .separation_threshold(64)
+                .block_size(4096),
         ))
     };
     {
@@ -709,11 +712,19 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
     };
     // The frontier must land on a FRAME boundary, as a real relocation's does:
     // a punch inside a frame leaves an unparseable record and the file is
-    // rejected outright rather than recovered restricted.
-    let frontier = super::BlobFileScanner::new(&blob, &*memfs, 0)?
-        .next()
-        .expect("the blob file holds at least one frame")?
-        .frame_end;
+    // rejected outright rather than recovered restricted. The first block is
+    // consumed with its last value.
+    let mut frontier = data_start;
+    for entry in super::BlobFileScanner::new(&blob, &*memfs, 0)? {
+        frontier = entry?.frame_end;
+        if frontier > data_start {
+            break;
+        }
+    }
+    assert!(
+        frontier > data_start,
+        "the first block ends before the data"
+    );
 
     // Punch, then rebuild the manifest from the on-disk geometry so the
     // frontier is COMMITTED, exactly as a completed relocation leaves it.

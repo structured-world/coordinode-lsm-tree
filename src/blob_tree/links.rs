@@ -76,18 +76,19 @@ pub fn fold_blob_links(
 ) {
     for (key, ind, holding) in refs {
         if *holding == Holding::OwnedCell {
-            owned_cells.push((ind.vhandle.blob_file_id, ind.vhandle.offset));
+            owned_cells.push((ind.vhandle.blob_file_id, ind.vhandle.object()));
         }
-        let (len, bytes, on_disk_bytes) = if holding.owns() {
-            (1, u64::from(ind.size), u64::from(ind.vhandle.on_disk_size))
+        let (len, bytes, (on_disk_bytes, block_bytes)) = if holding.owns() {
+            (1, u64::from(ind.size), ind.stored.split())
         } else {
-            (0, 0, 0)
+            (0, 0, (0, 0))
         };
         derived
             .entry(ind.vhandle.blob_file_id)
             .and_modify(|link| {
                 link.bytes += bytes;
                 link.on_disk_bytes += on_disk_bytes;
+                link.block_bytes += block_bytes;
                 link.len += len;
                 link.last_key.clone_from(key);
             })
@@ -95,6 +96,7 @@ pub fn fold_blob_links(
                 blob_file_id: ind.vhandle.blob_file_id,
                 bytes,
                 on_disk_bytes,
+                block_bytes,
                 len,
                 first_key: key.clone(),
                 last_key: key.clone(),

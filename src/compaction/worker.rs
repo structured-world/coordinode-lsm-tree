@@ -1756,12 +1756,14 @@ struct Relocated<'a> {
 #[cfg(feature = "std")]
 const BLOB_META_BYTES: u64 = 1_024;
 
-/// The bytes a relocated frame of `value` under `key` takes in a blob file.
+/// At most the bytes the relocated copy of the value `indirection` names
+/// takes in a blob file: what it takes now, its frames' headers included,
+/// and a frame header more for a value that shares a block, whose copy may
+/// open one. A block's share is its uncompressed entry, which compression
+/// only shrinks.
 #[cfg(feature = "std")]
-fn frame_bytes(key: &[u8], on_disk_size: u32) -> u64 {
-    crate::vlog::blob_file::writer::BLOB_HEADER_LEN as u64
-        + key.len() as u64
-        + u64::from(on_disk_size)
+fn frame_bytes(indirection: &crate::blob_tree::handle::BlobIndirection) -> u64 {
+    u64::from(indirection.stored.bytes()) + crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64
 }
 
 /// The bytes of the blob frames `item` points at in the `stale` files, which
@@ -1772,11 +1774,10 @@ fn stale_frame_bytes(item: &InternalValue, stale: &HashSet<BlobFileId>) -> crate
     use crate::blob_tree::handle::BlobIndirection;
     use crate::coding::Decode;
 
-    let key = &item.key.user_key;
     if item.key.value_type.is_indirection() {
         let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
         return Ok(if stale.contains(&indirection.vhandle.blob_file_id) {
-            frame_bytes(key, indirection.vhandle.on_disk_size)
+            frame_bytes(&indirection)
         } else {
             0
         });
@@ -1787,7 +1788,7 @@ fn stale_frame_bytes(item: &InternalValue, stale: &HashSet<BlobFileId>) -> crate
             if let RowCell::Ref { indirection, .. } = field.cell
                 && stale.contains(&indirection.vhandle.blob_file_id)
             {
-                bytes += frame_bytes(key, indirection.vhandle.on_disk_size);
+                bytes += frame_bytes(&indirection);
             }
         }
         return Ok(bytes);
@@ -3292,6 +3293,7 @@ fn run_subcompaction(
             .use_sync_mode(opts.config.sync_mode)
             .use_writeback_bytes(opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
+            .use_frame_sizes(blob_opts.frame_sizes())
             .use_clock(opts.config.clock.clone())
             .use_key_domains(
                 opts.config.key_domains.clone(),
@@ -3700,17 +3702,10 @@ fn open_blob_scanner_at_frontier(
     from: u64,
     opts: &Options,
 ) -> crate::Result<BlobFileScanner> {
-    let off = from.max(bf.live_data_start());
     // The relocation reads the blob files of its inputs, their trailer and
     // table of contents included: they report their latency as the table
     // reads do, and count to the run's work.
-    BlobFileScanner::open_paced(
-        &bf.0.path,
-        &*bf.0.fs,
-        bf.id(),
-        (off != 0).then_some(off),
-        Some(input_pacer(opts)),
-    )
+    BlobFileScanner::of_paced(bf, Some(from), Some(input_pacer(opts)))
 }
 
 /// Whether merging a move's tables instead would relocate blob files for
@@ -3804,8 +3799,8 @@ fn pick_blob_files_for_locality(
         let len = table.file_len();
         table_bytes += len.checked_sub(table.punch_offset()?).unwrap_or(len);
         for link in table.blob_links()? {
-            if stale.iter().any(|bf| bf.id() == link.blob_file_id) {
-                stale_written += link.on_disk_bytes;
+            if let Some(bf) = stale.iter().find(|bf| bf.id() == link.blob_file_id) {
+                stale_written += link.on_disk(bf.meta());
             }
         }
     }
@@ -4668,6 +4663,7 @@ fn merge_tables(
                 .use_sync_mode(opts.config.sync_mode)
                 .use_writeback_bytes(opts.config.writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
+                .use_frame_sizes(blob_opts.frame_sizes())
                 .use_clock(opts.config.clock.clone())
                 .use_key_domains(
                     opts.config.key_domains.clone(),

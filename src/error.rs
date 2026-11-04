@@ -6,7 +6,7 @@ use crate::{Checksum, CompressionType, SeqNo};
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
-/// The part of a table whose on-disk format [`Error::UnsupportedFormat`]
+/// The part of a store whose on-disk format [`Error::UnsupportedFormat`]
 /// refers to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -16,6 +16,8 @@ pub enum FormatPart {
     Filter,
     /// The columnar row groups: a page directory followed by its pages.
     Columnar,
+    /// The blob files holding separated values.
+    BlobFiles,
 }
 
 impl core::fmt::Display for FormatPart {
@@ -23,6 +25,7 @@ impl core::fmt::Display for FormatPart {
         f.write_str(match self {
             Self::Filter => "filter and locator sections",
             Self::Columnar => "columnar row groups",
+            Self::BlobFiles => "blob files",
         })
     }
 }
@@ -41,9 +44,9 @@ pub enum Error {
     /// read. The data is not damaged; see the `Display` form for the remedy.
     InvalidVersion(u8),
 
-    /// A table carries a part in an on-disk format this release does not
-    /// read: its `BuRR` filter and locator sections, or its columnar row
-    /// groups.
+    /// A store carries a part in an on-disk format this release does not
+    /// read: a table's `BuRR` filter and locator sections or columnar row
+    /// groups, or its blob files.
     ///
     /// 6.0 replaced both outright. The filter's solution matrix is packed to
     /// `r` bits per row instead of a full 64-bit word per row; a columnar row
@@ -599,6 +602,19 @@ pub enum Error {
     /// A caller-side error, refused before anything is written. The payload
     /// names which of these it is.
     CellRow(&'static str),
+
+    /// A read of part of a value asked for bytes `start..end` of a value of
+    /// `len` bytes: the range ends past the value or before it starts.
+    ///
+    /// A caller-side error, not damage.
+    ValueRange {
+        /// The first byte asked for.
+        start: u64,
+        /// The byte past the last one asked for.
+        end: u64,
+        /// The value's length.
+        len: u64,
+    },
 
     /// A salvage could not write, finish or make durable its OUTPUT: the
     /// failure lies with the destination, not with the bytes of the file

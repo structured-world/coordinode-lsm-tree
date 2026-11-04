@@ -60,10 +60,14 @@ fn blob_tree_compression() -> lsm_tree::Result<()> {
 
         assert_eq!(
             &{
+                // A value sharing a compressed block is charged its entry
+                // uncompressed (14 bytes, the key, the value) as block bytes,
+                // whose part of the file's compressed blocks is what it frees.
                 let mut map = lsm_tree::HashMap::default();
                 map.insert(
                     0,
-                    FragmentationEntry::new(1, b"smol".len().try_into().unwrap(), 5),
+                    FragmentationEntry::new(1, b"smol".len().try_into().unwrap(), 0)
+                        .with_block_bytes(14 + 1 + 4),
                 );
                 map
             },

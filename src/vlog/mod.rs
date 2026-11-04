@@ -2,7 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-mod accessor;
+pub(crate) mod accessor;
 pub(crate) mod blob_file;
 mod handle;
 
@@ -211,23 +211,7 @@ pub(crate) fn recover_blob_files(
 
             let mut file = fs.open(blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
 
-            let meta = {
-                let reader = crate::sfa::Reader::from_reader(&mut file)?;
-                let toc = reader.toc();
-
-                let metadata_section = toc.section(b"meta")
-                .ok_or(crate::Error::Unrecoverable)
-                .inspect_err(|_| {
-                    log::error!("meta section in blob file #{blob_file_id} is missing - maybe the file is corrupted?");
-                })?;
-
-                let metadata_len = usize::try_from(metadata_section.len())
-                    .map_err(|_| crate::Error::Unrecoverable)?;
-                let metadata_slice =
-                    crate::file::read_exact(&*file, metadata_section.pos(), metadata_len)?;
-
-                Metadata::from_slice(&metadata_slice)?
-            };
+            let (meta, frames) = read_meta_and_frames(&mut file, blob_file_id)?;
 
             // With a descriptor cache the file is closed once its metadata is
             // read, and reopened through the cache by its first read: holding
@@ -261,6 +245,7 @@ pub(crate) fn recover_blob_files(
                 punched_through: once_cell::race::OnceBox::new(),
                 checksum,
                 live_data_start,
+                frames,
                 file_accessor,
                 tree_id,
                 fs: fs.clone(),
@@ -407,19 +392,8 @@ pub(crate) fn recover_blob_file_cached(
 ) -> crate::Result<BlobFile> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
 
-    // Same meta-section read as `recover_blob_files`' per-id branch above.
-    let meta = {
-        let reader = crate::sfa::Reader::from_reader(&mut file)?;
-        let toc = reader.toc();
-        let metadata_section = toc.section(b"meta").ok_or_else(|| {
-            log::error!("meta section in blob file #{id} is missing (file may be corrupted)");
-            crate::Error::Unrecoverable
-        })?;
-        let metadata_len =
-            usize::try_from(metadata_section.len()).map_err(|_| crate::Error::Unrecoverable)?;
-        let metadata_slice = crate::file::read_exact(&*file, metadata_section.pos(), metadata_len)?;
-        Metadata::from_slice(&metadata_slice)?
-    };
+    // Same read as `recover_blob_files`' per-id branch above.
+    let (meta, frames) = read_meta_and_frames(&mut file, id)?;
 
     let file: Arc<dyn crate::fs::FsFile> = Arc::from(file);
     let file_accessor = match descriptors {
@@ -453,6 +427,7 @@ pub(crate) fn recover_blob_file_cached(
         punched_through: once_cell::race::OnceBox::new(),
         checksum,
         live_data_start,
+        frames,
         file_accessor,
         tree_id,
         fs: fs.clone(),
@@ -461,6 +436,67 @@ pub(crate) fn recover_blob_file_cached(
         #[cfg(feature = "std")]
         background_deleter: once_cell::race::OnceBox::new(),
     })))
+}
+
+/// Reads a blob file's metadata, then its frame index, from its archive.
+///
+/// The metadata is read first: it carries the layout version, so a file of an
+/// earlier layout, which has no frame index, is refused as one rather than as
+/// a file missing a section.
+///
+/// # Errors
+///
+/// [`crate::Error::UnsupportedFormat`] for a file of another layout,
+/// [`crate::Error::Unrecoverable`] for a missing section, and any error
+/// reading or decoding them.
+pub(crate) fn read_meta_and_frames(
+    file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
+    id: BlobFileId,
+) -> crate::Result<(Metadata, Arc<[u64]>)> {
+    let (meta, frames_at) = read_meta_and_index_at(file, id)?;
+    let (pos, len) = frames_at?;
+    let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
+    let frames =
+        blob_file::writer::decode_frame_index(&crate::file::read_exact(&**file, pos, len)?)?;
+    Ok((meta, frames))
+}
+
+/// The metadata of the blob file at `path`, without its frame index: what a
+/// salvage needs of a file whose index may be what is damaged.
+///
+/// # Errors
+///
+/// As [`read_meta_and_frames`], short of the frame index.
+#[cfg(feature = "std")]
+pub(crate) fn read_blob_meta(path: &Path, fs: &dyn Fs, id: BlobFileId) -> crate::Result<Metadata> {
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    read_meta_and_index_at(&mut file, id).map(|(meta, _)| meta)
+}
+
+/// The metadata, and where the frame index lies when the file lists one.
+fn read_meta_and_index_at(
+    file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
+    id: BlobFileId,
+) -> crate::Result<(Metadata, crate::Result<(u64, u64)>)> {
+    let (meta_at, frames_at) = {
+        let reader = crate::sfa::Reader::from_reader(file)?;
+        let toc = reader.toc();
+        let section = |name: &'static str| {
+            toc.section(name.as_bytes())
+                .map(|entry| (entry.pos(), entry.len()))
+                .ok_or_else(|| {
+                    log::error!(
+                        "{name} section in blob file #{id} is missing (file may be corrupted)"
+                    );
+                    crate::Error::Unrecoverable
+                })
+        };
+        (section("meta")?, section("frames"))
+    };
+    let (pos, len) = meta_at;
+    let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
+    let meta = Metadata::from_slice(&crate::file::read_exact(&**file, pos, len)?)?;
+    Ok((meta, frames_at))
 }
 
 /// The unique identifier for a value log blob file.

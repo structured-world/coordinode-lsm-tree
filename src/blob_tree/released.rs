@@ -34,8 +34,9 @@ use spin::Mutex;
 /// Version ids, as [`Version::id`](crate::version::Version::id) numbers them.
 type VersionId = u64;
 
-/// The objects one dropped table owned, as `(blob file, offset)` sorted
-/// ascending: its `owned_blob_objects` section, kept as read.
+/// The objects one dropped table owned, as `(blob file, object)` sorted
+/// ascending (see [`ValueHandle::object`]): its `owned_blob_objects` section,
+/// kept as read.
 pub type OwnedObjects = Arc<[(BlobFileId, u64)]>;
 
 #[derive(Default)]
@@ -129,7 +130,7 @@ impl ReleasedObjects {
     /// than `read`, the version a reference to it was read from.
     pub fn released_since(&self, read: VersionId, handle: &ValueHandle) -> bool {
         let records = self.records.lock();
-        let object = (handle.blob_file_id, handle.offset);
+        let object = (handle.blob_file_id, handle.object());
         records.objects.get(handle).is_some_and(|&at| at > read)
             || records
                 .tables

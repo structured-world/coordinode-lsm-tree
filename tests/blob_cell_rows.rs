@@ -479,7 +479,8 @@ fn a_row_of_a_range_read_keeps_its_read() -> lsm_tree::Result<()> {
 }
 
 /// Builds a blob file holding `doc`'s body and a garbage value, so a major
-/// compaction relocates the body.
+/// compaction relocates the body. The body is separated: a non-empty one by
+/// the default threshold, an empty one only where the caller set it to zero.
 fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> {
     let filler = vec![b'f'; 8_192];
     tree.insert_cells("doc", &bytes(&[b"draft", body]), 0)?;
@@ -490,7 +491,19 @@ fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> 
     // The compaction that drops the old filler charges it; files are picked
     // for relocation by what is charged before a compaction starts.
     tree.major_compact(64_000_000, SeqNo::MAX)?;
-    assert_eq!(tree.stale_blob_bytes(), 8_192, "the filler is garbage");
+    // The filler shares a block with the body: it is charged its entry,
+    // uncompressed, as block bytes. The body is live, so it is not charged,
+    // an empty one too: its file holds a live object of zero bytes.
+    let filler_entry = 14 + b"filler".len() as u64 + filler.len() as u64;
+    let gc_stats = tree.current_version().gc_stats().clone();
+    assert_eq!(
+        gc_stats.values().copied().collect::<Vec<_>>(),
+        [
+            lsm_tree::blob_tree::FragmentationEntry::new(1, filler.len() as u64, 0)
+                .with_block_bytes(filler_entry)
+        ],
+        "the filler is garbage"
+    );
     Ok(())
 }
 
@@ -752,10 +765,19 @@ fn a_memtable_reference_keeps_its_file_through_relocation() -> lsm_tree::Result<
         "the memtable row still reads its object"
     );
     // The relocated file stays for that row, all of it garbage: the body was
-    // copied out and the filler was dead, and the stale bytes say so.
+    // copied out and the filler was dead, and the stale bytes say so. Both
+    // shared one block, so both are charged their entries as block bytes.
+    let entries = (14 + b"doc".len() + body.len()) + (14 + b"filler".len() + 8_192);
     assert_eq!(
-        tree.stale_blob_bytes(),
-        (body.len() + 8_192) as u64,
+        tree.current_version()
+            .gc_stats()
+            .values()
+            .copied()
+            .collect::<Vec<_>>(),
+        [
+            lsm_tree::blob_tree::FragmentationEntry::new(2, (body.len() + 8_192) as u64, 0)
+                .with_block_bytes(entries as u64)
+        ],
         "the whole relocated file is stale"
     );
 

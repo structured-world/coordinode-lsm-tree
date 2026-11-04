@@ -2774,11 +2774,16 @@ fn blob_file_picking_simple() -> crate::Result<()> {
     assert_eq!(2, tree.table_count());
     assert_eq!(1, tree.blob_file_count());
 
+    // `a` shares a block with the others: it is charged its entry
+    // uncompressed as block bytes, its key and one byte with the entry's
+    // fixed part, nothing of frames of its own.
+    let charged = (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + 2) as u64;
+    let garbage = crate::blob_tree::FragmentationEntry::new(1, 1, 0).with_block_bytes(charged);
     {
         assert_eq!(
             &{
                 let mut map = crate::HashMap::default();
-                map.insert(0, crate::blob_tree::FragmentationEntry::new(1, 1, 1));
+                map.insert(0, garbage);
                 map
             },
             &**tree.current_version().gc_stats(),
@@ -2795,7 +2800,7 @@ fn blob_file_picking_simple() -> crate::Result<()> {
         assert_eq!(
             &{
                 let mut map = crate::HashMap::default();
-                map.insert(0, crate::blob_tree::FragmentationEntry::new(1, 1, 1));
+                map.insert(0, garbage);
                 map
             },
             &**tree.current_version().gc_stats(),
@@ -5381,22 +5386,29 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
     use crate::vlog::ValueHandle;
     use crate::{InternalValue, vlog::BlobFileId};
 
-    let reference = |blob_file_id: u64, size: u32| RowCell::Ref {
-        indirection: BlobIndirection {
-            vhandle: ValueHandle {
-                blob_file_id,
-                offset: 0,
-                on_disk_size: size,
-            },
-            size,
+    let indirection = |blob_file_id: u64, frame: u32, stored: u32| BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id,
+            frame,
+            index: 0,
         },
+        size: stored,
+        stored: crate::blob_tree::handle::Stored::Frames(stored),
+    };
+    let reference = |indirection| RowCell::Ref {
+        indirection,
         owner: true,
     };
+    let (first, other, second) = (
+        indirection(7, 0, 100),
+        indirection(8, 0, 300),
+        indirection(7, 1, 40),
+    );
     let row = encode_row(&[
         RowField::bytes(3, RowCell::Value(b"inline")),
-        RowField::bytes(4, reference(7, 100)),
-        RowField::bytes(5, reference(8, 300)),
-        RowField::bytes(6, reference(7, 40)),
+        RowField::bytes(4, reference(first)),
+        RowField::bytes(5, reference(other)),
+        RowField::bytes(6, reference(second)),
     ])?;
     let stale: crate::HashSet<BlobFileId> = core::iter::once(7).collect();
     let key = b"row-key";
@@ -5404,7 +5416,7 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
     let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
     assert_eq!(
         super::stale_frame_bytes(&item, &stale)?,
-        super::frame_bytes(key, 100) + super::frame_bytes(key, 40),
+        super::frame_bytes(&first) + super::frame_bytes(&second),
     );
     let plain = InternalValue::from_components(*key, b"v".to_vec(), 2, crate::ValueType::Value);
     assert_eq!(super::stale_frame_bytes(&plain, &stale)?, 0);
@@ -6206,6 +6218,9 @@ mod locality_relocation {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
+        // Tables close at a block, so small blocks let a small target split
+        // the keys into several tables whatever a reference's encoded width.
+        .data_block_size_policy(crate::config::BlockSizePolicy::all(512))
         .blob_compression(crate::CompressionType::None)
         .with_kv_separation(Some(blob_opts))
         .open()
@@ -6465,13 +6480,13 @@ mod locality_relocation {
             let mut stale_written = 0;
             let mut smallest = u64::MAX;
             for link in table.blob_links()? {
+                let Some(bf) = version.blob_files.get(link.blob_file_id) else {
+                    panic!("a linked file exists");
+                };
                 if interleaved.contains(&link.blob_file_id) {
-                    let Some(bf) = version.blob_files.get(link.blob_file_id) else {
-                        panic!("a linked file exists");
-                    };
                     smallest = smallest.min(bf.physical_size()?);
                 } else {
-                    stale_written += link.on_disk_bytes;
+                    stale_written += link.on_disk(bf.meta());
                 }
             }
             #[expect(clippy::cast_precision_loss, reason = "test budget from byte counts")]
@@ -6549,7 +6564,7 @@ mod locality_relocation {
                 if interleaved.contains(&link.blob_file_id) {
                     sizes.insert(link.blob_file_id, bf.physical_size()?);
                 } else {
-                    stale_written += link.on_disk_bytes;
+                    stale_written += link.on_disk(bf.meta());
                     stale_len += bf.physical_size()?;
                 }
             }
