@@ -58,16 +58,48 @@ fn run_reports_ratio_to_baseline_and_time_per_operation() {
         Arm::new("ours", fixed(Duration::from_micros(200))),
         Arm::new("rocksdb", fixed(Duration::from_micros(100))),
     ];
-    let results = run("g", 100, "rocksdb", arms, &settings(10, 10));
+    let results = run("g", 100, &|_| "rocksdb", arms, &settings(10, 10));
     assert_eq!(results.len(), 2);
     let ours = &results[0];
     assert_eq!(ours.label, "ours");
     assert_eq!(ours.rounds, 10);
     assert_eq!(ours.ns_per_op.median, 2_000.0);
+    assert_eq!(ours.baseline, Some("rocksdb"));
     let ratio = ours.vs_baseline.expect("ours has a baseline");
     assert_eq!((ratio.median, ratio.lower, ratio.upper), (2.0, 2.0, 2.0));
     assert_eq!(results[1].ns_per_op.median, 1_000.0);
     assert!(results[1].vs_baseline.is_none());
+    assert!(results[1].baseline.is_none());
+}
+
+/// Arms of one group taken against different baselines: each ratio divides by
+/// its own baseline's time, a baseline reports none, and an arm whose baseline
+/// is not in the group reports none rather than a ratio to another arm.
+#[test]
+fn run_takes_each_arm_against_its_own_baseline() {
+    let arms = vec![
+        Arm::new("ours", fixed(Duration::from_micros(300))),
+        Arm::new("rocksdb", fixed(Duration::from_micros(100))),
+        Arm::new("blob_tree", fixed(Duration::from_micros(300))),
+        Arm::new("rocksdb_blob", fixed(Duration::from_micros(600))),
+        Arm::new("orphan", fixed(Duration::from_micros(100))),
+    ];
+    let baseline_of = |label: &str| match label {
+        "blob_tree" | "rocksdb_blob" => "rocksdb_blob",
+        "orphan" => "absent",
+        _ => "rocksdb",
+    };
+    let results = run("g", 1, &baseline_of, arms, &settings(10, 10));
+
+    let ratio = |i: usize| results[i].vs_baseline.map(|e| e.median);
+    assert_eq!(ratio(0), Some(3.0));
+    assert_eq!(results[0].baseline, Some("rocksdb"));
+    assert_eq!(ratio(2), Some(0.5));
+    assert_eq!(results[2].baseline, Some("rocksdb_blob"));
+    for i in [1, 3, 4] {
+        assert_eq!(ratio(i), None, "{} has no ratio", results[i].label);
+        assert!(results[i].baseline.is_none());
+    }
 }
 
 /// The number of rounds follows the budget over one round's cost, held
@@ -79,10 +111,16 @@ fn run_sizes_rounds_by_budget_within_bounds() {
         Arm::new("a", fixed(Duration::from_micros(10))),
         Arm::new("b", fixed(Duration::from_micros(10))),
     ];
-    assert_eq!(run("g", 1, "b", cheap, &settings(10, 40))[0].rounds, 40);
+    assert_eq!(
+        run("g", 1, &|_| "b", cheap, &settings(10, 40))[0].rounds,
+        40
+    );
 
     let costly = vec![Arm::new("a", fixed(Duration::from_millis(200)))];
-    assert_eq!(run("g", 1, "a", costly, &settings(10, 40))[0].rounds, 10);
+    assert_eq!(
+        run("g", 1, &|_| "a", costly, &settings(10, 40))[0].rounds,
+        10
+    );
 }
 
 /// Every arm takes every position equally often: the rounds are a multiple of
@@ -107,7 +145,7 @@ fn run_rounds_are_a_multiple_of_the_arm_count() {
             })
         })
         .collect();
-    let results = run("g", 1, "a", arms, &settings(10, 40));
+    let results = run("g", 1, &|_| "a", arms, &settings(10, 40));
     assert_eq!(results[0].rounds, 16);
     // After one warm-up call per arm, every eighth call opens a round.
     let calls = first.into_inner();
@@ -126,7 +164,7 @@ fn run_rounds_are_a_multiple_of_the_arm_count() {
         .collect();
     let mut s = settings(10, 40);
     s.budget = Duration::from_secs(1);
-    assert_eq!(run("g", 1, "x", cheap, &s)[0].rounds, 39);
+    assert_eq!(run("g", 1, &|_| "x", cheap, &s)[0].rounds, 39);
 }
 
 /// An arm's metrics are read after each of its timed samples and reported as a
@@ -150,7 +188,7 @@ fn run_reports_each_metric_over_the_timed_samples_only() {
     let plain = Arm::new("b", fixed(Duration::from_micros(10)));
     let mut s = settings(10, 10);
     s.sample_target = Duration::from_nanos(1);
-    let results = run("g", 1, "b", vec![measured, plain], &s);
+    let results = run("g", 1, &|_| "b", vec![measured, plain], &s);
 
     let metrics = &results[0].metrics;
     let names: Vec<&str> = metrics.iter().map(|(name, _)| *name).collect();
@@ -177,7 +215,7 @@ fn run_rotates_which_arm_goes_first() {
     let arms = vec![arm("a"), arm("b"), arm("c")];
     let mut s = settings(3, 3);
     s.sample_target = Duration::from_nanos(1);
-    run("g", 1, "a", arms, &s);
+    run("g", 1, &|_| "a", arms, &s);
     // One warm-up call per arm, then three rounds of one sample each.
     let order = order.into_inner();
     let rounds: Vec<&[&str]> = order[3..].chunks(3).collect();

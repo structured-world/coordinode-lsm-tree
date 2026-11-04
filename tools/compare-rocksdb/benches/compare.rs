@@ -3002,8 +3002,47 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The arm every ratio is taken against.
-const BASELINE: Engine = Engine::RocksDb;
+/// Where an arm keeps its values, which decides the arm its ratio is taken
+/// against: a tree with blob files against RocksDB with blob files, every
+/// other arm against plain RocksDB. The page shows one layout at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// Values in the tables.
+    Inline,
+    /// Values in blob files.
+    Separated,
+}
+
+impl Layout {
+    const ALL: [Self; 2] = [Self::Inline, Self::Separated];
+
+    fn of(label: &str) -> Self {
+        if label == Engine::BlobTree.label() || label == Engine::RocksDbBlob.label() {
+            Self::Separated
+        } else {
+            Self::Inline
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Separated => "separated",
+        }
+    }
+
+    fn baseline(self) -> Engine {
+        match self {
+            Self::Inline => Engine::RocksDb,
+            Self::Separated => Engine::RocksDbBlob,
+        }
+    }
+}
+
+/// The arm the ratio of the arm labelled `label` is taken against.
+fn baseline_of(label: &str) -> &'static str {
+    Layout::of(label).baseline().label()
+}
 
 /// One run of the harness: how groups are measured, which run, and what they
 /// measured.
@@ -3133,7 +3172,7 @@ impl Run {
         if arms.is_empty() {
             return;
         }
-        let results = paired::run(group, n, BASELINE.label(), arms, &self.settings);
+        let results = paired::run(group, n, &baseline_of, arms, &self.settings);
         self.results.extend(results);
     }
 }
@@ -3150,9 +3189,10 @@ fn estimate_json(e: paired::Estimate) -> serde_json::Value {
     serde_json::json!({ "median": e.median, "lower": e.lower, "upper": e.upper })
 }
 
-/// Writes the summary the published page is drawn from: the run's preset and
-/// baseline, what each group measures, and every arm's time per operation and
-/// time relative to the baseline, each a median with its 95% interval.
+/// Writes the summary the published page is drawn from: the run's preset, the
+/// baseline of each value layout, what each group measures, and every arm's
+/// layout, time per operation and time relative to its baseline, each a
+/// median with its 95% interval.
 fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
     let results: Vec<serde_json::Value> = run
         .results
@@ -3161,6 +3201,7 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
             serde_json::json!({
                 "group": r.group,
                 "engine": r.label,
+                "values": Layout::of(r.label).label(),
                 "n": r.n,
                 "rounds": r.rounds,
                 "ns_per_op": estimate_json(r.ns_per_op),
@@ -3180,7 +3221,10 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
         .collect();
     let summary = serde_json::json!({
         "preset": active_preset().label(),
-        "baseline": BASELINE.label(),
+        "baselines": Layout::ALL
+            .iter()
+            .map(|layout| (layout.label().to_owned(), layout.baseline().label().into()))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
         "settings": {
             "warm_up_s": run.settings.warm_up.as_secs_f64(),
             "sample_s": run.settings.sample_target.as_secs_f64(),

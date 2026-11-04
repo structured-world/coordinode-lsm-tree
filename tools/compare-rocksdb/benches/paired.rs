@@ -5,7 +5,7 @@
 //! of load on the host then lands on every engine of the rounds it overlaps,
 //! not on whichever arm happened to be running, and divides out of the ratio
 //! of two arms measured in the same round. The group reports, per arm, the
-//! median time per operation and the median of its per-round ratio to the
+//! median time per operation and the median of its per-round ratio to its
 //! baseline arm, each with a distribution-free 95% confidence interval.
 
 use std::time::Duration;
@@ -77,16 +77,18 @@ pub struct ArmResult {
     pub rounds: usize,
     /// Nanoseconds per operation (per key of the routine's key set).
     pub ns_per_op: Estimate,
-    /// This arm's time over the baseline arm's in the same round; `None` for
-    /// the baseline itself and for a group without one.
+    /// The arm [`Self::vs_baseline`] is taken against.
+    pub baseline: Option<&'static str>,
+    /// This arm's time over its baseline arm's in the same round; `None` for
+    /// a baseline itself and for an arm whose baseline is not in the group.
     pub vs_baseline: Option<Estimate>,
     /// Each metric the arm reports besides its time, over the rounds.
     pub metrics: Vec<(&'static str, Estimate)>,
 }
 
 /// Runs the arms of `group` at key count `n` in paired rounds and returns one
-/// result per arm, in the order given. `baseline` names the arm the ratios are
-/// taken against.
+/// result per arm, in the order given. `baseline_of` names, for an arm's
+/// label, the arm its ratio is taken against.
 ///
 /// # Panics
 ///
@@ -94,7 +96,7 @@ pub struct ArmResult {
 pub fn run(
     group: &str,
     n: u64,
-    baseline: &str,
+    baseline_of: &dyn Fn(&str) -> &'static str,
     mut arms: Vec<Arm<'_>>,
     settings: &Settings,
 ) -> Vec<ArmResult> {
@@ -174,12 +176,16 @@ pub fn run(
         }
     }
 
-    let base = arms.iter().position(|arm| arm.label == baseline);
     arms.iter()
         .zip(metric_samples)
         .enumerate()
         .map(|(a, (arm, metric_samples))| {
-            let vs_baseline = base.filter(|&b| b != a).map(|b| {
+            let baseline = baseline_of(arm.label);
+            let base = arms
+                .iter()
+                .position(|other| other.label == baseline)
+                .filter(|&b| b != a);
+            let vs_baseline = base.map(|b| {
                 let ratios: Vec<f64> = samples[a]
                     .iter()
                     .zip(&samples[b])
@@ -193,6 +199,7 @@ pub fn run(
                 n,
                 rounds,
                 ns_per_op: estimate(samples[a].clone()),
+                baseline: base.map(|_| baseline),
                 vs_baseline,
                 metrics: metric_samples
                     .into_iter()
@@ -207,12 +214,15 @@ pub fn run(
 
 /// One line per arm on stderr, so the job log shows what the page will.
 fn report(r: &ArmResult) {
-    let ratio = r.vs_baseline.map_or(String::new(), |e| {
-        format!(
-            "  x{:.3} [{:.3} .. {:.3}] vs baseline",
-            e.median, e.lower, e.upper
-        )
-    });
+    let ratio = r
+        .vs_baseline
+        .zip(r.baseline)
+        .map_or(String::new(), |(e, baseline)| {
+            format!(
+                "  x{:.3} [{:.3} .. {:.3}] vs {baseline}",
+                e.median, e.lower, e.upper
+            )
+        });
     eprintln!(
         "{}/{}/{}: {:.1} ns/op [{:.1} .. {:.1}], {} rounds{ratio}",
         r.group, r.label, r.n, r.ns_per_op.median, r.ns_per_op.lower, r.ns_per_op.upper, r.rounds,
