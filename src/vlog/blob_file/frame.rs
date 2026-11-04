@@ -408,6 +408,7 @@ fn parse_entries(header: &FrameHeader, entries: &[u8]) -> crate::Result<Vec<Fram
 /// # Errors
 ///
 /// As [`decode_frame`], short of decompression.
+#[cfg(feature = "std")]
 pub(crate) fn verify_frame(bytes: &[u8]) -> crate::Result<FrameHeader> {
     check_frame(bytes).map(|(header, _)| header)
 }
@@ -786,6 +787,7 @@ pub(crate) struct EntrySpec<'k> {
 ///
 /// A key is empty or longer than `u16::MAX`, or a frame lists more than
 /// `u16::MAX` entries: the writer never builds one.
+#[cfg(any(feature = "std", test))]
 pub(crate) fn encode_frame(
     kind: FrameKind,
     entries: &[EntrySpec<'_>],

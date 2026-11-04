@@ -511,7 +511,8 @@ impl KvSeparationOptions {
     /// Only new blob files take it; a file records the frames it was written
     /// with.
     ///
-    /// Defaults to 16 KiB.
+    /// Defaults to 8 KiB: a larger block packs more and makes each point read
+    /// of a value in it decode more.
     ///
     /// # Examples
     ///

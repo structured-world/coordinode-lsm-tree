@@ -202,7 +202,7 @@ fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()
     for compression in std::iter::once(CompressionType::None).chain(codecs()) {
         let folder = get_tmp_folder();
         let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
-        // Twenty values of 2,000 bytes: three blocks.
+        // Twenty values of 2,000 bytes, four to an 8 KiB block: five blocks.
         for i in 0..20 {
             tree.insert(format!("k{i:02}"), random(i, 2_000), 0);
         }
@@ -218,8 +218,8 @@ fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()
         }
         let requests = m.blob_read_count();
         assert!(
-            requests <= 3,
-            "{compression:?}: {requests} reads for three blocks"
+            requests <= 5,
+            "{compression:?}: {requests} reads for five blocks"
         );
         let keys: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
         let got = tree.multi_get(&keys, SeqNo::MAX)?;
@@ -263,8 +263,8 @@ fn a_batch_reads_each_block_it_needs_once() -> lsm_tree::Result<()> {
         }
         let decoded_blocks = m.blob_read_count();
         assert!(
-            decoded_blocks <= 3,
-            "{compression:?}: {decoded_blocks} reads for three blocks"
+            decoded_blocks <= 5,
+            "{compression:?}: {decoded_blocks} reads for five blocks"
         );
     }
     Ok(())
@@ -365,9 +365,9 @@ fn a_damaged_block_costs_its_values_alone() -> lsm_tree::Result<()> {
             Err(_) => failed += 1,
         }
     }
-    // A 16 KiB block holds 7 values of 2,000 bytes and their keys.
+    // An 8 KiB block holds 4 values of 2,000 bytes and their keys.
     assert!(
-        (1..=8).contains(&failed),
+        (1..=4).contains(&failed),
         "{failed} of {n} values failed for one damaged block"
     );
     let report = lsm_tree::verify::verify_integrity(&tree);

@@ -5,7 +5,9 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-use super::frame::{Codec, EntrySpec, FrameKind, encode_frame, encode_frame_parts, head_payload};
+#[cfg(feature = "std")]
+use super::frame::encode_frame;
+use super::frame::{Codec, EntrySpec, FrameKind, encode_frame_parts, head_payload};
 use super::meta::{META_VERSION, Metadata};
 use crate::io::BufWriter;
 #[cfg(not(feature = "std"))]
@@ -59,9 +61,15 @@ pub(crate) struct FrameSizes {
 }
 
 impl FrameSizes {
-    /// A block of 16 KiB, chunks of 256 KiB.
+    /// A block of 8 KiB, chunks of 256 KiB, chosen from the blob file sweep in
+    /// `docs/BENCHMARKING.md`. Against a frame per value an 8 KiB block takes
+    /// a fifth to two fifths less room, and a cold point read of documents
+    /// costs about what it did; 16 KiB saves 4 to 8% more for a third more per
+    /// read.
+    /// A 256 KiB chunk reads a 4 KiB range of a large value in under 0.5 ms
+    /// where a frame of the whole value took 60 to 120 ms.
     pub(crate) const DEFAULT: Self = Self {
-        block_target: 16 * 1024,
+        block_target: 8 * 1024,
         chunk_size: 256 * 1024,
     };
 }

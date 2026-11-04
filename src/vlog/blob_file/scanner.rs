@@ -121,6 +121,7 @@ impl Scanner {
     ///
     /// The file lacks a "data" section, `start` lies outside it, or an IO
     /// error occurs.
+    #[cfg(any(feature = "std", test))]
     pub(crate) fn open<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,

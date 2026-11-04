@@ -637,6 +637,7 @@ impl BlobFile {
     }
 
     /// How many frames the file holds.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn frame_count(&self) -> usize {
         // The index always ends with the data end: a written and a decoded one
@@ -652,6 +653,7 @@ impl BlobFile {
     }
 
     /// The number of the frame that starts at `offset`, if one does.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn frame_at_offset(&self, offset: u64) -> Option<u32> {
         let starts = self.0.frames.get(..self.frame_count())?;

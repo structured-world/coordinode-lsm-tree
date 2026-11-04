@@ -234,7 +234,7 @@ impl lsm_tree::fs::Fs for BatchCountFs {
 /// A frame is a 40-byte header, an entry per value (14 bytes and the key)
 /// and its payload. A value up to the 256 KiB chunk size is a frame of its
 /// own; a larger one is a head (its entry and an 8-byte chunk table) and a
-/// frame per 256 KiB chunk. A value below the 16 KiB block size shares a
+/// frame per 256 KiB chunk. A value below the 8 KiB block size shares a
 /// block instead, see [`block_entry_len`].
 pub fn stored_len(key: &[u8], value_len: u64) -> u64 {
     const HEADER: u64 = 40;
@@ -251,7 +251,7 @@ pub fn stored_len(key: &[u8], value_len: u64) -> u64 {
     }
 }
 
-/// The entry a value below the default 16 KiB block size takes in the block
+/// The entry a value below the default 8 KiB block size takes in the block
 /// it shares, uncompressed: what it is charged as block bytes once dropped.
 pub fn block_entry_len(key: &[u8], value_len: u64) -> u64 {
     assert!(
@@ -265,7 +265,7 @@ pub fn block_entry_len(key: &[u8], value_len: u64) -> u64 {
 const ENTRY: u64 = 14;
 
 /// The default block size: smaller values share a block.
-const BLOCK: u64 = 16 * 1024;
+const BLOCK: u64 = 8 * 1024;
 
 /// Convert an iterator guard into owned `(key, value)` byte vectors.
 ///

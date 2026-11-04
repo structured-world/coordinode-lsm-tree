@@ -180,7 +180,7 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
     // read went uncounted, a change that moved work into it would look like an
     // improvement.
     let folder = get_tmp_folder();
-    let value_len = 8_192;
+    let value_len = 4_096;
     let n = 200_u32;
     let tree = Config::new(
         folder.path(),
@@ -208,7 +208,7 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
     }
 
     // A point read resolves its value on its own: one request per cold block.
-    // Two 8 KiB values share a 16 KiB block, and the second of them finds the
+    // Two 4 KiB values share an 8 KiB block, and the second of them finds the
     // block in the blob cache its neighbour's read filled.
     assert_eq!(
         m.blob_read_count() - requests_before,

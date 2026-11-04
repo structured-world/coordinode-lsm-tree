@@ -300,6 +300,99 @@ diagnostics, `n/a` where the denominator is zero; they are not series.
 array in a file with `--github-json-append <PATH>`; `--github-json-costs <PATH>`
 writes the costs and `--github-json-timings <PATH>` the timings.
 
+## The blob file sweep
+
+`tools/blob-sweep` is what the defaults of a blob file's layout are chosen
+from: the block size below which values share a compressed block, the chunk
+size above which a value is split, and the size classes a zstd dictionary
+compresses. It writes each corpus into a blob tree under each layout and codec
+and measures it:
+
+```sh
+node tools/blob-sweep/fetch-data.ts ~/blob-sweep-data
+cd tools/blob-sweep && cargo run --release -- --data ~/blob-sweep-data --work /var/tmp
+```
+
+`fetch-data.ts` builds the corpora from public data, outside the repository,
+once: the products that store values in blob files keep documents of a few
+KiB (one hour of GitHub events), chain blocks and transactions (TRON blocks
+from a fixed height, and the transactions in them) and files of KiB to
+hundreds of MiB (the Canterbury and Silesia corpora, the Silesia tar, and the
+Silesia zip, an archive no codec shrinks). `manifest.json` beside them records
+what each was built from.
+
+| Layout | What it is |
+|---|---|
+| `per-value` | Every value a frame of its own and none split: how blob files held values before size classes, the baseline the others are read against. |
+| `block <B> chunk <C>` | Blocks of `B` and chunks of `C`, under lz4 and zstd 3. |
+| `… dict <classes>` | zstd 3 with a dictionary trained on the corpus, applied to the classes named. |
+
+Each run reports the ratio of blob file bytes to value bytes; the write time
+and the most heap the write took; a full scan; point reads of every key in a
+shuffled order, once with a 16 MiB cache the data does not fit in and once
+with one it fits in; 4 KiB range reads of the values above 1 MiB with the
+bytes each decodes, and the most heap a whole read and a range read of the
+largest value take; and the write amplification of collection, three rounds
+each overwriting a third of the keys, flushed and compacted, as relocated blob
+bytes over removed blob bytes. Every value is separated (threshold 64 bytes),
+so the runs measure the blob files alone. The trees go to `--work`, which is
+to be the disk the products run on: a RAM disk measures no read.
+
+### What the defaults rest on
+
+A run on Linux (the benchmark host, NVMe), chunks of 256 KiB unless named.
+Documents are 20,049 values (64 MiB), chain 70,258 values (142 MiB), files
+25 values (472 MiB). A point read is the mean per key with the cache smaller
+than the data.
+
+| Corpus | Layout | Ratio lz4 | Ratio zstd 3 | Point read lz4 | Point read zstd 3 | Collection WA lz4 |
+|---|---|---|---|---|---|---|
+| documents | per-value | 0.371 | 0.278 | 7.3 µs | 13.6 µs | 0.50 |
+| documents | block 4K | 0.311 | 0.225 | 6.6 µs | 11.0 µs | 0.59 |
+| documents | block 8K | 0.297 | 0.213 | 7.6 µs | 12.6 µs | 0.63 |
+| documents | block 16K | 0.286 | 0.203 | 9.8 µs | 16.7 µs | 0.66 |
+| documents | block 32K | 0.262 | 0.182 | 20.7 µs | 38.5 µs | 0.79 |
+| chain | per-value | 0.599 | 0.405 | 7.1 µs | 11.6 µs | 0.50 |
+| chain | block 4K | 0.442 | 0.270 | 10.1 µs | 16.3 µs | 0.61 |
+| chain | block 8K | 0.409 | 0.242 | 11.9 µs | 19.2 µs | 0.63 |
+| chain | block 16K | 0.384 | 0.221 | 15.3 µs | 26.2 µs | 0.64 |
+| chain | block 32K | 0.368 | 0.209 | 23.2 µs | 39.1 µs | 0.65 |
+
+With the cache holding the data, every layout reads a key in 1.4 to 2.1 µs.
+
+| Files, zstd 3 | Ratio | Write | Whole scan | 4 KiB range read | Decoded per range read | Heap, whole read | Heap, range read |
+|---|---|---|---|---|---|---|---|
+| per-value | 0.407 | 6.5 s | 1.71 s | 122 ms | 34 MiB | 266 MiB | 266 MiB |
+| chunk 64K | 0.437 | 2.7 s | 1.41 s | 0.14 ms | | | |
+| chunk 256K | 0.422 | 2.4 s | 1.33 s | 0.49 ms | 261 KiB | 203 MiB | 0.48 MiB |
+| chunk 1M | 0.412 | 2.5 s | 1.36 s | 1.9 ms | | | |
+| chunk 4M | 0.408 | 2.8 s | 1.56 s | 9.1 ms | | | |
+
+A dictionary trained on the corpus, zstd 3 with 16 KiB blocks:
+
+| Dictionary on | Ratio documents | Ratio chain | Ratio files |
+|---|---|---|---|
+| nothing | 0.203 | 0.221 | 0.4215 |
+| blocks | 0.178 | 0.202 | 0.4215 |
+| blocks and single values | 0.141 | 0.199 | 0.4215 |
+| every class | 0.141 | 0.199 | 0.4210 |
+
+The defaults that follow:
+
+- **Blocks of 8 KiB.** On documents a cold point read costs what it did with a
+  frame per value (7.6 against 7.3 µs under lz4, 12.6 against 13.6 µs under
+  zstd) for a fifth less on disk; 16 KiB saves another 4% and costs about a
+  third more per read, 32 KiB nearly triples it. Chain values are small enough
+  that every block size costs reads; 8 KiB adds two thirds to a read for a
+  third less on disk. A block also costs collection: a block is relocated with its live
+  neighbours, which takes the write amplification from 0.50 to 0.63 at 8 KiB.
+- **Chunks of 256 KiB.** 64 KiB loses 4% of ratio, 1 MiB and above make a
+  4 KiB range read four to nineteen times slower for at most 3% of ratio.
+- **A dictionary for blocks and single values, none for chunks.** Small values
+  are where a dictionary helps (documents 0.203 to 0.141); a chunk is long
+  enough to carry its own context, and the dictionary there gains 0.1% and
+  costs write and scan time.
+
 ## Dashboard series
 
 The `db_bench` dashboard (`dev/bench` on the project's GitHub Pages) keeps one
