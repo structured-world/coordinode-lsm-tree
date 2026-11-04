@@ -793,6 +793,30 @@ pub(crate) fn encode_frame(
     codec: Codec<'_>,
     out: &mut Vec<u8>,
 ) -> crate::Result<()> {
+    if encode_frame_parts(kind, entries, payload, codec, out)? {
+        out.extend_from_slice(payload);
+    }
+    Ok(())
+}
+
+/// [`encode_frame`], the payload left out of `out` when it is stored as it is
+/// (`true`): the frame is `out` followed by `payload`, which a writer then
+/// writes from where it lies rather than copying it in first.
+///
+/// # Errors
+///
+/// As [`encode_frame`].
+///
+/// # Panics
+///
+/// As [`encode_frame`].
+pub(crate) fn encode_frame_parts(
+    kind: FrameKind,
+    entries: &[EntrySpec<'_>],
+    payload: &[u8],
+    codec: Codec<'_>,
+    out: &mut Vec<u8>,
+) -> crate::Result<bool> {
     super::writer::check_size_cap(payload.len())?;
     #[expect(
         clippy::expect_used,
@@ -832,7 +856,9 @@ pub(crate) fn encode_frame(
         out.extend_from_slice(entry.key);
     }
     let entries_end = out.len();
-    out.extend_from_slice(stored);
+    if let Some(compressed) = &compressed {
+        out.extend_from_slice(compressed);
+    }
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -863,7 +889,7 @@ pub(crate) fn encode_frame(
     if let Some(slot) = out.get_mut(..FRAME_HEADER_LEN) {
         slot.copy_from_slice(&header);
     }
-    Ok(())
+    Ok(compressed.is_none())
 }
 
 /// The payload of a head naming chunks of `chunk_size` bytes, `chunks` of them.

@@ -5,7 +5,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-use super::frame::{Codec, EntrySpec, FrameKind, encode_frame, head_payload};
+use super::frame::{Codec, EntrySpec, FrameKind, encode_frame, encode_frame_parts, head_payload};
 use super::meta::{META_VERSION, Metadata};
 use crate::io::BufWriter;
 #[cfg(not(feature = "std"))]
@@ -588,14 +588,23 @@ impl Writer {
 
     /// Writes `bytes`, one encoded frame, at the current offset.
     fn put_frame(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.put_frame_parts(bytes, &[])
+    }
+
+    /// Writes one encoded frame given as `head` followed by `tail`, at the
+    /// current offset.
+    fn put_frame_parts(&mut self, head: &[u8], tail: &[u8]) -> crate::Result<()> {
         self.frames.push(self.offset);
-        self.writer.write_all(bytes)?;
-        self.offset += bytes.len() as u64;
-        self.written_blob_bytes += bytes.len() as u64;
+        self.writer.write_all(head)?;
+        self.writer.write_all(tail)?;
+        let len = (head.len() + tail.len()) as u64;
+        self.offset += len;
+        self.written_blob_bytes += len;
         self.writeback_if_due()
     }
 
-    /// Encodes and writes one frame.
+    /// Encodes and writes one frame. A payload stored as it is goes to the
+    /// file from where it lies, not through the frame buffer.
     fn emit(
         &mut self,
         kind: FrameKind,
@@ -603,8 +612,9 @@ impl Writer {
         payload: &[u8],
     ) -> crate::Result<()> {
         let mut scratch = core::mem::take(&mut self.scratch);
-        let encoded = encode_frame(kind, entries, payload, self.codec(kind), &mut scratch);
-        let written = encoded.and_then(|()| self.put_frame(&scratch));
+        let encoded = encode_frame_parts(kind, entries, payload, self.codec(kind), &mut scratch);
+        let written = encoded
+            .and_then(|as_is| self.put_frame_parts(&scratch, if as_is { payload } else { &[] }));
         self.scratch = scratch;
         written
     }
