@@ -175,15 +175,6 @@
           if (layoutOf[e] === layout) { engines[e] = groups[group][e]; }
         });
         if (!Object.keys(engines).length) { return; }
-        if (!(kind in grids)) {
-          const h = document.createElement("h2");
-          h.textContent = KIND_TITLE[kind] || "Other";
-          const grid = document.createElement("div");
-          grid.className = "grid";
-          container.appendChild(h);
-          container.appendChild(grid);
-          grids[kind] = grid;
-        }
         // A group's size counts keys, but the sustained scenario's counts the
         // rewrites of its hot set.
         const unit = base(group) === "overwrite_sustained" ? "writes" : "keys";
@@ -208,6 +199,18 @@
             results: sizes.map(function (n) { return engines[engine][n] || null; }),
           };
         });
+        // A chart with no bar (a ratio view whose baseline did not run, or that
+        // holds only the baseline) is left out, so the empty state shows.
+        if (!datasets.some(function (d) { return d.data.some(function (v) { return v !== null; }); })) { return; }
+        if (!(kind in grids)) {
+          const h = document.createElement("h2");
+          h.textContent = KIND_TITLE[kind] || "Other";
+          const grid = document.createElement("div");
+          grid.className = "grid";
+          container.appendChild(h);
+          container.appendChild(grid);
+          grids[kind] = grid;
+        }
 
         const card = document.createElement("div");
         card.className = "card";
