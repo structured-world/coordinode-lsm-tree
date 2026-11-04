@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793737695095,
+  "lastUpdate": 1793776149647,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -102886,6 +102886,90 @@ window.BENCHMARK_DATA = {
             "value": 330378.05428357894,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 12.6us | P99.9: 87.7us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4b70d01b3dcb4248139fa9b6632b414fc03edb6c",
+          "message": "fix(fs)!: read into ReadBuf memory without a byte slice (#1051)\n\n## Summary\n- Memory a `ReadBuf` has not initialized leaves it only as `MaybeUninit`\nbytes, never as a `&mut [u8]`, which `from_raw_parts_mut` does not allow\nover unwritten memory whether or not it is read.\n- The built-in backends read into that memory through a pointer, so\nnothing is zeroed on their read paths.\n\n## Changes\n- `ReadBuf::fill_with` hands its closure `&mut [MaybeUninit<u8>]`;\n`ReadBuf::bytes_mut_unchecked` is removed. The ring backends' batch\nregions give a pointer and a length.\n- `StdFs`: one positioned read into `MaybeUninit` memory, `pread64` on\nLinux and Android, `pread` on other Unix, `ReadFile` with an\n`OVERLAPPED` offset on Windows; `read_at`, `read_at_buf` and\n`IoUringFs`'s single and lone-descriptor reads go through it.\n- Raw io_uring backend: reads into `MaybeUninit` memory through its\npointer. `MemFs`: copies with `write_copy_of_slice`.\n- An offset past `i64::MAX` is refused on every built-in backend,\nWindows and `MemFs` included. On both io_uring backends this also fixes\nreads and writes at `u64::MAX`: the ring reads offset `-1` as the\ndescriptor's own position, so they used to land at the start of the\nfile. A batch holding such a read is refused whole before any of it is\nsubmitted.\n- On Windows, a positioned read through a handle opened for overlapped\nI/O waits for a pending `ReadFile` before its memory is released.\n- Tests: a short read on every built-in backend leaves initialized\nexactly the bytes read; the positioned read stops at the end of the\nfile, takes an empty destination, and refuses an offset no file can\nhave, alone and in a batch.\n\n## Testing\nClippy with and without all features, the full test suite and the doc\ntests pass on Linux; the read tests, the doc test and the no-std check\npass on macOS. The Windows read path is checked by CI.\n\nBREAKING CHANGE: `ReadBuf::fill_with` takes a closure over `&mut\n[MaybeUninit<u8>]`, and `ReadBuf::bytes_mut_unchecked` is removed.\n\nCloses #1050\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Positioned and batched reads now handle end-of-file consistently,\nfilling only bytes actually read.\n* Reads and writes reject offsets that cannot be represented, rather\nthan risking incorrect results or modifying file contents.\n* Reads from write-only files report an access error instead of\nappearing to return end-of-file.\n* **Tests**\n* Expanded coverage for end-of-file behavior, invalid offsets, and reads\non supported platforms.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-03T22:16:23Z",
+          "tree_id": "12876d850c870ffe3e4f84dde0ae59de8c552eac",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4b70d01b3dcb4248139fa9b6632b414fc03edb6c"
+        },
+        "date": 1793776148379,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 138364.98259496145,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 17.3us | P99.9: 28.4us\nthreads: 1 | elapsed: 3.87s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3034858.9053124324,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 901802.2156558996,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.0us | P99.9: 12.8us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 489663.6580148272,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.7us | P99.9: 20.2us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3074290.632799379,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.6us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 324429.22298951284,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.4us | P99.9: 15.1us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 191069.24904450472,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.9us | P99.9: 21.9us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 854843.3724343821,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1018014.4891762614,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 365983.5016723552,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 11.6us | P99.9: 81.0us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
           }
         ]
       }
