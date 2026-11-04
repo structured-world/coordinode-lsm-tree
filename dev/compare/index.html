@@ -30,7 +30,7 @@
   .metrics table { border-collapse: collapse; font-size: .8rem; white-space: nowrap; }
   .metrics th, .metrics td { padding: .15rem .5rem; text-align: right; border-bottom: 1px solid var(--line); }
   .metrics th:first-child, .metrics td:first-child { text-align: left; }
-  #empty { display: none; }
+  #empty, #none { display: none; }
 </style>
 </head>
 <body>
@@ -47,11 +47,17 @@
     values and four block-compression threads, no WAL, and every lsm-tree protection RocksDB has no equivalent for is
     off; the <code>ours-deferred-wal</code> arm is the exception, writing and syncing a caller-kept log once per batch.
     SurrealKV, on the uncompressed charts only, runs with its defaults and commits through its own WAL, synced on each
-    commit.
+    commit. <strong>Values</strong> switches between the engines keeping values in their tables and the engines keeping
+    them in blob files: there our tree with blob files is measured against RocksDB with blob files, both separating
+    values at the same size.
     &middot; <a href="../bench/">single-engine trend &rarr;</a>
   </p>
   <p class="meta" id="meta"></p>
   <div class="controls">
+    <label>Values <select id="values">
+      <option value="inline">In tables</option>
+      <option value="separated">In blob files</option>
+    </select></label>
     <label>Show <select id="view">
       <option value="ratio">Relative to RocksDB</option>
       <option value="time">Time per operation</option>
@@ -69,6 +75,7 @@
     </select></label>
   </div>
   <p id="empty">No head-to-head results have been published yet.</p>
+  <p id="none" class="meta">No results for this selection.</p>
   <div id="charts"></div>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
@@ -87,6 +94,8 @@
     major_compact_zstd3: "compaction", subcompaction_zstd3: "compaction",
   };
   const KIND_TITLE = { write: "Writes", read: "Reads", compaction: "Compaction" };
+  // How a baseline engine reads in an axis title.
+  const BASELINE_TITLE = { rocksdb: "RocksDB", rocksdb_blob: "RocksDB with blob files" };
 
   const fmtTime = function (ns) {
     if (ns >= 1e6) { return (ns / 1e6).toFixed(2) + " ms"; }
@@ -107,7 +116,8 @@
       document.getElementById("empty").style.display = "block";
       return;
     }
-    const baseline = summary.baseline;
+    // The engine each value layout's ratios are taken against.
+    const baselines = summary.baselines;
     if (meta) {
       const m = document.getElementById("meta");
       m.textContent = "Measured on the " + meta.line + ".x line, " + meta.ref + " at ";
@@ -120,11 +130,13 @@
     const notes = {};
     summary.groups.forEach(function (g) { notes[g.name] = g.note; });
 
-    // group -> engine -> n -> result
+    // group -> engine -> n -> result, and the value layout of each engine.
     const groups = {};
+    const layoutOf = {};
     summary.results.forEach(function (r) {
       (groups[r.group] = groups[r.group] || {});
       (groups[r.group][r.engine] = groups[r.group][r.engine] || {})[r.n] = r;
+      layoutOf[r.engine] = r.values;
     });
     // A group's scenario, without its codec or blob-size suffix.
     const base = function (group) { return group.replace(/_zstd22$/, "").replace(/_blobs_\d+mib$/, ""); };
@@ -141,6 +153,7 @@
 
     const charts = [];
     const container = document.getElementById("charts");
+    const valuesSel = document.getElementById("values");
     const viewSel = document.getElementById("view");
     const codecSel = document.getElementById("codec");
     const kindSel = document.getElementById("kind");
@@ -149,21 +162,19 @@
       charts.splice(0).forEach(function (c) { c.destroy(); });
       container.innerHTML = "";
       const ratio = viewSel.value === "ratio";
+      const layout = valuesSel.value;
+      const baseline = baselines[layout];
       const grids = {};
       ordered.forEach(function (group) {
         const kind = KIND[base(group)] || "other";
         if (codecSel.value !== "all" && codecSel.value !== codecOf(group) && kind !== "compaction") { return; }
         if (kindSel.value !== "all" && kindSel.value !== kind) { return; }
-        if (!(kind in grids)) {
-          const h = document.createElement("h2");
-          h.textContent = KIND_TITLE[kind] || "Other";
-          const grid = document.createElement("div");
-          grid.className = "grid";
-          container.appendChild(h);
-          container.appendChild(grid);
-          grids[kind] = grid;
-        }
-        const engines = groups[group];
+        // Only the engines of the chosen layout, each group without one left out.
+        const engines = {};
+        Object.keys(groups[group]).forEach(function (e) {
+          if (layoutOf[e] === layout) { engines[e] = groups[group][e]; }
+        });
+        if (!Object.keys(engines).length) { return; }
         // A group's size counts keys, but the sustained scenario's counts the
         // rewrites of its hot set.
         const unit = base(group) === "overwrite_sustained" ? "writes" : "keys";
@@ -188,6 +199,18 @@
             results: sizes.map(function (n) { return engines[engine][n] || null; }),
           };
         });
+        // A chart with no bar (a ratio view whose baseline did not run, or that
+        // holds only the baseline) is left out, so the empty state shows.
+        if (!datasets.some(function (d) { return d.data.some(function (v) { return v !== null; }); })) { return; }
+        if (!(kind in grids)) {
+          const h = document.createElement("h2");
+          h.textContent = KIND_TITLE[kind] || "Other";
+          const grid = document.createElement("div");
+          grid.className = "grid";
+          container.appendChild(h);
+          container.appendChild(grid);
+          grids[kind] = grid;
+        }
 
         const card = document.createElement("div");
         card.className = "card";
@@ -255,7 +278,10 @@
                 ticks: { color: "#8b949e", callback: function (v) { return fmtRatio(v); } },
                 // Parity with RocksDB stands out from the other grid lines.
                 grid: { color: function (ctx) { return ctx.tick && ctx.tick.value === 1 ? "#8b949e" : "#21262d"; } },
-                title: { display: true, text: "time relative to RocksDB (below 1 is faster)", color: "#8b949e" },
+                title: {
+                  display: true, color: "#8b949e",
+                  text: "time relative to " + (BASELINE_TITLE[baseline] || baseline) + " (below 1 is faster)",
+                },
               } : {
                 beginAtZero: true,
                 ticks: { color: "#8b949e", callback: function (v) { return fmtTime(v); } },
@@ -281,7 +307,9 @@
           },
         }));
       });
+      document.getElementById("none").style.display = charts.length ? "none" : "block";
     };
+    valuesSel.addEventListener("change", draw);
     viewSel.addEventListener("change", draw);
     codecSel.addEventListener("change", draw);
     kindSel.addEventListener("change", draw);
