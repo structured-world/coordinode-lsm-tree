@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793783364524,
+  "lastUpdate": 1793783368756,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -107646,6 +107646,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.401371561,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bc074dbaedc5eec727ec5d60c06c20284b2cb91d",
+          "message": "bench(compare): take blob trees against RocksDB blob files (#1055)\n\n## Summary\n\n- The head-to-head page shows one value layout at a time: engines\nkeeping values in their tables, or engines keeping them in blob files.\n- Our tree with blob files is measured against RocksDB with blob files\nin the same rounds, not against plain RocksDB.\n\n## Changes\n\n- `paired::run` takes each arm against the baseline its label names; a\nresult records that baseline, and an arm whose baseline is not in the\ngroup reports no ratio.\n- The harness maps `blob_tree` and `rocksdb_blob` to the blob-file\nlayout with `rocksdb_blob` as its baseline, every other arm to plain\nRocksDB.\n- `summary.json` records each result's `values` layout and each layout's\nbaseline under `baselines`.\n- The page gets a `Values` selector, draws only the engines of the\nchosen layout, names that layout's baseline on the ratio axis, and says\nso when a selection has no results.\n- `docs/BENCHMARKING.md` describes the per-layout baseline.\n\n## Testing\n\nClippy (all targets) and the paired-runner tests pass for\n`tools/compare-rocksdb` on Linux; a short run of the harness writes the\nnew summary fields, and the page was checked in a browser against it in\nboth layouts.\n\nCloses #1054\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Benchmark comparisons can now be viewed separately for inline values\nand blob-file values, with results matched to the selected layout.\n* Comparison charts use the corresponding RocksDB baseline and identify\nit in the relative-time axis. A message appears when the selected layout\nhas no results.\n* **Documentation**\n* Updated benchmarking guidance to explain how comparisons and\nconfidence intervals differ between value layouts.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-04T08:47:43Z",
+          "tree_id": "1d08a202f53480e50a959585e2a955509d808965",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bc074dbaedc5eec727ec5d60c06c20284b2cb91d"
+        },
+        "date": 1793783367461,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 697.225,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 222.534301ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 312.348,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 316.050341ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1617.467,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 280.017162ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5462.8009999999995,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 27602.962000000003,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.919,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 52.527103,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.416841967,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 24.175,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 53.575679,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.415262908,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
