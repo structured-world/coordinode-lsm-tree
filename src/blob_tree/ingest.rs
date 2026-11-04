@@ -72,6 +72,7 @@ impl<'a> BlobIngestion<'a> {
         .use_writeback_bytes(tree.index.config.writeback_bytes)
         .use_lifetime_groups(kv.lifetime_groups)
         .use_frame_sizes(kv.frame_sizes())
+        .use_dictionary_classes(kv.dictionary_classes)
         .use_clock(tree.index.config.clock.clone())
         .use_key_domains(
             tree.index.config.key_domains.clone(),

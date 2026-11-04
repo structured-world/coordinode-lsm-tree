@@ -234,6 +234,9 @@ pub(crate) struct Writer {
     /// How this file sizes its frames.
     pub(crate) sizes: FrameSizes,
 
+    /// The frame classes a dictionary codec compresses with its dictionary.
+    pub(crate) dictionary_classes: crate::config::DictionaryClasses,
+
     /// Where each frame written so far starts.
     frames: Vec<u64>,
 
@@ -262,6 +265,7 @@ struct ChunkCodec {
     dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
     #[cfg(zstd_any)]
     two_pass_seed: bool,
+    plain: bool,
 }
 
 #[cfg(feature = "std")]
@@ -279,6 +283,7 @@ impl crate::table::writer::ordered_pipeline::OrderedJob for ChunkJob {
             two_pass_seed: codec.two_pass_seed,
             #[cfg(not(zstd_any))]
             dictionary: core::marker::PhantomData,
+            plain: codec.plain,
         };
         encode_frame(FrameKind::Chunk, &[], &self.0, codec, &mut frame)?;
         Ok(frame)
@@ -400,6 +405,7 @@ impl Writer {
             zstd_two_pass_seed: true,
 
             sizes: FrameSizes::DEFAULT,
+            dictionary_classes: crate::config::DictionaryClasses::ALL,
             frames: Vec::new(),
             block: PendingBlock::default(),
             scratch: Vec::new(),
@@ -429,6 +435,17 @@ impl Writer {
     #[must_use]
     pub(crate) fn use_frame_sizes(mut self, sizes: FrameSizes) -> Self {
         self.sizes = sizes;
+        self
+    }
+
+    /// Compresses only the frames of `classes` with a dictionary codec's
+    /// dictionary, the others at its level without one.
+    #[must_use]
+    pub(crate) fn use_dictionary_classes(
+        mut self,
+        classes: crate::config::DictionaryClasses,
+    ) -> Self {
+        self.dictionary_classes = classes;
         self
     }
 
@@ -535,7 +552,22 @@ impl Writer {
         self.offset + self.block.len()
     }
 
-    fn codec(&self) -> Codec<'_> {
+    /// The codec a frame of `kind` is compressed under: the file's, without
+    /// its dictionary for a class the dictionary does not apply to.
+    fn codec(&self, kind: FrameKind) -> Codec<'_> {
+        #[cfg(zstd_any)]
+        if let CompressionType::ZstdDict { level, .. } = self.compression
+            && !self.dictionary_classes.covers(kind)
+        {
+            return Codec {
+                compression: CompressionType::Zstd(level),
+                dictionary: None,
+                two_pass_seed: self.zstd_two_pass_seed,
+                plain: true,
+            };
+        }
+        #[cfg(not(zstd_any))]
+        let _ = kind;
         Codec {
             compression: self.compression,
             #[cfg(zstd_any)]
@@ -544,6 +576,7 @@ impl Writer {
             two_pass_seed: self.zstd_two_pass_seed,
             #[cfg(not(zstd_any))]
             dictionary: core::marker::PhantomData,
+            plain: false,
         }
     }
 
@@ -570,7 +603,7 @@ impl Writer {
         payload: &[u8],
     ) -> crate::Result<()> {
         let mut scratch = core::mem::take(&mut self.scratch);
-        let encoded = encode_frame(kind, entries, payload, self.codec(), &mut scratch);
+        let encoded = encode_frame(kind, entries, payload, self.codec(kind), &mut scratch);
         let written = encoded.and_then(|()| self.put_frame(&scratch));
         self.scratch = scratch;
         written
@@ -587,12 +620,18 @@ impl Writer {
             && self.compression != CompressionType::None
             && value.len() > chunk_size
         {
+            let chunk = self.codec(FrameKind::Chunk);
             let codec = ChunkCodec {
-                compression: self.compression,
+                compression: chunk.compression,
                 #[cfg(zstd_any)]
-                dictionary: self.zstd_dictionary.clone(),
+                dictionary: if chunk.plain {
+                    None
+                } else {
+                    self.zstd_dictionary.clone()
+                },
                 #[cfg(zstd_any)]
-                two_pass_seed: self.zstd_two_pass_seed,
+                two_pass_seed: chunk.two_pass_seed,
+                plain: chunk.plain,
             };
             // Two chunks in flight per worker keep every worker fed while the
             // writer writes, and bound what a large value holds encoded.

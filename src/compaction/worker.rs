@@ -3294,6 +3294,7 @@ fn run_subcompaction(
             .use_writeback_bytes(opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
             .use_frame_sizes(blob_opts.frame_sizes())
+            .use_dictionary_classes(blob_opts.dictionary_classes)
             .use_clock(opts.config.clock.clone())
             .use_key_domains(
                 opts.config.key_domains.clone(),
@@ -4668,6 +4669,7 @@ fn merge_tables(
                 .use_writeback_bytes(opts.config.writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
                 .use_frame_sizes(blob_opts.frame_sizes())
+                .use_dictionary_classes(blob_opts.dictionary_classes)
                 .use_clock(opts.config.clock.clone())
                 .use_key_domains(
                     opts.config.key_domains.clone(),

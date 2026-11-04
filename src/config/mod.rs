@@ -294,6 +294,11 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub chunk_size: core::num::NonZeroU32,
 
+    /// The frames a dictionary blob codec compresses with its dictionary. See
+    /// [`Self::dictionary_classes`].
+    #[doc(hidden)]
+    pub dictionary_classes: DictionaryClasses,
+
     /// Separation thresholds of the fields of rows written as cells, as
     /// `(column, bytes)` pairs; a column without one uses
     /// `separation_threshold`. See [`Self::cell_separation_threshold`].
@@ -333,6 +338,40 @@ pub struct KvSeparationOptions {
     #[cfg(zstd_any)]
     #[doc(hidden)]
     pub zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
+}
+
+/// The frames of a blob file, by the size class of what they hold, that a
+/// dictionary codec compresses with its dictionary. Set through
+/// [`KvSeparationOptions::dictionary_classes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictionaryClasses {
+    /// Blocks of values below the block size.
+    pub blocks: bool,
+    /// Values from the block size up to the chunk size, a frame each.
+    pub singles: bool,
+    /// The chunks of values above the chunk size.
+    pub chunks: bool,
+}
+
+impl DictionaryClasses {
+    /// Every class.
+    pub const ALL: Self = Self {
+        blocks: true,
+        singles: true,
+        chunks: true,
+    };
+
+    /// Whether a frame of `kind` is compressed with the dictionary. A head
+    /// holds its chunk table, which is never compressed.
+    #[cfg(zstd_any)]
+    pub(crate) fn covers(self, kind: crate::vlog::blob_file::frame::FrameKind) -> bool {
+        use crate::vlog::blob_file::frame::FrameKind;
+        match kind {
+            FrameKind::Block => self.blocks,
+            FrameKind::Single => self.singles,
+            FrameKind::Chunk | FrameKind::Head => self.chunks,
+        }
+    }
 }
 
 /// Whether a value read from a blob file goes into the shared cache.
@@ -398,6 +437,7 @@ impl Default for KvSeparationOptions {
                 crate::vlog::blob_file::writer::FrameSizes::DEFAULT.chunk_size,
             )
             .expect("the default chunk size is not zero"),
+            dictionary_classes: DictionaryClasses::ALL,
             cell_separation_thresholds: alloc::vec::Vec::new(),
 
             staleness_threshold: 0.25,
@@ -499,6 +539,37 @@ impl KvSeparationOptions {
     #[must_use]
     pub fn chunk_size(mut self, bytes: core::num::NonZeroU32) -> Self {
         self.chunk_size = bytes;
+        self
+    }
+
+    /// Sets which frames of a blob file a dictionary codec
+    /// ([`CompressionType::ZstdDict`](crate::CompressionType::ZstdDict))
+    /// compresses with its dictionary; the others are compressed at its level
+    /// without one.
+    ///
+    /// A dictionary gives a small frame the history it lacks; a large one
+    /// builds its own, and pays for the dictionary at every decode for little
+    /// or no gain. Other codecs ignore it.
+    ///
+    /// Defaults to every class.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{DictionaryClasses, KvSeparationOptions};
+    ///
+    /// // The dictionary compresses blocks of small values only.
+    /// let classes = DictionaryClasses {
+    ///     blocks: true,
+    ///     singles: false,
+    ///     chunks: false,
+    /// };
+    /// let opts = KvSeparationOptions::default().dictionary_classes(classes);
+    /// assert_eq!(opts.dictionary_classes, classes);
+    /// ```
+    #[must_use]
+    pub fn dictionary_classes(mut self, classes: DictionaryClasses) -> Self {
+        self.dictionary_classes = classes;
         self
     }
 

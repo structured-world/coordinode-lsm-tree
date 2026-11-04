@@ -23,7 +23,8 @@
 //! 4][key]`, uncompressed, so a scan, a collection and a salvage read keys
 //! without decoding values. `payload` is the values back to back (a head's is
 //! its chunk table), compressed under the file's codec unless [`FLAG_RAW`]
-//! says compression saved nothing and the bytes are stored as they are.
+//! says compression saved nothing and the bytes are stored as they are, or
+//! [`FLAG_PLAIN`] says a dictionary codec compressed it without its dictionary.
 //! `header_crc` covers the fixed fields after the magic; `checksum` is
 //! xxh3-128 over the entries, the payload as stored and `header_crc`.
 
@@ -48,6 +49,11 @@ pub(crate) const ENTRY_HEADER_LEN: usize = 8 + 2 + 4;
 
 /// The payload is stored as it is: compression did not make it smaller.
 pub(crate) const FLAG_RAW: u8 = 1;
+
+/// Under a dictionary codec, the payload is compressed without the dictionary,
+/// at the codec's level: the frame's class is one the dictionary does not
+/// apply to (see [`crate::config::DictionaryClasses`]).
+pub(crate) const FLAG_PLAIN: u8 = 2;
 
 /// The length of a head's payload: its chunk size and chunk count.
 const HEAD_PAYLOAD_LEN: usize = 8;
@@ -267,7 +273,9 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
     // A head's payload is its chunk table, never compressed.
     let head_ok =
         kind != FrameKind::Head || (flags & FLAG_RAW != 0 && raw_len as usize == HEAD_PAYLOAD_LEN);
-    if !shape_ok || !head_ok {
+    // A stored payload is compressed one way or not at all.
+    let flags_ok = flags & !(FLAG_RAW | FLAG_PLAIN) == 0 && flags != FLAG_RAW | FLAG_PLAIN;
+    if !shape_ok || !head_ok || !flags_ok {
         return Err(short);
     }
     Ok(FrameHeader {
@@ -449,6 +457,19 @@ pub(crate) fn decode_frame(
     let entries = bytes.slice(FRAME_HEADER_LEN..entries_end);
     let stored = bytes.slice(entries_end..bytes.len());
     let raw_len = header.raw_len as usize;
+    #[cfg(zstd_any)]
+    let (compression, dictionary) = if header.flags & FLAG_PLAIN == 0 {
+        (compression, dictionary)
+    } else if let CompressionType::ZstdDict { level, .. } = compression {
+        (CompressionType::Zstd(level), None)
+    } else {
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    };
+    #[cfg(not(zstd_any))]
+    if header.flags & FLAG_PLAIN != 0 {
+        // Only a dictionary codec writes a plain frame.
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
     let payload = if header.is_raw() || compression == CompressionType::None {
         *decoded = stored.len();
         if stored.len() != raw_len {
@@ -553,6 +574,9 @@ pub(crate) struct Codec<'d> {
     pub(crate) two_pass_seed: bool,
     #[cfg(not(zstd_any))]
     pub(crate) dictionary: core::marker::PhantomData<&'d ()>,
+    /// `compression` is a dictionary codec's level without its dictionary,
+    /// which the frame says by [`FLAG_PLAIN`] once it is compressed.
+    pub(crate) plain: bool,
 }
 
 /// `payload` compressed under `codec`, or `None` when that saves nothing and
@@ -649,6 +673,8 @@ pub(crate) fn encode_frame(
         || (compressed.is_none() && codec.compression != CompressionType::None)
     {
         FLAG_RAW
+    } else if codec.plain {
+        FLAG_PLAIN
     } else {
         0
     };
@@ -789,6 +815,7 @@ pub(crate) fn decoded_frame(values: &[(&[u8], &[u8])]) -> DecodedFrame {
         two_pass_seed: false,
         #[cfg(not(zstd_any))]
         dictionary: core::marker::PhantomData,
+        plain: false,
     };
     let mut out = Vec::new();
     encode_frame(kind, &entries, &payload, codec, &mut out).unwrap();

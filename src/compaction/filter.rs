@@ -334,6 +334,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             .use_writeback_bytes(self.shared.opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
             .use_frame_sizes(blob_opts.frame_sizes())
+            .use_dictionary_classes(blob_opts.dictionary_classes)
             .use_clock(self.shared.opts.config.clock.clone())
             .use_key_domains(
                 self.shared.opts.config.key_domains.clone(),

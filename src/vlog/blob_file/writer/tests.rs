@@ -399,6 +399,68 @@ fn blob_write_zstd_dict_with_dict_succeeds() -> crate::Result<()> {
     Ok(())
 }
 
+/// Under a dictionary codec only the classes the dictionary applies to are
+/// compressed with it; the frames of the others say they are compressed
+/// without it, and every frame decodes under the file's codec and dictionary.
+#[cfg(zstd_any)]
+#[test]
+fn a_dictionary_compresses_only_its_classes() -> crate::Result<()> {
+    use crate::vlog::blob_file::frame::FLAG_PLAIN;
+
+    let folder = tempfile::tempdir()?;
+    let dict = alloc::sync::Arc::new(crate::compression::ZstdDictionary::new(
+        &b"abcde".repeat(200),
+    ));
+    let compression = CompressionType::ZstdDict {
+        level: 3,
+        dict_id: dict.id(),
+    };
+    let mut w = writer(&folder)?
+        .use_compression(compression)
+        .use_zstd_dictionary(Some(alloc::sync::Arc::clone(&dict)))
+        .use_dictionary_classes(crate::config::DictionaryClasses {
+            blocks: true,
+            singles: false,
+            chunks: false,
+        });
+    let value = |len: usize| b"abcde".repeat(len / 5);
+    w.write(b"a", 0, &value(40))?;
+    w.write(b"b", 0, &value(150))?;
+    w.write(b"c", 0, &value(700))?;
+    let path = w.path.clone();
+    let (_, _, frames) = w.finish()?;
+
+    let bytes = std::fs::read(path)?;
+    let decoded: Vec<DecodedFrame> = frames
+        .windows(2)
+        .map(|pair| {
+            decode_frame(
+                &crate::Slice::from(&bytes[pair[0] as usize..pair[1] as usize]),
+                compression,
+                Some(&dict),
+                &mut 0,
+            )
+        })
+        .collect::<crate::Result<_>>()?;
+    let plain: Vec<_> = decoded
+        .iter()
+        .map(|f| (f.header.kind, f.header.flags & FLAG_PLAIN != 0))
+        .collect();
+    assert_eq!(
+        plain,
+        [
+            (FrameKind::Block, false),
+            (FrameKind::Single, true),
+            (FrameKind::Head, false),
+            (FrameKind::Chunk, true),
+            (FrameKind::Chunk, true),
+            (FrameKind::Chunk, true),
+        ]
+    );
+    assert_eq!(&*decoded[1].payload, &value(150)[..]);
+    Ok(())
+}
+
 /// The frame index decodes to the starts and the end it was written with,
 /// and refuses a tampered, short or non-increasing one.
 #[test]

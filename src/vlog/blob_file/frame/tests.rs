@@ -13,6 +13,7 @@ fn codec<'d>(compression: CompressionType) -> Codec<'d> {
         two_pass_seed: true,
         #[cfg(not(zstd_any))]
         dictionary: core::marker::PhantomData,
+        plain: false,
     }
 }
 
@@ -128,6 +129,52 @@ fn compressible_payload_is_stored_compressed() {
     assert!((header.disk_len as usize) < payload.len());
     let frame = decode(&out, CompressionType::Lz4).unwrap();
     assert_eq!(frame.value(0).as_deref(), Some(payload.as_slice()));
+}
+
+/// A frame compressed without a dictionary codec's dictionary says so, and
+/// decodes under that codec with no dictionary at hand; under a codec with no
+/// dictionary the same flag names nothing and the frame is refused.
+#[cfg(zstd_any)]
+#[test]
+fn a_plain_frame_decodes_under_its_dictionary_codec_without_the_dictionary() {
+    let payload = vec![b'x'; 8192];
+    let entry = EntrySpec {
+        key: b"k",
+        seqno: 1,
+        value_len: payload.len() as u32,
+    };
+    let mut out = Vec::new();
+    let mut plain_zstd = codec(CompressionType::Zstd(3));
+    plain_zstd.plain = true;
+    encode_frame(FrameKind::Single, &[entry], &payload, plain_zstd, &mut out).unwrap();
+    assert_eq!(parse_header(&out).unwrap().flags, FLAG_PLAIN);
+
+    let dict_codec = CompressionType::ZstdDict {
+        level: 3,
+        dict_id: 7,
+    };
+    let frame = decode(&out, dict_codec).unwrap();
+    assert_eq!(frame.value(0).as_deref(), Some(payload.as_slice()));
+    assert!(decode(&out, CompressionType::Zstd(3)).is_err());
+}
+
+/// A flag the format does not define, or a payload flagged both raw and
+/// compressed without the dictionary, is refused at the header.
+#[test]
+fn a_frame_with_flags_it_cannot_hold_is_refused() {
+    let entry = EntrySpec {
+        key: b"k",
+        seqno: 1,
+        value_len: 3,
+    };
+    let mut out = Vec::new();
+    encode_frame(FrameKind::Single, &[entry], b"abc", plain(), &mut out).unwrap();
+    for flags in [4, FLAG_RAW | FLAG_PLAIN, 0x80] {
+        let mut frame = out.clone();
+        frame[5] = flags;
+        restamp_header_crc(&mut frame);
+        assert!(parse_header(&frame).is_err(), "flags {flags:#x}");
+    }
 }
 
 /// A head carries its chunk table uncompressed whatever the file's codec, and

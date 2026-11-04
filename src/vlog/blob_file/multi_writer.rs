@@ -60,6 +60,10 @@ pub(crate) struct MultiWriter {
     /// How every file this writer produces sizes its frames.
     sizes: super::writer::FrameSizes,
 
+    /// The frame classes a dictionary codec compresses with its dictionary in
+    /// every file this writer produces.
+    dictionary_classes: crate::config::DictionaryClasses,
+
     /// Durability level wired from `Config::sync_mode`, stamped on every
     /// rotated blob writer.
     sync_mode: SyncMode,
@@ -186,6 +190,7 @@ impl MultiWriter {
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
             sizes: super::writer::FrameSizes::DEFAULT,
+            dictionary_classes: crate::config::DictionaryClasses::ALL,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
@@ -370,6 +375,18 @@ impl MultiWriter {
         self
     }
 
+    /// Compresses only the frames of `classes` with a dictionary codec's
+    /// dictionary in every file this writer produces.
+    #[must_use]
+    pub(crate) fn use_dictionary_classes(
+        mut self,
+        classes: crate::config::DictionaryClasses,
+    ) -> Self {
+        self.dictionary_classes = classes;
+        self.active_writer.dictionary_classes = classes;
+        self
+    }
+
     /// Splits the files this writer produces into `groups` lifetime classes,
     /// the files written so far taking the class of a fresh value.
     #[must_use]
@@ -464,6 +481,7 @@ impl MultiWriter {
         let mut w = w
             .use_compression(codec)
             .use_frame_sizes(self.sizes)
+            .use_dictionary_classes(self.dictionary_classes)
             .use_sync_mode(self.sync_mode)
             .use_writeback_bytes(self.writeback_bytes)
             .use_clock(self.clock.clone());
