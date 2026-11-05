@@ -221,6 +221,46 @@ impl<'a> Accessor<'a> {
         frame: u32,
         cache: &Cache,
     ) -> crate::Result<HeldFrame> {
+        self.load(tree_id, blob_file, frame, cache, |bytes, decoded| {
+            Reader::decode(blob_file, bytes, decoded)
+        })
+    }
+
+    /// Chunk `at` of the value `head`, frame `head_frame` of `blob_file`, as
+    /// [`Self::frame`] reads a frame: decoded by the head's table, the chunk
+    /// carrying no header of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::frame`], and a chunk the head does not list.
+    fn chunk(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        head: &DecodedFrame,
+        head_frame: u32,
+        at: u32,
+        cache: &Cache,
+    ) -> crate::Result<HeldFrame> {
+        let frame = head_frame
+            .checked_add(1)
+            .and_then(|first| first.checked_add(at))
+            .ok_or(crate::Error::InvalidHeader("Blob"))?;
+        self.load(tree_id, blob_file, frame, cache, |bytes, decoded| {
+            Reader::decode_chunk(blob_file, head, at, bytes, decoded)
+        })
+    }
+
+    /// Frame `frame` of `blob_file`, from the cache or read and decoded now
+    /// by `decode`.
+    fn load(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        frame: u32,
+        cache: &Cache,
+        decode: impl FnOnce(&crate::Slice, &mut usize) -> crate::Result<DecodedFrame>,
+    ) -> crate::Result<HeldFrame> {
         let at = BlobFrameAt {
             blob_file_id: blob_file.id(),
             frame,
@@ -272,7 +312,7 @@ impl<'a> Accessor<'a> {
         // Charged before the result is judged, like the read above: a frame
         // refused after decompression was still decompressed.
         let mut decoded = 0;
-        let parsed = Reader::decode(blob_file, &bytes, &mut decoded);
+        let parsed = decode(&bytes, &mut decoded);
         self.count_decoded(decoded);
         let frame = parsed?;
         cache.record_blob_load(tree_id, at, timer);
@@ -352,15 +392,10 @@ impl<'a> Accessor<'a> {
         }
         let range = range.unwrap_or(0..total);
         check_range(&range, total)?;
-        let all = chunk_frames(&first, vhandle.frame)?;
         let (covered, _) = covering_chunks(&first, &range)?;
         let mut chunks = Vec::with_capacity((covered.end - covered.start) as usize);
         for at in covered {
-            let frame = all
-                .start
-                .checked_add(at)
-                .ok_or(crate::Error::InvalidHeader("Blob"))?;
-            chunks.push(self.frame(tree_id, blob_file, frame, cache)?);
+            chunks.push(self.chunk(tree_id, blob_file, &first, vhandle.frame, at, cache)?);
         }
         let value = assemble(&first, &chunks, Some(&range))?;
         self.count_gather(value.len());
@@ -368,11 +403,11 @@ impl<'a> Accessor<'a> {
     }
 
     /// The chunked value `head`, frame `head_frame` of `blob_file`, read whole
-    /// into one allocation: a chunk stored as it is has its payload read
-    /// straight into the place it takes in the value, its header beside it,
-    /// and a compressed one is read whole and decompressed into its place. No
-    /// chunk is held decoded on its own, so the value costs what a value of a
-    /// frame of its own does: one copy of its bytes out of the file.
+    /// into one allocation: a run of chunks stored as they are is read in one
+    /// request straight into the place it takes in the value, and a
+    /// compressed chunk is read and decompressed into its place. No chunk is
+    /// held decoded on its own, so the value costs what a value of a frame of
+    /// its own does: one copy of its bytes out of the file.
     ///
     /// # Errors
     ///
@@ -385,12 +420,10 @@ impl<'a> Accessor<'a> {
         head: &DecodedFrame,
         head_frame: u32,
     ) -> crate::Result<UserValue> {
-        use crate::vlog::blob_file::frame::{
-            FRAME_HEADER_LEN, check_stored_chunk, decode_chunk_into, parse_header,
-        };
+        use crate::vlog::blob_file::frame::{check_chunk, decode_chunk_into};
 
         let malformed = || crate::Error::InvalidHeader("Blob");
-        let (size, count) = head.chunk_table()?;
+        let (_, count) = head.chunk_table()?;
         let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
         let len = usize::try_from(total).map_err(|_| malformed())?;
         let chunks = chunk_frames(head, head_frame)?;
@@ -403,33 +436,31 @@ impl<'a> Accessor<'a> {
             .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
         let compression = blob_file.0.meta.compression;
 
+        // Each chunk where the frame index places it, of the length its row
+        // in the head's table gives.
+        let mut placed = Vec::with_capacity(count as usize);
+        for (at, frame) in (0_u32..).zip(chunks) {
+            let spec = head.chunk(at)?;
+            let (start, end) = blob_file.frame_span(frame).ok_or_else(malformed)?;
+            let as_is_fits = !spec.is_stored_as_is(compression) || spec.stored_len == spec.raw_len;
+            if end - start != u64::from(spec.stored_len) || !as_is_fits {
+                return Err(malformed());
+            }
+            placed.push((spec, start));
+        }
+
         let mut value = crate::slice::UnfilledSlice::new(len);
         let mut target = value.target();
-        for (at, frame) in (0_u32..).zip(chunks) {
-            let expected = if at + 1 == count {
-                total - u64::from(at) * u64::from(size)
-            } else {
-                u64::from(size)
-            };
-            let expected = usize::try_from(expected).map_err(|_| malformed())?;
-            let (start, end) = blob_file.frame_span(frame).ok_or_else(malformed)?;
-            let frame_len = usize::try_from(end - start).map_err(|_| malformed())?;
-            self.count_request(frame_len);
-            let mut part = target.portion(target.filled(), expected);
-            if frame_len == FRAME_HEADER_LEN + expected {
-                // As long as the chunk itself: stored as it is.
-                let header = crate::file::read_exact(file.as_ref(), start, FRAME_HEADER_LEN)?;
-                let header = parse_header(&header)?;
-                file.read_at_buf(&mut part, start + FRAME_HEADER_LEN as u64)?;
-                if part.filled() != expected {
-                    return Err(malformed());
-                }
-                check_stored_chunk(&header, part.init_mut())?;
-                self.count_decoded(expected);
-            } else {
-                let bytes = crate::file::read_exact(file.as_ref(), start, frame_len)?;
+        let mut at = 0;
+        while let Some(&(spec, start)) = placed.get(at) {
+            if !spec.is_stored_as_is(compression) {
+                let stored_len = spec.stored_len as usize;
+                self.count_request(stored_len);
+                let bytes = crate::file::read_exact(file.as_ref(), start, stored_len)?;
+                let mut part = target.portion(target.filled(), spec.raw_len as usize);
                 let mut decoded = 0;
                 let checked = decode_chunk_into(
+                    &spec,
                     &bytes,
                     compression,
                     #[cfg(zstd_any)]
@@ -439,9 +470,35 @@ impl<'a> Accessor<'a> {
                 );
                 self.count_decoded(decoded);
                 checked?;
-                part.set_filled(expected)?;
+                part.set_filled(spec.raw_len as usize)?;
+                target.extend_from_portion(spec.raw_len as usize);
+                at += 1;
+                continue;
             }
-            target.extend_from_portion(expected);
+            // The run of chunks stored as they are from here: back to back in
+            // the file as in the value, so one read fills them all.
+            let run_end = placed
+                .iter()
+                .skip(at)
+                .position(|(spec, _)| !spec.is_stored_as_is(compression))
+                .map_or(placed.len(), |n| at + n);
+            let run = placed.get(at..run_end).unwrap_or_default();
+            let run_len: usize = run.iter().map(|(spec, _)| spec.raw_len as usize).sum();
+            self.count_request(run_len);
+            let mut part = target.portion(target.filled(), run_len);
+            file.read_at_buf(&mut part, start)?;
+            if part.filled() != run_len {
+                return Err(malformed());
+            }
+            let mut from = 0;
+            for (spec, _) in run {
+                let to = from + spec.raw_len as usize;
+                check_chunk(spec, part.init_mut().get(from..to).ok_or_else(malformed)?)?;
+                from = to;
+            }
+            self.count_decoded(run_len);
+            target.extend_from_portion(run_len);
+            at = run_end;
         }
         if target.filled() != len {
             return Err(malformed());

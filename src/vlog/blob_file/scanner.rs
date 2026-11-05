@@ -5,7 +5,7 @@
 use super::frame::{
     DecodedFrame, FRAME_HEADER_LEN, FRAME_MAGIC, FrameKind, decode_frame, parse_header,
 };
-use super::reader::assemble;
+use super::reader::assemble_stored;
 use crate::fs::{Fs, FsOpenOptions};
 use crate::io::BufReader;
 #[cfg(not(feature = "std"))]
@@ -463,38 +463,71 @@ impl Scanner {
                 let Ok(chunks) = super::reader::chunk_frames(&decoded, frame) else {
                     return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
                 };
-                let mut stored = alloc::vec![bytes];
-                let mut parts = Vec::with_capacity((chunks.end - chunks.start) as usize);
-                let mut end = frame_end;
-                for _ in chunks.clone() {
-                    let failure = match self.read_one() {
-                        Some(Ok((_, at, chunk_bytes, chunk)))
-                            if chunk.header.kind == FrameKind::Chunk =>
-                        {
-                            end = at + chunk_bytes.len() as u64;
-                            stored.push(chunk_bytes);
-                            parts.push(alloc::boxed::Box::new(chunk));
-                            continue;
-                        }
-                        Some(Ok(_)) | None => crate::Error::InvalidHeader("BlobFrame"),
-                        Some(Err(e)) => e,
+                // A value whose chunks do not read is damage that ends with
+                // them: by the index, the walk goes on at the frame after
+                // them, so the chunks left are not read as frames; a chain
+                // walk, which only the head's table placed, searches on.
+                let failed = |this: &mut Self, e: crate::Error| {
+                    let moved = match this.bounds {
+                        Bounds::Index(_) => this.skip_to_frame(chunks.end),
+                        Bounds::Chain => this.resync_to_next_frame(offset),
                     };
-                    // By the index, the value's damage ends with its chunks:
-                    // the walk goes on at the frame after them, so the chunks
-                    // left do not each read as a chunk without its head.
-                    if let Err(e) = self.skip_to_frame(chunks.end) {
-                        self.is_terminated = true;
-                        return Some(Err(e));
+                    if let Err(seek) = moved {
+                        this.is_terminated = true;
+                        return Some(Err(seek));
                     }
-                    return Some(Err(failure));
+                    Some(Err(e))
+                };
+                let mut specs = Vec::with_capacity((chunks.end - chunks.start) as usize);
+                for at in 0..chunks.end - chunks.start {
+                    match decoded.chunk(at) {
+                        Ok(spec) => specs.push(spec),
+                        Err(e) => return failed(self, e),
+                    }
                 }
+                let area_len: u64 = specs.iter().map(|spec| u64::from(spec.stored_len)).sum();
+                let end = frame_end + area_len;
+                let placed = chunks.end > chunks.start
+                    && self
+                        .indexed_end(chunks.end - 1)
+                        .is_none_or(|indexed| indexed == end);
+                let Ok(area_len) = usize::try_from(area_len) else {
+                    return failed(self, crate::Error::InvalidHeader("BlobFrame"));
+                };
+                if !placed || end > self.data_end {
+                    return failed(self, crate::Error::InvalidHeader("BlobFrame"));
+                }
+                // The chunks follow the head back to back.
+                let mut area = alloc::vec![0_u8; area_len];
+                if let Err(e) = self.inner.read_exact(&mut area) {
+                    self.is_terminated = true;
+                    return Some(Err(e.into()));
+                }
+                let area = Slice::from(area);
                 let (Some(entry), Some(key)) = (decoded.list.first(), decoded.key(0)) else {
-                    return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+                    return failed(self, crate::Error::InvalidHeader("BlobFrame"));
                 };
-                let value = match assemble(&decoded, &parts, None) {
+                let mut produced = 0;
+                let value = match assemble_stored(
+                    &decoded,
+                    &area,
+                    self.codec.compression,
+                    #[cfg(zstd_any)]
+                    self.codec.dictionary.as_deref(),
+                    &mut produced,
+                ) {
                     Ok(value) => value,
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => return failed(self, e),
                 };
+                let mut stored = Vec::with_capacity(specs.len() + 1);
+                stored.push(bytes);
+                let mut from = 0;
+                for spec in &specs {
+                    let to = from + spec.stored_len as usize;
+                    stored.push(area.slice(from..to));
+                    from = to;
+                }
+                self.next_frame = chunks.end;
                 self.pending.push_back(ScanEntry {
                     key: UserKey::from(key),
                     seqno: entry.seqno,

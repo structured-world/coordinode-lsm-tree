@@ -222,11 +222,16 @@ fn head_frame_names_its_chunk_table() {
         seqno: 7,
         value_len: 10_000,
     };
+    let value = vec![b'x'; 10_000];
+    let specs: Vec<ChunkSpec> = value
+        .chunks(4096)
+        .map(|chunk| encode_chunk(chunk, plain()).unwrap().1)
+        .collect();
     let mut out = Vec::new();
     encode_frame(
         FrameKind::Head,
         &[entry],
-        &head_payload(4096, 3),
+        &head_payload(4096, &specs),
         plain(),
         &mut out,
     )
@@ -235,12 +240,15 @@ fn head_frame_names_its_chunk_table() {
     assert!(frame.header.is_raw());
     assert_eq!(frame.chunk_table().unwrap(), (4096, 3));
     assert_eq!(frame.list[0].value_len, 10_000);
+    assert_eq!(frame.chunk(2).unwrap().raw_len, 10_000 - 2 * 4096);
+    assert_eq!(head_chunks(&out).unwrap(), specs);
+    assert!(frame.chunk(3).is_err(), "no fourth chunk");
 
     // Two chunks of 4096 do not cover 10000 bytes.
     encode_frame(
         FrameKind::Head,
         &[entry],
-        &head_payload(4096, 2),
+        &head_payload(4096, &specs[..2]),
         plain(),
         &mut out,
     )
@@ -252,16 +260,39 @@ fn head_frame_names_its_chunk_table() {
     ));
 }
 
-/// A chunk lists no entries; any other frame's table is not a chunk table.
+/// A chunk carries no header: no frame on disk is a chunk, and a chunk is
+/// decoded by the row of its head's table, which its bytes must match.
 #[test]
-fn chunk_frame_has_no_entries() {
+fn a_chunk_decodes_by_its_heads_row() {
     let mut out = Vec::new();
     encode_frame(FrameKind::Chunk, &[], b"chunk bytes", plain(), &mut out).unwrap();
-    let frame = decode(&out, CompressionType::None).unwrap();
-    assert_eq!(frame.header.kind, FrameKind::Chunk);
-    assert_eq!(frame.list.len(), 0);
-    assert_eq!(&*frame.payload, b"chunk bytes");
-    assert!(frame.chunk_table().is_err());
+    assert!(
+        decode(&out, CompressionType::None).is_err(),
+        "a chunk frame on disk is refused"
+    );
+
+    let (stored, spec) = encode_chunk(b"chunk bytes", plain()).unwrap();
+    assert!(
+        stored.is_none(),
+        "without a codec the chunk is stored as it is"
+    );
+    let chunk = decode_chunk(
+        &spec,
+        &Slice::from(&b"chunk bytes"[..]),
+        CompressionType::None,
+        #[cfg(zstd_any)]
+        None,
+        &mut 0,
+    )
+    .unwrap();
+    assert_eq!(chunk.header.kind, FrameKind::Chunk);
+    assert_eq!(&*chunk.payload, b"chunk bytes");
+    assert!(chunk.chunk_table().is_err());
+    assert!(matches!(
+        check_chunk(&spec, b"chunk bytez"),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+    assert!(check_chunk(&spec, b"chunk").is_err(), "another length");
 }
 
 fn sample_block() -> Vec<u8> {

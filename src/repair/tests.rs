@@ -14958,6 +14958,71 @@ fn a_wholly_zeroed_blob_section_without_holes_is_not_fully_consumed() -> crate::
     Ok(())
 }
 
+/// A reclaim that crashed mid-way leaves holes with consumed values between
+/// them; the walk to the frontier steps over each intact value whole, a value
+/// in chunks as its head and the chunks its table lists, which carry no
+/// header of their own. Stepping frame by frame, it would read the first
+/// chunk as a frame that does not check and stop at the first hole.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn the_frontier_walk_steps_over_a_chunked_value_between_holes() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .blob_compression(crate::CompressionType::None)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(16)
+                .block_size(0)
+                .chunk_size(core::num::NonZeroU32::new(100).expect("non-zero")),
+        ))
+        .open()?;
+        // Three chunks each.
+        for i in 0..6u32 {
+            tree.insert(
+                format!("k{i:04}").as_bytes(),
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 300],
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let blob_path = root.join(crate::file::BLOBS_FOLDER).join("0");
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 6, "six separated values");
+    let data_start = entries.first().expect("a value").offset;
+    // Values 0 and 1 reclaimed, value 2 consumed but not yet, value 3
+    // reclaimed: the shape a reclaim that punches value by value leaves.
+    memfs.punch_hole(&blob_path, data_start, entries[1].frame_end - data_start)?;
+    memfs.punch_hole(
+        &blob_path,
+        entries[3].offset,
+        entries[3].frame_end - entries[3].offset,
+    )?;
+
+    let derived = super::derive_blob_frontier(&fs, &blob_path)?;
+    assert!(
+        matches!(derived, super::BlobFrontier::Punched(at) if at == entries[3].frame_end),
+        "the frontier ends with the last hole, past the value in chunks between them: \
+         {derived:?}, want {}",
+        entries[3].frame_end,
+    );
+    Ok(())
+}
+
 /// Separation of every value from 16 bytes, each into a frame of its own: a
 /// fixture whose damage to one value's frame is damage to that value alone,
 /// what the frame-level repair tests probe.

@@ -226,6 +226,40 @@ fn a_chunked_value_is_written_back_once_it_is_whole() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A value stored in chunks as they are goes to its file in one range after
+/// its head: chunks with a frame header each between them cost a write call
+/// per header and one per chunk, eight times what a frame of the value took.
+#[test]
+fn a_chunked_value_is_written_in_a_few_calls() -> lsm_tree::Result<()> {
+    let fs = FaultFs::new(MemFs::new());
+    let injector = fs.injector();
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(fs) as Arc<dyn Fs>)
+    .blob_compression(lsm_tree::CompressionType::None)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(1)
+            .chunk_size(core::num::NonZeroU32::new(64 * 1_024).expect("non-zero")),
+    ))
+    .open()?;
+    // Sixteen chunks.
+    tree.insert("big", vec![b'v'; 1_024 * 1_024], 0);
+    tree.flush_active_memtable(0)?;
+    let writes = injector.writes_for("blobs");
+    // The head with what the buffer held before it, the value, and the
+    // file's closing sections.
+    assert!(
+        writes.len() <= 4,
+        "{} writes for one value of sixteen chunks: {writes:?}",
+        writes.len()
+    );
+    Ok(())
+}
+
 #[test]
 fn a_zero_step_starts_no_writeback() -> lsm_tree::Result<()> {
     let injector = flushed(|config| {

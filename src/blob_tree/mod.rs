@@ -456,23 +456,20 @@ impl BlobSource {
         if bytes.len() as u64 == end - start {
             return Ok((None, None));
         }
-        let all = reader::chunk_frames(&frame, read.vhandle.frame)?;
-        let mut chunks = Vec::with_capacity((all.end - all.start) as usize);
-        for chunk in all {
-            let (chunk_start, chunk_end) =
-                read.blob_file.frame_span(chunk).ok_or_else(malformed)?;
-            let mut decoded = 0;
-            let parsed = reader::Reader::decode(
-                read.blob_file,
-                &frame_bytes(chunk_start, chunk_end)?,
-                &mut decoded,
-            );
-            accessor.count_decoded(decoded);
-            chunks.push(parsed?);
-        }
-        let value = reader::assemble(&frame, &chunks.iter().collect::<Vec<_>>(), None)?;
-        accessor.count_gather(value.len());
-        Ok((Some(value), None))
+        // The chunks follow the head back to back: a value stored as it is
+        // is handed out of the read as it lies, any other decoded into place.
+        let area = frame_bytes(end, start + bytes.len() as u64)?;
+        let mut decoded = 0;
+        let value = reader::assemble_stored(
+            &frame,
+            &area,
+            read.blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            read.blob_file.0.zstd_dictionary.as_deref(),
+            &mut decoded,
+        );
+        accessor.count_decoded(decoded);
+        Ok((Some(value?), None))
     }
 
     /// The value `item` stands for, out of `frame`, the frame `at` names,

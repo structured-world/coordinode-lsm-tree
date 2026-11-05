@@ -719,6 +719,45 @@ fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
 }
 
 #[test]
+fn a_multi_get_of_chunked_values_reads_them_into_place() {
+    // A value in chunks stored as they are lies in one range of its file, so
+    // a batch that reads its frames in one go hands the value out of that
+    // read as it is. Chunks with frame headers between them would leave the
+    // batch to copy every byte of the value once more to join them.
+    let (value_len, n) = (1 << 20, 4_u32);
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(CompressionType::None)
+    .with_kv_separation(Some(Default::default()))
+    .blob_cache_fill(BlobCacheFill::Never)
+    .open()
+    .expect("open");
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let keys: Vec<Vec<u8>> = (0..n).map(key).collect();
+
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+    let got = tree.multi_get(&keys, SeqNo::MAX).expect("multi_get");
+    assert!(
+        got.iter()
+            .all(|value| value.as_ref().map(|v| v.len()) == Some(value_len)),
+        "every value is read whole",
+    );
+    assert_eq!(
+        m.bytes_copied() - before,
+        0,
+        "the chunked values were assembled out of another buffer",
+    );
+}
+
+#[test]
 fn a_point_read_admitted_to_the_row_cache_counts_the_row_it_detaches() -> lsm_tree::Result<()> {
     // A point read that misses the row cache copies the key and value it
     // resolved out of the data block, so the cached row owns its bytes rather

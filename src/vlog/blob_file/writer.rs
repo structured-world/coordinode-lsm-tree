@@ -5,9 +5,9 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-#[cfg(feature = "std")]
-use super::frame::encode_frame;
-use super::frame::{Codec, EntrySpec, FrameKind, encode_frame_parts, head_payload};
+use super::frame::{
+    ChunkSpec, Codec, EntrySpec, FrameKind, encode_chunk, encode_frame_parts, head_payload,
+};
 use super::meta::{META_VERSION, Metadata};
 use crate::io::BufWriter;
 #[cfg(not(feature = "std"))]
@@ -260,10 +260,14 @@ pub(crate) struct Writer {
     parallel: Option<crate::table::writer::ParallelCompression>,
 }
 
-/// One chunk of a large value to encode into its frame on a worker. The chunk
-/// is the job's own copy: a worker outlives the borrow of the value written.
+/// One chunk of a large value to encode on a worker. The chunk is the job's
+/// own copy: a worker outlives the borrow of the value written.
 #[cfg(feature = "std")]
 struct ChunkJob(Vec<u8>);
+
+/// A chunk encoded: compressed bytes when compression shrank it, `None` when
+/// it is stored as it is, and its row in the head's table.
+type EncodedChunk = (Option<Vec<u8>>, ChunkSpec);
 
 /// The codec every chunk of a writer's file is encoded under.
 #[cfg(feature = "std")]
@@ -279,10 +283,9 @@ struct ChunkCodec {
 #[cfg(feature = "std")]
 impl crate::table::writer::ordered_pipeline::OrderedJob for ChunkJob {
     type Context = ChunkCodec;
-    type Output = crate::Result<Vec<u8>>;
+    type Output = crate::Result<EncodedChunk>;
 
     fn run(self, codec: &ChunkCodec) -> Self::Output {
-        let mut frame = Vec::new();
         let codec = Codec {
             compression: codec.compression,
             #[cfg(zstd_any)]
@@ -293,8 +296,9 @@ impl crate::table::writer::ordered_pipeline::OrderedJob for ChunkJob {
             dictionary: core::marker::PhantomData,
             plain: codec.plain,
         };
-        encode_frame(FrameKind::Chunk, &[], &self.0, codec, &mut frame)?;
-        Ok(frame)
+        // The chunk is stored as it is from the value written, not from
+        // this copy: only what compression made is handed back.
+        encode_chunk(&self.0, codec)
     }
 }
 
@@ -629,11 +633,14 @@ impl Writer {
         written
     }
 
-    /// Writes `value` as chunks of `chunk_size` bytes, each a frame of its own,
-    /// in order. Compressed chunks are encoded on the parallel workers when the
-    /// writer has them and the value has more than one chunk; without a codec
-    /// an encode is a copy, which a worker would only add a copy to.
-    fn emit_chunks(&mut self, value: &[u8], chunk_size: usize) -> crate::Result<()> {
+    /// Encodes `value` as chunks of `chunk_size` bytes, in order: all of them
+    /// before any is written, since the head that precedes them lists how
+    /// each is stored. Compressed chunks are encoded on the parallel workers
+    /// when the writer has them and the value has more than one chunk;
+    /// without a codec an encode is a checksum, which a worker would only add
+    /// a copy to.
+    fn encode_chunks(&self, value: &[u8], chunk_size: usize) -> crate::Result<Vec<EncodedChunk>> {
+        let mut encoded = Vec::with_capacity(value.len().div_ceil(chunk_size));
         #[cfg(feature = "std")]
         if let Some(parallel) = &self.parallel
             && parallel.threads > 1
@@ -653,8 +660,7 @@ impl Writer {
                 two_pass_seed: chunk.two_pass_seed,
                 plain: chunk.plain,
             };
-            // Two chunks in flight per worker keep every worker fed while the
-            // writer writes, and bound what a large value holds encoded.
+            // Two chunks in flight per worker keep every worker fed.
             let in_flight = parallel.threads * 2;
             let mut pipeline = crate::table::writer::ordered_pipeline::OrderedPipeline::new(
                 alloc::sync::Arc::clone(&parallel.spawner),
@@ -662,35 +668,72 @@ impl Writer {
                 parallel.threads,
                 in_flight,
             );
+            #[expect(
+                clippy::expect_used,
+                reason = "taken only while a chunk is pending, which take_next then returns"
+            )]
             for chunk in value.chunks(chunk_size) {
                 if pipeline.pending() == in_flight {
-                    self.put_next_chunk(&mut pipeline)?;
+                    encoded.push(pipeline.take_next().expect("a chunk is pending")?);
                 }
                 pipeline.submit(ChunkJob(chunk.to_vec()));
             }
+            #[expect(
+                clippy::expect_used,
+                reason = "taken only while a chunk is pending, which take_next then returns"
+            )]
             while pipeline.pending() > 0 {
-                self.put_next_chunk(&mut pipeline)?;
+                encoded.push(pipeline.take_next().expect("a chunk is pending")?);
             }
-            return Ok(());
+            return Ok(encoded);
         }
+        let codec = self.codec(FrameKind::Chunk);
         for chunk in value.chunks(chunk_size) {
-            self.emit(FrameKind::Chunk, &[], chunk)?;
+            encoded.push(encode_chunk(chunk, codec)?);
+        }
+        Ok(encoded)
+    }
+
+    /// Writes `chunks`, the chunks of `value` of `chunk_size` bytes each as
+    /// encoded, back to back, each where the frame index places it. A run of
+    /// chunks stored as they are is one range of the value, written from it
+    /// in one call, as a frame of the whole value would be.
+    fn put_chunks(
+        &mut self,
+        value: &[u8],
+        chunk_size: usize,
+        chunks: &[EncodedChunk],
+    ) -> crate::Result<()> {
+        let mut run_start: Option<usize> = None;
+        for (at, (compressed, _)) in chunks.iter().enumerate() {
+            let from = at * chunk_size;
+            match compressed {
+                None => {
+                    let start = *run_start.get_or_insert(from);
+                    self.frames.push(self.offset + (from - start) as u64);
+                }
+                Some(bytes) => {
+                    if let Some(start) = run_start.take() {
+                        self.put_bytes(value.get(start..from).unwrap_or_default())?;
+                    }
+                    self.frames.push(self.offset);
+                    self.put_bytes(bytes)?;
+                }
+            }
+        }
+        if let Some(start) = run_start {
+            self.put_bytes(value.get(start..).unwrap_or_default())?;
         }
         Ok(())
     }
 
-    /// Writes the next chunk frame `pipeline` encoded, in submission order.
-    #[cfg(feature = "std")]
-    fn put_next_chunk(
-        &mut self,
-        pipeline: &mut crate::table::writer::ordered_pipeline::OrderedPipeline<ChunkJob>,
-    ) -> crate::Result<()> {
-        #[expect(
-            clippy::expect_used,
-            reason = "called only while a chunk is pending, which take_next then returns"
-        )]
-        let frame = pipeline.take_next().expect("a chunk is pending")?;
-        self.put_frame(&frame)
+    /// Writes `bytes` at the current offset, as part of the frames placed so
+    /// far.
+    fn put_bytes(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.writer.write_all(bytes)?;
+        self.offset += bytes.len() as u64;
+        self.written_blob_bytes += bytes.len() as u64;
+        Ok(())
     }
 
     /// Writes the block waiting for its values, if any.
@@ -819,8 +862,13 @@ impl Writer {
                 value_len,
             };
             let before = self.offset;
-            self.emit(FrameKind::Head, &[entry], &head_payload(chunk_size, chunks))?;
-            self.emit_chunks(value, chunk_size as usize)?;
+            let encoded = self.encode_chunks(value, chunk_size as usize)?;
+            if encoded.len() != chunks as usize {
+                return Err(crate::Error::InvalidHeader("blob chunk count"));
+            }
+            let specs: Vec<ChunkSpec> = encoded.iter().map(|(_, spec)| *spec).collect();
+            self.emit(FrameKind::Head, &[entry], &head_payload(chunk_size, &specs))?;
+            self.put_chunks(value, chunk_size as usize, &encoded)?;
             FrameRef {
                 frame,
                 index: 0,
@@ -863,8 +911,16 @@ impl Writer {
         if !shape_ok || listed_key != Some(key) {
             return Err(malformed());
         }
-        for chunk in frames.get(1..).unwrap_or_default() {
-            if super::frame::parse_header(chunk)?.kind != FrameKind::Chunk {
+        if header.kind == FrameKind::Head {
+            // Each chunk takes what the head's table says it takes, so the
+            // frames the copy places are where the head's readers look.
+            let table = super::frame::head_chunks(first)?;
+            let fits = table.len() == chunks
+                && table
+                    .iter()
+                    .zip(frames.get(1..).unwrap_or_default())
+                    .all(|(spec, chunk)| chunk.len() == spec.stored_len as usize);
+            if !fits {
                 return Err(malformed());
             }
         }

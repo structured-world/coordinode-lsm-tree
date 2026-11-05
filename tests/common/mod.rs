@@ -233,12 +233,14 @@ impl lsm_tree::fs::Fs for BatchCountFs {
 ///
 /// A frame is a 40-byte header, an entry per value (14 bytes and the key)
 /// and its payload. A value up to the 256 KiB chunk size is a frame of its
-/// own; a larger one is a head (its entry and an 8-byte chunk table) and a
-/// frame per 256 KiB chunk. A value below the 8 KiB block size shares a
-/// block instead, see [`block_entry_len`].
+/// own; a larger one is a head (its entry and a chunk table of 8 bytes and
+/// 21 per 256 KiB chunk) followed by the chunks, which carry no header. A
+/// value below the 8 KiB block size shares a block instead, see
+/// [`block_entry_len`].
 pub(crate) fn stored_len(key: &[u8], value_len: u64) -> u64 {
     const HEADER: u64 = 40;
     const CHUNK: u64 = 256 * 1024;
+    const CHUNK_ROW: u64 = 21;
     assert!(
         value_len >= BLOCK,
         "a value of {value_len} bytes shares a block"
@@ -247,7 +249,7 @@ pub(crate) fn stored_len(key: &[u8], value_len: u64) -> u64 {
     if value_len <= CHUNK {
         HEADER + entry + value_len
     } else {
-        HEADER + entry + 8 + value_len.div_ceil(CHUNK) * HEADER + value_len
+        HEADER + entry + 8 + value_len.div_ceil(CHUNK) * CHUNK_ROW + value_len
     }
 }
 

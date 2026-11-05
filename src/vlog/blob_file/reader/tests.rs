@@ -174,10 +174,23 @@ fn a_range_covers_only_its_chunks() -> crate::Result<()> {
     assert_eq!(covering_chunks(&head, &(600..700))?, (2..3, 0));
 
     let chunks = chunk_frames(&head, handles[0].frame)?;
-    let second = reader.read_frame(chunks.start + 1, &mut 0)?;
+    let second = read_chunk(&reader, &blob_file, &head, chunks.start, 1)?;
     let part = assemble(&head, &[Box::new(second)], Some(&(310..320)))?;
     assert_eq!(&*part, &value[310..320]);
     Ok(())
+}
+
+/// Chunk `at` of the value `head`, whose chunks start at frame `first`,
+/// read and decoded by its row in the head's table.
+fn read_chunk(
+    reader: &Reader<'_>,
+    blob_file: &BlobFile,
+    head: &DecodedFrame,
+    first: u32,
+    at: u32,
+) -> crate::Result<DecodedFrame> {
+    let stored = reader.read_frame_bytes(first + at)?;
+    Reader::decode_chunk(blob_file, head, at, &stored, &mut 0)
 }
 
 /// Chunks that are not the head's are refused: of another size than its
@@ -194,10 +207,13 @@ fn chunks_must_be_the_heads() -> crate::Result<()> {
     let file = File::open(&blob_file.0.path)?;
     let reader = Reader::new(&blob_file, &file);
     let head = reader.read_frame(handles[0].frame, &mut 0)?;
-    let first = reader.read_frame(handles[0].frame + 1, &mut 0)?;
-    let last = reader.read_frame(handles[0].frame + 3, &mut 0)?;
+    let first = read_chunk(&reader, &blob_file, &head, handles[0].frame + 1, 0)?;
+    let last = read_chunk(&reader, &blob_file, &head, handles[0].frame + 1, 2)?;
     let tail = reader.read_frame(handles[1].frame, &mut 0)?;
 
+    // A chunk's bytes read as another chunk do not match its row.
+    let stored = reader.read_frame_bytes(handles[0].frame + 3)?;
+    assert!(Reader::decode_chunk(&blob_file, &head, 0, &stored, &mut 0).is_err());
     // The last chunk (100 bytes) where the first (300) belongs.
     assert!(assemble(&head, &[Box::new(last)], Some(&(0..10))).is_err());
     // A block where a chunk belongs.

@@ -66,6 +66,29 @@ impl<'a> Reader<'a> {
         )
     }
 
+    /// Checks and decodes `stored`, chunk `at` of the value `head` names in
+    /// this file, under its codec.
+    ///
+    /// # Errors
+    ///
+    /// The head lists no such chunk, or the chunk does not check or decode.
+    pub(crate) fn decode_chunk(
+        blob_file: &BlobFile,
+        head: &DecodedFrame,
+        at: u32,
+        stored: &Slice,
+        decoded: &mut usize,
+    ) -> crate::Result<DecodedFrame> {
+        super::frame::decode_chunk(
+            &head.chunk(at)?,
+            stored,
+            blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            blob_file.0.zstd_dictionary.as_deref(),
+            decoded,
+        )
+    }
+
     /// Reads, checks and decodes frame `frame`.
     ///
     /// # Errors
@@ -95,10 +118,15 @@ impl<'a> Reader<'a> {
             FrameKind::Head => {
                 check_key(&frame, vhandle.index, key)?;
                 let mut chunks = Vec::new();
-                for chunk in chunk_frames(&frame, vhandle.frame)? {
-                    chunks.push(alloc::boxed::Box::new(
-                        self.read_frame(chunk, &mut decoded)?,
-                    ));
+                for (at, chunk) in (0_u32..).zip(chunk_frames(&frame, vhandle.frame)?) {
+                    let stored = self.read_frame_bytes(chunk)?;
+                    chunks.push(alloc::boxed::Box::new(Self::decode_chunk(
+                        self.blob_file,
+                        &frame,
+                        at,
+                        &stored,
+                        &mut decoded,
+                    )?));
                 }
                 assemble(&frame, &chunks, None)
             }
@@ -131,13 +159,11 @@ impl<'a> Reader<'a> {
             },
             FrameKind::Head => {
                 let mut frames = alloc::vec![first];
-                for chunk in chunk_frames(&frame, vhandle.frame)? {
+                for (at, chunk) in (0_u32..).zip(chunk_frames(&frame, vhandle.frame)?) {
                     let bytes = self.read_frame_bytes(chunk)?;
                     read += bytes.len() as u64;
-                    let decoded_chunk = Self::decode(self.blob_file, &bytes, &mut decoded)?;
-                    if decoded_chunk.header.kind != FrameKind::Chunk {
-                        return Err(crate::Error::InvalidHeader("Blob"));
-                    }
+                    // Copied as stored: its checksum proves it, no decode.
+                    super::frame::check_chunk(&frame.chunk(at)?, &bytes)?;
                     frames.push(bytes);
                 }
                 CopySource::Frames { frames, value_len }
@@ -227,6 +253,83 @@ pub(crate) fn covering_chunks(
     )]
     let chunks = (range.start / size) as u32..range.end.div_ceil(size) as u32;
     Ok((chunks, range.start % size))
+}
+
+/// The whole value `head` names out of `area`, its chunks as stored back to
+/// back, each checked and decoded under `compression`. A value whose chunks
+/// are all stored as they are is handed out of `area` as it is, a view with
+/// no copy; any other is decoded into one buffer, each chunk into its place.
+///
+/// `decoded` receives what the chunks decoded to, as [`Reader::decode`] does.
+///
+/// # Errors
+///
+/// `area` is not the chunks the head lists, or a chunk does not check or
+/// decode.
+pub(crate) fn assemble_stored(
+    head: &DecodedFrame,
+    area: &Slice,
+    compression: crate::CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    decoded: &mut usize,
+) -> crate::Result<UserValue> {
+    use super::frame::{check_chunk, decode_chunk_into};
+
+    let malformed = || crate::Error::InvalidHeader("Blob");
+    let (_, count) = head.chunk_table()?;
+    let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
+    let len = usize::try_from(total).map_err(|_| malformed())?;
+    let mut specs = Vec::with_capacity(count as usize);
+    for at in 0..count {
+        specs.push(head.chunk(at)?);
+    }
+    let stored_len: u64 = specs.iter().map(|spec| u64::from(spec.stored_len)).sum();
+    if stored_len != area.len() as u64 {
+        return Err(malformed());
+    }
+    *decoded = 0;
+    if specs.iter().all(|spec| spec.is_stored_as_is(compression)) {
+        let mut from = 0;
+        for spec in &specs {
+            let to = from + spec.stored_len as usize;
+            check_chunk(spec, area.get(from..to).ok_or_else(malformed)?)?;
+            from = to;
+        }
+        *decoded = area.len();
+        if area.len() != len {
+            return Err(malformed());
+        }
+        return Ok(area.clone());
+    }
+    let mut value = crate::slice::UnfilledSlice::new(len);
+    let mut target = value.target();
+    let mut from = 0;
+    for spec in &specs {
+        let to = from + spec.stored_len as usize;
+        let mut part = target.portion(target.filled(), spec.raw_len as usize);
+        let mut produced = 0;
+        let checked = decode_chunk_into(
+            spec,
+            area.get(from..to).ok_or_else(malformed)?,
+            compression,
+            #[cfg(zstd_any)]
+            dictionary,
+            part.init_mut(),
+            &mut produced,
+        );
+        *decoded += produced;
+        checked?;
+        part.set_filled(spec.raw_len as usize)?;
+        target.extend_from_portion(spec.raw_len as usize);
+        from = to;
+    }
+    if target.filled() != len {
+        return Err(malformed());
+    }
+    // SAFETY: every byte of the value was filled above, chunk by chunk, as
+    // `target` counted them.
+    #[expect(unsafe_code, reason = "see safety")]
+    Ok(unsafe { value.assume_filled() })
 }
 
 /// Assembles a chunked value out of its head and `chunks`, the chunks of
