@@ -6,6 +6,7 @@ pub(crate) mod frame;
 pub(crate) mod merge;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
+pub(crate) mod packed;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod writer;

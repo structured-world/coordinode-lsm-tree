@@ -289,7 +289,14 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
     let count64 = u64::from(count);
     let entries_max = count64 * (ENTRY_HEADER_LEN as u64 + u64::from(u16::MAX));
     let entries_min = count64 * (ENTRY_HEADER_LEN as u64 + 1);
-    if !(entries_min..=entries_max).contains(&u64::from(entries_len)) {
+    // A packed block lists its values in its records, its entries empty.
+    let packed = flags == super::packed::FLAG_PACKED;
+    let entries_ok = if packed {
+        kind == FrameKind::Block && count >= 1 && entries_len == 0
+    } else {
+        (entries_min..=entries_max).contains(&u64::from(entries_len))
+    };
+    if !entries_ok {
         return Err(short());
     }
     let shape_ok = match kind {
@@ -305,7 +312,8 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
                 .checked_sub(HEAD_TABLE_LEN)
                 .is_some_and(|rows| rows % CHUNK_ROW_LEN == 0));
     // A stored payload is compressed one way or not at all.
-    let flags_ok = flags & !(FLAG_RAW | FLAG_PLAIN) == 0 && flags != FLAG_RAW | FLAG_PLAIN;
+    let flags_ok =
+        packed || (flags & !(FLAG_RAW | FLAG_PLAIN) == 0 && flags != FLAG_RAW | FLAG_PLAIN);
     if !shape_ok || !head_ok || !flags_ok {
         return Err(short());
     }
@@ -331,6 +339,9 @@ pub(crate) struct FrameEntry {
     pub(crate) value_len: u32,
     /// Where the value lies in the payload (single and block frames).
     pub(crate) value: Range<usize>,
+    /// Where the value's record starts in a packed block, which its handle
+    /// names it by; `0` in any other frame.
+    pub(crate) at: u32,
 }
 
 /// The entries a frame lists: the one of a single frame or a head held in
@@ -364,6 +375,25 @@ pub(crate) struct DecodedFrame {
 }
 
 impl DecodedFrame {
+    /// Whether the frame is a packed block, whose values a handle names by
+    /// their records' offsets.
+    #[must_use]
+    pub(crate) fn is_packed(&self) -> bool {
+        self.header.flags & super::packed::FLAG_PACKED != 0
+    }
+
+    /// The place in the list of the value a handle's `index` names: the
+    /// place itself, or in a packed block the value whose record starts there.
+    #[must_use]
+    pub(crate) fn place_of(&self, index: u16) -> Option<usize> {
+        if !self.is_packed() {
+            return Some(usize::from(index));
+        }
+        self.list
+            .binary_search_by_key(&u32::from(index), |entry| entry.at)
+            .ok()
+    }
+
     /// The key of entry `at`.
     #[must_use]
     pub(crate) fn key(&self, at: usize) -> Option<&[u8]> {
@@ -629,6 +659,7 @@ fn parse_entries(header: &FrameHeader, entries: &[u8]) -> crate::Result<FrameEnt
             key: key_start..key_end,
             value_len,
             value: value_at..value_end,
+            at: 0,
         };
         if header.count == 1 {
             only = Some(entry);
@@ -684,6 +715,10 @@ pub(crate) fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, FrameEntr
             expected: crate::Checksum::from_raw(header.checksum),
         });
     }
+    // A packed block's records carry its list, parsed as it is decoded.
+    if header.flags & super::packed::FLAG_PACKED != 0 {
+        return Ok((header, FrameEntries::Many(Vec::new())));
+    }
     let list = parse_entries(&header, entries)?;
     Ok((header, list))
 }
@@ -708,6 +743,16 @@ pub(crate) fn decode_frame(
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
     let entries = bytes.slice(FRAME_HEADER_LEN..entries_end);
     let stored = bytes.slice(entries_end..bytes.len());
+    if header.flags & super::packed::FLAG_PACKED != 0 {
+        return super::packed::decode_packed(
+            header,
+            &stored,
+            compression,
+            #[cfg(zstd_any)]
+            dictionary,
+            decoded,
+        );
+    }
     let raw_len = header.raw_len as usize;
     #[cfg(zstd_any)]
     let (compression, dictionary) = plain_codec(header.flags, compression, dictionary)?;
@@ -744,6 +789,19 @@ pub(crate) fn decode_frame(
 /// plain frame is zstd at the file's level without a dictionary, which a file
 /// training its own dictionary writes before the dictionary exists, whether
 /// or not it ends up with one.
+#[cfg(zstd_any)]
+pub(crate) fn frame_codec<'d>(
+    flags: u8,
+    compression: CompressionType,
+    dictionary: Option<&'d crate::compression::ZstdDictionary>,
+) -> crate::Result<(
+    CompressionType,
+    Option<&'d crate::compression::ZstdDictionary>,
+)> {
+    plain_codec(flags, compression, dictionary)
+}
+
+/// [`frame_codec`] for this module.
 #[cfg(zstd_any)]
 fn plain_codec<'d>(
     flags: u8,
@@ -1072,6 +1130,69 @@ fn compress(payload: &[u8], codec: Codec<'_>) -> crate::Result<Option<Vec<u8>>> 
         }
     };
     Ok((compressed.len() < payload.len()).then_some(compressed))
+}
+
+/// `payload` compressed under `codec`, or `None` when that saves nothing.
+///
+/// # Errors
+///
+/// Propagates the compression.
+pub(crate) fn compress_payload(payload: &[u8], codec: Codec<'_>) -> crate::Result<Option<Vec<u8>>> {
+    compress(payload, codec)
+}
+
+/// `stored` decompressed under `compression` into exactly `raw_len` bytes.
+///
+/// # Errors
+///
+/// A decompression that fails or produces another length.
+pub(crate) fn decompress_payload(
+    stored: &[u8],
+    raw_len: usize,
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    decoded: &mut usize,
+) -> crate::Result<Slice> {
+    decompress(
+        stored,
+        raw_len,
+        compression,
+        #[cfg(zstd_any)]
+        dictionary,
+        decoded,
+    )
+}
+
+/// The header of a frame of `kind` and `flags` listing `count` values whose
+/// entries take `entries_len` bytes, `raw_len` decoded, over `stored`, its
+/// entries and payload as stored.
+#[must_use]
+pub(crate) fn stamp_header(
+    kind: FrameKind,
+    flags: u8,
+    count: u16,
+    entries_len: u32,
+    raw_len: u32,
+    stored: &[u8],
+) -> [u8; FRAME_HEADER_LEN] {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a frame's stored bytes are bounded by the value cap"
+    )]
+    let disk_len = stored.len() as u32 - entries_len;
+    let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
+    let checksum = frame_checksum(stored, crc);
+    let mut header = [0_u8; FRAME_HEADER_LEN];
+    let mut put = Put::new(&mut header);
+    put.bytes(&FRAME_MAGIC);
+    put.bytes(&[kind as u8, flags]);
+    put.bytes(&count.to_le_bytes());
+    put.bytes(&entries_len.to_le_bytes());
+    put.bytes(&raw_len.to_le_bytes());
+    put.bytes(&disk_len.to_le_bytes());
+    put.bytes(&crc.to_le_bytes());
+    put.bytes(&checksum.to_le_bytes());
+    header
 }
 
 /// One value a frame lists: its key, sequence number and length.

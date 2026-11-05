@@ -198,7 +198,13 @@ pub(crate) fn resolve_value_handle(
             // A reference to an object the version no longer holds is damage,
             // reported as such rather than read as an empty field.
             accessor
-                .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
+                .get_stored(
+                    tree_id,
+                    &item.key.user_key,
+                    &vptr.vhandle,
+                    vptr.stored,
+                    cache,
+                )?
                 .ok_or(crate::Error::InvalidHeader(
                     "field row: a reference names a blob file the version does not hold",
                 ))
@@ -225,7 +231,13 @@ pub(crate) fn resolve_value_handle(
         // An indirection naming a blob file the version does not hold is
         // damage, reported as such, the way a cell row's dangling reference is.
         let value = accessor
-            .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
+            .get_stored(
+                tree_id,
+                &item.key.user_key,
+                &vptr.vhandle,
+                vptr.stored,
+                cache,
+            )?
             .ok_or(crate::Error::InvalidHeader(
                 "blob tree: an indirection names a blob file the version does not hold",
             ))?;
@@ -524,7 +536,13 @@ impl BlobSource {
             #[cfg(feature = "metrics")]
             Some(&self.metrics),
         )
-        .get(self.tree_id, key, &indirection.vhandle, &self.cache)?
+        .get_stored(
+            self.tree_id,
+            key,
+            &indirection.vhandle,
+            indirection.stored,
+            &self.cache,
+        )?
         .ok_or(crate::Error::InvalidHeader(
             "field row: a reference names a blob file the version does not hold",
         ))

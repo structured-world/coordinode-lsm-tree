@@ -85,6 +85,12 @@ impl Default for FrameSizes {
 /// block never closes small for want of room for one more value.
 pub(crate) const BLOCK_FILL_PERCENT: u64 = 90;
 
+/// The records a packed block gathers before it closes. A read of one value
+/// reads its record alone whatever the block holds; the block's size is what
+/// a scan, a collection and the frame index see.
+#[cfg(zstd_any)]
+const PACKED_TARGET: usize = 32 * 1024;
+
 /// Where a written value lies: the frame that holds it (a head for a chunked
 /// value) and its place in the frame's list, and the bytes it takes (see
 /// [`crate::blob_tree::handle::BlobIndirection::stored`]).
@@ -266,6 +272,16 @@ pub(crate) struct Writer {
     /// The block the next small value joins.
     block: PendingBlock,
 
+    /// The records of the packed block the next small value joins under the
+    /// file's own dictionary, back to back, how many, and their values'
+    /// bytes.
+    #[cfg(zstd_any)]
+    packed: Vec<u8>,
+    #[cfg(zstd_any)]
+    packed_count: u16,
+    #[cfg(zstd_any)]
+    packed_raw: u64,
+
     /// A frame being encoded, kept so a writer allocates it once.
     scratch: Vec<u8>,
 
@@ -441,6 +457,12 @@ impl Writer {
             dictionary_classes: crate::config::DictionaryClasses::DEFAULT,
             frames: Vec::new(),
             block: PendingBlock::default(),
+            #[cfg(zstd_any)]
+            packed: Vec::new(),
+            #[cfg(zstd_any)]
+            packed_count: 0,
+            #[cfg(zstd_any)]
+            packed_raw: 0,
             scratch: Vec::new(),
             #[cfg(feature = "std")]
             parallel: None,
@@ -645,8 +667,10 @@ impl Writer {
     /// [`crate::Error::InvalidHeader`] for a file that already wrote values
     /// toward its own dictionary.
     fn leave_file_dictionary(&mut self) -> crate::Result<()> {
+        // A file that holds its dictionary takes frames of that codec, its
+        // own; only one still gathering values toward it cannot.
         #[cfg(zstd_any)]
-        if self.file_dictionary_on() {
+        if self.collecting_dictionary() {
             if self.item_count > 0 {
                 return Err(crate::Error::InvalidHeader(
                     "verbatim frames into a file building its own dictionary",
@@ -666,7 +690,11 @@ impl Writer {
     /// Bytes the file holds so far, the values waiting for their block counted.
     #[must_use]
     pub(crate) fn len_written(&self) -> u64 {
-        self.offset + self.block.len()
+        #[cfg(zstd_any)]
+        let packed = self.packed.len() as u64;
+        #[cfg(not(zstd_any))]
+        let packed = 0;
+        self.offset + self.block.len() + packed
     }
 
     /// The codec a frame of `kind` is compressed under: the file's, without
@@ -850,8 +878,10 @@ impl Writer {
         Ok(())
     }
 
-    /// Writes the block waiting for its values, if any.
+    /// Writes the block waiting for its values, packed or not, if any.
     fn close_block(&mut self) -> crate::Result<()> {
+        #[cfg(zstd_any)]
+        self.close_packed()?;
         if self.block.is_empty() {
             return Ok(());
         }
@@ -917,15 +947,20 @@ impl Writer {
             block_target,
             chunk_size,
         } = self.sizes;
-        // Under the file's own dictionary a small value is a frame of its
-        // own, read without its neighbours, and a sample until the dictionary
-        // exists.
+        // Under the file's own dictionary a small value is a record of its
+        // own in a packed block, read without its neighbours, and a sample
+        // until the dictionary exists.
         #[cfg(zstd_any)]
-        let (block_target, sample) = if self.file_dictionary_on() {
-            (0, value_len < block_target && self.collecting_dictionary())
-        } else {
-            (block_target, false)
-        };
+        if self.file_dictionary_on() && value_len < block_target {
+            let sample = self.collecting_dictionary();
+            let at = self.write_packed(key, seqno, value)?;
+            self.note_key(key, value_len);
+            if sample {
+                self.sample_for_dictionary(value);
+            }
+            self.writeback_if_due()?;
+            return Ok(at);
+        }
         let at = if value_len < block_target {
             // A block is sized by its entries, keys and values alike: small
             // values under long keys would otherwise fill it with keys.
@@ -999,12 +1034,76 @@ impl Writer {
             }
         };
         self.note_key(key, value_len);
-        #[cfg(zstd_any)]
-        if sample {
-            self.sample_for_dictionary(value);
-        }
         self.writeback_if_due()?;
         Ok(at)
+    }
+
+    /// Writes `value` as a record of the packed block being gathered, closing
+    /// it first when it holds its target or a record starting past it would
+    /// not be named by a handle's index.
+    #[cfg(zstd_any)]
+    fn write_packed(&mut self, key: &[u8], seqno: SeqNo, value: &[u8]) -> crate::Result<FrameRef> {
+        use super::packed::{PACKED_REACH, encode_record};
+
+        if !self.packed.is_empty()
+            && (self.packed.len() >= PACKED_TARGET
+                || self.packed.len() > PACKED_REACH
+                || self.packed_count == u16::MAX)
+        {
+            self.close_packed()?;
+        }
+        let frame = self.next_frame()?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a packed block closes before a record would start past u16::MAX"
+        )]
+        let index = self.packed.len() as u16;
+        let mut records = core::mem::take(&mut self.packed);
+        let encoded = encode_record(
+            &mut records,
+            key,
+            seqno,
+            value,
+            self.codec(FrameKind::Block),
+        );
+        self.packed = records;
+        let len = encoded?;
+        self.packed_count += 1;
+        self.packed_raw += value.len() as u64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a record holds a value below the block target and a u16 key"
+        )]
+        let len = len as u32;
+        self.block_entry_bytes += u64::from(len);
+        Ok(FrameRef {
+            frame,
+            index,
+            stored: crate::blob_tree::handle::Stored::Packed(len),
+        })
+    }
+
+    /// Writes the packed block being gathered, if any.
+    #[cfg(zstd_any)]
+    fn close_packed(&mut self) -> crate::Result<()> {
+        if self.packed.is_empty() {
+            return Ok(());
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a packed block holds less than one record past u16::MAX bytes of values"
+        )]
+        let raw_len = self.packed_raw as u32;
+        let header = super::packed::packed_header(self.packed_count, raw_len, &self.packed);
+        let records = core::mem::take(&mut self.packed);
+        let before = self.offset;
+        let written = self.put_frame_parts(&header, &records);
+        self.block_frame_bytes += self.offset - before;
+        self.packed = records;
+        self.packed.clear();
+        self.packed_count = 0;
+        self.packed_raw = 0;
+        written
     }
 
     /// Writes `frames`, the encoded frames of one whole value (a single frame,
@@ -1089,6 +1188,17 @@ impl Writer {
         let before = self.offset;
         self.put_frame(stored)?;
         self.block_frame_bytes += self.offset - before;
+        if header.flags & super::packed::FLAG_PACKED != 0 {
+            // Its values are its records, each charged as it lies.
+            let mut at = 0;
+            while let Some(rest) = entries.get(at..).filter(|rest| !rest.is_empty()) {
+                let record = super::packed::parse_record(rest)?;
+                let key = rest.get(record.key.clone()).unwrap_or_default();
+                self.block_entry_bytes += record.len as u64;
+                self.note_key(key, record.value_len);
+                at += record.len;
+            }
+        }
         for entry in list.iter() {
             let key = entries.get(entry.key.clone()).unwrap_or_default();
             self.block_entry_bytes +=

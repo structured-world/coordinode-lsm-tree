@@ -344,6 +344,76 @@ impl<'a> Accessor<'a> {
         self.read(tree_id, key, vhandle, None, cache)
     }
 
+    /// Reads one separated value whole, `stored` what its table records of
+    /// it: a value with a record of its own in a packed block is read as that
+    /// record alone, any other as [`Self::get`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get`], and a record that does not check or is not `key`'s.
+    pub(crate) fn get_stored(
+        &self,
+        tree_id: TreeId,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        stored: crate::blob_tree::handle::Stored,
+        cache: &Cache,
+    ) -> crate::Result<Option<UserValue>> {
+        let crate::blob_tree::handle::Stored::Packed(len) = stored else {
+            return self.get(tree_id, key, vhandle, cache);
+        };
+        let Some(blob_file) = self.blob_files.get(vhandle.blob_file_id) else {
+            return Ok(None);
+        };
+        // A packed block read whole before, for a scan or a fill, answers.
+        if let Some(frame) = cache.get_blob_frame(tree_id, vhandle.frame_at()) {
+            return value_in(&frame, vhandle.index, key).map(Some);
+        }
+        self.read_record(tree_id, blob_file, key, vhandle, len)
+            .map(Some)
+    }
+
+    /// The record of `len` bytes `vhandle` names in its packed block of
+    /// `blob_file`, read alone, checked and decoded.
+    fn read_record(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        len: u32,
+    ) -> crate::Result<UserValue> {
+        use crate::vlog::blob_file::{frame::FRAME_HEADER_LEN, packed};
+
+        let malformed = || crate::Error::InvalidHeader("BlobRecord");
+        let (start, end) = blob_file.frame_span(vhandle.frame).ok_or_else(malformed)?;
+        let at = start + FRAME_HEADER_LEN as u64 + u64::from(vhandle.index);
+        if at + u64::from(len) > end {
+            return Err(malformed());
+        }
+        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
+        let (file, _) = blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
+        self.count_request(len as usize);
+        let bytes = crate::file::read_exact(file.as_ref(), at, len as usize)?;
+        let record = packed::parse_record(&bytes)?;
+        if record.len != bytes.len() || bytes.get(record.key.clone()) != Some(key) {
+            return Err(malformed());
+        }
+        let mut decoded = 0;
+        let value = packed::record_value(
+            &record,
+            &bytes,
+            blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            blob_file.0.zstd_dictionary.as_deref(),
+            &mut decoded,
+        );
+        self.count_decoded(decoded);
+        value
+    }
+
     /// Reads bytes `range` of one separated value: of a chunked value, only
     /// the chunks the range covers are read.
     ///
