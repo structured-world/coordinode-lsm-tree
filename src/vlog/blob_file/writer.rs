@@ -627,6 +627,15 @@ impl Writer {
             && matches!(self.compression, CompressionType::Zstd(_))
     }
 
+    /// Whether small values are packed records rather than block entries:
+    /// under the file's own dictionary, and in a file that compresses
+    /// nothing, where a block gains nothing from sharing.
+    #[cfg(zstd_any)]
+    fn packs(&self) -> bool {
+        self.file_dictionary_on()
+            || (self.file_dictionary > 0 && self.compression == CompressionType::None)
+    }
+
     /// Whether values are written a frame each under the file's own
     /// dictionary, built or being built.
     #[cfg(zstd_any)]
@@ -951,7 +960,7 @@ impl Writer {
         // own in a packed block, read without its neighbours, and a sample
         // until the dictionary exists.
         #[cfg(zstd_any)]
-        if self.file_dictionary_on() && value_len < block_target {
+        if self.packs() && value_len < block_target {
             let sample = self.collecting_dictionary();
             let at = self.write_packed(key, seqno, value)?;
             self.note_key(key, value_len);
