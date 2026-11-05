@@ -531,9 +531,13 @@ impl CompressionProvider for ZstdProvider {
         // structured-zstd). This eliminates the per-thread `Dictionary` re-parse
         // the cache used to do on every miss — the dictionary's entropy tables
         // are built once globally and the FrameDecoder just shares the Arc.
+        // Several dictionaries at once: blob files that each hold a
+        // dictionary of their own interleave in reads, and one slot would
+        // rebuild the decoder at every switch.
+        const DECODERS: usize = 8;
         thread_local! {
-            static TLS_DECODER: std::cell::RefCell<Option<(u64, FrameDecoder)>> =
-                const { std::cell::RefCell::new(None) };
+            static TLS_DECODERS: std::cell::RefCell<Vec<(u64, FrameDecoder)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
 
         // For raw-content dicts `FrameDecoder::init` does not auto-resolve
@@ -549,26 +553,33 @@ impl CompressionProvider for ZstdProvider {
             .raw()
             .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
 
-        TLS_DECODER.with(|cell| {
-            let mut state = cell.borrow_mut();
+        TLS_DECODERS.with(|cell| {
+            let mut decoders = cell.borrow_mut();
 
-            // Re-initialise if this is the first call in this thread or if
-            // the dictionary has changed (different id64 → different table).
-            if !matches!(&*state, Some((id, _)) if *id == dict.id64()) {
-                // Pull the shared pre-parsed handle from the dictionary. First
-                // caller across all threads parses; everyone after gets an Arc
-                // clone of the cached entropy tables.
-                let handle = dict.prepared_handle()?;
-                let mut decoder = FrameDecoder::new();
-                decoder
-                    .add_dict_handle(handle)
-                    .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-                *state = Some((dict.id64(), decoder));
+            // The decoder of this dictionary moves to the front; a miss builds
+            // one there, evicting the least recently used past the bound.
+            match decoders.iter().position(|(id, _)| *id == dict.id64()) {
+                Some(0) => {}
+                Some(at) => {
+                    let found = decoders.remove(at);
+                    decoders.insert(0, found);
+                }
+                None => {
+                    // Pull the shared pre-parsed handle from the dictionary.
+                    // First caller across all threads parses; everyone after
+                    // gets an Arc clone of the cached entropy tables.
+                    let handle = dict.prepared_handle()?;
+                    let mut decoder = FrameDecoder::new();
+                    decoder
+                        .add_dict_handle(handle)
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                    decoders.truncate(DECODERS - 1);
+                    decoders.insert(0, (dict.id64(), decoder));
+                }
             }
 
-            // Unreachable: the branch above always initialises `state`.
-            let Some((_, decoder)) = state.as_mut() else {
-                unreachable!("TLS_DECODER always initialised above");
+            let Some((_, decoder)) = decoders.first_mut() else {
+                unreachable!("the decoder of this dictionary is at the front");
             };
 
             do_decompress_with_dict(decoder, data, dict.frame_id(), capacity, is_raw_content)

@@ -233,6 +233,21 @@ pub(crate) struct Writer {
     #[cfg(zstd_any)]
     pub(crate) zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 
+    /// The bytes of the dictionary a zstd file builds from its own first
+    /// values, `0` for none: see [`Self::use_file_dictionary`].
+    #[cfg(zstd_any)]
+    file_dictionary: u32,
+
+    /// The values collected toward the file's dictionary while it does not
+    /// exist yet, back to back.
+    #[cfg(zstd_any)]
+    dictionary_samples: Vec<u8>,
+
+    /// Whether [`Self::zstd_dictionary`] is the file's own, built from its
+    /// values and written into it.
+    #[cfg(zstd_any)]
+    pub(crate) dictionary_in_file: bool,
+
     /// Whether zstd levels 19-22 run the `btultra2` two-pass seed. Defaults to
     /// `true`, the codec's own behaviour; set from the live runtime config via
     /// [`Self::use_zstd_two_pass_seed`].
@@ -414,6 +429,12 @@ impl Writer {
             #[cfg(zstd_any)]
             zstd_dictionary: None,
             #[cfg(zstd_any)]
+            file_dictionary: 0,
+            #[cfg(zstd_any)]
+            dictionary_samples: Vec::new(),
+            #[cfg(zstd_any)]
+            dictionary_in_file: false,
+            #[cfg(zstd_any)]
             zstd_two_pass_seed: true,
 
             sizes: FrameSizes::DEFAULT,
@@ -554,6 +575,88 @@ impl Writer {
         self
     }
 
+    /// Builds a dictionary of `bytes` from this file's own first values when
+    /// it compresses with zstd and no dictionary: every value up to the chunk
+    /// size then gets a frame of its own, none shares a block, and a value is
+    /// compressed with the file's dictionary once the file holds one, so a
+    /// read of a value decodes that value alone. The values written before
+    /// the dictionary exists are compressed without it. `0` builds none.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub(crate) fn use_file_dictionary(mut self, bytes: u32) -> Self {
+        self.set_file_dictionary(bytes);
+        self
+    }
+
+    /// [`Self::use_file_dictionary`] on a writer that holds nothing yet: a
+    /// file that wrote a value keeps the dictionary it began with.
+    #[cfg(zstd_any)]
+    pub(crate) fn set_file_dictionary(&mut self, bytes: u32) {
+        if self.item_count == 0 && !self.dictionary_in_file {
+            self.file_dictionary = bytes;
+        }
+    }
+
+    /// Whether this file is collecting values toward a dictionary of its own.
+    #[cfg(zstd_any)]
+    fn collecting_dictionary(&self) -> bool {
+        self.file_dictionary > 0
+            && !self.dictionary_in_file
+            && matches!(self.compression, CompressionType::Zstd(_))
+    }
+
+    /// Whether values are written a frame each under the file's own
+    /// dictionary, built or being built.
+    #[cfg(zstd_any)]
+    fn file_dictionary_on(&self) -> bool {
+        self.dictionary_in_file || self.collecting_dictionary()
+    }
+
+    /// Takes `value` toward the file's dictionary, and builds it once the
+    /// samples fill it: the dictionary is the samples as they are, raw
+    /// content a frame's matches reach back into, the latest last.
+    #[cfg(zstd_any)]
+    fn sample_for_dictionary(&mut self, value: &[u8]) {
+        let CompressionType::Zstd(level) = self.compression else {
+            return;
+        };
+        let want = self.file_dictionary as usize;
+        let room = want - self.dictionary_samples.len();
+        self.dictionary_samples
+            .extend_from_slice(value.get(..room.min(value.len())).unwrap_or_default());
+        if self.dictionary_samples.len() < want {
+            return;
+        }
+        let dict = crate::compression::ZstdDictionary::new(&self.dictionary_samples);
+        self.compression = CompressionType::ZstdDict {
+            level,
+            dict_id: dict.id(),
+        };
+        self.zstd_dictionary = Some(alloc::sync::Arc::new(dict));
+        self.dictionary_in_file = true;
+        self.dictionary_samples = Vec::new();
+    }
+
+    /// Stops building a dictionary of the file's own before frames encoded
+    /// elsewhere are copied in as they are: a file records one codec, theirs.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] for a file that already wrote values
+    /// toward its own dictionary.
+    fn leave_file_dictionary(&mut self) -> crate::Result<()> {
+        #[cfg(zstd_any)]
+        if self.file_dictionary_on() {
+            if self.item_count > 0 {
+                return Err(crate::Error::InvalidHeader(
+                    "verbatim frames into a file building its own dictionary",
+                ));
+            }
+            self.file_dictionary = 0;
+        }
+        Ok(())
+    }
+
     /// Returns the blob file ID.
     #[must_use]
     pub(crate) fn blob_file_id(&self) -> BlobFileId {
@@ -569,6 +672,17 @@ impl Writer {
     /// The codec a frame of `kind` is compressed under: the file's, without
     /// its dictionary for a class the dictionary does not apply to.
     fn codec(&self, kind: FrameKind) -> Codec<'_> {
+        // Before the file's own dictionary exists: its level, no dictionary,
+        // said so by the frame, as the file will record the dictionary codec.
+        #[cfg(zstd_any)]
+        if self.collecting_dictionary() {
+            return Codec {
+                compression: self.compression,
+                dictionary: None,
+                two_pass_seed: self.zstd_two_pass_seed,
+                plain: true,
+            };
+        }
         #[cfg(zstd_any)]
         if let CompressionType::ZstdDict { level, .. } = self.compression
             && !self.dictionary_classes.covers(kind)
@@ -803,6 +917,15 @@ impl Writer {
             block_target,
             chunk_size,
         } = self.sizes;
+        // Under the file's own dictionary a small value is a frame of its
+        // own, read without its neighbours, and a sample until the dictionary
+        // exists.
+        #[cfg(zstd_any)]
+        let (block_target, sample) = if self.file_dictionary_on() {
+            (0, value_len < block_target && self.collecting_dictionary())
+        } else {
+            (block_target, false)
+        };
         let at = if value_len < block_target {
             // A block is sized by its entries, keys and values alike: small
             // values under long keys would otherwise fill it with keys.
@@ -876,6 +999,10 @@ impl Writer {
             }
         };
         self.note_key(key, value_len);
+        #[cfg(zstd_any)]
+        if sample {
+            self.sample_for_dictionary(value);
+        }
         self.writeback_if_due()?;
         Ok(at)
     }
@@ -896,6 +1023,7 @@ impl Writer {
         value_len: u32,
     ) -> crate::Result<FrameRef> {
         let malformed = || crate::Error::InvalidHeader("verbatim blob frames");
+        self.leave_file_dictionary()?;
         let first = frames.first().ok_or_else(malformed)?;
         let header = super::frame::parse_header(first)?;
         let chunks = frames.len() - 1;
@@ -948,6 +1076,7 @@ impl Writer {
     /// [`crate::Error::InvalidHeader`] when `stored` is not a block, a frame
     /// that does not check, and any IO error.
     pub(crate) fn write_block_verbatim(&mut self, stored: &[u8]) -> crate::Result<u32> {
+        self.leave_file_dictionary()?;
         let (header, list) = super::frame::check_frame(stored)?;
         if header.kind != FrameKind::Block {
             return Err(crate::Error::InvalidHeader("verbatim blob block"));
@@ -990,6 +1119,16 @@ impl Writer {
     /// Any IO error.
     pub(crate) fn finish(mut self) -> crate::Result<(Metadata, Checksum, alloc::sync::Arc<[u64]>)> {
         self.close_block()?;
+
+        // The file's own dictionary, which its reader decodes with: what the
+        // codec it records names, since a dictionary's id is its content's.
+        #[cfg(zstd_any)]
+        if self.dictionary_in_file
+            && let Some(dict) = &self.zstd_dictionary
+        {
+            self.writer.start("dict")?;
+            self.writer.write_all(dict.raw())?;
+        }
 
         self.writer.start("frames")?;
         let index = encode_frame_index(&self.frames, self.offset);

@@ -1581,6 +1581,9 @@ impl RelocatingCompaction {
             .rate_limiter
             .request_interruptible(read, || self.stop_signal.is_stopped());
 
+        // A file's own dictionary goes with its frames into the file that
+        // copies them, which holds it as its own.
+        self.blob_writer.lend_dictionary(blob_file);
         self.blob_writer.select_output(
             blob_file.compression(),
             self.blob_writer
@@ -1780,6 +1783,15 @@ impl RelocatingCompaction {
                 .request_interruptible(claimed.value.len() as u64, || {
                     self.stop_signal.is_stopped()
                 });
+            // A file's own dictionary goes with its frames into the file that
+            // copies them, which holds it as its own.
+            if let Some(file) = self
+                .rewriting_blob_files
+                .iter()
+                .find(|file| file.id() == blob_file_id)
+            {
+                self.blob_writer.lend_dictionary(file);
+            }
             self.blob_writer.select_output(source_codec, class)?;
             match &claimed.frames {
                 Some(frames) => {

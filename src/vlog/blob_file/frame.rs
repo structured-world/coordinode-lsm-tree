@@ -710,16 +710,10 @@ pub(crate) fn decode_frame(
     let stored = bytes.slice(entries_end..bytes.len());
     let raw_len = header.raw_len as usize;
     #[cfg(zstd_any)]
-    let (compression, dictionary) = if header.flags & FLAG_PLAIN == 0 {
-        (compression, dictionary)
-    } else if let CompressionType::ZstdDict { level, .. } = compression {
-        (CompressionType::Zstd(level), None)
-    } else {
-        return Err(crate::Error::InvalidHeader("BlobFrame"));
-    };
+    let (compression, dictionary) = plain_codec(header.flags, compression, dictionary)?;
     #[cfg(not(zstd_any))]
     if header.flags & FLAG_PLAIN != 0 {
-        // Only a dictionary codec writes a plain frame.
+        // Only a zstd codec writes a plain frame.
         return Err(crate::Error::InvalidHeader("BlobFrame"));
     }
     let payload = if header.is_raw() || compression == CompressionType::None {
@@ -746,8 +740,31 @@ pub(crate) fn decode_frame(
     })
 }
 
-/// The codec a chunk of `spec` under a file of `compression` decodes with: a
-/// plain chunk under a dictionary codec, its level without the dictionary.
+/// The codec a frame of `flags` under a file of `compression` decodes with: a
+/// plain frame is zstd at the file's level without a dictionary, which a file
+/// training its own dictionary writes before the dictionary exists, whether
+/// or not it ends up with one.
+#[cfg(zstd_any)]
+fn plain_codec<'d>(
+    flags: u8,
+    compression: CompressionType,
+    dictionary: Option<&'d crate::compression::ZstdDictionary>,
+) -> crate::Result<(
+    CompressionType,
+    Option<&'d crate::compression::ZstdDictionary>,
+)> {
+    if flags & FLAG_PLAIN == 0 {
+        return Ok((compression, dictionary));
+    }
+    match compression {
+        CompressionType::ZstdDict { level, .. } | CompressionType::Zstd(level) => {
+            Ok((CompressionType::Zstd(level), None))
+        }
+        _ => Err(crate::Error::InvalidHeader("BlobFrame")),
+    }
+}
+
+/// The codec a chunk of `spec` under a file of `compression` decodes with.
 #[cfg(zstd_any)]
 fn chunk_codec<'d>(
     spec: &ChunkSpec,
@@ -757,13 +774,7 @@ fn chunk_codec<'d>(
     CompressionType,
     Option<&'d crate::compression::ZstdDictionary>,
 )> {
-    if spec.flags & FLAG_PLAIN == 0 {
-        Ok((compression, dictionary))
-    } else if let CompressionType::ZstdDict { level, .. } = compression {
-        Ok((CompressionType::Zstd(level), None))
-    } else {
-        Err(crate::Error::InvalidHeader("BlobFrame"))
-    }
+    plain_codec(spec.flags, compression, dictionary)
 }
 
 /// The codec a chunk of `spec` under a file of `compression` decodes with:

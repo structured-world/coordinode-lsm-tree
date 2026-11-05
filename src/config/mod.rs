@@ -299,6 +299,11 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub dictionary_classes: DictionaryClasses,
 
+    /// The bytes of the dictionary a zstd blob file builds from its own
+    /// values, `0` for none. See [`Self::file_dictionary`].
+    #[doc(hidden)]
+    pub file_dictionary: u32,
+
     /// Separation thresholds of the fields of rows written as cells, as
     /// `(column, bytes)` pairs; a column without one uses
     /// `separation_threshold`. See [`Self::cell_separation_threshold`].
@@ -453,6 +458,7 @@ impl Default for KvSeparationOptions {
             )
             .expect("the default chunk size is not zero"),
             dictionary_classes: DictionaryClasses::DEFAULT,
+            file_dictionary: 0,
             cell_separation_thresholds: alloc::vec::Vec::new(),
 
             staleness_threshold: 0.25,
@@ -586,6 +592,23 @@ impl KvSeparationOptions {
     #[must_use]
     pub fn dictionary_classes(mut self, classes: DictionaryClasses) -> Self {
         self.dictionary_classes = classes;
+        self
+    }
+
+    /// Sets the bytes of the dictionary each zstd blob file builds from its
+    /// own values, `0` for none.
+    ///
+    /// A blob file under `CompressionType::Zstd` then gives every value up to
+    /// the chunk size a frame of its own, none shares a block, and compresses
+    /// each with a dictionary of its first small values, stored in the file:
+    /// a small value gains most of what a block's neighbours give it, and a
+    /// read of it decodes that value alone. The values written before the
+    /// dictionary fills are compressed without it.
+    ///
+    /// Defaults to `0`.
+    #[must_use]
+    pub fn file_dictionary(mut self, bytes: u32) -> Self {
+        self.file_dictionary = bytes;
         self
     }
 

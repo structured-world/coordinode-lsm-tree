@@ -212,6 +212,8 @@ pub(crate) fn recover_blob_files(
             let mut file = fs.open(blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
 
             let (meta, frames) = read_meta_and_frames(&mut file, blob_file_id)?;
+            #[cfg(zstd_any)]
+            let own_dictionary = read_file_dictionary(&mut file, &meta)?;
 
             // With a descriptor cache the file is closed once its metadata is
             // read, and reopened through the cache by its first read: holding
@@ -238,7 +240,12 @@ pub(crate) fn recover_blob_files(
                 // still restore it, rather than turning every value in the
                 // file into a failed read far from the cause.
                 #[cfg(zstd_any)]
-                zstd_dictionary: zstd_dictionaries.for_compression(meta.compression)?,
+                dictionary_in_file: own_dictionary.is_some(),
+                #[cfg(zstd_any)]
+                zstd_dictionary: match own_dictionary {
+                    Some(dict) => Some(dict),
+                    None => zstd_dictionaries.for_compression(meta.compression)?,
+                },
                 meta,
                 is_deleted: AtomicBool::new(false),
                 punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
@@ -394,6 +401,8 @@ pub(crate) fn recover_blob_file_cached(
 
     // Same read as `recover_blob_files`' per-id branch above.
     let (meta, frames) = read_meta_and_frames(&mut file, id)?;
+    #[cfg(zstd_any)]
+    let own_dictionary = read_file_dictionary(&mut file, &meta)?;
 
     let file: Arc<dyn crate::fs::FsFile> = Arc::from(file);
     let file_accessor = match descriptors {
@@ -417,10 +426,15 @@ pub(crate) fn recover_blob_file_cached(
         // supply. Refusing here would collapse both answers into "not a blob
         // file" and throw that context away.
         #[cfg(zstd_any)]
-        zstd_dictionary: zstd_dictionaries
-            .for_compression(meta.compression)
-            .ok()
-            .flatten(),
+        dictionary_in_file: own_dictionary.is_some(),
+        #[cfg(zstd_any)]
+        zstd_dictionary: match own_dictionary {
+            Some(dict) => Some(dict),
+            None => zstd_dictionaries
+                .for_compression(meta.compression)
+                .ok()
+                .flatten(),
+        },
         meta,
         is_deleted: AtomicBool::new(false),
         punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
@@ -459,6 +473,46 @@ pub(crate) fn read_meta_and_frames(
     let frames =
         blob_file::writer::decode_frame_index(&crate::file::read_exact(&**file, pos, len)?)?;
     Ok((meta, frames))
+}
+
+/// The dictionary a blob file stores of its own, when it does: the one the
+/// codec its metadata records names, since a dictionary's id is its
+/// content's.
+///
+/// # Errors
+///
+/// [`crate::Error::Unrecoverable`] for a stored dictionary another than the
+/// one the metadata names, and any error reading it.
+#[cfg(zstd_any)]
+pub(crate) fn read_file_dictionary(
+    file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
+    meta: &Metadata,
+) -> crate::Result<Option<Arc<crate::compression::ZstdDictionary>>> {
+    let at = {
+        let reader = crate::sfa::Reader::from_reader(file)?;
+        reader
+            .toc()
+            .section(b"dict")
+            .map(|entry| (entry.pos(), entry.len()))
+    };
+    let Some((pos, len)) = at else {
+        return Ok(None);
+    };
+    let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
+    let dict =
+        crate::compression::ZstdDictionary::new(&crate::file::read_exact(&**file, pos, len)?);
+    match meta.compression {
+        crate::CompressionType::ZstdDict { dict_id, .. } if dict_id == dict.id() => {
+            Ok(Some(Arc::new(dict)))
+        }
+        _ => {
+            log::error!(
+                "blob file #{} stores a dictionary its codec does not name",
+                meta.id
+            );
+            Err(crate::Error::Unrecoverable)
+        }
+    }
 }
 
 /// The metadata of the blob file at `path`, without its frame index: what a
