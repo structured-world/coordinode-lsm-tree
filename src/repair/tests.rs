@@ -15004,21 +15004,19 @@ fn the_frontier_walk_steps_over_a_chunked_value_between_holes() -> crate::Result
         .collect::<crate::Result<Vec<_>>>()?;
     assert_eq!(entries.len(), 6, "six separated values");
     let data_start = entries.first().expect("a value").offset;
+    let second = entries.get(1).expect("a second value");
+    let fourth = entries.get(3).expect("a fourth value");
     // Values 0 and 1 reclaimed, value 2 consumed but not yet, value 3
     // reclaimed: the shape a reclaim that punches value by value leaves.
-    memfs.punch_hole(&blob_path, data_start, entries[1].frame_end - data_start)?;
-    memfs.punch_hole(
-        &blob_path,
-        entries[3].offset,
-        entries[3].frame_end - entries[3].offset,
-    )?;
+    memfs.punch_hole(&blob_path, data_start, second.frame_end - data_start)?;
+    memfs.punch_hole(&blob_path, fourth.offset, fourth.frame_end - fourth.offset)?;
 
     let derived = super::derive_blob_frontier(&fs, &blob_path)?;
     assert!(
-        matches!(derived, super::BlobFrontier::Punched(at) if at == entries[3].frame_end),
+        matches!(derived, super::BlobFrontier::Punched(at) if at == fourth.frame_end),
         "the frontier ends with the last hole, past the value in chunks between them: \
          {derived:?}, want {}",
-        entries[3].frame_end,
+        fourth.frame_end,
     );
     Ok(())
 }

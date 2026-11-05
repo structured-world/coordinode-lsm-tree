@@ -16,8 +16,10 @@
 //! and the table its record's length, so a point read reads that record
 //! alone and decodes that value alone: the neighbours a block compresses a
 //! value with are what the file's dictionary gives it here. `checksum` is
-//! xxh3-64 over the rest of the record; the frame's own checksum covers every
-//! record, for a read of the frame whole.
+//! xxh3-64 over the rest of the record. The frame's own checksum is xxh3-128
+//! over its records' checksums in order, seeded with its header's CRC: the
+//! records' bytes are each hashed once, by their own checksums, and a read of
+//! the frame whole checks every record and that they are the frame's.
 
 use super::frame::{
     Codec, DecodedFrame, FLAG_PLAIN, FLAG_RAW, FRAME_HEADER_LEN, FrameEntries, FrameEntry,
@@ -27,6 +29,10 @@ use crate::{CompressionType, SeqNo, Slice};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::ops::Range;
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
+mod tests;
 
 /// A block whose values are records compressed one by one.
 pub(crate) const FLAG_PACKED: u8 = 4;
@@ -41,6 +47,8 @@ pub(crate) const PACKED_REACH: usize = u16::MAX as usize;
 /// One record of a packed block, parsed and checked.
 #[derive(Clone, Debug)]
 pub(crate) struct Record {
+    /// The record's own checksum, as stored.
+    pub(crate) checksum: u64,
     pub(crate) seqno: SeqNo,
     /// Where the key lies in the bytes the record was parsed from.
     pub(crate) key: Range<usize>,
@@ -112,6 +120,26 @@ pub(crate) fn encode_record(
 /// [`crate::Error::InvalidHeader`] for a record that runs past `bytes` or is
 /// malformed, [`crate::Error::ChecksumMismatch`] for one that does not check.
 pub(crate) fn parse_record(bytes: &[u8]) -> crate::Result<Record> {
+    let record = record_fields(bytes)?;
+    let rest = bytes.get(8..record.len).unwrap_or_default();
+    let got = xxhash_rust::xxh3::xxh3_64(rest);
+    if got != record.checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: crate::Checksum::from_raw(u128::from(got)),
+            expected: crate::Checksum::from_raw(u128::from(record.checksum)),
+        });
+    }
+    Ok(record)
+}
+
+/// The fields of the record at the start of `bytes`, its checksum not
+/// checked: for a frame whose records were checked whole.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for a record that runs past `bytes` or is
+/// malformed.
+fn record_fields(bytes: &[u8]) -> crate::Result<Record> {
     let malformed = || crate::Error::InvalidHeader("BlobRecord");
     let field = |at: usize, len: usize| bytes.get(at..at + len).ok_or_else(malformed);
     let u64_at = |at| -> crate::Result<u64> {
@@ -144,15 +172,11 @@ pub(crate) fn parse_record(bytes: &[u8]) -> crate::Result<Record> {
     {
         return Err(malformed());
     }
-    let rest = bytes.get(8..len).ok_or_else(malformed)?;
-    let got = xxhash_rust::xxh3::xxh3_64(rest);
-    if got != checksum {
-        return Err(crate::Error::ChecksumMismatch {
-            got: crate::Checksum::from_raw(u128::from(got)),
-            expected: crate::Checksum::from_raw(u128::from(checksum)),
-        });
+    if bytes.len() < len {
+        return Err(malformed());
     }
     Ok(Record {
+        checksum,
         seqno,
         key,
         value_len,
@@ -201,29 +225,70 @@ pub(crate) fn record_value(
     )
 }
 
-/// The packed block whose header is `header` and whose payload, its records,
-/// is `records`, decoded whole: every value, for a read of the frame whole
-/// (a scan, a collection, a cache fill).
+/// Checks the records of the packed block whose header is `header`, each
+/// against its own checksum and all of them against the frame's, and lists
+/// its values: keys as views into `records`, values where they lie once
+/// decoded back to back.
 ///
 /// # Errors
 ///
-/// A record that does not check or decode, or records that are not the
-/// header's.
+/// A record that does not check, records that are not the header's, or a
+/// frame checksum that does not match.
+pub(crate) fn check_packed(header: &FrameHeader, records: &[u8]) -> crate::Result<FrameEntries> {
+    let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    let count = usize::from(header.count);
+    let mut list = Vec::with_capacity(count);
+    let mut sums = Vec::with_capacity(count * 8);
+    let mut at = 0;
+    let mut decoded = 0_usize;
+    while at < records.len() {
+        let record = parse_record(records.get(at..).unwrap_or_default())?;
+        sums.extend_from_slice(&record.checksum.to_le_bytes());
+        let value_len = record.value_len as usize;
+        list.push(FrameEntry {
+            seqno: record.seqno,
+            key: at + record.key.start..at + record.key.end,
+            value_len: record.value_len,
+            value: decoded..decoded + value_len,
+            at: u32::try_from(at).map_err(|_| malformed())?,
+        });
+        decoded += value_len;
+        at += record.len;
+    }
+    if list.len() != count || decoded != header.raw_len as usize {
+        return Err(malformed());
+    }
+    let checksum = super::frame::frame_checksum(&sums, header.header_crc);
+    if checksum != header.checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: crate::Checksum::from_raw(checksum),
+            expected: crate::Checksum::from_raw(header.checksum),
+        });
+    }
+    Ok(FrameEntries::Many(list))
+}
+
+/// The packed block whose header is `header`, whose payload, its records, is
+/// `records` and whose values `list` lists ([`check_packed`] checked them),
+/// decoded whole: every value, for a read of the frame whole (a scan, a
+/// collection, a cache fill).
+///
+/// # Errors
+///
+/// A record that does not decode to the length it declares.
 pub(crate) fn decode_packed(
     header: FrameHeader,
     records: &Slice,
+    list: FrameEntries,
     compression: CompressionType,
     #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
     decoded: &mut usize,
 ) -> crate::Result<DecodedFrame> {
-    let malformed = || crate::Error::InvalidHeader("BlobFrame");
-    let mut list = Vec::with_capacity(usize::from(header.count));
     let mut payload = Vec::with_capacity(header.raw_len as usize);
-    let mut at = 0;
     *decoded = 0;
-    while at < records.len() {
-        let rest = records.slice(at..records.len());
-        let record = parse_record(&rest)?;
+    for entry in list.iter() {
+        let rest = records.slice(entry.at as usize..records.len());
+        let record = record_fields(&rest)?;
         let mut produced = 0;
         let value = record_value(
             &record,
@@ -234,31 +299,32 @@ pub(crate) fn decode_packed(
             &mut produced,
         );
         *decoded += produced;
-        let value = value?;
-        let start = payload.len();
-        payload.extend_from_slice(&value);
-        list.push(FrameEntry {
-            seqno: record.seqno,
-            key: at + record.key.start..at + record.key.end,
-            value_len: record.value_len,
-            value: start..payload.len(),
-            at: u32::try_from(at).map_err(|_| malformed())?,
-        });
-        at += record.len;
-    }
-    if list.len() != usize::from(header.count) || payload.len() != header.raw_len as usize {
-        return Err(malformed());
+        payload.extend_from_slice(&value?);
     }
     Ok(DecodedFrame {
         header,
         entries: records.clone(),
-        list: FrameEntries::Many(list),
+        list,
         payload: Slice::from(payload),
     })
 }
 
 /// The header of a packed block of `count` records, `raw_len` value bytes
-/// decoded, over `records`.
-pub(crate) fn packed_header(count: u16, raw_len: u32, records: &[u8]) -> [u8; FRAME_HEADER_LEN] {
-    super::frame::stamp_header(FrameKind::Block, FLAG_PACKED, count, 0, raw_len, records)
+/// decoded, `records_len` bytes long, whose records' checksums are `sums` in
+/// order.
+pub(crate) fn packed_header(
+    count: u16,
+    raw_len: u32,
+    records_len: u32,
+    sums: &[u8],
+) -> [u8; FRAME_HEADER_LEN] {
+    super::frame::stamp_header(
+        FrameKind::Block,
+        FLAG_PACKED,
+        count,
+        0,
+        raw_len,
+        records_len,
+        |crc| super::frame::frame_checksum(sums, crc),
+    )
 }

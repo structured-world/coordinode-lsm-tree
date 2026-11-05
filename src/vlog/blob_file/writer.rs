@@ -273,10 +273,12 @@ pub(crate) struct Writer {
     block: PendingBlock,
 
     /// The records of the packed block the next small value joins under the
-    /// file's own dictionary, back to back, how many, and their values'
-    /// bytes.
+    /// file's own dictionary, back to back, their checksums in order, how
+    /// many, and their values' bytes.
     #[cfg(zstd_any)]
     packed: Vec<u8>,
+    #[cfg(zstd_any)]
+    packed_sums: Vec<u8>,
     #[cfg(zstd_any)]
     packed_count: u16,
     #[cfg(zstd_any)]
@@ -459,6 +461,8 @@ impl Writer {
             block: PendingBlock::default(),
             #[cfg(zstd_any)]
             packed: Vec::new(),
+            #[cfg(zstd_any)]
+            packed_sums: Vec::new(),
             #[cfg(zstd_any)]
             packed_count: 0,
             #[cfg(zstd_any)]
@@ -1077,6 +1081,10 @@ impl Writer {
         );
         self.packed = records;
         let len = encoded?;
+        // A record starts with its checksum.
+        let start = usize::from(index);
+        self.packed_sums
+            .extend_from_slice(self.packed.get(start..start + 8).unwrap_or_default());
         self.packed_count += 1;
         self.packed_raw += value.len() as u64;
         #[expect(
@@ -1103,13 +1111,24 @@ impl Writer {
             reason = "a packed block holds less than one record past u16::MAX bytes of values"
         )]
         let raw_len = self.packed_raw as u32;
-        let header = super::packed::packed_header(self.packed_count, raw_len, &self.packed);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a packed block holds less than one record past u16::MAX bytes"
+        )]
+        let records_len = self.packed.len() as u32;
+        let header = super::packed::packed_header(
+            self.packed_count,
+            raw_len,
+            records_len,
+            &self.packed_sums,
+        );
         let records = core::mem::take(&mut self.packed);
         let before = self.offset;
         let written = self.put_frame_parts(&header, &records);
         self.block_frame_bytes += self.offset - before;
         self.packed = records;
         self.packed.clear();
+        self.packed_sums.clear();
         self.packed_count = 0;
         self.packed_raw = 0;
         written
@@ -1197,21 +1216,17 @@ impl Writer {
         let before = self.offset;
         self.put_frame(stored)?;
         self.block_frame_bytes += self.offset - before;
-        if header.flags & super::packed::FLAG_PACKED != 0 {
+        let packed = header.flags & super::packed::FLAG_PACKED != 0;
+        if packed {
             // Its values are its records, each charged as it lies.
-            let mut at = 0;
-            while let Some(rest) = entries.get(at..).filter(|rest| !rest.is_empty()) {
-                let record = super::packed::parse_record(rest)?;
-                let key = rest.get(record.key.clone()).unwrap_or_default();
-                self.block_entry_bytes += record.len as u64;
-                self.note_key(key, record.value_len);
-                at += record.len;
-            }
+            self.block_entry_bytes += entries.len() as u64;
         }
         for entry in list.iter() {
             let key = entries.get(entry.key.clone()).unwrap_or_default();
-            self.block_entry_bytes +=
-                (super::frame::ENTRY_HEADER_LEN + key.len()) as u64 + u64::from(entry.value_len);
+            if !packed {
+                self.block_entry_bytes += (super::frame::ENTRY_HEADER_LEN + key.len()) as u64
+                    + u64::from(entry.value_len);
+            }
             self.note_key(key, entry.value_len);
         }
         self.writeback_if_due()?;

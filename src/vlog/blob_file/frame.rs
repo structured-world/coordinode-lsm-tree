@@ -40,7 +40,8 @@
 //! what is left.
 //! `header_crc` covers the fixed fields after the magic; `checksum` is
 //! xxh3-128 over the entries and the payload as stored, which lie back to
-//! back, seeded with `header_crc`.
+//! back, seeded with `header_crc`; a packed block's is over its records'
+//! checksums instead (see [`super::packed`]).
 
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
@@ -216,7 +217,7 @@ impl<'b> Put<'b> {
 /// The checksum of a frame's entries and stored payload, `stored` the two as
 /// they lie back to back, seeded with `header_crc` so a header recomputed
 /// after tampering is still caught.
-fn frame_checksum(stored: &[u8], header_crc: u32) -> u128 {
+pub(crate) fn frame_checksum(stored: &[u8], header_crc: u32) -> u128 {
     xxhash_rust::xxh3::xxh3_128_with_seed(stored, u64::from(header_crc))
 }
 
@@ -701,6 +702,11 @@ pub(crate) fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, FrameEntr
     if header.frame_len() != bytes.len() as u64 {
         return Err(crate::Error::InvalidHeader("BlobFrame"));
     }
+    if header.flags & super::packed::FLAG_PACKED != 0 {
+        let records = bytes.get(FRAME_HEADER_LEN..).unwrap_or_default();
+        let list = super::packed::check_packed(&header, records)?;
+        return Ok((header, list));
+    }
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
     let (Some(entries), Some(checked)) = (
         bytes.get(FRAME_HEADER_LEN..entries_end),
@@ -714,10 +720,6 @@ pub(crate) fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, FrameEntr
             got: crate::Checksum::from_raw(checksum),
             expected: crate::Checksum::from_raw(header.checksum),
         });
-    }
-    // A packed block's records carry its list, parsed as it is decoded.
-    if header.flags & super::packed::FLAG_PACKED != 0 {
-        return Ok((header, FrameEntries::Many(Vec::new())));
     }
     let list = parse_entries(&header, entries)?;
     Ok((header, list))
@@ -747,6 +749,7 @@ pub(crate) fn decode_frame(
         return super::packed::decode_packed(
             header,
             &stored,
+            list,
             compression,
             #[cfg(zstd_any)]
             dictionary,
@@ -755,7 +758,7 @@ pub(crate) fn decode_frame(
     }
     let raw_len = header.raw_len as usize;
     #[cfg(zstd_any)]
-    let (compression, dictionary) = plain_codec(header.flags, compression, dictionary)?;
+    let (compression, dictionary) = frame_codec(header.flags, compression, dictionary)?;
     #[cfg(not(zstd_any))]
     if header.flags & FLAG_PLAIN != 0 {
         // Only a zstd codec writes a plain frame.
@@ -790,27 +793,11 @@ pub(crate) fn decode_frame(
 /// training its own dictionary writes before the dictionary exists, whether
 /// or not it ends up with one.
 #[cfg(zstd_any)]
-pub(crate) fn frame_codec<'d>(
+pub(crate) fn frame_codec(
     flags: u8,
     compression: CompressionType,
-    dictionary: Option<&'d crate::compression::ZstdDictionary>,
-) -> crate::Result<(
-    CompressionType,
-    Option<&'d crate::compression::ZstdDictionary>,
-)> {
-    plain_codec(flags, compression, dictionary)
-}
-
-/// [`frame_codec`] for this module.
-#[cfg(zstd_any)]
-fn plain_codec<'d>(
-    flags: u8,
-    compression: CompressionType,
-    dictionary: Option<&'d crate::compression::ZstdDictionary>,
-) -> crate::Result<(
-    CompressionType,
-    Option<&'d crate::compression::ZstdDictionary>,
-)> {
+    dictionary: Option<&crate::compression::ZstdDictionary>,
+) -> crate::Result<(CompressionType, Option<&crate::compression::ZstdDictionary>)> {
     if flags & FLAG_PLAIN == 0 {
         return Ok((compression, dictionary));
     }
@@ -832,7 +819,7 @@ fn chunk_codec<'d>(
     CompressionType,
     Option<&'d crate::compression::ZstdDictionary>,
 )> {
-    plain_codec(spec.flags, compression, dictionary)
+    frame_codec(spec.flags, compression, dictionary)
 }
 
 /// The codec a chunk of `spec` under a file of `compression` decodes with:
@@ -1164,8 +1151,9 @@ pub(crate) fn decompress_payload(
 }
 
 /// The header of a frame of `kind` and `flags` listing `count` values whose
-/// entries take `entries_len` bytes, `raw_len` decoded, over `stored`, its
-/// entries and payload as stored.
+/// entries take `entries_len` bytes, `raw_len` decoded, its payload
+/// `disk_len` stored, its checksum what `checksum` computes from the header's
+/// CRC.
 #[must_use]
 pub(crate) fn stamp_header(
     kind: FrameKind,
@@ -1173,15 +1161,11 @@ pub(crate) fn stamp_header(
     count: u16,
     entries_len: u32,
     raw_len: u32,
-    stored: &[u8],
+    disk_len: u32,
+    checksum: impl FnOnce(u32) -> u128,
 ) -> [u8; FRAME_HEADER_LEN] {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "a frame's stored bytes are bounded by the value cap"
-    )]
-    let disk_len = stored.len() as u32 - entries_len;
     let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
-    let checksum = frame_checksum(stored, crc);
+    let checksum = checksum(crc);
     let mut header = [0_u8; FRAME_HEADER_LEN];
     let mut put = Put::new(&mut header);
     put.bytes(&FRAME_MAGIC);
