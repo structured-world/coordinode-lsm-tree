@@ -22,6 +22,24 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+/// A frame a read holds: shared with the cache and the reads waiting on it,
+/// or the read's own when neither takes it.
+pub(crate) enum HeldFrame {
+    Shared(Arc<DecodedFrame>),
+    Own(DecodedFrame),
+}
+
+impl core::ops::Deref for HeldFrame {
+    type Target = DecodedFrame;
+
+    fn deref(&self) -> &DecodedFrame {
+        match self {
+            Self::Shared(frame) => frame,
+            Self::Own(frame) => frame,
+        }
+    }
+}
+
 /// Frames a read fetched ahead for itself, held by that read instead of the
 /// shared cache: what a scan reads ahead when blob values are not cached.
 ///
@@ -29,7 +47,7 @@ use core::ops::Range;
 /// taken out of one only for the key its frame lists at the handle's index.
 #[derive(Default)]
 pub(crate) struct Prefetched {
-    frames: crate::HashMap<BlobFrameAt, Arc<DecodedFrame>>,
+    frames: crate::HashMap<BlobFrameAt, DecodedFrame>,
 }
 
 impl Prefetched {
@@ -55,16 +73,23 @@ impl Prefetched {
         if self.frames.is_empty() {
             return;
         }
-        self.frames.retain(|at, _| {
-            items
-                .iter()
-                .any(|(_, vhandle, _)| vhandle.frame_at() == *at)
-        });
+        // Moved over by lookup, one per item: matching each held frame against
+        // every item cost a scan's refill the product of the two.
+        let mut held = core::mem::take(&mut self.frames);
+        for (_, vhandle, _) in items {
+            let at = vhandle.frame_at();
+            if let Some(frame) = held.remove(&at) {
+                self.frames.insert(at, frame);
+            }
+            if held.is_empty() {
+                break;
+            }
+        }
     }
 
     /// Holds `frame` as read ahead at `at`.
     #[cfg(test)]
-    pub(crate) fn hold(&mut self, at: BlobFrameAt, frame: Arc<DecodedFrame>) {
+    pub(crate) fn hold(&mut self, at: BlobFrameAt, frame: DecodedFrame) {
         self.frames.insert(at, frame);
     }
 }
@@ -195,13 +220,13 @@ impl<'a> Accessor<'a> {
         blob_file: &BlobFile,
         frame: u32,
         cache: &Cache,
-    ) -> crate::Result<Arc<DecodedFrame>> {
+    ) -> crate::Result<HeldFrame> {
         let at = BlobFrameAt {
             blob_file_id: blob_file.id(),
             frame,
         };
         if let Some(cached) = cache.get_blob_frame(tree_id, at) {
-            return Ok(cached);
+            return Ok(HeldFrame::Shared(cached));
         }
         let lead = match cache.claim_blob_frame(tree_id, at) {
             crate::cache::BlobClaim::Shared(shared) => {
@@ -217,14 +242,14 @@ impl<'a> Accessor<'a> {
                 if caches(self.fill, &shared) && !cache.contains_blob_frame(tree_id, at) {
                     cache.insert_blob_frame(tree_id, at, Arc::clone(&shared));
                 }
-                return Ok(shared);
+                return Ok(HeldFrame::Shared(shared));
             }
             crate::cache::BlobClaim::Lead(lead) => {
                 // A read that finished between the miss above and this claim
                 // left its frame in the cache, when the fill policy let it.
                 if let Some(cached) = cache.get_blob_frame(tree_id, at) {
                     lead.publish(cache, tree_id, at, &cached, false);
-                    return Ok(cached);
+                    return Ok(HeldFrame::Shared(cached));
                 }
                 Some(lead)
             }
@@ -249,16 +274,18 @@ impl<'a> Accessor<'a> {
         let mut decoded = 0;
         let parsed = Reader::decode(blob_file, &bytes, &mut decoded);
         self.count_decoded(decoded);
-        let frame = Arc::new(parsed?);
+        let frame = parsed?;
         cache.record_blob_load(tree_id, at, timer);
-        match lead {
-            Some(lead) => lead.publish(cache, tree_id, at, &frame, caches(self.fill, &frame)),
-            None if caches(self.fill, &frame) => {
+        let fills = caches(self.fill, &frame);
+        Ok(match lead {
+            Some(lead) => lead.publish_owned(cache, tree_id, at, frame, fills),
+            None if fills => {
+                let frame = Arc::new(frame);
                 cache.insert_blob_frame(tree_id, at, Arc::clone(&frame));
+                HeldFrame::Shared(frame)
             }
-            None => {}
-        }
-        Ok(frame)
+            None => HeldFrame::Own(frame),
+        })
     }
 
     /// Reads one separated value whole.
@@ -764,19 +791,31 @@ impl<'a> Accessor<'a> {
             *admit_budget -= weight;
             // A frame decoded as stored is a view into the coalesced read;
             // copied out so it does not keep the whole read alive, unless the
-            // read is that frame alone.
-            let frame = if from == 0 && to == bytes.len() {
-                frame
-            } else {
-                let (frame, copied) = own_frame(frame, blob_file.compression());
-                self.count_gather(copied);
-                frame
-            };
-            let frame = Arc::new(frame);
+            // read is that frame alone. In the read's own store only what it
+            // hands on is: a value stored as it is would pin the read for as
+            // long as its caller holds it, while the entries stay with the
+            // store, which lets the read go with the frame.
+            let whole = from == 0 && to == bytes.len();
             let at = vhandle.frame_at();
             match into {
-                PrefetchInto::Cache => cache.insert_blob_frame(tree_id, at, frame),
+                PrefetchInto::Cache => {
+                    let frame = if whole {
+                        frame
+                    } else {
+                        let (frame, copied) = own_frame(frame, blob_file.compression(), true);
+                        self.count_gather(copied);
+                        frame
+                    };
+                    cache.insert_blob_frame(tree_id, at, Arc::new(frame));
+                }
                 PrefetchInto::Local(store) => {
+                    let frame = if whole {
+                        frame
+                    } else {
+                        let (frame, copied) = own_frame(frame, blob_file.compression(), false);
+                        self.count_gather(copied);
+                        frame
+                    };
                     store.frames.insert(at, frame);
                 }
             }
@@ -836,14 +875,24 @@ fn span_extent(
     })
 }
 
-/// `frame`, decoded from a file under `compression`, holding its own bytes,
-/// and the bytes copied for that: a frame decoded out of a larger read is a
-/// view into it, its payload too when it is stored as it is.
-fn own_frame(frame: DecodedFrame, compression: crate::CompressionType) -> (DecodedFrame, usize) {
+/// `frame`, decoded from a file under `compression`, holding its own payload,
+/// and its own entries too when `entries` says so, and the bytes copied for
+/// that: a frame decoded out of a larger read is a view into it, its payload
+/// too when it is stored as it is.
+fn own_frame(
+    frame: DecodedFrame,
+    compression: crate::CompressionType,
+    entries: bool,
+) -> (DecodedFrame, usize) {
     let stored_as_is = frame.header.is_raw() || compression == crate::CompressionType::None;
-    let copied = frame.entries.len() + if stored_as_is { frame.payload.len() } else { 0 };
+    let copied = if entries { frame.entries.len() } else { 0 }
+        + if stored_as_is { frame.payload.len() } else { 0 };
     let frame = DecodedFrame {
-        entries: crate::Slice::new(&frame.entries),
+        entries: if entries {
+            crate::Slice::new(&frame.entries)
+        } else {
+            frame.entries
+        },
         payload: if stored_as_is {
             crate::Slice::new(&frame.payload)
         } else {

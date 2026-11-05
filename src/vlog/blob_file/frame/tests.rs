@@ -17,6 +17,42 @@ fn codec<'d>(compression: CompressionType) -> Codec<'d> {
     }
 }
 
+/// The writer sums a frame's entries and payload as two parts, the reader as
+/// the one range they make: the two agree at every length, across the input
+/// sizes where xxh3 changes how it hashes, or a frame the writer stamps would
+/// fail its read.
+#[test]
+fn a_checksum_in_two_parts_is_the_checksum_of_the_whole() {
+    let bytes: Vec<u8> = (0..4_096_u32).map(|at| (at * 31 + 7) as u8).collect();
+    for len in [0, 1, 16, 17, 128, 129, 240, 241, 1_024, 4_096] {
+        let whole = &bytes[..len];
+        for split in [0, len / 3, len] {
+            let (entries, payload) = whole.split_at(split);
+            assert_eq!(
+                frame_checksum_parts(entries, payload, 0xdead_beef),
+                frame_checksum(whole, 0xdead_beef),
+                "{len} bytes split at {split}"
+            );
+        }
+    }
+}
+
+/// A single frame lists its one entry in place: decoding a frame of one value
+/// allocates no list for it.
+#[test]
+fn a_single_frame_holds_its_entry_in_place() {
+    let entry = EntrySpec {
+        key: b"k",
+        seqno: 3,
+        value_len: 3,
+    };
+    let mut out = Vec::new();
+    encode_frame(FrameKind::Single, &[entry], b"abc", plain(), &mut out).unwrap();
+    let frame = decode(&out, CompressionType::None).unwrap();
+    assert!(matches!(frame.list, FrameEntries::One(_)));
+    assert_eq!(frame.value(0).as_deref(), Some(&b"abc"[..]));
+}
+
 fn decode(bytes: &[u8], compression: CompressionType) -> crate::Result<DecodedFrame> {
     let mut decoded = 0;
     decode_frame(
@@ -350,7 +386,7 @@ fn forge(kind: FrameKind, stored: &[u8], raw_len: u32) -> Vec<u8> {
     entries.push(b'k');
     let (count, entries_len, disk_len) = (1_u16, entries.len() as u32, stored.len() as u32);
     let crc = header_crc(kind, 0, count, entries_len, raw_len, disk_len);
-    let checksum = frame_checksum(&entries, stored, crc);
+    let checksum = frame_checksum_parts(&entries, stored, crc);
     let mut out = Vec::new();
     out.extend_from_slice(&FRAME_MAGIC);
     out.extend_from_slice(&[kind as u8, 0]);

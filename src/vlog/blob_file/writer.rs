@@ -904,7 +904,7 @@ impl Writer {
         let before = self.offset;
         self.put_frame(stored)?;
         self.block_frame_bytes += self.offset - before;
-        for entry in &list {
+        for entry in list.iter() {
             let key = entries.get(entry.key.clone()).unwrap_or_default();
             self.block_entry_bytes +=
                 (super::frame::ENTRY_HEADER_LEN + key.len()) as u64 + u64::from(entry.value_len);

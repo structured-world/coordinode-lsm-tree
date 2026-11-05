@@ -197,9 +197,7 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
     let mut store = crate::vlog::Prefetched::default();
     store.hold(
         vhandle.frame_at(),
-        Arc::new(crate::vlog::blob_file::frame::decoded_frame(&[(
-            b"k", b"value",
-        )])),
+        crate::vlog::blob_file::frame::decoded_frame(&[(b"k", b"value")]),
     );
 
     let damaged = |value_type| InternalValue::from_components("k", vec![0xff_u8; 3], 0, value_type);

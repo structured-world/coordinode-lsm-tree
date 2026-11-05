@@ -408,11 +408,11 @@ impl BlobSource {
         key: &[u8],
         read: &ValueRead<'_>,
         bytes: &crate::Slice,
-    ) -> crate::Result<(
-        Option<UserValue>,
-        Option<Arc<crate::vlog::blob_file::frame::DecodedFrame>>,
-    )> {
-        use crate::vlog::blob_file::{frame::FrameKind, reader};
+    ) -> crate::Result<(Option<UserValue>, Option<crate::vlog::accessor::HeldFrame>)> {
+        use crate::vlog::{
+            accessor::HeldFrame,
+            blob_file::{frame::FrameKind, reader},
+        };
 
         let accessor = Accessor::new(
             &version.blob_files,
@@ -437,11 +437,17 @@ impl BlobSource {
         let parsed =
             reader::Reader::decode(read.blob_file, &frame_bytes(start, end)?, &mut decoded);
         accessor.count_decoded(decoded);
-        let frame = Arc::new(parsed?);
-        if crate::vlog::accessor::caches(self.fill, &frame) {
+        let frame = parsed?;
+        // Shared only with the cache: the batch's other values in the frame
+        // are taken out of it here, by reference.
+        let frame = if crate::vlog::accessor::caches(self.fill, &frame) {
+            let frame = Arc::new(frame);
             self.cache
                 .insert_blob_frame(self.tree_id, read.vhandle.frame_at(), Arc::clone(&frame));
-        }
+            HeldFrame::Shared(frame)
+        } else {
+            HeldFrame::Own(frame)
+        };
         if frame.header.kind != FrameKind::Head {
             let value = reader::value_in(&frame, read.vhandle.index, key)?;
             return Ok((Some(value), Some(frame)));

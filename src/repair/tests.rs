@@ -7857,8 +7857,8 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     }
 
     // Overwrite the compressed payload with same-length garbage and RE-STAMP
-    // the frame checksum (xxh3-128 over the entries, the stored payload and
-    // the header CRC), so the frame verifies while the payload no longer
+    // the frame checksum (xxh3-128 over the entries and the stored payload,
+    // seeded with the header CRC), so the frame verifies while the payload no longer
     // decompresses.
     let entry = crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
         .next()
@@ -7874,14 +7874,13 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     let entries_end = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + header.entries_len as usize;
     let garbage = vec![0xA5u8; frame_bytes.len() - entries_end];
     let restamped = {
-        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(u64::from(header.header_crc));
         hasher.update(
             frame_bytes
                 .get(crate::vlog::blob_file::frame::FRAME_HEADER_LEN..entries_end)
                 .expect("the frame holds its entries"),
         );
         hasher.update(&garbage);
-        hasher.update(&header.header_crc.to_le_bytes());
         hasher.digest128()
     };
     {
