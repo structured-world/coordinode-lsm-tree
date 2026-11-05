@@ -168,8 +168,10 @@ fn compressible_payload_is_stored_compressed() {
 }
 
 /// A frame compressed without a dictionary codec's dictionary says so, and
-/// decodes under that codec with no dictionary at hand; under a codec with no
-/// dictionary the same flag names nothing and the frame is refused.
+/// decodes under that codec with no dictionary at hand, and under plain zstd
+/// too: a file building its own dictionary writes such frames before it has
+/// one, and records plain zstd when it never does. Under a codec that is not
+/// zstd the flag names nothing and the frame is refused.
 #[cfg(zstd_any)]
 #[test]
 fn a_plain_frame_decodes_under_its_dictionary_codec_without_the_dictionary() {
@@ -191,7 +193,9 @@ fn a_plain_frame_decodes_under_its_dictionary_codec_without_the_dictionary() {
     };
     let frame = decode(&out, dict_codec).unwrap();
     assert_eq!(frame.value(0).as_deref(), Some(payload.as_slice()));
-    assert!(decode(&out, CompressionType::Zstd(3)).is_err());
+    let frame = decode(&out, CompressionType::Zstd(3)).unwrap();
+    assert_eq!(frame.value(0).as_deref(), Some(payload.as_slice()));
+    assert!(decode(&out, CompressionType::None).is_err());
 }
 
 /// A flag the format does not define, or a payload flagged both raw and
