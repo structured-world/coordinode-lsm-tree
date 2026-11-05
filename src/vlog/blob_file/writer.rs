@@ -503,7 +503,9 @@ impl Writer {
     }
 
     /// Starts writing back what the file wrote since the last writeback, once
-    /// at least `writeback_bytes` of it gathered.
+    /// at least `writeback_bytes` of it gathered. Checked once per value
+    /// written, not per frame: a range hint per chunk of a large value cost its
+    /// write a fifth of its time.
     fn writeback_if_due(&mut self) -> crate::Result<()> {
         // `written_back` only ever takes a value of `offset`, which grows.
         let pending = self.offset - self.written_back;
@@ -608,7 +610,7 @@ impl Writer {
         let len = (head.len() + tail.len()) as u64;
         self.offset += len;
         self.written_blob_bytes += len;
-        self.writeback_if_due()
+        Ok(())
     }
 
     /// Encodes and writes one frame. A payload stored as it is goes to the
@@ -826,6 +828,7 @@ impl Writer {
             }
         };
         self.note_key(key, value_len);
+        self.writeback_if_due()?;
         Ok(at)
     }
 
@@ -872,6 +875,7 @@ impl Writer {
             self.put_frame(bytes)?;
         }
         self.note_key(key, value_len);
+        self.writeback_if_due()?;
         Ok(FrameRef {
             frame,
             index: 0,
@@ -906,6 +910,7 @@ impl Writer {
                 (super::frame::ENTRY_HEADER_LEN + key.len()) as u64 + u64::from(entry.value_len);
             self.note_key(key, entry.value_len);
         }
+        self.writeback_if_due()?;
         Ok(frame)
     }
 

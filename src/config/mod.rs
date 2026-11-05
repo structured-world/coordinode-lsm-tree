@@ -2991,6 +2991,8 @@ impl Config {
     /// delays the journal's own syncs. Writeback makes nothing durable; the
     /// final sync still does. Only Linux starts one
     /// (`sync_file_range(SYNC_FILE_RANGE_WRITE)`); elsewhere this is unused.
+    /// A blob file checks after each value it writes, so a value larger than
+    /// this is written back once it is whole.
     ///
     /// # Examples
     ///
