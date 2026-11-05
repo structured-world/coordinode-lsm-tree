@@ -895,6 +895,14 @@ fn separate_values(config: Config, blobs: Option<BlobCodec>) -> Config {
             {
                 opts = opts.block_size(bytes);
             }
+            // A dictionary of each zstd blob file's own: `COMPARE_BLOB_DICT`
+            // bytes, none without it.
+            if let Some(bytes) = std::env::var("COMPARE_BLOB_DICT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                opts = opts.file_dictionary(bytes);
+            }
             config
                 .with_kv_separation(Some(opts))
                 .blob_compression(codec.ours())
