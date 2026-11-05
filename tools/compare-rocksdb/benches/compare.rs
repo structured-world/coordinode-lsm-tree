@@ -884,11 +884,21 @@ fn ours_config(
 /// compressed as `blobs` says, or unchanged without it.
 fn separate_values(config: Config, blobs: Option<BlobCodec>) -> Config {
     match blobs {
-        Some(codec) => config
-            .with_kv_separation(Some(
-                KvSeparationOptions::default().separation_threshold(BLOB_SEPARATION_THRESHOLD),
-            ))
-            .blob_compression(codec.ours()),
+        Some(codec) => {
+            let mut opts =
+                KvSeparationOptions::default().separation_threshold(BLOB_SEPARATION_THRESHOLD);
+            // Blob block size under study: `COMPARE_BLOB_BLOCK` bytes, the
+            // library default without it.
+            if let Some(bytes) = std::env::var("COMPARE_BLOB_BLOCK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                opts = opts.block_size(bytes);
+            }
+            config
+                .with_kv_separation(Some(opts))
+                .blob_compression(codec.ours())
+        }
         None => config,
     }
 }
