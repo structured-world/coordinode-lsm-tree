@@ -225,6 +225,47 @@ pub(crate) fn record_value(
     )
 }
 
+/// The value `value` of `record`, parsed out of `bytes` at offset `index` of
+/// its packed block, held as a frame of that one value for the cache: its
+/// key, its value decoded, and the place a handle names it by.
+#[must_use]
+pub(crate) fn record_frame(
+    record: &Record,
+    bytes: &Slice,
+    value: Slice,
+    index: u16,
+) -> DecodedFrame {
+    // Copied out, so a value decompressed out of the record does not keep the
+    // record's bytes alive behind a cache weight that leaves them out.
+    let key = Slice::from(bytes.get(record.key.clone()).unwrap_or_default());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a record is a value below the block target and a u16 key"
+    )]
+    let disk_len = record.len as u32;
+    DecodedFrame {
+        header: FrameHeader {
+            kind: FrameKind::Block,
+            flags: FLAG_PACKED,
+            count: 1,
+            entries_len: 0,
+            raw_len: record.value_len,
+            disk_len,
+            header_crc: 0,
+            checksum: u128::from(record.checksum),
+        },
+        list: FrameEntries::One(FrameEntry {
+            seqno: record.seqno,
+            key: 0..key.len(),
+            value_len: record.value_len,
+            value: 0..value.len(),
+            at: u32::from(index),
+        }),
+        entries: key,
+        payload: value,
+    }
+}
+
 /// Checks the records of the packed block whose header is `header`, each
 /// against its own checksum and all of them against the frame's, and lists
 /// its values: keys as views into `records`, values where they lie once

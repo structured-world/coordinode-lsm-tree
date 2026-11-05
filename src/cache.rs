@@ -22,6 +22,9 @@ const TAG_ROW: u8 = 3;
 /// checked once, keyed by the group's offset.
 #[cfg(feature = "columnar")]
 const TAG_DIRECTORY: u8 = 4;
+/// Blob-record tag: one value of a packed block, read and decoded alone, keyed
+/// by its frame and its record's offset in it.
+const TAG_BLOB_RECORD: u8 = 5;
 
 #[derive(Clone)]
 enum Item {
@@ -357,6 +360,11 @@ pub(crate) struct BlobFrameAt {
 
 fn blob_frame_key(vlog_id: crate::TreeId, at: BlobFrameAt) -> CacheKey {
     (TAG_BLOB, vlog_id, at.blob_file_id, u64::from(at.frame)).into()
+}
+
+fn blob_record_key(vlog_id: crate::TreeId, at: BlobFrameAt, index: u16) -> CacheKey {
+    let place = (u64::from(at.frame) << 16) | u64::from(index);
+    (TAG_BLOB_RECORD, vlog_id, at.blob_file_id, place).into()
 }
 
 /// Shards of the load registry: as many as the cache, so two loads that
@@ -1087,7 +1095,39 @@ impl Cache {
         vlog_id: crate::TreeId,
         at: BlobFrameAt,
     ) -> Option<alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>> {
-        match self.data.get(&blob_frame_key(vlog_id, at))? {
+        self.blob_item(&blob_frame_key(vlog_id, at))
+    }
+
+    /// Caches one value of a packed block, read alone, under its frame and
+    /// its record's offset `index`: a frame of that one value.
+    pub(crate) fn insert_blob_record(
+        &self,
+        vlog_id: crate::TreeId,
+        at: BlobFrameAt,
+        index: u16,
+        record: alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>,
+    ) {
+        self.data
+            .insert(blob_record_key(vlog_id, at, index), Item::BlobFrame(record));
+    }
+
+    /// The value of a packed block cached at `at` and `index`, as a frame of
+    /// that one value. The caller compares its key, as for a frame.
+    #[must_use]
+    pub(crate) fn get_blob_record(
+        &self,
+        vlog_id: crate::TreeId,
+        at: BlobFrameAt,
+        index: u16,
+    ) -> Option<alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>> {
+        self.blob_item(&blob_record_key(vlog_id, at, index))
+    }
+
+    fn blob_item(
+        &self,
+        key: &CacheKey,
+    ) -> Option<alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>> {
+        match self.data.get(key)? {
             Item::BlobFrame(frame) => Some(frame),
             Item::Block(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]

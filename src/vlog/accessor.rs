@@ -365,16 +365,26 @@ impl<'a> Accessor<'a> {
         let Some(blob_file) = self.blob_files.get(vhandle.blob_file_id) else {
             return Ok(None);
         };
-        // A packed block read whole before, for a scan or a fill, answers.
-        if let Some(frame) = cache.get_blob_frame(tree_id, vhandle.frame_at()) {
+        // The value read alone before, or its packed block read whole before
+        // for a scan or a fill, answers.
+        let at = vhandle.frame_at();
+        if let Some(record) = cache.get_blob_record(tree_id, at, vhandle.index) {
+            return value_in(&record, vhandle.index, key).map(Some);
+        }
+        if let Some(frame) = cache.get_blob_frame(tree_id, at) {
             return value_in(&frame, vhandle.index, key).map(Some);
         }
-        self.read_record(tree_id, blob_file, key, vhandle, len)
-            .map(Some)
+        let record = self.read_record(tree_id, blob_file, key, vhandle, len)?;
+        let value = record.payload.clone();
+        // A small value is cached as the block it shares a frame with would
+        // be (see `caches`): it is read again as often.
+        cache.insert_blob_record(tree_id, at, vhandle.index, Arc::new(record));
+        Ok(Some(value))
     }
 
     /// The record of `len` bytes `vhandle` names in its packed block of
-    /// `blob_file`, read alone, checked and decoded.
+    /// `blob_file`, read alone, checked and decoded, as a frame of its one
+    /// value.
     fn read_record(
         &self,
         tree_id: TreeId,
@@ -382,7 +392,7 @@ impl<'a> Accessor<'a> {
         key: &[u8],
         vhandle: &ValueHandle,
         len: u32,
-    ) -> crate::Result<UserValue> {
+    ) -> crate::Result<DecodedFrame> {
         use crate::vlog::blob_file::{frame::FRAME_HEADER_LEN, packed};
 
         let malformed = || crate::Error::InvalidHeader("BlobRecord");
@@ -411,7 +421,7 @@ impl<'a> Accessor<'a> {
             &mut decoded,
         );
         self.count_decoded(decoded);
-        value
+        Ok(packed::record_frame(&record, &bytes, value?, vhandle.index))
     }
 
     /// Reads bytes `range` of one separated value: of a chunked value, only
