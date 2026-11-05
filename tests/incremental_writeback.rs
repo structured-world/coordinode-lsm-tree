@@ -206,6 +206,8 @@ fn a_chunked_value_is_written_back_once_it_is_whole() -> lsm_tree::Result<()> {
     )
     .with_shared_fs(Arc::new(fs) as Arc<dyn Fs>)
     .writeback_bytes(STEP)
+    // Stored as it is: a codec would shrink the repeated byte below a step.
+    .blob_compression(lsm_tree::CompressionType::None)
     .with_kv_separation(Some(
         KvSeparationOptions::default()
             .separation_threshold(1)
