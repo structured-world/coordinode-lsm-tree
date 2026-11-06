@@ -1237,16 +1237,40 @@ pub(crate) fn encode_frame_parts(
     out: &mut Vec<u8>,
 ) -> crate::Result<bool> {
     super::writer::check_size_cap(payload.len())?;
-    #[expect(
-        clippy::expect_used,
-        reason = "the writer closes a block before u16::MAX entries"
-    )]
-    let count = u16::try_from(entries.len()).expect("a frame lists at most u16::MAX entries");
     let compressed = if kind == FrameKind::Head {
         None
     } else {
         compress(payload, codec)?
     };
+    encode_frame_parts_compressed(kind, entries, payload, codec, compressed.as_deref(), out)
+}
+
+/// [`encode_frame_parts`] with the payload compressed already as
+/// `compressed`, what compressing it under `codec` made (`None` when that
+/// saved nothing).
+///
+/// # Errors
+///
+/// [`crate::Error::DecompressedSizeTooLarge`] for a payload past the value
+/// cap.
+///
+/// # Panics
+///
+/// As [`encode_frame`].
+pub(crate) fn encode_frame_parts_compressed(
+    kind: FrameKind,
+    entries: &[EntrySpec<'_>],
+    payload: &[u8],
+    codec: Codec<'_>,
+    compressed: Option<&[u8]>,
+    out: &mut Vec<u8>,
+) -> crate::Result<bool> {
+    super::writer::check_size_cap(payload.len())?;
+    #[expect(
+        clippy::expect_used,
+        reason = "the writer closes a block before u16::MAX entries"
+    )]
+    let count = u16::try_from(entries.len()).expect("a frame lists at most u16::MAX entries");
     // Raw when nothing compressed it although the file names a codec, and for
     // a head always: the flag tells a reader not to decode.
     let flags = if kind == FrameKind::Head
@@ -1258,7 +1282,7 @@ pub(crate) fn encode_frame_parts(
     } else {
         0
     };
-    let stored: &[u8] = compressed.as_deref().unwrap_or(payload);
+    let stored: &[u8] = compressed.unwrap_or(payload);
 
     out.clear();
     out.resize(FRAME_HEADER_LEN, 0);
@@ -1275,7 +1299,7 @@ pub(crate) fn encode_frame_parts(
         out.extend_from_slice(entry.key);
     }
     let entries_end = out.len();
-    if let Some(compressed) = &compressed {
+    if let Some(compressed) = compressed {
         out.extend_from_slice(compressed);
     }
 

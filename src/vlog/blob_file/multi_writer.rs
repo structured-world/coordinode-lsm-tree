@@ -895,9 +895,43 @@ impl MultiWriter {
         seqno: SeqNo,
         value: &[u8],
     ) -> crate::Result<BlobIndirection> {
+        self.write_pre(key, seqno, value, None)
+    }
+
+    /// The codec a value of `value_len` bytes of lifetime `class` written
+    /// next would be compressed under as a whole, for a worker to compress it
+    /// ahead (see [`super::writer::Writer::value_codec`]): asked of the file
+    /// that is taking `class` now, `None` when another one is.
+    #[cfg(feature = "std")]
+    pub(crate) fn value_codec(
+        &self,
+        class: u8,
+        value_len: u32,
+    ) -> Option<super::writer::OwnedCodec> {
+        let takes_class = self.lifetime_groups.cap(class) == self.active_class
+            && self.active_source.is_none()
+            && self.domain.is_none();
+        takes_class
+            .then(|| self.active_writer.value_codec(value_len))
+            .flatten()
+    }
+
+    /// [`Self::write`], the value compressed ahead as `pre` when it was (see
+    /// [`Self::value_codec`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`].
+    pub(crate) fn write_pre(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+        pre: Option<super::writer::PreCompressed>,
+    ) -> crate::Result<BlobIndirection> {
         let size = super::writer::check_size_cap(value.len())?;
         self.enter_key(key)?;
-        let at = self.active_writer.write(key, seqno, value)?;
+        let at = self.active_writer.write_pre(key, seqno, value, pre)?;
         self.written(at, size)
     }
 

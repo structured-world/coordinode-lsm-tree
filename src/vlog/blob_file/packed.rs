@@ -61,14 +61,13 @@ pub(crate) struct Record {
     pub(crate) len: usize,
 }
 
-/// Appends the record of `value` under `key` and `seqno` to `out`, the value
-/// compressed under `codec` unless that saves nothing, and returns the
-/// record's length.
+/// Appends the record of `value` under `key` and `seqno` to `out`, stored as
+/// `compressed`, what compressing it under `codec` made (`None` when that
+/// saved nothing), and returns the record's length.
 ///
 /// # Errors
 ///
-/// Propagates the compression; [`crate::Error::DecompressedSizeTooLarge`] for
-/// a value past the cap.
+/// [`crate::Error::DecompressedSizeTooLarge`] for a value past the cap.
 ///
 /// # Panics
 ///
@@ -79,9 +78,9 @@ pub(crate) fn encode_record(
     seqno: SeqNo,
     value: &[u8],
     codec: Codec<'_>,
+    compressed: Option<&[u8]>,
 ) -> crate::Result<usize> {
     let value_len = super::writer::check_size_cap(value.len())?;
-    let compressed = super::frame::compress_payload(value, codec)?;
     let flags = if compressed.is_none() && codec.compression != CompressionType::None {
         FLAG_RAW
     } else if compressed.is_some() && codec.plain {
@@ -89,7 +88,7 @@ pub(crate) fn encode_record(
     } else {
         0
     };
-    let stored: &[u8] = compressed.as_deref().unwrap_or(value);
+    let stored: &[u8] = compressed.unwrap_or(value);
     #[expect(clippy::expect_used, reason = "the writer refuses longer keys first")]
     let key_len = u16::try_from(key.len()).expect("keys are u16 length max");
     #[expect(

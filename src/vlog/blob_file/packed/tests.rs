@@ -20,7 +20,15 @@ fn records(values: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
     for (i, value) in values.iter().enumerate() {
         starts.push(out.len());
         let key = alloc::format!("k{i}");
-        encode_record(&mut out, key.as_bytes(), i as SeqNo, value, UNCOMPRESSED).unwrap();
+        encode_record(
+            &mut out,
+            key.as_bytes(),
+            i as SeqNo,
+            value,
+            UNCOMPRESSED,
+            None,
+        )
+        .unwrap();
     }
     (out, starts)
 }
