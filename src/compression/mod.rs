@@ -266,11 +266,10 @@ impl ZstdDictionary {
     /// Returns the shared pre-parsed `DictionaryHandle`, parsing on first call
     /// and reusing the cached handle on every subsequent call (across threads).
     ///
-    /// The handle wraps an `Arc<Dictionary>` inside structured-zstd, so cloning
-    /// it is an atomic refcount bump — cheap enough to use on every decompress
-    /// call. Frame decoders register the dictionary via
-    /// `FrameDecoder::add_dict_handle`, which shares the same `Arc` rather than
-    /// cloning the underlying entropy tables.
+    /// Borrowed, so a decode that only reads the dictionary pays no refcount
+    /// bump; a frame decoder that registers it via
+    /// `FrameDecoder::add_dict_handle` clones the handle, which shares the
+    /// same `Arc` rather than the underlying entropy tables.
     ///
     /// On the first call we attempt finalized-dict parsing (magic bytes
     /// `37 A4 30 EC`); buffers without that prefix are treated as raw-content
@@ -282,7 +281,7 @@ impl ZstdDictionary {
     #[cfg(feature = "zstd")]
     pub(crate) fn prepared_handle(
         &self,
-    ) -> crate::Result<structured_zstd::decoding::DictionaryHandle> {
+    ) -> crate::Result<&structured_zstd::decoding::DictionaryHandle> {
         use structured_zstd::decoding::{DICTIONARY_MAGIC, Dictionary, DictionaryHandle};
 
         // `OnceBox::get_or_try_init` is the canonical single-init-
@@ -310,7 +309,6 @@ impl ZstdDictionary {
                 };
                 Ok(Box::new(handle))
             })
-            .cloned()
     }
 
     /// Returns a 32-bit fingerprint derived from the dictionary content.

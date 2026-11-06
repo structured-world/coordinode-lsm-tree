@@ -1044,13 +1044,23 @@ fn decompress(
                 expected: dict_id,
                 got: None,
             })?;
-            let out = crate::compression::ZstdBackend::decompress_with_dict(stored, dict, raw_len)
-                .map_err(|_| crate::Error::Decompress(compression))?;
-            *decoded = out.len();
-            if out.len() != raw_len {
+            // SAFETY: as for zstd above: the decoder refuses an offset reaching
+            // past what it wrote and the dictionary's history, so it never
+            // reads an unwritten position; the length check below rejects a
+            // short fill.
+            #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+            let mut builder = unsafe { Slice::builder_unzeroed(raw_len) };
+            let written = crate::compression::ZstdBackend::decompress_with_dict_into(
+                stored,
+                dict,
+                &mut builder,
+            )
+            .map_err(|_| crate::Error::Decompress(compression))?;
+            *decoded = written;
+            if written != raw_len {
                 return Err(crate::Error::Decompress(compression));
             }
-            Ok(Slice::from(out))
+            Ok(builder.freeze().into())
         }
     }
 }
