@@ -225,6 +225,13 @@ pub(crate) fn record_value(
     )
 }
 
+/// What the frame [`record_frame`] builds of `record` and its decoded
+/// `value` weighs in the cache, known before it is built.
+#[must_use]
+pub(crate) fn record_frame_weight(record: &Record, value: &Slice) -> u64 {
+    (record.key.len() + value.len() + size_of::<FrameEntry>()) as u64
+}
+
 /// The value `value` of `record`, parsed out of `bytes` at offset `index` of
 /// its packed block, held as a frame of that one value for the cache: its
 /// key, its value decoded, and the place a handle names it by.

@@ -517,15 +517,20 @@ where
         shard.read().contains(h, key)
     }
 
-    /// Whether a missed `key` should be inserted now: only when it was missed
+    /// Whether a missed `key`, `weight` once built, should be inserted now:
+    /// at once while its shard has room for it, since an insert that evicts
+    /// nothing costs nothing later; into a full shard only when it was missed
     /// (or evicted cold) recently, which the ghost queue remembers. A first
-    /// miss is remembered there instead, so a read that never comes back
-    /// costs a fingerprint, not an entry built, inserted and evicted. An
-    /// admitted key then enters the main queue on insert.
-    pub(crate) fn admit(&self, key: &K) -> bool {
+    /// miss into a full shard is remembered there instead, so a read that
+    /// never comes back costs a fingerprint, not an entry built, inserted and
+    /// evicted unread. A key admitted on a repeat enters the main queue.
+    pub(crate) fn admit(&self, key: &K, weight: u64) -> bool {
         let (_, shard) = self.locate(key);
-        if shard.read().ghost_set.contains(key) {
-            return true;
+        {
+            let core = shard.read();
+            if core.resident_bytes() + weight <= core.capacity || core.ghost_set.contains(key) {
+                return true;
+            }
         }
         shard.write().push_ghost(key.clone());
         false

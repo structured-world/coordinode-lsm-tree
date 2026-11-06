@@ -376,14 +376,21 @@ impl<'a> Accessor<'a> {
         }
         let (record, bytes, value) = self.read_record(tree_id, blob_file, key, vhandle, len)?;
         // A small value is cached as the block it shares a frame with would
-        // be (see `caches`), but only once it is read again: a value read once
-        // would cost its entry built, inserted and evicted unread.
-        if cache.admit_blob_record(tree_id, at, vhandle.index) {
+        // be (see `caches`), but into a full cache only once it is read again:
+        // a value read once would cost its entry built, inserted and evicted
+        // unread.
+        let weight = crate::vlog::blob_file::packed::record_frame_weight(&record, &value);
+        if cache.admit_blob_record(tree_id, at, vhandle.index, weight) {
             let frame = crate::vlog::blob_file::packed::record_frame(
                 &record,
                 &bytes,
                 value.clone(),
                 vhandle.index,
+            );
+            debug_assert_eq!(
+                frame.weight(),
+                weight,
+                "admitted at the weight it is cached at"
             );
             cache.insert_blob_record(tree_id, at, vhandle.index, Arc::new(frame));
         }
