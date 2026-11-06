@@ -968,14 +968,8 @@ fn decompress_to(
                 expected: dict_id,
                 got: None,
             })?;
-            let decompressed =
-                crate::compression::ZstdBackend::decompress_with_dict(stored, dict, out.len())
-                    .map_err(|_| crate::Error::Decompress(compression))?;
-            let target = out
-                .get_mut(..decompressed.len())
-                .ok_or(crate::Error::Decompress(compression))?;
-            target.copy_from_slice(&decompressed);
-            decompressed.len()
+            crate::compression::ZstdBackend::decompress_with_dict_into(stored, dict, out)
+                .map_err(|_| crate::Error::Decompress(compression))?
         }
     };
     *decoded = written;
