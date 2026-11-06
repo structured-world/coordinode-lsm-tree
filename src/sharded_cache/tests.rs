@@ -22,6 +22,43 @@ fn insert_get_roundtrip() {
     assert_eq!(c.get(&2), None);
 }
 
+/// A key missed once is only remembered; the second miss admits it. Guards
+/// against caching every one-off read, whose insert and later eviction cost
+/// a miss more than the miss itself.
+#[test]
+fn admit_refuses_a_first_miss_and_takes_the_second() {
+    let c = byte_cache(10_000);
+    assert!(!c.admit(&5), "a key never seen is not admitted");
+    assert!(c.admit(&5), "a key seen once before is admitted");
+    assert_eq!(c.get(&5), None, "admitting stores nothing by itself");
+}
+
+/// An admitted key goes into the main queue, so churn through the small
+/// queue that evicts one-off entries leaves it resident.
+#[test]
+fn admitted_entry_survives_churn_of_one_off_entries() {
+    let c = ShardedCache::with_weighter(1_000, 1, 1024, LenWeighter, FxBuildHasher);
+    assert!(!c.admit(&1));
+    assert!(c.admit(&1));
+    c.insert(1, vec![0u8; 100]);
+    for key in 100..200 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    assert_eq!(c.get(&1), Some(vec![0u8; 100]));
+}
+
+/// The doorkeeper is bounded by the ghost queue: a key whose first miss has
+/// aged out of it is refused again rather than remembered forever.
+#[test]
+fn admit_forgets_a_miss_past_the_ghost_capacity() {
+    let c = ShardedCache::with_weighter(1_000, 1, 16, LenWeighter, FxBuildHasher);
+    assert!(!c.admit(&1));
+    for key in 100..200 {
+        assert!(!c.admit(&key));
+    }
+    assert!(!c.admit(&1), "the first miss aged out of the ghost queue");
+}
+
 #[test]
 fn peek_does_not_promote_but_get_does() {
     let c = byte_cache(10_000);

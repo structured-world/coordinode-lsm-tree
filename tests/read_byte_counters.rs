@@ -620,9 +620,11 @@ fn a_blob_admitted_to_the_blob_cache_copies_nothing() -> lsm_tree::Result<()> {
 #[test]
 #[cfg(feature = "zstd")]
 fn a_packed_value_read_again_is_served_from_the_cache() -> lsm_tree::Result<()> {
-    // A small value packed beside others is read as its record alone; read
-    // again, it comes from the cache as a value of a block does, under the
-    // default fill that caches no value of a frame of its own.
+    // A small value packed beside others is read as its record alone. A value
+    // read once is not cached, so a stream of one-off reads costs no cache
+    // churn; read a second time it is admitted, and from then on it comes from
+    // the cache as a value of a block does, under the default fill that
+    // caches no value of a frame of its own.
     let folder = get_tmp_folder();
     let tree = Config::new(
         folder.path(),
@@ -653,6 +655,16 @@ fn a_packed_value_read_again_is_served_from_the_cache() -> lsm_tree::Result<()> 
     assert!(cold > 0, "the first reads read the blob file");
     // Each read is its record alone, not its block.
     assert!(cold < 50 * 300, "{cold} B read for 50 values of 200 B");
+
+    let before = m.blob_bytes_read();
+    for i in 0..50 {
+        assert!(tree.get(key(i), SeqNo::MAX)?.is_some());
+    }
+    assert_eq!(
+        m.blob_bytes_read() - before,
+        cold,
+        "a value read once was not cached, so its second read reads it again"
+    );
 
     let before = m.blob_bytes_read();
     for i in 0..50 {

@@ -1111,6 +1111,19 @@ impl Cache {
             .insert(blob_record_key(vlog_id, at, index), Item::BlobFrame(record));
     }
 
+    /// Whether the value of a packed block at `at` and `index`, just missed,
+    /// goes into the cache: only on a miss that repeats a recent one, so a
+    /// value read once is not built into an entry only to be evicted unread.
+    #[must_use]
+    pub(crate) fn admit_blob_record(
+        &self,
+        vlog_id: crate::TreeId,
+        at: BlobFrameAt,
+        index: u16,
+    ) -> bool {
+        self.data.admit(&blob_record_key(vlog_id, at, index))
+    }
+
     /// The value of a packed block cached at `at` and `index`, as a frame of
     /// that one value. The caller compares its key, as for a frame.
     #[must_use]

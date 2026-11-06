@@ -374,17 +374,25 @@ impl<'a> Accessor<'a> {
         if let Some(frame) = cache.get_blob_frame(tree_id, at) {
             return value_in(&frame, vhandle.index, key).map(Some);
         }
-        let record = self.read_record(tree_id, blob_file, key, vhandle, len)?;
-        let value = record.payload.clone();
+        let (record, bytes, value) = self.read_record(tree_id, blob_file, key, vhandle, len)?;
         // A small value is cached as the block it shares a frame with would
-        // be (see `caches`): it is read again as often.
-        cache.insert_blob_record(tree_id, at, vhandle.index, Arc::new(record));
+        // be (see `caches`), but only once it is read again: a value read once
+        // would cost its entry built, inserted and evicted unread.
+        if cache.admit_blob_record(tree_id, at, vhandle.index) {
+            let frame = crate::vlog::blob_file::packed::record_frame(
+                &record,
+                &bytes,
+                value.clone(),
+                vhandle.index,
+            );
+            cache.insert_blob_record(tree_id, at, vhandle.index, Arc::new(frame));
+        }
         Ok(Some(value))
     }
 
     /// The record of `len` bytes `vhandle` names in its packed block of
-    /// `blob_file`, read alone, checked and decoded, as a frame of its one
-    /// value.
+    /// `blob_file`, read alone and checked: the record, its bytes and its
+    /// value decoded.
     fn read_record(
         &self,
         tree_id: TreeId,
@@ -392,7 +400,11 @@ impl<'a> Accessor<'a> {
         key: &[u8],
         vhandle: &ValueHandle,
         len: u32,
-    ) -> crate::Result<DecodedFrame> {
+    ) -> crate::Result<(
+        crate::vlog::blob_file::packed::Record,
+        crate::Slice,
+        crate::Slice,
+    )> {
         use crate::vlog::blob_file::{frame::FRAME_HEADER_LEN, packed};
 
         let malformed = || crate::Error::InvalidHeader("BlobRecord");
@@ -421,7 +433,7 @@ impl<'a> Accessor<'a> {
             &mut decoded,
         );
         self.count_decoded(decoded);
-        Ok(packed::record_frame(&record, &bytes, value?, vhandle.index))
+        Ok((record, bytes, value?))
     }
 
     /// Reads bytes `range` of one separated value: of a chunked value, only

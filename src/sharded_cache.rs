@@ -517,6 +517,20 @@ where
         shard.read().contains(h, key)
     }
 
+    /// Whether a missed `key` should be inserted now: only when it was missed
+    /// (or evicted cold) recently, which the ghost queue remembers. A first
+    /// miss is remembered there instead, so a read that never comes back
+    /// costs a fingerprint, not an entry built, inserted and evicted. An
+    /// admitted key then enters the main queue on insert.
+    pub(crate) fn admit(&self, key: &K) -> bool {
+        let (_, shard) = self.locate(key);
+        if shard.read().ghost_set.contains(key) {
+            return true;
+        }
+        shard.write().push_ghost(key.clone());
+        false
+    }
+
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
     /// stay within capacity.
     pub(crate) fn insert(&self, key: K, value: V) {
