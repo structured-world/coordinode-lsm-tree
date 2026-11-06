@@ -115,8 +115,11 @@ struct ShardCore<K, V, S> {
     hasher: S,
     small: VecDeque<K>,
     main: VecDeque<K>,
-    ghost: VecDeque<K>,
-    ghost_set: hashbrown::HashSet<K, S>,
+    /// Fingerprints (the wrapper's precomputed key hashes) of keys evicted
+    /// cold or missed into a full shard, oldest first. The hash is already
+    /// mixed, so `ghost_set` is keyed by it as is: no key clone, no rehash.
+    ghost: VecDeque<u64>,
+    ghost_set: hashbrown::HashTable<u64>,
     small_bytes: u64,
     main_bytes: u64,
     /// Per-shard byte capacity.
@@ -137,11 +140,11 @@ where
     fn new(capacity: u64, ghost_capacity: usize, hasher: S) -> Self {
         Self {
             map: hashbrown::HashTable::new(),
-            hasher: hasher.clone(),
+            hasher,
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
-            ghost_set: hashbrown::HashSet::with_hasher(hasher),
+            ghost_set: hashbrown::HashTable::new(),
             small_bytes: 0,
             main_bytes: 0,
             capacity,
@@ -239,7 +242,7 @@ where
             let (loc, init_freq) = match priority {
                 Priority::High => (Location::Main, MAX_FREQ),
                 Priority::Normal => {
-                    if self.ghost_set.remove(&key) {
+                    if self.take_ghost(hash) {
                         (Location::Main, 0)
                     } else {
                         (Location::Small, 0)
@@ -354,7 +357,7 @@ where
                     entry.remove();
                 }
                 self.small_bytes -= w;
-                self.push_ghost(key);
+                self.push_ghost(hash);
             }
             return true;
         }
@@ -387,16 +390,37 @@ where
         false
     }
 
-    fn push_ghost(&mut self, key: K) {
+    /// Whether the key hashed to `hash` is remembered in the ghost queue.
+    #[inline]
+    fn in_ghost(&self, hash: u64) -> bool {
+        self.ghost_set.find(hash, |&h| h == hash).is_some()
+    }
+
+    /// Forgets `hash` from the ghost set, reporting whether it was there. Its
+    /// queue node stays and is skipped as stale when it ages out.
+    fn take_ghost(&mut self, hash: u64) -> bool {
+        match self.ghost_set.find_entry(hash, |&h| h == hash) {
+            Ok(entry) => {
+                entry.remove();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn push_ghost(&mut self, hash: u64) {
         if self.ghost_capacity == 0 {
             return;
         }
-        if self.ghost_set.insert(key.clone()) {
-            self.ghost.push_back(key);
+        if let hashbrown::hash_table::Entry::Vacant(slot) =
+            self.ghost_set.entry(hash, |&h| h == hash, |&h| h)
+        {
+            slot.insert(hash);
+            self.ghost.push_back(hash);
         }
         while self.ghost.len() > self.ghost_capacity {
             if let Some(old) = self.ghost.pop_front() {
-                self.ghost_set.remove(&old);
+                self.take_ghost(old);
             }
         }
     }
@@ -525,14 +549,14 @@ where
     /// never comes back costs a fingerprint, not an entry built, inserted and
     /// evicted unread. A key admitted on a repeat enters the main queue.
     pub(crate) fn admit(&self, key: &K, weight: u64) -> bool {
-        let (_, shard) = self.locate(key);
+        let (h, shard) = self.locate(key);
         {
             let core = shard.read();
-            if core.resident_bytes() + weight <= core.capacity || core.ghost_set.contains(key) {
+            if core.resident_bytes() + weight <= core.capacity || core.in_ghost(h) {
                 return true;
             }
         }
-        shard.write().push_ghost(key.clone());
+        shard.write().push_ghost(h);
         false
     }
 
