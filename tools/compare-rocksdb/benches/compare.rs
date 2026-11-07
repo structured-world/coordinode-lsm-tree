@@ -1067,7 +1067,7 @@ fn write_throughput_variant(run: &mut Run, group_name: &str, compression: Compre
         .engines
         .contains(&Engine::SurrealKv)
         .then(|| skv_runtime().expect("surrealkv: tokio runtime"));
-    for &n in spec.sizes {
+    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
         // Precompute the keys + values ONCE per `n`, so the timed body does no
         // per-iteration allocation.
         let inputs = WorkloadInputs::of(n, spec.values);
@@ -1177,7 +1177,7 @@ fn point_read_variant(
     }
     series.retain(|&(label, ..)| run.wants_engine(label));
 
-    for &n in spec.sizes {
+    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // Every arm opened and checked before the rounds: they only ever pay
         // for reads, never for open / write / flush.
@@ -1652,7 +1652,7 @@ fn multi_get_variant(
         .filter(|engine| !matches!(engine, Engine::SurrealKv))
         .collect();
 
-    for &n in spec.sizes {
+    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // This measures WARM steady-state batched-MultiGet throughput, NOT
         // cold first-touch latency: every engine opens its seed and probes once
@@ -1804,7 +1804,7 @@ fn warm_read_group(
     if !run.wants(group_name) {
         return;
     }
-    for &n in spec.sizes {
+    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
         let inputs = WorkloadInputs::of(n, spec.values);
         let warm: Vec<(Engine, WarmEngine)> = run
             .engines_of(spec.engines)
@@ -2026,7 +2026,7 @@ fn overwrite_variant(
     if !run.wants(group_name) {
         return;
     }
-    for &n in spec.sizes {
+    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // Every seed written before the rounds; SurrealKV is not seeded (see
         // `SeedStates`) and writes its first copy per iteration instead.
@@ -2947,7 +2947,7 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
         CompactionShape::Major => &[10_000, 40_000],
         CompactionShape::Split => &[40_000, 100_000],
     };
-    for &n in sizes {
+    for &n in sizes.iter().filter(|&&n| run.wants_size(n)) {
         let inputs = match shape {
             CompactionShape::Major => WorkloadInputs::build(n),
             CompactionShape::Split => WorkloadInputs::incompressible(n),
@@ -3148,6 +3148,9 @@ struct Run {
     /// Only arms with these labels run, from `COMPARE_ENGINES` (comma
     /// separated): one engine's profile or system calls without the others'.
     engines: Option<Vec<String>>,
+    /// Only these key counts run, from `COMPARE_SIZES` (comma separated): one
+    /// size's profile without the others' setup and rounds.
+    sizes: Option<Vec<u64>>,
     results: Vec<paired::ArmResult>,
 }
 
@@ -3227,11 +3230,21 @@ impl Run {
         let engines = std::env::var("COMPARE_ENGINES")
             .ok()
             .map(|list| list.split(',').map(|e| e.trim().to_owned()).collect());
+        let sizes = std::env::var("COMPARE_SIZES").ok().map(|list| {
+            list.split(',')
+                .map(|n| {
+                    n.trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("COMPARE_SIZES: not a key count: {n}"))
+                })
+                .collect()
+        });
         Self {
             settings,
             filter,
             measuring,
             engines,
+            sizes,
             results: Vec::new(),
         }
     }
@@ -3253,6 +3266,11 @@ impl Run {
         self.engines
             .as_ref()
             .is_none_or(|engines| engines.iter().any(|e| e == label))
+    }
+
+    /// Whether the key count `n` runs.
+    fn wants_size(&self, n: u64) -> bool {
+        self.sizes.as_ref().is_none_or(|sizes| sizes.contains(&n))
     }
 
     /// The engines of `engines` that run, so a filtered run does not set up
