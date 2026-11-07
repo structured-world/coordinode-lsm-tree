@@ -1327,8 +1327,7 @@ fn tally_block(
         dead: (0, 0, 0),
         resynced: false,
     });
-    let bytes = (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + entry.key.len()) as u64
-        + u64::from(entry.uncompressed_len);
+    let bytes = block.entry_bytes;
     tally.seen += 1;
     tally.resynced |= entry.resynced;
     if claimed {

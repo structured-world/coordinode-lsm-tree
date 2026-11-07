@@ -8306,9 +8306,38 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
 /// that share blocks: a punched block's values are seeded as block bytes, their
 /// entries uncompressed, so their share of the file's blocks is what the file
 /// is charged, and none as frames of their own.
+#[cfg(feature = "lz4")]
 #[test]
-#[expect(clippy::expect_used, reason = "test code")]
 fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
+    // Blocks of four 64-byte values each, an entry of 83 bytes with its
+    // 14-byte header and five-byte key.
+    let block = punched_first_block_is_seeded(crate::CompressionType::Lz4, 8, 340)?;
+    assert_eq!(block, 4, "the first block holds four values");
+    Ok(())
+}
+
+/// [`repair_seeds_a_punched_block_prefix_as_block_bytes`] for a file that
+/// compresses nothing, whose small values are packed: a punched packed block's
+/// records are seeded as block bytes as they lie.
+#[test]
+fn repair_seeds_a_punched_packed_prefix_as_block_bytes() -> crate::Result<()> {
+    // Packed blocks of four 64-byte values each, a record of 96 bytes with
+    // its 27-byte fixed part and five-byte key.
+    let block = punched_first_block_is_seeded(crate::CompressionType::None, 8, 340)?;
+    assert_eq!(block, 4, "the first packed block holds four records");
+    Ok(())
+}
+
+/// Writes `count` 64-byte values into one blob file compressed as
+/// `compression` with blocks of `block_size`, punches its first block away,
+/// repairs, and checks that block is seeded as garbage of block bytes alone.
+/// Returns how many values the punched block held.
+#[expect(clippy::expect_used, reason = "test code")]
+fn punched_first_block_is_seeded(
+    compression: crate::CompressionType,
+    count: u32,
+    block_size: u32,
+) -> crate::Result<usize> {
     use crate::AbstractTree;
     use crate::fs::{Fs, MemFs};
     use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
@@ -8325,23 +8354,22 @@ fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        // Blocks of four 64-byte values each, an entry of 83 bytes with its
-        // 14-byte header and five-byte key.
         .with_kv_separation(Some(
             KvSeparationOptions::default()
                 .separation_threshold(16)
-                .block_size(340),
+                .block_size(block_size),
         ))
+        .blob_compression(compression)
     };
     {
         let tree = match open_config().open()? {
             crate::AnyTree::Blob(t) => t,
             crate::AnyTree::Standard(_) => panic!("expected blob tree"),
         };
-        for i in 0..8u32 {
+        for i in 0..count {
             tree.insert(
                 format!("k{i:04}").as_bytes(),
-                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64],
+                alloc::vec![b'a' + u8::try_from(i % 26).expect("below 26"); 64],
                 u64::from(i),
             );
         }
@@ -8352,18 +8380,15 @@ fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
     let blob_path = blobs.join("0");
     let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
         .collect::<crate::Result<Vec<_>>>()?;
-    assert_eq!(entries.len(), 8, "eight separated values");
+    assert_eq!(entries.len(), count as usize, "every value separated");
     let block: Vec<_> = entries.iter().take_while(|e| e.frame == 0).collect();
-    assert_eq!(block.len(), 4, "the first block holds four values");
+    assert!(block.len() < entries.len(), "more than one block");
     assert!(block.iter().all(|e| e.frames.is_none()), "they share it");
-    let frontier = block.last().expect("four values").frame_end;
+    let frontier = block.last().expect("a value").frame_end;
     let prefix_bytes: u64 = block.iter().map(|e| u64::from(e.uncompressed_len)).sum();
     let prefix_entries: u64 = block
         .iter()
-        .map(|e| {
-            (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + e.key.len()) as u64
-                + u64::from(e.uncompressed_len)
-        })
+        .map(|e| e.block.as_ref().expect("in a block").entry_bytes)
         .sum();
     let data_start = {
         let mut f = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
@@ -8390,12 +8415,13 @@ fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
         .get(&0)
         .copied()
         .expect("the punched block is seeded as garbage");
+    let len = block.len();
     assert_eq!(
         entry,
-        crate::blob_tree::FragmentationEntry::new(4, prefix_bytes, 0)
+        crate::blob_tree::FragmentationEntry::new(len, prefix_bytes, 0)
             .with_block_bytes(prefix_entries),
     );
-    Ok(())
+    Ok(len)
 }
 
 /// A salvage temp left behind by THIS repair's own failed blob salvage (the

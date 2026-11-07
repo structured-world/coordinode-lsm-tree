@@ -405,7 +405,9 @@ pub enum BlobCacheFill {
     /// No value of a frame of its own read from a blob file is cached: values
     /// large enough to be separated are mostly read once, and cached they
     /// would evict the index, filter and data blocks of every tree sharing the
-    /// cache. A block of small values a point read decodes is cached all the
+    /// cache. Nor is a packed small value, read as its record alone: it brings
+    /// no neighbour along, and under rewrites each insert would be made stale
+    /// by the next. A block of small values a point read decodes is cached all the
     /// same, as a data block is: the values beside the one read are read as
     /// often, and each would otherwise decode the whole block again. A scan
     /// still reads its values ahead, into a store of its own holding at most

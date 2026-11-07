@@ -86,12 +86,6 @@ impl Default for FrameSizes {
 /// block never closes small for want of room for one more value.
 pub(crate) const BLOCK_FILL_PERCENT: u64 = 90;
 
-/// The records a packed block gathers before it closes. A read of one value
-/// reads its record alone whatever the block holds; the block's size is what
-/// a scan, a collection and the frame index see.
-#[cfg(zstd_any)]
-const PACKED_TARGET: usize = 32 * 1024;
-
 /// Where a written value lies: the frame that holds it (a head for a chunked
 /// value) and its place in the frame's list, and the bytes it takes (see
 /// [`crate::blob_tree::handle::BlobIndirection::stored`]).
@@ -273,16 +267,12 @@ pub(crate) struct Writer {
     /// The block the next small value joins.
     block: PendingBlock,
 
-    /// The records of the packed block the next small value joins under the
-    /// file's own dictionary, back to back, their checksums in order, how
-    /// many, and their values' bytes.
-    #[cfg(zstd_any)]
+    /// The records of the packed block the next small value joins (see
+    /// [`Self::packs`]), back to back, their checksums in order, how many,
+    /// and their values' bytes.
     packed: Vec<u8>,
-    #[cfg(zstd_any)]
     packed_sums: Vec<u8>,
-    #[cfg(zstd_any)]
     packed_count: u16,
-    #[cfg(zstd_any)]
     packed_raw: u64,
 
     /// A frame being encoded, kept so a writer allocates it once.
@@ -371,6 +361,13 @@ struct CodecStamp {
 }
 
 impl CodecStamp {
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::trivially_copy_pass_by_ref,
+            reason = "without zstd a codec carries no dictionary and fits a byte"
+        )
+    )]
     fn of(codec: &Codec<'_>) -> Self {
         Self {
             compression: codec.compression,
@@ -531,13 +528,9 @@ impl Writer {
             dictionary_classes: crate::config::DictionaryClasses::DEFAULT,
             frames: Vec::new(),
             block: PendingBlock::default(),
-            #[cfg(zstd_any)]
             packed: Vec::new(),
-            #[cfg(zstd_any)]
             packed_sums: Vec::new(),
-            #[cfg(zstd_any)]
             packed_count: 0,
-            #[cfg(zstd_any)]
             packed_raw: 0,
             scratch: Vec::new(),
             #[cfg(feature = "std")]
@@ -706,10 +699,12 @@ impl Writer {
     /// Whether small values are packed records rather than block entries:
     /// under the file's own dictionary, and in a file that compresses
     /// nothing, where a block gains nothing from sharing.
-    #[cfg(zstd_any)]
     fn packs(&self) -> bool {
-        self.file_dictionary_on()
-            || (self.file_dictionary > 0 && self.compression == CompressionType::None)
+        #[cfg(zstd_any)]
+        let own_dictionary = self.file_dictionary_on();
+        #[cfg(not(zstd_any))]
+        let own_dictionary = false;
+        own_dictionary || self.compression == CompressionType::None
     }
 
     /// Whether values are written a frame each under the file's own
@@ -751,6 +746,15 @@ impl Writer {
     ///
     /// [`crate::Error::InvalidHeader`] for a file that already wrote values
     /// toward its own dictionary.
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            clippy::needless_pass_by_ref_mut,
+            reason = "without zstd no file builds a dictionary of its own"
+        )
+    )]
     fn leave_file_dictionary(&mut self) -> crate::Result<()> {
         // A file that holds its dictionary takes frames of that codec, its
         // own; only one still gathering values toward it cannot.
@@ -775,11 +779,7 @@ impl Writer {
     /// Bytes the file holds so far, the values waiting for their block counted.
     #[must_use]
     pub(crate) fn len_written(&self) -> u64 {
-        #[cfg(zstd_any)]
-        let packed = self.packed.len() as u64;
-        #[cfg(not(zstd_any))]
-        let packed = 0;
-        self.offset + self.block.len() + packed
+        self.offset + self.block.len() + self.packed.len() as u64
     }
 
     /// The codec a frame of `kind` is compressed under: the file's, without
@@ -853,7 +853,6 @@ impl Writer {
             block_target,
             chunk_size,
         } = self.sizes;
-        #[cfg(zstd_any)]
         if self.packs() && value_len < block_target {
             return Some(self.owned_codec(FrameKind::Block));
         }
@@ -1023,7 +1022,6 @@ impl Writer {
 
     /// Writes the block waiting for its values, packed or not, if any.
     fn close_block(&mut self) -> crate::Result<()> {
-        #[cfg(zstd_any)]
         self.close_packed()?;
         if self.block.is_empty() {
             return Ok(());
@@ -1111,14 +1109,15 @@ impl Writer {
             block_target,
             chunk_size,
         } = self.sizes;
-        // Under the file's own dictionary a small value is a record of its
-        // own in a packed block, read without its neighbours, and a sample
-        // until the dictionary exists.
-        #[cfg(zstd_any)]
+        // A small value that packs is a record of its own in a packed block,
+        // read without its neighbours, and under the file's own dictionary a
+        // sample until the dictionary exists.
         if self.packs() && value_len < block_target {
+            #[cfg(zstd_any)]
             let sample = self.collecting_dictionary();
             let at = self.write_packed(key, seqno, value, pre)?;
             self.note_key(key, value_len);
+            #[cfg(zstd_any)]
             if sample {
                 self.sample_for_dictionary(value);
             }
@@ -1203,9 +1202,10 @@ impl Writer {
     }
 
     /// Writes `value` as a record of the packed block being gathered, closing
-    /// it first when it holds its target or a record starting past it would
-    /// not be named by a handle's index.
-    #[cfg(zstd_any)]
+    /// it first when it holds the block target or a record starting past it
+    /// would not be named by a handle's index. A read of one value reads its
+    /// record alone whatever the block holds; the block's size is what a
+    /// scan, a collection and the frame index see, as of a block of entries.
     fn write_packed(
         &mut self,
         key: &[u8],
@@ -1216,7 +1216,7 @@ impl Writer {
         use super::packed::{PACKED_REACH, encode_record};
 
         if !self.packed.is_empty()
-            && (self.packed.len() >= PACKED_TARGET
+            && (self.packed.len() as u64 >= u64::from(self.sizes.block_target)
                 || self.packed.len() > PACKED_REACH
                 || self.packed_count == u16::MAX)
         {
@@ -1262,7 +1262,6 @@ impl Writer {
     }
 
     /// Writes the packed block being gathered, if any.
-    #[cfg(zstd_any)]
     fn close_packed(&mut self) -> crate::Result<()> {
         if self.packed.is_empty() {
             return Ok(());

@@ -425,20 +425,24 @@ impl Scanner {
         match decoded.header.kind {
             FrameKind::Single | FrameKind::Block => {
                 let last = decoded.list.len() - 1;
-                let block = (decoded.header.kind == FrameKind::Block).then(|| ScanBlock {
-                    stored: bytes.clone(),
-                    values: decoded.header.count,
-                });
+                let in_block = decoded.header.kind == FrameKind::Block;
                 for (at, entry) in decoded.list.iter().enumerate() {
-                    let (Some(key), Some(value)) = (decoded.key(at), decoded.value(at)) else {
+                    // The index a handle names the value by: in a packed
+                    // block its record's offset.
+                    let (Some(key), Some(value), Some(index), Some(entry_bytes)) = (
+                        decoded.key(at),
+                        decoded.value(at),
+                        decoded.index_of(at),
+                        decoded.block_entry_bytes(at),
+                    ) else {
                         return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
                     };
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "a frame lists at most u16::MAX values"
-                    )]
-                    let index = at as u16;
-                    let whole = decoded.header.kind == FrameKind::Single;
+                    let block = in_block.then(|| ScanBlock {
+                        stored: bytes.clone(),
+                        values: decoded.header.count,
+                        entry_bytes,
+                    });
+                    let whole = !in_block;
                     self.pending.push_back(ScanEntry {
                         key: UserKey::from(key),
                         seqno: entry.seqno,
@@ -454,7 +458,7 @@ impl Scanner {
                         frame_end: if at == last { frame_end } else { offset },
                         resynced,
                         frames: whole.then(|| alloc::vec![bytes.clone()]),
-                        block: block.clone(),
+                        block,
                     });
                 }
                 Some(Ok(()))
@@ -588,6 +592,9 @@ pub(crate) struct ScanBlock {
     pub stored: Slice,
     /// How many values the block holds.
     pub values: u16,
+    /// What this value adds to its file's block entry bytes, as its writer
+    /// counted it (see [`DecodedFrame::block_entry_bytes`]).
+    pub entry_bytes: u64,
 }
 
 impl Iterator for Scanner {

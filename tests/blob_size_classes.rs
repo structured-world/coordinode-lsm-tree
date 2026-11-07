@@ -199,7 +199,7 @@ fn a_large_value_read_whole_is_built_in_place() -> lsm_tree::Result<()> {
 #[cfg(feature = "metrics")]
 #[test]
 fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()> {
-    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+    for compression in codecs() {
         let folder = get_tmp_folder();
         let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
         // Twenty values of 2,000 bytes, four to an 8 KiB block: five blocks.
@@ -242,12 +242,46 @@ fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()
     Ok(())
 }
 
+/// In a file that compresses nothing a small value is a packed record: a
+/// point read and a batch read it alone, a request of its record's bytes,
+/// and under `Never` it is read again each time, as a value of a frame of its
+/// own is.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_packed_value_is_read_as_its_record_alone() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), CompressionType::None, BlobCacheFill::Never)?;
+    for i in 0..20 {
+        tree.insert(format!("k{i:02}"), random(i, 2_000), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    let keys: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
+    let m = tree.metrics();
+
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(
+            tree.get(key, SeqNo::MAX)?.as_deref(),
+            Some(&*random(i as u64, 2_000))
+        );
+    }
+    assert_eq!(m.blob_read_count(), 20, "one record read per value");
+    // The record's fixed part and its three-byte key beside the value.
+    assert_eq!(m.blob_bytes_read(), 20 * (27 + 3 + 2_000));
+
+    let got = tree.multi_get(&keys, SeqNo::MAX)?;
+    for (i, value) in got.iter().enumerate() {
+        assert_eq!(value.as_deref(), Some(&*random(i as u64, 2_000)));
+    }
+    assert_eq!(m.blob_read_count(), 40, "the batch reads each record again");
+    Ok(())
+}
+
 /// A batch whose values share blocks reads each block once, even when none
 /// is cached yet.
 #[cfg(feature = "metrics")]
 #[test]
 fn a_batch_reads_each_block_it_needs_once() -> lsm_tree::Result<()> {
-    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+    for compression in codecs() {
         let folder = get_tmp_folder();
         let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
         for i in 0..20 {

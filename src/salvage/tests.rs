@@ -9547,7 +9547,9 @@ fn salvage_blob_file_reports_a_remap_for_every_salvaged_record() -> crate::Resul
 
 /// Values that shared a block in the source are salvaged out of it into a
 /// block of the recovered file, each to its own place; a damaged block loses
-/// the values it held, and only those.
+/// the values it held, and only those. The source compresses, so its small
+/// values share blocks rather than being packed.
+#[cfg(feature = "lz4")]
 #[test]
 #[expect(clippy::indexing_slicing, reason = "test code")]
 fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::Result<()> {
@@ -9558,10 +9560,12 @@ fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::
     let dest = dir.path().join("blob_salvaged");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
     {
-        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?.use_frame_sizes(FrameSizes {
-            block_target: 100,
-            chunk_size: 256,
-        });
+        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?
+            .use_compression(crate::CompressionType::Lz4)
+            .use_frame_sizes(FrameSizes {
+                block_target: 100,
+                chunk_size: 256,
+            });
         // Two blocks of three values (an entry of 36 bytes each), a single
         // value, a chunked one.
         for i in 0..6_u8 {

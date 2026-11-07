@@ -395,6 +395,36 @@ impl DecodedFrame {
             .ok()
     }
 
+    /// The index a handle names entry `at` by, as [`Self::place_of`] reads
+    /// it back: the place itself, or in a packed block its record's offset.
+    /// `None` past what a handle's index holds.
+    #[must_use]
+    pub(crate) fn index_of(&self, at: usize) -> Option<u16> {
+        if self.is_packed() {
+            return self
+                .list
+                .get(at)
+                .and_then(|entry| u16::try_from(entry.at).ok());
+        }
+        u16::try_from(at).ok()
+    }
+
+    /// What entry `at` adds to its file's block entry bytes, as its writer
+    /// counted it: a block's entry uncompressed, or a packed block's record
+    /// as it lies.
+    #[must_use]
+    pub(crate) fn block_entry_bytes(&self, at: usize) -> Option<u64> {
+        let entry = self.list.get(at)?;
+        if self.is_packed() {
+            let end = self
+                .list
+                .get(at + 1)
+                .map_or(self.entries.len() as u64, |next| u64::from(next.at));
+            return end.checked_sub(u64::from(entry.at));
+        }
+        Some((ENTRY_HEADER_LEN + entry.key.len()) as u64 + u64::from(entry.value_len))
+    }
+
     /// The key of entry `at`.
     #[must_use]
     pub(crate) fn key(&self, at: usize) -> Option<&[u8]> {

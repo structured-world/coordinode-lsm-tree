@@ -306,13 +306,30 @@ pub(crate) enum ValuePlan<'v> {
     Alone,
 }
 
-/// One blob frame a batched read reads: the `len` bytes of `blob_file` at
-/// `offset` that hold the frame the handle names.
+/// What a batched read reads for one value: the `len` bytes of `blob_file`
+/// at `offset` that hold the frame the handle names, or the value's record
+/// alone when `record` says it is packed.
 pub(crate) struct ValueRead<'v> {
     pub(crate) blob_file: &'v BlobFile,
     pub(crate) vhandle: crate::vlog::ValueHandle,
     pub(crate) offset: u64,
     pub(crate) len: usize,
+    pub(crate) record: bool,
+}
+
+/// What one batched read reads: a frame of a blob file, or one record of
+/// its packed block, which no other value of the block shares.
+pub(crate) type ReadOf = (crate::vlog::BlobFileId, u32, Option<u16>);
+
+impl ValueRead<'_> {
+    /// What this read reads, for values of the same frame to share it.
+    pub(crate) fn reads(&self) -> ReadOf {
+        (
+            self.vhandle.blob_file_id,
+            self.vhandle.frame,
+            self.record.then_some(self.vhandle.index),
+        )
+    }
 }
 
 /// Where a blob tree's values kept in the value log are read from: the tree
@@ -412,6 +429,29 @@ impl BlobSource {
         let Some(blob_file) = version.blob_files.get(vhandle.blob_file_id) else {
             return ValuePlan::Alone;
         };
+        // A packed value is its record alone, as a single read reads it: its
+        // block is read only by a scan or a fill.
+        if let crate::blob_tree::handle::Stored::Packed(len) = indirection.stored {
+            if let Some(record) =
+                self.cache
+                    .get_blob_record(self.tree_id, vhandle.frame_at(), vhandle.index)
+            {
+                return match reader::value_in(&record, vhandle.index, &item.key.user_key) {
+                    Ok(value) => ValuePlan::Ready(value),
+                    Err(_) => ValuePlan::Alone,
+                };
+            }
+            let Ok(offset) = crate::vlog::accessor::record_offset(blob_file, &vhandle, len) else {
+                return ValuePlan::Alone;
+            };
+            return ValuePlan::Read(ValueRead {
+                blob_file,
+                vhandle,
+                offset,
+                len: len as usize,
+                record: true,
+            });
+        }
         let Ok((offset, frame_len)) = reader::Reader::frame_span(blob_file, vhandle.frame) else {
             return ValuePlan::Alone;
         };
@@ -432,6 +472,7 @@ impl BlobSource {
             vhandle,
             offset,
             len,
+            record: false,
         })
     }
 
@@ -479,6 +520,17 @@ impl BlobSource {
             #[cfg(feature = "metrics")]
             Some(&self.metrics),
         );
+        if read.record {
+            let value = accessor.record_read(
+                self.tree_id,
+                read.blob_file,
+                key,
+                &read.vhandle,
+                bytes,
+                &self.cache,
+            )?;
+            return Ok((Some(value), None));
+        }
         let malformed = || crate::Error::InvalidHeader("Blob");
         let (start, end) = read
             .blob_file

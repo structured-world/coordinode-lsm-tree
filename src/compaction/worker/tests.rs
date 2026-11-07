@@ -2774,10 +2774,10 @@ fn blob_file_picking_simple() -> crate::Result<()> {
     assert_eq!(2, tree.table_count());
     assert_eq!(1, tree.blob_file_count());
 
-    // `a` shares a block with the others: it is charged its entry
-    // uncompressed as block bytes, its key and one byte with the entry's
-    // fixed part, nothing of frames of its own.
-    let charged = (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + 2) as u64;
+    // `a` is a record of a packed block shared with the others: it is
+    // charged its record as block bytes, its key and one byte with the
+    // record's fixed part, nothing of frames of its own.
+    let charged = (crate::vlog::blob_file::packed::RECORD_HEADER_LEN + 2) as u64;
     let garbage = crate::blob_tree::FragmentationEntry::new(1, 1, 0).with_block_bytes(charged);
     {
         assert_eq!(

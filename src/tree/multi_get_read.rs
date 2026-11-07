@@ -149,9 +149,10 @@ pub(super) struct MultiGetRead<'a, K> {
     merge_room: Option<u64>,
     /// Value reads whose blob file is open, by tag, not yet handed out.
     blobs_ready: VecDeque<usize>,
-    /// The tag of the read out for each blob frame, by file and frame: a value
-    /// in a frame already being read waits on that read.
-    frames_out: crate::HashMap<(crate::vlog::BlobFileId, u32), usize>,
+    /// The tag of the read out for each blob frame or packed record, by what
+    /// it reads (see [`crate::blob_tree::ValueRead::reads`]): a value in a
+    /// frame already being read waits on that read.
+    frames_out: crate::HashMap<crate::blob_tree::ReadOf, usize>,
     /// The bytes of the value reads out.
     blob_bytes_out: usize,
 }
@@ -341,7 +342,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                     self.jobs += 1;
                 }
                 ValuePlan::Read(read) => {
-                    let frame = (read.vhandle.blob_file_id, read.vhandle.frame);
+                    let frame = read.reads();
                     if let Some(&tag) = self.frames_out.get(&frame)
                         && let Some(Some(ValueReadOut::Blob(lead))) = self.reads.get_mut(tag)
                     {
@@ -400,8 +401,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 if let Some(ValueReadOut::Blob(read)) = pending.take_if(
                     |pending| matches!(pending, ValueReadOut::Blob(read) if read.slot == slot),
                 ) {
-                    self.frames_out
-                        .remove(&(read.read.vhandle.blob_file_id, read.read.vhandle.frame));
+                    self.frames_out.remove(&read.read.reads());
                     self.alone.push((read.idx, read.item));
                     self.alone.extend(read.waiters);
                 }
@@ -476,7 +476,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             }
         }
         let at = pending.read.vhandle.frame_at();
-        self.frames_out.remove(&(at.blob_file_id, at.frame));
+        self.frames_out.remove(&pending.read.reads());
         match value {
             Some(value) => self.value_done(pending.idx, Ok(Some(value))),
             None => self.alone.push((pending.idx, pending.item)),

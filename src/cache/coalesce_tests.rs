@@ -995,15 +995,18 @@ fn a_caching_read_caches_a_value_it_took_from_a_read_that_does_not() -> crate::R
     Ok(())
 }
 
-/// Reads that miss the same cold separated value at once read its record once
-/// and every one gets the value.
+/// Reads that miss the same cold separated value of a frame of its own at
+/// once read the frame once and every one gets the value.
 #[test]
 fn simultaneous_cold_reads_of_one_blob_read_it_once() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    // One key, so its record is the blob file's first, at offset 0.
+    // One key, its value past the block target: a frame of its own, the blob
+    // file's first, at offset 0.
     write_keys(
         config(folder.path()).with_kv_separation(Some(
-            crate::KvSeparationOptions::default().separation_threshold(1),
+            crate::KvSeparationOptions::default()
+                .separation_threshold(1)
+                .block_size(16),
         )),
         1,
     )?;

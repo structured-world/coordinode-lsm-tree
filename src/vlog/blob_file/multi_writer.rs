@@ -397,6 +397,14 @@ impl MultiWriter {
 
     /// Takes the dictionary of its own `source` holds, if any, for the file
     /// its frames are copied into.
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::unused_self,
+            clippy::needless_pass_by_ref_mut,
+            reason = "without zstd no file holds a dictionary to lend"
+        )
+    )]
     pub(crate) fn lend_dictionary(&mut self, source: &BlobFile) {
         #[cfg(zstd_any)]
         if source.has_own_dictionary()

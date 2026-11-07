@@ -678,6 +678,13 @@ impl BlobFile {
     /// Whether this file decodes with a dictionary of its own, which no other
     /// file holds: its values are copied out decoded, never as its frames.
     #[must_use]
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::unused_self,
+            reason = "without zstd no file holds a dictionary of its own"
+        )
+    )]
     pub(crate) fn has_own_dictionary(&self) -> bool {
         #[cfg(zstd_any)]
         return self.0.dictionary_in_file;

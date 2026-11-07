@@ -129,6 +129,27 @@ pub(crate) fn caches(fill: BlobCacheFill, frame: &DecodedFrame) -> bool {
     fill.fills() || frame.header.kind == crate::vlog::blob_file::frame::FrameKind::Block
 }
 
+/// Where in `blob_file` the record of `len` bytes `vhandle` names lies, in
+/// its packed block.
+///
+/// # Errors
+///
+/// A frame the file does not list, or a record running past its frame.
+pub(crate) fn record_offset(
+    blob_file: &BlobFile,
+    vhandle: &ValueHandle,
+    len: u32,
+) -> crate::Result<u64> {
+    let malformed = || crate::Error::InvalidHeader("BlobRecord");
+    let (start, end) = blob_file.frame_span(vhandle.frame).ok_or_else(malformed)?;
+    let at =
+        start + crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64 + u64::from(vhandle.index);
+    if at + u64::from(len) > end {
+        return Err(malformed());
+    }
+    Ok(at)
+}
+
 impl<'a> Accessor<'a> {
     pub(crate) fn new(
         blob_files: &'a BlobFileList,
@@ -374,24 +395,64 @@ impl<'a> Accessor<'a> {
         if let Some(frame) = cache.get_blob_frame(tree_id, at) {
             return value_in(&frame, vhandle.index, key).map(Some);
         }
-        let (record, bytes, value) = self.read_record(tree_id, blob_file, key, vhandle, len)?;
-        // Measured without caching the record: whether the sustained read
-        // tail follows the insert.
-        if !self.fill.fills() {
-            return Ok(Some(value));
+        let offset = record_offset(blob_file, vhandle, len)?;
+        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
+        let (file, _) = blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
+        self.count_request(len as usize);
+        let bytes = crate::file::read_exact(file.as_ref(), offset, len as usize)?;
+        self.record_read(tree_id, blob_file, key, vhandle, &bytes, cache)
+            .map(Some)
+    }
+
+    /// The value of the record `vhandle` names in its packed block of
+    /// `blob_file`, out of `bytes`, the record as read: checked to be `key`'s,
+    /// decoded, and cached as the fill says.
+    ///
+    /// # Errors
+    ///
+    /// A record that does not check, is not `bytes` whole or is not `key`'s,
+    /// and a value that does not decode.
+    pub(crate) fn record_read(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        bytes: &crate::Slice,
+        cache: &Cache,
+    ) -> crate::Result<UserValue> {
+        use crate::vlog::blob_file::packed;
+
+        let record = packed::parse_record(bytes)?;
+        if record.len != bytes.len() || bytes.get(record.key.clone()) != Some(key) {
+            return Err(crate::Error::InvalidHeader("BlobRecord"));
         }
-        // A small value is cached as the block it shares a frame with would
-        // be (see `caches`), but into a full cache only once it is read again:
-        // a value read once would cost its entry built, inserted and evicted
-        // unread.
-        let weight = crate::vlog::blob_file::packed::record_frame_weight(&record, &value);
+        let mut decoded = 0;
+        let value = packed::record_value(
+            &record,
+            bytes,
+            blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            blob_file.0.zstd_dictionary.as_deref(),
+            &mut decoded,
+        );
+        self.count_decoded(decoded);
+        let value = value?;
+        // A value read alone follows the fill as a value of a frame of its own
+        // does: its record brings no neighbour along, and caching it under a
+        // stream of rewrites costs every read an insert the next rewrite
+        // makes stale.
+        if !self.fill.fills() {
+            return Ok(value);
+        }
+        // Into a full cache only once it is read again: a value read once
+        // would cost its entry built, inserted and evicted unread.
+        let at = vhandle.frame_at();
+        let weight = packed::record_frame_weight(&record, &value);
         if cache.admit_blob_record(tree_id, at, vhandle.index, weight) {
-            let frame = crate::vlog::blob_file::packed::record_frame(
-                &record,
-                &bytes,
-                value.clone(),
-                vhandle.index,
-            );
+            let frame = packed::record_frame(&record, bytes, value.clone(), vhandle.index);
             debug_assert_eq!(
                 frame.weight(),
                 weight,
@@ -399,53 +460,7 @@ impl<'a> Accessor<'a> {
             );
             cache.insert_blob_record(tree_id, at, vhandle.index, Arc::new(frame));
         }
-        Ok(Some(value))
-    }
-
-    /// The record of `len` bytes `vhandle` names in its packed block of
-    /// `blob_file`, read alone and checked: the record, its bytes and its
-    /// value decoded.
-    fn read_record(
-        &self,
-        tree_id: TreeId,
-        blob_file: &BlobFile,
-        key: &[u8],
-        vhandle: &ValueHandle,
-        len: u32,
-    ) -> crate::Result<(
-        crate::vlog::blob_file::packed::Record,
-        crate::Slice,
-        crate::Slice,
-    )> {
-        use crate::vlog::blob_file::{frame::FRAME_HEADER_LEN, packed};
-
-        let malformed = || crate::Error::InvalidHeader("BlobRecord");
-        let (start, end) = blob_file.frame_span(vhandle.frame).ok_or_else(malformed)?;
-        let at = start + FRAME_HEADER_LEN as u64 + u64::from(vhandle.index);
-        if at + u64::from(len) > end {
-            return Err(malformed());
-        }
-        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
-        let (file, _) = blob_file
-            .file_accessor()
-            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
-        self.count_request(len as usize);
-        let bytes = crate::file::read_exact(file.as_ref(), at, len as usize)?;
-        let record = packed::parse_record(&bytes)?;
-        if record.len != bytes.len() || bytes.get(record.key.clone()) != Some(key) {
-            return Err(malformed());
-        }
-        let mut decoded = 0;
-        let value = packed::record_value(
-            &record,
-            &bytes,
-            blob_file.0.meta.compression,
-            #[cfg(zstd_any)]
-            blob_file.0.zstd_dictionary.as_deref(),
-            &mut decoded,
-        );
-        self.count_decoded(decoded);
-        Ok((record, bytes, value?))
+        Ok(value)
     }
 
     /// Reads bytes `range` of one separated value: of a chunked value, only

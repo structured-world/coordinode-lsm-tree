@@ -617,13 +617,10 @@ fn a_blob_admitted_to_the_blob_cache_copies_nothing() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-#[test]
-#[cfg(feature = "zstd")]
-fn a_packed_value_read_again_is_served_from_the_cache() -> lsm_tree::Result<()> {
-    // A small value packed beside others is read as its record alone; read
-    // again, it comes from the cache as a value of a block does, under the
-    // default fill that caches no value of a frame of its own. The values fit
-    // the cache, so each is taken on its first read.
+/// Reads 50 small values of a file that compresses nothing, packed and so
+/// each read as its record alone, twice under `fill`, and returns the blob
+/// bytes each pass read.
+fn packed_reads(fill: BlobCacheFill) -> lsm_tree::Result<(u64, u64)> {
     let folder = get_tmp_folder();
     let tree = Config::new(
         folder.path(),
@@ -635,38 +632,44 @@ fn a_packed_value_read_again_is_served_from_the_cache() -> lsm_tree::Result<()> 
     ))
     .blob_compression(CompressionType::None)
     .with_kv_separation(Some(
-        lsm_tree::KvSeparationOptions::default()
-            .separation_threshold(1)
-            .file_dictionary(16 * 1_024),
+        lsm_tree::KvSeparationOptions::default().separation_threshold(1),
     ))
+    .blob_cache_fill(fill)
     .open()?;
     for i in 0..50 {
         tree.insert(key(i), vec![b'v'; 200], u64::from(i));
     }
     tree.flush_active_memtable(0)?;
     let m = tree.metrics();
+    let pass = || -> lsm_tree::Result<u64> {
+        let before = m.blob_bytes_read();
+        for i in 0..50 {
+            assert_eq!(
+                tree.get(key(i), SeqNo::MAX)?.as_deref(),
+                Some(vec![b'v'; 200].as_slice())
+            );
+        }
+        Ok(m.blob_bytes_read() - before)
+    };
+    let cold = pass()?;
+    Ok((cold, pass()?))
+}
 
-    let before = m.blob_bytes_read();
-    for i in 0..50 {
-        assert!(tree.get(key(i), SeqNo::MAX)?.is_some());
-    }
-    let cold = m.blob_bytes_read() - before;
+#[test]
+fn a_packed_value_follows_the_fill_as_a_value_of_its_own_frame_does() -> lsm_tree::Result<()> {
+    // A small value packed beside others is read as its record alone. Its
+    // record brings no neighbour, so it is cached as a value of a frame of
+    // its own is: not under the default fill, where a value read again is
+    // read again, and under a fill that caches, from the cache. The values
+    // fit the cache, so each is taken on its first read again.
+    let (cold, again) = packed_reads(BlobCacheFill::default())?;
     assert!(cold > 0, "the first reads read the blob file");
-    // Each read is its record alone, not its block.
     assert!(cold < 50 * 300, "{cold} B read for 50 values of 200 B");
+    assert_eq!(again, cold, "each read again is its record alone again");
 
-    let before = m.blob_bytes_read();
-    for i in 0..50 {
-        assert_eq!(
-            tree.get(key(i), SeqNo::MAX)?.as_deref(),
-            Some(vec![b'v'; 200].as_slice())
-        );
-    }
-    assert_eq!(
-        m.blob_bytes_read(),
-        before,
-        "a packed value read again comes from the cache"
-    );
+    let (cold, again) = packed_reads(BlobCacheFill::Always)?;
+    assert!(cold > 0, "the first reads read the blob file");
+    assert_eq!(again, 0, "a packed value read again comes from the cache");
     Ok(())
 }
 
