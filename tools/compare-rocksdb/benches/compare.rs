@@ -3137,7 +3137,8 @@ fn baseline_of(label: &str) -> &'static str {
 /// measured.
 struct Run {
     settings: paired::Settings,
-    /// Only groups whose name contains it run.
+    /// Only groups whose name contains it run, or whose name it is when it
+    /// ends in `$`.
     filter: Option<String>,
     /// Started by `cargo bench`, which passes `--bench`. Without it (`cargo
     /// test` runs a bench target too) every group runs once as a smoke test
@@ -3235,8 +3236,16 @@ impl Run {
         }
     }
 
+    /// Whether group `group` runs: its name contains the filter, or is the
+    /// filter exactly when it ends in `$` (`write_throughput$` leaves out
+    /// `write_throughput_zstd22`).
     fn wants(&self, group: &str) -> bool {
-        self.filter.as_deref().is_none_or(|f| group.contains(f))
+        self.filter
+            .as_deref()
+            .is_none_or(|f| match f.strip_suffix('$') {
+                Some(exact) => group == exact,
+                None => group.contains(f),
+            })
     }
 
     /// Whether the arm labelled `label` runs.
