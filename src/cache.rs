@@ -1227,6 +1227,20 @@ impl Cache {
             .admit(&blob_record_key(vlog_id, at, index), weight)
     }
 
+    /// Whether the cache holds the value of a packed block at `at` and
+    /// `index`, `weight` once cached, without evicting anything.
+    #[must_use]
+    pub(crate) fn room_for_blob_record(
+        &self,
+        vlog_id: crate::TreeId,
+        at: BlobFrameAt,
+        index: u16,
+        weight: u64,
+    ) -> bool {
+        self.data
+            .has_room(&blob_record_key(vlog_id, at, index), weight)
+    }
+
     /// Whether the blob frame at `at`, just read and `weight` once cached,
     /// goes into the cache under a fill that does not cache everything, as
     /// [`Self::admit_blob_record`] decides for a packed value.

@@ -570,6 +570,13 @@ where
         false
     }
 
+    /// Whether `key`'s shard holds `weight` more without evicting anything.
+    pub(crate) fn has_room(&self, key: &K, weight: u64) -> bool {
+        let (_, shard) = self.locate(key);
+        let core = shard.read();
+        core.resident_bytes() + weight <= core.capacity
+    }
+
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
     /// stay within capacity.
     pub(crate) fn insert(&self, key: K, value: V) {
