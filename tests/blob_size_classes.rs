@@ -21,7 +21,9 @@ fn random(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// A blob tree separating values from 1 KiB, its blob files compressed with
-/// `compression` and its blob frames cached as `fill` says.
+/// `compression` and its blob frames cached as `fill` says. Its zstd files
+/// build no dictionary of their own, so small values share blocks under
+/// every codec; packing under a file's dictionary is tested apart.
 fn open(
     path: &std::path::Path,
     compression: CompressionType,
@@ -33,7 +35,9 @@ fn open(
         SequenceNumberCounter::default(),
     )
     .with_kv_separation(Some(
-        KvSeparationOptions::default().separation_threshold(1_024),
+        KvSeparationOptions::default()
+            .separation_threshold(1_024)
+            .file_dictionary(0),
     ))
     .blob_compression(compression)
     .blob_cache_fill(fill)
@@ -239,6 +243,53 @@ fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()
             "{compression:?}: a value of its own is not cached under Never"
         );
     }
+    Ok(())
+}
+
+/// Under zstd and the default options a blob file builds its own dictionary
+/// and packs its small values: a cold point read of a value reads its record
+/// alone, and not the 8 KiB block of its neighbours a file without a
+/// dictionary would read and decode. Incompressible values keep the block
+/// and the record at their raw sizes, so the bytes read tell them apart.
+#[cfg(all(feature = "metrics", feature = "zstd"))]
+#[test]
+fn a_zstd_file_reads_a_small_value_alone_by_default() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let AnyTree::Blob(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(1_024),
+    ))
+    .blob_compression(CompressionType::Zstd(3))
+    .blob_cache_fill(BlobCacheFill::Never)
+    .use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
+        64 << 20,
+    )))
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    // 400 KB, well past the default dictionary's 64 KiB of samples.
+    for i in 0..200 {
+        tree.insert(format!("k{i:03}"), random(i, 2_000), 0);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = tree.metrics();
+    let (reads, bytes) = (m.blob_read_count(), m.blob_bytes_read());
+    assert_eq!(
+        tree.get("k150", SeqNo::MAX)?.as_deref(),
+        Some(&*random(150, 2_000))
+    );
+    assert_eq!(m.blob_read_count(), reads + 1, "one read for the value");
+    let read = m.blob_bytes_read() - bytes;
+    assert!(
+        read < 2 * 2_000,
+        "{read} bytes read for a value of 2000: its record alone"
+    );
     Ok(())
 }
 

@@ -406,9 +406,11 @@ pub enum BlobCacheFill {
     /// large enough to be separated are mostly read once, and cached they
     /// would evict the index, filter and data blocks of every tree sharing the
     /// cache. A packed small value read as its record alone is cached all the
-    /// same, once read again, off the read's path. A block of small values a point read decodes is cached all the
-    /// same, as a data block is: the values beside the one read are read as
-    /// often, and each would otherwise decode the whole block again. A scan
+    /// same, once read again, off the read's path. A block of small values a
+    /// point read decodes is cached all the same while the cache has room,
+    /// and in a full cache once missed again: the values beside the one read
+    /// are read as often, and each would otherwise decode the whole block
+    /// again. A scan
     /// still reads its values ahead, into a store of its own holding at most
     /// one coalesced read, from which it hands them out.
     #[default]
@@ -459,7 +461,7 @@ impl Default for KvSeparationOptions {
             )
             .expect("the default chunk size is not zero"),
             dictionary_classes: DictionaryClasses::DEFAULT,
-            file_dictionary: 0,
+            file_dictionary: /* 64 KiB */ 64 * 1_024,
             cell_separation_thresholds: alloc::vec::Vec::new(),
 
             staleness_threshold: 0.25,
@@ -606,7 +608,13 @@ impl KvSeparationOptions {
     /// read of it decodes that value alone. The values written before the
     /// dictionary fills are compressed without it.
     ///
-    /// Defaults to `0`.
+    /// Defaults to 64 KiB: against blocks of 8 KiB a cold point read of a
+    /// 256-byte value decodes it alone (3.5 us against 12-14 at 70 000 keys,
+    /// and a sustained overwrite's read p99 22-26 us against 41-50), a range
+    /// scan stays faster than values compressed one by one without it, and
+    /// the files take 30% more space than the blocks, 5% less than values
+    /// compressed alone. Dictionaries of 4 and 16 KiB read the same and keep
+    /// slightly more.
     #[must_use]
     pub fn file_dictionary(mut self, bytes: u32) -> Self {
         self.file_dictionary = bytes;
