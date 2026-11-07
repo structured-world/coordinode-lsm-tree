@@ -1227,6 +1227,19 @@ impl Cache {
             .admit(&blob_record_key(vlog_id, at, index), weight)
     }
 
+    /// Whether the blob frame at `at`, just read and `weight` once cached,
+    /// goes into the cache under a fill that does not cache everything, as
+    /// [`Self::admit_blob_record`] decides for a packed value.
+    #[must_use]
+    pub(crate) fn admit_blob_frame(
+        &self,
+        vlog_id: crate::TreeId,
+        at: BlobFrameAt,
+        weight: u64,
+    ) -> bool {
+        self.data.admit(&blob_frame_key(vlog_id, at), weight)
+    }
+
     /// The value of a packed block cached at `at` and `index`, as a frame of
     /// that one value. The caller compares its key, as for a frame.
     #[must_use]

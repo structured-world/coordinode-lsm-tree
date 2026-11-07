@@ -120,13 +120,23 @@ pub(crate) struct Accessor<'a> {
     metrics: Option<&'a Metrics>,
 }
 
-/// Whether a frame a read decoded goes into the cache under `fill`. A block
-/// of small values always does, as a data block does: the values beside the
-/// one read are read next as often as not, and a block decoded once per value
-/// costs each of them the whole block. A frame of one value, or a chunk,
-/// follows the fill.
-pub(crate) fn caches(fill: BlobCacheFill, frame: &DecodedFrame) -> bool {
-    fill.fills() || frame.header.kind == crate::vlog::blob_file::frame::FrameKind::Block
+/// Whether the frame at `at` a read decoded goes into the cache under `fill`.
+/// A block of small values does while the cache has room for it, and in a
+/// full cache once it is missed again: the values beside the one read are
+/// read next as often as not, and a block decoded once per value costs each
+/// of them the whole block, but a block of a cold random read would only
+/// evict the tables' blocks the next read needs. A frame of one value, or a
+/// chunk, follows the fill.
+pub(crate) fn caches(
+    fill: BlobCacheFill,
+    cache: &Cache,
+    tree_id: TreeId,
+    at: BlobFrameAt,
+    frame: &DecodedFrame,
+) -> bool {
+    fill.fills()
+        || (frame.header.kind == crate::vlog::blob_file::frame::FrameKind::Block
+            && cache.admit_blob_frame(tree_id, at, frame.weight()))
 }
 
 /// Where in `blob_file` the record of `len` bytes `vhandle` names lies, in
@@ -300,7 +310,9 @@ impl<'a> Accessor<'a> {
                 // The read that led may not cache what it reads (its policy
                 // is its own, taken when it began): one whose policy does
                 // caches the shared frame itself.
-                if caches(self.fill, &shared) && !cache.contains_blob_frame(tree_id, at) {
+                if !cache.contains_blob_frame(tree_id, at)
+                    && caches(self.fill, cache, tree_id, at, &shared)
+                {
                     cache.insert_blob_frame(tree_id, at, Arc::clone(&shared));
                 }
                 return Ok(HeldFrame::Shared(shared));
@@ -337,7 +349,7 @@ impl<'a> Accessor<'a> {
         self.count_decoded(decoded);
         let frame = parsed?;
         cache.record_blob_load(tree_id, at, timer);
-        let fills = caches(self.fill, &frame);
+        let fills = caches(self.fill, cache, tree_id, at, &frame);
         Ok(match lead {
             Some(lead) => lead.publish_owned(cache, tree_id, at, frame, fills),
             None if fills => {

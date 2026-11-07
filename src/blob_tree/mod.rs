@@ -551,14 +551,16 @@ impl BlobSource {
         let frame = parsed?;
         // Shared only with the cache: the batch's other values in the frame
         // are taken out of it here, by reference.
-        let frame = if crate::vlog::accessor::caches(self.fill, &frame) {
-            let frame = Arc::new(frame);
-            self.cache
-                .insert_blob_frame(self.tree_id, read.vhandle.frame_at(), Arc::clone(&frame));
-            HeldFrame::Shared(frame)
-        } else {
-            HeldFrame::Own(frame)
-        };
+        let at = read.vhandle.frame_at();
+        let frame =
+            if crate::vlog::accessor::caches(self.fill, &self.cache, self.tree_id, at, &frame) {
+                let frame = Arc::new(frame);
+                self.cache
+                    .insert_blob_frame(self.tree_id, at, Arc::clone(&frame));
+                HeldFrame::Shared(frame)
+            } else {
+                HeldFrame::Own(frame)
+            };
         if frame.header.kind != FrameKind::Head {
             let value = reader::value_in(&frame, read.vhandle.index, key)?;
             return Ok((Some(value), Some(frame)));
