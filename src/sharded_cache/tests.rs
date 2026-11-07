@@ -67,6 +67,56 @@ fn admitted_entry_survives_churn_of_one_off_entries() {
     assert_eq!(c.get(&1), Some(vec![0u8; 100]));
 }
 
+/// Main-queue entries left after `count` keys are each missed twice into a
+/// full shard (admitted on the repeat) and inserted at `priority`, none read
+/// again. The shard starts as ten entries read once each, so they move to
+/// main as the first inserts evict.
+fn main_survivors_of_repeat_misses(priority: Priority, count: u64) -> usize {
+    let c = full_shard(1024);
+    for key in 1_000..1_010 {
+        assert!(c.get(&key).is_some());
+    }
+    for key in 0..count {
+        assert!(!c.admit(&key, 100));
+        assert!(c.admit(&key, 100));
+        c.insert_with_priority(key, vec![0u8; 100], priority);
+    }
+    (1_000..1_010).filter(|key| c.peek(key).is_some()).count()
+}
+
+/// A value admitted on a repeat miss goes on probation: a stream of such
+/// values read once each leaves every block already in main resident, where
+/// at normal priority the same stream evicts them all. This is what keeps a
+/// sustained read of separated values from evicting the table blocks every
+/// read walks.
+#[test]
+fn probation_entries_admitted_on_a_repeat_leave_main_resident() {
+    assert_eq!(
+        main_survivors_of_repeat_misses(Priority::Probation, 100),
+        10
+    );
+    assert_eq!(
+        main_survivors_of_repeat_misses(Priority::Normal, 100),
+        0,
+        "a ghost hit at normal priority enters main and evicts there"
+    );
+}
+
+/// On probation an entry still earns main by being read again while in the
+/// small queue, so a value read repeatedly stays cached.
+#[test]
+fn probation_entry_read_again_survives_churn() {
+    let c = full_shard(1024);
+    assert!(!c.admit(&1, 100));
+    assert!(c.admit(&1, 100));
+    c.insert_with_priority(1, vec![0u8; 100], Priority::Probation);
+    assert!(c.get(&1).is_some());
+    for key in 100..200 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    assert_eq!(c.get(&1), Some(vec![0u8; 100]));
+}
+
 /// The doorkeeper is bounded by the ghost queue: a key whose first miss has
 /// aged out of it is refused again rather than remembered forever.
 #[test]

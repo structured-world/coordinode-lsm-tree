@@ -1099,7 +1099,9 @@ impl Cache {
     }
 
     /// Caches one value of a packed block, read alone, under its frame and
-    /// its record's offset `index`: a frame of that one value.
+    /// its record's offset `index`: a frame of that one value. On probation:
+    /// it stays only if read again, so a stream of values read once each
+    /// cannot push table blocks out of the main queue.
     pub(crate) fn insert_blob_record(
         &self,
         vlog_id: crate::TreeId,
@@ -1107,8 +1109,11 @@ impl Cache {
         index: u16,
         record: alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>,
     ) {
-        self.data
-            .insert(blob_record_key(vlog_id, at, index), Item::BlobFrame(record));
+        self.data.insert_with_priority(
+            blob_record_key(vlog_id, at, index),
+            Item::BlobFrame(record),
+            Priority::Probation,
+        );
     }
 
     /// Whether the value of a packed block at `at` and `index`, just missed

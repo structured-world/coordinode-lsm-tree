@@ -83,6 +83,11 @@ pub(crate) enum Priority {
     Normal,
     /// Pinned admission: straight to main with a full frequency credit.
     High,
+    /// Probationary admission: the small queue even on a ghost hit, so the
+    /// entry reaches main only by being read again there. For entries one
+    /// read each, like a separated value, whose stream must not push the
+    /// main queue's blocks out.
+    Probation,
 }
 
 /// One cached entry: the value, its weight, the S3-FIFO frequency counter, and
@@ -247,6 +252,11 @@ where
                     } else {
                         (Location::Small, 0)
                     }
+                }
+                Priority::Probation => {
+                    // The fingerprint was spent on admitting the entry.
+                    self.take_ghost(hash);
+                    (Location::Small, 0)
                 }
             };
             let hasher = &self.hasher;
@@ -547,7 +557,7 @@ where
     /// (or evicted cold) recently, which the ghost queue remembers. A first
     /// miss into a full shard is remembered there instead, so a read that
     /// never comes back costs a fingerprint, not an entry built, inserted and
-    /// evicted unread. A key admitted on a repeat enters the main queue.
+    /// evicted unread.
     pub(crate) fn admit(&self, key: &K, weight: u64) -> bool {
         let (h, shard) = self.locate(key);
         {
