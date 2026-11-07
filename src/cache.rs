@@ -1169,6 +1169,10 @@ impl Cache {
     /// read's path (see [`fill`]). On probation: it stays only if read again,
     /// so a stream of values read once each cannot push table blocks out of
     /// the main queue.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the experiment's stage rides beside the fill"
+    )]
     pub(crate) fn fill_blob_record(
         &self,
         vlog_id: crate::TreeId,
@@ -1177,7 +1181,7 @@ impl Cache {
         record: crate::vlog::blob_file::packed::Record,
         bytes: crate::Slice,
         value: crate::Slice,
-        room_only: bool,
+        stage: FillStage,
     ) {
         let key = blob_record_key(vlog_id, at, index);
         #[cfg(feature = "std")]
@@ -1189,12 +1193,13 @@ impl Cache {
                 bytes,
                 value,
                 index,
-                room_only,
+                stage,
             },
         );
         // no-std: no worker thread, the entry is built and inserted inline
         #[cfg(not(feature = "std"))]
         {
+            let _ = stage;
             let frame = crate::vlog::blob_file::packed::record_frame(&record, &bytes, value, index);
             self.data.insert_with_priority(
                 key,
@@ -1285,6 +1290,19 @@ impl Cache {
 
 #[cfg(feature = "std")]
 mod fill;
+
+/// Experiment: how far the fill worker takes a fill.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillStage {
+    /// Built and inserted.
+    Insert,
+    /// Built and inserted only when its shard has room for it then.
+    RoomOnly,
+    /// Built and dropped: the worker's work without the cache's.
+    BuildOnly,
+    /// Dropped as taken off the queue: the queue and the worker's wakes alone.
+    DropOnly,
+}
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code")]

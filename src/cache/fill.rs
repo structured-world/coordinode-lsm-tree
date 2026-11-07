@@ -16,7 +16,7 @@
 //! read never wakes it; once it has found the queue empty for [`IDLE_POLLS`]
 //! drains in a row it parks, and the next fill wakes it.
 
-use super::{CacheKey, Data, Item};
+use super::{CacheKey, Data, FillStage, Item};
 use crate::Slice;
 use crate::sharded_cache::Priority;
 use crate::vlog::blob_file::packed::Record;
@@ -41,14 +41,17 @@ pub(crate) struct Fill {
     pub(crate) bytes: Slice,
     pub(crate) value: Slice,
     pub(crate) index: u16,
-    /// Experiment: inserted only when its shard has room for it then.
-    pub(crate) room_only: bool,
+    /// Experiment: how far the worker takes the fill.
+    pub(crate) stage: FillStage,
 }
 
 impl Fill {
     /// Builds the entry and inserts it, on probation (see
     /// [`super::Cache::fill_blob_record`]).
     pub(crate) fn apply(self, data: &Data) {
+        if self.stage == FillStage::DropOnly {
+            return;
+        }
         let frame = crate::vlog::blob_file::packed::record_frame(
             &self.record,
             &self.bytes,
@@ -56,10 +59,10 @@ impl Fill {
             self.index,
         );
         let item = Item::BlobFrame(Arc::new(frame));
-        if self.room_only {
-            data.insert_if_room(self.key, item, Priority::Probation);
-        } else {
-            data.insert_with_priority(self.key, item, Priority::Probation);
+        match self.stage {
+            FillStage::RoomOnly => data.insert_if_room(self.key, item, Priority::Probation),
+            FillStage::Insert => data.insert_with_priority(self.key, item, Priority::Probation),
+            FillStage::BuildOnly | FillStage::DropOnly => drop(core::hint::black_box(item)),
         }
     }
 }

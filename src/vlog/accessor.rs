@@ -519,15 +519,30 @@ impl<'a> Accessor<'a> {
         // Experiment: `off` caches no value read alone; `room` only into room,
         // checked at the read and again under the insert's lock, so it evicts
         // nothing; `ghost` admits as usual but inserts nothing; `admit-room`
-        // admits as usual and inserts only into room.
-        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let mode = *MODE.get_or_init(|| match std::env::var("LSM_RECORD_FILL").as_deref() {
-            Ok("off") => 1,
-            Ok("room") => 2,
-            Ok("ghost") => 3,
-            Ok("admit-room") => 4,
-            _ => 0,
-        });
+        // admits as usual and inserts only into room; `build` admits and
+        // leaves the fill to the worker, which builds the entry and drops it;
+        // `push` leaves it to the worker, which drops it as taken.
+        #[cfg(feature = "std")]
+        let mode = {
+            static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+            *MODE.get_or_init(|| match std::env::var("LSM_RECORD_FILL").as_deref() {
+                Ok("off") => 1,
+                Ok("room") => 2,
+                Ok("ghost") => 3,
+                Ok("admit-room") => 4,
+                Ok("build") => 5,
+                Ok("push") => 6,
+                _ => 0,
+            })
+        };
+        #[cfg(not(feature = "std"))]
+        let mode = 0_u8;
+        let stage = match mode {
+            2 | 4 => crate::cache::FillStage::RoomOnly,
+            5 => crate::cache::FillStage::BuildOnly,
+            6 => crate::cache::FillStage::DropOnly,
+            _ => crate::cache::FillStage::Insert,
+        };
         if mode == 1 {
             return;
         }
@@ -542,7 +557,7 @@ impl<'a> Accessor<'a> {
                     record,
                     bytes,
                     value.clone(),
-                    true,
+                    stage,
                 );
             }
             return;
@@ -559,7 +574,7 @@ impl<'a> Accessor<'a> {
                 record,
                 bytes,
                 value.clone(),
-                mode == 4,
+                stage,
             );
         }
     }
