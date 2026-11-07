@@ -100,6 +100,52 @@ fn misses_share_loads_only_once_loads_are_measured_slow() {
     assert_eq!(sharing.loads_in_flight(), 0);
 }
 
+/// Packed values read alone are cached by the fill worker: settled, each is
+/// in the cache; and a cache dropped with fills still queued stops its
+/// worker rather than leaving it waiting, so the drop returns.
+#[cfg(feature = "std")]
+#[test]
+fn packed_values_are_cached_by_the_worker_and_its_cache_drops_cleanly() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .use_cache(Arc::clone(&cache))
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(1),
+    ))
+    .blob_compression(crate::CompressionType::None)
+    .open()?;
+    for i in 0..2_000u32 {
+        tree.insert(i.to_be_bytes(), [7u8; 100], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..2_000u32 {
+        assert!(tree.get(i.to_be_bytes(), crate::SeqNo::MAX)?.is_some());
+    }
+    cache.settle_fills();
+    assert!(cache.size() >= 2_000 * 100, "{} bytes cached", cache.size());
+
+    for i in 0..2_000u32 {
+        assert!(tree.get((i + 1).to_be_bytes(), crate::SeqNo::MAX).is_ok());
+    }
+    let started = std::time::Instant::now();
+    drop(tree);
+    drop(cache);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the drop waited {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
 #[test]
 fn metadata_priority_defaults_on_and_toggles() {
     // On by default.

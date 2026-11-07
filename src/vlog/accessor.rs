@@ -395,6 +395,25 @@ impl<'a> Accessor<'a> {
         if let Some(frame) = cache.get_blob_frame(tree_id, at) {
             return value_in(&frame, vhandle.index, key).map(Some);
         }
+        // Concurrent misses of one record read it once, when reads take long
+        // enough for waiting to pay: the others take the value it decoded.
+        let lead = match cache.claim_blob_record(tree_id, at, vhandle.index) {
+            crate::cache::BlobClaim::Shared(frame) => {
+                return value_in(&frame, vhandle.index, key).map(Some);
+            }
+            crate::cache::BlobClaim::Lead(lead) => {
+                // A read that finished between the miss and this claim has
+                // left its value to be cached, perhaps already.
+                if let Some(record) = cache.get_blob_record(tree_id, at, vhandle.index) {
+                    let value = value_in(&record, vhandle.index, key);
+                    lead.hand_over(record);
+                    return value.map(Some);
+                }
+                Some(lead)
+            }
+            crate::cache::BlobClaim::Alone => None,
+        };
+        let timer = crate::cache::Cache::time_load();
         let offset = record_offset(blob_file, vhandle, len)?;
         let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
         let (file, _) = blob_file
@@ -402,18 +421,29 @@ impl<'a> Accessor<'a> {
             .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
         self.count_request(len as usize);
         let bytes = crate::file::read_exact(file.as_ref(), offset, len as usize)?;
-        self.record_read(tree_id, blob_file, key, vhandle, &bytes, cache)
-            .map(Some)
+        let (record, value) = self.record_value(blob_file, key, &bytes)?;
+        cache.record_blob_record_load(tree_id, at, vhandle.index, timer);
+        if let Some(lead) = lead
+            && lead.has_waiters()
+        {
+            lead.hand_over(Arc::new(crate::vlog::blob_file::packed::record_frame(
+                &record,
+                &bytes,
+                value.clone(),
+                vhandle.index,
+            )));
+        }
+        Self::keep_record(tree_id, vhandle, record, bytes, &value, cache);
+        Ok(Some(value))
     }
 
     /// The value of the record `vhandle` names in its packed block of
     /// `blob_file`, out of `bytes`, the record as read: checked to be `key`'s,
-    /// decoded, and cached as the fill says.
+    /// decoded, and left to be cached (see [`Self::keep_record`]).
     ///
     /// # Errors
     ///
-    /// A record that does not check, is not `bytes` whole or is not `key`'s,
-    /// and a value that does not decode.
+    /// As [`Self::record_value`].
     pub(crate) fn record_read(
         &self,
         tree_id: TreeId,
@@ -423,6 +453,24 @@ impl<'a> Accessor<'a> {
         bytes: &crate::Slice,
         cache: &Cache,
     ) -> crate::Result<UserValue> {
+        let (record, value) = self.record_value(blob_file, key, bytes)?;
+        Self::keep_record(tree_id, vhandle, record, bytes.clone(), &value, cache);
+        Ok(value)
+    }
+
+    /// The record `bytes` holds, checked to be all of `bytes` and `key`'s,
+    /// and its value decoded under `blob_file`'s codec.
+    ///
+    /// # Errors
+    ///
+    /// A record that does not check, is not `bytes` whole or is not `key`'s,
+    /// and a value that does not decode.
+    fn record_value(
+        &self,
+        blob_file: &BlobFile,
+        key: &[u8],
+        bytes: &crate::Slice,
+    ) -> crate::Result<(crate::vlog::blob_file::packed::Record, UserValue)> {
         use crate::vlog::blob_file::packed;
 
         let record = packed::parse_record(bytes)?;
@@ -439,28 +487,28 @@ impl<'a> Accessor<'a> {
             &mut decoded,
         );
         self.count_decoded(decoded);
-        let value = value?;
-        // A value read alone follows the fill as a value of a frame of its own
-        // does: its record brings no neighbour along, and caching it under a
-        // stream of rewrites costs every read an insert the next rewrite
-        // makes stale.
-        if !self.fill.fills() {
-            return Ok(value);
-        }
-        // Into a full cache only once it is read again: a value read once
-        // would cost its entry built, inserted and evicted unread.
+        Ok((record, value?))
+    }
+
+    /// Leaves a packed value read alone to be cached, off the read's path: a
+    /// small value is read again as often as the values of a block are, and
+    /// the insert and what it evicts are the worker's (see
+    /// [`Cache::fill_blob_record`]). Into a full cache only once it is read
+    /// again: a value read once would cost its entry built, inserted and
+    /// evicted unread.
+    fn keep_record(
+        tree_id: TreeId,
+        vhandle: &ValueHandle,
+        record: crate::vlog::blob_file::packed::Record,
+        bytes: crate::Slice,
+        value: &UserValue,
+        cache: &Cache,
+    ) {
         let at = vhandle.frame_at();
-        let weight = packed::record_frame_weight(&record, &value);
+        let weight = crate::vlog::blob_file::packed::record_frame_weight(&record, value);
         if cache.admit_blob_record(tree_id, at, vhandle.index, weight) {
-            let frame = packed::record_frame(&record, bytes, value.clone(), vhandle.index);
-            debug_assert_eq!(
-                frame.weight(),
-                weight,
-                "admitted at the weight it is cached at"
-            );
-            cache.insert_blob_record(tree_id, at, vhandle.index, Arc::new(frame));
+            cache.fill_blob_record(tree_id, at, vhandle.index, record, bytes, value.clone());
         }
-        Ok(value)
     }
 
     /// Reads bytes `range` of one separated value: of a chunked value, only

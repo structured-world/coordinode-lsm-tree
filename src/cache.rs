@@ -160,8 +160,12 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 /// ```
 pub struct Cache {
     // NOTE: rustc_hash performed best: https://fjall-rs.github.io/post/fjall-2-1
-    /// In-tree sharded S3-FIFO cache (byte-weighted).
-    data: ShardedCache<CacheKey, Item, BlockWeighter, rustc_hash::FxBuildHasher>,
+    /// In-tree sharded S3-FIFO cache (byte-weighted), shared with the fill
+    /// worker.
+    data: alloc::sync::Arc<Data>,
+    /// The fills a point read leaves off its path (see [`fill`]).
+    #[cfg(feature = "std")]
+    fills: fill::Fills,
     /// When false, the row cache (decoded point-read results) is off, so
     /// `get_row` always misses and `insert_row` is a no-op. Blocks / blobs are
     /// cached regardless.
@@ -184,6 +188,9 @@ pub struct Cache {
     /// one decode. Only a miss consults it.
     loads: Loads,
 }
+
+/// The entries a cache holds.
+type Data = ShardedCache<CacheKey, Item, BlockWeighter, rustc_hash::FxBuildHasher>;
 
 /// The registry of cold loads in flight.
 type Loads =
@@ -311,7 +318,8 @@ pub(crate) struct BlobLead<'a>(LoadLead<'a>);
 
 impl BlobLead<'_> {
     /// Hands the frame read to the waiters, caching it first when `fill` says
-    /// so.
+    /// so: a frame is cached at once, since the values beside the one read
+    /// are read next and each would otherwise decode the frame again.
     pub(crate) fn publish(
         self,
         cache: &Cache,
@@ -328,6 +336,20 @@ impl BlobLead<'_> {
             cache.data.insert(blob_frame_key(vlog_id, at), item.clone());
         }
         self.0.publish(item);
+    }
+
+    /// Whether a read waits on this one.
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.0.has_waiters()
+    }
+
+    /// Hands `frame`, the value a read of one packed record decoded, to the
+    /// reads waiting on it.
+    pub(crate) fn hand_over(
+        self,
+        frame: alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>,
+    ) {
+        self.0.publish(Item::BlobFrame(frame));
     }
 
     /// [`Self::publish`] for the frame this read decoded: shared only when
@@ -396,13 +418,15 @@ impl Cache {
     #[must_use]
     pub fn with_capacity_bytes(bytes: u64) -> Self {
         Self {
-            data: ShardedCache::with_weighter(
+            data: alloc::sync::Arc::new(ShardedCache::with_weighter(
                 bytes,
                 BLOCK_CACHE_SHARDS,
                 BLOCK_CACHE_EST_ITEMS,
                 BlockWeighter,
                 rustc_hash::FxBuildHasher,
-            ),
+            )),
+            #[cfg(feature = "std")]
+            fills: fill::Fills::new(),
             row_cache_enabled: true,
             metadata_priority: true,
             loads: crate::inflight::InflightLoads::new(
@@ -596,6 +620,48 @@ impl Cache {
             }
             crate::inflight::Claim::Alone => BlobClaim::Alone,
         }
+    }
+
+    /// Claims the cold read of the packed record at `at` and `index`, as
+    /// [`Self::claim_blob_frame`] does for a frame: the reads waiting on it
+    /// take the value the lead decoded.
+    pub(crate) fn claim_blob_record(
+        &self,
+        vlog_id: crate::TreeId,
+        at: BlobFrameAt,
+        index: u16,
+    ) -> BlobClaim<'_> {
+        match self
+            .loads
+            .claim(blob_record_key(vlog_id, at, index), LoadIdentity::BlobFrame)
+        {
+            crate::inflight::Claim::Lead(lead) => BlobClaim::Lead(BlobLead(lead)),
+            crate::inflight::Claim::Join(join) => {
+                let shared = if crate::inflight::may_wait() {
+                    join.wait()
+                } else {
+                    join.try_take()
+                };
+                match shared {
+                    Some(Item::BlobFrame(frame)) => BlobClaim::Shared(frame),
+                    _ => BlobClaim::Alone,
+                }
+            }
+            crate::inflight::Claim::Alone => BlobClaim::Alone,
+        }
+    }
+
+    /// Records the cold read of the packed record at `at` and `index` that
+    /// `timer` timed.
+    pub(crate) fn record_blob_record_load(
+        &self,
+        vlog_id: crate::TreeId,
+        at: BlobFrameAt,
+        index: u16,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads
+            .record_load(&blob_record_key(vlog_id, at, index), timer);
     }
 
     /// Enables or disables the row cache (decoded point-read results), returning
@@ -1099,21 +1165,50 @@ impl Cache {
     }
 
     /// Caches one value of a packed block, read alone, under its frame and
-    /// its record's offset `index`: a frame of that one value. On probation:
-    /// it stays only if read again, so a stream of values read once each
-    /// cannot push table blocks out of the main queue.
-    pub(crate) fn insert_blob_record(
+    /// its record's offset `index`: a frame of that one value, built off the
+    /// read's path (see [`fill`]). On probation: it stays only if read again,
+    /// so a stream of values read once each cannot push table blocks out of
+    /// the main queue.
+    pub(crate) fn fill_blob_record(
         &self,
         vlog_id: crate::TreeId,
         at: BlobFrameAt,
         index: u16,
-        record: alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>,
+        record: crate::vlog::blob_file::packed::Record,
+        bytes: crate::Slice,
+        value: crate::Slice,
     ) {
-        self.data.insert_with_priority(
-            blob_record_key(vlog_id, at, index),
-            Item::BlobFrame(record),
-            Priority::Probation,
+        let key = blob_record_key(vlog_id, at, index);
+        #[cfg(feature = "std")]
+        self.fills.push(
+            &self.data,
+            fill::Fill {
+                key,
+                record,
+                bytes,
+                value,
+                index,
+            },
         );
+        // no-std: no worker thread, the entry is built and inserted inline
+        #[cfg(not(feature = "std"))]
+        {
+            let frame = crate::vlog::blob_file::packed::record_frame(&record, &bytes, value, index);
+            self.data.insert_with_priority(
+                key,
+                Item::BlobFrame(alloc::sync::Arc::new(frame)),
+                Priority::Probation,
+            );
+        }
+    }
+
+    /// Waits until every fill a read left before the call is in the cache,
+    /// or dropped for a full queue: for a caller that reads the cache right
+    /// after a read that filled it, such as a test.
+    #[doc(hidden)]
+    pub fn settle_fills(&self) {
+        #[cfg(feature = "std")]
+        self.fills.settle();
     }
 
     /// Whether the value of a packed block at `at` and `index`, just missed
@@ -1158,6 +1253,9 @@ impl Cache {
         }
     }
 }
+
+#[cfg(feature = "std")]
+mod fill;
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code")]

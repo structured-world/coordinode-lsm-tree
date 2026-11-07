@@ -243,14 +243,29 @@ fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()
 }
 
 /// In a file that compresses nothing a small value is a packed record: a
-/// point read and a batch read it alone, a request of its record's bytes,
-/// and under `Never` it is read again each time, as a value of a frame of its
-/// own is.
+/// batch and a point read read it alone, a request of its record's bytes, and
+/// once cached, off the read's path, a read again takes it from the cache
+/// even under `Never`.
 #[cfg(feature = "metrics")]
 #[test]
 fn a_packed_value_is_read_as_its_record_alone() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
-    let tree = open(folder.path(), CompressionType::None, BlobCacheFill::Never)?;
+    let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(64 << 20));
+    let AnyTree::Blob(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(1_024),
+    ))
+    .blob_compression(CompressionType::None)
+    .blob_cache_fill(BlobCacheFill::Never)
+    .use_cache(std::sync::Arc::clone(&cache))
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
     for i in 0..20 {
         tree.insert(format!("k{i:02}"), random(i, 2_000), 0);
     }
@@ -258,21 +273,26 @@ fn a_packed_value_is_read_as_its_record_alone() -> lsm_tree::Result<()> {
     let keys: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
     let m = tree.metrics();
 
+    let got = tree.multi_get(&keys, SeqNo::MAX)?;
+    for (i, value) in got.iter().enumerate() {
+        assert_eq!(value.as_deref(), Some(&*random(i as u64, 2_000)));
+    }
+    assert_eq!(m.blob_read_count(), 20, "one record read per value");
+    // The record's fixed part and its three-byte key beside the value.
+    assert_eq!(m.blob_bytes_read(), 20 * (27 + 3 + 2_000));
+
+    cache.settle_fills();
     for (i, key) in keys.iter().enumerate() {
         assert_eq!(
             tree.get(key, SeqNo::MAX)?.as_deref(),
             Some(&*random(i as u64, 2_000))
         );
     }
-    assert_eq!(m.blob_read_count(), 20, "one record read per value");
-    // The record's fixed part and its three-byte key beside the value.
-    assert_eq!(m.blob_bytes_read(), 20 * (27 + 3 + 2_000));
-
-    let got = tree.multi_get(&keys, SeqNo::MAX)?;
-    for (i, value) in got.iter().enumerate() {
-        assert_eq!(value.as_deref(), Some(&*random(i as u64, 2_000)));
-    }
-    assert_eq!(m.blob_read_count(), 40, "the batch reads each record again");
+    assert_eq!(
+        m.blob_read_count(),
+        20,
+        "each read again comes from the cache"
+    );
     Ok(())
 }
 

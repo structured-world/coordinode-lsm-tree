@@ -622,14 +622,14 @@ fn a_blob_admitted_to_the_blob_cache_copies_nothing() -> lsm_tree::Result<()> {
 /// bytes each pass read.
 fn packed_reads(fill: BlobCacheFill) -> lsm_tree::Result<(u64, u64)> {
     let folder = get_tmp_folder();
+    let cache =
+        std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
     let tree = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .use_cache(std::sync::Arc::new(
-        lsm_tree::Cache::with_capacity_bytes(64 << 20).with_row_cache(false),
-    ))
+    .use_cache(std::sync::Arc::clone(&cache))
     .blob_compression(CompressionType::None)
     .with_kv_separation(Some(
         lsm_tree::KvSeparationOptions::default().separation_threshold(1),
@@ -652,24 +652,30 @@ fn packed_reads(fill: BlobCacheFill) -> lsm_tree::Result<(u64, u64)> {
         Ok(m.blob_bytes_read() - before)
     };
     let cold = pass()?;
+    // The values are cached off the reads' path: wait for them, as a read
+    // a moment later would find them.
+    cache.settle_fills();
     Ok((cold, pass()?))
 }
 
 #[test]
-fn a_packed_value_follows_the_fill_as_a_value_of_its_own_frame_does() -> lsm_tree::Result<()> {
-    // A small value packed beside others is read as its record alone. Its
-    // record brings no neighbour, so it is cached as a value of a frame of
-    // its own is: not under the default fill, where a value read again is
-    // read again, and under a fill that caches, from the cache. The values
-    // fit the cache, so each is taken on its first read again.
-    let (cold, again) = packed_reads(BlobCacheFill::default())?;
-    assert!(cold > 0, "the first reads read the blob file");
-    assert!(cold < 50 * 300, "{cold} B read for 50 values of 200 B");
-    assert_eq!(again, cold, "each read again is its record alone again");
-
-    let (cold, again) = packed_reads(BlobCacheFill::Always)?;
-    assert!(cold > 0, "the first reads read the blob file");
-    assert_eq!(again, 0, "a packed value read again comes from the cache");
+fn a_packed_value_read_again_is_served_from_the_cache() -> lsm_tree::Result<()> {
+    // A small value packed beside others is read as its record alone; read
+    // again, it comes from the cache, as a value of a block does, whatever
+    // the fill says of a value of a frame of its own. The values fit the
+    // cache, so each is taken on its first read.
+    for fill in [BlobCacheFill::default(), BlobCacheFill::Always] {
+        let (cold, again) = packed_reads(fill)?;
+        assert!(cold > 0, "{fill:?}: the first reads read the blob file");
+        assert!(
+            cold < 50 * 300,
+            "{fill:?}: {cold} B read for 50 values of 200 B"
+        );
+        assert_eq!(
+            again, 0,
+            "{fill:?}: a packed value read again comes from the cache"
+        );
+    }
     Ok(())
 }
 
