@@ -516,6 +516,11 @@ impl<'a> Accessor<'a> {
         value: &UserValue,
         cache: &Cache,
     ) {
+        // Experiment: no value read alone goes into the cache.
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("LSM_NO_RECORD_FILL").is_some()) {
+            return;
+        }
         let at = vhandle.frame_at();
         let weight = crate::vlog::blob_file::packed::record_frame_weight(&record, value);
         if cache.admit_blob_record(tree_id, at, vhandle.index, weight) {
