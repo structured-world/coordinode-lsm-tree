@@ -65,8 +65,9 @@
 //! in exactly one place per engine and the workload code stays
 //! engine-agnostic. The engines: `ours`, `rocksdb`, `surrealkv` (pure-Rust
 //! embedded LSM/MVCC), and each of ours and RocksDB with its values in blob
-//! files, uncompressed (`blob_tree`, `rocksdb_blob`) and at zstd level 3
-//! (`blob_tree_zstd`, `rocksdb_blob_zstd`, see [`BlobCodec`]). Every group runs
+//! files, uncompressed (`blob_tree`, `rocksdb_blob`), at zstd level 3
+//! (`blob_tree_zstd`, `rocksdb_blob_zstd`) and at zstd level 22
+//! (`blob_tree_zstd22`, `rocksdb_blob_zstd22`, see [`BlobCodec`]). Every group runs
 //! the inline and blob arms of both engines ([`HEAD_TO_HEAD`]); SurrealKV
 //! compresses with zstd at a fixed level 3 only, so it overlays ONLY on the
 //! `None`-compression groups (see [`engines_for`]).
@@ -79,15 +80,18 @@
 //! values inline and in blob files, neither caching blob values, so a blob is
 //! read from its file through the page cache on both (see [`BLOB_SPECS`]).
 //!
-//! ## Compression axis + cross-engine overlay
+//! ## Compression axes + cross-engine overlay
 //!
-//! Every scenario is run twice: once with `None` block compression
-//! (the `<scenario>` group) and once with zstd at level 22, the maximum
-//! "ultra" level (the `<scenario>_zstd22` group). Both engines are
-//! configured identically per variant — ours via
-//! `CompressionType::Zstd(22)`, RocksDB via `DBCompressionType::Zstd`
-//! pinned to level 22 — so the no-compression and high-ratio paths sit
-//! side-by-side on the dashboard.
+//! The keys and the values are compressed apart, each with a codec and a
+//! level of its own, on both engines alike. The tables, which hold the keys
+//! (and the inline arms' values with them), are the group's axis: every
+//! scenario runs once with `None` block compression (the `<scenario>` group)
+//! and once with zstd at level 22, the maximum "ultra" level (the
+//! `<scenario>_zstd22` group), ours via `CompressionType::Zstd(22)` and
+//! RocksDB via `DBCompressionType::Zstd` pinned to level 22. The blob files,
+//! which hold the separated values, are the arm's axis within the group:
+//! uncompressed, zstd 3 or zstd 22, ours through its blob compression and
+//! RocksDB through its blob compression type and `blob_compression_opts`.
 //!
 //! Within each group every engine runs in the SAME process and the SAME
 //! rounds (ours vs rocksdb, plus surrealkv on the `None` groups). Because the
@@ -296,8 +300,10 @@ impl Engine {
             Self::SurrealKv => "surrealkv",
             Self::BlobTree(BlobCodec::Off) => "blob_tree",
             Self::BlobTree(BlobCodec::Zstd) => "blob_tree_zstd",
+            Self::BlobTree(BlobCodec::Zstd22) => "blob_tree_zstd22",
             Self::RocksDbBlob(BlobCodec::Off) => "rocksdb_blob",
             Self::RocksDbBlob(BlobCodec::Zstd) => "rocksdb_blob_zstd",
+            Self::RocksDbBlob(BlobCodec::Zstd22) => "rocksdb_blob_zstd22",
         }
     }
 
@@ -318,43 +324,49 @@ impl Engine {
     }
 }
 
-/// How the blob arms compress their blob files, the same on both engines.
+/// How the blob arms compress their blob files, the same on both engines and
+/// apart from the tables, whose compression is the group's: the keys and the
+/// values each have a codec and a level of their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlobCodec {
     /// Blob files uncompressed.
     Off,
-    /// Blob files at zstd level [`BlobCodec::ZSTD_LEVEL`], whatever the group
-    /// compresses its tables with.
+    /// Blob files at zstd's default level, 3.
     Zstd,
+    /// Blob files at zstd's maximum level, 22.
+    Zstd22,
 }
 
 impl BlobCodec {
-    /// zstd's default level. RocksDB's C API sets the blob codec but not the
-    /// blob level, which stays at its `blob_compression_opts` default, zstd's
-    /// own default; ours is set to the same.
-    const ZSTD_LEVEL: i32 = 3;
+    /// The zstd level of the blob files, `None` for none.
+    fn zstd_level(self) -> Option<i32> {
+        match self {
+            Self::Off => None,
+            Self::Zstd => Some(3),
+            Self::Zstd22 => Some(Compression::ZSTD_MAX_LEVEL),
+        }
+    }
 
     /// Our blob compression. Set in both arms, so a default that changes with a
     /// feature of the bench crate cannot compress the uncompressed arm.
     fn ours(self) -> CompressionType {
-        match self {
-            Self::Off => CompressionType::None,
-            Self::Zstd => CompressionType::Zstd(Self::ZSTD_LEVEL),
-        }
+        self.zstd_level()
+            .map_or(CompressionType::None, CompressionType::Zstd)
     }
 
-    /// RocksDB's blob compression type; its level stays at the default, which
-    /// is [`BlobCodec::ZSTD_LEVEL`].
+    /// RocksDB's blob compression type; its level is set apart (see
+    /// [`set_blob_files`]).
     fn rocksdb(self) -> rocksdb::DBCompressionType {
         match self {
             Self::Off => rocksdb::DBCompressionType::None,
-            Self::Zstd => rocksdb::DBCompressionType::Zstd,
+            Self::Zstd | Self::Zstd22 => rocksdb::DBCompressionType::Zstd,
         }
     }
 }
 
 /// Our engine and RocksDB, each with its values inline and in blob files, the
-/// blob files uncompressed and compressed: the arms of every group.
+/// blob files uncompressed and compressed at the default and the maximum
+/// level: the arms of every group.
 const HEAD_TO_HEAD: &[Engine] = &[
     Engine::Ours,
     Engine::RocksDb,
@@ -362,6 +374,8 @@ const HEAD_TO_HEAD: &[Engine] = &[
     Engine::RocksDbBlob(BlobCodec::Off),
     Engine::BlobTree(BlobCodec::Zstd),
     Engine::RocksDbBlob(BlobCodec::Zstd),
+    Engine::BlobTree(BlobCodec::Zstd22),
+    Engine::RocksDbBlob(BlobCodec::Zstd22),
 ];
 
 /// KV-separation threshold for the `blob_tree` arm: values at or above this many
@@ -390,6 +404,8 @@ fn engines_for(compression: Compression) -> &'static [Engine] {
             Engine::RocksDbBlob(BlobCodec::Off),
             Engine::BlobTree(BlobCodec::Zstd),
             Engine::RocksDbBlob(BlobCodec::Zstd),
+            Engine::BlobTree(BlobCodec::Zstd22),
+            Engine::RocksDbBlob(BlobCodec::Zstd22),
         ],
         Compression::Zstd22 => HEAD_TO_HEAD,
     }
@@ -753,6 +769,14 @@ fn rocksdb_options(
         block_opts.set_data_block_hash_ratio(0.75);
     }
     let mut opts = rocksdb::Options::default();
+    // The blob level has no setter of its own: it is the options string's,
+    // read into the options first, so the cache and table factory set below
+    // are held by the options the engine opens with.
+    if let Some(level) = blob_files.and_then(BlobCodec::zstd_level) {
+        opts = opts
+            .get_options_from_string(format!("blob_compression_opts={{level={level}}}"))
+            .expect("rocksdb: blob compression level");
+    }
     opts.create_if_missing(true);
     match compression {
         Compression::None => opts.set_compression_type(rocksdb::DBCompressionType::None),
@@ -776,7 +800,8 @@ fn rocksdb_options(
 }
 
 /// RocksDB's blob files as the blob arms use them: values at or above
-/// [`BLOB_SEPARATION_THRESHOLD`], compressed as `codec` says.
+/// [`BLOB_SEPARATION_THRESHOLD`], compressed as `codec` says, at the level
+/// [`rocksdb_options`] reads in.
 fn set_blob_files(opts: &mut rocksdb::Options, codec: BlobCodec) {
     opts.set_enable_blob_files(true);
     opts.set_min_blob_size(u64::from(BLOB_SEPARATION_THRESHOLD));
@@ -3364,8 +3389,45 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Fails unless RocksDB writes its blob files at the level each blob arm
+/// names: the level comes from an options string, which a misspelled key or
+/// a struct RocksDB no longer reads would leave at its default unnoticed.
+fn check_rocksdb_blob_levels() {
+    for codec in [BlobCodec::Zstd, BlobCodec::Zstd22] {
+        let Some(level) = codec.zstd_level() else {
+            continue;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        drop(
+            rocksdb::DB::open(
+                &rocksdb_options(Compression::None, false, Some(codec)),
+                dir.path(),
+            )
+            .expect("rocksdb: open"),
+        );
+        let options = std::fs::read_dir(dir.path())
+            .expect("rocksdb: list")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("OPTIONS-"))
+            .map(|e| std::fs::read_to_string(e.path()).expect("rocksdb: OPTIONS"))
+            .last()
+            .expect("rocksdb wrote no OPTIONS file");
+        let blob = options
+            .lines()
+            .find(|line| line.trim_start().starts_with("blob_compression_opts="))
+            .expect("rocksdb: no blob_compression_opts in OPTIONS");
+        assert!(
+            blob.contains(&format!(";level={level};"))
+                || blob.contains(&format!("{{level={level};"))
+                || blob.contains(&format!(";level={level}}}")),
+            "rocksdb blob files not at level {level}: {blob}"
+        );
+    }
+}
+
 fn main() {
     let mut run = Run::from_args();
+    check_rocksdb_blob_levels();
     let mode = if run.measuring {
         "measurement"
     } else {
