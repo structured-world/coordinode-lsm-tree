@@ -375,6 +375,11 @@ impl<'a> Accessor<'a> {
             return value_in(&frame, vhandle.index, key).map(Some);
         }
         let (record, bytes, value) = self.read_record(tree_id, blob_file, key, vhandle, len)?;
+        // Measured without caching the record: whether the sustained read
+        // tail follows the insert.
+        if !self.fill.fills() {
+            return Ok(Some(value));
+        }
         // A small value is cached as the block it shares a frame with would
         // be (see `caches`), but into a full cache only once it is read again:
         // a value read once would cost its entry built, inserted and evicted
