@@ -1067,7 +1067,7 @@ fn write_throughput_variant(run: &mut Run, group_name: &str, compression: Compre
         .engines
         .contains(&Engine::SurrealKv)
         .then(|| skv_runtime().expect("surrealkv: tokio runtime"));
-    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
+    for n in run.sizes_of(spec.sizes) {
         // Precompute the keys + values ONCE per `n`, so the timed body does no
         // per-iteration allocation.
         let inputs = WorkloadInputs::of(n, spec.values);
@@ -1177,7 +1177,7 @@ fn point_read_variant(
     }
     series.retain(|&(label, ..)| run.wants_engine(label));
 
-    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
+    for n in run.sizes_of(spec.sizes) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // Every arm opened and checked before the rounds: they only ever pay
         // for reads, never for open / write / flush.
@@ -1652,7 +1652,7 @@ fn multi_get_variant(
         .filter(|engine| !matches!(engine, Engine::SurrealKv))
         .collect();
 
-    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
+    for n in run.sizes_of(spec.sizes) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // This measures WARM steady-state batched-MultiGet throughput, NOT
         // cold first-touch latency: every engine opens its seed and probes once
@@ -1804,7 +1804,7 @@ fn warm_read_group(
     if !run.wants(group_name) {
         return;
     }
-    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
+    for n in run.sizes_of(spec.sizes) {
         let inputs = WorkloadInputs::of(n, spec.values);
         let warm: Vec<(Engine, WarmEngine)> = run
             .engines_of(spec.engines)
@@ -2026,7 +2026,7 @@ fn overwrite_variant(
     if !run.wants(group_name) {
         return;
     }
-    for &n in spec.sizes.iter().filter(|&&n| run.wants_size(n)) {
+    for n in run.sizes_of(spec.sizes) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // Every seed written before the rounds; SurrealKV is not seeded (see
         // `SeedStates`) and writes its first copy per iteration instead.
@@ -2947,7 +2947,7 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
         CompactionShape::Major => &[10_000, 40_000],
         CompactionShape::Split => &[40_000, 100_000],
     };
-    for &n in sizes.iter().filter(|&&n| run.wants_size(n)) {
+    for n in run.sizes_of(sizes) {
         let inputs = match shape {
             CompactionShape::Major => WorkloadInputs::build(n),
             CompactionShape::Split => WorkloadInputs::incompressible(n),
@@ -3268,9 +3268,14 @@ impl Run {
             .is_none_or(|engines| engines.iter().any(|e| e == label))
     }
 
-    /// Whether the key count `n` runs.
-    fn wants_size(&self, n: u64) -> bool {
-        self.sizes.as_ref().is_none_or(|sizes| sizes.contains(&n))
+    /// The key counts of `sizes` that run, taken out so a group's loop can
+    /// measure into the run.
+    fn sizes_of(&self, sizes: &[u64]) -> Vec<u64> {
+        sizes
+            .iter()
+            .copied()
+            .filter(|n| self.sizes.as_ref().is_none_or(|wanted| wanted.contains(n)))
+            .collect()
     }
 
     /// The engines of `engines` that run, so a filtered run does not set up
