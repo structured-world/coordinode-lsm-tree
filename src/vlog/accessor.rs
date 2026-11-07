@@ -516,13 +516,16 @@ impl<'a> Accessor<'a> {
         value: &UserValue,
         cache: &Cache,
     ) {
-        // Experiment: `off` caches no value read alone, `room` only while the
-        // cache has room, `ghost` admits as usual but inserts nothing.
+        // Experiment: `off` caches no value read alone; `room` only into room,
+        // checked at the read and again under the insert's lock, so it evicts
+        // nothing; `ghost` admits as usual but inserts nothing; `admit-room`
+        // admits as usual and inserts only into room.
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let mode = *MODE.get_or_init(|| match std::env::var("LSM_RECORD_FILL").as_deref() {
             Ok("off") => 1,
             Ok("room") => 2,
             Ok("ghost") => 3,
+            Ok("admit-room") => 4,
             _ => 0,
         });
         if mode == 1 {
@@ -532,7 +535,15 @@ impl<'a> Accessor<'a> {
         let weight = crate::vlog::blob_file::packed::record_frame_weight(&record, value);
         if mode == 2 {
             if cache.room_for_blob_record(tree_id, at, vhandle.index, weight) {
-                cache.fill_blob_record(tree_id, at, vhandle.index, record, bytes, value.clone());
+                cache.fill_blob_record(
+                    tree_id,
+                    at,
+                    vhandle.index,
+                    record,
+                    bytes,
+                    value.clone(),
+                    true,
+                );
             }
             return;
         }
@@ -541,7 +552,15 @@ impl<'a> Accessor<'a> {
             return;
         }
         if admitted {
-            cache.fill_blob_record(tree_id, at, vhandle.index, record, bytes, value.clone());
+            cache.fill_blob_record(
+                tree_id,
+                at,
+                vhandle.index,
+                record,
+                bytes,
+                value.clone(),
+                mode == 4,
+            );
         }
     }
 

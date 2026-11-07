@@ -1177,6 +1177,7 @@ impl Cache {
         record: crate::vlog::blob_file::packed::Record,
         bytes: crate::Slice,
         value: crate::Slice,
+        room_only: bool,
     ) {
         let key = blob_record_key(vlog_id, at, index);
         #[cfg(feature = "std")]
@@ -1188,6 +1189,7 @@ impl Cache {
                 bytes,
                 value,
                 index,
+                room_only,
             },
         );
         // no-std: no worker thread, the entry is built and inserted inline

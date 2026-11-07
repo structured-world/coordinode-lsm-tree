@@ -41,6 +41,8 @@ pub(crate) struct Fill {
     pub(crate) bytes: Slice,
     pub(crate) value: Slice,
     pub(crate) index: u16,
+    /// Experiment: inserted only when its shard has room for it then.
+    pub(crate) room_only: bool,
 }
 
 impl Fill {
@@ -53,11 +55,12 @@ impl Fill {
             self.value,
             self.index,
         );
-        data.insert_with_priority(
-            self.key,
-            Item::BlobFrame(Arc::new(frame)),
-            Priority::Probation,
-        );
+        let item = Item::BlobFrame(Arc::new(frame));
+        if self.room_only {
+            data.insert_if_room(self.key, item, Priority::Probation);
+        } else {
+            data.insert_with_priority(self.key, item, Priority::Probation);
+        }
     }
 }
 

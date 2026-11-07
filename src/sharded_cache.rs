@@ -577,6 +577,17 @@ where
         core.resident_bytes() + weight <= core.capacity
     }
 
+    /// Inserts `key` at `priority` only when its shard holds it without
+    /// evicting anything, decided under the insert's own lock.
+    pub(crate) fn insert_if_room(&self, key: K, value: V, priority: Priority) {
+        let weight = self.weighter.weight(&key, &value);
+        let (h, shard) = self.locate(&key);
+        let mut core = shard.write();
+        if core.resident_bytes() + weight <= core.capacity {
+            core.insert(h, key, value, weight, priority);
+        }
+    }
+
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
     /// stay within capacity.
     pub(crate) fn insert(&self, key: K, value: V) {
