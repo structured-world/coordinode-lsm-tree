@@ -545,7 +545,7 @@ impl KvSeparationOptions {
     }
 
     /// Sets which frames of a blob file a dictionary codec
-    /// ([`CompressionType::ZstdDict`](crate::CompressionType::ZstdDict))
+    /// (`CompressionType::ZstdDict`, with the `zstd` feature)
     /// compresses with its dictionary; the others are compressed at its level
     /// without one.
     ///
