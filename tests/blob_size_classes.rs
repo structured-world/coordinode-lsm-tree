@@ -196,6 +196,38 @@ fn a_large_value_read_whole_is_built_in_place() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A large value read alone without the cache is one request of the
+/// filesystem, its head and its chunks together, under every codec: read
+/// apart, the head's small read starts the kernel's readahead small and the
+/// chunks after it come in one growing window after another, which made a
+/// cold 4 MiB value three times slower than a frame of its own.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_large_value_read_alone_is_one_request() -> lsm_tree::Result<()> {
+    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+        let folder = get_tmp_folder();
+        let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
+        let mut value: Vec<u8> = (0..600_000_u32).map(|i| (i % 7) as u8).collect();
+        value.extend(random(9, 600_000));
+        tree.insert("large", &value, 0);
+        tree.flush_active_memtable(0)?;
+
+        let m = tree.metrics();
+        let before = m.blob_read_count();
+        assert_eq!(
+            tree.get("large", SeqNo::MAX)?.as_deref(),
+            Some(&*value),
+            "{compression:?}"
+        );
+        assert_eq!(
+            m.blob_read_count() - before,
+            1,
+            "{compression:?}: the head and the chunks in one request"
+        );
+    }
+    Ok(())
+}
+
 /// A block of small values a point read decodes is cached like a data block,
 /// whatever the blob cache fill says: the values beside the one read are read
 /// from the cache, by `get` and by `multi_get` alike, not decoded again per

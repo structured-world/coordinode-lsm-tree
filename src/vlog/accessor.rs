@@ -380,7 +380,8 @@ impl<'a> Accessor<'a> {
 
     /// Reads one separated value whole, `stored` what its table records of
     /// it: a value with a record of its own in a packed block is read as that
-    /// record alone, any other as [`Self::get`] reads it.
+    /// record alone, a chunked one its read does not cache as its head and
+    /// chunks in one read, any other as [`Self::get`] reads it.
     ///
     /// # Errors
     ///
@@ -393,8 +394,17 @@ impl<'a> Accessor<'a> {
         stored: crate::blob_tree::handle::Stored,
         cache: &Cache,
     ) -> crate::Result<Option<UserValue>> {
-        let crate::blob_tree::handle::Stored::Packed(len) = stored else {
-            return self.get(tree_id, key, vhandle, cache);
+        let len = match stored {
+            crate::blob_tree::handle::Stored::Packed(len) => len,
+            crate::blob_tree::handle::Stored::Frames(len) => {
+                if let Some(value) = self.chunked_at_once(tree_id, key, vhandle, len, cache)? {
+                    return Ok(Some(value));
+                }
+                return self.get(tree_id, key, vhandle, cache);
+            }
+            crate::blob_tree::handle::Stored::InBlock(_) => {
+                return self.get(tree_id, key, vhandle, cache);
+            }
         };
         let Some(blob_file) = self.blob_files.get(vhandle.blob_file_id) else {
             return Ok(None);
@@ -443,6 +453,70 @@ impl<'a> Accessor<'a> {
         }
         Self::keep_record(tree_id, vhandle, &record, &bytes, &value, cache);
         Ok(Some(value))
+    }
+
+    /// The chunked value `vhandle` names, `stored` bytes from its head on, as
+    /// one read of its head and its chunks, which lie back to back after it;
+    /// `None` when it is not read that way, and then [`Self::get`] reads it.
+    ///
+    /// Read apart, the head's small read starts the kernel's readahead with a
+    /// small window, and the chunks right after it are read as that stream's
+    /// next windows, growing one after the other, each waiting for the device:
+    /// a cold 4 MiB value took three times what one read of it takes. A read
+    /// that caches what it reads keeps its chunks apart, as the cache holds
+    /// them, and a head already cached leaves the chunks one read anyway.
+    ///
+    /// # Errors
+    ///
+    /// The blob file's open or read failures, and a head or chunks that do not
+    /// check or are not `key`'s.
+    fn chunked_at_once(
+        &self,
+        tree_id: TreeId,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        stored: u32,
+        cache: &Cache,
+    ) -> crate::Result<Option<UserValue>> {
+        if self.fill.fills() {
+            return Ok(None);
+        }
+        let Some(blob_file) = self.blob_files.get(vhandle.blob_file_id) else {
+            return Ok(None);
+        };
+        let (offset, head_len) = Reader::frame_span(blob_file, vhandle.frame)?;
+        let stored_len = stored as usize;
+        if stored_len <= head_len
+            || !blob_file.is_frame_boundary(offset + u64::from(stored))
+            || cache.contains_blob_frame(tree_id, vhandle.frame_at())
+        {
+            return Ok(None);
+        }
+        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
+        let (file, _) = blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
+        self.count_request(stored_len);
+        let bytes = crate::file::read_exact(file.as_ref(), offset, stored_len)?;
+        let mut decoded = 0;
+        let head = Reader::decode(blob_file, &bytes.slice(..head_len), &mut decoded);
+        self.count_decoded(decoded);
+        let head = head?;
+        if head.header.kind != FrameKind::Head {
+            return Ok(None);
+        }
+        check_key(&head, vhandle.index, key)?;
+        let mut decoded = 0;
+        let value = crate::vlog::blob_file::reader::assemble_stored(
+            &head,
+            &bytes.slice(head_len..),
+            blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            blob_file.0.zstd_dictionary.as_deref(),
+            &mut decoded,
+        );
+        self.count_decoded(decoded);
+        value.map(Some)
     }
 
     /// The value of the record `vhandle` names in its packed block of
