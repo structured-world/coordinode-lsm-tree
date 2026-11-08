@@ -1765,22 +1765,34 @@ const BLOB_META_BYTES: u64 = 1_024;
 /// copy may open, or, when the value is above `chunk_size` (a tree reopened
 /// with a smaller one), a head with its chunk table and a header per chunk.
 /// A block's share is its uncompressed entry, which compression only shrinks.
+/// Each frame the copy writes also takes an entry of the output file's frame
+/// index: a value with frames of its own is split into chunks of at least
+/// [`MIN_CHUNK_SIZE`](crate::vlog::blob_file::writer::MIN_CHUNK_SIZE), which
+/// bounds how many it has.
 #[cfg(feature = "std")]
 fn frame_bytes(indirection: &crate::blob_tree::handle::BlobIndirection, chunk_size: u32) -> u64 {
     use crate::blob_tree::handle::Stored;
-    use crate::vlog::blob_file::frame::FRAME_HEADER_LEN;
+    use crate::vlog::blob_file::{frame::FRAME_HEADER_LEN, writer::MIN_CHUNK_SIZE};
 
     /// A head's chunk table: the chunk size and the chunk count.
     const CHUNK_TABLE_LEN: u64 = 8;
+    /// A frame's entry in the file's frame index: its offset.
+    const INDEX_ENTRY_LEN: u64 = 8;
 
     match indirection.stored {
-        // Copied as those frames, under the same codec.
-        Stored::Frames(bytes) => u64::from(bytes),
-        Stored::InBlock(bytes) if indirection.size > chunk_size => {
-            let chunks = u64::from(indirection.size.div_ceil(chunk_size));
-            u64::from(bytes) + FRAME_HEADER_LEN as u64 * (1 + chunks) + CHUNK_TABLE_LEN
+        // Copied as those frames, under the same codec: at most a head and
+        // a chunk per smallest chunk of the value.
+        Stored::Frames(bytes) => {
+            let frames = 1 + u64::from(indirection.size.div_ceil(MIN_CHUNK_SIZE));
+            u64::from(bytes) + INDEX_ENTRY_LEN * frames
         }
-        Stored::InBlock(bytes) => u64::from(bytes) + FRAME_HEADER_LEN as u64,
+        Stored::InBlock(bytes) if indirection.size > chunk_size => {
+            let frames = 1 + u64::from(indirection.size.div_ceil(chunk_size));
+            u64::from(bytes)
+                + (FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN) * frames
+                + CHUNK_TABLE_LEN
+        }
+        Stored::InBlock(bytes) => u64::from(bytes) + FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN,
     }
 }
 

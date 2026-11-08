@@ -509,14 +509,12 @@ impl KvSeparationOptions {
     /// cap; a block takes values below its target until it is 90% full, so
     /// its payload stays under twice the target, which is held within half
     /// the cap, and within the chunk size, so a value the chunk size splits
-    /// never shares a block. A chunk is at least a page: below that, a value
-    /// at the cap splits into so many chunks that their frame headers pass
-    /// the u32 a value's stored bytes are recorded in, and each chunk costs
-    /// a page read anyway. Computed once per writer, not per value.
+    /// never shares a block. A chunk is at least
+    /// [`MIN_CHUNK_SIZE`](crate::vlog::blob_file::writer::MIN_CHUNK_SIZE).
+    /// Computed once per writer, not per value.
     #[must_use]
     pub(crate) fn frame_sizes(&self) -> crate::vlog::blob_file::writer::FrameSizes {
-        /// The smallest chunk: a page.
-        const MIN_CHUNK_SIZE: u32 = 4 * 1024;
+        use crate::vlog::blob_file::writer::MIN_CHUNK_SIZE;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "the cap, 256 MiB, fits u32"

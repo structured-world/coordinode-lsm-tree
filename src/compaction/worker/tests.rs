@@ -5425,10 +5425,11 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
 }
 
 /// What a relocated copy takes is bounded tight: a value with frames of its
-/// own is copied as those frames, headers included, so it takes exactly its
-/// stored bytes; a value sharing a block is re-encoded, and its copy may open
-/// a block, so its bound is its entry and one frame header. A header too many
-/// on every value would refuse a tight-space slice that fits its budget.
+/// own is copied as those frames, headers included, so it takes its stored
+/// bytes and their index entries; a value sharing a block is re-encoded, and
+/// its copy may open a block, so its bound is its entry, one frame header and
+/// its index entry. A header too many on every value would refuse a
+/// tight-space slice that fits its budget.
 #[test]
 fn frame_bytes_add_a_header_only_to_a_value_that_shares_a_block() {
     use crate::blob_tree::handle::{BlobIndirection, Stored};
@@ -5444,13 +5445,47 @@ fn frame_bytes_add_a_header_only_to_a_value_that_shares_a_block() {
         stored,
     };
     let header = crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64;
+    let index_entry = 8;
+    // A 100-byte value is one frame; the bound allows one chunk more.
     assert_eq!(
         super::frame_bytes(&indirection(Stored::Frames(140)), u32::MAX),
-        140
+        140 + 2 * index_entry
     );
     assert_eq!(
         super::frame_bytes(&indirection(Stored::InBlock(114)), u32::MAX),
-        114 + header
+        114 + header + index_entry
+    );
+}
+
+/// A copied value adds its frames to the output file's frame index too, eight
+/// bytes a frame: a value split into many chunks adds hundreds. The bound a
+/// tight-space pass charges covers them, or a slice sized to its room fails
+/// to land.
+#[test]
+fn frame_bytes_cover_the_frame_index_a_chunked_copy_adds() {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::ValueHandle;
+
+    let size = 1024 * 1024;
+    let chunk_size = crate::vlog::blob_file::writer::MIN_CHUNK_SIZE;
+    let Ok(header) = u32::try_from(crate::vlog::blob_file::frame::FRAME_HEADER_LEN) else {
+        panic!("a frame header fits u32");
+    };
+    let frames = 1 + size / chunk_size;
+    let stored = size + header * frames;
+    let chunked = BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 7,
+            frame: 0,
+            index: 0,
+        },
+        size,
+        stored: Stored::Frames(stored),
+    };
+    let index = 8 * u64::from(frames);
+    assert!(
+        super::frame_bytes(&chunked, chunk_size) >= u64::from(stored) + index,
+        "the bound covers the value's frames and their {index} index bytes"
     );
 }
 

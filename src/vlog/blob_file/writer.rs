@@ -31,6 +31,13 @@ use std::io::Write;
 /// diverge.
 pub(crate) const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
 
+/// The smallest chunk a value is split into: a page. Below that, a value at
+/// the cap splits into so many chunks that their frame headers pass the u32
+/// a value's stored bytes are recorded in, and each chunk costs a page read
+/// anyway. It also bounds how many frames, and frame index entries, a value
+/// takes.
+pub(crate) const MIN_CHUNK_SIZE: u32 = 4 * 1024;
+
 /// Returns `Err(DecompressedSizeTooLarge)` if `len > MAX_DECOMPRESSION_SIZE`.
 pub(crate) fn check_size_cap(len: usize) -> crate::Result<u32> {
     if len > MAX_DECOMPRESSION_SIZE {
