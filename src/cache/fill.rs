@@ -74,35 +74,25 @@ impl Fill {
 }
 
 /// Experiment: with `LSM_FILL_TIMING=1`, how long the inline fills of one
-/// cache took, in buckets, printed as the cache drops.
+/// cache took, in buckets, apart for the fills whose insert grew a shard's
+/// table or queues, printed as the cache drops.
 pub(crate) struct Timing {
     on: bool,
-    /// Fills under 1, 2, 5, 10, 20 us and the rest.
-    buckets: [core::sync::atomic::AtomicU64; 6],
+    steady: Buckets,
+    grown: Buckets,
+}
+
+/// Fills under 1, 2, 5, 10, 20 us and the rest, their total and the longest.
+#[derive(Default)]
+struct Buckets {
+    counts: [core::sync::atomic::AtomicU64; 6],
     total_ns: core::sync::atomic::AtomicU64,
     max_ns: core::sync::atomic::AtomicU64,
 }
 
-impl Timing {
-    pub(crate) fn new() -> Self {
-        Self {
-            on: std::env::var("LSM_FILL_TIMING").as_deref() == Ok("1"),
-            buckets: Default::default(),
-            total_ns: core::sync::atomic::AtomicU64::new(0),
-            max_ns: core::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    pub(crate) fn start(&self) -> Option<std::time::Instant> {
-        self.on.then(std::time::Instant::now)
-    }
-
-    pub(crate) fn record(&self, started: Option<std::time::Instant>) {
-        let Some(started) = started else {
-            return;
-        };
-        let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let [b1, b2, b5, b10, b20, rest] = &self.buckets;
+impl Buckets {
+    fn record(&self, ns: u64) {
+        let [b1, b2, b5, b10, b20, rest] = &self.counts;
         let bucket = match ns {
             0..1_000 => b1,
             1_000..2_000 => b2,
@@ -115,6 +105,50 @@ impl Timing {
         self.total_ns.fetch_add(ns, Ordering::Relaxed);
         self.max_ns.fetch_max(ns, Ordering::Relaxed);
     }
+
+    fn report(&self, what: &str) {
+        let [b1, b2, b5, b10, b20, rest] =
+            self.counts.each_ref().map(|b| b.load(Ordering::Relaxed));
+        let n = b1 + b2 + b5 + b10 + b20 + rest;
+        if n == 0 {
+            return;
+        }
+        eprintln!(
+            "fill timing {what}: {n} fills, mean {} ns, max {} ns, <1us {b1} <2us {b2} <5us {b5} <10us {b10} <20us {b20} >=20us {rest}",
+            self.total_ns.load(Ordering::Relaxed) / n,
+            self.max_ns.load(Ordering::Relaxed),
+        );
+    }
+}
+
+impl Timing {
+    pub(crate) fn new() -> Self {
+        Self {
+            on: std::env::var("LSM_FILL_TIMING").as_deref() == Ok("1"),
+            steady: Buckets::default(),
+            grown: Buckets::default(),
+        }
+    }
+
+    pub(crate) fn start(&self) -> Option<std::time::Instant> {
+        if !self.on {
+            return None;
+        }
+        crate::sharded_cache::GREW.with(|grew| grew.set(false));
+        Some(std::time::Instant::now())
+    }
+
+    pub(crate) fn record(&self, started: Option<std::time::Instant>) {
+        let Some(started) = started else {
+            return;
+        };
+        let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if crate::sharded_cache::GREW.with(core::cell::Cell::get) {
+            self.grown.record(ns);
+        } else {
+            self.steady.record(ns);
+        }
+    }
 }
 
 impl Drop for Timing {
@@ -122,17 +156,8 @@ impl Drop for Timing {
         if !self.on {
             return;
         }
-        let [b1, b2, b5, b10, b20, rest] =
-            self.buckets.each_ref().map(|b| b.load(Ordering::Relaxed));
-        let n = b1 + b2 + b5 + b10 + b20 + rest;
-        if n == 0 {
-            return;
-        }
-        eprintln!(
-            "fill timing: {n} fills, mean {} ns, max {} ns, <1us {b1} <2us {b2} <5us {b5} <10us {b10} <20us {b20} >=20us {rest}",
-            self.total_ns.load(Ordering::Relaxed) / n,
-            self.max_ns.load(Ordering::Relaxed),
-        );
+        self.steady.report("steady");
+        self.grown.report("grown");
     }
 }
 

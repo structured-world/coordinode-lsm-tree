@@ -231,6 +231,36 @@ where
         priority: Priority,
         evicted: &mut Vec<V>,
     ) {
+        #[cfg(feature = "std")]
+        let caps = self.capacities();
+        self.insert_inner(hash, key, value, weight, priority, evicted);
+        #[cfg(feature = "std")]
+        if self.capacities() != caps {
+            GREW.with(|grew| grew.set(true));
+        }
+    }
+
+    /// Experiment: the capacities of the shard's table, queues and ghosts.
+    #[cfg(feature = "std")]
+    fn capacities(&self) -> [usize; 5] {
+        [
+            self.map.capacity(),
+            self.small.capacity(),
+            self.main.capacity(),
+            self.ghost.capacity(),
+            self.ghost_set.capacity(),
+        ]
+    }
+
+    fn insert_inner(
+        &mut self,
+        hash: u64,
+        key: K,
+        value: V,
+        weight: u64,
+        priority: Priority,
+        evicted: &mut Vec<V>,
+    ) {
         if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
             // Replace in place: adjust the owning queue's byte tally by the
             // weight delta.
@@ -460,6 +490,13 @@ where
             }
         }
     }
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Experiment: set when an insert on this thread grew a shard's table,
+    /// queues or ghosts.
+    pub(crate) static GREW: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Releases an insert's shard lock and drops what the insert evicted.
