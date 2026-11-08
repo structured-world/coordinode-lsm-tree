@@ -237,6 +237,157 @@ fn a_damaged_chunk_costs_its_value_alone() -> crate::Result<()> {
     Ok(())
 }
 
+/// A head lost to damage leaves its chunks behind it: by the index, each is
+/// reached and refused as a chunk without its head, and the walk goes on to
+/// the value after them.
+#[test]
+fn chunks_whose_head_is_damaged_are_refused_each() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
+    let index = index_of(&path)?;
+    // A key byte of the head, frame 0.
+    edit(&path, |bytes| bytes[index[0] + 40 + 14] ^= 0x40)?;
+    let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+    assert_eq!(results.len(), 5, "the head, three chunks, the next value");
+    assert!(matches!(
+        results[0],
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+    for chunk in &results[1..4] {
+        assert!(matches!(
+            chunk,
+            Err(crate::Error::InvalidHeader("BlobFrame"))
+        ));
+    }
+    assert_eq!(
+        results[4].as_ref().expect("the next value").key,
+        Slice::from(&b"next"[..])
+    );
+    Ok(())
+}
+
+/// Rewrites the chunked value's head, frame 0 of a file written by `write`:
+/// its value length and its chunk count, sealed again so the head checks.
+fn rewrite_head(path: &std::path::Path, value_len: u32, chunks: u32) -> crate::Result<()> {
+    let index = index_of(path)?;
+    edit(path, |bytes| {
+        let head = &mut bytes[index[0]..index[1]];
+        // The entry's value length, after its seqno and key length.
+        head[40 + 10..40 + 14].copy_from_slice(&value_len.to_le_bytes());
+        // The chunk table after the entry: the chunk size, then the count.
+        let table = head.len() - 4;
+        head[table..].copy_from_slice(&chunks.to_le_bytes());
+        crate::vlog::blob_file::frame::reseal(head);
+    })
+}
+
+/// A head that checks but names chunks its value length does not need, or
+/// chunks the file does not hold where they should lie, is damage: the walk
+/// reports it for the value instead of taking another frame, or the end of the
+/// data, for a chunk.
+#[test]
+fn a_head_naming_chunks_that_are_not_there_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let value = [9; 700];
+
+    // Four chunks of 300 bytes for 700: the table does not cover the value.
+    let path = write(dir.path(), &[(b"big", &value), (b"next", &[1; 120])])?;
+    rewrite_head(&path, 700, 4)?;
+    let first = Scanner::new(&path, &StdFs, 0)?.next().expect("the head");
+    assert!(matches!(
+        first,
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+
+    // A thousand bytes in four chunks: the fourth is where the next value lies.
+    rewrite_head(&path, 1000, 4)?;
+    let first = Scanner::new(&path, &StdFs, 0)?.next().expect("the head");
+    assert!(matches!(
+        first,
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+
+    // The same with nothing after the value: the fourth is past the data.
+    let alone = tempdir()?;
+    let path = write(alone.path(), &[(b"big", &value)])?;
+    rewrite_head(&path, 1000, 4)?;
+    let first = Scanner::new(&path, &StdFs, 0)?.next().expect("the head");
+    assert!(matches!(
+        first,
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    Ok(())
+}
+
+/// An index that checks but ends past the data section is not the file's:
+/// the scan walks the frame chain instead and reads every value, none past
+/// the section.
+#[test]
+fn an_index_ending_past_the_data_is_walked_around() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let index = index_of(&path)?;
+    let (pos, len) = section(&path, b"frames")?;
+    let starts: Vec<u64> = index[..index.len() - 1]
+        .iter()
+        .map(|&at| at as u64)
+        .collect();
+    let past = index[index.len() - 1] as u64 + 1;
+    let encoded = crate::vlog::blob_file::writer::encode_frame_index(&starts, past);
+    assert_eq!(encoded.len(), len, "the same count of frames");
+    edit(&path, |bytes| {
+        bytes[pos..pos + len].copy_from_slice(&encoded);
+    })?;
+
+    let keys: Vec<_> = Scanner::new(&path, &StdFs, 0)?
+        .map(|entry| entry.map(|entry| entry.key))
+        .collect::<crate::Result<_>>()?;
+    assert_eq!(keys.len(), 3, "every value, along the chain");
+    Ok(())
+}
+
+/// A read that fails anywhere in a scan, by the index or along the frame
+/// chain, surfaces as an error and ends the scan: it never reads as a short
+/// file or an empty value.
+#[test]
+fn a_failed_read_ends_the_scan_with_its_error() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempdir()?;
+    // More than the scanner's buffer, so the frames take reads of their own.
+    let values: Vec<(Vec<u8>, Vec<u8>)> =
+        (0..40_u8).map(|i| (vec![b'k', i], vec![i; 280])).collect();
+    let borrowed: Vec<(&[u8], &[u8])> = values.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+    let path = write(dir.path(), &borrowed)?;
+    let indexed = std::fs::read(&path)?;
+    break_index(&path)?;
+    let chained = std::fs::read(&path)?;
+
+    for bytes in [indexed, chained] {
+        std::fs::write(&path, &bytes)?;
+        let mut failed_any = false;
+        for skip in 0..64 {
+            let fs = FaultFs::new(StdFs);
+            let mut scanner = Scanner::new(&path, &fs, 0)?;
+            fs.injector().arm(
+                FaultRule::new(FaultOp::Read, Fault::Error(crate::io::ErrorKind::Other))
+                    .skip(skip)
+                    .once(),
+            );
+            let results: Vec<_> = scanner.by_ref().collect();
+            if let Some(at) = results.iter().position(Result::is_err) {
+                failed_any = true;
+                assert_eq!(at, results.len() - 1, "the scan ends at the failure");
+            } else {
+                assert_eq!(results.len(), values.len(), "an untouched scan reads all");
+                break;
+            }
+        }
+        assert!(failed_any, "some read of the scan was faulted");
+    }
+    Ok(())
+}
+
 /// A field past the decompression cap under a header CRC that holds is
 /// refused before anything is allocated for it.
 #[test]

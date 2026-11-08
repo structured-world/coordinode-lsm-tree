@@ -359,33 +359,34 @@ impl Scanner {
         };
 
         // The span to read: the index's, else the header's declared length,
-        // bounded by the section either way.
-        let len = match self.indexed_end(frame) {
-            Some(end) if end > offset && end <= self.data_end => end - offset,
-            Some(_) => return damaged(self, crate::Error::InvalidHeader("BlobFrame")),
-            None => {
-                if offset + FRAME_HEADER_LEN as u64 > self.data_end {
-                    self.is_terminated = true;
-                    return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
-                }
-                let mut header = [0_u8; FRAME_HEADER_LEN];
-                if let Err(e) = self.inner.read_exact(&mut header) {
-                    self.is_terminated = true;
-                    return Some(Err(e.into()));
-                }
-                let declared = match parse_header(&header) {
-                    Ok(header) => header.frame_len(),
-                    Err(e) => return damaged(self, e),
-                };
-                if offset + declared > self.data_end {
-                    return damaged(self, crate::Error::InvalidHeader("BlobFrame"));
-                }
-                if let Err(e) = self.inner.seek(SeekFrom::Start(offset)) {
-                    self.is_terminated = true;
-                    return Some(Err(e.into()));
-                }
-                declared
+        // bounded by the section either way. An index is taken only when it
+        // rises strictly within the data section and ends at its end, and a
+        // walk by it only ever stands at a frame's start, so a frame's end
+        // lies past where the walk stands and within the section.
+        let len = if let Some(end) = self.indexed_end(frame) {
+            end - offset
+        } else {
+            if offset + FRAME_HEADER_LEN as u64 > self.data_end {
+                self.is_terminated = true;
+                return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
             }
+            let mut header = [0_u8; FRAME_HEADER_LEN];
+            if let Err(e) = self.inner.read_exact(&mut header) {
+                self.is_terminated = true;
+                return Some(Err(e.into()));
+            }
+            let declared = match parse_header(&header) {
+                Ok(header) => header.frame_len(),
+                Err(e) => return damaged(self, e),
+            };
+            if offset + declared > self.data_end {
+                return damaged(self, crate::Error::InvalidHeader("BlobFrame"));
+            }
+            if let Err(e) = self.inner.seek(SeekFrom::Start(offset)) {
+                self.is_terminated = true;
+                return Some(Err(e.into()));
+            }
+            declared
         };
         let Ok(len) = usize::try_from(len) else {
             return damaged(self, crate::Error::InvalidHeader("BlobFrame"));
@@ -561,12 +562,11 @@ impl ScanEntry {
                 &mut 0,
             )
         };
-        let malformed = || crate::Error::InvalidHeader("Blob");
         let (head, chunks) = self
             .frames
             .as_deref()
             .and_then(<[Slice]>::split_first)
-            .ok_or_else(malformed)?;
+            .ok_or(crate::Error::InvalidHeader("Blob"))?;
         let chunks = chunks
             .iter()
             .map(decode)

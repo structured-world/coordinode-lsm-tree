@@ -811,6 +811,25 @@ pub(crate) fn restamp_header_crc(frame: &mut [u8]) {
         .copy_from_slice(&crc.to_le_bytes());
 }
 
+/// Seals `frame`, its entries or payload edited in place, as a writer would:
+/// its header CRC and its checksum over what it now holds.
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test code")]
+pub(crate) fn reseal(frame: &mut [u8]) {
+    restamp_header_crc(frame);
+    let header = parse_header(frame).unwrap();
+    let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
+    let checksum = frame_checksum(
+        frame.get(FRAME_HEADER_LEN..entries_end).unwrap(),
+        frame.get(entries_end..).unwrap(),
+        header.header_crc,
+    );
+    frame
+        .get_mut(FRAME_HEADER_LEN - 16..FRAME_HEADER_LEN)
+        .unwrap()
+        .copy_from_slice(&checksum.to_le_bytes());
+}
+
 /// A frame holding `values` under `keys` at seqno 0, uncompressed and
 /// decoded: a single frame for one value, a block for several. What a test
 /// seeds a cache or a read's store with.
