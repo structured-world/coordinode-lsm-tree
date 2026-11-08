@@ -40,6 +40,35 @@ fn blob_frame_sizes_keep_every_frame_within_the_cap() {
     );
 }
 
+/// The bytes one value's frames take are recorded in a u32: a chunk size of a
+/// byte splits a value at the cap into 2^28 chunks, each with a frame header,
+/// past what the record holds, and garbage accounting and the space a
+/// relocation reserves would undercount by gigabytes. The chunk size is held
+/// to a floor under which every value's frames fit.
+#[test]
+fn blob_chunk_size_keeps_a_value_s_frames_within_their_record() {
+    use crate::vlog::blob_file::{
+        frame::{ENTRY_HEADER_LEN, FRAME_HEADER_LEN},
+        writer::MAX_DECOMPRESSION_SIZE,
+    };
+
+    let Some(one) = core::num::NonZeroU32::new(1) else {
+        panic!("non-zero");
+    };
+    let sizes = KvSeparationOptions::default().chunk_size(one).frame_sizes();
+    let chunks = (MAX_DECOMPRESSION_SIZE as u64).div_ceil(u64::from(sizes.chunk_size));
+    // Every chunk's header, the value stored raw at most, and a head with
+    // the longest key and its table.
+    let most = chunks * FRAME_HEADER_LEN as u64
+        + MAX_DECOMPRESSION_SIZE as u64
+        + (FRAME_HEADER_LEN + ENTRY_HEADER_LEN + usize::from(u16::MAX) + 8) as u64;
+    assert!(
+        most <= u64::from(u32::MAX),
+        "a value at the cap takes {most} bytes at chunk size {}",
+        sizes.chunk_size
+    );
+}
+
 #[test]
 fn restart_interval_policies_can_be_overridden_independently() {
     let folder = match tempfile::tempdir() {

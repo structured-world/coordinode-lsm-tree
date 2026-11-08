@@ -716,7 +716,8 @@ impl Writer {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a frame never stores more than its raw bytes, so one value takes at most \
-                  the 256 MiB cap plus its frames' headers"
+                  the 256 MiB cap plus its frames' headers, and a chunk of at least 4 KiB \
+                  keeps those headers within the rest of a u32"
     )]
     fn stored_since(&self, before: u64) -> crate::blob_tree::handle::Stored {
         crate::blob_tree::handle::Stored::Frames((self.offset - before) as u32)
