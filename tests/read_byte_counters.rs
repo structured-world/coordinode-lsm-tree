@@ -207,11 +207,13 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
         assert_eq!(got.len(), value_len, "the whole value must come back");
     }
 
-    // A point read resolves its value on its own: one request per value.
+    // A point read resolves its value on its own: one request per cold block.
+    // Two 8 KiB values share a 16 KiB block, and the second of them finds the
+    // block in the blob cache its neighbour's read filled.
     assert_eq!(
         m.blob_read_count() - requests_before,
-        n as usize,
-        "each cold point read of a separated value is one blob read request",
+        n as usize / 2,
+        "each cold block of separated values is one blob read request",
     );
 
     let blob_read = m.blob_bytes_read() - before.1;
@@ -561,8 +563,7 @@ fn a_blob_prefetch_the_filesystem_refuses_still_counts_its_span() {
 
 /// A key-value-separated tree of `n` 8 KiB values, blob files written with
 /// `compression`, caching what it reads from them over a cache with the row
-/// cache off, so the only thing a lookup can detach is the key it hands the
-/// blob cache.
+/// cache off, so no lookup copies a row into it.
 fn blob_tree_without_row_cache(
     n: u32,
     compression: CompressionType,
@@ -588,11 +589,11 @@ fn blob_tree_without_row_cache(
 }
 
 #[test]
-fn a_blob_admitted_to_the_blob_cache_counts_the_key_it_detaches() -> lsm_tree::Result<()> {
-    // The blob cache stores each value under its own copy of the key, so the
-    // entry does not borrow the caller's buffer. That copy is a gather: a
-    // point read that misses charges exactly its key, and a read served from
-    // the cache copies nothing.
+fn a_blob_admitted_to_the_blob_cache_copies_nothing() -> lsm_tree::Result<()> {
+    // The blob cache keeps each frame read under its place in its file, the
+    // frame its own read's bytes, and a value is handed out as a view into
+    // it: a point read that misses copies nothing into the cache, and one
+    // served from the cache copies nothing either.
     let (_folder, tree) = blob_tree_without_row_cache(20, CompressionType::None)?;
     let m = tree.metrics();
 
@@ -600,11 +601,10 @@ fn a_blob_admitted_to_the_blob_cache_counts_the_key_it_detaches() -> lsm_tree::R
     for i in 0..10 {
         assert!(tree.get(key(i), SeqNo::MAX)?.is_some());
     }
-    let keys: u64 = (0..10).map(|i| key(i).len() as u64).sum();
     assert_eq!(
-        m.bytes_copied() - before,
-        keys,
-        "each resolved blob detached its key into the cache",
+        m.bytes_copied(),
+        before,
+        "a frame read for one value is cached as it was read",
     );
 
     let before = m.bytes_copied();
@@ -617,11 +617,12 @@ fn a_blob_admitted_to_the_blob_cache_counts_the_key_it_detaches() -> lsm_tree::R
 
 #[test]
 #[cfg(feature = "lz4")]
-fn a_blob_prefetch_counts_the_keys_it_detaches() -> lsm_tree::Result<()> {
-    // A scan's read-ahead caches each record it decodes under a copy of its
-    // key, as the point read does. Over a compressed blob file the records
-    // decompress into buffers of their own, so the keys are the only copy the
-    // scan makes: every value is cached exactly once, whichever path read it.
+fn a_compressed_blob_prefetch_copies_only_its_entries() -> lsm_tree::Result<()> {
+    // A scan's read-ahead caches each frame it decodes out of its coalesced
+    // read. Over a compressed blob file a frame's values decompress into a
+    // buffer of their own; only its list of entries, a view into the read,
+    // is copied out so the cache does not keep the read alive. No value byte
+    // is copied.
     let n = 50;
     let (_folder, tree) = blob_tree_without_row_cache(n, CompressionType::Lz4)?;
     let m = tree.metrics();
@@ -633,11 +634,12 @@ fn a_blob_prefetch_counts_the_keys_it_detaches() -> lsm_tree::Result<()> {
         rows += 1;
     }
     assert_eq!(rows, n);
-    let keys: u64 = (0..n).map(|i| key(i).len() as u64).sum();
-    assert_eq!(
-        m.bytes_copied() - before,
-        keys,
-        "every value the scan cached detached its key",
+    // An entry is 14 bytes and its key.
+    let entries: u64 = (0..n).map(|i| 14 + key(i).len() as u64).sum();
+    let copied = m.bytes_copied() - before;
+    assert!(
+        copied <= entries,
+        "{copied} B copied, more than the {entries} B of entries"
     );
     Ok(())
 }
@@ -666,10 +668,10 @@ fn uncompressed_blob_tree(fill: BlobCacheFill) -> (TempDir, AnyTree) {
 #[test]
 fn an_uncached_blob_prefetch_detaches_the_values_it_hands_out() {
     // Not cached, a scan's read-ahead still hands its values to the caller,
-    // who may keep them as long as it likes. An uncompressed value handed out
-    // as a view of the coalesced read would pin that whole read for as long
-    // as the caller keeps it, so each value is copied out: a copy the gather
-    // counter has to show.
+    // who may keep them as long as it likes. An uncompressed frame kept as a
+    // view of the coalesced read would pin that whole read for as long as the
+    // caller keeps a value of it, so each frame is copied out: a copy the
+    // gather counter has to show.
     let (_folder, tree) = uncompressed_blob_tree(BlobCacheFill::Never);
     let value_len = 8_192_usize;
     let m = tree.metrics();
@@ -691,10 +693,10 @@ fn an_uncached_blob_prefetch_detaches_the_values_it_hands_out() {
 
 #[test]
 fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
-    // A scan's read-ahead reads a run of neighbouring records in one buffer.
-    // An uncompressed record would otherwise be handed out as a view that pins
-    // the whole run in the cache, so each is copied into a buffer of its own:
-    // a copy the scan performed, and one the gather counter has to show.
+    // A scan's read-ahead reads a run of neighbouring frames in one buffer.
+    // An uncompressed frame would otherwise be cached as a view that pins the
+    // whole run, so each is copied into a buffer of its own: a copy the scan
+    // performed, and one the gather counter has to show.
     let (_folder, tree) = uncompressed_blob_tree(BlobCacheFill::Always);
     let value_len = 8_192_usize;
 

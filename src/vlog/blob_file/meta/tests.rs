@@ -8,33 +8,44 @@ fn test_blob_file_meta_truncated_returns_err() {
     assert!(Metadata::from_slice(&buf).is_err());
 }
 
-/// A retired-version (3) metadata block serialized through the PRODUCTION
-/// encoder must be rejected by the production decoder: the engine reads
-/// exactly one blob-file format (version 4), so a pre-V5 blob meta is
-/// `InvalidHeader`, never a compat case.
+/// A blob file of an earlier format, its metadata serialized through the
+/// PRODUCTION encoder, is refused by the production decoder: the engine reads
+/// exactly one blob-file format, and an earlier one is a format to convert,
+/// reported as such (so repair keeps the file rather than grading it damaged),
+/// never a compat case and never damage.
 #[test]
 #[expect(clippy::unwrap_used)]
 fn test_blob_file_meta_retired_version_rejected() {
-    let metadata = Metadata {
-        id: 0,
-        version: 3,
-        created_at: 0,
-        item_count: 1,
-        total_compressed_bytes: 8,
-        total_uncompressed_bytes: 8,
-        key_range: KeyRange::new((b"a"[..].into(), b"z"[..].into())),
-        compression: CompressionType::None,
-        lifetime_class: 0,
-    };
-    let mut buf = Vec::new();
-    metadata.encode_into(&mut buf).unwrap();
+    for version in [3, META_VERSION - 1] {
+        let metadata = Metadata {
+            id: 0,
+            version,
+            created_at: 0,
+            item_count: 1,
+            total_compressed_bytes: 8,
+            total_uncompressed_bytes: 8,
+            block_entry_bytes: 0,
+            block_frame_bytes: 0,
+            key_range: KeyRange::new((b"a"[..].into(), b"z"[..].into())),
+            compression: CompressionType::None,
+            lifetime_class: 0,
+        };
+        let mut buf = Vec::new();
+        metadata.encode_into(&mut buf).unwrap();
 
-    let buf = Slice::from(buf);
-    let result = Metadata::from_slice(&buf);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("BlobFileMeta"))),
-        "expected Err(InvalidHeader(\"BlobFileMeta\")), got {result:?}",
-    );
+        let result = Metadata::from_slice(&Slice::from(buf));
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::UnsupportedFormat {
+                    part: crate::FormatPart::BlobFiles,
+                    found: Some(found),
+                    expected: META_VERSION,
+                }) if found == version
+            ),
+            "version {version}: got {result:?}",
+        );
+    }
 }
 
 /// Build a metadata block that is structurally valid but omits a required
@@ -52,7 +63,9 @@ fn test_blob_file_meta_missing_field_returns_err() {
     // Include all required fields EXCEPT `compression`
     #[rustfmt::skip]
     let meta_items = [
-        meta("blob_file_version", &[4u8]),
+        meta("blob_file_version", &[META_VERSION]),
+        meta("block_entry_bytes", &0u64.to_le_bytes()),
+        meta("block_frame_bytes", &0u64.to_le_bytes()),
         meta("checksum_type", &[u8::from(ChecksumType::Xxh3)]),
         // "compression" intentionally omitted
         meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
@@ -103,6 +116,8 @@ fn test_blob_file_meta_corrupted_trailer_returns_err() {
         item_count: 100,
         total_compressed_bytes: 1024,
         total_uncompressed_bytes: 2048,
+        block_entry_bytes: 0,
+        block_frame_bytes: 0,
         key_range: KeyRange::new((b"a".into(), b"z".into())),
         lifetime_class: 0,
     };
@@ -142,6 +157,10 @@ fn test_blob_file_meta_roundtrip() {
         item_count: 100,
         total_compressed_bytes: 1024,
         total_uncompressed_bytes: 2048,
+        // Distinct non-zero values so the roundtrip proves each is encoded in
+        // its own item.
+        block_entry_bytes: 900,
+        block_frame_bytes: 300,
         key_range: KeyRange::new((b"a".into(), b"z".into())),
         // Non-zero so the roundtrip proves the class is encoded, not defaulted.
         lifetime_class: 2,
@@ -153,4 +172,48 @@ fn test_blob_file_meta_roundtrip() {
 
     let meta2 = Metadata::from_slice(&buf).unwrap();
     assert_eq!(meta, meta2);
+}
+
+fn with_blocks(total_compressed_bytes: u64, entries: u64, frames: u64) -> Metadata {
+    Metadata {
+        id: 0,
+        version: META_VERSION,
+        created_at: 0,
+        compression: CompressionType::None,
+        item_count: 1,
+        total_compressed_bytes,
+        total_uncompressed_bytes: 1,
+        block_entry_bytes: entries,
+        block_frame_bytes: frames,
+        key_range: KeyRange::new((b"a".into(), b"z".into())),
+        lifetime_class: 0,
+    }
+}
+
+/// Block entries take their part of the file's blocks on disk: a third of the
+/// entries of blocks compressed to a third take a ninth, and a file with no
+/// block holds no block entry to charge.
+#[test]
+fn block_share_is_the_entries_part_of_the_blocks_on_disk() {
+    let meta = with_blocks(1_000, 900, 300);
+    assert_eq!(meta.block_share(300), 100);
+    assert_eq!(meta.block_share(900), 300);
+    assert_eq!(meta.block_share(0), 0);
+    assert_eq!(meta.own_frame_bytes(), 700);
+    assert_eq!(with_blocks(1_000, 0, 0).block_share(50), 0);
+}
+
+/// Metadata whose blocks take more than all of its frames describes no file
+/// the writer could have written: it is refused, so the frame bytes of values
+/// with frames of their own never go below zero.
+#[test]
+#[expect(clippy::unwrap_used)]
+fn metadata_whose_blocks_exceed_its_frames_is_refused() {
+    let mut buf = Vec::new();
+    with_blocks(100, 50, 101).encode_into(&mut buf).unwrap();
+    let result = Metadata::from_slice(&Slice::from(buf));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("BlobFileMeta"))),
+        "got {result:?}"
+    );
 }

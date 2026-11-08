@@ -4,6 +4,8 @@ use lsm_tree::{
 };
 use test_log::test;
 
+mod common;
+
 #[test]
 fn blob_tree_recover_gc_stats() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -51,7 +53,8 @@ fn blob_tree_recover_gc_stats() -> lsm_tree::Result<()> {
             &{
                 let mut map = lsm_tree::HashMap::default();
                 let size = big_value.len() as u64;
-                map.insert(0, FragmentationEntry::new(1, size, size));
+                let stored = common::stored_len(b"big", size);
+                map.insert(0, FragmentationEntry::new(1, size, stored));
                 map
             },
             &*gc_stats,
@@ -74,7 +77,8 @@ fn blob_tree_recover_gc_stats() -> lsm_tree::Result<()> {
             &{
                 let mut map = lsm_tree::HashMap::default();
                 let size = big_value.len() as u64;
-                map.insert(0, FragmentationEntry::new(1, size, size));
+                let stored = common::stored_len(b"big", size);
+                map.insert(0, FragmentationEntry::new(1, size, stored));
                 map
             },
             &*gc_stats,

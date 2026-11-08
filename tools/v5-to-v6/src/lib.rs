@@ -204,8 +204,6 @@ pub struct Report {
     pub tables: usize,
     /// Data blocks carried over.
     pub data_blocks: usize,
-    /// Blob files converted.
-    pub blob_files: usize,
     /// Bytes the source's files take.
     pub source_bytes: u64,
     /// Bytes the converted store's files take.
@@ -433,6 +431,13 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
     if state.comparator_name != "default" {
         return Err(Error::Unsupported("a tree with a custom comparator"));
     }
+    // 6.0 lays separated values out in frames by size and names them by
+    // frame, where 5.x named them by offset: carrying a blob file over is a
+    // rewrite of it and of every handle to it, which this converter does not
+    // do yet.
+    if !state.blob_files.is_empty() {
+        return Err(Error::Unsupported("a tree holding separated values"));
+    }
     // The dictionaries the store keeps, each verified against its name by the
     // 5.x read, and the ones the caller supplies.
     let mut v5_dictionaries =
@@ -495,50 +500,6 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
         let dict = Arc::new(lsm6::ZstdDictionary::new(v5.raw()));
         lsm6::import::store_dictionary(&staging, &dict, &*v6_fs, v6_encryption.as_deref())?;
         dictionaries = dictionaries.with(dict);
-    }
-
-    // Blob files first: each value lands at the offset the source held it, so
-    // every value handle in the tables still names it.
-    let mut blob_files = Vec::with_capacity(state.blob_files.len());
-    if !state.blob_files.is_empty() {
-        let staging_blobs = staging.join(lsm6::file::BLOBS_FOLDER);
-        std::fs::create_dir_all(&staging_blobs)?;
-        for record in &state.blob_files {
-            // A file a tight-space relocation reclaimed below a frontier keeps
-            // it: its live values stay at their offsets past it.
-            let live_from = state
-                .blob_restrictions
-                .iter()
-                .find(|(id, _)| *id == record.id)
-                .map_or(0, |(_, from)| *from);
-            let Some(checksum) = convert_blob_file(
-                &folder
-                    .join(lsm5::file::BLOBS_FOLDER)
-                    .join(record.id.to_string()),
-                record,
-                live_from,
-                &staging_blobs.join(record.id.to_string()),
-                &v5_fs,
-                &v6_fs,
-            )?
-            else {
-                continue;
-            };
-            report.blob_files += 1;
-            let stale = state
-                .blob_gc_stats
-                .iter()
-                .find(|s| s.id == record.id)
-                .map_or((0, 0, 0), |s| {
-                    (s.stale_items as usize, s.stale_bytes, s.stale_on_disk_bytes)
-                });
-            blob_files.push(lsm6::import::BlobFilePlacement {
-                id: record.id,
-                checksum,
-                stale,
-                live_from,
-            });
-        }
     }
 
     let max_table_id = state
@@ -613,7 +574,7 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
         tree_type,
         version_id: state.version_id,
         levels,
-        blob_files,
+        blob_files: Vec::new(),
         restrictions: state
             .restrictions
             .iter()
@@ -633,16 +594,11 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
         &dictionaries,
     )?;
     // Every converted table, read back as an open reads it, records what its
-    // source recorded; the source is not touched until it does.
-    // A blob file left out for holding no live value is referenced by no row.
-    if recorded.iter().flat_map(|t| &t.blob_links).any(|link| {
-        !image
-            .blob_files
-            .iter()
-            .any(|file| file.id == link.blob_file_id)
-    }) {
+    // source recorded; the source is not touched until it does. The store
+    // holds no blob file, so no row may reference one.
+    if recorded.iter().any(|t| !t.blob_links.is_empty()) {
         return Err(Error::Unsupported(
-            "a table referencing a blob file with no live value",
+            "a table referencing a blob file the store does not hold",
         ));
     }
     // The import reads back one record per placement, in placement order.
@@ -935,57 +891,6 @@ fn records_match(
         ..without_layout(table)
     };
     links_fit && seqnos_fit && without_derived(expected) == without_derived(recorded)
-}
-
-/// Writes one blob file through the 6.0 import from the frames its 5.x export
-/// reads from `live_from` on, each verified, as stored and at its source
-/// offset. Returns the checksum the converted file's manifest entry records,
-/// or `None` for a file whose relocation consumed every value: nothing reads
-/// it, so it is not carried.
-fn convert_blob_file(
-    source: &Path,
-    record: &lsm5::export::BlobFileRecord,
-    live_from: u64,
-    path: &Path,
-    v5_fs: &Arc<dyn lsm5::fs::Fs>,
-    v6_fs: &Arc<dyn lsm6::fs::Fs>,
-) -> Result<Option<lsm6::Checksum>, Error> {
-    let export = lsm5::export::BlobFileExport::open(source, record, live_from, v5_fs.clone())?;
-    let frames = export.frames()?;
-    if frames.is_empty() {
-        return Ok(None);
-    }
-    // A restricted file is charged its garbage, the reclaimed values
-    // included, against the totals its source counted: it keeps them.
-    let restriction = (live_from > 0).then(|| {
-        let totals = export.totals();
-        lsm6::import::BlobFileRestriction {
-            live_from,
-            item_count: totals.item_count,
-            compressed_bytes: totals.compressed_bytes,
-            uncompressed_bytes: totals.uncompressed_bytes,
-            first_key: lsm6::UserKey::from(&*totals.first_key),
-            last_key: lsm6::UserKey::from(&*totals.last_key),
-        }
-    });
-    let mut file = lsm6::import::BlobFileImport::create(
-        path,
-        record.id,
-        v6_fs.clone(),
-        compression(export.compression())?,
-        export.created_at(),
-        restriction,
-    )?;
-    for frame in frames {
-        file.append(
-            frame.offset,
-            &frame.key,
-            frame.seqno,
-            &frame.stored,
-            frame.uncompressed_len,
-        )?;
-    }
-    Ok(Some(file.finish()?))
 }
 
 /// One table as [`convert_table`] wrote it.

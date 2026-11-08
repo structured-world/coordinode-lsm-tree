@@ -20,6 +20,7 @@ and cannot recover from.
 | Data block (disk) | Per-KV digest footer (`AtBlockCompile`) | Which record in a block diverged | n/a | off (opt-in) |
 | Data block (disk) | Page ECC parity trailer | Bit-rot of the block | yes (SEC-DED / XOR / Reed-Solomon) | off (opt-in) |
 | Data block (disk) | AAD-bound AEAD | Tampering, block-swap, codec/epoch relabel + confidentiality | n/a | off (opt-in) |
+| Blob frame (disk) | Header CRC + frame XXH3-128 over entries and payload; a checksummed frame index | Bit-rot of a frame, its lengths or its keys; a frame read at another frame's place | n/a | always on |
 | Manifest | 5-layer hardening (XXH3-128 + ECC + AEAD + footer mirror) | Bit-rot, partial write, file substitution | partial (ECC / mirror) | mirror on, rest opt-in |
 | On open | Manifest recovery modes | Malformed manifest records | drops a torn edit-log tail (opt-in) | `AbsoluteConsistency` |
 | Out of band | `verify_integrity`, `patrol_scrub`, `sst-dump verify`, `Config::repair` | Latent corruption anywhere | scrub heals; repair rebuilds manifest | n/a |
@@ -272,24 +273,25 @@ inspection, or rollback to a known-good point.
   opted in (`SalvageOptions::allow_delete_resurrection`, `sst-dump salvage
   --allow-delete-resurrection`).
 - **`salvage::salvage_blob_file(src, dest, &fs, id, &comparator) -> crate::Result<BlobSalvageReport>`**:
-  record-granular salvage of one blob (vlog) file. The `comparator` must be the
+  frame-granular salvage of one blob (vlog) file. The `comparator` must be the
   SAME `SharedComparator` the source tree was written with (pass the tree's
   configured comparator, or `comparator::default_comparator()` for the default
   lexicographic ordering): the salvage walk orders and validates recovered
-  records under it, so a mismatched comparator would mis-order the output. When a frame fails checksum,
-  header-CRC, or structural validation, the record stream re-syncs to the next
-  frame magic WHEN one is found in-bounds; if none is (for example a CRC-vouched
-  frame end overruns the data section), the scan terminates. Either way the
-  resync magic (and every frame chained after it) has an unproven boundary (it
-  may be nested in the damaged frame's user bytes), so the walk **drops the
-  entire tail past the first resync / termination** (fail closed): the
-  conservative loss is as much as everything after the first damaged record, not
-  just that one record, because a fabricated chain of checksum-valid frames is
-  indistinguishable from genuine ones and re-emitting it would forge records.
-  Only records BEFORE the first resync are recovered. The salvaged file is written COMPACTED, so it is **not a drop-in
-  replacement** while SST entries hold `ValueHandle::offset` values into the
-  source: re-target them through `BlobSalvageReport::offset_remap` first (a
-  source offset absent from the map is a lost record).
+  records under it, so a mismatched comparator would mis-order the output. The
+  walk follows the file's frame index, whose checksum vouches for every
+  frame's place, so a frame that fails its header CRC, its checksum or its
+  structure costs that frame alone: a value of its own, or every value of a
+  block it shared. A chunked value goes whole or not at all. When the index
+  itself is damaged, the walk falls back to the chain of frames: after a
+  damaged frame it re-syncs to the next frame magic found in bounds, and that
+  magic (and every frame chained after it) has an unproven boundary (it may be
+  nested in the damaged frame's user bytes), so the walk **drops the entire
+  tail past the first resync** (fail closed), because a fabricated chain of
+  checksum-valid frames is indistinguishable from genuine ones and re-emitting
+  it would forge records. The salvaged file is written COMPACTED, so it is
+  **not a drop-in replacement** while SST entries name places (frame, index)
+  in the source: re-target them through `BlobSalvageReport::remap` first (a
+  source place absent from the map is a lost record).
 - **`Config::repair_with_salvage(true)`** (also `tools/sst-dump repair
   --salvage`): the manifest rebuild above, but an SST that fails verification is
   block-salvaged in place instead of being left out, and

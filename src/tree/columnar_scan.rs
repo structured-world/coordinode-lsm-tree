@@ -1199,15 +1199,20 @@ impl ColumnarScan {
     /// deleted or invisible version is never resolved or projected. Also
     /// returns which keys were resolved to a value: such a row holds no cell
     /// of its own for a column no field declares. `judged` says the merge
-    /// already gave every row its final verdict on the predicate.
+    /// already gave every row its final verdict on the predicate. Objects are
+    /// read ahead into `prefetched`, the merge's store across its batches.
     pub(super) fn read_late(
         &self,
         batch: ColumnBatch,
         judged: bool,
+        prefetched: &mut crate::vlog::Prefetched,
     ) -> crate::Result<(ColumnBatch, Resolved)> {
         let (batch, resolved) = self.resolve_operands(batch)?;
         if let Some(cells) = &self.cells {
-            return Ok((cells::materialize(self, cells, batch, judged)?, resolved));
+            return Ok((
+                cells::materialize(self, cells, batch, judged, prefetched)?,
+                resolved,
+            ));
         }
         let mut batch = if self.declared {
             projection::project_decided(

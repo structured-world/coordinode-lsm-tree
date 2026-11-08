@@ -2,77 +2,13 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-#[cfg(zstd_any)]
-use crate::compression::CompressionProvider as _;
-
+use super::frame::{DecodedFrame, FrameKind, decode_frame};
+use crate::{BlobFile, Slice, UserValue, fs::FsFile, vlog::ValueHandle};
 #[cfg(not(feature = "std"))]
-use crate::io::{Cursor, Read};
-use crate::io::{LittleEndian, ReadBytesExt};
-use crate::{
-    BlobFile, Checksum, CompressionType, UserValue,
-    fs::FsFile,
-    vlog::{
-        ValueHandle,
-        blob_file::writer::{BLOB_HEADER_LEN, BLOB_HEADER_MAGIC, validate_header_crc},
-    },
-};
-#[cfg(feature = "std")]
-use std::io::{Cursor, Read};
+use alloc::vec::Vec;
+use core::ops::Range;
 
-// Safety cap on blob value size (256 MiB), defined in `writer` (the blob-format
-// definition site) and shared by this reader.
-use super::writer::MAX_DECOMPRESSION_SIZE;
-
-/// The exact on-disk span a blob record occupies: header + key + on-disk value.
-///
-/// One definition shared by the single read in [`Reader::read_record`] and by the
-/// prefetcher that coalesces several adjacent records into one read, so the two
-/// can never disagree about where a record ends.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::InvalidHeader`] for a key longer than the writer's
-/// `u16` limit (a caller cannot inflate the computed read that way), and
-/// [`crate::Error::DecompressedSizeTooLarge`] when the record would exceed the
-/// 256 MiB value cap plus its header / key overhead.
-pub(crate) fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize> {
-    // Enforce the same key-length constraint as the writer (u16::MAX)
-    // so that a caller cannot inflate the computed read size.
-    if key_len > u16::MAX as usize {
-        return Err(crate::Error::InvalidHeader("Blob"));
-    }
-
-    let add_size = (BLOB_HEADER_LEN as u64) + (key_len as u64);
-
-    // Validate the full on-disk read size (header + key + value) against the limit.
-    // Allow header+key overhead on top of the data cap.
-    // NOTE: A separate `on_disk_size > MAX` check is mathematically redundant here
-    // because `total > MAX + overhead` already implies `on_disk_size > MAX`.
-    // 256 MiB cap plus a small (≤ header + u16 key) overhead — bounded well
-    // within u64 (see the `add_size < u32::MAX` note below), so a plain add
-    // cannot overflow.
-    let max_total_read_size = (MAX_DECOMPRESSION_SIZE as u64) + add_size;
-
-    // on_disk_size is u32 and add_size < u32::MAX, so this cannot overflow u64.
-    let total_read_size = u64::from(vhandle.on_disk_size) + add_size;
-
-    if total_read_size > max_total_read_size {
-        return Err(crate::Error::DecompressedSizeTooLarge {
-            declared: total_read_size,
-            limit: max_total_read_size,
-        });
-    }
-
-    // After the cap check, total_read_size <= ~256 MiB + overhead, which fits
-    // in usize on all supported platforms (>= 32-bit).
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "bounded to MAX_DECOMPRESSION_SIZE + overhead by the check above"
-    )]
-    Ok(total_read_size as usize)
-}
-
-/// Reads a single blob from a blob file
+/// Reads frames, and the values in them, out of one blob file.
 pub(crate) struct Reader<'a> {
     blob_file: &'a BlobFile,
     file: &'a dyn FsFile,
@@ -83,284 +19,266 @@ impl<'a> Reader<'a> {
         Self { blob_file, file }
     }
 
-    /// Reads the raw bytes of one record, `len` of them from `vhandle.offset`,
-    /// without validating them: the caller parses them with
-    /// [`Self::parse_record`].
-    ///
-    /// `len` is the record's [`record_len`], computed by the caller so that it
-    /// can account for the request before issuing it.
+    /// Where frame `frame` lies: its first byte and its length.
     ///
     /// # Errors
     ///
-    /// Returns the file's read failures.
-    pub(crate) fn read_record(
-        &self,
-        vhandle: &ValueHandle,
-        len: usize,
-    ) -> crate::Result<crate::Slice> {
-        debug_assert_eq!(vhandle.blob_file_id, self.blob_file.id());
-        Ok(crate::file::read_exact(self.file, vhandle.offset, len)?)
+    /// [`crate::Error::InvalidHeader`] for a frame the file does not have, or
+    /// one longer than any frame can be.
+    pub(crate) fn frame_span(blob_file: &BlobFile, frame: u32) -> crate::Result<(u64, usize)> {
+        let (start, end) = blob_file
+            .frame_span(frame)
+            .ok_or(crate::Error::InvalidHeader("Blob"))?;
+        let len = usize::try_from(end - start).map_err(|_| crate::Error::InvalidHeader("Blob"))?;
+        Ok((start, len))
     }
 
-    /// Reads and parses one record in one call.
-    #[cfg(test)]
-    pub(crate) fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
-        let record = self.read_record(vhandle, record_len(key.len(), vhandle)?)?;
-        self.parse_record(key, vhandle, &record, &mut 0)
-    }
-
-    /// Parses one blob record out of bytes already read from the file.
+    /// The bytes of frame `frame`, as stored and unchecked: a caller checks
+    /// them with [`Self::decode`].
     ///
-    /// `record` must be exactly the [`record_len`] bytes that start at
-    /// `vhandle.offset`. Splitting this out of the read lets a caller
-    /// that read several adjacent records in ONE read serve each of them from
-    /// its slice of that buffer: the validation below is identical either way,
-    /// so a prefetched value is byte-for-byte what a direct read would return.
+    /// # Errors
+    ///
+    /// The frame is not in the file, or the read fails.
+    pub(crate) fn read_frame_bytes(&self, frame: u32) -> crate::Result<Slice> {
+        let (start, len) = Self::frame_span(self.blob_file, frame)?;
+        Ok(crate::file::read_exact(self.file, start, len)?)
+    }
+
+    /// Checks and decodes `bytes`, one frame of this file, under its codec.
     ///
     /// `decoded` receives the length the decompressor produced, as soon as it
-    /// produced it: a record refused afterwards (its output is not the length
-    /// the header declares) was still decompressed.
+    /// produced it: a frame refused afterwards was still decompressed.
     ///
     /// # Errors
     ///
-    /// Returns the header / checksum / decompression errors of a malformed
-    /// record; a caller that prefetched speculatively should treat
-    /// them as "leave this one to the read path" rather than as fatal.
-    pub(crate) fn parse_record(
-        &self,
-        key: &[u8],
-        vhandle: &ValueHandle,
-        record: &crate::Slice,
+    /// The frame does not check or does not decode.
+    pub(crate) fn decode(
+        blob_file: &BlobFile,
+        bytes: &Slice,
         decoded: &mut usize,
-    ) -> crate::Result<UserValue> {
-        let (raw_data, real_val_len) = Self::check_record(key, vhandle, record)?;
-        self.decode(raw_data, real_val_len, decoded)
+    ) -> crate::Result<DecodedFrame> {
+        decode_frame(
+            bytes,
+            blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            blob_file.0.zstd_dictionary.as_deref(),
+            decoded,
+        )
     }
 
-    /// Reads one record and returns its value as stored, still in the file's
-    /// codec, with its decoded length: what a verbatim copy into another
-    /// file of the same codec writes.
-    ///
-    /// The record is validated as [`Self::parse_record`] validates it, short
-    /// of decompressing.
+    /// Reads, checks and decodes frame `frame`.
     ///
     /// # Errors
     ///
-    /// Returns the file's read failures and the header / checksum errors of a
-    /// malformed record.
-    pub(crate) fn read_raw(
+    /// As [`Self::read_frame_bytes`] and [`Self::decode`].
+    #[cfg(test)]
+    pub(crate) fn read_frame(
         &self,
-        key: &[u8],
-        vhandle: &ValueHandle,
-    ) -> crate::Result<(crate::Slice, usize)> {
-        let record = self.read_record(vhandle, record_len(key.len(), vhandle)?)?;
-        Self::check_record(key, vhandle, &record)
-    }
-
-    /// Validates a record's header, key and checksum against `key` and
-    /// `vhandle`, and returns its stored value with the declared decoded
-    /// length.
-    fn check_record(
-        key: &[u8],
-        vhandle: &ValueHandle,
-        record: &crate::Slice,
-    ) -> crate::Result<(crate::Slice, usize)> {
-        let value = record;
-        let mut reader = Cursor::new(&value[..]);
-
-        let mut magic = [0u8; 4];
-        reader.read_exact(&mut magic)?;
-
-        // Exactly one frame format exists (single-format contract): any
-        // other magic — including the retired pre-V5 `b"BLOB"` layout — is
-        // corruption or a misdirected handle, never a compat case.
-        if magic != BLOB_HEADER_MAGIC {
-            return Err(crate::Error::InvalidHeader("Blob"));
-        }
-
-        let expected_checksum = reader.read_u128::<LittleEndian>()?;
-
-        let seqno = reader.read_u64::<LittleEndian>()?;
-        let key_len = reader.read_u16::<LittleEndian>()?;
-
-        let real_val_len = reader.read_u32::<LittleEndian>()? as usize;
-
-        let on_disk_val_len = reader.read_u32::<LittleEndian>()?;
-
-        // Read and validate the header CRC before cross-checks.
-        // Uses the on-disk CRC value (not recomputed) in data checksum
-        // verification so that recomputing header_crc after tampering
-        // header fields is still caught by the data checksum.
-        let stored_header_crc = {
-            let crc = reader.read_u32::<LittleEndian>()?;
-            // `allow`, not `expect`: on 32-bit targets usize == u32 and the
-            // lint never fires, which would make an `expect` unfulfilled.
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "real_val_len originates as u32, round-tripped through usize; lossless on supported targets"
-            )]
-            validate_header_crc(seqno, key_len, real_val_len as u32, on_disk_val_len, crc)?;
-            crc
-        };
-
-        // Cross-check header fields against caller-provided inputs to catch
-        // corruption or mismatched handles early, before checksum/decompression.
-        if key_len as usize != key.len() || on_disk_val_len != vhandle.on_disk_size {
-            return Err(crate::Error::InvalidHeader("Blob"));
-        }
-
-        // Validate real_val_len before checksum/decompression to fail fast
-        // on malformed headers and avoid unnecessary hashing work.
-        if real_val_len > MAX_DECOMPRESSION_SIZE {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: real_val_len as u64,
-                limit: MAX_DECOMPRESSION_SIZE as u64,
-            });
-        }
-
-        let header_len = BLOB_HEADER_LEN;
-
-        // Zero-copy view of the on-disk key bytes for checksum and cross-check.
-        // The full blob record is already in `value`, so slicing avoids an extra
-        // allocation vs UserKey::from_reader (upstream #277).
-        let on_disk_key = value.slice(header_len..header_len + key_len as usize);
-
-        // Ensure the stored key bytes exactly match the caller-provided key.
-        // This protects against handles that point at a different key with the
-        // same length (e.g., due to corruption or misuse).
-        if on_disk_key != key {
-            return Err(crate::Error::InvalidHeader("Blob"));
-        }
-
-        // Slice exactly on_disk_val_len bytes.
-        // No usize overflow: on_disk_val_len is u32, data_offset is ~42+key_len,
-        // and total is bounded by MAX_DECOMPRESSION_SIZE (256 MiB) cap check above.
-        let data_offset = header_len + key.len();
-        let raw_data = value.slice(data_offset..data_offset + on_disk_val_len as usize);
-
-        {
-            // Checksum covers on-disk key + raw value data (upstream #277)
-            // plus the header_crc bytes, so that recomputing header_crc
-            // after tampering header fields is still detected.
-            let checksum =
-                super::writer::record_checksum(&on_disk_key, &raw_data, stored_header_crc);
-
-            if expected_checksum != checksum {
-                log::error!(
-                    "Checksum mismatch for blob {vhandle:?}, got={checksum}, expected={expected_checksum}",
-                );
-
-                return Err(crate::Error::ChecksumMismatch {
-                    got: Checksum::from_raw(checksum),
-                    expected: Checksum::from_raw(expected_checksum),
-                });
-            }
-        }
-
-        Ok((raw_data, real_val_len))
-    }
-
-    /// Decodes a validated record's stored value under the file's codec.
-    fn decode(
-        &self,
-        raw_data: crate::Slice,
-        real_val_len: usize,
+        frame: u32,
         decoded: &mut usize,
-    ) -> crate::Result<UserValue> {
-        #[warn(clippy::match_single_binding)]
-        let value = match &self.blob_file.0.meta.compression {
-            CompressionType::None => {
-                *decoded = raw_data.len();
-                if real_val_len != raw_data.len() {
-                    return Err(crate::Error::InvalidHeader("Blob"));
+    ) -> crate::Result<DecodedFrame> {
+        let bytes = self.read_frame_bytes(frame)?;
+        Self::decode(self.blob_file, &bytes, decoded)
+    }
+
+    /// Reads the value `vhandle` names under `key`, whole: out of its frame,
+    /// or out of its head's chunks for a chunked value.
+    ///
+    /// # Errors
+    ///
+    /// The frames do not check, or the entry `vhandle` names is not `key`'s.
+    #[cfg(test)]
+    pub(crate) fn get(&self, key: &[u8], vhandle: &ValueHandle) -> crate::Result<UserValue> {
+        let mut decoded = 0;
+        let frame = self.read_frame(vhandle.frame, &mut decoded)?;
+        match frame.header.kind {
+            FrameKind::Head => {
+                check_key(&frame, vhandle.index, key)?;
+                let mut chunks = Vec::new();
+                for chunk in chunk_frames(&frame, vhandle.frame)? {
+                    chunks.push(alloc::boxed::Box::new(
+                        self.read_frame(chunk, &mut decoded)?,
+                    ));
                 }
-                raw_data
+                assemble(&frame, &chunks, None)
             }
+            _ => value_in(&frame, vhandle.index, key),
+        }
+    }
 
-            #[cfg(feature = "lz4")]
-            CompressionType::Lz4 => {
-                // Straight into the value's allocation, unzeroed: zeroing bytes
-                // about to be written buys nothing. SAFETY: the slice goes to
-                // this one decoder and no open trait, and it refuses a match
-                // reaching before the output, so it never reads an unwritten
-                // position whatever the stream holds (an unkeyed checksum
-                // proves nothing about it); the length check below rejects a
-                // short fill.
-                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                let mut builder = unsafe { UserValue::builder_unzeroed(real_val_len) };
-
-                let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut builder)
-                    .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
-                *decoded = bytes_written;
-
-                // Runtime validation: corrupted data may decompress to fewer bytes
-                if bytes_written != real_val_len {
-                    return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
+    /// What a copy of the value `vhandle` names under `key` into another file
+    /// writes, each frame read checked, and the bytes read for it.
+    ///
+    /// # Errors
+    ///
+    /// The frames do not check, or the entry is not `key`'s.
+    pub(crate) fn copy_source(
+        &self,
+        key: &[u8],
+        vhandle: &ValueHandle,
+    ) -> crate::Result<(CopySource, u64)> {
+        let mut decoded = 0;
+        let first = self.read_frame_bytes(vhandle.frame)?;
+        let mut read = first.len() as u64;
+        let frame = Self::decode(self.blob_file, &first, &mut decoded)?;
+        check_key(&frame, vhandle.index, key)?;
+        let value_len = frame.list.first().map_or(0, |e| e.value_len);
+        let source = match frame.header.kind {
+            FrameKind::Block => CopySource::Value(value_in(&frame, vhandle.index, key)?),
+            FrameKind::Single => CopySource::Frames {
+                frames: alloc::vec![first],
+                value_len,
+            },
+            FrameKind::Head => {
+                let mut frames = alloc::vec![first];
+                for chunk in chunk_frames(&frame, vhandle.frame)? {
+                    let bytes = self.read_frame_bytes(chunk)?;
+                    read += bytes.len() as u64;
+                    let decoded_chunk = Self::decode(self.blob_file, &bytes, &mut decoded)?;
+                    if decoded_chunk.header.kind != FrameKind::Chunk {
+                        return Err(crate::Error::InvalidHeader("Blob"));
+                    }
+                    frames.push(bytes);
                 }
-
-                builder.freeze().into()
+                CopySource::Frames { frames, value_len }
             }
-
-            #[cfg(zstd_any)]
-            CompressionType::Zstd(_) => {
-                // Straight into the value's allocation, unzeroed, on the
-                // thread's reused decoder: zeroing bytes about to be written
-                // buys nothing. SAFETY: the slice goes to this one decoder and
-                // no open trait, and it resolves matches in a window of its own
-                // and refuses an offset past what it wrote, so the slice is
-                // only written, whatever the frame holds; the length check
-                // below rejects a short fill.
-                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                let mut builder = unsafe { UserValue::builder_unzeroed(real_val_len) };
-
-                let bytes_written =
-                    crate::compression::ZstdBackend::decompress_into(&raw_data, &mut builder)
-                        .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
-                *decoded = bytes_written;
-
-                if bytes_written != real_val_len {
-                    return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
-                }
-
-                builder.freeze().into()
-            }
-
-            #[cfg(zstd_any)]
-            CompressionType::ZstdDict { dict_id, .. } => {
-                // The blob file's OWN dictionary, pinned on its handle when the
-                // handle was built. Not looked up per read: the hold that keeps
-                // this file readable is what keeps its dictionary alive, so a
-                // reader cannot lose it to a collection running underneath.
-                let dict = self.blob_file.0.zstd_dictionary.as_deref().ok_or(
-                    crate::Error::ZstdDictMismatch {
-                        expected: *dict_id,
-                        got: None,
-                    },
-                )?;
-                debug_assert_eq!(dict.id(), *dict_id, "pinned by this file's own descriptor");
-
-                let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
-                    &raw_data,
-                    dict,
-                    real_val_len,
-                )
-                .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
-                *decoded = decompressed.len();
-
-                if decompressed.len() != real_val_len {
-                    return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
-                }
-
-                UserValue::from(decompressed)
-            }
+            FrameKind::Chunk => return Err(crate::Error::InvalidHeader("Blob")),
         };
-
-        debug_assert_eq!(real_val_len, value.len());
-
-        Ok(value)
+        Ok((source, read))
     }
 }
 
+/// What a copy of one value into another file writes.
+pub(crate) enum CopySource {
+    /// The frames of a value that has frames of its own, as stored: written
+    /// as they are into a file under the same codec. `value_len` is the
+    /// value's decoded length.
+    Frames { frames: Vec<Slice>, value_len: u32 },
+    /// A value that shares a block, out of it: written as a value.
+    Value(UserValue),
+}
+
+/// Checks that entry `index` of `frame` is `key`'s.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] when it is not, or the frame lists no such
+/// entry: a handle that names another value is damage, never that value.
+pub(crate) fn check_key(frame: &DecodedFrame, index: u16, key: &[u8]) -> crate::Result<()> {
+    if frame.key(usize::from(index)) == Some(key) {
+        Ok(())
+    } else {
+        Err(crate::Error::InvalidHeader("Blob"))
+    }
+}
+
+/// The value at `index` of `frame`, a single or block frame, under `key`.
+///
+/// Handed on as a view into the frame, with no copy: a value out of a block
+/// keeps that block alive while it is held, as a value read out of a table's
+/// data block keeps the data block.
+///
+/// # Errors
+///
+/// The entry is not `key`'s, or the frame is not a single or block frame.
+pub(crate) fn value_in(frame: &DecodedFrame, index: u16, key: &[u8]) -> crate::Result<UserValue> {
+    check_key(frame, index, key)?;
+    match frame.header.kind {
+        FrameKind::Single | FrameKind::Block => frame
+            .value(usize::from(index))
+            .ok_or(crate::Error::InvalidHeader("Blob")),
+        FrameKind::Head | FrameKind::Chunk => Err(crate::Error::InvalidHeader("Blob")),
+    }
+}
+
+/// The frame numbers of a head's chunks: the frames right after it.
+///
+/// # Errors
+///
+/// The head's chunk table is malformed, or the chunks would run past frame
+/// number `u32::MAX`.
+pub(crate) fn chunk_frames(head: &DecodedFrame, frame: u32) -> crate::Result<Range<u32>> {
+    let (_, chunks) = head.chunk_table()?;
+    let first = frame
+        .checked_add(1)
+        .ok_or(crate::Error::InvalidHeader("Blob"))?;
+    let end = first
+        .checked_add(chunks)
+        .ok_or(crate::Error::InvalidHeader("Blob"))?;
+    Ok(first..end)
+}
+
+/// The chunks a byte range of a chunked value covers, by their place among
+/// the head's chunks, and where the range starts in the first of them.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for a malformed head; an empty or
+/// out-of-bounds range is the caller's to refuse.
+pub(crate) fn covering_chunks(
+    head: &DecodedFrame,
+    range: &Range<u64>,
+) -> crate::Result<(Range<u32>, u64)> {
+    let (size, _) = head.chunk_table()?;
+    let size = u64::from(size);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a chunk number fits u32: the head's table holds u32 chunks"
+    )]
+    let chunks = (range.start / size) as u32..range.end.div_ceil(size) as u32;
+    Ok((chunks, range.start % size))
+}
+
+/// Assembles a chunked value out of its head and `chunks`, the chunks of
+/// `range` (all of them when `None`), each decoded.
+///
+/// # Errors
+///
+/// A chunk is not a chunk, or is not the size the head's table gives it.
+pub(crate) fn assemble<C: core::ops::Deref<Target = DecodedFrame>>(
+    head: &DecodedFrame,
+    chunks: &[C],
+    range: Option<&Range<u64>>,
+) -> crate::Result<UserValue> {
+    let malformed = || crate::Error::InvalidHeader("Blob");
+    let (size, count) = head.chunk_table()?;
+    let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
+    let range = range.cloned().unwrap_or(0..total);
+    let (covered, skip) = covering_chunks(head, &range)?;
+    if chunks.len() != (covered.end - covered.start) as usize || covered.end > count {
+        return Err(malformed());
+    }
+    let len = usize::try_from(range.end - range.start).map_err(|_| malformed())?;
+    let mut out = Vec::with_capacity(len);
+    for (at, chunk) in covered.clone().zip(chunks) {
+        let expected = if at + 1 == count {
+            total - u64::from(at) * u64::from(size)
+        } else {
+            u64::from(size)
+        };
+        if chunk.header.kind != FrameKind::Chunk || chunk.payload.len() as u64 != expected {
+            return Err(malformed());
+        }
+        let from = if at == covered.start {
+            usize::try_from(skip).map_err(|_| malformed())?
+        } else {
+            0
+        };
+        let wanted = len - out.len();
+        let bytes = chunk.payload.get(from..).ok_or_else(malformed)?;
+        out.extend_from_slice(bytes.get(..wanted.min(bytes.len())).ok_or_else(malformed)?);
+    }
+    if out.len() != len {
+        return Err(malformed());
+    }
+    Ok(UserValue::from(out))
+}
+
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
+#[expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "test code: fixture files are small enough for every cast"
+)]
 mod tests;

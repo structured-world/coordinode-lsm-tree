@@ -78,6 +78,7 @@ pub(super) fn materialize(
     cells: &CellSource,
     batch: ColumnBatch,
     judged: bool,
+    prefetched: &mut crate::vlog::Prefetched,
 ) -> crate::Result<ColumnBatch> {
     let declared: Vec<ProjectedField> = scan
         .fields
@@ -95,7 +96,7 @@ pub(super) fn materialize(
         .as_ref()
         .filter(|p| !judged && p.apply == PredicateApply::Filter)
         .and_then(|p| declared.iter().position(|f| f.column_id() == p.column_id));
-    read_fields(scan, cells, batch, &declared, judged)
+    read_fields(scan, cells, batch, &declared, judged, prefetched)
 }
 
 /// Whether the scan's filtering predicate keeps each row of `batch`, rows of
@@ -111,6 +112,7 @@ pub(super) fn judge(
     scan: &ColumnarScan,
     cells: &CellSource,
     batch: ColumnBatch,
+    prefetched: &mut crate::vlog::Prefetched,
 ) -> crate::Result<Vec<bool>> {
     let rows = batch.row_count as usize;
     let Some((predicate, field)) = scan
@@ -127,7 +129,14 @@ pub(super) fn judge(
     else {
         return Ok(alloc::vec![true; rows]);
     };
-    let read = read_fields(scan, cells, batch, core::slice::from_ref(&field), None)?;
+    let read = read_fields(
+        scan,
+        cells,
+        batch,
+        core::slice::from_ref(&field),
+        None,
+        prefetched,
+    )?;
     let column = read
         .columns
         .into_iter()
@@ -153,6 +162,7 @@ fn read_fields(
     batch: ColumnBatch,
     declared: &[ProjectedField],
     judged: Option<usize>,
+    prefetched: &mut crate::vlog::Prefetched,
 ) -> crate::Result<ColumnBatch> {
     let row_count = batch.row_count as usize;
     let find = |id: u16| batch.columns.iter().find(|c| c.column_id == id);
@@ -291,7 +301,7 @@ fn read_fields(
         }
     }
 
-    read_objects(cells, &mut rows, now)?;
+    read_objects(cells, &mut rows, now, prefetched)?;
     project(scan, declared, &mut rows)?;
 
     // The predicate drops what it rejects before the rest is read.
@@ -333,7 +343,7 @@ fn read_fields(
         return Err(projection::MISTYPED);
     }
 
-    read_objects(cells, &mut rows, later)?;
+    read_objects(cells, &mut rows, later, prefetched)?;
     project(scan, declared, &mut rows)?;
 
     build(batch, declared, &rows, &out_types, kept.as_deref())
@@ -387,35 +397,47 @@ fn holds_declared_type(
     Ok(false)
 }
 
-/// Reads `fetches`, in blob file and offset order, into the rows: a field's
-/// object into its cell, a whole value into the values the projector reads.
-fn read_objects(cells: &CellSource, rows: &mut Rows, mut fetches: Vec<Fetch>) -> crate::Result<()> {
+/// Reads `fetches`, in the order their objects lie in the blob files, into
+/// the rows: a field's object into its cell, a whole value into the values
+/// the projector reads. `prefetched` is the scan's own store of frames read
+/// ahead, kept across batches so a block that two batches share is read once.
+fn read_objects(
+    cells: &CellSource,
+    rows: &mut Rows,
+    mut fetches: Vec<Fetch>,
+    prefetched: &mut crate::vlog::Prefetched,
+) -> crate::Result<()> {
+    // Nothing to read leaves the store as it is, for the next batch.
+    if fetches.is_empty() {
+        return Ok(());
+    }
     fetches.sort_by_key(|fetch| {
         (
             fetch.indirection.vhandle.blob_file_id,
-            fetch.indirection.vhandle.offset,
+            fetch.indirection.vhandle.object(),
         )
     });
     // Objects close together in one file are read in one request first;
-    // each is then taken from the cache, or from what this read kept.
-    let mut prefetched = crate::vlog::Prefetched::default();
+    // each is then taken from the cache, or from what this scan kept.
+    let mut items = Vec::with_capacity(fetches.len());
+    for fetch in &fetches {
+        let key = rows.keys.get(fetch.row).ok_or(MISSING_BATCH_COLUMN)?;
+        items.push((&**key, fetch.indirection.vhandle, 0));
+    }
+    prefetched.retain_for(&items);
     if fetches.len() > 1 {
-        let mut items = Vec::with_capacity(fetches.len());
-        for fetch in &fetches {
-            let key = rows.keys.get(fetch.row).ok_or(MISSING_BATCH_COLUMN)?;
-            items.push((&**key, fetch.indirection.vhandle, 0));
-        }
         cells
             .source
-            .prefetch(&cells.version.version, &mut items, &mut prefetched);
+            .prefetch(&cells.version.version, &mut items, prefetched);
     }
+    drop(items);
     for fetch in fetches {
         let key = rows.keys.get(fetch.row).ok_or(MISSING_BATCH_COLUMN)?;
         let object = cells.source.object_prefetched(
             &cells.version.version,
             key,
             &fetch.indirection,
-            &mut prefetched,
+            prefetched,
         )?;
         if object.len() != fetch.indirection.size as usize {
             return Err(Error::InvalidHeader(

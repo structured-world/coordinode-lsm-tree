@@ -110,8 +110,8 @@ const REFRESH_KEY_FRACTION: u64 = 64;
 const REFRESH_HASH_STEP_KEYS: u64 = 8;
 
 /// Bytes a `linked_blob_files` record takes before its two keys: the blob
-/// file's id, entry count, bytes and on-disk bytes.
-pub(crate) const LINKED_BLOB_FILE_FIXED_LEN: usize = 4 * core::mem::size_of::<u64>();
+/// file's id, entry count, bytes, on-disk bytes and block entry bytes.
+pub(crate) const LINKED_BLOB_FILE_FIXED_LEN: usize = 5 * core::mem::size_of::<u64>();
 
 /// Bytes one `linked_blob_files` record takes: its fixed fields and its first
 /// and last key, each preceded by a two-byte length.
@@ -132,8 +132,9 @@ pub(crate) struct LinkedBlobFiles {
 
 impl LinkedBlobFiles {
     /// Records that the table's entry at `key` points at a value of `bytes`
-    /// (`on_disk_bytes` stored) in `blob_file_id`. Keys arrive in order, so
-    /// the first key seen for a file is its first and the latest its last.
+    /// (`stored` as it takes in the file) in `blob_file_id`. Keys arrive in
+    /// order, so the first key seen for a file is its first and the latest its
+    /// last.
     ///
     /// Only an `owned` reference adds to the counts: the counts are what
     /// dropping the table charges to the file, and an object is charged
@@ -143,20 +144,21 @@ impl LinkedBlobFiles {
         &mut self,
         blob_file_id: BlobFileId,
         bytes: u64,
-        on_disk_bytes: u64,
+        stored: crate::blob_tree::handle::Stored,
         key: &UserKey,
         owned: bool,
     ) {
-        let (len, bytes, on_disk_bytes) = if owned {
-            (1, bytes, on_disk_bytes)
+        let (len, bytes, (on_disk_bytes, block_bytes)) = if owned {
+            (1, bytes, stored.split())
         } else {
-            (0, 0, 0)
+            (0, 0, (0, 0))
         };
         match self.files.entry(blob_file_id) {
             hashbrown::hash_map::Entry::Occupied(mut entry) => {
                 let link = entry.get_mut();
                 link.bytes += bytes;
                 link.on_disk_bytes += on_disk_bytes;
+                link.block_bytes += block_bytes;
                 link.len += len;
                 // The record grows or shrinks by the change in its last key.
                 self.records_len = self.records_len - link.last_key.len() as u64 + key.len() as u64;
@@ -168,6 +170,7 @@ impl LinkedBlobFiles {
                     blob_file_id,
                     bytes,
                     on_disk_bytes,
+                    block_bytes,
                     len,
                     first_key: key.clone(),
                     last_key: key.clone(),
@@ -255,12 +258,14 @@ pub(crate) fn parse_linked_blob_files(buf: &[u8]) -> crate::Result<Vec<LinkedFil
         })?;
         let bytes = reader.read_u64::<LE>()?;
         let on_disk_bytes = reader.read_u64::<LE>()?;
+        let block_bytes = reader.read_u64::<LE>()?;
         let first_key = read_key(&mut reader)?;
         let last_key = read_key(&mut reader)?;
         links.push(LinkedFile {
             blob_file_id,
             bytes,
             on_disk_bytes,
+            block_bytes,
             len,
             first_key,
             last_key,
@@ -275,13 +280,14 @@ pub(crate) fn parse_linked_blob_files(buf: &[u8]) -> crate::Result<Vec<LinkedFil
 }
 
 /// Bytes the payload of an `owned_blob_objects` block holding `count` objects
-/// takes: a four-byte count, then each object's blob file and offset.
+/// takes: a four-byte count, then each object's blob file and its place in
+/// it (see [`crate::vlog::ValueHandle::object`]).
 #[must_use]
 pub(crate) fn owned_blob_objects_len(count: usize) -> u64 {
     4 + count as u64 * 16
 }
 
-/// Encodes `objects`, sorted by blob file and offset with no repeat, as the
+/// Encodes `objects`, sorted by blob file and place with no repeat, as the
 /// payload of an `owned_blob_objects` block.
 ///
 /// # Errors
@@ -298,15 +304,15 @@ pub(crate) fn encode_owned_blob_objects(
         crate::Error::InvalidHeader("owned_blob_objects: more objects than the count holds")
     })?;
     out.write_u32::<LE>(count)?;
-    for &(blob_file_id, offset) in objects {
+    for &(blob_file_id, object) in objects {
         out.write_u64::<LE>(blob_file_id)?;
-        out.write_u64::<LE>(offset)?;
+        out.write_u64::<LE>(object)?;
     }
     Ok(())
 }
 
 /// Parses the payload of an `owned_blob_objects` block: the objects, sorted by
-/// blob file and offset with no repeat, filling the payload exactly.
+/// blob file and place with no repeat, filling the payload exactly.
 ///
 /// # Errors
 ///
@@ -478,14 +484,24 @@ pub struct LinkedFile {
     pub blob_file_id: BlobFileId,
     /// Bytes of the objects the table owns, before compression.
     pub bytes: u64,
-    /// Bytes of the objects the table owns, as stored.
+    /// Bytes of the frames of their own that the objects the table owns take.
     pub on_disk_bytes: u64,
+    /// Entries of the objects the table owns that share a block, before
+    /// compression: their part of the file's blocks is what they take.
+    pub block_bytes: u64,
     /// Objects of the file the table owns.
     pub len: usize,
     /// The table's first key whose value lives in this blob file.
     pub first_key: UserKey,
     /// The table's last key whose value lives in this blob file.
     pub last_key: UserKey,
+}
+
+impl LinkedFile {
+    /// The bytes the objects the table owns take on disk in `meta`'s file.
+    pub(crate) fn on_disk(&self, meta: &crate::vlog::blob_file::meta::Metadata) -> u64 {
+        self.on_disk_bytes + meta.block_share(self.block_bytes)
+    }
 }
 
 /// Serializes and compresses values into blocks and writes them to disk as a table.
@@ -618,7 +634,7 @@ pub struct Writer {
 
     linked_blob_files: Vec<LinkedFile>,
 
-    /// The blob objects this table's cell rows own, as `(blob file, offset)`,
+    /// The blob objects this table's cell rows own, as `(blob file, object)`,
     /// for the `owned_blob_objects` section.
     owned_blob_objects: Vec<(BlobFileId, u64)>,
 
@@ -1975,7 +1991,7 @@ impl Writer {
         self.linked_blob_files.push(link);
     }
 
-    /// Records the blob objects, as `(blob file, offset)`, that this table's
+    /// Records the blob objects, as `(blob file, object)`, that this table's
     /// cell rows own, for the `owned_blob_objects` section.
     pub fn own_blob_objects(&mut self, objects: Vec<(BlobFileId, u64)>) {
         if self.owned_blob_objects.is_empty() {
@@ -5377,6 +5393,7 @@ impl Writer {
                 self.file_writer.write_u64::<LE>(file.len as u64)?;
                 self.file_writer.write_u64::<LE>(file.bytes)?;
                 self.file_writer.write_u64::<LE>(file.on_disk_bytes)?;
+                self.file_writer.write_u64::<LE>(file.block_bytes)?;
                 for key in [&file.first_key, &file.last_key] {
                     // A user key is at most `u16::MAX` bytes: the writer
                     // rejects longer keys before they reach a table.

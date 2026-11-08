@@ -2,11 +2,10 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-#[cfg(zstd_any)]
-use crate::compression::CompressionProvider as _;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
+use super::frame::{Codec, EntrySpec, FrameKind, encode_frame, head_payload};
 use super::meta::{META_VERSION, Metadata};
 use crate::io::BufWriter;
 #[cfg(not(feature = "std"))]
@@ -30,175 +29,145 @@ use std::io::Write;
 /// than duplicate it. Kept SEPARATE from `table::block`'s cap (a `u32`) on
 /// purpose, since blocks and blobs are independent storage formats that may
 /// diverge.
-pub(super) const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
 
 /// Returns `Err(DecompressedSizeTooLarge)` if `len > MAX_DECOMPRESSION_SIZE`.
-pub(super) fn check_size_cap(len: usize) -> crate::Result<()> {
+pub(crate) fn check_size_cap(len: usize) -> crate::Result<u32> {
     if len > MAX_DECOMPRESSION_SIZE {
         return Err(crate::Error::DecompressedSizeTooLarge {
             declared: len as u64,
             limit: MAX_DECOMPRESSION_SIZE as u64,
         });
     }
-    Ok(())
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the cap, 256 MiB, fits u32"
+    )]
+    Ok(len as u32)
 }
 
-/// `value` as a blob frame stores it under `compression`: compressed with
-/// `dictionary` for a dictionary codec, as it is for none. The output is
-/// checked against the size cap, which applies to blob data whatever its
-/// encoding.
-#[cfg_attr(
-    not(any(feature = "lz4", zstd_any)),
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "without a codec built in, a value is stored as it is and cannot fail"
-    )
-)]
-#[cfg_attr(
-    not(zstd_any),
-    expect(
-        clippy::elidable_lifetime_names,
-        reason = "named to stay valid in the zstd build, where the dictionary is a second reference"
-    )
-)]
-pub(super) fn encode_value<'v>(
-    compression: CompressionType,
-    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
-    #[cfg(zstd_any)] two_pass_seed: bool,
-    value: &'v [u8],
-) -> crate::Result<alloc::borrow::Cow<'v, [u8]>> {
-    Ok(match compression {
-        CompressionType::None => alloc::borrow::Cow::Borrowed(value),
-
-        #[cfg(feature = "lz4")]
-        CompressionType::Lz4 => {
-            let compressed = lz4_flex::block::compress(value);
-            check_size_cap(compressed.len())?;
-            alloc::borrow::Cow::Owned(compressed)
-        }
-
-        #[cfg(zstd_any)]
-        CompressionType::Zstd(level) => {
-            let compressed =
-                crate::compression::ZstdBackend::compress(value, level, two_pass_seed)?;
-            check_size_cap(compressed.len())?;
-            alloc::borrow::Cow::Owned(compressed)
-        }
-
-        #[cfg(zstd_any)]
-        CompressionType::ZstdDict { level, dict_id } => {
-            let dict = dictionary.ok_or(crate::Error::ZstdDictMismatch {
-                expected: dict_id,
-                got: None,
-            })?;
-            if dict.id() != dict_id {
-                return Err(crate::Error::ZstdDictMismatch {
-                    expected: dict_id,
-                    got: Some(dict.id()),
-                });
-            }
-            let compressed = crate::compression::ZstdBackend::compress_with_dict(
-                value,
-                level,
-                dict,
-                two_pass_seed,
-            )?;
-            check_size_cap(compressed.len())?;
-            alloc::borrow::Cow::Owned(compressed)
-        }
-    })
+/// How a blob file sizes its frames: set through
+/// [`KvSeparationOptions::block_size`](crate::KvSeparationOptions::block_size)
+/// and [`KvSeparationOptions::chunk_size`](crate::KvSeparationOptions::chunk_size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameSizes {
+    /// Values below it share a block, which closes once it reaches
+    /// [`BLOCK_FILL_PERCENT`] of it and the next value would take it past.
+    pub(crate) block_target: u32,
+    /// Values above it are split into chunks of this many bytes; never zero.
+    pub(crate) chunk_size: u32,
 }
 
-// Note: these constants are `pub` for crate-internal use but the parent
-// `vlog` module is NOT exported from `lib.rs`, so they are not public API.
-
-/// Blob frame magic. This is the ONLY readable frame shape: the engine
-/// supports exactly one on-disk format (see [`crate::FormatVersion`]) — a
-/// frame under any other magic (including the retired pre-V5 `b"BLOB"`
-/// layout without a header CRC) is corruption, not a compat case.
-pub(crate) const BLOB_HEADER_MAGIC: &[u8] = b"BLO4";
-
-/// Blob frame header length: 42 bytes, `header_crc` included. The fields sum to
-/// 42: 4 (magic), 16 (u128 checksum), 8 (seqno), 2 (key len), 4 (real val len),
-/// 4 (on-disk val len), 4 (header crc). Pinned by the reader tests
-/// (`assert_eq!(BLOB_HEADER_LEN, 42)`).
-pub(crate) const BLOB_HEADER_LEN: usize = BLOB_HEADER_MAGIC.len()
-    + core::mem::size_of::<u128>() // Checksum
-    + core::mem::size_of::<u64>() // SeqNo
-    + core::mem::size_of::<u16>() // Key length
-    + core::mem::size_of::<u32>() // Real value length
-    + core::mem::size_of::<u32>() // On-disk value length
-    + core::mem::size_of::<u32>(); // Header CRC
-
-/// Compute the frame header CRC from header fields.
-/// Returns a 4-byte truncated xxh3 hash.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "intentionally truncated to 4-byte CRC"
-)]
-pub(super) fn compute_header_crc(
-    seqno: u64,
-    key_len: u16,
-    real_val_len: u32,
-    on_disk_val_len: u32,
-) -> u32 {
-    let mut fields = [0_u8; 18];
-    fields[..8].copy_from_slice(&seqno.to_le_bytes());
-    fields[8..10].copy_from_slice(&key_len.to_le_bytes());
-    fields[10..14].copy_from_slice(&real_val_len.to_le_bytes());
-    fields[14..18].copy_from_slice(&on_disk_val_len.to_le_bytes());
-    xxhash_rust::xxh3::xxh3_64(&fields) as u32
+impl FrameSizes {
+    /// A block of 16 KiB, chunks of 256 KiB.
+    pub(crate) const DEFAULT: Self = Self {
+        block_target: 16 * 1024,
+        chunk_size: 256 * 1024,
+    };
 }
 
-/// Key, value and CRC bytes that hash in one call. A streaming hasher costs
-/// more to set up than this many bytes cost to copy.
-const ONE_CALL_HASH_BYTES: usize = 1024;
-
-/// The checksum of a record: its key, its stored value and its header CRC, in
-/// that order. Covering the CRC detects a header recomputed after tampering.
-pub(super) fn record_checksum(key: &[u8], value: &[u8], header_crc: u32) -> u128 {
-    let crc = header_crc.to_le_bytes();
-    let len = key.len() + value.len() + crc.len();
-    if len <= ONE_CALL_HASH_BYTES {
-        let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); ONE_CALL_HASH_BYTES];
-        let dst = buf.as_mut_ptr().cast::<u8>();
-        // SAFETY: the three copies are disjoint, fill exactly the first `len`
-        // bytes, and `len` is within the buffer.
-        let bytes = unsafe {
-            core::ptr::copy_nonoverlapping(key.as_ptr(), dst, key.len());
-            let at = dst.add(key.len());
-            core::ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
-            core::ptr::copy_nonoverlapping(crc.as_ptr(), at.add(value.len()), crc.len());
-            core::slice::from_raw_parts(dst, len)
-        };
-        return xxhash_rust::xxh3::xxh3_128(bytes);
+impl Default for FrameSizes {
+    fn default() -> Self {
+        Self::DEFAULT
     }
-    let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-    hasher.update(key);
-    hasher.update(value);
-    hasher.update(&crc);
-    hasher.digest128()
 }
 
-/// Validate the frame header CRC: recompute from header fields and compare
-/// against the stored value.
-pub(super) fn validate_header_crc(
-    seqno: u64,
-    key_len: u16,
-    real_val_len: u32,
-    on_disk_val_len: u32,
-    stored_crc: u32,
-) -> crate::Result<()> {
-    let recomputed_crc = compute_header_crc(seqno, key_len, real_val_len, on_disk_val_len);
+/// How full a block must be before the next value may close it, in percent of
+/// the target. Below it, a value joins the block even past the target, so a
+/// block never closes small for want of room for one more value.
+pub(crate) const BLOCK_FILL_PERCENT: u64 = 90;
 
-    if stored_crc != recomputed_crc {
-        return Err(crate::Error::HeaderCrcMismatch {
-            recomputed: recomputed_crc,
-            stored: stored_crc,
-        });
+/// Where a written value lies: the frame that holds it (a head for a chunked
+/// value) and its place in the frame's list, and the bytes it takes (see
+/// [`crate::blob_tree::handle::BlobIndirection::stored`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameRef {
+    pub(crate) frame: u32,
+    pub(crate) index: u16,
+    pub(crate) stored: crate::blob_tree::handle::Stored,
+}
+
+/// The values waiting for the block they join.
+#[derive(Default)]
+struct PendingBlock {
+    /// Every key, back to back.
+    keys: Vec<u8>,
+    /// Each value's sequence number, the end of its key in `keys` and its
+    /// length.
+    entries: Vec<(SeqNo, usize, u32)>,
+    /// Every value, back to back.
+    payload: Vec<u8>,
+}
+
+impl PendingBlock {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
-    Ok(())
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.entries.clear();
+        self.payload.clear();
+    }
+
+    /// What the block holds so far, uncompressed: its entries, keys and
+    /// values.
+    fn len(&self) -> u64 {
+        (self.entries.len() * super::frame::ENTRY_HEADER_LEN + self.keys.len() + self.payload.len())
+            as u64
+    }
+}
+
+/// The frame index a blob file ends its data with: where each frame starts,
+/// then where the data ends, then a checksum over both.
+///
+/// `[count; 4][offset; 8] * count [end; 8][xxh3; 8]`
+pub(crate) fn encode_frame_index(starts: &[u64], end: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + (starts.len() + 2) * 8);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a frame number is a u32, so a file holds at most u32::MAX frames"
+    )]
+    out.extend_from_slice(&(starts.len() as u32).to_le_bytes());
+    for start in starts {
+        out.extend_from_slice(&start.to_le_bytes());
+    }
+    out.extend_from_slice(&end.to_le_bytes());
+    let digest = xxhash_rust::xxh3::xxh3_64(&out);
+    out.extend_from_slice(&digest.to_le_bytes());
+    out
+}
+
+/// Decodes a frame index: each frame's start followed by the data end, one
+/// more entry than there are frames.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for an index that is short, long, fails its
+/// checksum, or lists starts that do not increase within the data.
+pub(crate) fn decode_frame_index(bytes: &[u8]) -> crate::Result<alloc::sync::Arc<[u64]>> {
+    let malformed = || crate::Error::InvalidHeader("BlobFrameIndex");
+    let (body, digest) = bytes.split_last_chunk::<8>().ok_or_else(malformed)?;
+    if xxhash_rust::xxh3::xxh3_64(body) != u64::from_le_bytes(*digest) {
+        return Err(malformed());
+    }
+    let (count, rest) = body.split_first_chunk::<4>().ok_or_else(malformed)?;
+    let words = (u32::from_le_bytes(*count) as usize)
+        .checked_add(1)
+        .and_then(|words| words.checked_mul(8));
+    if words != Some(rest.len()) {
+        return Err(malformed());
+    }
+    let offsets: Vec<u64> = rest
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|word| u64::from_le_bytes(*word))
+        .collect();
+    if offsets.windows(2).any(|pair| pair.first() >= pair.get(1)) {
+        return Err(malformed());
+    }
+    Ok(offsets.into())
 }
 
 /// Blob file writer
@@ -216,30 +185,23 @@ pub(crate) struct Writer {
     pub(crate) written_blob_bytes: u64,
     pub(crate) uncompressed_bytes: u64,
 
+    /// What the values written into blocks were charged, their entries
+    /// uncompressed, and what those blocks take on disk.
+    block_entry_bytes: u64,
+    block_frame_bytes: u64,
+
     pub(crate) first_key: Option<UserKey>,
-    /// Rewritten by every frame, so it reuses its buffer rather than keeping a
-    /// key of its own per frame.
+    /// Rewritten by every value, so it reuses its buffer rather than keeping a
+    /// key of its own per value.
     pub(crate) last_key: Vec<u8>,
 
     pub(crate) compression: CompressionType,
 
-    /// Compression to RECORD in the blob file's metadata, when it must differ
-    /// from [`Self::compression`]. Set for relocation / GC passthrough: the
-    /// caller hands `write_raw` bytes that are ALREADY compressed (so
-    /// `compression` stays `None` to skip re-compressing), but the file's
-    /// metadata must still declare the real codec so a reopened reader
-    /// decompresses correctly. `None` here means "record `compression`".
-    pub(crate) metadata_compression_override: Option<CompressionType>,
-
     /// The lifetime class this file holds, recorded in its metadata.
     pub(crate) lifetime_class: u8,
 
-    /// The age to record instead of the time the file is finished, for a file
-    /// rebuilt from another store.
-    pub(crate) created_at: Option<u128>,
-
-    /// The tree's clock, read for the age when `created_at` does not set it;
-    /// `None` reads the process clock.
+    /// The tree's clock, read for the file's age; `None` reads the process
+    /// clock.
     clock: Option<alloc::sync::Arc<dyn crate::Clock>>,
 
     /// Durability level for the final blob-file fsync. Default
@@ -268,6 +230,18 @@ pub(crate) struct Writer {
     /// [`Self::use_zstd_two_pass_seed`].
     #[cfg(zstd_any)]
     pub(crate) zstd_two_pass_seed: bool,
+
+    /// How this file sizes its frames.
+    pub(crate) sizes: FrameSizes,
+
+    /// Where each frame written so far starts.
+    frames: Vec<u64>,
+
+    /// The block the next small value joins.
+    block: PendingBlock,
+
+    /// A frame being encoded, kept so a writer allocates it once.
+    scratch: Vec<u8>,
 }
 
 impl Writer {
@@ -286,11 +260,33 @@ impl Writer {
         Self::open(path, blob_file_id, tree_id, fs, None)
     }
 
+    /// [`Self::new`] writing every value up to the default chunk size into a
+    /// frame of its own, none into a block: a fixture whose damage to one
+    /// value is damage to that value alone.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    #[cfg(test)]
+    pub(crate) fn one_frame_each<P: AsRef<Path>>(
+        path: P,
+        blob_file_id: BlobFileId,
+        tree_id: TreeId,
+        fs: &dyn Fs,
+    ) -> crate::Result<Self> {
+        Ok(
+            Self::new(path, blob_file_id, tree_id, fs)?.use_frame_sizes(FrameSizes {
+                block_target: 0,
+                chunk_size: FrameSizes::DEFAULT.chunk_size,
+            }),
+        )
+    }
+
     /// Initializes a new blob file writer, its file written as `origin`'s
     /// when given.
     ///
     /// Uses `create_new` (not `create+truncate`) because blob file IDs are
-    /// monotonically unique — a path collision indicates a bug, not a retry.
+    /// monotonically unique: a path collision indicates a bug, not a retry.
     /// Orphaned files from crashes are cleaned up during recovery.
     ///
     /// # Errors
@@ -311,7 +307,7 @@ impl Writer {
         // From here the file exists and is OURS (`create_new` proved it), so
         // this constructor owns cleanup: an init failure below must not leak a
         // partial file, and a CALLER must never remove `path` on a constructor
-        // error — an open failure above created nothing, so caller-side
+        // error: an open failure above created nothing, so caller-side
         // cleanup would race a concurrent creator and delete a file it does
         // not own.
         let mut writer = crate::sfa::Writer::from_writer(ChecksummedWriter::new(
@@ -343,14 +339,14 @@ impl Writer {
             item_count: 0,
             written_blob_bytes: 0,
             uncompressed_bytes: 0,
+            block_entry_bytes: 0,
+            block_frame_bytes: 0,
 
             first_key: None,
             last_key: Vec::new(),
 
             compression: CompressionType::None,
-            metadata_compression_override: None,
             lifetime_class: 0,
-            created_at: None,
             clock: None,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
@@ -361,11 +357,23 @@ impl Writer {
             zstd_dictionary: None,
             #[cfg(zstd_any)]
             zstd_two_pass_seed: true,
+
+            sizes: FrameSizes::DEFAULT,
+            frames: Vec::new(),
+            block: PendingBlock::default(),
+            scratch: Vec::new(),
         })
     }
 
     pub(crate) fn use_compression(mut self, compressor: CompressionType) -> Self {
         self.compression = compressor;
+        self
+    }
+
+    /// Sizes this file's frames by `sizes`.
+    #[must_use]
+    pub(crate) fn use_frame_sizes(mut self, sizes: FrameSizes) -> Self {
+        self.sizes = sizes;
         self
     }
 
@@ -422,10 +430,6 @@ impl Writer {
         if self.writeback_bytes == 0 || pending < self.writeback_bytes {
             return Ok(());
         }
-        #[cfg(not(feature = "std"))]
-        use crate::io::Write;
-        #[cfg(feature = "std")]
-        use std::io::Write;
         // The range is in the buffer until it is flushed to the file.
         let checksummed = self.writer.get_mut();
         checksummed.flush()?;
@@ -464,200 +468,288 @@ impl Writer {
         self
     }
 
-    /// Returns the current offset in the file.
-    #[must_use]
-    pub(crate) fn offset(&self) -> u64 {
-        self.offset
-    }
-
     /// Returns the blob file ID.
     #[must_use]
     pub(crate) fn blob_file_id(&self) -> BlobFileId {
         self.blob_file_id
     }
 
-    /// Skips `len` bytes of the data section, so the next value lands `len`
-    /// bytes later: for a file rebuilt from one whose consumed prefix was
-    /// reclaimed, whose live values keep the offsets their handles name. The
-    /// gap is never written: a filesystem with sparse files leaves it
-    /// unallocated, and the file is restricted past it. Its bytes are not part
-    /// of the writer's checksum, which a restricted file does not use.
-    #[cfg(feature = "std")]
-    pub(crate) fn write_filler(&mut self, len: u64) -> crate::Result<()> {
-        use std::io::Seek as _;
-        let skip =
-            i64::try_from(len).map_err(|_| crate::Error::InvalidHeader("blob file frontier"))?;
-        self.writer
-            .get_mut()
-            .seek(std::io::SeekFrom::Current(skip))?;
-        self.offset += len;
-        Ok(())
+    /// Bytes the file holds so far, the values waiting for their block counted.
+    #[must_use]
+    pub(crate) fn len_written(&self) -> u64 {
+        self.offset + self.block.len()
     }
 
-    pub(crate) fn write_raw(
-        &mut self,
-        key: &[u8],
-        seqno: SeqNo,
-        value: &[u8],
-        uncompressed_len: u32,
-    ) -> crate::Result<u32> {
-        assert_ne!(key.len(), 0, "a blob is written under a non-empty key");
-        assert!(u16::try_from(key.len()).is_ok());
-        assert!(u32::try_from(value.len()).is_ok());
-
-        check_size_cap(uncompressed_len as usize)?;
-        check_size_cap(value.len())?;
-
-        // Perform compression before mutating writer state, so an error
-        // leaves the writer consistent.
-        let value = encode_value(
-            self.compression,
+    fn codec(&self) -> Codec<'_> {
+        Codec {
+            compression: self.compression,
             #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
+            dictionary: self.zstd_dictionary.as_deref(),
             #[cfg(zstd_any)]
-            self.zstd_two_pass_seed,
-            value,
-        )?;
-        self.append(key, seqno, &value, uncompressed_len)
+            two_pass_seed: self.zstd_two_pass_seed,
+            #[cfg(not(zstd_any))]
+            dictionary: core::marker::PhantomData,
+        }
     }
 
-    /// Writes `encoded`, a value already encoded under the codec this file
-    /// records, without encoding it again. `uncompressed_len` is its decoded
-    /// length.
-    pub(crate) fn write_encoded(
-        &mut self,
-        key: &[u8],
-        seqno: SeqNo,
-        encoded: &[u8],
-        uncompressed_len: u32,
-    ) -> crate::Result<u32> {
-        assert_ne!(key.len(), 0, "a blob is written under a non-empty key");
-        assert!(u16::try_from(key.len()).is_ok());
-
-        check_size_cap(uncompressed_len as usize)?;
-        check_size_cap(encoded.len())?;
-        self.append(key, seqno, encoded, uncompressed_len)
+    /// The number the next frame written gets.
+    fn next_frame(&self) -> crate::Result<u32> {
+        u32::try_from(self.frames.len())
+            .map_err(|_| crate::Error::InvalidHeader("blob file holds u32::MAX frames"))
     }
 
-    /// Appends the frame of `value`, already in its on-disk form.
-    fn append(
-        &mut self,
-        key: &[u8],
-        seqno: SeqNo,
-        value: &[u8],
-        uncompressed_len: u32,
-    ) -> crate::Result<u32> {
-        // Ensure the compressed value length fits in u32 before we write it
-        // to disk as a 32-bit length. This prevents truncation if compression
-        // expands the payload (possible for incompressible data near u32 boundary).
-        let compressed_len_u32 = u32::try_from(value.len())
-            .map_err(|_| crate::io::Error::other("compressed value length exceeds u32::MAX"))?;
+    /// Writes `bytes`, one encoded frame, at the current offset.
+    fn put_frame(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.frames.push(self.offset);
+        self.writer.write_all(bytes)?;
+        self.offset += bytes.len() as u64;
+        self.written_blob_bytes += bytes.len() as u64;
+        self.writeback_if_due()
+    }
 
+    /// Encodes and writes one frame.
+    fn emit(
+        &mut self,
+        kind: FrameKind,
+        entries: &[EntrySpec<'_>],
+        payload: &[u8],
+    ) -> crate::Result<()> {
+        let mut scratch = core::mem::take(&mut self.scratch);
+        let encoded = encode_frame(kind, entries, payload, self.codec(), &mut scratch);
+        let written = encoded.and_then(|()| self.put_frame(&scratch));
+        self.scratch = scratch;
+        written
+    }
+
+    /// Writes the block waiting for its values, if any.
+    fn close_block(&mut self) -> crate::Result<()> {
+        if self.block.is_empty() {
+            return Ok(());
+        }
+        let block = core::mem::take(&mut self.block);
+        let mut key_start = 0;
+        let entries: Vec<EntrySpec<'_>> = block
+            .entries
+            .iter()
+            .map(|&(seqno, key_end, value_len)| {
+                let key = block.keys.get(key_start..key_end).unwrap_or_default();
+                key_start = key_end;
+                EntrySpec {
+                    key,
+                    seqno,
+                    value_len,
+                }
+            })
+            .collect();
+        let before = self.offset;
+        let written = self.emit(FrameKind::Block, &entries, &block.payload);
+        drop(entries);
+        self.block_frame_bytes += self.offset - before;
+        self.block = block;
+        self.block.clear();
+        written
+    }
+
+    fn note_key(&mut self, key: &[u8], value_len: u32) {
         if self.first_key.is_none() {
             self.first_key = Some(key.into());
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
-
-        self.uncompressed_bytes += u64::from(uncompressed_len);
-
-        // NOTE:
-        // BLOB HEADER LAYOUT
-        //
-        // [MAGIC_BYTES; 4B]    - BLOB_HEADER_MAGIC (b"BLO4")
-        // [Checksum; 16B]      - xxh3_128(key + value + header_crc_le)
-        // [Seqno; 8B]
-        // [key len; 2B]
-        // [real val len; 4B]
-        // [on-disk val len; 4B]
-        // [header_crc; 4B]     - truncated xxh3(seqno + key_len + real_val_len + on_disk_val_len)
-        // [...key; ?]
-        // [...val; ?]
-
-        #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
-        let header_crc = compute_header_crc(
-            seqno,
-            key.len() as u16,
-            uncompressed_len,
-            compressed_len_u32,
-        );
-
-        // Data checksum includes header_crc bytes so that changes to header
-        // fields without correspondingly updating the data checksum will be
-        // detected as an inconsistency between header and data.
-        let checksum = record_checksum(key, value, header_crc);
-
-        // The header goes down as one write: the file's own checksum hashes
-        // every write it sees, field by field otherwise.
-        let mut header = [0_u8; BLOB_HEADER_LEN];
-        {
-            let mut rest = &mut header[..];
-            let mut put = |field: &[u8]| {
-                let (slot, after) = core::mem::take(&mut rest).split_at_mut(field.len());
-                slot.copy_from_slice(field);
-                rest = after;
-            };
-            put(BLOB_HEADER_MAGIC);
-            put(&checksum.to_le_bytes());
-            put(&seqno.to_le_bytes());
-            #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
-            put(&(key.len() as u16).to_le_bytes());
-            put(&uncompressed_len.to_le_bytes());
-            put(&compressed_len_u32.to_le_bytes());
-            put(&header_crc.to_le_bytes());
-        }
-        self.writer.write_all(&header)?;
-
-        self.writer.write_all(key)?;
-        self.writer.write_all(value)?;
-
-        // Update offset
-        self.offset += BLOB_HEADER_LEN as u64;
-        self.offset += key.len() as u64;
-        self.offset += value.len() as u64;
-
-        // Update metadata
-        self.written_blob_bytes += value.len() as u64;
         self.item_count += 1;
-        self.writeback_if_due()?;
-
-        // TODO: if we store the offset before writing, we can return a vhandle here
-        // instead of needing to call offset() and blob_file_id() before write()
-
-        Ok(compressed_len_u32)
+        self.uncompressed_bytes += u64::from(value_len);
     }
 
-    /// Writes an item into the file.
+    /// Writes an item into the file, into the frame its size calls for, and
+    /// returns where it lies.
     ///
     /// Items need to be written in key order.
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
-    ///
-    /// Will return `Err(Error::DecompressedSizeTooLarge { .. })` if the value exceeds the 256 MiB limit.
+    /// Will return `Err` if an IO error occurs, or
+    /// `Err(Error::DecompressedSizeTooLarge { .. })` if the value exceeds the
+    /// 256 MiB limit.
     ///
     /// # Panics
     ///
-    /// Panics if the key length is empty or greater than 2^16, or the value length is greater than 2^32.
-    pub(crate) fn write(&mut self, key: &[u8], seqno: SeqNo, value: &[u8]) -> crate::Result<u32> {
-        #[expect(clippy::cast_possible_truncation, reason = "values are u32 max")]
-        self.write_raw(key, seqno, value, value.len() as u32)
+    /// Panics if the key is empty or longer than `u16::MAX`.
+    pub(crate) fn write(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+    ) -> crate::Result<FrameRef> {
+        assert_ne!(key.len(), 0, "a blob is written under a non-empty key");
+        assert!(u16::try_from(key.len()).is_ok(), "keys are u16 length max");
+        let value_len = check_size_cap(value.len())?;
+
+        let FrameSizes {
+            block_target,
+            chunk_size,
+        } = self.sizes;
+        let at = if value_len < block_target {
+            // A block is sized by its entries, keys and values alike: small
+            // values under long keys would otherwise fill it with keys.
+            let pending = self.block.len();
+            let entry = (super::frame::ENTRY_HEADER_LEN + key.len()) as u64 + u64::from(value_len);
+            let full = pending * 100 >= u64::from(block_target) * BLOCK_FILL_PERCENT;
+            if !self.block.is_empty()
+                && ((full && pending + entry > u64::from(block_target))
+                    || self.block.entries.len() == usize::from(u16::MAX))
+            {
+                self.close_block()?;
+            }
+            let frame = self.next_frame()?;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a block closes at u16::MAX values"
+            )]
+            let index = self.block.entries.len() as u16;
+            self.block.keys.extend_from_slice(key);
+            self.block
+                .entries
+                .push((seqno, self.block.keys.len(), value_len));
+            self.block.payload.extend_from_slice(value);
+            // The value's entry as the block holds it, uncompressed: its share
+            // of the block once compressed is not known yet. A key is at most
+            // u16::MAX bytes and the value below the block target, a u32.
+            #[expect(clippy::cast_possible_truncation, reason = "bounded as above")]
+            let entry = (super::frame::ENTRY_HEADER_LEN + key.len()) as u32 + value_len;
+            self.block_entry_bytes += u64::from(entry);
+            FrameRef {
+                frame,
+                index,
+                stored: crate::blob_tree::handle::Stored::InBlock(entry),
+            }
+        } else if value_len <= chunk_size {
+            self.close_block()?;
+            let frame = self.next_frame()?;
+            let entry = EntrySpec {
+                key,
+                seqno,
+                value_len,
+            };
+            let before = self.offset;
+            self.emit(FrameKind::Single, &[entry], value)?;
+            FrameRef {
+                frame,
+                index: 0,
+                stored: self.stored_since(before),
+            }
+        } else {
+            self.close_block()?;
+            let frame = self.next_frame()?;
+            let chunks = value_len.div_ceil(chunk_size);
+            let entry = EntrySpec {
+                key,
+                seqno,
+                value_len,
+            };
+            let before = self.offset;
+            self.emit(FrameKind::Head, &[entry], &head_payload(chunk_size, chunks))?;
+            for chunk in value.chunks(chunk_size as usize) {
+                self.emit(FrameKind::Chunk, &[], chunk)?;
+            }
+            FrameRef {
+                frame,
+                index: 0,
+                stored: self.stored_since(before),
+            }
+        };
+        self.note_key(key, value_len);
+        Ok(at)
     }
 
-    pub(crate) fn finish(mut self) -> crate::Result<(Metadata, Checksum)> {
+    /// Writes `frames`, the encoded frames of one whole value (a single frame,
+    /// or a head and its chunks) under the codec this file records, without
+    /// encoding them again, and returns where the value lies. `value_len` is
+    /// the value's decoded length.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the frames are not one whole value
+    /// under `key`, and any IO error.
+    pub(crate) fn write_verbatim(
+        &mut self,
+        key: &[u8],
+        frames: &[crate::Slice],
+        value_len: u32,
+    ) -> crate::Result<FrameRef> {
+        let malformed = || crate::Error::InvalidHeader("verbatim blob frames");
+        let first = frames.first().ok_or_else(malformed)?;
+        let header = super::frame::parse_header(first)?;
+        let chunks = frames.len() - 1;
+        let shape_ok = match header.kind {
+            FrameKind::Single => chunks == 0,
+            FrameKind::Head => chunks > 0,
+            FrameKind::Block | FrameKind::Chunk => false,
+        };
+        let listed_key = first.get(
+            super::frame::FRAME_HEADER_LEN + super::frame::ENTRY_HEADER_LEN
+                ..super::frame::FRAME_HEADER_LEN + header.entries_len as usize,
+        );
+        if !shape_ok || listed_key != Some(key) {
+            return Err(malformed());
+        }
+        for chunk in frames.get(1..).unwrap_or_default() {
+            if super::frame::parse_header(chunk)?.kind != FrameKind::Chunk {
+                return Err(malformed());
+            }
+        }
+        self.close_block()?;
+        let frame = self.next_frame()?;
+        let before = self.offset;
+        for bytes in frames {
+            self.put_frame(bytes)?;
+        }
+        self.note_key(key, value_len);
+        Ok(FrameRef {
+            frame,
+            index: 0,
+            stored: self.stored_since(before),
+        })
+    }
+
+    /// The bytes written since the offset was `before`: what the frames of
+    /// one value take.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a frame never stores more than its raw bytes, so one value takes at most \
+                  the 256 MiB cap plus its frames' headers"
+    )]
+    fn stored_since(&self, before: u64) -> crate::blob_tree::handle::Stored {
+        crate::blob_tree::handle::Stored::Frames((self.offset - before) as u32)
+    }
+
+    /// Writes the pending block, the frame index and the metadata, and returns
+    /// the metadata, the file's checksum and its frame index: where each frame
+    /// starts, then where the data ends.
+    ///
+    /// # Errors
+    ///
+    /// Any IO error.
+    pub(crate) fn finish(mut self) -> crate::Result<(Metadata, Checksum, alloc::sync::Arc<[u64]>)> {
+        self.close_block()?;
+
+        self.writer.start("frames")?;
+        let index = encode_frame_index(&self.frames, self.offset);
+        self.writer.write_all(&index)?;
+        self.frames.push(self.offset);
+        let frames: alloc::sync::Arc<[u64]> = core::mem::take(&mut self.frames).into();
+
         self.writer.start("meta")?;
 
         // Write metadata
         let metadata = Metadata {
             id: self.blob_file_id,
             version: META_VERSION,
-            created_at: self
-                .created_at
-                .unwrap_or_else(|| crate::time::now_on(self.clock.as_ref()).as_nanos()),
+            created_at: crate::time::now_on(self.clock.as_ref()).as_nanos(),
             item_count: self.item_count,
             total_compressed_bytes: self.written_blob_bytes,
             total_uncompressed_bytes: self.uncompressed_bytes,
+            block_entry_bytes: self.block_entry_bytes,
+            block_frame_bytes: self.block_frame_bytes,
             #[expect(clippy::expect_used, reason = "should have written at least 1 item")]
             key_range: KeyRange::new((
                 self.first_key
@@ -665,12 +757,9 @@ impl Writer {
                     .expect("should have written at least 1 item"),
                 UserKey::from(self.last_key.as_slice()),
             )),
-            // Record the override (relocation passthrough) when set, so a
-            // reopened reader sees the real codec of the already-compressed
-            // bytes; otherwise record this writer's own compression.
-            compression: self
-                .metadata_compression_override
-                .unwrap_or(self.compression),
+            // The codec every frame of the file is under: the writer's own,
+            // which verbatim frames written into it share.
+            compression: self.compression,
             lifetime_class: self.lifetime_class,
         };
         metadata.encode_into(&mut self.writer)?;
@@ -683,9 +772,15 @@ impl Writer {
         }
         let checksum = checksum.checksum();
 
-        Ok((metadata, checksum))
+        Ok((metadata, checksum, frames))
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    reason = "test code: fixture files are small enough for every cast"
+)]
 mod tests;

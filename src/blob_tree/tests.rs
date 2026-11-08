@@ -184,17 +184,26 @@ fn a_scan_not_caching_reads_ahead_into_its_own_store() -> crate::Result<()> {
 fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
     let vhandle = ValueHandle {
         blob_file_id: 3,
-        offset: 128,
-        on_disk_size: 40,
+        frame: 12,
+        index: 0,
     };
-    let indirection = BlobIndirection { vhandle, size: 32 };
+    let indirection = BlobIndirection {
+        vhandle,
+        size: 5,
+        stored: crate::blob_tree::handle::Stored::Frames(5),
+    };
     let mut store = crate::vlog::Prefetched::default();
-    store.hold(b"k", &vhandle, crate::UserValue::from(b"value".as_slice()));
+    store.hold(
+        vhandle.frame_at(),
+        Arc::new(crate::vlog::blob_file::frame::decoded_frame(&[(
+            b"k", b"value",
+        )])),
+    );
 
     let damaged = |value_type| InternalValue::from_components("k", vec![0xff_u8; 3], 0, value_type);
     for value_type in [crate::ValueType::Indirection, crate::ValueType::CellRow] {
         assert!(
-            take_prefetched(&mut store, &damaged(value_type)).is_empty(),
+            take_prefetched(&store, &damaged(value_type)).is_empty(),
             "{value_type:?} that does not decode takes nothing"
         );
     }
@@ -206,13 +215,22 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
         0,
         crate::ValueType::Indirection,
     );
-    let taken = take_prefetched(&mut store, &row);
+    let taken = take_prefetched(&store, &row);
     let [(handle, value)] = taken.as_slice() else {
         panic!("one value taken, got {}", taken.len());
     };
     assert_eq!(*handle, vhandle);
     assert_eq!(&**value, b"value");
-    assert!(store.is_empty(), "taken out, not copied");
+
+    // The frame lists its key: a row of another key naming the same place
+    // takes nothing out of it.
+    let other = InternalValue::from_components(
+        "other",
+        indirection.encode_into_vec(),
+        0,
+        crate::ValueType::Indirection,
+    );
+    assert_eq!(take_prefetched(&store, &other), Vec::new());
 }
 
 /// A scan that does not cache hands each guard the values read ahead for it.
@@ -287,10 +305,11 @@ fn a_dangling_indirection_resolves_to_an_error() -> crate::Result<()> {
     let dangling = BlobIndirection {
         vhandle: ValueHandle {
             blob_file_id: 999,
-            offset: 0,
-            on_disk_size: 10,
+            frame: 0,
+            index: 0,
         },
         size: 10,
+        stored: crate::blob_tree::handle::Stored::Frames(10),
     };
     let item = InternalValue::from_components(
         "k",

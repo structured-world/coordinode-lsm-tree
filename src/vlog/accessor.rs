@@ -5,54 +5,67 @@
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
 use crate::{
-    Cache, GlobalTableId, TreeId, UserValue,
+    BlobFile, Cache, GlobalTableId, TreeId, UserValue,
+    cache::BlobFrameAt,
     config::BlobCacheFill,
     version::BlobFileList,
-    vlog::{ValueHandle, blob_file::reader::Reader},
+    vlog::{
+        ValueHandle,
+        blob_file::{
+            frame::{DecodedFrame, FrameKind},
+            reader::{Reader, assemble, check_key, chunk_frames, covering_chunks, value_in},
+        },
+    },
 };
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{string::ToString, vec::Vec};
+use alloc::vec::Vec;
+use core::ops::Range;
 
-/// Values a read fetched ahead for itself, held by that read instead of the
+/// Frames a read fetched ahead for itself, held by that read instead of the
 /// shared cache: what a scan reads ahead when blob values are not cached.
 ///
-/// Kept by place in the blob files, with the key and the declared on-disk size
-/// each was read for, so a handle taking one out is proven to be the handle it
-/// was read for, as a cache lookup proves it.
+/// Kept by place, file and frame number, as the cache keeps them; a value is
+/// taken out of one only for the key its frame lists at the handle's index.
 #[derive(Default)]
 pub(crate) struct Prefetched {
-    values: crate::HashMap<(crate::vlog::BlobFileId, u64), (crate::UserKey, u32, UserValue)>,
+    frames: crate::HashMap<BlobFrameAt, Arc<DecodedFrame>>,
 }
 
 impl Prefetched {
-    /// Takes out the value read ahead for `vhandle` under `key`, if any.
-    pub(crate) fn take(&mut self, key: &[u8], vhandle: &ValueHandle) -> Option<UserValue> {
-        let place = (vhandle.blob_file_id, vhandle.offset);
-        match self.values.get(&place) {
-            Some((read_key, size, _)) if &**read_key == key && *size == vhandle.on_disk_size => {
-                self.values.remove(&place).map(|(_, _, value)| value)
-            }
-            _ => None,
+    /// The value read ahead for `vhandle` under `key`, if its frame was: a
+    /// view into the frame, which stays for the other values it holds.
+    pub(crate) fn get(&self, key: &[u8], vhandle: &ValueHandle) -> Option<UserValue> {
+        let frame = self.frames.get(&vhandle.frame_at())?;
+        if frame.header.kind == FrameKind::Head {
+            return None;
         }
+        value_in(frame, vhandle.index, key).ok()
     }
 
     /// Whether it holds nothing.
     pub(crate) fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.frames.is_empty()
     }
 
-    /// Drops what it holds.
-    pub(crate) fn clear(&mut self) {
-        self.values.clear();
+    /// Keeps only the frames the values `items` name lie in: a read that
+    /// holds its store across batches keeps a block the next batch shares and
+    /// lets the rest go, so the store stays one read's worth.
+    pub(crate) fn retain_for(&mut self, items: &[(&[u8], ValueHandle, usize)]) {
+        if self.frames.is_empty() {
+            return;
+        }
+        self.frames.retain(|at, _| {
+            items
+                .iter()
+                .any(|(_, vhandle, _)| vhandle.frame_at() == *at)
+        });
     }
 
-    /// Holds `value` as read ahead for `vhandle` under `key`.
+    /// Holds `frame` as read ahead at `at`.
     #[cfg(test)]
-    pub(crate) fn hold(&mut self, key: &[u8], vhandle: &ValueHandle, value: UserValue) {
-        self.values.insert(
-            (vhandle.blob_file_id, vhandle.offset),
-            (crate::UserKey::from(key), vhandle.on_disk_size, value),
-        );
+    pub(crate) fn hold(&mut self, at: BlobFrameAt, frame: Arc<DecodedFrame>) {
+        self.frames.insert(at, frame);
     }
 }
 
@@ -71,7 +84,7 @@ pub(crate) enum PrefetchInto<'p> {
 /// hold.
 pub(crate) struct Accessor<'a> {
     blob_files: &'a BlobFileList,
-    /// Whether the values this accessor reads from disk go into the cache.
+    /// Whether the frames this accessor reads from disk go into the cache.
     fill: BlobCacheFill,
     /// Where this accessor's reads are counted. A blob read is a read of the
     /// filesystem like any other, so it lands in the same `bytes_read` /
@@ -96,7 +109,7 @@ impl<'a> Accessor<'a> {
         }
     }
 
-    /// Records one read request issued to the filesystem for blob records,
+    /// Records one read request issued to the filesystem for blob frames,
     /// covering `on_disk` bytes.
     #[cfg_attr(
         not(feature = "metrics"),
@@ -118,7 +131,7 @@ impl<'a> Accessor<'a> {
         }
     }
 
-    /// Records what came out of one record's validation and decompression.
+    /// Records what came out of one frame's check and decompression.
     #[cfg_attr(
         not(feature = "metrics"),
         expect(
@@ -138,107 +151,6 @@ impl<'a> Accessor<'a> {
         }
     }
 
-    /// Reads one separated value.
-    ///
-    /// The blob file is reopened from the path it was RECOVERED under, so no
-    /// caller supplies a base directory: a file can legitimately sit under a
-    /// noncanonical spelling of its own id (`blobs/00` for id 0), and a path
-    /// rebuilt from the id would miss it on every cache miss.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the blob file's open / read failures.
-    pub(crate) fn get(
-        &self,
-        tree_id: TreeId,
-        key: &[u8],
-        vhandle: &ValueHandle,
-        cache: &Cache,
-    ) -> crate::Result<Option<UserValue>> {
-        if let Some(value) = cache.get_blob(tree_id, vhandle, key) {
-            return Ok(Some(value));
-        }
-
-        let Some(blob_file) = self.blob_files.get(vhandle.blob_file_id) else {
-            return Ok(None);
-        };
-
-        let lead = match cache.claim_blob(tree_id, vhandle, key) {
-            crate::cache::BlobClaim::Shared(value) => {
-                #[cfg(feature = "metrics")]
-                if let Some(metrics) = self.metrics {
-                    metrics
-                        .blob_load_shared
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                }
-                // The read that led may not cache what it reads (its policy
-                // is its own, taken when it began): one whose policy does
-                // caches the shared value itself. The position alone is
-                // checked: every value cached there passed the record check
-                // of its key and size against the record's header, so an
-                // entry at this position is for this same key and size.
-                if self.fill.fills() && !cache.contains_blob(tree_id, vhandle) {
-                    let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
-                    self.count_gather(detached);
-                }
-                return Ok(Some(value));
-            }
-            crate::cache::BlobClaim::Lead(lead) => {
-                // A read that finished between the miss above and this claim
-                // left its value in the cache, when the fill policy let it.
-                if let Some(value) = cache.get_blob(tree_id, vhandle, key) {
-                    lead.publish(cache, tree_id, vhandle, key, value.clone(), false);
-                    return Ok(Some(value));
-                }
-                Some(lead)
-            }
-            crate::cache::BlobClaim::Alone => None,
-        };
-
-        let timer = crate::cache::Cache::time_load();
-        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
-
-        let (file, _) = blob_file
-            .file_accessor()
-            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
-
-        let reader = Reader::new(blob_file, file.as_ref());
-
-        // Charged before the read is issued, as a block read is: a request the
-        // filesystem then fails, or whose bytes then fail their checksum or
-        // decompression, was still asked of it.
-        let len = crate::vlog::blob_file::reader::record_len(key.len(), vhandle)?;
-        self.count_request(len);
-        let record = reader.read_record(vhandle, len)?;
-        // Charged before the result is judged, like the read above: a record
-        // refused after decompression was still decompressed.
-        let mut decoded = 0;
-        let parsed = reader.parse_record(key, vhandle, &record, &mut decoded);
-        self.count_decoded(decoded);
-        let value = parsed?;
-        cache.record_blob_load(tree_id, vhandle, timer);
-        match lead {
-            Some(lead) => {
-                let detached = lead.publish(
-                    cache,
-                    tree_id,
-                    vhandle,
-                    key,
-                    value.clone(),
-                    self.fill.fills(),
-                );
-                self.count_gather(detached);
-            }
-            None if self.fill.fills() => {
-                let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
-                self.count_gather(detached);
-            }
-            None => {}
-        }
-
-        Ok(Some(value))
-    }
-
     /// Records a gather this accessor performed on a read's behalf.
     #[cfg_attr(
         not(feature = "metrics"),
@@ -256,33 +168,182 @@ impl<'a> Accessor<'a> {
         }
     }
 
-    /// Warms the cache with a run of upcoming separated values, coalescing
-    /// adjacent records into as few reads as possible.
+    /// Frame `frame` of `blob_file`, from the cache or read and decoded now:
+    /// concurrent misses of one frame share one read.
     ///
-    /// A scan resolves one value per [`get`](Self::get), and each of those is
-    /// its own read of a few hundred bytes. Values land in the blob file in the
-    /// order the flush wrote them, which is key order, so a scan's next handles
-    /// are usually its immediate on-disk neighbours: reading the whole run at
-    /// once turns that stream of small reads into a handful of large ones.
+    /// The blob file is reopened from the path it was RECOVERED under, so no
+    /// caller supplies a base directory: a file can legitimately sit under a
+    /// noncanonical spelling of its own id (`blobs/00` for id 0), and a path
+    /// rebuilt from the id would miss it on every cache miss.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the blob file's open / read failures and a frame that does
+    /// not check.
+    pub(crate) fn frame(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        frame: u32,
+        cache: &Cache,
+    ) -> crate::Result<Arc<DecodedFrame>> {
+        let at = BlobFrameAt {
+            blob_file_id: blob_file.id(),
+            frame,
+        };
+        if let Some(cached) = cache.get_blob_frame(tree_id, at) {
+            return Ok(cached);
+        }
+        let lead = match cache.claim_blob_frame(tree_id, at) {
+            crate::cache::BlobClaim::Shared(shared) => {
+                #[cfg(feature = "metrics")]
+                if let Some(metrics) = self.metrics {
+                    metrics
+                        .blob_load_shared
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                // The read that led may not cache what it reads (its policy
+                // is its own, taken when it began): one whose policy does
+                // caches the shared frame itself.
+                if self.fill.fills() && !cache.contains_blob_frame(tree_id, at) {
+                    cache.insert_blob_frame(tree_id, at, Arc::clone(&shared));
+                }
+                return Ok(shared);
+            }
+            crate::cache::BlobClaim::Lead(lead) => {
+                // A read that finished between the miss above and this claim
+                // left its frame in the cache, when the fill policy let it.
+                if let Some(cached) = cache.get_blob_frame(tree_id, at) {
+                    lead.publish(cache, tree_id, at, &cached, false);
+                    return Ok(cached);
+                }
+                Some(lead)
+            }
+            crate::cache::BlobClaim::Alone => None,
+        };
+
+        let timer = crate::cache::Cache::time_load();
+        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
+        let (file, _) = blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
+        let reader = Reader::new(blob_file, file.as_ref());
+
+        // Charged before the read is issued, as a block read is: a request the
+        // filesystem then fails, or whose bytes then fail their checksum or
+        // decompression, was still asked of it.
+        let (_, len) = Reader::frame_span(blob_file, frame)?;
+        self.count_request(len);
+        let bytes = reader.read_frame_bytes(frame)?;
+        // Charged before the result is judged, like the read above: a frame
+        // refused after decompression was still decompressed.
+        let mut decoded = 0;
+        let parsed = Reader::decode(blob_file, &bytes, &mut decoded);
+        self.count_decoded(decoded);
+        let frame = Arc::new(parsed?);
+        cache.record_blob_load(tree_id, at, timer);
+        match lead {
+            Some(lead) => lead.publish(cache, tree_id, at, &frame, self.fill.fills()),
+            None if self.fill.fills() => cache.insert_blob_frame(tree_id, at, Arc::clone(&frame)),
+            None => {}
+        }
+        Ok(frame)
+    }
+
+    /// Reads one separated value whole.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the blob file's open / read failures, a frame that does not
+    /// check, and a handle that names another key's value.
+    pub(crate) fn get(
+        &self,
+        tree_id: TreeId,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        cache: &Cache,
+    ) -> crate::Result<Option<UserValue>> {
+        self.read(tree_id, key, vhandle, None, cache)
+    }
+
+    /// Reads bytes `range` of one separated value: of a chunked value, only
+    /// the chunks the range covers are read.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::ValueRange`] for a range outside the value, and as
+    /// [`Self::get`].
+    pub(crate) fn get_range(
+        &self,
+        tree_id: TreeId,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        range: Range<u64>,
+        cache: &Cache,
+    ) -> crate::Result<Option<UserValue>> {
+        self.read(tree_id, key, vhandle, Some(range), cache)
+    }
+
+    fn read(
+        &self,
+        tree_id: TreeId,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        range: Option<Range<u64>>,
+        cache: &Cache,
+    ) -> crate::Result<Option<UserValue>> {
+        let Some(blob_file) = self.blob_files.get(vhandle.blob_file_id) else {
+            return Ok(None);
+        };
+        let first = self.frame(tree_id, blob_file, vhandle.frame, cache)?;
+        if first.header.kind != FrameKind::Head {
+            let value = value_in(&first, vhandle.index, key)?;
+            return Ok(Some(match range {
+                None => value,
+                Some(range) => slice_range(&value, &range)?,
+            }));
+        }
+        check_key(&first, vhandle.index, key)?;
+        let total = first.list.first().map_or(0, |e| u64::from(e.value_len));
+        let range = range.unwrap_or(0..total);
+        check_range(&range, total)?;
+        let all = chunk_frames(&first, vhandle.frame)?;
+        let (covered, _) = covering_chunks(&first, &range)?;
+        let mut chunks = Vec::with_capacity((covered.end - covered.start) as usize);
+        for at in covered {
+            let frame = all
+                .start
+                .checked_add(at)
+                .ok_or(crate::Error::InvalidHeader("Blob"))?;
+            chunks.push(self.frame(tree_id, blob_file, frame, cache)?);
+        }
+        let value = assemble(&first, &chunks, Some(&range))?;
+        self.count_gather(value.len());
+        Ok(Some(value))
+    }
+
+    /// Warms the cache, or the read's own store, with the frames a run of
+    /// upcoming separated values lie in, coalescing frames close together
+    /// into as few reads as possible.
+    ///
+    /// A scan resolves one value per [`get`](Self::get). Values land in the
+    /// blob file in the order the flush wrote them, which is key order, so a
+    /// scan's next handles are usually in the same block or the next frames:
+    /// reading them at once turns a stream of small reads into a few large
+    /// ones.
     ///
     /// Purely an I/O optimization, and best-effort in both directions: it never
-    /// changes which bytes [`get`](Self::get) returns (the same
-    /// [`parse_record`](crate::vlog::blob_file::reader::Reader::parse_record)
-    /// validates either path), and any failure here is dropped so the read walk
-    /// handles that value authoritatively, including reporting its corruption.
+    /// changes which bytes [`get`](Self::get) returns (the same check
+    /// validates either path), and any failure here is dropped so the read
+    /// walk handles that value authoritatively, including reporting its
+    /// corruption.
     ///
     /// `items` is `(key, handle, _)` in scan order, and is CONSUMED as the
-    /// working buffer: it is filtered and sorted in place, and its third field
-    /// filled with each record's length, so one window costs the caller's
-    /// single allocation and nothing per record.
+    /// working buffer: it is filtered and sorted in place.
     ///
-    /// `max_gap` is how many wasted bytes between two records are worth
+    /// `max_gap` is how many wasted bytes between two frames are worth
     /// swallowing to merge their reads; `max_read` caps a single coalesced
     /// read.
-    ///
-    /// `into` says where the values go: the shared cache, or the read's own
-    /// store when blob values are not cached, which then holds at most one
-    /// coalesced read's worth.
     pub(crate) fn prefetch(
         &self,
         tree_id: TreeId,
@@ -303,101 +364,66 @@ impl<'a> Accessor<'a> {
             return;
         }
 
-        // Keep the cold records: anything already cached needs no read, and
-        // letting it anchor a span would widen the read for no gain. The record
-        // length is computed once here and carried, so the span walk below and
-        // the parse both use the one definition without recomputing it.
-        //
-        // This is a pre-filter on the records, not the read budget. What is
-        // actually read is a span's EXTENT, which also covers the gaps merged
-        // into it, so the budget that bounds the I/O is applied per span below.
-        // Nor is it the admission budget: a compressed blob file stores less
-        // than the cache will charge for the decoded value, so that is enforced
-        // separately in `warm_span` against the weight the cache sees.
-        let mut record_bytes: u64 = 0;
-        let mut full = false;
-        items.retain_mut(|(key, vhandle, len)| {
-            if full || cache.contains_blob(tree_id, vhandle) {
-                return false;
-            }
-            let Ok(record) = crate::vlog::blob_file::reader::record_len(key.len(), vhandle) else {
-                return false;
+        // One entry per frame to read: frames already held need no read, and
+        // the values of one block share their frame.
+        items.retain(|(_, vhandle, _)| {
+            let held = match &into {
+                PrefetchInto::Cache => cache.contains_blob_frame(tree_id, vhandle.frame_at()),
+                PrefetchInto::Local(store) => store.frames.contains_key(&vhandle.frame_at()),
             };
-            // Checked BEFORE keeping, so the record that fills the budget is
-            // dropped rather than admitted whole on top of it. Plain add: a
-            // window holds at most `u16::MAX` records and `record_len` caps
-            // each at the 256 MiB value limit plus its header, so the running
-            // total cannot approach `u64::MAX`.
-            if record_bytes + record as u64 > half {
-                full = true;
-                return false;
-            }
-            record_bytes += record as u64;
-            *len = record;
-            true
+            !held && self.blob_files.get(vhandle.blob_file_id).is_some()
         });
-
-        // A single cold record is exactly what `get` already does well; the
-        // prefetch only earns its keep by merging two or more.
-        if items.len() < 2 {
-            return;
-        }
-
-        // Group by blob file, then by offset: records reach us in key order,
-        // which is on-disk order within ONE file, but a run can straddle files
-        // (a compaction rewrote part of the range) and those interleave.
-        //
-        // Checked before sorting because the ordered case is the common one (a
-        // window that stays inside one blob file arrives already grouped), and
-        // proving it costs one linear pass against the sort's n log n.
         let key =
-            |(_, vhandle, _): &(&[u8], ValueHandle, usize)| (vhandle.blob_file_id, vhandle.offset);
+            |(_, vhandle, _): &(&[u8], ValueHandle, usize)| (vhandle.blob_file_id, vhandle.frame);
         if !items.is_sorted_by_key(key) {
             items.sort_unstable_by_key(key);
         }
+        // Whether each frame serves more than one value: read once ahead, a
+        // block several values share spares each of them a read of it.
+        let mut shared: Vec<bool> = Vec::with_capacity(items.len());
+        let mut prev = None;
+        for item in items.iter() {
+            let at = key(item);
+            if prev == Some(at) {
+                if let Some(last) = shared.last_mut() {
+                    *last = true;
+                }
+            } else {
+                shared.push(false);
+            }
+            prev = Some(at);
+        }
+        items.dedup_by_key(|item| key(item));
+        // A single cold frame of one value is exactly what `get` already does
+        // well; the prefetch earns its keep by merging two or more frames, or
+        // by reading once a frame several values share.
+        if items.len() < 2 && !shared.contains(&true) {
+            return;
+        }
 
-        // Two budgets, because the two costs are different. `read_budget` is
-        // the I/O: what a span costs is its EXTENT, gaps included, not the sum
-        // of its records, and merging through a gap is exactly what buys the
-        // speedup. `admit_budget` is the cache weight, which for a compressed
-        // file is a different number again. Each bounds the prefetch at half
-        // the cache.
+        // Spans of frames close together in one file, bounded by the read
+        // budget, the extent counted with its gaps.
         let mut read_budget = half;
-
-        // Every span of the window is found first and then read in one batch,
-        // so they overlap in flight instead of going out one after another.
         let mut spans: Vec<Span> = Vec::new();
-        let mut start = 0;
-        while start < items.len() && read_budget > 0 {
-            #[expect(clippy::indexing_slicing, reason = "start < items.len() by the loop")]
-            let (_, first, _) = items[start];
-
-            // The span may not reach past what is left of the read budget, so a
-            // run of small records with wide gaps cannot turn into a read the
-            // budget never sanctioned.
-            let Some((end, span_end)) =
-                span_extent(items, start, max_gap, max_read as u64, read_budget)
+        let mut at = 0;
+        while at < items.len() && read_budget > 0 {
+            let Some(span) = self.span_from(items, at, max_gap, max_read as u64, read_budget)
             else {
-                start += 1;
+                at += 1;
                 continue;
             };
-
-            if end - start >= 2 {
-                // `span_extent` bounds the extent by `reach`, so it fits.
-                debug_assert!(span_end - first.offset <= read_budget);
-                read_budget -= span_end - first.offset;
-                spans.push(Span {
-                    records: start..end,
-                    start: first.offset,
-                    end: span_end,
-                });
+            let serves_many = span.frames.end - span.frames.start >= 2
+                || shared.get(span.frames.start).copied().unwrap_or(false);
+            at = span.frames.end;
+            if serves_many {
+                read_budget -= span.end - span.start;
+                spans.push(span);
             }
-            start = end;
         }
         // The spans go out in batches of at most one coalesced read's worth of
-        // extent, so the buffers held at once are what one read held before
-        // the spans were batched; a window within that (the usual one) is one
-        // batch. A batch is read only while the admission budget lasts.
+        // extent, so the buffers held at once are what one read holds; a
+        // window within that (the usual one) is one batch. A batch is read
+        // only while the admission budget lasts.
         let mut admit_budget = half;
         let mut start = 0;
         while start < spans.len() && admit_budget > 0 {
@@ -418,15 +444,27 @@ impl<'a> Accessor<'a> {
         }
     }
 
+    /// [`span_extent`] over the frames this accessor's blob files place.
+    fn span_from(
+        &self,
+        items: &[(&[u8], ValueHandle, usize)],
+        start: usize,
+        max_gap: u64,
+        max_read: u64,
+        read_budget: u64,
+    ) -> Option<Span> {
+        span_extent(items, start, max_gap, max_read, read_budget, |vhandle| {
+            self.blob_files
+                .get(vhandle.blob_file_id)?
+                .frame_span(vhandle.frame)
+        })
+    }
+
     /// Reads every one of `spans` of `items` in one batched call per
-    /// filesystem (a window's blob files are normally all one backend's), then
-    /// parses the records each covers into the cache, or into the read's own
-    /// store, in span order. A span whose file will not open or whose read
-    /// fails stays cold, and the read walk fetches its values normally.
-    ///
-    /// `admit_budget` is how many bytes this prefetch may still hand over,
-    /// spent by what each value actually weighs; the walk stops when it runs
-    /// out.
+    /// filesystem (a window's blob files are normally all one backend's),
+    /// then decodes the frames each covers into the cache, or into the read's
+    /// own store, in span order. A span whose file will not open or whose
+    /// read fails stays cold, and the read walk fetches its values itself.
     fn warm_spans(
         &self,
         tree_id: TreeId,
@@ -437,18 +475,17 @@ impl<'a> Accessor<'a> {
         admit_budget: &mut u64,
     ) {
         /// One span's read: its span, its blob file and the open file, and
-        /// the buffer its extent is read into, which the span's values go on
-        /// to share, `None` when the read fails.
+        /// the buffer its extent is read into, `None` when the read fails.
         struct SpanRead<'b> {
             span: usize,
-            blob_file: &'b crate::vlog::BlobFile,
-            file: alloc::sync::Arc<dyn crate::fs::FsFile>,
+            blob_file: &'b BlobFile,
+            file: Arc<dyn crate::fs::FsFile>,
             buf: Option<crate::fs::QueuedBuf>,
         }
 
         let mut reads: Vec<SpanRead<'_>> = Vec::with_capacity(spans.len());
         for (at, span) in spans.iter().enumerate() {
-            let Some((_, first, _)) = items.get(span.records.start) else {
+            let Some((_, first, _)) = items.get(span.frames.start) else {
                 continue;
             };
             let Some(blob_file) = self.blob_files.get(first.blob_file_id) else {
@@ -461,19 +498,12 @@ impl<'a> Accessor<'a> {
             else {
                 continue;
             };
-            // `end` was built as the maximum record end in the span, and every
-            // one of those is at or past `start` (the span's own first offset,
-            // in a slice sorted by offset), so the extent is never negative.
-            debug_assert!(span.end >= span.start);
             let Ok(len) = usize::try_from(span.end - span.start) else {
                 continue;
             };
             // The whole extent, gaps included: that is what is asked of the
-            // filesystem, and swallowing a gap to merge two reads is the point
-            // of the coalescing, so charging only the records would hide its
-            // cost. Charged before the read is issued, so a read the
-            // filesystem then fails is counted, and whether or not every
-            // record it covers is then parsed.
+            // filesystem. Charged before the read is issued, so a read the
+            // filesystem then fails is counted.
             self.count_request(len);
             #[cfg(feature = "metrics")]
             if let Some(metrics) = self.metrics {
@@ -492,17 +522,11 @@ impl<'a> Accessor<'a> {
         // One batched call per filesystem, taking its spans in window order.
         let mut issued = alloc::vec![false; reads.len()];
         while let Some(lead) = issued.iter().position(|issued| !issued) {
-            let Some(fs) = reads
-                .get(lead)
-                .map(|read| alloc::sync::Arc::clone(&read.blob_file.0.fs))
-            else {
+            let Some(fs) = reads.get(lead).map(|read| Arc::clone(&read.blob_file.0.fs)) else {
                 break;
             };
             let on_fs = |read: &SpanRead<'_>| {
-                core::ptr::addr_eq(
-                    alloc::sync::Arc::as_ptr(&read.blob_file.0.fs),
-                    alloc::sync::Arc::as_ptr(&fs),
-                )
+                core::ptr::addr_eq(Arc::as_ptr(&read.blob_file.0.fs), Arc::as_ptr(&fs))
             };
             // In ascending order, so membership is a binary search.
             let group: Vec<usize> = reads
@@ -565,22 +589,18 @@ impl<'a> Accessor<'a> {
             if *admit_budget == 0 {
                 return;
             }
-            let (Some(span), Some(buf)) = (
+            let (Some(span), Some(bytes)) = (
                 spans.get(read.span),
                 read.buf.and_then(crate::fs::QueuedBuf::into_slice),
             ) else {
                 continue;
             };
-            let Some(records) = items.get(span.records.clone()) else {
-                continue;
-            };
             self.admit_span(
                 tree_id,
-                records,
-                span.start,
-                &buf,
+                items,
+                span,
+                &bytes,
                 read.blob_file,
-                read.file.as_ref(),
                 cache,
                 into,
                 admit_budget,
@@ -588,185 +608,186 @@ impl<'a> Accessor<'a> {
         }
     }
 
-    /// Parses every record of `records`, a span read from `span_start` into
-    /// `span`, into the cache or the read's own store, spending
-    /// `admit_budget` by each value's weight and stopping when it runs out.
+    /// Decodes every frame of `span`, read into `bytes`, into the cache or the
+    /// read's own store, spending `admit_budget` by what each frame weighs and
+    /// stopping when it runs out.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one span: its records and bytes, its file, and where its values go under which budget"
+        reason = "one span: its frames and bytes, its file, and where its frames go under which budget"
     )]
     fn admit_span(
         &self,
         tree_id: TreeId,
-        records: &[(&[u8], ValueHandle, usize)],
-        span_start: u64,
-        span: &crate::Slice,
-        blob_file: &crate::vlog::BlobFile,
-        file: &dyn crate::fs::FsFile,
+        items: &[(&[u8], ValueHandle, usize)],
+        span: &Span,
+        bytes: &crate::Slice,
+        blob_file: &BlobFile,
         cache: &Cache,
         into: &mut PrefetchInto<'_>,
         admit_budget: &mut u64,
     ) {
-        let reader = Reader::new(blob_file, file);
-
-        // An uncompressed value is returned as a VIEW into the buffer it was
-        // parsed from, here the whole coalesced read. Handed on as it is, every
-        // value would pin that read for as long as anyone holds it: the cache
-        // until the last of the window is evicted, a scan's caller for as long
-        // as it keeps the value. So such a value is copied out, once it is
-        // known to be handed on, and then owns exactly its own bytes, as on the
-        // one-record read path. The compressed paths decompress into a fresh
-        // buffer already, so there the span is dropped with this function and
-        // copying would be pure waste.
-        let aliases_span = matches!(blob_file.0.meta.compression, crate::CompressionType::None);
-
-        for &(key, vhandle, len) in records {
+        for (_, vhandle, _) in items.get(span.frames.clone()).unwrap_or_default() {
             if *admit_budget == 0 {
                 return;
             }
-            // Every record in the span is at or past its start: the slice is
-            // sorted by offset and `span_start` is its first one.
-            debug_assert!(vhandle.offset >= span_start);
-            let Ok(rel) = usize::try_from(vhandle.offset - span_start) else {
+            let Some((start, end)) = blob_file.frame_span(vhandle.frame) else {
                 continue;
             };
-            let Some(record_end) = rel.checked_add(len) else {
+            let (Ok(from), Ok(to)) = (
+                usize::try_from(start - span.start),
+                usize::try_from(end - span.start),
+            ) else {
                 continue;
             };
-            if record_end > span.len() {
+            if to > bytes.len() {
                 continue;
             }
-            let record = span.slice(rel..record_end);
-            // Decoded only: the span's bytes were charged once above. Charged
-            // whether or not the record is then accepted.
             let mut decoded = 0;
-            let parsed = reader.parse_record(key, &vhandle, &record, &mut decoded);
+            let parsed = Reader::decode(blob_file, &bytes.slice(from..to), &mut decoded);
             self.count_decoded(decoded);
-            if let Ok(value) = parsed {
-                // Checked BEFORE inserting, against the full weight the cache
-                // charges (key as well as value), and against the DECODED
-                // length rather than the on-disk one: a compressed blob file
-                // stores less than the cache accounts for, so budgeting on
-                // what was read would admit several times the capacity from
-                // one window and evict everything else to hold values the scan
-                // has not reached yet. Deducting after the fact would let the
-                // last value of a window exceed the bound by its own size.
-                let weight = (key.len() + value.len()) as u64;
-                // A value heavier than one cache shard can never stay
-                // resident (the cache refuses it), so inserting it would
-                // spend admission budget on nothing. Skip it and keep
-                // warming the span's other records.
-                if matches!(into, PrefetchInto::Cache) && weight > cache.max_entry_weight() {
-                    continue;
-                }
-                if weight > *admit_budget {
-                    *admit_budget = 0;
-                    return;
-                }
-                *admit_budget -= weight;
-                let value = if aliases_span {
-                    // A copy out of the span: charged as the gather it is.
-                    self.count_gather(value.len());
-                    UserValue::new(&value)
-                } else {
-                    value
-                };
-                match into {
-                    PrefetchInto::Cache => {
-                        let detached = cache.insert_blob(tree_id, &vhandle, key, value);
-                        self.count_gather(detached);
-                    }
-                    PrefetchInto::Local(store) => {
-                        // The key goes with the value as the cache keeps it:
-                        // a copy, charged as the gather it is.
-                        self.count_gather(key.len());
-                        store.values.insert(
-                            (vhandle.blob_file_id, vhandle.offset),
-                            (crate::UserKey::from(key), vhandle.on_disk_size, value),
-                        );
-                    }
+            let Ok(frame) = parsed else {
+                continue;
+            };
+            // Checked BEFORE inserting, against the weight the cache charges:
+            // the decoded frame, not what was read.
+            let weight = frame.weight();
+            if matches!(into, PrefetchInto::Cache) && weight > cache.max_entry_weight() {
+                continue;
+            }
+            if weight > *admit_budget {
+                *admit_budget = 0;
+                return;
+            }
+            *admit_budget -= weight;
+            // A frame decoded as stored is a view into the coalesced read;
+            // copied out so it does not keep the whole read alive, unless the
+            // read is that frame alone.
+            let frame = if from == 0 && to == bytes.len() {
+                frame
+            } else {
+                let (frame, copied) = own_frame(frame, blob_file.compression());
+                self.count_gather(copied);
+                frame
+            };
+            let frame = Arc::new(frame);
+            let at = vhandle.frame_at();
+            match into {
+                PrefetchInto::Cache => cache.insert_blob_frame(tree_id, at, frame),
+                PrefetchInto::Local(store) => {
+                    store.frames.insert(at, frame);
                 }
             }
         }
     }
 }
 
-/// One coalesced read of a window: the records it covers, by their places in
-/// the window, and the extent of the blob file it reads, gaps included.
-struct Span {
-    records: core::ops::Range<usize>,
-    start: u64,
-    end: u64,
-}
-
-/// How far one coalesced span reaches, starting at `items[start]`.
-///
-/// Returns the exclusive end index and the span's end offset, or `None` when
-/// the first record's own end does not fit a `u64`.
-///
-/// A span grows while the next record is in the same blob file, starts within
-/// `max_gap` of what the span already covers, and leaves the whole extent
-/// within BOTH bounds: `max_read`, the cap on any single read, and
-/// `read_budget`, what is left of this prefetch's I/O allowance.
-///
-/// The extent is what a caller actually reads, GAPS INCLUDED. Merging through a
-/// gap is the point, but it means the read is wider than the records in it, so
-/// both bounds have to be applied to the extent. Bounding the record bytes
-/// instead would let a run of small records with wide gaps read many times what
-/// the budget allowed.
-///
-/// Offsets come from a `BlobIndirection` decoded out of an SST value, so they
-/// are on-disk data: `record_len` bounds a record's length, but nothing bounds
-/// where it claims to start. An end that does not fit a `u64` is a handle no
-/// writer produced, and is rejected rather than clamped. Clamping would be
-/// worse than wrong here: a saturated `span_end + max_gap` compares as
-/// "nothing is too far away", which merges the span across a gap of any size.
-///
-/// `items` must be sorted by `(blob_file_id, offset)`.
+/// The span of frames that starts with `items[start]`'s: the following frames
+/// of the same file within `max_gap` of it, the whole extent within
+/// `max_read` and `read_budget`. `span` gives where a handle's frame lies, as
+/// its file's index places it. `None` when the first frame is not there.
 fn span_extent(
     items: &[(&[u8], ValueHandle, usize)],
     start: usize,
     max_gap: u64,
     max_read: u64,
     read_budget: u64,
-) -> Option<(usize, u64)> {
+    span: impl Fn(&ValueHandle) -> Option<(u64, u64)>,
+) -> Option<Span> {
     let reach = max_read.min(read_budget);
-    let (_, first, first_len) = *items.get(start)?;
-    let file_id = first.blob_file_id;
-
+    let (_, first, _) = items.get(start)?;
+    let (span_start, mut span_end) = span(first)?;
     let mut end = start + 1;
-    let mut span_end = first.offset.checked_add(first_len as u64)?;
-
-    // The anchor's own width counts against the bound, not just the records
-    // merged after it. Its length comes from a handle, so a corrupt one can
-    // declare a record wider than any read is allowed to be; checking only what
-    // follows would leave that width unexamined, and a later handle pointing
-    // inside the declared span would turn it into a span that gets read whole.
-    // Returning it alone leaves it to the direct read, which validates it.
-    if span_end - first.offset > reach {
-        return Some((end, span_end));
+    // The first frame alone past the bound is left to the direct read.
+    if span_end - span_start > reach {
+        return Some(Span {
+            frames: start..end,
+            start: span_start,
+            end: span_end,
+        });
     }
-
-    while let Some(&(_, next, next_len)) = items.get(end) {
-        let within_gap = span_end
-            .checked_add(max_gap)
-            .is_some_and(|reach| next.offset <= reach);
-        if next.blob_file_id != file_id || !within_gap {
+    while let Some((_, next, _)) = items.get(end) {
+        if next.blob_file_id != first.blob_file_id {
             break;
         }
-        let Some(next_end) = next.offset.checked_add(next_len as u64) else {
+        let Some((next_start, next_end)) = span(next) else {
             break;
         };
-        // Sorted by offset, so this end is at or past the span's start.
-        debug_assert!(next_end >= first.offset);
-        if next_end - first.offset > reach {
+        // An end past `u64::MAX` is a frame index no writer produced: the
+        // span stops rather than merge across a gap of any size.
+        let within_gap = span_end
+            .checked_add(max_gap)
+            .is_some_and(|reach| next_start <= reach);
+        let within_reach = next_end
+            .checked_sub(span_start)
+            .is_some_and(|extent| extent <= reach);
+        if !within_gap || !within_reach {
             break;
         }
-        span_end = span_end.max(next_end);
+        span_end = next_end;
         end += 1;
     }
+    Some(Span {
+        frames: start..end,
+        start: span_start,
+        end: span_end,
+    })
+}
 
-    Some((end, span_end))
+/// `frame`, decoded from a file under `compression`, holding its own bytes,
+/// and the bytes copied for that: a frame decoded out of a larger read is a
+/// view into it, its payload too when it is stored as it is.
+fn own_frame(frame: DecodedFrame, compression: crate::CompressionType) -> (DecodedFrame, usize) {
+    let stored_as_is = frame.header.is_raw() || compression == crate::CompressionType::None;
+    let copied = frame.entries.len() + if stored_as_is { frame.payload.len() } else { 0 };
+    let frame = DecodedFrame {
+        entries: crate::Slice::new(&frame.entries),
+        payload: if stored_as_is {
+            crate::Slice::new(&frame.payload)
+        } else {
+            frame.payload
+        },
+        ..frame
+    };
+    (frame, copied)
+}
+
+/// Checks that `range` lies within a value of `len` bytes.
+///
+/// # Errors
+///
+/// [`crate::Error::ValueRange`] when it does not.
+pub(crate) fn check_range(range: &Range<u64>, len: u64) -> crate::Result<()> {
+    if range.start > range.end || range.end > len {
+        return Err(crate::Error::ValueRange {
+            start: range.start,
+            end: range.end,
+            len,
+        });
+    }
+    Ok(())
+}
+
+/// Bytes `range` of `value`.
+///
+/// # Errors
+///
+/// [`crate::Error::ValueRange`] for a range outside the value.
+pub(crate) fn slice_range(value: &UserValue, range: &Range<u64>) -> crate::Result<UserValue> {
+    check_range(range, value.len() as u64)?;
+    // Within the value's length, which is a `usize`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by the value's length just above"
+    )]
+    Ok(value.slice(range.start as usize..range.end as usize))
+}
+
+/// One coalesced read of a window: the frames it covers, by their places in
+/// the window, and the extent of the blob file it reads, gaps included.
+struct Span {
+    frames: Range<usize>,
+    start: u64,
+    end: u64,
 }
 
 #[cfg(test)]

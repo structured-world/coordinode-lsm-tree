@@ -9,6 +9,8 @@ use lsm_tree::{
 use std::sync::Arc;
 use test_log::test;
 
+mod common;
+
 struct MyFilter;
 
 impl CompactionFilter for MyFilter {
@@ -78,12 +80,16 @@ fn compaction_filter_gc_stats_destroy() -> lsm_tree::Result<()> {
             &{
                 let mut map = lsm_tree::HashMap::default();
                 let size = other_big_value.len() as u64;
-                map.insert(0, FragmentationEntry::new(1, size, size));
+                let stored = common::stored_len(b"removethis", size);
+                map.insert(0, FragmentationEntry::new(1, size, stored));
                 map
             },
             &*gc_stats,
         );
-        assert_eq!(other_big_value.len() as u64, tree.stale_blob_bytes());
+        assert_eq!(
+            common::stored_len(b"removethis", other_big_value.len() as u64),
+            tree.stale_blob_bytes()
+        );
     }
 
     Ok(())

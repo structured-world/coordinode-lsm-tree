@@ -3,14 +3,15 @@ use crate::blob_tree::field_row::{RowCell, RowField, encode_row, row_refs};
 use crate::vlog::ValueHandle;
 use test_log::test;
 
-fn object(offset: u64) -> BlobIndirection {
+fn object(frame: u32) -> BlobIndirection {
     BlobIndirection {
         vhandle: ValueHandle {
             blob_file_id: 1,
-            offset,
-            on_disk_size: 100,
+            frame,
+            index: 0,
         },
         size: 100,
+        stored: crate::blob_tree::handle::Stored::Frames(100),
     }
 }
 
@@ -146,7 +147,7 @@ fn held_rows_keep_their_order_before_later_keys() {
 #[test]
 fn a_drop_of_the_next_key_settles_with_its_own_key() {
     let x = object(0);
-    let y = object(100);
+    let y = object(1);
     let (written, frag) = run(vec![
         Ok(cell_row("a", 2, &[(x, true)])),
         Err(cell_row("b", 4, &[(y, true)])),

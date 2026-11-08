@@ -1,6 +1,8 @@
 use lsm_tree::{AbstractTree, KvSeparationOptions, SeqNo, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
+mod common;
+
 #[test]
 fn blob_tree_ingest_relink() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -32,7 +34,8 @@ fn blob_tree_ingest_relink() -> lsm_tree::Result<()> {
         let expected = Some(vec![lsm_tree::table::writer::LinkedFile {
             blob_file_id: 0,
             bytes: big_value.len() as u64,
-            on_disk_bytes: big_value.len() as u64,
+            on_disk_bytes: common::stored_len(b"big", big_value.len() as u64),
+            block_bytes: 0,
             len: 1,
             first_key: "big".into(),
             last_key: "big".into(),

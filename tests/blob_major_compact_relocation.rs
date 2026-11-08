@@ -4,6 +4,8 @@ use lsm_tree::{
 };
 use test_log::test;
 
+mod common;
+
 #[test]
 fn blob_tree_major_compact_relocation_simple() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -68,7 +70,8 @@ fn blob_tree_major_compact_relocation_simple() -> lsm_tree::Result<()> {
                 &{
                     let mut map = lsm_tree::HashMap::default();
                     let size = big_value.len() as u64;
-                    map.insert(0, FragmentationEntry::new(1, size, size));
+                    let stored = common::stored_len(b"big", size);
+                    map.insert(0, FragmentationEntry::new(1, size, stored));
                     map
                 },
                 &*gc_stats,
@@ -218,7 +221,8 @@ fn blob_tree_major_compact_relocation_repeated_key() -> lsm_tree::Result<()> {
                 &{
                     let mut map = lsm_tree::HashMap::default();
                     let size = very_big_value.len() as u64;
-                    map.insert(0, FragmentationEntry::new(1, size, size));
+                    let stored = common::stored_len(b"c", size);
+                    map.insert(0, FragmentationEntry::new(1, size, stored));
                     map
                 },
                 &*gc_stats,
@@ -327,7 +331,11 @@ fn blob_tree_major_compact_relocation_interleaved() -> lsm_tree::Result<()> {
                 &{
                     let mut map = lsm_tree::HashMap::default();
                     let size = big_value.len() as u64;
-                    map.insert(0, FragmentationEntry::new(1, size, size));
+                    let block = common::block_entry_len(b"d", size);
+                    map.insert(
+                        0,
+                        FragmentationEntry::new(1, size, 0).with_block_bytes(block),
+                    );
                     map
                 },
                 &*gc_stats,

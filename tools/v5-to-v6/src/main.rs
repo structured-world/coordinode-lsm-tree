@@ -77,12 +77,8 @@ fn main() -> std::process::ExitCode {
                 println!("finished the switch an earlier run started");
             } else {
                 println!(
-                    "converted {} tables, {} data blocks, {} blob files: {} bytes, {} before",
-                    report.tables,
-                    report.data_blocks,
-                    report.blob_files,
-                    report.converted_bytes,
-                    report.source_bytes,
+                    "converted {} tables, {} data blocks: {} bytes, {} before",
+                    report.tables, report.data_blocks, report.converted_bytes, report.source_bytes,
                 );
             }
             for (from, to) in &report.renumbered_fields {

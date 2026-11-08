@@ -227,6 +227,46 @@ impl lsm_tree::fs::Fs for BatchCountFs {
     }
 }
 
+/// The bytes of the frames an uncompressed separated value of `value_len`
+/// bytes under `key` has of its own under the default frame sizes, what
+/// garbage accounting charges once it is dropped.
+///
+/// A frame is a 40-byte header, an entry per value (14 bytes and the key)
+/// and its payload. A value up to the 256 KiB chunk size is a frame of its
+/// own; a larger one is a head (its entry and an 8-byte chunk table) and a
+/// frame per 256 KiB chunk. A value below the 16 KiB block size shares a
+/// block instead, see [`block_entry_len`].
+pub fn stored_len(key: &[u8], value_len: u64) -> u64 {
+    const HEADER: u64 = 40;
+    const CHUNK: u64 = 256 * 1024;
+    assert!(
+        value_len >= BLOCK,
+        "a value of {value_len} bytes shares a block"
+    );
+    let entry = ENTRY + key.len() as u64;
+    if value_len <= CHUNK {
+        HEADER + entry + value_len
+    } else {
+        HEADER + entry + 8 + value_len.div_ceil(CHUNK) * HEADER + value_len
+    }
+}
+
+/// The entry a value below the default 16 KiB block size takes in the block
+/// it shares, uncompressed: what it is charged as block bytes once dropped.
+pub fn block_entry_len(key: &[u8], value_len: u64) -> u64 {
+    assert!(
+        value_len < BLOCK,
+        "a value of {value_len} bytes has frames of its own"
+    );
+    ENTRY + key.len() as u64 + value_len
+}
+
+/// The bytes of a blob entry's fixed fields, before its key.
+const ENTRY: u64 = 14;
+
+/// The default block size: smaller values share a block.
+const BLOCK: u64 = 16 * 1024;
+
 /// Convert an iterator guard into owned `(key, value)` byte vectors.
 ///
 /// Returns `Err` on I/O failure (e.g. BlobTree indirection read) instead
