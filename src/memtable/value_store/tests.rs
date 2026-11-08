@@ -110,3 +110,115 @@ fn concurrent_append_and_read() {
 
     assert_eq!(all.len(), n_threads * n_per_thread);
 }
+
+/// A write whose segment allocation fails unwinds with its index taken and
+/// its slot never written. When a later write allocates that segment, the
+/// slot holds whatever the fresh memory held, and dropping the store must not
+/// drop it as a value: here the memory is filled with a pattern that reads as
+/// a heap view with a wild pointer.
+#[test]
+fn a_slot_left_by_a_failed_segment_allocation_is_not_dropped_as_a_value() {
+    let store = ValueStore::new();
+    store.scribble_segments_for_test();
+    store.fail_next_segment_for_test();
+
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.append(val(b"a value too long to be held inline"));
+    }));
+    assert!(
+        failed.is_err(),
+        "the injected allocation failure must unwind"
+    );
+    assert_eq!(store.len(), 1, "the failed write keeps its index");
+
+    let idx = store.append(val(b"a second value, long enough for the heap"));
+    assert_eq!(idx, 1);
+    assert_eq!(
+        &*unsafe { store.get(idx) },
+        b"a second value, long enough for the heap"
+    );
+
+    drop(store);
+}
+
+/// The pointer the store holds for its first segment.
+fn first_segment(store: &ValueStore) -> *mut UserValue {
+    store
+        .segments
+        .first()
+        .expect("the table has segments")
+        .load(Ordering::Acquire)
+}
+
+/// A write that found its segment null and failed to allocate it, while
+/// another write installed the segment meanwhile, writes its slot into that
+/// segment rather than unwinding or marking the segment torn.
+#[test]
+fn a_failed_segment_allocation_uses_the_segment_another_write_installed() {
+    let store = ValueStore::new();
+    let first = store.append(val(b"a value too long to be held inline"));
+    let installed = first_segment(&store);
+
+    // The failing write loaded the segment as null before the first write
+    // installed it.
+    store.fail_next_segment_for_test();
+    store.allocate_segment(0, ptr::null_mut());
+    assert_eq!(
+        first_segment(&store),
+        installed,
+        "the installed segment stays, not marked torn"
+    );
+
+    let second = store.append(val(b"a second value, long enough for the heap"));
+    assert_eq!(
+        &*unsafe { store.get(first) },
+        b"a value too long to be held inline"
+    );
+    assert_eq!(
+        &*unsafe { store.get(second) },
+        b"a second value, long enough for the heap"
+    );
+}
+
+/// A write that found its segment null and allocated it, while a failed
+/// allocation marked the segment torn meanwhile, installs its segment over
+/// the marker filled with empty values, so the slot the failed write left
+/// reads and drops as an empty value. The fresh memory is filled with a
+/// pattern that reads as a heap view with a wild pointer.
+#[test]
+fn a_segment_found_torn_at_install_is_filled_with_empty_values() {
+    let store = ValueStore::new();
+    store.scribble_segments_for_test();
+    store.fail_next_segment_for_test();
+
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.append(val(b"a value too long to be held inline"));
+    }));
+    assert!(
+        failed.is_err(),
+        "the injected allocation failure must unwind"
+    );
+    assert_eq!(
+        first_segment(&store),
+        torn(),
+        "the failed allocation marks the segment torn"
+    );
+
+    // The installing write loaded the segment as null before it turned torn.
+    store.allocate_segment(0, ptr::null_mut());
+    assert!(
+        first_segment(&store).addr() > TORN_ADDR,
+        "a real segment replaces the marker"
+    );
+    assert!(
+        unsafe { store.get(0) }.is_empty(),
+        "the slot the failed write left is an empty value"
+    );
+
+    let idx = store.append(val(b"a second value, long enough for the heap"));
+    assert_eq!(
+        &*unsafe { store.get(idx) },
+        b"a second value, long enough for the heap"
+    );
+    drop(store);
+}
