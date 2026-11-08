@@ -326,9 +326,9 @@ fn a_zstd_file_reads_a_small_value_alone_by_default() -> lsm_tree::Result<()> {
 }
 
 /// In a file that compresses nothing a small value is a packed record: a
-/// batch and a point read read it alone, a request of its record's bytes, and
-/// once cached, off the read's path, a read again takes it from the cache
-/// even under `Never`.
+/// batch and a point read read it alone, a request of its record's bytes.
+/// Under `Never` a cache that has not filled keeps none of them, so a read
+/// again reads its record again.
 #[cfg(feature = "metrics")]
 #[test]
 fn a_packed_value_is_read_as_its_record_alone() -> lsm_tree::Result<()> {
@@ -364,7 +364,6 @@ fn a_packed_value_is_read_as_its_record_alone() -> lsm_tree::Result<()> {
     // The record's fixed part and its three-byte key beside the value.
     assert_eq!(m.blob_bytes_read(), 20 * (27 + 3 + 2_000));
 
-    cache.settle_fills();
     for (i, key) in keys.iter().enumerate() {
         assert_eq!(
             tree.get(key, SeqNo::MAX)?.as_deref(),
@@ -373,9 +372,10 @@ fn a_packed_value_is_read_as_its_record_alone() -> lsm_tree::Result<()> {
     }
     assert_eq!(
         m.blob_read_count(),
-        20,
-        "each read again comes from the cache"
+        40,
+        "each read again reads its record again"
     );
+    assert_eq!(m.blob_bytes_read(), 40 * (27 + 3 + 2_000));
     Ok(())
 }
 

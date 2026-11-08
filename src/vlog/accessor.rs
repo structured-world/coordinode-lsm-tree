@@ -451,7 +451,7 @@ impl<'a> Accessor<'a> {
         {
             lead.hand_over(packed::cached_record(&record, &bytes, &value));
         }
-        Self::keep_record(tree_id, vhandle, &record, &bytes, &value, cache);
+        self.keep_record(tree_id, vhandle, &record, &bytes, &value, cache);
         Ok(Some(value))
     }
 
@@ -536,7 +536,7 @@ impl<'a> Accessor<'a> {
         cache: &Cache,
     ) -> crate::Result<UserValue> {
         let (record, value) = self.record_value(blob_file, key, bytes)?;
-        Self::keep_record(tree_id, vhandle, &record, bytes, &value, cache);
+        self.keep_record(tree_id, vhandle, &record, bytes, &value, cache);
         Ok(value)
     }
 
@@ -570,13 +570,21 @@ impl<'a> Accessor<'a> {
         Ok((record, value?))
     }
 
-    /// Leaves a packed value read alone to be cached, off the read's path: a
-    /// small value is read again as often as the values of a block are, and
-    /// the insert and what it evicts are the worker's (see
-    /// [`Cache::fill_blob_record`]). Into a full cache only once it is read
-    /// again: a value read once would cost its entry built, inserted and
-    /// evicted unread.
+    /// Caches a packed value read alone, on the read's path: under
+    /// [`BlobCacheFill::Always`] as every value read is, and otherwise only
+    /// into a shard of the cache that has filled once, there as its admission
+    /// takes it.
+    ///
+    /// A shard still filling would grow for it: every insert there touches
+    /// fresh memory and the shard's table copies itself as it doubles, on the
+    /// read's path, which is where the slowest reads of a cache filling up
+    /// came from. A shard that has filled has grown to what it holds: an
+    /// insert takes the place of what it evicts, and the allocator hands that
+    /// memory to the next one. Into its room a value goes on its first miss,
+    /// past it only on a miss that repeats a recent one, so a value read once
+    /// is not cached to be evicted unread.
     fn keep_record(
+        &self,
         tree_id: TreeId,
         vhandle: &ValueHandle,
         record: &packed::Record,
@@ -584,75 +592,16 @@ impl<'a> Accessor<'a> {
         value: &UserValue,
         cache: &Cache,
     ) {
-        // Experiment: `off` caches no value read alone; `room` only into room,
-        // checked at the read and again under the insert's lock, so it evicts
-        // nothing; `ghost` admits as usual but inserts nothing; `admit-room`
-        // admits as usual and inserts only into room; `build` admits and
-        // leaves the fill to the worker, which builds the entry and drops it;
-        // `push` leaves it to the worker, which drops it as taken; `inline`
-        // admits, builds and inserts on the read's path, no worker;
-        // `inline-try` the same, inserting only when the shard's lock is free;
-        // `inline-build` builds on the read's path and drops; `inline-lock`
-        // builds, takes the shard's write lock and releases it, and drops;
-        // `inline-room` builds and inserts on the read's path only into room;
-        // `full` inserts on the read's path only into a shard with no room.
-        #[cfg(feature = "std")]
-        let mode = {
-            static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-            *MODE.get_or_init(|| match std::env::var("LSM_RECORD_FILL").as_deref() {
-                Ok("off") => 1,
-                Ok("room") => 2,
-                Ok("ghost") => 3,
-                Ok("admit-room") => 4,
-                Ok("build") => 5,
-                Ok("push") => 6,
-                Ok("inline") => 7,
-                Ok("inline-try") => 8,
-                Ok("inline-build") => 9,
-                Ok("inline-lock") => 10,
-                Ok("inline-room") => 11,
-                Ok("full") => 12,
-                _ => 0,
-            })
-        };
-        #[cfg(not(feature = "std"))]
-        let mode = 0_u8;
-        let stage = match mode {
-            2 | 4 => crate::cache::FillStage::RoomOnly,
-            5 => crate::cache::FillStage::BuildOnly,
-            6 => crate::cache::FillStage::DropOnly,
-            7 => crate::cache::FillStage::Inline,
-            8 | 12 => crate::cache::FillStage::InlineTry,
-            9 => crate::cache::FillStage::InlineBuild,
-            10 => crate::cache::FillStage::InlineLock,
-            11 => crate::cache::FillStage::InlineRoom,
-            _ => crate::cache::FillStage::Insert,
-        };
-        if mode == 1 {
-            return;
-        }
         let at = vhandle.frame_at();
         let weight = packed::cached_record_len(record, value) as u64;
-        if mode == 2 {
-            if cache.room_for_blob_record(tree_id, at, vhandle.index, weight) {
-                let cached = packed::cached_record(record, bytes, value);
-                cache.fill_blob_record(tree_id, at, vhandle.index, cached, stage);
-            }
+        if !self.fill.fills()
+            && (!cache.filled_for_blob_record(tree_id, at, vhandle.index)
+                || !cache.admit_blob_record(tree_id, at, vhandle.index, weight))
+        {
             return;
         }
-        // `full` caches a value only into a shard with no room left, where the
-        // insert evicts what it replaces and the cache does not grow.
-        if mode == 12 && cache.room_for_blob_record(tree_id, at, vhandle.index, weight) {
-            return;
-        }
-        let admitted = cache.admit_blob_record(tree_id, at, vhandle.index, weight);
-        if mode == 3 {
-            return;
-        }
-        if admitted {
-            let cached = packed::cached_record(record, bytes, value);
-            cache.fill_blob_record(tree_id, at, vhandle.index, cached, stage);
-        }
+        let cached = packed::cached_record(record, bytes, value);
+        cache.fill_blob_record(tree_id, at, vhandle.index, cached);
     }
 
     /// Reads bytes `range` of one separated value: of a chunked value, only

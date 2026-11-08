@@ -134,6 +134,10 @@ struct ShardCore<K, V, S> {
     small_target: u64,
     /// Max number of fingerprints retained in the ghost queue.
     ghost_capacity: usize,
+    /// Whether the shard has ever had to evict to stay within capacity: its
+    /// table and queues have grown to what it holds, and an insert now takes
+    /// the place of what it evicts rather than fresh memory.
+    filled: bool,
 }
 
 impl<K, V, S> ShardCore<K, V, S>
@@ -143,29 +147,13 @@ where
     S: BuildHasher + Clone,
 {
     fn new(capacity: u64, ghost_capacity: usize, hasher: S) -> Self {
-        // Experiment: `LSM_CACHE_RESERVE=<bytes>` sizes the table and the
-        // queues up front for a shard full of entries that heavy, and the
-        // ghosts for their capacity, so no insert grows them under the write
-        // lock.
-        #[cfg(feature = "std")]
-        let reserve = std::env::var("LSM_CACHE_RESERVE")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&b| b > 0)
-            .map_or(0, |b| usize::try_from(capacity / b).unwrap_or(0));
-        #[cfg(not(feature = "std"))]
-        let reserve = 0_usize;
         Self {
-            map: hashbrown::HashTable::with_capacity(reserve),
+            map: hashbrown::HashTable::new(),
             hasher,
-            small: VecDeque::with_capacity(reserve),
-            main: VecDeque::with_capacity(reserve),
-            ghost: VecDeque::with_capacity(if reserve > 0 { ghost_capacity + 1 } else { 0 }),
-            ghost_set: hashbrown::HashTable::with_capacity(if reserve > 0 {
-                ghost_capacity + 1
-            } else {
-                0
-            }),
+            small: VecDeque::new(),
+            main: VecDeque::new(),
+            ghost: VecDeque::new(),
+            ghost_set: hashbrown::HashTable::new(),
             small_bytes: 0,
             main_bytes: 0,
             capacity,
@@ -173,6 +161,7 @@ where
             // meaningful for tiny shards).
             small_target: (capacity / 10).max(1),
             ghost_capacity,
+            filled: false,
         }
     }
 
@@ -229,58 +218,7 @@ where
         value: V,
         weight: u64,
         priority: Priority,
-        evicted: &mut Vec<V>,
-    ) {
-        #[cfg(feature = "std")]
-        let before = self.shape();
-        self.insert_inner(hash, key, value, weight, priority, evicted);
-        #[cfg(feature = "std")]
-        {
-            let after = self.shape();
-            let mut what = 0_u8;
-            // A table reallocated grew; one whose allocation stayed but whose
-            // room went up rehashed in place to clear its tombstones.
-            if after.map_bytes != before.map_bytes {
-                what |= GROW_MAP;
-            } else if after.map_room > before.map_room {
-                what |= REHASH_MAP;
-            }
-            if after.queues != before.queues {
-                what |= GROW_QUEUES;
-            }
-            if after.ghost != before.ghost {
-                what |= GROW_GHOST;
-            }
-            if after.ghost_set_bytes != before.ghost_set_bytes {
-                what |= GROW_GHOST_SET;
-            } else if after.ghost_set_room > before.ghost_set_room {
-                what |= REHASH_GHOST_SET;
-            }
-            GREW.with(|grew| grew.set(grew.get() | what));
-        }
-    }
-
-    /// Experiment: the allocations and room of the shard's tables and queues.
-    #[cfg(feature = "std")]
-    fn shape(&self) -> Shape {
-        Shape {
-            map_bytes: self.map.allocation_size(),
-            map_room: self.map.capacity(),
-            queues: (self.small.capacity(), self.main.capacity()),
-            ghost: self.ghost.capacity(),
-            ghost_set_bytes: self.ghost_set.allocation_size(),
-            ghost_set_room: self.ghost_set.capacity(),
-        }
-    }
-
-    fn insert_inner(
-        &mut self,
-        hash: u64,
-        key: K,
-        value: V,
-        weight: u64,
-        priority: Priority,
-        evicted: &mut Vec<V>,
+        evicted: &mut Evicted<V>,
     ) {
         if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
             // Replace in place: adjust the owning queue's byte tally by the
@@ -385,7 +323,10 @@ where
 
     /// Evicts until the shard is within capacity, handing what it evicts to
     /// `evicted` for the caller to drop once the lock is released.
-    fn evict_to_capacity(&mut self, evicted: &mut Vec<V>) {
+    fn evict_to_capacity(&mut self, evicted: &mut Evicted<V>) {
+        if self.resident_bytes() > self.capacity {
+            self.filled = true;
+        }
         while self.resident_bytes() > self.capacity {
             if !self.evict_one(evicted) {
                 // Both queues are out of live entries — nothing left to free
@@ -403,7 +344,7 @@ where
         clippy::if_same_then_else,
         reason = "the branches differ in which queue `||` tries first; the lint reads them as equal"
     )]
-    fn evict_one(&mut self, evicted: &mut Vec<V>) -> bool {
+    fn evict_one(&mut self, evicted: &mut Evicted<V>) -> bool {
         let prefer_small = self.main_bytes == 0 || self.small_bytes >= self.small_target;
         if prefer_small {
             self.evict_from_small(evicted) || self.evict_from_main(evicted)
@@ -416,7 +357,7 @@ where
     /// (freq > 0) migrates to the main queue; an unused one is evicted and its
     /// key recorded in the ghost queue. Returns `false` if the small queue holds
     /// no live entry.
-    fn evict_from_small(&mut self, evicted: &mut Vec<V>) -> bool {
+    fn evict_from_small(&mut self, evicted: &mut Evicted<V>) -> bool {
         while let Some(key) = self.small.pop_front() {
             let hash = self.hasher.hash_one(&key);
             let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
@@ -455,7 +396,7 @@ where
     /// frequency is reinserted at the back with its counter decremented; an
     /// unused one is evicted. Returns `false` if the main queue holds no live
     /// entry.
-    fn evict_from_main(&mut self, evicted: &mut Vec<V>) -> bool {
+    fn evict_from_main(&mut self, evicted: &mut Evicted<V>) -> bool {
         while let Some(key) = self.main.pop_front() {
             let hash = self.hasher.hash_one(&key);
             let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
@@ -513,52 +454,36 @@ where
     }
 }
 
-/// Experiment: what an insert changed in its shard, as the bits of [`GREW`].
-pub(crate) const GROW_MAP: u8 = 1;
-pub(crate) const REHASH_MAP: u8 = 2;
-pub(crate) const GROW_QUEUES: u8 = 4;
-pub(crate) const GROW_GHOST: u8 = 8;
-pub(crate) const GROW_GHOST_SET: u8 = 16;
-pub(crate) const REHASH_GHOST_SET: u8 = 32;
-
-/// Experiment: a shard's tables and queues, as an insert left them.
-#[cfg(feature = "std")]
-#[derive(Clone, Copy)]
-struct Shape {
-    map_bytes: usize,
-    map_room: usize,
-    queues: (usize, usize),
-    ghost: usize,
-    ghost_set_bytes: usize,
-    ghost_set_room: usize,
+/// What one insert replaced or evicted, dropped by its caller once the
+/// shard's lock is released, so no read of the shard waits behind the frees.
+/// The first is held in place: an insert evicts one entry or none far more
+/// often than more, and then collecting them allocates nothing.
+pub(crate) struct Evicted<V> {
+    first: Option<V>,
+    rest: Vec<V>,
 }
 
-#[cfg(feature = "std")]
-std::thread_local! {
-    /// Experiment: what the inserts on this thread changed in their shards
-    /// since it was last cleared.
-    pub(crate) static GREW: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
-}
-
-/// Releases an insert's shard lock and drops what the insert evicted.
-/// Experiment: `LSM_CACHE_DEFER_DROP=1` drops them after the lock is
-/// released, so no read of the shard waits behind their frees; otherwise
-/// before, as the eviction did.
-fn release<G, V>(guard: G, evicted: Vec<V>) {
-    #[cfg(feature = "std")]
-    let defer = {
-        static DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *DEFER.get_or_init(|| std::env::var("LSM_CACHE_DEFER_DROP").as_deref() == Ok("1"))
-    };
-    #[cfg(not(feature = "std"))]
-    let defer = true;
-    if defer {
-        drop(guard);
-        drop(evicted);
-    } else {
-        drop(evicted);
-        drop(guard);
+impl<V> Evicted<V> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            first: None,
+            rest: Vec::new(),
+        }
     }
+
+    fn push(&mut self, value: V) {
+        if self.first.is_none() {
+            self.first = Some(value);
+        } else {
+            self.rest.push(value);
+        }
+    }
+}
+
+/// Releases an insert's shard lock, then drops what the insert evicted.
+fn release<G, V>(guard: G, evicted: Evicted<V>) {
+    drop(guard);
+    drop(evicted);
 }
 
 /// Applies a weight replacement (`old` → `new`) to a running byte tally without
@@ -695,24 +620,12 @@ where
         false
     }
 
-    /// Whether `key`'s shard holds `weight` more without evicting anything.
-    pub(crate) fn has_room(&self, key: &K, weight: u64) -> bool {
+    /// Whether `key`'s shard has ever had to evict to stay within capacity,
+    /// so an insert there takes the place of what it evicts instead of
+    /// growing the shard into fresh memory.
+    pub(crate) fn has_filled(&self, key: &K) -> bool {
         let (_, shard) = self.locate(key);
-        let core = shard.read();
-        core.resident_bytes() + weight <= core.capacity
-    }
-
-    /// Inserts `key` at `priority` only when its shard holds it without
-    /// evicting anything, decided under the insert's own lock.
-    pub(crate) fn insert_if_room(&self, key: K, value: V, priority: Priority) {
-        let weight = self.weighter.weight(&key, &value);
-        let (h, shard) = self.locate(&key);
-        let mut evicted = Vec::new();
-        let mut core = shard.write();
-        if core.resident_bytes() + weight <= core.capacity {
-            core.insert(h, key, value, weight, priority, &mut evicted);
-        }
-        release(core, evicted);
+        shard.read().filled
     }
 
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
@@ -733,7 +646,7 @@ where
             return;
         }
         let (h, shard) = self.locate(&key);
-        let mut evicted = Vec::new();
+        let mut evicted = Evicted::new();
         let mut core = shard.write();
         core.insert(h, key, value, weight, priority, &mut evicted);
         release(core, evicted);
@@ -748,17 +661,10 @@ where
         }
         let (h, shard) = self.locate(&key);
         if let Some(mut core) = shard.try_write() {
-            let mut evicted = Vec::new();
+            let mut evicted = Evicted::new();
             core.insert(h, key, value, weight, priority, &mut evicted);
             release(core, evicted);
         }
-    }
-
-    /// Experiment: takes `key`'s shard write lock and releases it, inserting
-    /// nothing, to price the lock an insert holds apart from the insert.
-    pub(crate) fn lock_only(&self, key: &K) {
-        let (_, shard) = self.locate(key);
-        drop(core::hint::black_box(shard.write()));
     }
 
     /// Inserts the value `merge` derives from what `key` holds now, read and
@@ -777,7 +683,7 @@ where
         if weight > self.per_shard_capacity {
             return;
         }
-        let mut evicted = Vec::new();
+        let mut evicted = Evicted::new();
         core.insert(h, key, value, weight, Priority::Normal, &mut evicted);
         release(core, evicted);
     }

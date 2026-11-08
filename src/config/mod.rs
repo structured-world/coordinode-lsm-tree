@@ -406,7 +406,10 @@ pub enum BlobCacheFill {
     /// large enough to be separated are mostly read once, and cached they
     /// would evict the index, filter and data blocks of every tree sharing the
     /// cache. A packed small value read as its record alone is cached all the
-    /// same, once read again, off the read's path. A block of small values a
+    /// same once the cache has filled, where it takes the place of what it
+    /// evicts, on its first miss into room and past it once missed again;
+    /// into a cache still filling it is not, since there it would grow the
+    /// cache on the read's path. A block of small values a
     /// point read decodes is cached all the same while the cache has room,
     /// and in a full cache once missed again: the values beside the one read
     /// are read as often, and each would otherwise decode the whole block

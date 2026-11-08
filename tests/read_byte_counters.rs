@@ -652,29 +652,28 @@ fn packed_reads(fill: BlobCacheFill) -> lsm_tree::Result<(u64, u64)> {
         Ok(m.blob_bytes_read() - before)
     };
     let cold = pass()?;
-    // The values are cached off the reads' path: wait for them, as a read
-    // a moment later would find them.
-    cache.settle_fills();
     Ok((cold, pass()?))
 }
 
 #[test]
-fn a_packed_value_read_again_is_served_from_the_cache() -> lsm_tree::Result<()> {
-    // A small value packed beside others is read as its record alone; read
-    // again, it comes from the cache, as a value of a block does, whatever
-    // the fill says of a value of a frame of its own. The values fit the
-    // cache, so each is taken on its first read.
-    for fill in [BlobCacheFill::default(), BlobCacheFill::Always] {
+fn a_packed_value_read_again_is_served_from_the_cache_that_fills() -> lsm_tree::Result<()> {
+    // A small value packed beside others is read as its record alone. Under
+    // `Always` it is cached as every value read is, and read again comes
+    // from the cache. Under the default it stays out of a cache that has not
+    // filled, which would grow on the reads' path for it, so read again it
+    // reads its record again.
+    for (fill, cached) in [
+        (BlobCacheFill::Always, true),
+        (BlobCacheFill::default(), false),
+    ] {
         let (cold, again) = packed_reads(fill)?;
         assert!(cold > 0, "{fill:?}: the first reads read the blob file");
         assert!(
             cold < 50 * 300,
             "{fill:?}: {cold} B read for 50 values of 200 B"
         );
-        assert_eq!(
-            again, 0,
-            "{fill:?}: a packed value read again comes from the cache"
-        );
+        let expected = if cached { 0 } else { cold };
+        assert_eq!(again, expected, "{fill:?}: what a read again reads");
     }
     Ok(())
 }

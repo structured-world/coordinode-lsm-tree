@@ -33,6 +33,23 @@ fn full_shard(ghost: usize) -> ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighte
     c
 }
 
+/// A shard has filled once an insert made it evict, and stays filled when
+/// eviction leaves it room again: what fills it is whether it still grows
+/// into fresh memory, not what it holds at the moment.
+#[test]
+fn a_shard_has_filled_once_it_has_evicted_and_stays_so() {
+    let c = full_shard(1024);
+    assert!(
+        !c.has_filled(&1),
+        "a shard at capacity has evicted nothing yet"
+    );
+    c.insert(2_000, vec![0u8; 100]);
+    assert!(c.has_filled(&1), "the insert past capacity evicted");
+    c.remove(&2_000);
+    assert!(c.weight() < 1_000, "the removal left room");
+    assert!(c.has_filled(&1), "a shard that has filled stays filled");
+}
+
 /// A first miss is taken while its shard has room: inserting it evicts
 /// nothing, so there is no churn to save, and a working set that fits the
 /// cache is cached on its first read.

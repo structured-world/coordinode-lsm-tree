@@ -165,15 +165,7 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 /// ```
 pub struct Cache {
     // NOTE: rustc_hash performed best: https://fjall-rs.github.io/post/fjall-2-1
-    /// In-tree sharded S3-FIFO cache (byte-weighted), shared with the fill
-    /// worker.
-    data: alloc::sync::Arc<Data>,
-    /// The fills a point read leaves off its path (see [`fill`]).
-    #[cfg(feature = "std")]
-    fills: fill::Fills,
-    /// Experiment: how long the inline fills take.
-    #[cfg(feature = "std")]
-    timing: fill::Timing,
+    data: ShardedCache<CacheKey, Item, BlockWeighter, rustc_hash::FxBuildHasher>,
     /// When false, the row cache (decoded point-read results) is off, so
     /// `get_row` always misses and `insert_row` is a no-op. Blocks / blobs are
     /// cached regardless.
@@ -196,9 +188,6 @@ pub struct Cache {
     /// one decode. Only a miss consults it.
     loads: Loads,
 }
-
-/// The entries a cache holds.
-type Data = ShardedCache<CacheKey, Item, BlockWeighter, rustc_hash::FxBuildHasher>;
 
 /// The registry of cold loads in flight.
 type Loads =
@@ -435,17 +424,13 @@ impl Cache {
     #[must_use]
     pub fn with_capacity_bytes(bytes: u64) -> Self {
         Self {
-            data: alloc::sync::Arc::new(ShardedCache::with_weighter(
+            data: ShardedCache::with_weighter(
                 bytes,
                 BLOCK_CACHE_SHARDS,
                 BLOCK_CACHE_EST_ITEMS,
                 BlockWeighter,
                 rustc_hash::FxBuildHasher,
-            )),
-            #[cfg(feature = "std")]
-            fills: fill::Fills::new(),
-            #[cfg(feature = "std")]
-            timing: fill::Timing::new(),
+            ),
             row_cache_enabled: true,
             metadata_priority: true,
             loads: crate::inflight::InflightLoads::new(
@@ -1190,68 +1175,21 @@ impl Cache {
     /// Caches one value of a packed block, read alone, under its frame and
     /// its record's offset `index`: `record`, the record as the cache holds
     /// it. On probation: it stays only if read again, so a stream of values
-    /// read once each cannot push table blocks out of the main queue.
+    /// read once each cannot push table blocks out of the main queue. A fill
+    /// is a hint: one that finds its shard's lock held by another insert
+    /// leaves the value uncached rather than wait on the read's path.
     pub(crate) fn fill_blob_record(
         &self,
         vlog_id: crate::TreeId,
         at: BlobFrameAt,
         index: u16,
         record: crate::Slice,
-        stage: FillStage,
     ) {
-        let key = blob_record_key(vlog_id, at, index);
-        if matches!(
-            stage,
-            FillStage::Inline
-                | FillStage::InlineTry
-                | FillStage::InlineRoom
-                | FillStage::InlineBuild
-                | FillStage::InlineLock
-        ) {
-            #[cfg(feature = "std")]
-            let started = self.timing.start();
-            let item = Item::BlobRecord(record);
-            match stage {
-                FillStage::Inline => {
-                    self.data
-                        .insert_with_priority(key, item, Priority::Probation);
-                }
-                FillStage::InlineTry => {
-                    self.data
-                        .try_insert_with_priority(key, item, Priority::Probation);
-                }
-                FillStage::InlineRoom => {
-                    self.data.insert_if_room(key, item, Priority::Probation);
-                }
-                FillStage::InlineLock => {
-                    self.data.lock_only(&key);
-                    drop(core::hint::black_box(item));
-                }
-                _ => drop(core::hint::black_box(item)),
-            }
-            #[cfg(feature = "std")]
-            self.timing.record(started);
-            return;
-        }
-        #[cfg(feature = "std")]
-        self.fills
-            .push(&self.data, fill::Fill { key, record, stage });
-        // no-std: no worker thread, the entry is inserted inline
-        #[cfg(not(feature = "std"))]
-        {
-            let _ = stage;
-            self.data
-                .insert_with_priority(key, Item::BlobRecord(record), Priority::Probation);
-        }
-    }
-
-    /// Waits until every fill a read left before the call is in the cache,
-    /// or dropped for a full queue: for a caller that reads the cache right
-    /// after a read that filled it, such as a test.
-    #[doc(hidden)]
-    pub fn settle_fills(&self) {
-        #[cfg(feature = "std")]
-        self.fills.settle();
+        self.data.try_insert_with_priority(
+            blob_record_key(vlog_id, at, index),
+            Item::BlobRecord(record),
+            Priority::Probation,
+        );
     }
 
     /// Whether the value of a packed block at `at` and `index`, just missed
@@ -1270,18 +1208,17 @@ impl Cache {
             .admit(&blob_record_key(vlog_id, at, index), weight)
     }
 
-    /// Whether the cache holds the value of a packed block at `at` and
-    /// `index`, `weight` once cached, without evicting anything.
+    /// Whether the shard the value of a packed block at `at` and `index`
+    /// would go to has ever filled, so caching it there replaces what it
+    /// evicts instead of growing the cache.
     #[must_use]
-    pub(crate) fn room_for_blob_record(
+    pub(crate) fn filled_for_blob_record(
         &self,
         vlog_id: crate::TreeId,
         at: BlobFrameAt,
         index: u16,
-        weight: u64,
     ) -> bool {
-        self.data
-            .has_room(&blob_record_key(vlog_id, at, index), weight)
+        self.data.has_filled(&blob_record_key(vlog_id, at, index))
     }
 
     /// Whether the blob frame at `at`, just read and `weight` once cached,
@@ -1333,35 +1270,6 @@ impl Cache {
             Item::Directory(..) => unreachable!("invalid cache item"),
         }
     }
-}
-
-#[cfg(feature = "std")]
-mod fill;
-
-/// Experiment: how far the fill worker takes a fill.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FillStage {
-    /// Built and inserted.
-    Insert,
-    /// Built and inserted only when its shard has room for it then.
-    RoomOnly,
-    /// Built and dropped: the worker's work without the cache's.
-    BuildOnly,
-    /// Dropped as taken off the queue: the queue and the worker's wakes alone.
-    DropOnly,
-    /// Built and inserted on the read's path, no worker.
-    Inline,
-    /// Built on the read's path and inserted only when the shard's lock is
-    /// free then, no worker.
-    InlineTry,
-    /// Built on the read's path and inserted only when its shard has room
-    /// for it then, no worker.
-    InlineRoom,
-    /// Built on the read's path and dropped, no worker.
-    InlineBuild,
-    /// Built on the read's path, its shard's write lock taken and released,
-    /// and dropped, no worker.
-    InlineLock,
 }
 
 #[cfg(test)]
