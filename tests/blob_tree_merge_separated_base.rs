@@ -55,6 +55,27 @@ fn open(folder: &std::path::Path) -> lsm_tree::Result<AnyTree> {
     .open()
 }
 
+/// A range of a key whose newest version is a merge operand is the range of
+/// the value its operands fold onto the separated base: a merged value exists
+/// only whole.
+#[test]
+fn a_range_of_a_merged_value_is_of_the_folded_value() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let AnyTree::Blob(tree) = open(folder.path())? else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    tree.insert("k", base(), 0);
+    tree.flush_active_memtable(0)?;
+    tree.merge("k", "_A", 1);
+    let whole = merged(&[b"_A"]);
+    let range = (BASE_LEN as u64 - 2)..(BASE_LEN as u64 + 2);
+    assert_eq!(
+        tree.get_range("k", range.clone(), SeqNo::MAX)?.as_deref(),
+        whole.get(range.start as usize..range.end as usize),
+    );
+    Ok(())
+}
+
 /// Where the base and its two operands are when the key is read.
 #[derive(Clone, Copy, Debug)]
 enum Layout {

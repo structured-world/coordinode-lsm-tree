@@ -396,5 +396,96 @@ fn a_dangling_indirection_resolves_to_an_error() -> crate::Result<()> {
         matches!(result, Err(crate::Error::InvalidHeader(_))),
         "{result:?}"
     );
+    // A batched read leaves it to the value's own path, which reports it.
+    assert!(matches!(
+        tree.blob_source().plan_value(&version, &item_of(&dangling)),
+        ValuePlan::Alone
+    ));
+    Ok(())
+}
+
+/// The entry for key `k` pointing at `indirection`.
+fn item_of(indirection: &BlobIndirection) -> InternalValue {
+    InternalValue::from_components(
+        "k",
+        indirection.encode_into_vec(),
+        0,
+        crate::ValueType::Indirection,
+    )
+}
+
+/// A batched read plans a chunked value's read through its head: a head the
+/// cache holds is no value, so the value goes on its own path; a read that
+/// reaches the head alone hands back no value for that path to read the
+/// chunks; a read shorter than the head's frame is refused.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_batched_read_of_a_chunked_value_falls_back_to_its_own_path() -> crate::Result<()> {
+    use crate::{AbstractTree, coding::Decode};
+
+    let folder = crate::get_tmp_folder();
+    let open = |fill| {
+        crate::Config::new(
+            folder.path(),
+            crate::SequenceNumberCounter::default(),
+            crate::SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+        .blob_cache_fill(fill)
+        .open()
+    };
+    {
+        let crate::AnyTree::Blob(tree) = open(crate::config::BlobCacheFill::Never)? else {
+            panic!("a tree with kv separation opens as a blob tree");
+        };
+        tree.insert("k", vec![b'v'; 1024 * 1024], 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let crate::AnyTree::Blob(tree) = open(crate::config::BlobCacheFill::Never)? else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    let version = tree.current_version();
+    let item = tree
+        .index
+        .get_internal_entry(b"k", crate::SeqNo::MAX)?
+        .expect("the value");
+    let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
+
+    // A head charged only its own bytes is read alone.
+    let head_only = BlobIndirection {
+        stored: crate::blob_tree::handle::Stored::Frames(1),
+        ..indirection
+    };
+    let source = tree.blob_source();
+    let ValuePlan::Read(read) = source.plan_value(&version, &item_of(&head_only)) else {
+        panic!("an uncached value is read");
+    };
+    let file = std::fs::read(&read.blob_file.0.path)?;
+    let at = usize::try_from(read.offset).expect("fits");
+    let head = crate::Slice::from(&file[at..at + read.len]);
+    assert_eq!(
+        source.finish_value(&version, b"k", &read, &head)?,
+        None,
+        "the chunks are read on the value's own path"
+    );
+    let short = crate::Slice::from(&file[at..at + read.len - 1]);
+    assert!(source.finish_value(&version, b"k", &read, &short).is_err());
+
+    // Cached, the head is found by the plan and is no value.
+    drop(tree);
+    let crate::AnyTree::Blob(tree) = open(crate::config::BlobCacheFill::Always)? else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    assert_eq!(
+        tree.get("k", crate::SeqNo::MAX)?.map(|v| v.len()),
+        Some(1024 * 1024)
+    );
+    let version = tree.current_version();
+    assert!(matches!(
+        tree.blob_source()
+            .plan_value(&version, &item_of(&indirection)),
+        ValuePlan::Alone
+    ));
     Ok(())
 }
