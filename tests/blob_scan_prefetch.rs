@@ -99,6 +99,44 @@ fn a_scan_yields_the_same_values_with_and_without_prefetch() -> lsm_tree::Result
     Ok(())
 }
 
+/// A block several upcoming values share, wider than what a scan may prefetch
+/// into the cache (half of it), is left to the direct read: admitting it for
+/// serving many values took more than the budget left, which underflowed it.
+#[test_log::test]
+fn a_shared_block_wider_than_the_prefetch_budget_is_left_to_the_direct_read() -> lsm_tree::Result<()>
+{
+    const N: usize = 120;
+
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+        // Half of it, the prefetch budget, is narrower than one 16 KiB block.
+        .use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
+            16 * 1024,
+        )))
+        .blob_compression(lsm_tree::CompressionType::None)
+        // Prefetched into the cache, the budget is half of it.
+        .blob_cache_fill(lsm_tree::config::BlobCacheFill::Always)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(1)
+                .scan_prefetch(64),
+        ))
+        .open()?;
+    for i in 0..N {
+        tree.insert(key_for(i).as_bytes(), value_for(i), seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+
+    let scanned = collect(&tree)?;
+    assert_eq!(scanned.len(), N);
+    for (i, (key, value)) in scanned.iter().enumerate() {
+        assert_eq!(key.as_slice(), key_for(i).as_bytes());
+        assert_eq!(value.as_ref(), value_for(i).as_slice());
+    }
+    Ok(())
+}
+
 /// A window whose records lie in several blob files coalesces into a span per
 /// file, and the spans of one window go to the backend in ONE batched read,
 /// not one read each.

@@ -684,7 +684,10 @@ impl<'a> Accessor<'a> {
 /// The span of frames that starts with `items[start]`'s: the following frames
 /// of the same file within `max_gap` of it, the whole extent within
 /// `max_read` and `read_budget`. `span` gives where a handle's frame lies, as
-/// its file's index places it. `None` when the first frame is not there.
+/// its file's index places it. `None` when the first frame is not there, or
+/// is wider than that bound: such a frame is left to the direct read, so a
+/// span the caller charges to its budget never exceeds what is left of it,
+/// however many values share the frame.
 fn span_extent(
     items: &[(&[u8], ValueHandle, usize)],
     start: usize,
@@ -696,15 +699,11 @@ fn span_extent(
     let reach = max_read.min(read_budget);
     let (_, first, _) = items.get(start)?;
     let (span_start, mut span_end) = span(first)?;
-    let mut end = start + 1;
     // The first frame alone past the bound is left to the direct read.
     if span_end - span_start > reach {
-        return Some(Span {
-            frames: start..end,
-            start: span_start,
-            end: span_end,
-        });
+        return None;
     }
+    let mut end = start + 1;
     while let Some((_, next, _)) = items.get(end) {
         if next.blob_file_id != first.blob_file_id {
             break;

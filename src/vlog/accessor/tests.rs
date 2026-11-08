@@ -107,34 +107,37 @@ fn a_span_never_exceeds_the_remaining_read_budget() {
     assert!(span.frames.end < items.len());
 }
 
-/// A frame wider than the read cap is left to the direct read alone: it does
-/// not anchor a span the next frames join.
+/// A frame wider than the read cap is left to the direct read alone: it yields
+/// no span, neither one the next frames join nor one the caller would charge
+/// to its budget.
 #[test]
-fn an_anchor_frame_wider_than_the_bound_does_not_carry_a_span() {
+fn an_anchor_frame_wider_than_the_bound_yields_no_span() {
     let index = Index(vec![(0, 1_048_576), (1_048_576, 1_048_676)]);
-    let span =
-        span_extent(&index.items(), 0, 4096, 4_096, u64::MAX, |h| index.span(h)).expect("extent");
-    assert_eq!(
-        span.frames,
-        0..1,
-        "an anchor wider than the read cap must not gather a span",
+    assert!(
+        span_extent(&index.items(), 0, 4096, 4_096, u64::MAX, |h| index.span(h)).is_none(),
+        "an anchor wider than the read cap must not make a span",
     );
 }
 
-/// A budget of zero admits nothing beyond the frame that anchors the span, so
-/// the caller sees a one-frame span and skips it (a single frame is what the
-/// direct read already does well).
+/// A frame wider than the read budget left is left to the direct read too,
+/// even under a wide read cap: a span charged to the budget never exceeds it.
 #[test]
-fn a_zero_extent_bound_yields_a_single_frame_span() {
+fn an_anchor_frame_wider_than_the_budget_left_yields_no_span() {
     let index = Index::at(&[0, 100, 200], 100);
-    let span =
-        span_extent(&index.items(), 0, 4096, 0, u64::MAX, |h| index.span(h)).expect("extent");
-    assert_eq!(
-        span.frames,
-        0..1,
-        "nothing can be merged into a zero-byte budget"
+    assert!(
+        span_extent(&index.items(), 0, 4096, u64::MAX, 99, |h| index.span(h)).is_none(),
+        "a frame wider than the budget left must not make a span",
     );
-    assert_eq!(span.end, 100, "the anchor frame's own end");
+}
+
+/// A budget of zero admits no frame at all: every frame is the direct read's.
+#[test]
+fn a_zero_extent_bound_yields_no_span() {
+    let index = Index::at(&[0, 100, 200], 100);
+    assert!(
+        span_extent(&index.items(), 0, 4096, 0, u64::MAX, |h| index.span(h)).is_none(),
+        "nothing fits a zero-byte bound"
+    );
 }
 
 /// A handle naming a frame its file's index does not have yields no span:
