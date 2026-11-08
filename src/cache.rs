@@ -1184,6 +1184,18 @@ impl Cache {
         stage: FillStage,
     ) {
         let key = blob_record_key(vlog_id, at, index);
+        if matches!(stage, FillStage::Inline | FillStage::InlineTry) {
+            let frame = crate::vlog::blob_file::packed::record_frame(&record, &bytes, value, index);
+            let item = Item::BlobFrame(alloc::sync::Arc::new(frame));
+            if stage == FillStage::Inline {
+                self.data
+                    .insert_with_priority(key, item, Priority::Probation);
+            } else {
+                self.data
+                    .try_insert_with_priority(key, item, Priority::Probation);
+            }
+            return;
+        }
         #[cfg(feature = "std")]
         self.fills.push(
             &self.data,
@@ -1302,6 +1314,11 @@ pub(crate) enum FillStage {
     BuildOnly,
     /// Dropped as taken off the queue: the queue and the worker's wakes alone.
     DropOnly,
+    /// Built and inserted on the read's path, no worker.
+    Inline,
+    /// Built on the read's path and inserted only when the shard's lock is
+    /// free then, no worker.
+    InlineTry,
 }
 
 #[cfg(test)]

@@ -521,7 +521,9 @@ impl<'a> Accessor<'a> {
         // nothing; `ghost` admits as usual but inserts nothing; `admit-room`
         // admits as usual and inserts only into room; `build` admits and
         // leaves the fill to the worker, which builds the entry and drops it;
-        // `push` leaves it to the worker, which drops it as taken.
+        // `push` leaves it to the worker, which drops it as taken; `inline`
+        // admits, builds and inserts on the read's path, no worker;
+        // `inline-try` the same, inserting only when the shard's lock is free.
         #[cfg(feature = "std")]
         let mode = {
             static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -532,6 +534,8 @@ impl<'a> Accessor<'a> {
                 Ok("admit-room") => 4,
                 Ok("build") => 5,
                 Ok("push") => 6,
+                Ok("inline") => 7,
+                Ok("inline-try") => 8,
                 _ => 0,
             })
         };
@@ -541,6 +545,8 @@ impl<'a> Accessor<'a> {
             2 | 4 => crate::cache::FillStage::RoomOnly,
             5 => crate::cache::FillStage::BuildOnly,
             6 => crate::cache::FillStage::DropOnly,
+            7 => crate::cache::FillStage::Inline,
+            8 => crate::cache::FillStage::InlineTry,
             _ => crate::cache::FillStage::Insert,
         };
         if mode == 1 {

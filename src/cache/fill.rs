@@ -62,7 +62,10 @@ impl Fill {
         match self.stage {
             FillStage::RoomOnly => data.insert_if_room(self.key, item, Priority::Probation),
             FillStage::Insert => data.insert_with_priority(self.key, item, Priority::Probation),
-            FillStage::BuildOnly | FillStage::DropOnly => drop(core::hint::black_box(item)),
+            FillStage::BuildOnly
+            | FillStage::DropOnly
+            | FillStage::Inline
+            | FillStage::InlineTry => drop(core::hint::black_box(item)),
         }
     }
 }

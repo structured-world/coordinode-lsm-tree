@@ -609,6 +609,19 @@ where
         shard.write().insert(h, key, value, weight, priority);
     }
 
+    /// Inserts `key` as [`Self::insert_with_priority`] does, only when its
+    /// shard's lock is free now: a caller that must not wait drops the entry.
+    pub(crate) fn try_insert_with_priority(&self, key: K, value: V, priority: Priority) {
+        let weight = self.weighter.weight(&key, &value);
+        if weight > self.per_shard_capacity {
+            return;
+        }
+        let (h, shard) = self.locate(&key);
+        if let Some(mut core) = shard.try_write() {
+            core.insert(h, key, value, weight, priority);
+        }
+    }
+
     /// Inserts the value `merge` derives from what `key` holds now, read and
     /// replaced under one write lock, so a concurrent writer of the key cannot
     /// slip between the two. `merge` returning `None` leaves the entry as it
