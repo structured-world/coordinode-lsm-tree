@@ -525,7 +525,8 @@ impl<'a> Accessor<'a> {
         // admits, builds and inserts on the read's path, no worker;
         // `inline-try` the same, inserting only when the shard's lock is free;
         // `inline-build` builds on the read's path and drops; `inline-lock`
-        // builds, takes the shard's write lock and releases it, and drops.
+        // builds, takes the shard's write lock and releases it, and drops;
+        // `inline-room` builds and inserts on the read's path only into room.
         #[cfg(feature = "std")]
         let mode = {
             static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -540,6 +541,7 @@ impl<'a> Accessor<'a> {
                 Ok("inline-try") => 8,
                 Ok("inline-build") => 9,
                 Ok("inline-lock") => 10,
+                Ok("inline-room") => 11,
                 _ => 0,
             })
         };
@@ -553,6 +555,7 @@ impl<'a> Accessor<'a> {
             8 => crate::cache::FillStage::InlineTry,
             9 => crate::cache::FillStage::InlineBuild,
             10 => crate::cache::FillStage::InlineLock,
+            11 => crate::cache::FillStage::InlineRoom,
             _ => crate::cache::FillStage::Insert,
         };
         if mode == 1 {

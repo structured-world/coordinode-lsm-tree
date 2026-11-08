@@ -66,6 +66,7 @@ impl Fill {
             | FillStage::DropOnly
             | FillStage::Inline
             | FillStage::InlineTry
+            | FillStage::InlineRoom
             | FillStage::InlineBuild
             | FillStage::InlineLock => drop(core::hint::black_box(item)),
         }

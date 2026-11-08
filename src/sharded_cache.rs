@@ -222,12 +222,20 @@ where
     /// Inserts or replaces `key`, evicting to stay within capacity. The shard's
     /// running `small_bytes` / `main_bytes` tallies are kept current throughout
     /// (the sharded wrapper reads them under a shared lock for `weight()`).
-    fn insert(&mut self, hash: u64, key: K, value: V, weight: u64, priority: Priority) {
+    fn insert(
+        &mut self,
+        hash: u64,
+        key: K,
+        value: V,
+        weight: u64,
+        priority: Priority,
+        evicted: &mut Vec<V>,
+    ) {
         if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
             // Replace in place: adjust the owning queue's byte tally by the
             // weight delta.
             let old = slot.weight;
-            slot.value = value;
+            evicted.push(core::mem::replace(&mut slot.value, value));
             slot.weight = weight;
             // Honor a High-priority refresh of a probationary (small) entry:
             // promote it to main with full frequency credit so a re-inserted
@@ -301,7 +309,7 @@ where
             }
         }
 
-        self.evict_to_capacity();
+        self.evict_to_capacity(evicted);
     }
 
     /// Removes `key` if present (lazy tombstone — the stale queue entry is
@@ -324,9 +332,11 @@ where
         self.small_bytes + self.main_bytes
     }
 
-    fn evict_to_capacity(&mut self) {
+    /// Evicts until the shard is within capacity, handing what it evicts to
+    /// `evicted` for the caller to drop once the lock is released.
+    fn evict_to_capacity(&mut self, evicted: &mut Vec<V>) {
         while self.resident_bytes() > self.capacity {
-            if !self.evict_one() {
+            if !self.evict_one(evicted) {
                 // Both queues are out of live entries — nothing left to free
                 // (e.g. a single entry larger than the whole shard capacity).
                 break;
@@ -342,12 +352,12 @@ where
         clippy::if_same_then_else,
         reason = "the branches differ in which queue `||` tries first; the lint reads them as equal"
     )]
-    fn evict_one(&mut self) -> bool {
+    fn evict_one(&mut self, evicted: &mut Vec<V>) -> bool {
         let prefer_small = self.main_bytes == 0 || self.small_bytes >= self.small_target;
         if prefer_small {
-            self.evict_from_small() || self.evict_from_main()
+            self.evict_from_small(evicted) || self.evict_from_main(evicted)
         } else {
-            self.evict_from_main() || self.evict_from_small()
+            self.evict_from_main(evicted) || self.evict_from_small(evicted)
         }
     }
 
@@ -355,7 +365,7 @@ where
     /// (freq > 0) migrates to the main queue; an unused one is evicted and its
     /// key recorded in the ghost queue. Returns `false` if the small queue holds
     /// no live entry.
-    fn evict_from_small(&mut self) -> bool {
+    fn evict_from_small(&mut self, evicted: &mut Vec<V>) -> bool {
         while let Some(key) = self.small.pop_front() {
             let hash = self.hasher.hash_one(&key);
             let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
@@ -380,7 +390,7 @@ where
             } else {
                 // Cold: evict, remember the fingerprint in the ghost queue.
                 if let Ok(entry) = self.map.find_entry(hash, |(k, _)| *k == key) {
-                    entry.remove();
+                    evicted.push(entry.remove().0.1.value);
                 }
                 self.small_bytes -= w;
                 self.push_ghost(hash);
@@ -394,7 +404,7 @@ where
     /// frequency is reinserted at the back with its counter decremented; an
     /// unused one is evicted. Returns `false` if the main queue holds no live
     /// entry.
-    fn evict_from_main(&mut self) -> bool {
+    fn evict_from_main(&mut self, evicted: &mut Vec<V>) -> bool {
         while let Some(key) = self.main.pop_front() {
             let hash = self.hasher.hash_one(&key);
             let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
@@ -407,7 +417,7 @@ where
             } else {
                 let w = slot.weight;
                 if let Ok(entry) = self.map.find_entry(hash, |(k, _)| *k == key) {
-                    entry.remove();
+                    evicted.push(entry.remove().0.1.value);
                 }
                 self.main_bytes -= w;
             }
@@ -449,6 +459,27 @@ where
                 self.take_ghost(old);
             }
         }
+    }
+}
+
+/// Releases an insert's shard lock and drops what the insert evicted.
+/// Experiment: `LSM_CACHE_DEFER_DROP=1` drops them after the lock is
+/// released, so no read of the shard waits behind their frees; otherwise
+/// before, as the eviction did.
+fn release<G, V>(guard: G, evicted: Vec<V>) {
+    #[cfg(feature = "std")]
+    let defer = {
+        static DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DEFER.get_or_init(|| std::env::var("LSM_CACHE_DEFER_DROP").as_deref() == Ok("1"))
+    };
+    #[cfg(not(feature = "std"))]
+    let defer = true;
+    if defer {
+        drop(guard);
+        drop(evicted);
+    } else {
+        drop(evicted);
+        drop(guard);
     }
 }
 
@@ -598,10 +629,12 @@ where
     pub(crate) fn insert_if_room(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
         let (h, shard) = self.locate(&key);
+        let mut evicted = Vec::new();
         let mut core = shard.write();
         if core.resident_bytes() + weight <= core.capacity {
-            core.insert(h, key, value, weight, priority);
+            core.insert(h, key, value, weight, priority, &mut evicted);
         }
+        release(core, evicted);
     }
 
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
@@ -622,7 +655,10 @@ where
             return;
         }
         let (h, shard) = self.locate(&key);
-        shard.write().insert(h, key, value, weight, priority);
+        let mut evicted = Vec::new();
+        let mut core = shard.write();
+        core.insert(h, key, value, weight, priority, &mut evicted);
+        release(core, evicted);
     }
 
     /// Inserts `key` as [`Self::insert_with_priority`] does, only when its
@@ -634,7 +670,9 @@ where
         }
         let (h, shard) = self.locate(&key);
         if let Some(mut core) = shard.try_write() {
-            core.insert(h, key, value, weight, priority);
+            let mut evicted = Vec::new();
+            core.insert(h, key, value, weight, priority, &mut evicted);
+            release(core, evicted);
         }
     }
 
@@ -661,7 +699,9 @@ where
         if weight > self.per_shard_capacity {
             return;
         }
-        core.insert(h, key, value, weight, Priority::Normal);
+        let mut evicted = Vec::new();
+        core.insert(h, key, value, weight, Priority::Normal, &mut evicted);
+        release(core, evicted);
     }
 
     /// Removes `key` if present.

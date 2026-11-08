@@ -1188,6 +1188,7 @@ impl Cache {
             stage,
             FillStage::Inline
                 | FillStage::InlineTry
+                | FillStage::InlineRoom
                 | FillStage::InlineBuild
                 | FillStage::InlineLock
         ) {
@@ -1201,6 +1202,9 @@ impl Cache {
                 FillStage::InlineTry => {
                     self.data
                         .try_insert_with_priority(key, item, Priority::Probation);
+                }
+                FillStage::InlineRoom => {
+                    self.data.insert_if_room(key, item, Priority::Probation);
                 }
                 FillStage::InlineLock => {
                     self.data.lock_only(&key);
@@ -1333,6 +1337,9 @@ pub(crate) enum FillStage {
     /// Built on the read's path and inserted only when the shard's lock is
     /// free then, no worker.
     InlineTry,
+    /// Built on the read's path and inserted only when its shard has room
+    /// for it then, no worker.
+    InlineRoom,
     /// Built on the read's path and dropped, no worker.
     InlineBuild,
     /// Built on the read's path, its shard's write lock taken and released,
