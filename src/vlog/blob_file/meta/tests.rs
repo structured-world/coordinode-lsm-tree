@@ -48,6 +48,27 @@ fn test_blob_file_meta_retired_version_rejected() {
     }
 }
 
+/// The refusal of a blob file of an earlier layout names a remedy an operator
+/// can follow: the offline converter does not rewrite blob files, so it names
+/// the release that wrote the store rather than the converter.
+#[test]
+fn an_earlier_blob_layout_names_the_release_that_wrote_it() {
+    let rendered = crate::Error::UnsupportedFormat {
+        part: crate::FormatPart::BlobFiles,
+        found: Some(META_VERSION - 1),
+        expected: META_VERSION,
+    }
+    .to_string();
+    assert!(
+        rendered.contains("release that wrote it"),
+        "the remedy: {rendered}"
+    );
+    assert!(
+        !rendered.contains("run the offline converter"),
+        "the converter does not rewrite blob files: {rendered}"
+    );
+}
+
 /// Build a metadata block that is structurally valid but omits a required
 /// property (`compression`).  `from_slice` must return `Err`, not panic.
 #[test]

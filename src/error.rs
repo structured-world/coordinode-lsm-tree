@@ -57,6 +57,8 @@ pub enum Error {
     ///
     /// The store is intact and its data is not lost — the table has to be
     /// rewritten by the offline converter before this release can open it.
+    /// Blob files of an earlier layout are not rewritten by it: a store
+    /// holding them is opened with the release that wrote it.
     /// Reported when the table is opened rather than from inside the first
     /// read, so an operator learns what to do instead of seeing a parse fail
     /// somewhere under a `get`.
@@ -679,6 +681,15 @@ impl core::fmt::Display for Error {
             match found {
                 Some(v) => write!(f, "format {v}")?,
                 None => write!(f, "the original unstamped format")?,
+            }
+            // The offline converter rewrites tables, not blob files.
+            if *part == FormatPart::BlobFiles {
+                return write!(
+                    f,
+                    ", but this release reads only format {expected}. The data is \
+                     intact: the offline converter does not rewrite blob files, so \
+                     open the store with the release that wrote it.",
+                );
             }
             return write!(
                 f,
