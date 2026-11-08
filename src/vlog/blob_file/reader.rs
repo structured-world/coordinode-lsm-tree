@@ -124,7 +124,11 @@ impl<'a> Reader<'a> {
         check_key(&frame, vhandle.index, key)?;
         let value_len = frame.list.first().map_or(0, |e| e.value_len);
         let source = match frame.header.kind {
-            FrameKind::Block => CopySource::Value(value_in(&frame, vhandle.index, key)?),
+            // A chunk lists no entry, so the key check above already refused
+            // one; `value_in` refuses it again for any other caller.
+            FrameKind::Block | FrameKind::Chunk => {
+                CopySource::Value(value_in(&frame, vhandle.index, key)?)
+            }
             FrameKind::Single => CopySource::Frames {
                 frames: alloc::vec![first],
                 value_len,
@@ -142,7 +146,6 @@ impl<'a> Reader<'a> {
                 }
                 CopySource::Frames { frames, value_len }
             }
-            FrameKind::Chunk => return Err(crate::Error::InvalidHeader("Blob")),
         };
         Ok((source, read))
     }

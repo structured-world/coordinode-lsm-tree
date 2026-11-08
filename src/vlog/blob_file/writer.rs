@@ -73,12 +73,6 @@ impl FrameSizes {
     };
 }
 
-impl Default for FrameSizes {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
 /// How full a block must be before the next value may close it, in percent of
 /// the target. Below it, a value joins the block even past the target, so a
 /// block never closes small for want of room for one more value.

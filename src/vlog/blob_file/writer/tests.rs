@@ -8,6 +8,40 @@ const SIZES: FrameSizes = FrameSizes {
     chunk_size: 300,
 };
 
+/// A frame index decodes only whole and consistent: one too short for its
+/// digest, one failing its digest, one whose count disagrees with its length
+/// or whose starts do not rise, each under a digest that holds, are refused.
+#[test]
+fn a_frame_index_that_does_not_hold_is_refused() {
+    let refused = |bytes: &[u8]| {
+        matches!(
+            decode_frame_index(bytes),
+            Err(crate::Error::InvalidHeader(_))
+        )
+    };
+    let sealed = |body: &[u8]| {
+        let mut out = body.to_vec();
+        out.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(body).to_le_bytes());
+        out
+    };
+    let index = encode_frame_index(&[0, 40, 90], 120);
+    assert_eq!(
+        &*decode_frame_index(&index).expect("whole"),
+        &[0, 40, 90, 120]
+    );
+
+    assert!(refused(&index[..4]), "shorter than its digest");
+    let mut flipped = index.clone();
+    flipped[5] ^= 1;
+    assert!(refused(&flipped), "a digest that fails");
+    let mut count = index[..index.len() - 8].to_vec();
+    count[0] = 4;
+    assert!(refused(&sealed(&count)), "a count its length does not hold");
+    let falling = encode_frame_index(&[0, 90, 40], 120);
+    assert!(refused(&falling), "starts that do not rise");
+    assert!(refused(&sealed(&[1, 2])), "no room for a count");
+}
+
 /// The frames of the finished file at `path`, decoded, by the index `frames`.
 fn frames_of(path: &Path, frames: &[u64]) -> Vec<DecodedFrame> {
     let bytes = std::fs::read(path).expect("the file reads");

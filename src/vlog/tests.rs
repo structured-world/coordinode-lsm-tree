@@ -110,6 +110,37 @@ fn recover_blob_file_on_non_blob_file_errors() {
     assert!(result.is_err(), "recovering a non-blob file must fail");
 }
 
+/// A blob file of this layout missing its frame index, or missing its
+/// metadata, is damage the recovery reports, never a file it opens.
+#[test]
+fn a_blob_file_missing_a_section_is_unrecoverable() -> crate::Result<()> {
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    for section in [&b"frames"[..], b"meta"] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("7");
+        let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+        writer.write(b"key", 0, b"value")?;
+        let (_, checksum, _) = writer.finish()?;
+        crate::test_forge::forge_section_omitted(&path, section)?;
+
+        let result = recover_blob_file(
+            path.as_path(),
+            7,
+            checksum,
+            0,
+            &fs,
+            #[cfg(zstd_any)]
+            &no_dicts(),
+        );
+        assert!(
+            matches!(result, Err(crate::Error::Unrecoverable)),
+            "a file without its {} section",
+            String::from_utf8_lossy(section),
+        );
+    }
+    Ok(())
+}
+
 /// The views a tight-space relocation restricts a blob file to one after
 /// another punch only above what the view before finished, from the aligned
 /// edge under it, instead of the whole relocated prefix on every slice.

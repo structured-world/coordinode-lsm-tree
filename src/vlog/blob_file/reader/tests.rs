@@ -235,6 +235,65 @@ fn chunks_are_checked_without_gathering_the_value() -> crate::Result<()> {
     Ok(())
 }
 
+/// A head is not a value a frame holds, and a range running past a chunked
+/// value's end is not gathered short: both are refused.
+#[test]
+fn a_head_holds_no_value_and_a_range_past_the_value_is_refused() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let value = vec![9_u8; 700];
+    let (blob_file, handles) = write(&folder, CompressionType::None, &[(b"big", &value)])?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    let at = handles[0].frame;
+    let head = reader.read_frame(at, &mut 0)?;
+    assert!(value_in(&head, 0, b"big").is_err(), "a head holds no value");
+
+    let chunks = (at + 1..at + 4)
+        .map(|frame| reader.read_frame(frame, &mut 0).map(Box::new))
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(
+        assemble(&head, &chunks, Some(&(0..701))).is_err(),
+        "a byte past the value"
+    );
+    assert_eq!(&*assemble(&head, &chunks, None)?, &value[..]);
+    Ok(())
+}
+
+/// A copy of a chunked value checks each frame it takes is a chunk: a head
+/// naming one chunk more than were written finds the next value's frame in
+/// its place, and the copy is refused rather than carrying that frame along.
+#[test]
+fn a_copy_refuses_a_frame_that_is_not_its_value_s_chunk() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let (blob_file, handles) = write(
+        &folder,
+        CompressionType::None,
+        &[(b"big", &[9; 700]), (b"next", &[1; 150])],
+    )?;
+    let (start, end) = blob_file
+        .frame_span(handles[0].frame)
+        .expect("the head's frame");
+    let (start, end) = (start as usize, end as usize);
+    let mut bytes = std::fs::read(&blob_file.0.path)?;
+    {
+        // A thousand bytes in four chunks of 300: one more than written.
+        let head = &mut bytes[start..end];
+        head[40 + 10..40 + 14].copy_from_slice(&1000_u32.to_le_bytes());
+        let table = head.len() - 4;
+        head[table..].copy_from_slice(&4_u32.to_le_bytes());
+        crate::vlog::blob_file::frame::reseal(head);
+    }
+    std::fs::write(&blob_file.0.path, &bytes)?;
+
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    assert!(matches!(
+        reader.copy_source(b"big", &handles[0]),
+        Err(crate::Error::InvalidHeader("Blob"))
+    ));
+    Ok(())
+}
+
 /// A copy takes a value with frames of its own as those frames, each one
 /// checked, and a value out of a block as the value; the bytes it reports
 /// read are what it read.
