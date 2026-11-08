@@ -3263,12 +3263,55 @@ fn recover_blob_files(
                 unreadable.push((blob_path, e.to_string()));
             };
 
+        // IDENTITY and FORMAT before anything else: the metadata carries the
+        // file's layout version, and a file of an earlier layout, which lists
+        // no frame index, must be refused as a format this engine does not
+        // read (propagated, the file left in place) before the frontier walk
+        // reads its missing index as damage and sets the file aside.
+        //
+        // The id under which this file will be published comes from its
+        // FILENAME, but the metadata records the id it was written as. A
+        // mismatch means a renamed or swapped file — not damaged content —
+        // and publishing it under the filename's id would resolve existing SST
+        // handles into foreign frames (a read fails on the key cross-check,
+        // or, when the foreign frame happens to hold the same key, silently
+        // serves another generation's value). Salvage is the WRONG remedy here
+        // (it would re-emit the foreign records under the filename's id,
+        // laundering the swap); set the file aside.
+        // The metadata alone, not the frame index: the identity check needs
+        // the stored id and the dictionary below the compression descriptor,
+        // and a file whose index rotted is salvaged along its frame chain
+        // rather than set aside. Same transient/persistent split as every
+        // other per-file step: an unreadable meta section sets THIS file
+        // aside, never the repair.
+        let meta = match crate::vlog::read_blob_meta(&blob_path, &*config.fs, blob_id) {
+            Ok(meta) => meta,
+            Err(e) if is_environmental(&e) => return Err(e),
+            Err(e) => {
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+                continue;
+            }
+        };
+        let stored = meta.id;
+        if stored != blob_id {
+            let e = crate::Error::InvalidHeader(
+                "blob file's stored metadata id disagrees with its file name",
+            );
+            log::warn!(
+                "blob file at {}: metadata records id {stored}, file name says \
+                 {blob_id} — a renamed or swapped file; setting it aside",
+                blob_path.display(),
+            );
+            discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+            continue;
+        }
+
         // The committed frontier, when the manifest loaded cleanly, is exact
         // and free: no geometry walk, and no dependence on the backend being
         // able to attribute zeros to a hole (which, unanswered, reports a
         // punched file WHOLE — publishing handles that dereference the hole).
-        // Everything downstream — identity, frame validation, the handle
-        // rewrite — runs on it exactly as on a derived one.
+        // Everything downstream — frame validation, the handle rewrite — runs
+        // on it exactly as on a derived one.
         let frontier = match resolve_frontier(blob_id, &blob_path) {
             Ok(BlobFrontier::Whole) => 0,
             Ok(BlobFrontier::Punched(f)) => f,
@@ -3311,43 +3354,6 @@ fn recover_blob_files(
                 continue;
             }
         };
-
-        // IDENTITY before content: the id under which this file will be
-        // published comes from its FILENAME, but the metadata records the id
-        // it was written as. A mismatch means a renamed or swapped file — not
-        // damaged content — and publishing it under the filename's id would
-        // resolve existing SST handles into foreign frames (a read fails on
-        // the key cross-check, or, when the foreign frame happens to hold the
-        // same key, silently serves another generation's value). Salvage is
-        // the WRONG remedy here (it would re-emit the foreign records under
-        // the filename's id, laundering the swap); set the file aside.
-        // The metadata alone, not the frame index: the identity check needs
-        // the stored id and the dictionary below the compression descriptor,
-        // and a file whose index rotted is salvaged along its frame chain
-        // rather than set aside. Same transient/persistent split as every
-        // other per-file step: an unreadable meta section sets THIS file
-        // aside, never the repair.
-        let meta = match crate::vlog::read_blob_meta(&blob_path, &*config.fs, blob_id) {
-            Ok(meta) => meta,
-            Err(e) if is_environmental(&e) => return Err(e),
-            Err(e) => {
-                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
-                continue;
-            }
-        };
-        let stored = meta.id;
-        if stored != blob_id {
-            let e = crate::Error::InvalidHeader(
-                "blob file's stored metadata id disagrees with its file name",
-            );
-            log::warn!(
-                "blob file at {}: metadata records id {stored}, file name says \
-                 {blob_id} — a renamed or swapped file; setting it aside",
-                blob_path.display(),
-            );
-            discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
-            continue;
-        }
 
         // Validate the live frame range BEFORE recording a digest: hashing
         // damaged frames would restamp (launder) the corruption past every

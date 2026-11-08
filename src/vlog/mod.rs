@@ -454,7 +454,10 @@ pub(crate) fn read_meta_and_frames(
     id: BlobFileId,
 ) -> crate::Result<(Metadata, Arc<[u64]>)> {
     let (meta, frames_at) = read_meta_and_index_at(file, id)?;
-    let (pos, len) = frames_at?;
+    let Some((pos, len)) = frames_at else {
+        log::error!("frames section in blob file #{id} is missing (file may be corrupted)");
+        return Err(crate::Error::Unrecoverable);
+    };
     let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
     let frames =
         blob_file::writer::decode_frame_index(&crate::file::read_exact(&**file, pos, len)?)?;
@@ -473,25 +476,22 @@ pub(crate) fn read_blob_meta(path: &Path, fs: &dyn Fs, id: BlobFileId) -> crate:
     read_meta_and_index_at(&mut file, id).map(|(meta, _)| meta)
 }
 
-/// The metadata, and where the frame index lies when the file lists one.
+/// The metadata, and where the frame index lies when the file lists one: a
+/// missing index is reported by the caller that needs it, after the metadata
+/// has said whether the file is of this layout at all.
 fn read_meta_and_index_at(
     file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
     id: BlobFileId,
-) -> crate::Result<(Metadata, crate::Result<(u64, u64)>)> {
+) -> crate::Result<(Metadata, Option<(u64, u64)>)> {
     let (meta_at, frames_at) = {
         let reader = crate::sfa::Reader::from_reader(file)?;
         let toc = reader.toc();
-        let section = |name: &'static str| {
-            toc.section(name.as_bytes())
-                .map(|entry| (entry.pos(), entry.len()))
-                .ok_or_else(|| {
-                    log::error!(
-                        "{name} section in blob file #{id} is missing (file may be corrupted)"
-                    );
-                    crate::Error::Unrecoverable
-                })
+        let section = |name: &[u8]| toc.section(name).map(|entry| (entry.pos(), entry.len()));
+        let Some(meta_at) = section(b"meta") else {
+            log::error!("meta section in blob file #{id} is missing (file may be corrupted)");
+            return Err(crate::Error::Unrecoverable);
         };
-        (section("meta")?, section("frames"))
+        (meta_at, section(b"frames"))
     };
     let (pos, len) = meta_at;
     let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
