@@ -9355,6 +9355,23 @@ impl Table {
             });
         }
 
+        // The same refusal for a table whose blob links are of an earlier
+        // layout: its records fail the section's shape check, which the
+        // recovery paths grade as damage, so a repair would drop the table and
+        // its values. Gated on the table linking a blob file: one without
+        // links has no records to misread. Raised whether or not the tree
+        // separates values, since a repair configured without separation never
+        // reaches the blob files' own refusal.
+        if regions.linked_blob_files.is_some()
+            && metadata.blob_format != Some(crate::vlog::blob_file::meta::META_VERSION)
+        {
+            return Err(crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::BlobFiles,
+                found: metadata.blob_format,
+                expected: crate::vlog::blob_file::meta::META_VERSION,
+            });
+        }
+
         // Resolve the dictionary this table was written against, by the id the
         // table itself records. Fail-fast: a tree that does not hold that id
         // cannot decompress a single data block, so say so here rather than on

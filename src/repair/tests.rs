@@ -6998,6 +6998,109 @@ fn repairing_a_columnar_table_in_a_superseded_layout_refuses_and_keeps_it() -> c
     Ok(())
 }
 
+/// A table whose blob links are in an earlier layout is a format this engine
+/// does not read, even under a repair that does not separate values and so
+/// never reaches the blob files' own refusal: the repair refuses it as such
+/// and leaves it as it found it. Graded by its links' shape, the table was
+/// damaged, left out of the rebuilt manifest and removed with its values.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repairing_a_table_with_blob_links_of_an_earlier_layout_refuses_and_keeps_it() -> crate::Result<()>
+{
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?;
+        for i in 0..8_u32 {
+            tree.insert(format!("k{i:04}"), vec![b'a'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    remove_manifest(&StdFs, dir.path())?;
+
+    // The links rewritten as the release before wrote them: each record
+    // without the block-entry bytes this layout adds after the on-disk bytes.
+    let sst = dir.path().join(crate::file::TABLES_FOLDER).join("0");
+    let links = {
+        let reader = crate::sfa::Reader::new(&sst)?;
+        let section = reader
+            .toc()
+            .section(b"linked_blob_files")
+            .expect("a table of separated values links its blob file");
+        let bytes = std::fs::read(&sst)?;
+        let at = usize::try_from(section.pos()).expect("fits");
+        let len = usize::try_from(section.len()).expect("fits");
+        crate::table::writer::parse_linked_blob_files(
+            bytes.get(at..at + len).expect("the section is in the file"),
+        )?
+    };
+    let mut earlier = Vec::new();
+    earlier.extend_from_slice(&u32::try_from(links.len()).expect("fits").to_le_bytes());
+    for link in &links {
+        earlier.extend_from_slice(&link.blob_file_id.to_le_bytes());
+        earlier.extend_from_slice(&(link.len as u64).to_le_bytes());
+        earlier.extend_from_slice(&link.bytes.to_le_bytes());
+        earlier.extend_from_slice(&link.on_disk_bytes.to_le_bytes());
+        for key in [&link.first_key, &link.last_key] {
+            earlier.extend_from_slice(&u16::try_from(key.len()).expect("fits").to_le_bytes());
+            earlier.extend_from_slice(key);
+        }
+    }
+    crate::test_forge::forge_rename_and_replace_section(
+        &sst,
+        (b"linked_blob_files", b"linked_blob_files"),
+        &earlier,
+        (0, None),
+    )?;
+    // The stamp a table of that release carries for its links' layout: none
+    // at all, which reads as the version before this one.
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst,
+        b"descriptor#blob_format",
+        &[crate::vlog::blob_file::meta::META_VERSION - 1],
+    )?;
+    let before = std::fs::read(&sst)?;
+
+    let err = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()
+    {
+        Ok(report) => panic!(
+            "repair must refuse a table whose links it cannot read rather than rebuild \
+             without it: {report:?}",
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::BlobFiles,
+                ..
+            }
+        ),
+        "repair must propagate the format refusal, not grade the table as damaged: {err:?}",
+    );
+    assert_eq!(
+        std::fs::read(&sst)?,
+        before,
+        "repair must leave the refused table exactly as it found it",
+    );
+    Ok(())
+}
+
 /// A blob file of an earlier layout is a format this engine does not read: a
 /// repair refuses it as such and leaves it exactly as it found it, never
 /// grading it damaged and setting it aside with the values it holds.

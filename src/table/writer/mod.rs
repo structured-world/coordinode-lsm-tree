@@ -5880,6 +5880,15 @@ fn encode_meta_payload(
             "descriptor#filter_format",
             &[crate::table::filter::ribbon::burr::FORMAT_VERSION],
         ),
+        // Which blob-file layout the `linked_blob_files` records describe,
+        // stamped for the same reason: records of an earlier layout fail the
+        // section's shape check, and repair would grade that as damage and
+        // drop the table. A table written before the stamp existed carries
+        // records without the block-entry bytes.
+        meta(
+            "descriptor#blob_format",
+            &[crate::vlog::blob_file::meta::META_VERSION],
+        ),
         // Authenticated positional-delete count: the `delete_bitmap` section is
         // optional (omitted when empty), so this count lets a reader detect a
         // re-stamped TOC that hid a non-empty bitmap. A `> 0` count with no
