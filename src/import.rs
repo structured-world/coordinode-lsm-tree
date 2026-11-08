@@ -732,6 +732,8 @@ pub struct BlobLink {
     pub bytes: u64,
     /// Bytes of those objects, as stored.
     pub on_disk_bytes: u64,
+    /// The share of `on_disk_bytes` stored as entries of shared blocks.
+    pub block_bytes: u64,
 }
 
 impl RecordedTable {
@@ -745,6 +747,7 @@ impl RecordedTable {
                 len: link.len,
                 bytes: link.bytes,
                 on_disk_bytes: link.on_disk_bytes,
+                block_bytes: link.block_bytes,
             })
             .collect();
         blob_links.sort_unstable_by_key(|link| link.blob_file_id);

@@ -731,6 +731,8 @@ fn convert_table(
                     len: link.len,
                     bytes: link.bytes,
                     on_disk_bytes: link.on_disk_bytes,
+                    // 5.x stored every value in a frame of its own.
+                    block_bytes: 0,
                 })
                 .collect();
             links.sort_unstable_by_key(|link| link.blob_file_id);
@@ -879,6 +881,7 @@ fn records_match(
                 && link.len <= source.len
                 && link.bytes <= source.bytes
                 && link.on_disk_bytes <= source.on_disk_bytes
+                && link.block_bytes <= source.block_bytes
         })
     });
     let seqnos_fit = expected.seqnos.0 <= recorded.seqnos.0
