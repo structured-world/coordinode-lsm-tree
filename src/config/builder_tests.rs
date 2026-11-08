@@ -1,6 +1,45 @@
 use super::*;
 use crate::SequenceNumberCounter;
 
+/// The frame sizes a blob file is written with keep every frame a reader can
+/// decode: a chunk within the frame cap, and a block target within the chunk
+/// size, so a value above the chunk size is always chunked, and within half
+/// the cap, so a block, which takes values below its target until 90% full,
+/// never passes the cap. Unbounded, a large block size failed every flush.
+#[test]
+fn blob_frame_sizes_keep_every_frame_within_the_cap() {
+    use crate::vlog::blob_file::writer::MAX_DECOMPRESSION_SIZE;
+
+    let Ok(cap) = u32::try_from(MAX_DECOMPRESSION_SIZE) else {
+        panic!("the cap fits u32");
+    };
+    let Some(huge) = core::num::NonZeroU32::new(u32::MAX) else {
+        panic!("non-zero");
+    };
+
+    let sizes = KvSeparationOptions::default()
+        .block_size(u32::MAX)
+        .frame_sizes();
+    assert_eq!(
+        sizes.block_target, sizes.chunk_size,
+        "a block never takes a value the chunk size splits"
+    );
+
+    let sizes = KvSeparationOptions::default()
+        .block_size(u32::MAX)
+        .chunk_size(huge)
+        .frame_sizes();
+    assert_eq!(sizes.chunk_size, cap, "a chunk is one frame");
+    assert_eq!(sizes.block_target, cap / 2, "a block stays below the cap");
+
+    let sizes = KvSeparationOptions::default().frame_sizes();
+    assert_eq!(
+        (sizes.block_target, sizes.chunk_size),
+        (16 * 1024, 256 * 1024),
+        "the defaults are within every bound"
+    );
+}
+
 #[test]
 fn restart_interval_policies_can_be_overridden_independently() {
     let folder = match tempfile::tempdir() {

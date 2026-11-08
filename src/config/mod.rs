@@ -454,7 +454,8 @@ impl KvSeparationOptions {
     /// every value up to [`Self::chunk_size`] is compressed on its own.
     ///
     /// Only new blob files take it; a file records the frames it was written
-    /// with.
+    /// with. A size above [`Self::chunk_size`] or 128 MiB is held to the
+    /// smaller of the two, so a block is always one frame a reader decodes.
     ///
     /// Defaults to 16 KiB.
     ///
@@ -482,7 +483,7 @@ impl KvSeparationOptions {
     /// is one frame.
     ///
     /// Only new blob files take it; a file records the frames it was written
-    /// with.
+    /// with. A size above 256 MiB, the most one frame holds, is held to it.
     ///
     /// Defaults to 256 KiB.
     ///
@@ -502,12 +503,23 @@ impl KvSeparationOptions {
         self
     }
 
-    /// How the blob files written now size their frames.
+    /// How the blob files written now size their frames, bounded so every
+    /// frame decodes: a chunk is one frame, so it is held within the frame
+    /// cap; a block takes values below its target until it is 90% full, so
+    /// its payload stays under twice the target, which is held within half
+    /// the cap, and within the chunk size, so a value the chunk size splits
+    /// never shares a block. Computed once per writer, not per value.
     #[must_use]
     pub(crate) fn frame_sizes(&self) -> crate::vlog::blob_file::writer::FrameSizes {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the cap, 256 MiB, fits u32"
+        )]
+        let cap = crate::vlog::blob_file::writer::MAX_DECOMPRESSION_SIZE as u32;
+        let chunk_size = self.chunk_size.get().min(cap);
         crate::vlog::blob_file::writer::FrameSizes {
-            block_target: self.block_size,
-            chunk_size: self.chunk_size.get(),
+            block_target: self.block_size.min(chunk_size).min(cap / 2),
+            chunk_size,
         }
     }
 
