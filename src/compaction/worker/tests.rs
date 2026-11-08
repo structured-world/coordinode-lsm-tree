@@ -3783,6 +3783,7 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
     let relocated = super::Relocated {
         stale: &stale,
         target_size: 48 * 1024,
+        chunk_size: blob_reloc_kv_options().frame_sizes().chunk_size,
         file_groups: codecs.len() as u64 * u64::from(blob_reloc_kv_options().lifetime_groups.get()),
     };
     let slices = super::tight_slices(
@@ -5415,11 +5416,11 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
 
     let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
     assert_eq!(
-        super::stale_frame_bytes(&item, &stale)?,
-        super::frame_bytes(&first) + super::frame_bytes(&second),
+        super::stale_frame_bytes(&item, &stale, u32::MAX)?,
+        super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
     );
     let plain = InternalValue::from_components(*key, b"v".to_vec(), 2, crate::ValueType::Value);
-    assert_eq!(super::stale_frame_bytes(&plain, &stale)?, 0);
+    assert_eq!(super::stale_frame_bytes(&plain, &stale, u32::MAX)?, 0);
     Ok(())
 }
 
@@ -5443,11 +5444,61 @@ fn frame_bytes_add_a_header_only_to_a_value_that_shares_a_block() {
         stored,
     };
     let header = crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64;
-    assert_eq!(super::frame_bytes(&indirection(Stored::Frames(140))), 140);
     assert_eq!(
-        super::frame_bytes(&indirection(Stored::InBlock(114))),
+        super::frame_bytes(&indirection(Stored::Frames(140)), u32::MAX),
+        140
+    );
+    assert_eq!(
+        super::frame_bytes(&indirection(Stored::InBlock(114)), u32::MAX),
         114 + header
     );
+}
+
+/// A value that shares a block was written below the block size of its day;
+/// reopened with a smaller chunk size, its relocated copy is split into a head
+/// and chunks, a header each. Its bound covers what the writer then writes:
+/// one header more alone would let a tight-space slice outgrow its room.
+#[test]
+fn frame_bytes_cover_a_block_value_the_copy_splits_into_chunks() -> crate::Result<()> {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::{ValueHandle, blob_file::writer::FrameSizes};
+
+    let dir = tempfile::tempdir()?;
+    let key = b"key";
+    let value = vec![b'v'; 16 * 1_024];
+    let chunk_size = 4 * 1_024;
+    let mut writer =
+        crate::vlog::blob_file::writer::Writer::new(dir.path().join("0"), 0, 0, &crate::fs::StdFs)?
+            .use_frame_sizes(FrameSizes {
+                block_target: chunk_size,
+                chunk_size,
+            });
+    let written = writer.write(key, 0, &value)?.stored.bytes();
+    writer.finish()?;
+
+    let Ok(entry) =
+        u32::try_from(crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + key.len() + value.len())
+    else {
+        panic!("a block entry fits u32");
+    };
+    let Ok(size) = u32::try_from(value.len()) else {
+        panic!("the value fits u32");
+    };
+    let in_block = BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 7,
+            frame: 0,
+            index: 0,
+        },
+        size,
+        stored: Stored::InBlock(entry),
+    };
+    let bound = super::frame_bytes(&in_block, chunk_size);
+    assert!(
+        bound >= u64::from(written),
+        "bound {bound} under the {written} bytes the copy writes"
+    );
+    Ok(())
 }
 
 /// The blocks a tight-space pass reads to cut its slices are the run's reads:
