@@ -73,6 +73,69 @@ impl Fill {
     }
 }
 
+/// Experiment: with `LSM_FILL_TIMING=1`, how long the inline fills of one
+/// cache took, in buckets, printed as the cache drops.
+pub(crate) struct Timing {
+    on: bool,
+    /// Fills under 1, 2, 5, 10, 20 us and the rest.
+    buckets: [core::sync::atomic::AtomicU64; 6],
+    total_ns: core::sync::atomic::AtomicU64,
+    max_ns: core::sync::atomic::AtomicU64,
+}
+
+impl Timing {
+    pub(crate) fn new() -> Self {
+        Self {
+            on: std::env::var("LSM_FILL_TIMING").as_deref() == Ok("1"),
+            buckets: Default::default(),
+            total_ns: core::sync::atomic::AtomicU64::new(0),
+            max_ns: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn start(&self) -> Option<std::time::Instant> {
+        self.on.then(std::time::Instant::now)
+    }
+
+    pub(crate) fn record(&self, started: Option<std::time::Instant>) {
+        let Some(started) = started else {
+            return;
+        };
+        let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let [b1, b2, b5, b10, b20, rest] = &self.buckets;
+        let bucket = match ns {
+            0..1_000 => b1,
+            1_000..2_000 => b2,
+            2_000..5_000 => b5,
+            5_000..10_000 => b10,
+            10_000..20_000 => b20,
+            _ => rest,
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Timing {
+    fn drop(&mut self) {
+        if !self.on {
+            return;
+        }
+        let [b1, b2, b5, b10, b20, rest] =
+            self.buckets.each_ref().map(|b| b.load(Ordering::Relaxed));
+        let n = b1 + b2 + b5 + b10 + b20 + rest;
+        if n == 0 {
+            return;
+        }
+        eprintln!(
+            "fill timing: {n} fills, mean {} ns, max {} ns, <1us {b1} <2us {b2} <5us {b5} <10us {b10} <20us {b20} >=20us {rest}",
+            self.total_ns.load(Ordering::Relaxed) / n,
+            self.max_ns.load(Ordering::Relaxed),
+        );
+    }
+}
+
 /// What a read and the worker share.
 struct Shared {
     queue: Mutex<Vec<Fill>>,

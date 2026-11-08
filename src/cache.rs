@@ -166,6 +166,9 @@ pub struct Cache {
     /// The fills a point read leaves off its path (see [`fill`]).
     #[cfg(feature = "std")]
     fills: fill::Fills,
+    /// Experiment: how long the inline fills take.
+    #[cfg(feature = "std")]
+    timing: fill::Timing,
     /// When false, the row cache (decoded point-read results) is off, so
     /// `get_row` always misses and `insert_row` is a no-op. Blocks / blobs are
     /// cached regardless.
@@ -427,6 +430,8 @@ impl Cache {
             )),
             #[cfg(feature = "std")]
             fills: fill::Fills::new(),
+            #[cfg(feature = "std")]
+            timing: fill::Timing::new(),
             row_cache_enabled: true,
             metadata_priority: true,
             loads: crate::inflight::InflightLoads::new(
@@ -1192,6 +1197,8 @@ impl Cache {
                 | FillStage::InlineBuild
                 | FillStage::InlineLock
         ) {
+            #[cfg(feature = "std")]
+            let started = self.timing.start();
             let frame = crate::vlog::blob_file::packed::record_frame(&record, &bytes, value, index);
             let item = Item::BlobFrame(alloc::sync::Arc::new(frame));
             match stage {
@@ -1212,6 +1219,8 @@ impl Cache {
                 }
                 _ => drop(core::hint::black_box(item)),
             }
+            #[cfg(feature = "std")]
+            self.timing.record(started);
             return;
         }
         #[cfg(feature = "std")]
