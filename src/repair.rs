@@ -2285,6 +2285,19 @@ fn derive_blob_frontier(
         return Ok(BlobFrontier::Whole);
     }
 
+    // Fast path: an unpunched file's first frame magic (non-zero) sits at the
+    // data start. Taken before the frame index is read, so a file whose index
+    // rotted is still reported whole and reaches salvage, which walks its
+    // frame chain.
+    let magic = crate::file::read_exact(
+        &*file,
+        data_start,
+        crate::vlog::blob_file::frame::FRAME_MAGIC.len(),
+    )?;
+    if magic.iter().any(|b| *b != 0) {
+        return Ok(BlobFrontier::Whole);
+    }
+
     // A punch ends on a frame boundary, so the frames the file's index places
     // are the only candidates for the frontier.
     let index_len =
@@ -2335,17 +2348,6 @@ fn derive_blob_frontier(
         }
         Ok(fs.extent_contains_hole(path, from, to - from)? == Some(true))
     };
-
-    // Fast path: an unpunched file's first frame magic (non-zero) sits at the
-    // data start.
-    let magic = crate::file::read_exact(
-        &*file,
-        data_start,
-        crate::vlog::blob_file::frame::FRAME_MAGIC.len(),
-    )?;
-    if magic.iter().any(|b| *b != 0) {
-        return Ok(BlobFrontier::Whole);
-    }
 
     // The last structure-anchored frontier: committed only once a frame has
     // decoded cleanly at a zeroed run's end. Zero = no run was ever anchored,
@@ -3319,29 +3321,21 @@ fn recover_blob_files(
         // same key, silently serves another generation's value). Salvage is
         // the WRONG remedy here (it would re-emit the foreign records under
         // the filename's id, laundering the swap); set the file aside.
-        // Placeholder-checksum open (stored, never verified). Same
-        // transient/persistent split as every other per-file step: an
-        // unreadable meta section sets THIS file aside, never the repair.
-        // Read ONCE and kept: the identity check needs the stored id and the
-        // frame validation below needs the compression descriptor, and both
-        // live in this same meta section.
-        let handle = match crate::vlog::recover_blob_file(
-            &blob_path,
-            blob_id,
-            crate::Checksum::from_raw(0),
-            0,
-            &config.fs,
-            #[cfg(zstd_any)]
-            &config.current_zstd_dictionaries(),
-        ) {
-            Ok(handle) => handle,
+        // The metadata alone, not the frame index: the identity check needs
+        // the stored id and the dictionary below the compression descriptor,
+        // and a file whose index rotted is salvaged along its frame chain
+        // rather than set aside. Same transient/persistent split as every
+        // other per-file step: an unreadable meta section sets THIS file
+        // aside, never the repair.
+        let meta = match crate::vlog::read_blob_meta(&blob_path, &*config.fs, blob_id) {
+            Ok(meta) => meta,
             Err(e) if is_environmental(&e) => return Err(e),
             Err(e) => {
                 discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
             }
         };
-        let stored = handle.meta().id;
+        let stored = meta.id;
         if stored != blob_id {
             let e = crate::Error::InvalidHeader(
                 "blob file's stored metadata id disagrees with its file name",
@@ -3381,7 +3375,7 @@ fn recover_blob_files(
         // supplies the dictionary and re-runs. One nothing references holds no
         // value anyone can reach, and goes to the sweep like any other.
         #[cfg(zstd_any)]
-        let dict = match blob_file_dictionary(config, handle.compression()) {
+        let dict = match blob_file_dictionary(config, meta.compression) {
             Ok(dict) => dict,
             Err(e) if referenced.contains(&blob_id) => return Err(e),
             Err(e) => {
@@ -3399,16 +3393,37 @@ fn recover_blob_files(
                 continue;
             }
         };
-        let Some(live) = validate_blob_frames(
-            config,
+        // The frames are validated through the file's handle, which reads its
+        // frame index. An index that does not read leaves an unpunched file to
+        // salvage, whose walk chains frame to frame from the data start; a
+        // punched one has no chain to follow from its frontier and is set
+        // aside. Placeholder checksum: stored, never verified.
+        let validated = match crate::vlog::recover_blob_file(
             &blob_path,
             blob_id,
-            frontier,
-            &handle,
+            crate::Checksum::from_raw(0),
+            0,
+            &config.fs,
             #[cfg(zstd_any)]
-            dict.as_ref(),
-        )?
-        else {
+            &config.current_zstd_dictionaries(),
+        ) {
+            Ok(handle) => validate_blob_frames(
+                config,
+                &blob_path,
+                blob_id,
+                frontier,
+                &handle,
+                #[cfg(zstd_any)]
+                dict.as_ref(),
+            )?,
+            Err(e) if is_environmental(&e) => return Err(e),
+            Err(_) if frontier == 0 => None,
+            Err(e) => {
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+                continue;
+            }
+        };
+        let Some(live) = validated else {
             // An INVALID blob no recovered table references never reaches the
             // manifest: salvaging it would allocate a fresh id and burn disk
             // space on a replacement the reference filter deletes anyway —

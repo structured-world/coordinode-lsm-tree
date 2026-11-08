@@ -14362,6 +14362,96 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
     Ok(())
 }
 
+/// A blob file whose frame index rotted while its metadata and every value
+/// frame are intact is salvaged along its frame chain, not set aside whole:
+/// the index only says where frames start, and an unpunched file's frames
+/// chain from the data start. Every value reads back after the repair.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_salvages_a_blob_whose_frame_index_rotted() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64];
+    {
+        let tree = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(frame_per_value()))
+        .open()?;
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Rot a byte inside the frame index section; the frames and the metadata
+    // stay as written.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let index_at = {
+        let mut file = memfs.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let section = reader.toc().section(b"frames").expect("a frame index");
+        section.pos() + section.len() / 2
+    };
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, index_at, 1)?;
+        file.seek(SeekFrom::Start(index_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    remove_manifest(&*memfs, &root)?;
+
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    let report = config().repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the referencing table survives: {report:?}"
+    );
+    assert_eq!(
+        report.blob_files_salvaged.len(),
+        1,
+        "the file is salvaged, not set aside: {report:?}"
+    );
+
+    let tree = config().open()?;
+    for i in 0..8u32 {
+        assert_eq!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(value(i).as_slice()),
+            "k{i:04} must survive a rotted frame index",
+        );
+    }
+    Ok(())
+}
+
 /// A table that is itself a salvaged replacement and also references a
 /// salvaged blob is rewritten a second time, from the replacement. That
 /// rewrite must take over the replacement's pending swap: queued as a second
