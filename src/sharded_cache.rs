@@ -232,24 +232,45 @@ where
         evicted: &mut Vec<V>,
     ) {
         #[cfg(feature = "std")]
-        let caps = self.capacities();
+        let before = self.shape();
         self.insert_inner(hash, key, value, weight, priority, evicted);
         #[cfg(feature = "std")]
-        if self.capacities() != caps {
-            GREW.with(|grew| grew.set(true));
+        {
+            let after = self.shape();
+            let mut what = 0_u8;
+            // A table reallocated grew; one whose allocation stayed but whose
+            // room went up rehashed in place to clear its tombstones.
+            if after.map_bytes != before.map_bytes {
+                what |= GROW_MAP;
+            } else if after.map_room > before.map_room {
+                what |= REHASH_MAP;
+            }
+            if after.queues != before.queues {
+                what |= GROW_QUEUES;
+            }
+            if after.ghost != before.ghost {
+                what |= GROW_GHOST;
+            }
+            if after.ghost_set_bytes != before.ghost_set_bytes {
+                what |= GROW_GHOST_SET;
+            } else if after.ghost_set_room > before.ghost_set_room {
+                what |= REHASH_GHOST_SET;
+            }
+            GREW.with(|grew| grew.set(grew.get() | what));
         }
     }
 
-    /// Experiment: the capacities of the shard's table, queues and ghosts.
+    /// Experiment: the allocations and room of the shard's tables and queues.
     #[cfg(feature = "std")]
-    fn capacities(&self) -> [usize; 5] {
-        [
-            self.map.capacity(),
-            self.small.capacity(),
-            self.main.capacity(),
-            self.ghost.capacity(),
-            self.ghost_set.capacity(),
-        ]
+    fn shape(&self) -> Shape {
+        Shape {
+            map_bytes: self.map.allocation_size(),
+            map_room: self.map.capacity(),
+            queues: (self.small.capacity(), self.main.capacity()),
+            ghost: self.ghost.capacity(),
+            ghost_set_bytes: self.ghost_set.allocation_size(),
+            ghost_set_room: self.ghost_set.capacity(),
+        }
     }
 
     fn insert_inner(
@@ -492,11 +513,31 @@ where
     }
 }
 
+/// Experiment: what an insert changed in its shard, as the bits of [`GREW`].
+pub(crate) const GROW_MAP: u8 = 1;
+pub(crate) const REHASH_MAP: u8 = 2;
+pub(crate) const GROW_QUEUES: u8 = 4;
+pub(crate) const GROW_GHOST: u8 = 8;
+pub(crate) const GROW_GHOST_SET: u8 = 16;
+pub(crate) const REHASH_GHOST_SET: u8 = 32;
+
+/// Experiment: a shard's tables and queues, as an insert left them.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+struct Shape {
+    map_bytes: usize,
+    map_room: usize,
+    queues: (usize, usize),
+    ghost: usize,
+    ghost_set_bytes: usize,
+    ghost_set_room: usize,
+}
+
 #[cfg(feature = "std")]
 std::thread_local! {
-    /// Experiment: set when an insert on this thread grew a shard's table,
-    /// queues or ghosts.
-    pub(crate) static GREW: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Experiment: what the inserts on this thread changed in their shards
+    /// since it was last cleared.
+    pub(crate) static GREW: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
 }
 
 /// Releases an insert's shard lock and drops what the insert evicted.

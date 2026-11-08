@@ -79,8 +79,20 @@ impl Fill {
 pub(crate) struct Timing {
     on: bool,
     steady: Buckets,
-    grown: Buckets,
+    /// By the first thing the insert changed, in the order of [`CHANGES`].
+    changed: [Buckets; 6],
 }
+
+/// What an insert can change in its shard, as the bits it sets, and the name
+/// each is reported under; a fill is counted under the first one it set.
+const CHANGES: [(u8, &str); 6] = [
+    (crate::sharded_cache::GROW_MAP, "map grown"),
+    (crate::sharded_cache::REHASH_MAP, "map rehashed"),
+    (crate::sharded_cache::GROW_GHOST_SET, "ghost set grown"),
+    (crate::sharded_cache::REHASH_GHOST_SET, "ghost set rehashed"),
+    (crate::sharded_cache::GROW_QUEUES, "queues grown"),
+    (crate::sharded_cache::GROW_GHOST, "ghost queue grown"),
+];
 
 /// Fills under 1, 2, 5, 10, 20 us and the rest, their total and the longest.
 #[derive(Default)]
@@ -126,7 +138,7 @@ impl Timing {
         Self {
             on: std::env::var("LSM_FILL_TIMING").as_deref() == Ok("1"),
             steady: Buckets::default(),
-            grown: Buckets::default(),
+            changed: Default::default(),
         }
     }
 
@@ -134,7 +146,7 @@ impl Timing {
         if !self.on {
             return None;
         }
-        crate::sharded_cache::GREW.with(|grew| grew.set(false));
+        crate::sharded_cache::GREW.with(|grew| grew.set(0));
         Some(std::time::Instant::now())
     }
 
@@ -143,10 +155,14 @@ impl Timing {
             return;
         };
         let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        if crate::sharded_cache::GREW.with(core::cell::Cell::get) {
-            self.grown.record(ns);
-        } else {
-            self.steady.record(ns);
+        let what = crate::sharded_cache::GREW.with(core::cell::Cell::get);
+        let first = CHANGES
+            .iter()
+            .zip(&self.changed)
+            .find(|((bit, _), _)| what & bit != 0);
+        match first {
+            Some((_, buckets)) => buckets.record(ns),
+            None => self.steady.record(ns),
         }
     }
 }
@@ -157,7 +173,9 @@ impl Drop for Timing {
             return;
         }
         self.steady.report("steady");
-        self.grown.report("grown");
+        for ((_, name), buckets) in CHANGES.iter().zip(&self.changed) {
+            buckets.report(name);
+        }
     }
 }
 
