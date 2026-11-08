@@ -47,7 +47,9 @@ const MAX_SEGMENTS: usize =
 /// Reads via [`get`](Self::get) are wait-free.  The store never shrinks —
 /// it is dropped in bulk when the memtable is dropped.
 pub(crate) struct ValueStore {
-    /// Segment pointers.  Null = not yet allocated.  Once set, never modified.
+    /// Segment pointers: null until allocated, the torn marker (`TORN_ADDR`)
+    /// while an allocation a write waited on has failed (a later failure
+    /// leaves it torn), then a real segment, which is never modified.
     segments: Box<[AtomicPtr<UserValue>]>,
 
     /// Next index to allocate (monotonically increasing). Every insert moves
@@ -402,8 +404,9 @@ impl Drop for ValueStore {
             )]
             let layout =
                 alloc::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
-            // SAFETY: `seg_ptr` came from `alloc(layout)` in
-            // `ensure_segment()`, all initialised entries were dropped above,
+            // SAFETY: `seg_ptr` is a real segment (null and torn were skipped
+            // above), so it came from `alloc(layout)` in `allocate_segment()`;
+            // all initialised entries were dropped above,
             // and `Drop` has exclusive access — so this frees that allocation
             // exactly once with the original layout.
             unsafe {
