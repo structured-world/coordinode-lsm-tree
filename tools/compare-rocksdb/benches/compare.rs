@@ -1227,6 +1227,156 @@ fn point_read_variant(
     }
 }
 
+/// Workload: point-read every key once from an engine opened cold.
+///
+/// Every iteration copies the seed state into a fresh directory, drops the
+/// copy's pages from the OS page cache, opens the engine on it with an empty
+/// block cache and reads each stored key once, in insertion order (scattered
+/// on disk, see [`point_read_variant`]). Only the reads are timed, each on its
+/// own, so the group reports the read latency's median and p99 beside the
+/// mean: the first read of a block, a filter or a separated value goes to the
+/// device, the later reads of a block read it from the cache it filled.
+///
+/// The page cache is dropped with `dd iflag=nocache` per file on Linux; on
+/// another OS the copy's pages stay cached and only the engines' own caches
+/// start empty.
+fn point_read_cold_variant(
+    run: &mut Run,
+    group_name: &str,
+    compression: Compression,
+    spec: Spec,
+    seeds: &mut SeedStates,
+) {
+    if !run.wants(group_name) {
+        return;
+    }
+    let engines: Vec<Engine> = run
+        .engines_of(spec.engines)
+        .into_iter()
+        .filter(|engine| !matches!(engine, Engine::SurrealKv))
+        .collect();
+    for n in run.sizes_of(spec.sizes) {
+        let inputs = WorkloadInputs::of(n, spec.values);
+        let arms = engines
+            .iter()
+            .map(|&engine| {
+                let seed = seeds
+                    .seed(engine, compression, IndexStrategy::Binary, &inputs)
+                    .to_path_buf();
+                let last = Rc::new(Cell::new(ColdSample::default()));
+                let (inputs, sample) = (&inputs, Rc::clone(&last));
+                paired::Arm::new(engine.label(), move |iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let dir = copy_of(&seed);
+                        drop_page_cache(dir.path());
+                        let mut nanos = cold_reads(engine, compression, dir.path(), inputs);
+                        total += Duration::from_nanos(nanos.iter().sum());
+                        sample.set(ColdSample {
+                            read_p50_us: quantile_us(&mut nanos, 500),
+                            read_p99_us: quantile_us(&mut nanos, 990),
+                        });
+                    }
+                    total
+                })
+                .with_metrics(move || last.get().metrics())
+            })
+            .collect();
+        run.measure(group_name, n, arms);
+    }
+}
+
+/// The latencies of one cold pass: `engine` opened on `dir` and every key of
+/// `inputs` read once, each read timed on its own, in nanoseconds.
+fn cold_reads(
+    engine: Engine,
+    compression: Compression,
+    dir: &Path,
+    inputs: &WorkloadInputs,
+) -> Vec<u64> {
+    let mut nanos = Vec::with_capacity(inputs.keys.len());
+    let mut time = |read: &mut dyn FnMut()| {
+        let at = std::time::Instant::now();
+        read();
+        nanos.push(u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    };
+    match engine {
+        Engine::Ours | Engine::BlobTree(_) => {
+            let tree = open_ours(
+                dir,
+                compression,
+                engine.kv_separated(),
+                IndexStrategy::Binary,
+                false,
+            )
+            .expect("ours cold: open");
+            for key in &inputs.keys {
+                time(&mut || {
+                    let got = tree.get(key, MAX_SEQNO).expect("ours cold: get");
+                    assert!(got.is_some(), "ours cold: key unexpectedly missing");
+                    std::hint::black_box(got);
+                });
+            }
+        }
+        Engine::RocksDb | Engine::RocksDbBlob(_) => {
+            let db = open_rocksdb(dir, compression, false, engine.blob_files());
+            for key in &inputs.keys {
+                time(&mut || {
+                    let got = db.get_pinned(key).expect("rocksdb cold: get");
+                    assert!(got.is_some(), "rocksdb cold: key unexpectedly missing");
+                    std::hint::black_box(got);
+                });
+            }
+        }
+        Engine::SurrealKv => unreachable!("surrealkv is not seeded"),
+    }
+    nanos
+}
+
+/// Drops the pages of every file under `dir` from the OS page cache, so the
+/// next reads of them go to the device. The files are clean: [`copy_of`]
+/// synced them.
+fn drop_page_cache(dir: &Path) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            drop_page_cache(&path);
+            continue;
+        }
+        let mut input = std::ffi::OsString::from("if=");
+        input.push(&path);
+        let status = std::process::Command::new("dd")
+            .args([
+                input.as_os_str(),
+                "iflag=nocache".as_ref(),
+                "count=0".as_ref(),
+            ])
+            .args(["status=none"])
+            .status()
+            .expect("run dd");
+        assert!(status.success(), "dd iflag=nocache failed: {status}");
+    }
+}
+
+/// What one cold pass measured besides its total read time.
+#[derive(Clone, Copy, Default)]
+struct ColdSample {
+    read_p50_us: f64,
+    read_p99_us: f64,
+}
+
+impl ColdSample {
+    fn metrics(self) -> Vec<(&'static str, f64)> {
+        vec![
+            ("read_p50_us", self.read_p50_us),
+            ("read_p99_us", self.read_p99_us),
+        ]
+    }
+}
+
 /// One-time hit check OUTSIDE the timed window: enforces the workload contract
 /// ("read every stored key") so a setup/flush regression can't silently become
 /// a miss-read benchmark, without taxing each timed `get` with a branch.
@@ -1527,6 +1677,24 @@ fn bench_seeded(run: &mut Run) {
         false,
         &mut seeds,
     );
+    // The cold reads run the head-to-head arms on both table codecs: a cold
+    // read is where blob files and tables meet the device.
+    let cold = Spec {
+        sizes: SIZES,
+        values: Values::Pool,
+        engines: HEAD_TO_HEAD,
+    };
+    point_read_cold_variant(run, "point_read_cold", none, cold, &mut seeds);
+    point_read_cold_variant(run, "point_read_cold_zstd22", zstd, cold, &mut seeds);
+    for (suffix, spec) in BLOB_SPECS {
+        point_read_cold_variant(
+            run,
+            &format!("point_read_cold{suffix}"),
+            none,
+            *spec,
+            &mut seeds,
+        );
+    }
     multi_get_variant(run, "multi_get", none, Spec::reads(none), &mut seeds);
     multi_get_variant(run, "multi_get_zstd22", zstd, Spec::reads(zstd), &mut seeds);
     range_scan_variant(run, "range_scan", none, Spec::reads(none), &mut seeds);
@@ -3100,6 +3268,10 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     (
         "point_read",
         "One get per stored key on a warm engine. Also our hash index, ribbon locator and row cache, and RocksDB's hash index, on the same chart.",
+    ),
+    (
+        "point_read_cold",
+        "One get per stored key on an engine opened on a fresh copy of the state, its files dropped from the OS page cache and its block cache empty. Only the reads are timed, each on its own; beside the mean, their p50 and p99.",
     ),
     (
         "multi_get",
