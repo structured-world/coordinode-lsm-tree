@@ -288,9 +288,12 @@ impl ValueStore {
             {
                 return;
             }
-            #[cfg(test)]
-            assert!(!injected, "ValueStore: injected segment allocation failure");
+            // Tests stand in an unwinding handler for the real one, which
+            // aborts the process under `std`.
+            #[cfg(not(test))]
             alloc::alloc::handle_alloc_error(layout);
+            #[cfg(test)]
+            panic!("ValueStore: segment allocation failure");
         }
         #[cfg(test)]
         if self.scribble_segments.load(Ordering::Relaxed) {
