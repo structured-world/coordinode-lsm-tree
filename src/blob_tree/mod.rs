@@ -329,6 +329,11 @@ impl BlobSource {
     /// a chunked value, a reference the version does not hold, a malformed
     /// one), which also reports what is wrong with it. Nothing here blocks on
     /// I/O.
+    ///
+    /// Each value plans a read of its own frame: values of one batch that
+    /// share a block each read and decode that block, the cache sparing only
+    /// reads issued after the first is back. Known cost, kept in this layout
+    /// step; a multi-get of many small values from few blocks pays it.
     pub(crate) fn plan_value<'v>(
         &self,
         version: &'v Version,
