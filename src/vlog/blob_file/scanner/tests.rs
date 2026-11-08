@@ -308,18 +308,25 @@ fn a_copying_scan_leaves_frames_of_their_own_undecoded() -> crate::Result<()> {
     let file = writer.finish()?.remove(0);
     let path = file.path().to_path_buf();
     let index = index_of(&path)?;
-    // Frame 1 is the single frame, frame 3 the head's first chunk.
-    let garble = |bytes: &mut Vec<u8>, frame: usize| {
-        let at = &mut bytes[index[frame]..index[frame + 1]];
-        let header = parse_header(at).expect("a frame");
-        assert!(!header.is_raw(), "lz4 compressed frame {frame}");
-        let stored = FRAME_HEADER_LEN + header.entries_len as usize;
-        at[stored..].fill(0xFF);
-        crate::vlog::blob_file::frame::reseal(at);
-    };
+    // Frame 1 is the single frame, frame 2 the head, frame 3 its first chunk:
+    // the single frame's payload garbled and the frame resealed, the chunk's
+    // bytes garbled and its row's checksum set to match them.
     edit(&path, |bytes| {
-        garble(bytes, 1);
-        garble(bytes, 3);
+        let single = &mut bytes[index[1]..index[2]];
+        let header = parse_header(single).expect("a frame");
+        assert!(!header.is_raw(), "lz4 compressed single frame");
+        single[FRAME_HEADER_LEN + header.entries_len as usize..].fill(0xFF);
+        crate::vlog::blob_file::frame::reseal(single);
+
+        let chunk = &mut bytes[index[3]..index[4]];
+        chunk.fill(0xFF);
+        let checksum = crate::vlog::blob_file::frame::chunk_checksum(chunk);
+        let head = &mut bytes[index[2]..index[3]];
+        let header = parse_header(head).expect("a head");
+        let row = FRAME_HEADER_LEN + header.entries_len as usize + 8;
+        assert_eq!(head[row + 4], 0, "lz4 compressed first chunk");
+        head[row + 5..row + 21].copy_from_slice(&checksum.to_le_bytes());
+        crate::vlog::blob_file::frame::reseal(head);
     })?;
     let on_disk = std::fs::read(&path)?;
 
@@ -449,12 +456,14 @@ fn rewrite_head_table(
         let head = &mut bytes[index[0]..index[1]];
         // The entry's value length, after its seqno and key length.
         head[40 + 10..40 + 14].copy_from_slice(&value_len.to_le_bytes());
-        // The chunk table after the entry: the chunk size, then the count.
-        let table = head.len() - 8;
+        // The chunk table after the entry: the chunk size, then the count,
+        // then a row per chunk, left as written.
+        let entries_len = parse_header(head).expect("a head").entries_len as usize;
+        let table = FRAME_HEADER_LEN + entries_len;
         if let Some(size) = chunk_size {
             head[table..table + 4].copy_from_slice(&size.to_le_bytes());
         }
-        head[table + 4..].copy_from_slice(&chunks.to_le_bytes());
+        head[table + 4..table + 8].copy_from_slice(&chunks.to_le_bytes());
         crate::vlog::blob_file::frame::reseal(head);
     })
 }

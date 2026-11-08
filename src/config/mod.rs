@@ -361,6 +361,18 @@ impl DictionaryClasses {
         chunks: true,
     };
 
+    /// Blocks and single values, the default: a chunk builds its own history
+    /// over its 256 KiB and gains nothing from a dictionary, while decoding
+    /// it with one is slower. Measured on documents, chain blocks and
+    /// transactions, and files of KiB to hundreds of MiB, a dictionary on the
+    /// chunks too changed the files' ratio by 0.1% and slowed their scan by
+    /// 7%.
+    pub const DEFAULT: Self = Self {
+        blocks: true,
+        singles: true,
+        chunks: false,
+    };
+
     /// Whether a frame of `kind` is compressed with the dictionary. A head
     /// holds its chunk table, which is never compressed.
     #[cfg(zstd_any)]
@@ -385,11 +397,14 @@ pub enum BlobCacheFill {
     /// Every value read from a blob file is cached, and a scan reads its
     /// values ahead into the cache.
     Always,
-    /// No value read from a blob file is cached: values large enough to be
-    /// separated are mostly read once, and cached they would evict the index,
-    /// filter and data blocks of every tree sharing the cache. A scan still
-    /// reads its values ahead, into a store of its own holding at most one
-    /// coalesced read, from which it hands them out.
+    /// No value of a frame of its own read from a blob file is cached: values
+    /// large enough to be separated are mostly read once, and cached they
+    /// would evict the index, filter and data blocks of every tree sharing the
+    /// cache. A block of small values a point read decodes is cached all the
+    /// same, as a data block is: the values beside the one read are read as
+    /// often, and each would otherwise decode the whole block again. A scan
+    /// still reads its values ahead, into a store of its own holding at most
+    /// one coalesced read, from which it hands them out.
     #[default]
     Never,
 }
@@ -437,7 +452,7 @@ impl Default for KvSeparationOptions {
                 crate::vlog::blob_file::writer::FrameSizes::DEFAULT.chunk_size,
             )
             .expect("the default chunk size is not zero"),
-            dictionary_classes: DictionaryClasses::ALL,
+            dictionary_classes: DictionaryClasses::DEFAULT,
             cell_separation_thresholds: alloc::vec::Vec::new(),
 
             staleness_threshold: 0.25,
@@ -497,7 +512,8 @@ impl KvSeparationOptions {
     /// with. A size above [`Self::chunk_size`] or 128 MiB is held to the
     /// smaller of the two, so a block is always one frame a reader decodes.
     ///
-    /// Defaults to 16 KiB.
+    /// Defaults to 8 KiB: a larger block packs more and makes each point read
+    /// of a value in it decode more.
     ///
     /// # Examples
     ///
@@ -553,7 +569,7 @@ impl KvSeparationOptions {
     /// builds its own, and pays for the dictionary at every decode for little
     /// or no gain. Other codecs ignore it.
     ///
-    /// Defaults to every class.
+    /// Defaults to blocks and single values ([`DictionaryClasses::DEFAULT`]).
     ///
     /// # Examples
     ///
@@ -2991,6 +3007,8 @@ impl Config {
     /// delays the journal's own syncs. Writeback makes nothing durable; the
     /// final sync still does. Only Linux starts one
     /// (`sync_file_range(SYNC_FILE_RANGE_WRITE)`); elsewhere this is unused.
+    /// A blob file checks after each value it writes, so a value larger than
+    /// this is written back once it is whole.
     ///
     /// # Examples
     ///

@@ -2328,12 +2328,26 @@ fn derive_blob_frontier(
     // Whether frame `at` reads as zeros through, as a punched frame does.
     let zeroed =
         |at: usize| -> crate::Result<bool> { Ok(frame_bytes(at)?.iter().all(|b| *b == 0)) };
-    // Whether frame `at` checks as stored: its codec is not needed for that.
-    let intact = |at: usize| -> crate::Result<bool> {
-        match crate::vlog::blob_file::frame::verify_frame(&frame_bytes(at)?) {
-            Ok(_) => Ok(true),
+    // How many frames the value at `at` takes when it checks as stored, its
+    // codec not needed for that: a head with its chunks, which follow it as
+    // frames of the index and check by its table; `None` when it does not.
+    let intact = |at: usize| -> crate::Result<Option<usize>> {
+        use crate::vlog::blob_file::frame::{FrameKind, check_chunk, head_chunks, verify_frame};
+        let bytes = frame_bytes(at)?;
+        let checked = verify_frame(&bytes).and_then(|header| {
+            if header.kind != FrameKind::Head {
+                return Ok(1);
+            }
+            let table = head_chunks(&bytes)?;
+            for (n, spec) in table.iter().enumerate() {
+                check_chunk(spec, &frame_bytes(at + 1 + n)?)?;
+            }
+            Ok(1 + table.len())
+        });
+        match checked {
+            Ok(frames) => Ok(Some(frames)),
             Err(e) if is_environmental(&e) => Err(e),
-            Err(_) => Ok(false),
+            Err(_) => Ok(None),
         }
     };
 
@@ -2401,11 +2415,11 @@ fn derive_blob_frontier(
         }
         // The zeroed run is punch geometry only when the frame at its end
         // checks: keep the last anchored frontier otherwise.
-        if !intact(at)? {
+        let Some(taken) = intact(at)? else {
             return Ok(committed(anchored));
-        }
+        };
         anchored = run_end;
-        at += 1;
+        at += taken;
         // Chain frames from the anchor until the section ends cleanly or the
         // chain breaks: another zeroed run continues the walk, a frame that
         // does not check is content corruption and ends it at the last
@@ -2417,10 +2431,10 @@ fn derive_blob_frontier(
             if zeroed(at)? {
                 break;
             }
-            if !intact(at)? {
+            let Some(taken) = intact(at)? else {
                 return Ok(committed(anchored));
-            }
-            at += 1;
+            };
+            at += taken;
         }
     }
 }

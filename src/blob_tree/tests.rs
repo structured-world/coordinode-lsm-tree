@@ -3,8 +3,10 @@ use crate::coding::Encode;
 use crate::vlog::ValueHandle;
 use test_log::test;
 
-/// A blob tree of `keys` keys with 4 KiB values, every one in a blob file,
-/// over a cache of its own, and reading with `fill`.
+/// A blob tree of `keys` keys with 4 KiB values, every one in a frame of its
+/// own in a blob file, over a cache of its own, and reading with `fill`. Frames
+/// of their own are what the fill governs: a block a point read decodes is
+/// cached whatever it says.
 fn blob_tree_with_cache(
     folder: &tempfile::TempDir,
     keys: u32,
@@ -19,7 +21,7 @@ fn blob_tree_with_cache(
         crate::SequenceNumberCounter::default(),
     )
     .use_cache(Arc::clone(&cache))
-    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .with_kv_separation(Some(crate::KvSeparationOptions::default().block_size(0)))
     .blob_cache_fill(fill)
     .open()?
     else {
@@ -269,9 +271,7 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
     let mut store = crate::vlog::Prefetched::default();
     store.hold(
         vhandle.frame_at(),
-        Arc::new(crate::vlog::blob_file::frame::decoded_frame(&[(
-            b"k", b"value",
-        )])),
+        crate::vlog::blob_file::frame::decoded_frame(&[(b"k", b"value")]),
     );
 
     let held = Arc::new(core::sync::atomic::AtomicUsize::new(0));
@@ -539,9 +539,9 @@ fn a_batched_read_of_a_chunked_value_falls_back_to_its_own_path() -> crate::Resu
     let file = std::fs::read(&read.blob_file.0.path)?;
     let at = usize::try_from(read.offset).expect("fits");
     let head = crate::Slice::from(&file[at..at + read.len]);
-    assert_eq!(
-        source.finish_value(&version, b"k", &read, &head)?,
-        None,
+    let (value, frame) = source.finish_value(&version, b"k", &read, &head)?;
+    assert!(
+        value.is_none() && frame.is_none(),
         "the chunks are read on the value's own path"
     );
     let short = crate::Slice::from(&file[at..at + read.len - 1]);

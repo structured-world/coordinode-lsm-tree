@@ -326,6 +326,26 @@ impl BlobLead<'_> {
         }
         self.0.publish(item);
     }
+
+    /// [`Self::publish`] for the frame this read decoded: shared only when
+    /// the cache keeps it or a read waits on it, and otherwise handed back as
+    /// the read's own, with no shared allocation made for it.
+    pub(crate) fn publish_owned(
+        self,
+        cache: &Cache,
+        vlog_id: crate::TreeId,
+        at: BlobFrameAt,
+        frame: crate::vlog::blob_file::frame::DecodedFrame,
+        fill: bool,
+    ) -> crate::vlog::accessor::HeldFrame {
+        use crate::vlog::accessor::HeldFrame;
+        if !fill && !self.0.has_waiters() {
+            return HeldFrame::Own(frame);
+        }
+        let frame = alloc::sync::Arc::new(frame);
+        self.publish(cache, vlog_id, at, &frame, fill);
+        HeldFrame::Shared(frame)
+    }
 }
 
 /// Where a blob frame lies: its file and its number in it.

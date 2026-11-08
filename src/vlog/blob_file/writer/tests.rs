@@ -45,20 +45,59 @@ fn a_frame_index_that_does_not_hold_is_refused() {
 /// The frames of the finished file at `path`, decoded, by the index `frames`.
 fn frames_of(path: &Path, frames: &[u64]) -> Vec<DecodedFrame> {
     let bytes = std::fs::read(path).expect("the file reads");
-    frames
-        .windows(2)
-        .map(|pair| {
-            let (start, end) = (pair[0] as usize, pair[1] as usize);
-            decode_frame(
-                &crate::Slice::from(&bytes[start..end]),
-                CompressionType::None,
+    decode_all(
+        &bytes,
+        frames,
+        CompressionType::None,
+        #[cfg(zstd_any)]
+        None,
+    )
+    .expect("every frame decodes")
+}
+
+/// Every frame of a file's `bytes` by its index `frames`, decoded under
+/// `compression`: a chunk by the row the head before it lists for it.
+fn decode_all(
+    bytes: &[u8],
+    frames: &[u64],
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+) -> crate::Result<Vec<DecodedFrame>> {
+    let mut decoded: Vec<DecodedFrame> = Vec::new();
+    // The head the chunks being read belong to, its place, and how many of
+    // its chunks are still to come.
+    let mut head: Option<(usize, u32, u32)> = None;
+    for pair in frames.windows(2) {
+        let stored = crate::Slice::from(&bytes[pair[0] as usize..pair[1] as usize]);
+        if let Some((at, next, chunks)) = head
+            && next < chunks
+        {
+            let frame = super::super::frame::decode_chunk(
+                &decoded[at].chunk(next)?,
+                &stored,
+                compression,
                 #[cfg(zstd_any)]
-                None,
+                dictionary,
                 &mut 0,
-            )
-            .expect("every frame decodes")
-        })
-        .collect()
+            )?;
+            decoded.push(frame);
+            head = Some((at, next + 1, chunks));
+            continue;
+        }
+        let frame = decode_frame(
+            &stored,
+            compression,
+            #[cfg(zstd_any)]
+            dictionary,
+            &mut 0,
+        )?;
+        head = match frame.header.kind {
+            FrameKind::Head => Some((decoded.len(), 0, frame.chunk_table()?.1)),
+            _ => None,
+        };
+        decoded.push(frame);
+    }
+    Ok(decoded)
 }
 
 fn writer(folder: &tempfile::TempDir) -> crate::Result<Writer> {
@@ -555,17 +594,7 @@ fn a_dictionary_compresses_only_its_classes() -> crate::Result<()> {
     let (_, _, frames) = w.finish()?;
 
     let bytes = std::fs::read(path)?;
-    let decoded: Vec<DecodedFrame> = frames
-        .windows(2)
-        .map(|pair| {
-            decode_frame(
-                &crate::Slice::from(&bytes[pair[0] as usize..pair[1] as usize]),
-                compression,
-                Some(&dict),
-                &mut 0,
-            )
-        })
-        .collect::<crate::Result<_>>()?;
+    let decoded = decode_all(&bytes, &frames, compression, Some(&dict))?;
     let plain: Vec<_> = decoded
         .iter()
         .map(|f| (f.header.kind, f.header.flags & FLAG_PLAIN != 0))

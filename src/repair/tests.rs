@@ -8047,8 +8047,8 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     }
 
     // Overwrite the compressed payload with same-length garbage and RE-STAMP
-    // the frame checksum (xxh3-128 over the entries, the stored payload and
-    // the header CRC), so the frame verifies while the payload no longer
+    // the frame checksum (xxh3-128 over the entries and the stored payload,
+    // seeded with the header CRC), so the frame verifies while the payload no longer
     // decompresses.
     let entry = crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
         .next()
@@ -8064,14 +8064,13 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     let entries_end = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + header.entries_len as usize;
     let garbage = vec![0xA5u8; frame_bytes.len() - entries_end];
     let restamped = {
-        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(u64::from(header.header_crc));
         hasher.update(
             frame_bytes
                 .get(crate::vlog::blob_file::frame::FRAME_HEADER_LEN..entries_end)
                 .expect("the frame holds its entries"),
         );
         hasher.update(&garbage);
-        hasher.update(&header.header_crc.to_le_bytes());
         hasher.digest128()
     };
     {
@@ -15480,6 +15479,69 @@ fn a_wholly_zeroed_blob_section_without_holes_is_not_fully_consumed() -> crate::
         matches!(derived, super::BlobFrontier::Whole),
         "a fully allocated zeroed section is destroyed data, not a relocation \
          whose file removal lagged a crash, got {derived:?}",
+    );
+    Ok(())
+}
+
+/// A reclaim that crashed mid-way leaves holes with consumed values between
+/// them; the walk to the frontier steps over each intact value whole, a value
+/// in chunks as its head and the chunks its table lists, which carry no
+/// header of their own. Stepping frame by frame, it would read the first
+/// chunk as a frame that does not check and stop at the first hole.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn the_frontier_walk_steps_over_a_chunked_value_between_holes() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .blob_compression(crate::CompressionType::None)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(16)
+                .block_size(0)
+                .chunk_size(core::num::NonZeroU32::new(100).expect("non-zero")),
+        ))
+        .open()?;
+        // Three chunks each.
+        for i in 0..6u32 {
+            tree.insert(
+                format!("k{i:04}").as_bytes(),
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 300],
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let blob_path = root.join(crate::file::BLOBS_FOLDER).join("0");
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 6, "six separated values");
+    let data_start = entries.first().expect("a value").offset;
+    let second = entries.get(1).expect("a second value");
+    let fourth = entries.get(3).expect("a fourth value");
+    // Values 0 and 1 reclaimed, value 2 consumed but not yet, value 3
+    // reclaimed: the shape a reclaim that punches value by value leaves.
+    memfs.punch_hole(&blob_path, data_start, second.frame_end - data_start)?;
+    memfs.punch_hole(&blob_path, fourth.offset, fourth.frame_end - fourth.offset)?;
+
+    let derived = super::derive_blob_frontier(&fs, &blob_path)?;
+    assert!(
+        matches!(derived, super::BlobFrontier::Punched(at) if at == fourth.frame_end),
+        "the frontier ends with the last hole, past the value in chunks between them: \
+         {derived:?}, want {}",
+        fourth.frame_end,
     );
     Ok(())
 }

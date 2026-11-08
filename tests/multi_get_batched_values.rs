@@ -26,14 +26,19 @@ fn value_for(i: usize) -> Vec<u8> {
     value
 }
 
-/// A blob tree of [`N`] separated values over four blob files, reopened so no
-/// value is in the cache, on the backend `fs`.
+/// A blob tree of [`N`] separated values over four blob files, each value a
+/// frame of its own so each is a read of its own, reopened so no value is in
+/// the cache, on the backend `fs`.
 fn cold_tree(dir: &std::path::Path, fs: &BatchCountFs) -> lsm_tree::Result<AnyTree> {
     let seqno = SequenceNumberCounter::default();
     let config = || {
         Config::new(dir, seqno.clone(), SequenceNumberCounter::default())
             .with_shared_fs(Arc::new(fs.clone()))
-            .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+            .with_kv_separation(Some(
+                KvSeparationOptions::default()
+                    .separation_threshold(1)
+                    .block_size(0),
+            ))
     };
     {
         let tree = config().open()?;

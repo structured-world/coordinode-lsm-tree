@@ -197,7 +197,7 @@ impl MultiWriter {
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
             sizes: super::writer::FrameSizes::DEFAULT,
-            dictionary_classes: crate::config::DictionaryClasses::ALL,
+            dictionary_classes: crate::config::DictionaryClasses::DEFAULT,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,

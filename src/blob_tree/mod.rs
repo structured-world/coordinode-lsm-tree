@@ -416,7 +416,8 @@ impl BlobSource {
     /// caches what it reads. A chunked value read whole, head and chunks, is
     /// assembled out of them; `None` for one read only as far as its head,
     /// whose chunks are read on the value's own path, which finds the head
-    /// cached.
+    /// cached. The frame comes back beside the value when it holds values of
+    /// its own (a block or a single), for the other values of the batch in it.
     ///
     /// # Errors
     ///
@@ -429,8 +430,11 @@ impl BlobSource {
         key: &[u8],
         read: &ValueRead<'_>,
         bytes: &crate::Slice,
-    ) -> crate::Result<Option<UserValue>> {
-        use crate::vlog::blob_file::{frame::FrameKind, reader};
+    ) -> crate::Result<(Option<UserValue>, Option<crate::vlog::accessor::HeldFrame>)> {
+        use crate::vlog::{
+            accessor::HeldFrame,
+            blob_file::{frame::FrameKind, reader},
+        };
 
         let accessor = Accessor::new(
             &version.blob_files,
@@ -455,49 +459,72 @@ impl BlobSource {
         let parsed =
             reader::Reader::decode(read.blob_file, &frame_bytes(start, end)?, &mut decoded);
         accessor.count_decoded(decoded);
-        let frame = Arc::new(parsed?);
-        if self.fill.fills() {
+        let frame = parsed?;
+        // Shared only with the cache: the batch's other values in the frame
+        // are taken out of it here, by reference.
+        let frame = if crate::vlog::accessor::caches(self.fill, &frame) {
             // Read with the chunks after it, a head decoded as a view would
             // keep the whole value's read alive in the cache, which charges
             // it only its own bytes: it is cached detached. A frame read alone
             // is the whole read and is cached as it is.
-            let cached = if bytes.len() as u64 == end - start {
-                Arc::clone(&frame)
+            let frame = if bytes.len() as u64 == end - start {
+                frame
             } else {
-                let (owned, copied) = crate::vlog::accessor::own_frame(
-                    (*frame).clone(),
-                    read.blob_file.compression(),
-                );
+                let (owned, copied) =
+                    crate::vlog::accessor::own_frame(frame, read.blob_file.compression(), true);
                 accessor.count_gather(copied);
-                Arc::new(owned)
+                owned
             };
+            let frame = Arc::new(frame);
             self.cache
-                .insert_blob_frame(self.tree_id, read.vhandle.frame_at(), cached);
-        }
+                .insert_blob_frame(self.tree_id, read.vhandle.frame_at(), Arc::clone(&frame));
+            HeldFrame::Shared(frame)
+        } else {
+            HeldFrame::Own(frame)
+        };
         if frame.header.kind != FrameKind::Head {
-            return reader::value_in(&frame, read.vhandle.index, key).map(Some);
+            let value = reader::value_in(&frame, read.vhandle.index, key)?;
+            return Ok((Some(value), Some(frame)));
         }
         reader::check_key(&frame, read.vhandle.index, key)?;
         if bytes.len() as u64 == end - start {
-            return Ok(None);
+            return Ok((None, None));
         }
-        let all = reader::chunk_frames(&frame, read.vhandle.frame, read.blob_file.frame_count())?;
-        let mut chunks = Vec::with_capacity((all.end - all.start) as usize);
-        for chunk in all {
-            let (chunk_start, chunk_end) =
-                read.blob_file.frame_span(chunk).ok_or_else(malformed)?;
-            let mut decoded = 0;
-            let parsed = reader::Reader::decode(
-                read.blob_file,
-                &frame_bytes(chunk_start, chunk_end)?,
-                &mut decoded,
-            );
-            accessor.count_decoded(decoded);
-            chunks.push(parsed?);
+        // The chunks follow the head back to back: a value stored as it is
+        // is handed out of the read as it lies, any other decoded into place.
+        let area = frame_bytes(end, start + bytes.len() as u64)?;
+        let mut decoded = 0;
+        let value = reader::assemble_stored(
+            &frame,
+            &area,
+            read.blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            read.blob_file.0.zstd_dictionary.as_deref(),
+            &mut decoded,
+        );
+        accessor.count_decoded(decoded);
+        Ok((Some(value?), None))
+    }
+
+    /// The value `item` stands for, out of `frame`, the frame `at` names,
+    /// which a batch read for another of its values: `None` when `item` names
+    /// another frame or its entry there is not its key's, and then it is read
+    /// on its own path.
+    pub(crate) fn value_in_frame(
+        frame: &crate::vlog::blob_file::frame::DecodedFrame,
+        at: crate::cache::BlobFrameAt,
+        item: &InternalValue,
+    ) -> Option<UserValue> {
+        let indirection = BlobIndirection::decode_from(&mut &item.value[..]).ok()?;
+        if indirection.vhandle.frame_at() != at {
+            return None;
         }
-        let value = reader::assemble(&frame, &chunks, None)?;
-        accessor.count_gather(value.len());
-        Ok(Some(value))
+        crate::vlog::blob_file::reader::value_in(
+            frame,
+            indirection.vhandle.index,
+            &item.key.user_key,
+        )
+        .ok()
     }
 
     /// Counts the read of `read`'s record as issued.

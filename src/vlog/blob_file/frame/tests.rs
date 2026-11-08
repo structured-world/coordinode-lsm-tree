@@ -17,6 +17,42 @@ fn codec<'d>(compression: CompressionType) -> Codec<'d> {
     }
 }
 
+/// The writer sums a frame's entries and payload as two parts, the reader as
+/// the one range they make: the two agree at every length, across the input
+/// sizes where xxh3 changes how it hashes, or a frame the writer stamps would
+/// fail its read.
+#[test]
+fn a_checksum_in_two_parts_is_the_checksum_of_the_whole() {
+    let bytes: Vec<u8> = (0..4_096_u32).map(|at| (at * 31 + 7) as u8).collect();
+    for len in [0, 1, 16, 17, 128, 129, 240, 241, 1_024, 4_096] {
+        let whole = &bytes[..len];
+        for split in [0, len / 3, len] {
+            let (entries, payload) = whole.split_at(split);
+            assert_eq!(
+                frame_checksum_parts(entries, payload, 0xdead_beef),
+                frame_checksum(whole, 0xdead_beef),
+                "{len} bytes split at {split}"
+            );
+        }
+    }
+}
+
+/// A single frame lists its one entry in place: decoding a frame of one value
+/// allocates no list for it.
+#[test]
+fn a_single_frame_holds_its_entry_in_place() {
+    let entry = EntrySpec {
+        key: b"k",
+        seqno: 3,
+        value_len: 3,
+    };
+    let mut out = Vec::new();
+    encode_frame(FrameKind::Single, &[entry], b"abc", plain(), &mut out).unwrap();
+    let frame = decode(&out, CompressionType::None).unwrap();
+    assert!(matches!(frame.list, FrameEntries::One(_)));
+    assert_eq!(frame.value(0).as_deref(), Some(&b"abc"[..]));
+}
+
 fn decode(bytes: &[u8], compression: CompressionType) -> crate::Result<DecodedFrame> {
     let mut decoded = 0;
     decode_frame(
@@ -229,11 +265,16 @@ fn head_frame_names_its_chunk_table() {
         seqno: 7,
         value_len: 10_000,
     };
+    let value = vec![b'x'; 10_000];
+    let specs: Vec<ChunkSpec> = value
+        .chunks(4096)
+        .map(|chunk| encode_chunk(chunk, plain()).unwrap().1)
+        .collect();
     let mut out = Vec::new();
     encode_frame(
         FrameKind::Head,
         &[entry],
-        &head_payload(4096, 3),
+        &head_payload(4096, &specs),
         plain(),
         &mut out,
     )
@@ -242,12 +283,15 @@ fn head_frame_names_its_chunk_table() {
     assert!(frame.header.is_raw());
     assert_eq!(frame.chunk_table().unwrap(), (4096, 3));
     assert_eq!(frame.list[0].value_len, 10_000);
+    assert_eq!(frame.chunk(2).unwrap().raw_len, 10_000 - 2 * 4096);
+    assert_eq!(head_chunks(&out).unwrap(), specs);
+    assert!(frame.chunk(3).is_err(), "no fourth chunk");
 
     // Two chunks of 4096 do not cover 10000 bytes.
     encode_frame(
         FrameKind::Head,
         &[entry],
-        &head_payload(4096, 2),
+        &head_payload(4096, &specs[..2]),
         plain(),
         &mut out,
     )
@@ -272,7 +316,7 @@ fn sealed(
     let entries_len = entries.len() as u32;
     let disk_len = stored.len() as u32;
     let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
-    let checksum = frame_checksum(entries, stored, crc);
+    let checksum = frame_checksum_parts(entries, stored, crc);
     let mut out = Vec::new();
     out.extend_from_slice(&FRAME_MAGIC);
     out.extend_from_slice(&[kind as u8, flags]);
@@ -391,28 +435,36 @@ fn a_decoded_frame_inconsistent_with_its_payload_yields_nothing() {
     let frame = DecodedFrame {
         header,
         entries: Slice::from(&b"k"[..]),
-        list: vec![FrameEntry {
+        list: FrameEntries::One(FrameEntry {
             seqno: 7,
             key: 0..1,
             value_len: 3,
             value: 0..3,
-        }],
+        }),
         payload: Slice::from(&b"ab"[..]),
     };
     assert_eq!(frame.value(0), None, "a value past the payload");
 
+    // Ten bytes in chunks of four: three rows.
+    let row = |raw_len| ChunkSpec {
+        raw_len,
+        stored_len: raw_len,
+        flags: FLAG_RAW,
+        checksum: 0,
+    };
+    let table = head_payload(4, &[row(4), row(4), row(2)]);
     let head_header = parse_header(&sealed(
         FrameKind::Head,
         1,
         FLAG_RAW,
-        HEAD_PAYLOAD_LEN as u32,
+        table.len() as u32,
         &entry_bytes(1, 10, b"k"),
-        &head_payload(4, 3),
+        &table,
     ))
     .unwrap();
     let head = DecodedFrame {
         header: head_header,
-        payload: Slice::from(&head_payload(4, 3)[..4]),
+        payload: Slice::from(&table[..4]),
         ..frame
     };
     assert!(head.chunk_table().is_err(), "a table cut short");
@@ -541,15 +593,18 @@ fn a_head_naming_a_value_above_the_cap_is_malformed() {
         seqno: 7,
         value_len: over,
     };
+    // One chunk the size of the whole value: the table covers it.
+    let table = head_payload(
+        over,
+        &[ChunkSpec {
+            raw_len: over,
+            stored_len: over,
+            flags: FLAG_RAW,
+            checksum: 0,
+        }],
+    );
     let mut out = Vec::new();
-    encode_frame(
-        FrameKind::Head,
-        &[entry],
-        &head_payload(1, over),
-        plain(),
-        &mut out,
-    )
-    .unwrap();
+    encode_frame(FrameKind::Head, &[entry], &table, plain(), &mut out).unwrap();
     let frame = decode(&out, CompressionType::None).unwrap();
     assert!(matches!(
         frame.chunk_table(),
@@ -557,16 +612,39 @@ fn a_head_naming_a_value_above_the_cap_is_malformed() {
     ));
 }
 
-/// A chunk lists no entries; any other frame's table is not a chunk table.
+/// A chunk carries no header: no frame on disk is a chunk, and a chunk is
+/// decoded by the row of its head's table, which its bytes must match.
 #[test]
-fn chunk_frame_has_no_entries() {
+fn a_chunk_decodes_by_its_heads_row() {
     let mut out = Vec::new();
     encode_frame(FrameKind::Chunk, &[], b"chunk bytes", plain(), &mut out).unwrap();
-    let frame = decode(&out, CompressionType::None).unwrap();
-    assert_eq!(frame.header.kind, FrameKind::Chunk);
-    assert_eq!(frame.list.len(), 0);
-    assert_eq!(&*frame.payload, b"chunk bytes");
-    assert!(frame.chunk_table().is_err());
+    assert!(
+        decode(&out, CompressionType::None).is_err(),
+        "a chunk frame on disk is refused"
+    );
+
+    let (stored, spec) = encode_chunk(b"chunk bytes", plain()).unwrap();
+    assert!(
+        stored.is_none(),
+        "without a codec the chunk is stored as it is"
+    );
+    let chunk = decode_chunk(
+        &spec,
+        &Slice::from(&b"chunk bytes"[..]),
+        CompressionType::None,
+        #[cfg(zstd_any)]
+        None,
+        &mut 0,
+    )
+    .unwrap();
+    assert_eq!(chunk.header.kind, FrameKind::Chunk);
+    assert_eq!(&*chunk.payload, b"chunk bytes");
+    assert!(chunk.chunk_table().is_err());
+    assert!(matches!(
+        check_chunk(&spec, b"chunk bytez"),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+    assert!(check_chunk(&spec, b"chunk").is_err(), "another length");
 }
 
 fn sample_block() -> Vec<u8> {
@@ -691,7 +769,7 @@ fn forge(kind: FrameKind, stored: &[u8], raw_len: u32) -> Vec<u8> {
     entries.push(b'k');
     let (count, entries_len, disk_len) = (1_u16, entries.len() as u32, stored.len() as u32);
     let crc = header_crc(kind, 0, count, entries_len, raw_len, disk_len);
-    let checksum = frame_checksum(&entries, stored, crc);
+    let checksum = frame_checksum_parts(&entries, stored, crc);
     let mut out = Vec::new();
     out.extend_from_slice(&FRAME_MAGIC);
     out.extend_from_slice(&[kind as u8, 0]);

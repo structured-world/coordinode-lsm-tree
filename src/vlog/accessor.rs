@@ -22,6 +22,30 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+/// A frame a read holds: shared with the cache and the reads waiting on it,
+/// or the read's own when neither takes it.
+pub(crate) enum HeldFrame {
+    Shared(Arc<DecodedFrame>),
+    Own(DecodedFrame),
+}
+
+impl core::ops::Deref for HeldFrame {
+    type Target = DecodedFrame;
+
+    fn deref(&self) -> &DecodedFrame {
+        match self {
+            Self::Shared(frame) => frame,
+            Self::Own(frame) => frame,
+        }
+    }
+}
+
+impl core::borrow::Borrow<DecodedFrame> for HeldFrame {
+    fn borrow(&self) -> &DecodedFrame {
+        self
+    }
+}
+
 /// Frames a read fetched ahead for itself, held by that read instead of the
 /// shared cache: what a scan reads ahead when blob values are not cached.
 ///
@@ -29,13 +53,13 @@ use core::ops::Range;
 /// taken out of one only for the key its frame lists at the handle's index.
 #[derive(Default)]
 pub(crate) struct Prefetched {
-    frames: crate::HashMap<BlobFrameAt, HeldFrame>,
+    frames: crate::HashMap<BlobFrameAt, AheadFrame>,
 }
 
 /// A frame read ahead, with the charge that counts its payload against the
 /// read-ahead bound from the first value taken out of it.
-struct HeldFrame {
-    frame: Arc<DecodedFrame>,
+struct AheadFrame {
+    frame: DecodedFrame,
     charge: core::cell::OnceCell<Arc<FrameCharge>>,
 }
 
@@ -73,7 +97,7 @@ impl Prefetched {
 
     /// The frame `vhandle` names a value of, unless it is a chunked value's
     /// head, which holds none.
-    fn frame_for(&self, vhandle: &ValueHandle) -> Option<&HeldFrame> {
+    fn frame_for(&self, vhandle: &ValueHandle) -> Option<&AheadFrame> {
         self.frames
             .get(&vhandle.frame_at())
             .filter(|held| held.frame.header.kind != FrameKind::Head)
@@ -91,22 +115,29 @@ impl Prefetched {
         if self.frames.is_empty() {
             return;
         }
-        self.frames.retain(|at, _| {
-            items
-                .iter()
-                .any(|(_, vhandle, _)| vhandle.frame_at() == *at)
-        });
+        // Moved over by lookup, one per item: matching each held frame against
+        // every item cost a scan's refill the product of the two.
+        let mut held = core::mem::take(&mut self.frames);
+        for (_, vhandle, _) in items {
+            let at = vhandle.frame_at();
+            if let Some(frame) = held.remove(&at) {
+                self.frames.insert(at, frame);
+            }
+            if held.is_empty() {
+                break;
+            }
+        }
     }
 
     /// Holds `frame` as read ahead at `at`.
     #[cfg(test)]
-    pub(crate) fn hold(&mut self, at: BlobFrameAt, frame: Arc<DecodedFrame>) {
-        self.frames.insert(at, HeldFrame::new(frame));
+    pub(crate) fn hold(&mut self, at: BlobFrameAt, frame: DecodedFrame) {
+        self.frames.insert(at, AheadFrame::new(frame));
     }
 }
 
-impl HeldFrame {
-    fn new(frame: Arc<DecodedFrame>) -> Self {
+impl AheadFrame {
+    fn new(frame: DecodedFrame) -> Self {
         Self {
             frame,
             charge: core::cell::OnceCell::new(),
@@ -165,6 +196,15 @@ pub(crate) struct Accessor<'a> {
     /// read counters leave out as they leave out compaction's own input.
     #[cfg(feature = "metrics")]
     metrics: Option<&'a Metrics>,
+}
+
+/// Whether a frame a read decoded goes into the cache under `fill`. A block
+/// of small values always does, as a data block does: the values beside the
+/// one read are read next as often as not, and a block decoded once per value
+/// costs each of them the whole block. A frame of one value, or a chunk,
+/// follows the fill.
+pub(crate) fn caches(fill: BlobCacheFill, frame: &DecodedFrame) -> bool {
+    fill.fills() || frame.header.kind == crate::vlog::blob_file::frame::FrameKind::Block
 }
 
 impl<'a> Accessor<'a> {
@@ -258,13 +298,53 @@ impl<'a> Accessor<'a> {
         blob_file: &BlobFile,
         frame: u32,
         cache: &Cache,
-    ) -> crate::Result<Arc<DecodedFrame>> {
+    ) -> crate::Result<HeldFrame> {
+        self.load(tree_id, blob_file, frame, cache, |bytes, decoded| {
+            Reader::decode(blob_file, bytes, decoded)
+        })
+    }
+
+    /// Chunk `at` of the value `head`, frame `head_frame` of `blob_file`, as
+    /// [`Self::frame`] reads a frame: decoded by the head's table, the chunk
+    /// carrying no header of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::frame`], and a chunk the head does not list.
+    fn chunk(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        head: &DecodedFrame,
+        head_frame: u32,
+        at: u32,
+        cache: &Cache,
+    ) -> crate::Result<HeldFrame> {
+        let frame = head_frame
+            .checked_add(1)
+            .and_then(|first| first.checked_add(at))
+            .ok_or(crate::Error::InvalidHeader("Blob"))?;
+        self.load(tree_id, blob_file, frame, cache, |bytes, decoded| {
+            Reader::decode_chunk(blob_file, head, at, bytes, decoded)
+        })
+    }
+
+    /// Frame `frame` of `blob_file`, from the cache or read and decoded now
+    /// by `decode`.
+    fn load(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        frame: u32,
+        cache: &Cache,
+        decode: impl FnOnce(&crate::Slice, &mut usize) -> crate::Result<DecodedFrame>,
+    ) -> crate::Result<HeldFrame> {
         let at = BlobFrameAt {
             blob_file_id: blob_file.id(),
             frame,
         };
         if let Some(cached) = cache.get_blob_frame(tree_id, at) {
-            return Ok(cached);
+            return Ok(HeldFrame::Shared(cached));
         }
         let lead = match cache.claim_blob_frame(tree_id, at) {
             crate::cache::BlobClaim::Shared(shared) => {
@@ -277,17 +357,17 @@ impl<'a> Accessor<'a> {
                 // The read that led may not cache what it reads (its policy
                 // is its own, taken when it began): one whose policy does
                 // caches the shared frame itself.
-                if self.fill.fills() && !cache.contains_blob_frame(tree_id, at) {
+                if caches(self.fill, &shared) && !cache.contains_blob_frame(tree_id, at) {
                     cache.insert_blob_frame(tree_id, at, Arc::clone(&shared));
                 }
-                return Ok(shared);
+                return Ok(HeldFrame::Shared(shared));
             }
             crate::cache::BlobClaim::Lead(lead) => {
                 // A read that finished between the miss above and this claim
                 // left its frame in the cache, when the fill policy let it.
                 if let Some(cached) = cache.get_blob_frame(tree_id, at) {
                     lead.publish(cache, tree_id, at, &cached, false);
-                    return Ok(cached);
+                    return Ok(HeldFrame::Shared(cached));
                 }
                 Some(lead)
             }
@@ -310,16 +390,20 @@ impl<'a> Accessor<'a> {
         // Charged before the result is judged, like the read above: a frame
         // refused after decompression was still decompressed.
         let mut decoded = 0;
-        let parsed = Reader::decode(blob_file, &bytes, &mut decoded);
+        let parsed = decode(&bytes, &mut decoded);
         self.count_decoded(decoded);
-        let frame = Arc::new(parsed?);
+        let frame = parsed?;
         cache.record_blob_load(tree_id, at, timer);
-        match lead {
-            Some(lead) => lead.publish(cache, tree_id, at, &frame, self.fill.fills()),
-            None if self.fill.fills() => cache.insert_blob_frame(tree_id, at, Arc::clone(&frame)),
-            None => {}
-        }
-        Ok(frame)
+        let fills = caches(self.fill, &frame);
+        Ok(match lead {
+            Some(lead) => lead.publish_owned(cache, tree_id, at, frame, fills),
+            None if fills => {
+                let frame = Arc::new(frame);
+                cache.insert_blob_frame(tree_id, at, Arc::clone(&frame));
+                HeldFrame::Shared(frame)
+            }
+            None => HeldFrame::Own(frame),
+        })
     }
 
     /// Reads one separated value whole.
@@ -377,6 +461,13 @@ impl<'a> Accessor<'a> {
         }
         check_key(&first, vhandle.index, key)?;
         let total = first.list.first().map_or(0, |e| u64::from(e.value_len));
+        // A whole value its read does not cache is built in place, its chunks
+        // read into it, and none decoded on its own.
+        if range.is_none() && !self.fill.fills() {
+            return self
+                .read_chunks_whole(tree_id, blob_file, &first, vhandle.frame)
+                .map(Some);
+        }
         let range = range.unwrap_or(0..total);
         check_range(&range, total)?;
         // An empty range inside a chunk covers that chunk by its rounding,
@@ -384,26 +475,133 @@ impl<'a> Accessor<'a> {
         if range.is_empty() {
             return Ok(Some(UserValue::empty()));
         }
-        let all = chunk_frames(&first, vhandle.frame, blob_file.frame_count())?;
         let (covered, _) = covering_chunks(&first, &range)?;
-        let chunk_at = |at: u32| {
-            all.start
-                .checked_add(at)
-                .ok_or(crate::Error::InvalidHeader("Blob"))
-        };
         // A range within one chunk is a view into it, with no list to gather.
         if covered.end - covered.start == 1 {
-            let chunk = self.frame(tree_id, blob_file, chunk_at(covered.start)?, cache)?;
+            let chunk = self.chunk(
+                tree_id,
+                blob_file,
+                &first,
+                vhandle.frame,
+                covered.start,
+                cache,
+            )?;
             return assemble(&first, core::slice::from_ref(&chunk), Some(&range)).map(Some);
         }
         let mut chunks = Vec::with_capacity((covered.end - covered.start) as usize);
         for at in covered {
-            chunks.push(self.frame(tree_id, blob_file, chunk_at(at)?, cache)?);
+            chunks.push(self.chunk(tree_id, blob_file, &first, vhandle.frame, at, cache)?);
         }
         let value = assemble(&first, &chunks, Some(&range))?;
         // A range across chunks is gathered into a buffer of its own.
         self.count_gather(value.len());
         Ok(Some(value))
+    }
+
+    /// The chunked value `head`, frame `head_frame` of `blob_file`, read whole
+    /// into one allocation: a run of chunks stored as they are is read in one
+    /// request straight into the place it takes in the value, and a
+    /// compressed chunk is read and decompressed into its place. No chunk is
+    /// held decoded on its own, so the value costs what a value of a frame of
+    /// its own does: one copy of its bytes out of the file.
+    ///
+    /// # Errors
+    ///
+    /// The blob file's open or read failures, and a chunk that does not check
+    /// or does not fit the head's table.
+    fn read_chunks_whole(
+        &self,
+        tree_id: TreeId,
+        blob_file: &BlobFile,
+        head: &DecodedFrame,
+        head_frame: u32,
+    ) -> crate::Result<UserValue> {
+        use crate::vlog::blob_file::frame::{check_chunk, decode_chunk_into};
+
+        let malformed = || crate::Error::InvalidHeader("Blob");
+        let (_, count) = head.chunk_table()?;
+        let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
+        let len = usize::try_from(total).map_err(|_| malformed())?;
+        let chunks = chunk_frames(head, head_frame, blob_file.frame_count())?;
+        if chunks.end - chunks.start != count {
+            return Err(malformed());
+        }
+        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
+        let (file, _) = blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
+        let compression = blob_file.0.meta.compression;
+
+        // Each chunk where the frame index places it, of the length its row
+        // in the head's table gives.
+        let mut placed = Vec::with_capacity(count as usize);
+        for (at, frame) in (0_u32..).zip(chunks) {
+            let spec = head.chunk(at)?;
+            let (start, end) = blob_file.frame_span(frame).ok_or_else(malformed)?;
+            if end - start != u64::from(spec.stored_len) || !spec.fits(compression) {
+                return Err(malformed());
+            }
+            placed.push((spec, start));
+        }
+
+        let mut value = crate::slice::UnfilledSlice::new(len);
+        let mut target = value.target();
+        let mut at = 0;
+        while let Some(&(spec, start)) = placed.get(at) {
+            if !spec.is_stored_as_is(compression) {
+                let stored_len = spec.stored_len as usize;
+                self.count_request(stored_len);
+                let bytes = crate::file::read_exact(file.as_ref(), start, stored_len)?;
+                let mut part = target.portion(target.filled(), spec.raw_len as usize);
+                let mut decoded = 0;
+                let checked = decode_chunk_into(
+                    &spec,
+                    &bytes,
+                    compression,
+                    #[cfg(zstd_any)]
+                    blob_file.0.zstd_dictionary.as_deref(),
+                    part.init_mut(),
+                    &mut decoded,
+                );
+                self.count_decoded(decoded);
+                checked?;
+                part.set_filled(spec.raw_len as usize)?;
+                target.extend_from_portion(spec.raw_len as usize);
+                at += 1;
+                continue;
+            }
+            // The run of chunks stored as they are from here: back to back in
+            // the file as in the value, so one read fills them all.
+            let run_end = placed
+                .iter()
+                .skip(at)
+                .position(|(spec, _)| !spec.is_stored_as_is(compression))
+                .map_or(placed.len(), |n| at + n);
+            let run = placed.get(at..run_end).unwrap_or_default();
+            let run_len: usize = run.iter().map(|(spec, _)| spec.raw_len as usize).sum();
+            self.count_request(run_len);
+            let mut part = target.portion(target.filled(), run_len);
+            file.read_at_buf(&mut part, start)?;
+            if part.filled() != run_len {
+                return Err(malformed());
+            }
+            let mut from = 0;
+            for (spec, _) in run {
+                let to = from + spec.raw_len as usize;
+                check_chunk(spec, part.init_mut().get(from..to).ok_or_else(malformed)?)?;
+                from = to;
+            }
+            self.count_decoded(run_len);
+            target.extend_from_portion(run_len);
+            at = run_end;
+        }
+        if target.filled() != len {
+            return Err(malformed());
+        }
+        // SAFETY: every byte of the value was filled above, chunk by chunk,
+        // as `target` counted them.
+        #[expect(unsafe_code, reason = "see safety")]
+        Ok(unsafe { value.assume_filled() })
     }
 
     /// Warms the cache, or the read's own store, with the frames a run of
@@ -761,20 +959,32 @@ impl<'a> Accessor<'a> {
             *admit_budget -= weight;
             // A frame decoded as stored is a view into the coalesced read;
             // copied out so it does not keep the whole read alive, unless the
-            // read is that frame alone.
-            let frame = if from == 0 && to == bytes.len() {
-                frame
-            } else {
-                let (frame, copied) = own_frame(frame, blob_file.compression());
-                self.count_gather(copied);
-                frame
-            };
-            let frame = Arc::new(frame);
+            // read is that frame alone. In the read's own store only what it
+            // hands on is: a value stored as it is would pin the read for as
+            // long as its caller holds it, while the entries stay with the
+            // store, which lets the read go with the frame.
+            let whole = from == 0 && to == bytes.len();
             let at = vhandle.frame_at();
             match into {
-                PrefetchInto::Cache => cache.insert_blob_frame(tree_id, at, frame),
+                PrefetchInto::Cache => {
+                    let frame = if whole {
+                        frame
+                    } else {
+                        let (frame, copied) = own_frame(frame, blob_file.compression(), true);
+                        self.count_gather(copied);
+                        frame
+                    };
+                    cache.insert_blob_frame(tree_id, at, Arc::new(frame));
+                }
                 PrefetchInto::Local(store) => {
-                    store.frames.insert(at, HeldFrame::new(frame));
+                    let frame = if whole {
+                        frame
+                    } else {
+                        let (frame, copied) = own_frame(frame, blob_file.compression(), false);
+                        self.count_gather(copied);
+                        frame
+                    };
+                    store.frames.insert(at, AheadFrame::new(frame));
                 }
             }
         }
@@ -832,12 +1042,14 @@ fn span_extent(
     })
 }
 
-/// `frame`, decoded from a file under `compression`, holding its own bytes,
-/// and the bytes copied for that: a frame stored as it is and decoded out of
-/// a larger read is a view into it; a compressed one already holds its own.
+/// `frame`, decoded from a file under `compression`, holding its own payload,
+/// and its own entries too when `entries` says so, and the bytes copied for
+/// that: a frame stored as it is and decoded out of a larger read is a view
+/// into it; a compressed one already holds its own.
 pub(crate) fn own_frame(
     frame: DecodedFrame,
     compression: crate::CompressionType,
+    entries: bool,
 ) -> (DecodedFrame, usize) {
     let stored_as_is = frame.header.is_raw() || compression == crate::CompressionType::None;
     if !stored_as_is {
@@ -845,9 +1057,13 @@ pub(crate) fn own_frame(
         // of its own.
         return (frame, 0);
     }
-    let copied = frame.entries.len() + frame.payload.len();
+    let copied = if entries { frame.entries.len() } else { 0 } + frame.payload.len();
     let frame = DecodedFrame {
-        entries: crate::Slice::new(&frame.entries),
+        entries: if entries {
+            crate::Slice::new(&frame.entries)
+        } else {
+            frame.entries
+        },
         payload: crate::Slice::new(&frame.payload),
         ..frame
     };
