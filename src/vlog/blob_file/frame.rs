@@ -338,7 +338,12 @@ impl DecodedFrame {
             return Err(malformed);
         };
         let total = self.list.first().map_or(0, |e| u64::from(e.value_len));
-        if size == 0 || u64::from(chunks) != total.div_ceil(u64::from(size)) {
+        // A value is written within the cap, and callers size their chunk
+        // list and buffer from this table: a larger one is damage.
+        if size == 0
+            || total > super::writer::MAX_DECOMPRESSION_SIZE as u64
+            || u64::from(chunks) != total.div_ceil(u64::from(size))
+        {
             return Err(malformed);
         }
         Ok((size, chunks))

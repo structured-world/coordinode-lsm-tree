@@ -169,6 +169,34 @@ fn head_frame_names_its_chunk_table() {
     ));
 }
 
+/// A head naming a value above the size a value may take is malformed, though
+/// its table covers that value: a caller sizes its chunk list and its buffer
+/// from the table, and a tiny damaged file would otherwise ask for gigabytes.
+#[test]
+fn a_head_naming_a_value_above_the_cap_is_malformed() {
+    let over = u32::try_from(crate::vlog::blob_file::writer::MAX_DECOMPRESSION_SIZE + 1)
+        .unwrap_or(u32::MAX);
+    let entry = EntrySpec {
+        key: b"big",
+        seqno: 7,
+        value_len: over,
+    };
+    let mut out = Vec::new();
+    encode_frame(
+        FrameKind::Head,
+        &[entry],
+        &head_payload(1, over),
+        plain(),
+        &mut out,
+    )
+    .unwrap();
+    let frame = decode(&out, CompressionType::None).unwrap();
+    assert!(matches!(
+        frame.chunk_table(),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+}
+
 /// A chunk lists no entries; any other frame's table is not a chunk table.
 #[test]
 fn chunk_frame_has_no_entries() {
