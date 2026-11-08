@@ -72,6 +72,7 @@ impl<'a> BlobIngestion<'a> {
         .use_writeback_bytes(tree.index.config.writeback_bytes)
         .use_lifetime_groups(kv.lifetime_groups)
         .use_frame_sizes(kv.frame_sizes())
+        .use_dictionary_classes(kv.dictionary_classes)
         .use_clock(tree.index.config.clock.clone())
         .use_key_domains(
             tree.index.config.key_domains.clone(),
@@ -88,6 +89,8 @@ impl<'a> BlobIngestion<'a> {
                 .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                 .use_zstd_dictionaries(dicts)
         };
+        #[cfg(feature = "std")]
+        let blob = blob.use_parallel_compression(tree.index.config.parallel_compression());
 
         let separation_threshold = kv.separation_threshold;
         let cell_thresholds = kv.cell_separation_thresholds.clone();

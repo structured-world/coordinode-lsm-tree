@@ -3336,6 +3336,7 @@ fn run_subcompaction(
             .use_writeback_bytes(opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
             .use_frame_sizes(blob_opts.frame_sizes())
+            .use_dictionary_classes(blob_opts.dictionary_classes)
             .use_clock(opts.config.clock.clone())
             .use_key_domains(
                 opts.config.key_domains.clone(),
@@ -3364,6 +3365,7 @@ fn run_subcompaction(
                     opts.tree_id,
                 )
                 .with_drain_below(drain_below)
+                .with_block_copy_share(Some(blob_opts.block_copy_share()))
                 .with_fresh_values(FreshValues {
                     options: blob_opts.clone(),
                     compression: rc.blob_compression,
@@ -3663,10 +3665,6 @@ pub(crate) fn pick_blob_files_to_rewrite(
 struct BlobRewrite {
     files: Vec<BlobFile>,
     /// Some of `files` are relocated for locality rather than for staleness.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(dead_code, reason = "read only by the std merge-on-read fast path")
-    )]
     for_locality: bool,
 }
 
@@ -3702,10 +3700,10 @@ fn pick_blob_files_for_merge(
 /// the dictionary each output file records, and the dictionary of the
 /// snapshot's blob policy, with its two-pass setting, encodes the new values.
 #[cfg_attr(
-    not(zstd_any),
+    not(any(zstd_any, feature = "std")),
     expect(
         clippy::missing_const_for_fn,
-        reason = "the zstd build reads the dictionaries"
+        reason = "the zstd build reads the dictionaries, the std build the parallel workers"
     )
 )]
 fn with_fresh_encoding(
@@ -3713,6 +3711,10 @@ fn with_fresh_encoding(
     opts: &Options,
     rc: &crate::runtime_config::RuntimeConfig,
 ) -> BlobFileWriter {
+    // New values and the block values rewritten out of their blocks are
+    // compressed here; copied frames are not.
+    #[cfg(feature = "std")]
+    let writer = writer.use_parallel_compression(opts.config.parallel_compression());
     #[cfg(zstd_any)]
     {
         let dicts = opts.config.current_zstd_dictionaries();
@@ -4284,6 +4286,7 @@ fn merge_tables(
             &pace,
         );
     }
+    let for_locality = blob_rewrite.for_locality;
     let blob_files_to_rewrite = blob_rewrite.files;
 
     // ---- Parallel sub-compaction (std only) ----
@@ -4706,6 +4709,7 @@ fn merge_tables(
                 .use_writeback_bytes(opts.config.writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
                 .use_frame_sizes(blob_opts.frame_sizes())
+                .use_dictionary_classes(blob_opts.dictionary_classes)
                 .use_clock(opts.config.clock.clone())
                 .use_key_domains(
                     opts.config.key_domains.clone(),
@@ -4730,6 +4734,10 @@ fn merge_tables(
                         opts.config.comparator.clone(),
                         opts.tree_id,
                     )
+                    // A pass that relocates for locality rewrites every value
+                    // in key order: a block copied whole would keep its
+                    // source's place among the files it interleaves with.
+                    .with_block_copy_share((!for_locality).then(|| blob_opts.block_copy_share()))
                     .with_fresh_values(FreshValues {
                         options: blob_opts.clone(),
                         compression: rc.blob_compression,

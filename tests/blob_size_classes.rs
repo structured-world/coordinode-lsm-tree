@@ -162,6 +162,70 @@ fn a_large_value_read_through_the_cache_is_served_from_it_again() -> lsm_tree::R
     Ok(())
 }
 
+/// A dictionary that applies to blocks only leaves the other classes
+/// compressed without it, and every value reads back, after a reopen too,
+/// whichever way its frame was compressed.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_dictionary_of_one_class_reads_back_every_class() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let dictionary = std::sync::Arc::new(lsm_tree::ZstdDictionary::new(
+        &b"a sample of the values a dictionary learns from ".repeat(64),
+    ));
+    let compression = CompressionType::ZstdDict {
+        level: 3,
+        dict_id: dictionary.id(),
+    };
+    let open = || {
+        Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(1_024)
+                .dict(std::sync::Arc::clone(&dictionary))
+                .dictionary_classes(lsm_tree::DictionaryClasses {
+                    blocks: true,
+                    singles: false,
+                    chunks: false,
+                }),
+        ))
+        .blob_compression(compression)
+        .open()
+    };
+    let value = |len: usize| b"the values a dictionary learns from ".repeat(len / 36);
+    let values = [
+        ("block", value(2_000)),
+        ("single", value(100_000)),
+        ("chunked", value(600_000)),
+    ];
+    {
+        let tree = open()?;
+        for (key, value) in &values {
+            tree.insert(*key, value, 0);
+        }
+        tree.flush_active_memtable(0)?;
+        for (key, value) in &values {
+            assert_eq!(
+                tree.get(*key, SeqNo::MAX)?.as_deref(),
+                Some(&**value),
+                "{key}"
+            );
+        }
+    }
+    let tree = open()?;
+    for (key, value) in &values {
+        assert_eq!(
+            tree.get(*key, SeqNo::MAX)?.as_deref(),
+            Some(&**value),
+            "{key}"
+        );
+    }
+    Ok(())
+}
+
 /// The byte at the middle of the only blob file, flipped.
 fn damage_the_middle(tree: &BlobTree) -> lsm_tree::Result<()> {
     let version = tree.current_version();

@@ -2394,6 +2394,7 @@ impl AbstractTree for BlobTree {
             .use_writeback_bytes(self.index.config.writeback_bytes)
             .use_lifetime_groups(kv_opts.lifetime_groups)
             .use_frame_sizes(kv_opts.frame_sizes())
+            .use_dictionary_classes(kv_opts.dictionary_classes)
             .use_clock(self.index.config.clock.clone())
             .use_key_domains(
                 self.index.config.key_domains.clone(),
@@ -2404,6 +2405,8 @@ impl AbstractTree for BlobTree {
                 .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
                 .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                 .use_zstd_dictionaries(dicts);
+            #[cfg(feature = "std")]
+            let w = w.use_parallel_compression(self.index.config.parallel_compression());
             w
         };
 

@@ -453,6 +453,10 @@ impl Scanner {
                 let whole = decoded.header.kind == FrameKind::Single;
                 // A single frame left undecoded is yielded by its frame alone.
                 let decoded_value = !whole || self.decode == Decode::All;
+                let block = (!whole).then(|| ScanBlock {
+                    stored: bytes.clone(),
+                    values: decoded.header.count,
+                });
                 for (at, entry) in decoded.list.iter().enumerate() {
                     let Some(key) = decoded.key(at) else {
                         return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
@@ -485,6 +489,7 @@ impl Scanner {
                         frame_end: if at == last { frame_end } else { offset },
                         resynced,
                         frames: whole.then(|| alloc::vec![bytes.clone()]),
+                        block: block.clone(),
                     });
                 }
                 Some(Ok(()))
@@ -552,6 +557,7 @@ impl Scanner {
                     frame_end: end,
                     resynced: self.resync_tainted,
                     frames: Some(stored),
+                    block: None,
                 });
                 Some(Ok(()))
             }
@@ -649,6 +655,18 @@ pub(crate) struct ScanEntry {
     /// single frame, or a head and its chunks): what a copy under the same
     /// codec writes as it is. `None` for a value that shares a block.
     pub frames: Option<Vec<Slice>>,
+    /// The block the value shares, for a value in one.
+    pub block: Option<ScanBlock>,
+}
+
+/// The block a scanned value shares with its neighbours.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScanBlock {
+    /// The block's frame as stored, which a copy under the same codec writes
+    /// as it is; every value of the block holds the same bytes.
+    pub stored: Slice,
+    /// How many values the block holds.
+    pub values: u16,
 }
 
 #[cfg(test)]
