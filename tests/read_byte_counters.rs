@@ -1382,6 +1382,60 @@ fn a_point_read_of_a_split_value_counts_the_rows_it_gathers_and_the_block() {
 }
 
 #[test]
+fn a_multi_get_caching_a_chunked_head_detaches_it_from_the_whole_value_read() {
+    // A cold multi-get reads a chunked value's head and chunks in one buffer.
+    // Cached as a view of that buffer, the head would keep the whole value's
+    // read alive while the cache charges it a few bytes, so a multi-get that
+    // caches what it reads copies the head out: a copy the gather counter
+    // shows beside the value it assembles, which a multi-get caching nothing
+    // makes too.
+    let value_len = 1 << 20;
+    // Keys long enough that a head's entries are not held inline; three, so
+    // the multi-get takes its batched path rather than reading key by key.
+    let keys = [vec![b'k'; 64], vec![b'l'; 64], vec![b'm'; 64]];
+    let copied = |fill: BlobCacheFill| {
+        let folder = get_tmp_folder();
+        let config = || {
+            Config::new(
+                folder.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .blob_compression(CompressionType::None)
+            // Each value is a head and four chunks.
+            .with_kv_separation(Some(
+                lsm_tree::KvSeparationOptions::default()
+                    .chunk_size(core::num::NonZeroU32::new(256 * 1024).expect("non-zero")),
+            ))
+            .blob_cache_fill(fill)
+        };
+        {
+            let tree = config().open().expect("open");
+            for (seqno, key) in (0..).zip(&keys) {
+                tree.insert(key, vec![b'v'; value_len], seqno);
+            }
+            tree.flush_active_memtable(0).expect("flush");
+        }
+        // Reopened, so nothing is cached and the multi-get reads cold.
+        let tree = config().open().expect("reopen");
+        let m = tree.metrics();
+        let before = m.bytes_copied();
+        let got = tree.multi_get(&keys, SeqNo::MAX).expect("multi_get");
+        for value in got {
+            assert_eq!(value.expect("every value").len(), value_len);
+        }
+        m.bytes_copied() - before
+    };
+    let cached = copied(BlobCacheFill::Always);
+    let uncached = copied(BlobCacheFill::Never);
+    assert!(
+        cached > uncached,
+        "caching the head copied nothing beyond the value ({cached} B against \
+         {uncached} B uncached): it is a view of the whole value's read",
+    );
+}
+
+#[test]
 fn a_multi_get_of_a_split_value_counts_the_values_it_rebuilds_and_the_blocks() {
     // The row path over a split-value block rebuilds every row's value from
     // its sub-columns and then encodes the rows into a row-major block. The

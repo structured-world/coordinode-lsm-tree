@@ -435,8 +435,22 @@ impl BlobSource {
         accessor.count_decoded(decoded);
         let frame = Arc::new(parsed?);
         if self.fill.fills() {
+            // Read with the chunks after it, a head decoded as a view would
+            // keep the whole value's read alive in the cache, which charges
+            // it only its own bytes: it is cached detached. A frame read alone
+            // is the whole read and is cached as it is.
+            let cached = if bytes.len() as u64 == end - start {
+                Arc::clone(&frame)
+            } else {
+                let (owned, copied) = crate::vlog::accessor::own_frame(
+                    (*frame).clone(),
+                    read.blob_file.compression(),
+                );
+                accessor.count_gather(copied);
+                Arc::new(owned)
+            };
             self.cache
-                .insert_blob_frame(self.tree_id, read.vhandle.frame_at(), Arc::clone(&frame));
+                .insert_blob_frame(self.tree_id, read.vhandle.frame_at(), cached);
         }
         if frame.header.kind != FrameKind::Head {
             return reader::value_in(&frame, read.vhandle.index, key).map(Some);
