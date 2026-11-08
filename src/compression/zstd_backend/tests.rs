@@ -30,6 +30,70 @@ const COMPRESSED: &[u8] = &[
 
 const PLAINTEXT: &[u8] = b"hello world hello world hello world";
 
+/// A frame under a finalized dictionary decodes straight into a buffer of
+/// exactly its length, as the allocating decode returns it.
+#[test]
+fn decompress_with_dict_into_finalized_fills_the_exact_buffer() {
+    let dict = ZstdDictionary::new(DICT);
+    let mut out = vec![0_u8; PLAINTEXT.len()];
+    let written = ZstdProvider::decompress_with_dict_into(COMPRESSED, &dict, &mut out)
+        .expect("decompression should succeed");
+    assert_eq!(written, PLAINTEXT.len());
+    assert_eq!(out, PLAINTEXT);
+}
+
+/// The raw-content path, which blob files use for the dictionary they carry,
+/// decodes into an exact buffer too, and twice in a row on one thread.
+#[test]
+fn decompress_with_dict_into_raw_content_fills_the_exact_buffer() {
+    let dict = ZstdDictionary::new(b"hello world raw content dictionary bytes");
+    let frame = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
+        .expect("compression should succeed");
+    for _ in 0..2 {
+        let mut out = vec![0_u8; PLAINTEXT.len()];
+        let written = ZstdProvider::decompress_with_dict_into(&frame, &dict, &mut out)
+            .expect("decompression should succeed");
+        assert_eq!(&out[..written], PLAINTEXT);
+    }
+}
+
+/// A frame compressed under another raw-content dictionary is refused, not
+/// decoded into silent garbage with the wrong history.
+#[test]
+fn decompress_with_dict_into_refuses_another_raw_content_dictionary() {
+    let used = ZstdDictionary::new(b"the dictionary the frame was compressed under");
+    let other = ZstdDictionary::new(b"a different dictionary of the same blob tree");
+    let frame = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &used, true)
+        .expect("compression should succeed");
+    let mut out = vec![0_u8; PLAINTEXT.len()];
+    assert!(ZstdProvider::decompress_with_dict_into(&frame, &other, &mut out).is_err());
+}
+
+/// A buffer shorter than the frame's content is refused rather than
+/// written past or truncated.
+#[test]
+fn decompress_with_dict_into_refuses_a_short_buffer() {
+    let dict = ZstdDictionary::new(DICT);
+    let mut out = vec![0_u8; PLAINTEXT.len() - 1];
+    assert!(ZstdProvider::decompress_with_dict_into(COMPRESSED, &dict, &mut out).is_err());
+}
+
+/// A plain frame decoded on the same thread after a dictionary frame comes
+/// out plain: the dictionary decoder leaves the plain one untouched.
+#[test]
+fn decompress_into_after_a_dictionary_decode_stays_plain() {
+    let dict = ZstdDictionary::new(b"hello world raw content dictionary bytes");
+    let with_dict = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
+        .expect("compression should succeed");
+    let plain = ZstdProvider::compress(PLAINTEXT, 3, true).expect("compression should succeed");
+    let mut out = vec![0_u8; PLAINTEXT.len()];
+    ZstdProvider::decompress_with_dict_into(&with_dict, &dict, &mut out)
+        .expect("decompression should succeed");
+    let mut out = vec![0_u8; PLAINTEXT.len()];
+    let written = ZstdProvider::decompress_into(&plain, &mut out).expect("plain decode");
+    assert_eq!(&out[..written], PLAINTEXT);
+}
+
 #[test]
 fn decompress_with_dict_returns_correct_plaintext() {
     let dict = ZstdDictionary::new(DICT);

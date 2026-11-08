@@ -93,8 +93,10 @@ fn a_scan_yields_every_class() -> crate::Result<()> {
     let index = index_of(&path)?;
     let entries = Scanner::new(&path, &StdFs, 0)?.collect::<crate::Result<Vec<_>>>()?;
 
-    let places: Vec<_> = entries.iter().map(|e| (e.frame, e.index)).collect();
-    assert_eq!(places, [(0, 0), (0, 1), (1, 0), (2, 0), (6, 0)]);
+    // The index a handle names each by is checked against the writes in
+    // `a_scan_names_each_value_as_its_handle_does`.
+    let frames: Vec<_> = entries.iter().map(|e| e.frame).collect();
+    assert_eq!(frames, [0, 0, 1, 2, 6]);
     assert_eq!(
         entries[0].frame_end, index[0] as u64,
         "the block is not consumed yet"
@@ -113,12 +115,40 @@ fn a_scan_yields_every_class() -> crate::Result<()> {
     assert_eq!(entries[3].frame_end, index[6] as u64, "past its last chunk");
     assert_eq!(entries[3].value, None, "a chunked value is not gathered");
     assert_eq!(
-        entries[3].whole_value()?,
+        entries[3].whole_value(CompressionType::None)?,
         Slice::from(chunked),
         "its frames hold it whole"
     );
     assert_eq!(entries[2].value, Some(Slice::from(&[b'c'; 150][..])));
     assert!(entries.iter().all(|e| !e.resynced && e.seqno == 7));
+    Ok(())
+}
+
+/// A value comes back at the frame and index its write returned, the place a
+/// handle names it by: in a packed block that is its record's offset, not its
+/// place in the block, or a compaction matching the scan against the tables'
+/// handles drains every record after the first as unreferenced.
+#[test]
+fn a_scan_names_each_value_as_its_handle_does() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("0");
+    let mut writer = BlobFileWriter::new(&path, 0, 0, &StdFs)?.use_frame_sizes(SIZES);
+    let values: [(&[u8], &[u8]); 4] = [
+        (b"a", b"x1"),
+        (b"b", b"x22"),
+        (b"c", &[b'c'; 150]),
+        (b"d", b"x333"),
+    ];
+    let mut written = Vec::new();
+    for (key, value) in values {
+        let at = writer.write(key, 7, value)?;
+        written.push((at.frame, at.index));
+    }
+    writer.finish()?;
+    let entries = Scanner::new(&path, &StdFs, 0)?.collect::<crate::Result<Vec<_>>>()?;
+    let scanned: Vec<_> = entries.iter().map(|e| (e.frame, e.index)).collect();
+    assert_eq!(scanned, written);
+    assert!(written[1].1 > 0, "the second record starts past the first");
     Ok(())
 }
 

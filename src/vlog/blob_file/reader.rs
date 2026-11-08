@@ -217,7 +217,7 @@ pub(crate) enum CopySource {
 /// [`crate::Error::InvalidHeader`] when it is not, or the frame lists no such
 /// entry: a handle that names another value is damage, never that value.
 pub(crate) fn check_key(frame: &DecodedFrame, index: u16, key: &[u8]) -> crate::Result<()> {
-    if frame.key(usize::from(index)) == Some(key) {
+    if frame.place_of(index).and_then(|at| frame.key(at)) == Some(key) {
         Ok(())
     } else {
         Err(crate::Error::InvalidHeader("Blob"))
@@ -237,7 +237,8 @@ pub(crate) fn value_in(frame: &DecodedFrame, index: u16, key: &[u8]) -> crate::R
     check_key(frame, index, key)?;
     match frame.header.kind {
         FrameKind::Single | FrameKind::Block => frame
-            .value(usize::from(index))
+            .place_of(index)
+            .and_then(|at| frame.value(at))
             .ok_or(crate::Error::InvalidHeader("Blob")),
         FrameKind::Head | FrameKind::Chunk => Err(crate::Error::InvalidHeader("Blob")),
     }

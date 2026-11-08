@@ -21,7 +21,9 @@ fn random(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// A blob tree separating values from 1 KiB, its blob files compressed with
-/// `compression` and its blob frames cached as `fill` says.
+/// `compression` and its blob frames cached as `fill` says. Its zstd files
+/// build no dictionary of their own, so small values share blocks under
+/// every codec; packing under a file's dictionary is tested apart.
 fn open(
     path: &std::path::Path,
     compression: CompressionType,
@@ -33,7 +35,9 @@ fn open(
         SequenceNumberCounter::default(),
     )
     .with_kv_separation(Some(
-        KvSeparationOptions::default().separation_threshold(1_024),
+        KvSeparationOptions::default()
+            .separation_threshold(1_024)
+            .file_dictionary(0),
     ))
     .blob_compression(compression)
     .blob_cache_fill(fill)
@@ -192,6 +196,38 @@ fn a_large_value_read_whole_is_built_in_place() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A large value read alone without the cache is one request of the
+/// filesystem, its head and its chunks together, under every codec: read
+/// apart, the head's small read starts the kernel's readahead small and the
+/// chunks after it come in one growing window after another, which made a
+/// cold 4 MiB value three times slower than a frame of its own.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_large_value_read_alone_is_one_request() -> lsm_tree::Result<()> {
+    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+        let folder = get_tmp_folder();
+        let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
+        let mut value: Vec<u8> = (0..600_000_u32).map(|i| (i % 7) as u8).collect();
+        value.extend(random(9, 600_000));
+        tree.insert("large", &value, 0);
+        tree.flush_active_memtable(0)?;
+
+        let m = tree.metrics();
+        let before = m.blob_read_count();
+        assert_eq!(
+            tree.get("large", SeqNo::MAX)?.as_deref(),
+            Some(&*value),
+            "{compression:?}"
+        );
+        assert_eq!(
+            m.blob_read_count() - before,
+            1,
+            "{compression:?}: the head and the chunks in one request"
+        );
+    }
+    Ok(())
+}
+
 /// A block of small values a point read decodes is cached like a data block,
 /// whatever the blob cache fill says: the values beside the one read are read
 /// from the cache, by `get` and by `multi_get` alike, not decoded again per
@@ -199,7 +235,7 @@ fn a_large_value_read_whole_is_built_in_place() -> lsm_tree::Result<()> {
 #[cfg(feature = "metrics")]
 #[test]
 fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()> {
-    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+    for compression in codecs() {
         let folder = get_tmp_folder();
         let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
         // Twenty values of 2,000 bytes, four to an 8 KiB block: five blocks.
@@ -242,12 +278,113 @@ fn a_block_a_point_read_decodes_serves_its_other_values() -> lsm_tree::Result<()
     Ok(())
 }
 
+/// Under zstd and the default options a blob file builds its own dictionary
+/// and packs its small values: a cold point read of a value reads its record
+/// alone, and not the 8 KiB block of its neighbours a file without a
+/// dictionary would read and decode. Incompressible values keep the block
+/// and the record at their raw sizes, so the bytes read tell them apart.
+#[cfg(all(feature = "metrics", feature = "zstd"))]
+#[test]
+fn a_zstd_file_reads_a_small_value_alone_by_default() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let AnyTree::Blob(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(1_024),
+    ))
+    .blob_compression(CompressionType::Zstd(3))
+    .blob_cache_fill(BlobCacheFill::Never)
+    .use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
+        64 << 20,
+    )))
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    // 400 KB, well past the default dictionary's 64 KiB of samples.
+    for i in 0..200 {
+        tree.insert(format!("k{i:03}"), random(i, 2_000), 0);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = tree.metrics();
+    let (reads, bytes) = (m.blob_read_count(), m.blob_bytes_read());
+    assert_eq!(
+        tree.get("k150", SeqNo::MAX)?.as_deref(),
+        Some(&*random(150, 2_000))
+    );
+    assert_eq!(m.blob_read_count(), reads + 1, "one read for the value");
+    let read = m.blob_bytes_read() - bytes;
+    assert!(
+        read < 2 * 2_000,
+        "{read} bytes read for a value of 2000: its record alone"
+    );
+    Ok(())
+}
+
+/// In a file that compresses nothing a small value is a packed record: a
+/// batch and a point read read it alone, a request of its record's bytes.
+/// Under `Never` a cache that has not filled keeps none of them, so a read
+/// again reads its record again.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_packed_value_is_read_as_its_record_alone() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(64 << 20));
+    let AnyTree::Blob(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(1_024),
+    ))
+    .blob_compression(CompressionType::None)
+    .blob_cache_fill(BlobCacheFill::Never)
+    .use_cache(std::sync::Arc::clone(&cache))
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    for i in 0..20 {
+        tree.insert(format!("k{i:02}"), random(i, 2_000), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    let keys: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
+    let m = tree.metrics();
+
+    let got = tree.multi_get(&keys, SeqNo::MAX)?;
+    for (i, value) in got.iter().enumerate() {
+        assert_eq!(value.as_deref(), Some(&*random(i as u64, 2_000)));
+    }
+    assert_eq!(m.blob_read_count(), 20, "one record read per value");
+    // The record's fixed part and its three-byte key beside the value.
+    assert_eq!(m.blob_bytes_read(), 20 * (27 + 3 + 2_000));
+
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(
+            tree.get(key, SeqNo::MAX)?.as_deref(),
+            Some(&*random(i as u64, 2_000))
+        );
+    }
+    assert_eq!(
+        m.blob_read_count(),
+        40,
+        "each read again reads its record again"
+    );
+    assert_eq!(m.blob_bytes_read(), 40 * (27 + 3 + 2_000));
+    Ok(())
+}
+
 /// A batch whose values share blocks reads each block once, even when none
 /// is cached yet.
 #[cfg(feature = "metrics")]
 #[test]
 fn a_batch_reads_each_block_it_needs_once() -> lsm_tree::Result<()> {
-    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+    for compression in codecs() {
         let folder = get_tmp_folder();
         let tree = open(folder.path(), compression, BlobCacheFill::Never)?;
         for i in 0..20 {

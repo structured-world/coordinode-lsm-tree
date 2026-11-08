@@ -24,22 +24,27 @@ pub enum Stored {
     /// compressed after the value is written, so its share on disk is this
     /// entry's part of the bytes the file's blocks take.
     InBlock(u32),
+    /// The value's record in a packed block, its exact length: the record
+    /// starts where the handle's index says, so a read of it reads it alone.
+    /// It shares the block's header with its neighbours, so it is charged as
+    /// a share of the file's blocks, as a block entry is.
+    Packed(u32),
 }
 
 impl Stored {
-    /// The bytes either kind counts: exact frame bytes, or the uncompressed
-    /// entry.
+    /// The bytes any kind counts: exact frame bytes, the uncompressed entry,
+    /// or the record.
     pub(crate) fn bytes(self) -> u32 {
         match self {
-            Self::Frames(bytes) | Self::InBlock(bytes) => bytes,
+            Self::Frames(bytes) | Self::InBlock(bytes) | Self::Packed(bytes) => bytes,
         }
     }
 
-    /// The exact frame bytes, and the uncompressed block entry bytes.
+    /// The exact frame bytes, and the block bytes, an entry's or a record's.
     pub(crate) fn split(self) -> (u64, u64) {
         match self {
             Self::Frames(bytes) => (u64::from(bytes), 0),
-            Self::InBlock(bytes) => (0, u64::from(bytes)),
+            Self::InBlock(bytes) | Self::Packed(bytes) => (0, u64::from(bytes)),
         }
     }
 }
@@ -59,11 +64,11 @@ impl Encode for BlobIndirection {
     fn encode_into<W: Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
         self.vhandle.encode_into(writer)?;
         writer.write_u32_varint(self.size)?;
-        // The kind rides in the low bit, so the common case costs no byte of
-        // its own.
+        // The kind rides in the low bits, so it costs no byte of its own.
         let stored = match self.stored {
-            Stored::Frames(bytes) => u64::from(bytes) << 1,
-            Stored::InBlock(bytes) => (u64::from(bytes) << 1) | 1,
+            Stored::Frames(bytes) => u64::from(bytes) << 2,
+            Stored::InBlock(bytes) => (u64::from(bytes) << 2) | 1,
+            Stored::Packed(bytes) => (u64::from(bytes) << 2) | 2,
         };
         writer.write_u64_varint(stored)?;
         Ok(())
@@ -75,12 +80,13 @@ impl Decode for BlobIndirection {
         let vhandle = ValueHandle::decode_from(reader)?;
         let size = reader.read_u32_varint()?;
         let word = reader.read_u64_varint()?;
-        let bytes =
-            u32::try_from(word >> 1).map_err(|_| crate::Error::InvalidHeader("BlobIndirection"))?;
-        let stored = if word & 1 == 0 {
-            Stored::Frames(bytes)
-        } else {
-            Stored::InBlock(bytes)
+        let malformed = || crate::Error::InvalidHeader("BlobIndirection");
+        let bytes = u32::try_from(word >> 2).map_err(|_| malformed())?;
+        let stored = match word & 3 {
+            0 => Stored::Frames(bytes),
+            1 => Stored::InBlock(bytes),
+            2 => Stored::Packed(bytes),
+            _ => return Err(malformed()),
         };
         Ok(Self {
             vhandle,

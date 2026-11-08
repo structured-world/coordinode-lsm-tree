@@ -94,6 +94,18 @@ pub(crate) struct MultiWriter {
     #[cfg(zstd_any)]
     zstd_two_pass_seed: bool,
 
+    /// The bytes of the dictionary each file this writer compresses itself
+    /// builds from its own values (see `Writer::use_file_dictionary`); a file
+    /// of frames copied as they are builds none.
+    #[cfg(zstd_any)]
+    file_dictionary: u32,
+
+    /// The dictionaries of their own the files whose frames this writer
+    /// copies hold: a file copying such frames holds the dictionary that
+    /// decodes them as its own.
+    #[cfg(zstd_any)]
+    lent: Vec<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
+
     /// The tree's dictionary set, used to PIN the dictionary each finished file
     /// records on its handle (see `blob_file::Inner::zstd_dictionary`).
     ///
@@ -208,6 +220,10 @@ impl MultiWriter {
             zstd_dictionary: None,
             #[cfg(zstd_any)]
             zstd_two_pass_seed: true,
+            #[cfg(zstd_any)]
+            file_dictionary: 0,
+            #[cfg(zstd_any)]
+            lent: Vec::new(),
             #[cfg(zstd_any)]
             zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
 
@@ -360,7 +376,45 @@ impl MultiWriter {
         if codec == self.compression {
             return self.zstd_dictionary.clone();
         }
+        if let Some(lent) = self.lent_for(codec) {
+            return Some(lent);
+        }
         self.zstd_dictionaries.for_compression(codec).ok().flatten()
+    }
+
+    /// The dictionary of its own a copied file holds for `codec`, if one was
+    /// lent.
+    #[cfg(zstd_any)]
+    fn lent_for(
+        &self,
+        codec: CompressionType,
+    ) -> Option<alloc::sync::Arc<crate::compression::ZstdDictionary>> {
+        let CompressionType::ZstdDict { dict_id, .. } = codec else {
+            return None;
+        };
+        self.lent.iter().find(|dict| dict.id() == dict_id).cloned()
+    }
+
+    /// Takes the dictionary of its own `source` holds, if any, for the file
+    /// its frames are copied into.
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::unused_self,
+            clippy::needless_pass_by_ref_mut,
+            reason = "without zstd no file holds a dictionary to lend"
+        )
+    )]
+    pub(crate) fn lend_dictionary(&mut self, source: &BlobFile) {
+        #[cfg(zstd_any)]
+        if source.has_own_dictionary()
+            && let Some(dict) = &source.0.zstd_dictionary
+            && !self.lent.iter().any(|held| held.id64() == dict.id64())
+        {
+            self.lent.push(alloc::sync::Arc::clone(dict));
+        }
+        #[cfg(not(zstd_any))]
+        let _ = source;
     }
 
     /// Makes the active writer, which holds nothing yet, compress with and
@@ -371,7 +425,32 @@ impl MultiWriter {
         #[cfg(zstd_any)]
         {
             self.active_writer.zstd_dictionary = self.dictionary_for(codec);
+            self.active_writer.dictionary_in_file = self.lent_for(codec).is_some();
+            self.active_writer
+                .set_file_dictionary(self.file_dictionary_for(passthrough));
         }
+    }
+
+    /// The dictionary a file of output `passthrough` builds of its own: one
+    /// this writer compresses itself only.
+    #[cfg(zstd_any)]
+    fn file_dictionary_for(&self, passthrough: CompressionType) -> u32 {
+        if passthrough == CompressionType::None {
+            self.file_dictionary
+        } else {
+            0
+        }
+    }
+
+    /// Has every file this writer compresses itself build a dictionary of
+    /// `bytes` from its own values.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub(crate) fn use_file_dictionary(mut self, bytes: u32) -> Self {
+        self.file_dictionary = bytes;
+        let own = self.file_dictionary_for(self.passthrough_compression);
+        self.active_writer.set_file_dictionary(own);
+        self
     }
 
     /// Sizes the frames of every file this writer produces by `sizes`.
@@ -547,9 +626,14 @@ impl MultiWriter {
         let mut w = w.use_parallel_compression(self.parallel.clone());
         w.set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
         #[cfg(zstd_any)]
-        let w = w
+        let mut w = w
             .use_zstd_dictionary(self.dictionary_for(codec))
-            .use_zstd_two_pass_seed(self.zstd_two_pass_seed);
+            .use_zstd_two_pass_seed(self.zstd_two_pass_seed)
+            .use_file_dictionary(self.file_dictionary_for(passthrough));
+        #[cfg(zstd_any)]
+        {
+            w.dictionary_in_file = self.lent_for(codec).is_some();
+        }
         Ok(w)
     }
 
@@ -657,6 +741,8 @@ impl MultiWriter {
             // Taken before `finish` consumes the writer.
             #[cfg(zstd_any)]
             let writer_dictionary = writer.zstd_dictionary.clone();
+            #[cfg(zstd_any)]
+            let dictionary_in_file = writer.dictionary_in_file;
 
             // A failed finish (the last block's compression, a write, the
             // sync) leaves a partial file no handle will ever own.
@@ -740,6 +826,8 @@ impl MultiWriter {
                 file_accessor,
                 #[cfg(zstd_any)]
                 zstd_dictionary,
+                #[cfg(zstd_any)]
+                dictionary_in_file,
                 meta: Metadata {
                     id: blob_file_id,
                     version: metadata.version,
@@ -815,9 +903,43 @@ impl MultiWriter {
         seqno: SeqNo,
         value: &[u8],
     ) -> crate::Result<BlobIndirection> {
+        self.write_pre(key, seqno, value, None)
+    }
+
+    /// The codec a value of `value_len` bytes of lifetime `class` written
+    /// next would be compressed under as a whole, for a worker to compress it
+    /// ahead (see [`super::writer::Writer::value_codec`]): asked of the file
+    /// that is taking `class` now, `None` when another one is.
+    #[cfg(feature = "std")]
+    pub(crate) fn value_codec(
+        &self,
+        class: u8,
+        value_len: u32,
+    ) -> Option<super::writer::OwnedCodec> {
+        let takes_class = self.lifetime_groups.cap(class) == self.active_class
+            && self.active_source.is_none()
+            && self.domain.is_none();
+        takes_class
+            .then(|| self.active_writer.value_codec(value_len))
+            .flatten()
+    }
+
+    /// [`Self::write`], the value compressed ahead as `pre` when it was (see
+    /// [`Self::value_codec`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`].
+    pub(crate) fn write_pre(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+        pre: Option<super::writer::PreCompressed>,
+    ) -> crate::Result<BlobIndirection> {
         let size = super::writer::check_size_cap(value.len())?;
         self.enter_key(key)?;
-        let at = self.active_writer.write(key, seqno, value)?;
+        let at = self.active_writer.write_pre(key, seqno, value, pre)?;
         self.written(at, size)
     }
 

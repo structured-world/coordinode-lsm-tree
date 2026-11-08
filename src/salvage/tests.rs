@@ -8653,11 +8653,15 @@ fn an_environmental_read_failure_never_becomes_a_lossy_blob_salvage() -> crate::
     Ok(())
 }
 
-/// Scans a blob file into its `(key, value)` records (Ok records only).
+/// Scans a blob file, which compresses nothing, into its `(key, value)`
+/// records (Ok records only).
 fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     BlobScanner::new(path, &**fs, 0)?
         .filter_map(Result::ok)
-        .map(|e| Ok((e.key.to_vec(), e.whole_value()?.to_vec())))
+        .map(|e| {
+            let value = e.whole_value(crate::CompressionType::None)?;
+            Ok((e.key.to_vec(), value.to_vec()))
+        })
         .collect()
 }
 
@@ -9612,7 +9616,9 @@ fn salvage_blob_file_reports_a_remap_for_every_salvaged_record() -> crate::Resul
 
 /// Values that shared a block in the source are salvaged out of it into a
 /// block of the recovered file, each to its own place; a damaged block loses
-/// the values it held, and only those.
+/// the values it held, and only those. The source compresses, so its small
+/// values share blocks rather than being packed.
+#[cfg(feature = "lz4")]
 #[test]
 #[expect(clippy::indexing_slicing, reason = "test code")]
 fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::Result<()> {
@@ -9623,10 +9629,12 @@ fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::
     let dest = dir.path().join("blob_salvaged");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
     {
-        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?.use_frame_sizes(FrameSizes {
-            block_target: 100,
-            chunk_size: 256,
-        });
+        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?
+            .use_compression(crate::CompressionType::Lz4)
+            .use_frame_sizes(FrameSizes {
+                block_target: 100,
+                chunk_size: 256,
+            });
         // Two blocks of three values (an entry of 36 bytes each), a single
         // value, a chunked one.
         for i in 0..6_u8 {
@@ -9668,12 +9676,17 @@ fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::
     let keys: Vec<&[u8]> = salvaged.iter().map(|e| &*e.key).collect();
     assert_eq!(keys, [&b"a\x03"[..], b"a\x04", b"a\x05", b"b", b"c"]);
     assert_eq!(
-        &*salvaged[4].whole_value()?,
+        &*salvaged[4].whole_value(crate::CompressionType::Lz4)?,
         &[8_u8; 600][..],
         "the chunked value whole"
     );
     for (src, dst) in entries[3..].iter().zip(&salvaged) {
-        assert_eq!(src.whole_value()?, dst.whole_value()?, "{:?}", src.key);
+        assert_eq!(
+            src.whole_value(crate::CompressionType::Lz4)?,
+            dst.whole_value(crate::CompressionType::Lz4)?,
+            "{:?}",
+            src.key
+        );
         let mapped = report
             .remap
             .iter()

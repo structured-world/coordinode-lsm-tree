@@ -450,15 +450,18 @@ impl Scanner {
         match decoded.header.kind {
             FrameKind::Single | FrameKind::Block => {
                 let last = decoded.list.len() - 1;
-                let whole = decoded.header.kind == FrameKind::Single;
+                let in_block = decoded.header.kind == FrameKind::Block;
+                let whole = !in_block;
                 // A single frame left undecoded is yielded by its frame alone.
-                let decoded_value = !whole || self.decode == Decode::All;
-                let block = (!whole).then(|| ScanBlock {
-                    stored: bytes.clone(),
-                    values: decoded.header.count,
-                });
+                let decoded_value = in_block || self.decode == Decode::All;
                 for (at, entry) in decoded.list.iter().enumerate() {
-                    let Some(key) = decoded.key(at) else {
+                    // The index a handle names the value by: in a packed
+                    // block its record's offset.
+                    let (Some(key), Some(index), Some(entry_bytes)) = (
+                        decoded.key(at),
+                        decoded.index_of(at),
+                        decoded.block_entry_bytes(at),
+                    ) else {
                         return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
                     };
                     let value = if decoded_value {
@@ -469,11 +472,11 @@ impl Scanner {
                     } else {
                         None
                     };
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "a frame lists at most u16::MAX values"
-                    )]
-                    let index = at as u16;
+                    let block = in_block.then(|| ScanBlock {
+                        stored: bytes.clone(),
+                        values: decoded.header.count,
+                        entry_bytes,
+                    });
                     self.pending.push_back(ScanEntry {
                         key: UserKey::from(key),
                         seqno: entry.seqno,
@@ -489,7 +492,7 @@ impl Scanner {
                         frame_end: if at == last { frame_end } else { offset },
                         resynced,
                         frames: whole.then(|| alloc::vec![bytes.clone()]),
-                        block: block.clone(),
+                        block,
                     });
                 }
                 Some(Ok(()))
@@ -698,13 +701,19 @@ pub(crate) struct ScanBlock {
     pub stored: Slice,
     /// How many values the block holds.
     pub values: u16,
+    /// What this value adds to its file's block entry bytes, as its writer
+    /// counted it (see [`DecodedFrame::block_entry_bytes`]).
+    pub entry_bytes: u64,
 }
 
 #[cfg(test)]
 impl ScanEntry {
-    /// The value whole: decoded, or, for a chunked value of an uncompressed
-    /// file, gathered out of its frames.
-    pub(crate) fn whole_value(&self) -> crate::Result<UserValue> {
+    /// The value whole: decoded, or, for a chunked value of a file under
+    /// `compression` (with no dictionary), gathered out of its frames.
+    pub(crate) fn whole_value(
+        &self,
+        compression: crate::CompressionType,
+    ) -> crate::Result<UserValue> {
         if let Some(value) = &self.value {
             return Ok(value.clone());
         }
@@ -715,7 +724,7 @@ impl ScanEntry {
             .ok_or(crate::Error::InvalidHeader("Blob"))?;
         let head = super::frame::decode_frame(
             head,
-            crate::CompressionType::None,
+            compression,
             #[cfg(zstd_any)]
             None,
             &mut 0,
@@ -727,7 +736,7 @@ impl ScanEntry {
         super::reader::assemble_stored(
             &head,
             &Slice::from(area),
-            crate::CompressionType::None,
+            compression,
             #[cfg(zstd_any)]
             None,
             &mut 0,

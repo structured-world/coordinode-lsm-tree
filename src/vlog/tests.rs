@@ -762,7 +762,8 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        // Blocks of sixteen values, so the file holds four.
+        // Blocks of sixteen values when the file compresses, packed blocks
+        // of about a hundred when it does not: more than one either way.
         .with_kv_separation(Some(
             KvSeparationOptions::default()
                 .separation_threshold(64)
@@ -773,7 +774,7 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
         let AnyTree::Blob(tree) = config().open()? else {
             panic!("expected Blob tree");
         };
-        for i in 0..64u64 {
+        for i in 0..256u64 {
             tree.insert(format!("k{i:05}").as_bytes(), alloc::vec![b'v'; 256], i);
         }
         tree.flush_active_memtable(0)?;
@@ -857,7 +858,7 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
          (allocated {allocated_before} before, {allocated_after} after)",
     );
     assert!(
-        tree.get(b"k00063", crate::MAX_SEQNO)?.is_some(),
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
         "the live suffix must still be served",
     );
     Ok(())

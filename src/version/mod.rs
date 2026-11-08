@@ -534,6 +534,8 @@ impl Version {
             .chain(
                 self.blob_files
                     .iter()
+                    // A file holding its dictionary carries it wherever it goes.
+                    .filter(|bf| !bf.has_own_dictionary())
                     .filter_map(|bf| dict_of(bf.compression())),
             )
             .collect();

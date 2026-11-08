@@ -617,6 +617,67 @@ fn a_blob_admitted_to_the_blob_cache_copies_nothing() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Reads 50 small values of a file that compresses nothing, packed and so
+/// each read as its record alone, twice under `fill`, and returns the blob
+/// bytes each pass read.
+fn packed_reads(fill: BlobCacheFill) -> lsm_tree::Result<(u64, u64)> {
+    let folder = get_tmp_folder();
+    let cache =
+        std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(std::sync::Arc::clone(&cache))
+    .blob_compression(CompressionType::None)
+    .with_kv_separation(Some(
+        lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+    ))
+    .blob_cache_fill(fill)
+    .open()?;
+    for i in 0..50 {
+        tree.insert(key(i), vec![b'v'; 200], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let m = tree.metrics();
+    let pass = || -> lsm_tree::Result<u64> {
+        let before = m.blob_bytes_read();
+        for i in 0..50 {
+            assert_eq!(
+                tree.get(key(i), SeqNo::MAX)?.as_deref(),
+                Some(vec![b'v'; 200].as_slice())
+            );
+        }
+        Ok(m.blob_bytes_read() - before)
+    };
+    let cold = pass()?;
+    Ok((cold, pass()?))
+}
+
+#[test]
+fn a_packed_value_read_again_is_served_from_the_cache_that_fills() -> lsm_tree::Result<()> {
+    // A small value packed beside others is read as its record alone. Under
+    // `Always` it is cached as every value read is, and read again comes
+    // from the cache. Under the default it stays out of a cache that has not
+    // filled, which would grow on the reads' path for it, so read again it
+    // reads its record again.
+    for (fill, cached) in [
+        (BlobCacheFill::Always, true),
+        (BlobCacheFill::default(), false),
+    ] {
+        let (cold, again) = packed_reads(fill)?;
+        assert!(cold > 0, "{fill:?}: the first reads read the blob file");
+        assert!(
+            cold < 50 * 300,
+            "{fill:?}: {cold} B read for 50 values of 200 B"
+        );
+        let expected = if cached { 0 } else { cold };
+        assert_eq!(again, expected, "{fill:?}: what a read again reads");
+    }
+    Ok(())
+}
+
 #[test]
 fn a_range_within_one_chunk_copies_nothing() -> lsm_tree::Result<()> {
     // A range of a chunked value within one chunk is a view into that chunk,

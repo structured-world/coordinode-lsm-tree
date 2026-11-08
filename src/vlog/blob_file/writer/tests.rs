@@ -104,9 +104,19 @@ fn writer(folder: &tempfile::TempDir) -> crate::Result<Writer> {
     Ok(Writer::new(folder.path().join("blob"), 0, 0, &StdFs)?.use_frame_sizes(SIZES))
 }
 
+/// A writer of `sizes` that compresses, so its small values share blocks: a
+/// file that compresses nothing packs them instead.
+#[cfg(feature = "lz4")]
+fn block_writer(folder: &tempfile::TempDir, sizes: FrameSizes) -> crate::Result<Writer> {
+    Ok(Writer::new(folder.path().join("blob"), 0, 0, &StdFs)?
+        .use_compression(CompressionType::Lz4)
+        .use_frame_sizes(sizes))
+}
+
 /// A value below the block target joins a block, one up to the chunk size is
 /// a frame of its own, a larger one a head and its chunks; each is found at
-/// the frame and index its write returned.
+/// the frame and index its write returned (in this packed block, the second
+/// small value's record offset).
 #[test]
 fn a_value_goes_to_the_frame_its_size_calls_for() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
@@ -119,7 +129,7 @@ fn a_value_goes_to_the_frame_its_size_calls_for() -> crate::Result<()> {
     let (meta, _, frames) = w.finish()?;
 
     assert_eq!((small[0].frame, small[0].index), (0, 0));
-    assert_eq!((small[1].frame, small[1].index), (0, 1));
+    assert_eq!(small[1].frame, 0);
     assert_eq!((single.frame, single.index), (1, 0));
     assert_eq!((chunked.frame, chunked.index), (2, 0));
     // The head's three chunks are frames 3 to 5: 300, 300, 100 bytes.
@@ -141,6 +151,7 @@ fn a_value_goes_to_the_frame_its_size_calls_for() -> crate::Result<()> {
             FrameKind::Block,
         ]
     );
+    assert_eq!(decoded[0].place_of(small[1].index), Some(1));
     assert_eq!(decoded[0].key(1), Some(&b"b"[..]));
     assert_eq!(decoded[2].chunk_table()?, (300, 3));
     let chunk_lens: Vec<_> = decoded[3..6].iter().map(|f| f.payload.len()).collect();
@@ -156,14 +167,17 @@ fn a_value_goes_to_the_frame_its_size_calls_for() -> crate::Result<()> {
 /// A block closes for the next value only once it is 90% full: below that a
 /// value joins it even past the target, so no block closes small. A value
 /// counts as its entry: 14 bytes, its one-byte key and its bytes.
+#[cfg(feature = "lz4")]
 #[test]
 fn a_block_closes_only_once_nearly_full() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let mut w =
-        Writer::new(folder.path().join("blob"), 0, 0, &StdFs)?.use_frame_sizes(FrameSizes {
+    let mut w = block_writer(
+        &folder,
+        FrameSizes {
             block_target: 1_000,
             chunk_size: 3_000,
-        });
+        },
+    )?;
     // 515 + 315 = 830 bytes, under 90% of 1000: the next value joins.
     w.write(b"a", 0, &[1; 500])?;
     w.write(b"b", 0, &[1; 300])?;
@@ -193,10 +207,11 @@ fn a_block_closes_only_once_nearly_full() -> crate::Result<()> {
 /// values under long keys fill it as their entries do, so a block of them
 /// stays near the target rather than holding a target's worth of value bytes
 /// and several times that in keys.
+#[cfg(feature = "lz4")]
 #[test]
 fn a_block_of_small_values_is_sized_by_its_entries() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let mut w = Writer::new(folder.path().join("blob"), 0, 0, &StdFs)?;
+    let mut w = block_writer(&folder, FrameSizes::DEFAULT)?;
     let target = u64::from(FrameSizes::DEFAULT.block_target);
     let mut first_block = 0u64;
     for i in 0..4_000u32 {
@@ -221,14 +236,17 @@ fn a_block_of_small_values_is_sized_by_its_entries() -> crate::Result<()> {
 }
 
 /// A block holds at most `u16::MAX` values, the most an index names.
+#[cfg(feature = "lz4")]
 #[test]
 fn a_block_closes_at_the_most_values_an_index_names() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let mut w =
-        Writer::new(folder.path().join("blob"), 0, 0, &StdFs)?.use_frame_sizes(FrameSizes {
+    let mut w = block_writer(
+        &folder,
+        FrameSizes {
             block_target: u32::MAX,
             chunk_size: u32::MAX,
-        });
+        },
+    )?;
     let mut last = None;
     for i in 0..=u32::from(u16::MAX) {
         last = Some(w.write(&i.to_be_bytes(), 0, b"v")?);
@@ -243,16 +261,51 @@ fn a_block_closes_at_the_most_values_an_index_names() -> crate::Result<()> {
     Ok(())
 }
 
+/// A file that compresses nothing gains nothing from a block sharing its
+/// compression: its small values are packed records, each read alone, with
+/// or without a dictionary configured.
+#[test]
+fn a_file_that_compresses_nothing_packs_its_small_values() -> crate::Result<()> {
+    use crate::blob_tree::handle::Stored;
+
+    let folder = tempfile::tempdir()?;
+    let mut w = writer(&folder)?;
+    let first = w.write(b"key", 0, b"value")?;
+    let second = w.write(b"kez", 0, b"v")?;
+    let (meta, _, _) = w.finish()?;
+    let (Stored::Packed(a), Stored::Packed(b)) = (first.stored, second.stored) else {
+        panic!("{:?} {:?}", first.stored, second.stored);
+    };
+    assert_eq!(
+        meta.block_entry_bytes,
+        u64::from(a + b),
+        "a record counts as a block entry, at its length on disk"
+    );
+    assert!(
+        matches!(first.stored, Stored::Packed(_)),
+        "{:?}",
+        first.stored
+    );
+    assert!(
+        matches!(second.stored, Stored::Packed(_)),
+        "{:?}",
+        second.stored
+    );
+    assert_eq!(first.frame, second.frame, "one packed block holds both");
+    Ok(())
+}
+
 /// What a value takes: its entry uncompressed in a block, whose compressed
 /// share is not known when it is written; its frames whole otherwise. The
 /// file's metadata sums the block entries and records what its blocks take,
 /// the two figures a block entry's share on disk is read from.
+#[cfg(feature = "lz4")]
 #[test]
 fn a_write_reports_what_the_value_takes() -> crate::Result<()> {
     use crate::blob_tree::handle::Stored;
 
     let folder = tempfile::tempdir()?;
-    let mut w = writer(&folder)?;
+    let mut w = block_writer(&folder, SIZES)?;
     let small = w.write(b"key", 0, b"value")?;
     let other = w.write(b"kez", 0, b"v")?;
     let single = w.write(b"one", 0, &[7; 150])?;

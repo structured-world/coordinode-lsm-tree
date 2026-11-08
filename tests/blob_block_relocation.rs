@@ -7,10 +7,11 @@ use lsm_tree::{
     SequenceNumberCounter, blob_tree::FragmentationEntry, get_tmp_folder,
 };
 
-/// Bytes of each value: with three-byte keys an entry takes 217 bytes, so a
-/// block of 1,000 bytes closes at five values.
+/// Bytes of each value: with three-byte keys a packed record takes 230 bytes
+/// (its 27-byte fixed part, key and value), so a block of 1,000 bytes closes
+/// at five values.
 const VALUE: usize = 200;
-const ENTRY: u64 = 14 + 3 + VALUE as u64;
+const ENTRY: u64 = 27 + 3 + VALUE as u64;
 
 fn key(i: usize) -> String {
     format!("k{i:02}")

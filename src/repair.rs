@@ -2558,15 +2558,13 @@ fn validate_blob_frames(
                 }
                 count += 1;
                 uncompressed_total += u64::from(entry.uncompressed_len);
-                match &entry.frames {
-                    Some(frames) => {
+                match (&entry.frames, &entry.block) {
+                    (Some(frames), _) => {
                         own_frame_total += frames.iter().map(|f| f.len() as u64).sum::<u64>();
                     }
-                    None => {
-                        block_entry_total += (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN
-                            + entry.key.len()) as u64
-                            + u64::from(entry.uncompressed_len);
-                    }
+                    (None, Some(block)) => block_entry_total += block.entry_bytes,
+                    // A value is a block's or has frames of its own.
+                    (None, None) => return Ok(None),
                 }
                 frames_from.get_or_insert(entry.offset);
                 frames_to = frames_to.max(entry.frame_end);

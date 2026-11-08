@@ -995,15 +995,63 @@ fn a_caching_read_caches_a_value_it_took_from_a_read_that_does_not() -> crate::R
     Ok(())
 }
 
-/// Reads that miss the same cold separated value at once read its record once
-/// and every one gets the value.
+/// Reads that miss the same cold packed value at once read its record once,
+/// the others taking the value the first decoded, and every one gets it.
+#[test]
+fn simultaneous_cold_reads_of_one_packed_value_read_its_record_once() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    // One key in a file that compresses nothing: its record is the first of
+    // the blob file's first packed block, just past the frame's header.
+    write_keys(
+        config(folder.path())
+            .with_kv_separation(Some(
+                crate::KvSeparationOptions::default().separation_threshold(1),
+            ))
+            .blob_compression(crate::CompressionType::None),
+        1,
+    )?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let cache = sharing_cache(64 << 20);
+    let tree = reopen_cold(folder.path(), fs, &cache, true)?;
+    assert!(tree.contains_key([0], SeqNo::MAX)?);
+    let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
+    let record = crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64;
+    injector.hook_read_at("blobs", record, hook);
+
+    let barrier = Arc::new(Barrier::new(usize::from(READERS)));
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let (tree, barrier) = (tree.clone(), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                tree.get([0], SeqNo::MAX)
+            })
+        })
+        .collect();
+    for reader in readers {
+        assert_eq!(
+            reader.join().expect("reader")?.as_deref(),
+            Some(&value(0)[..])
+        );
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "one read of the record");
+    assert_eq!(cache.loads_in_flight(), 0, "no load stays registered");
+    Ok(())
+}
+
+/// Reads that miss the same cold separated value of a frame of its own at
+/// once read the frame once and every one gets the value.
 #[test]
 fn simultaneous_cold_reads_of_one_blob_read_it_once() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    // One key, so its record is the blob file's first, at offset 0.
+    // One key, its value past the block target: a frame of its own, the blob
+    // file's first, at offset 0.
     write_keys(
         config(folder.path()).with_kv_separation(Some(
-            crate::KvSeparationOptions::default().separation_threshold(1),
+            crate::KvSeparationOptions::default()
+                .separation_threshold(1)
+                .block_size(16),
         )),
         1,
     )?;

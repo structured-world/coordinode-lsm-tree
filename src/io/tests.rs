@@ -253,6 +253,93 @@ fn write_all_via_blanket_impl_on_vec() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Records the length of every write the buffer hands down.
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct WriteLog {
+    bytes: Vec<u8>,
+    writes: Vec<usize>,
+}
+
+#[cfg(feature = "std")]
+impl std::io::Write for WriteLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writes.push(buf.len());
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Frames a little over a quarter of the buffer each, as a blob file's
+/// packed blocks are: the buffer has to go down full, not cut where the
+/// next frame stopped fitting, or a file takes a write per three frames
+/// instead of one per buffer.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_writes_full_buffers_for_frames_that_straddle_it() -> std::io::Result<()> {
+    use std::io::Write as _;
+    const CAP: usize = 1024;
+    let frame: Vec<u8> = (0..=255u8).cycle().take(CAP / 4 + 13).collect();
+    let mut out = BufWriter::with_capacity(CAP, WriteLog::default());
+    for _ in 0..40 {
+        out.write_all(&frame)?;
+    }
+    out.flush()?;
+    let log = out.get_ref();
+    let total = frame.len() * 40;
+    assert_eq!(log.bytes, frame.repeat(40));
+    let full = total / CAP;
+    let mut expected = vec![CAP; full];
+    expected.push(total - full * CAP);
+    assert_eq!(log.writes, expected);
+    Ok(())
+}
+
+/// Frames that fill the buffer exactly leave it full with nothing taken
+/// from the next one; that write must still take bytes, not report zero.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_takes_the_write_after_an_exactly_full_buffer() -> std::io::Result<()> {
+    use std::io::Write as _;
+    const CAP: usize = 1024;
+    let frame = [7u8; CAP / 4];
+    let mut out = BufWriter::with_capacity(CAP, WriteLog::default());
+    for _ in 0..9 {
+        out.write_all(&frame)?;
+    }
+    out.flush()?;
+    let log = out.get_ref();
+    assert_eq!(log.writes, [CAP, CAP, CAP / 4]);
+    assert_eq!(log.bytes, [7u8; 9 * CAP / 4]);
+    Ok(())
+}
+
+/// A write as large as the buffer goes down as it is, after what is
+/// buffered: copying it through the buffer would cost a copy and save no
+/// write.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_passes_a_write_of_a_whole_buffer_straight_down() -> std::io::Result<()> {
+    use std::io::Write as _;
+    const CAP: usize = 1024;
+    let mut out = BufWriter::with_capacity(CAP, WriteLog::default());
+    out.write_all(&[1; 100])?;
+    out.write_all(&[2; 3 * CAP])?;
+    out.write_all(&[3; 10])?;
+    out.flush()?;
+    let log = out.get_ref();
+    assert_eq!(log.writes, [100, 3 * CAP, 10]);
+    let mut expected = vec![1; 100];
+    expected.extend([2; 3 * CAP]);
+    expected.extend([3; 10]);
+    assert_eq!(log.bytes, expected);
+    Ok(())
+}
+
 /// Every `ErrorKind` discriminant — kept in one place so the
 /// exhaustive bridge tests below stay total. A new variant added
 /// to the enum without a row here fails the per-arm assertions
