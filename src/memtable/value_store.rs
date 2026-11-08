@@ -200,9 +200,11 @@ impl ValueStore {
     )]
     fn ensure_segment(&self, seg_idx: usize) {
         if self.segments[seg_idx].load(Ordering::Acquire).is_null() {
-            // Allocate a segment of uninitialised UserValue slots.
-            // We use alloc_zeroed for the raw memory — the slots will be
-            // initialised one-by-one via ptr::write in write().
+            // A segment of uninitialised slots, each initialised by its own
+            // `write` before anything reads or drops it, so the memory is
+            // left as it comes: zeroing it cleared 2 MiB per segment, most
+            // of which a small memtable never touches, and a heap chunk
+            // that glibc hands back cleared it on every new memtable.
             #[expect(
                 clippy::expect_used,
                 reason = "Layout::array with compile-time-known size cannot fail"
@@ -211,14 +213,14 @@ impl ValueStore {
                 alloc::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
 
             // SAFETY: layout is non-zero (SEGMENT_SIZE > 0, UserValue is non-ZST).
-            // The cast to *mut UserValue is safe because alloc_zeroed returns
-            // memory with alignment >= align_of::<UserValue>() (Layout::array
-            // sets alignment to align_of::<UserValue>()).
+            // The cast to *mut UserValue is safe because alloc returns memory
+            // with alignment >= align_of::<UserValue>() (Layout::array sets
+            // alignment to align_of::<UserValue>()).
             #[expect(
                 clippy::cast_ptr_alignment,
                 reason = "Layout::array ensures correct alignment"
             )]
-            let raw = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<UserValue>();
+            let raw = unsafe { alloc::alloc::alloc(layout) }.cast::<UserValue>();
             if raw.is_null() {
                 alloc::alloc::handle_alloc_error(layout);
             }
@@ -297,7 +299,7 @@ impl Drop for ValueStore {
             )]
             let layout =
                 alloc::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
-            // SAFETY: `seg_ptr` came from `alloc_zeroed(layout)` in
+            // SAFETY: `seg_ptr` came from `alloc(layout)` in
             // `ensure_segment()`, all initialised entries were dropped above,
             // and `Drop` has exclusive access — so this frees that allocation
             // exactly once with the original layout.
