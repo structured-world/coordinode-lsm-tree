@@ -1763,7 +1763,15 @@ const BLOB_META_BYTES: u64 = 1_024;
 /// only shrinks.
 #[cfg(feature = "std")]
 fn frame_bytes(indirection: &crate::blob_tree::handle::BlobIndirection) -> u64 {
-    u64::from(indirection.stored.bytes()) + crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64
+    use crate::blob_tree::handle::Stored;
+
+    match indirection.stored {
+        // Copied as those frames, under the same codec.
+        Stored::Frames(bytes) => u64::from(bytes),
+        Stored::InBlock(bytes) => {
+            u64::from(bytes) + crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64
+        }
+    }
 }
 
 /// The bytes of the blob frames `item` points at in the `stale` files, which

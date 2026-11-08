@@ -5423,6 +5423,33 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
     Ok(())
 }
 
+/// What a relocated copy takes is bounded tight: a value with frames of its
+/// own is copied as those frames, headers included, so it takes exactly its
+/// stored bytes; a value sharing a block is re-encoded, and its copy may open
+/// a block, so its bound is its entry and one frame header. A header too many
+/// on every value would refuse a tight-space slice that fits its budget.
+#[test]
+fn frame_bytes_add_a_header_only_to_a_value_that_shares_a_block() {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::ValueHandle;
+
+    let indirection = |stored| BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 7,
+            frame: 0,
+            index: 0,
+        },
+        size: 100,
+        stored,
+    };
+    let header = crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64;
+    assert_eq!(super::frame_bytes(&indirection(Stored::Frames(140))), 140);
+    assert_eq!(
+        super::frame_bytes(&indirection(Stored::InBlock(114))),
+        114 + header
+    );
+}
+
 /// The blocks a tight-space pass reads to cut its slices are the run's reads:
 /// read from the file, they count in its work as the merge's reads do.
 #[test]
