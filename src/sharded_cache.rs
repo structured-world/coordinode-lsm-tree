@@ -143,13 +143,29 @@ where
     S: BuildHasher + Clone,
 {
     fn new(capacity: u64, ghost_capacity: usize, hasher: S) -> Self {
+        // Experiment: `LSM_CACHE_RESERVE=<bytes>` sizes the table and the
+        // queues up front for a shard full of entries that heavy, and the
+        // ghosts for their capacity, so no insert grows them under the write
+        // lock.
+        #[cfg(feature = "std")]
+        let reserve = std::env::var("LSM_CACHE_RESERVE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&b| b > 0)
+            .map_or(0, |b| usize::try_from(capacity / b).unwrap_or(0));
+        #[cfg(not(feature = "std"))]
+        let reserve = 0_usize;
         Self {
-            map: hashbrown::HashTable::new(),
+            map: hashbrown::HashTable::with_capacity(reserve),
             hasher,
-            small: VecDeque::new(),
-            main: VecDeque::new(),
-            ghost: VecDeque::new(),
-            ghost_set: hashbrown::HashTable::new(),
+            small: VecDeque::with_capacity(reserve),
+            main: VecDeque::with_capacity(reserve),
+            ghost: VecDeque::with_capacity(if reserve > 0 { ghost_capacity + 1 } else { 0 }),
+            ghost_set: hashbrown::HashTable::with_capacity(if reserve > 0 {
+                ghost_capacity + 1
+            } else {
+                0
+            }),
             small_bytes: 0,
             main_bytes: 0,
             capacity,
