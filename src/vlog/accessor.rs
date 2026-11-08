@@ -805,21 +805,22 @@ fn span_extent(
 }
 
 /// `frame`, decoded from a file under `compression`, holding its own bytes,
-/// and the bytes copied for that: a frame decoded out of a larger read is a
-/// view into it, its payload too when it is stored as it is.
+/// and the bytes copied for that: a frame stored as it is and decoded out of
+/// a larger read is a view into it; a compressed one already holds its own.
 pub(crate) fn own_frame(
     frame: DecodedFrame,
     compression: crate::CompressionType,
 ) -> (DecodedFrame, usize) {
     let stored_as_is = frame.header.is_raw() || compression == crate::CompressionType::None;
-    let copied = frame.entries.len() + if stored_as_is { frame.payload.len() } else { 0 };
+    if !stored_as_is {
+        // Decoding a compressed frame already gave it entries and a payload
+        // of its own.
+        return (frame, 0);
+    }
+    let copied = frame.entries.len() + frame.payload.len();
     let frame = DecodedFrame {
         entries: crate::Slice::new(&frame.entries),
-        payload: if stored_as_is {
-            crate::Slice::new(&frame.payload)
-        } else {
-            frame.payload
-        },
+        payload: crate::Slice::new(&frame.payload),
         ..frame
     };
     (frame, copied)

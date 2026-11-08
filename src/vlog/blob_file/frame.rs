@@ -454,21 +454,25 @@ pub(crate) fn decode_frame(
     let entries = bytes.slice(FRAME_HEADER_LEN..entries_end);
     let stored = bytes.slice(entries_end..bytes.len());
     let raw_len = header.raw_len as usize;
-    let payload = if header.is_raw() || compression == CompressionType::None {
+    let (entries, payload) = if header.is_raw() || compression == CompressionType::None {
         *decoded = stored.len();
         if stored.len() != raw_len {
             return Err(crate::Error::InvalidHeader("BlobFrame"));
         }
-        stored
+        (entries, stored)
     } else {
-        decompress(
+        let payload = decompress(
             &stored,
             raw_len,
             compression,
             #[cfg(zstd_any)]
             dictionary,
             decoded,
-        )?
+        )?;
+        // The payload is its own buffer now: a copy of the entries, a few
+        // keys, lets the encoded read go instead of keeping it alive in the
+        // cache uncounted.
+        (Slice::from(&entries[..]), payload)
     };
     Ok(DecodedFrame {
         header,

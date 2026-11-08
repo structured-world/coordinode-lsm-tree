@@ -130,6 +130,49 @@ fn compressible_payload_is_stored_compressed() {
     assert_eq!(frame.value(0).as_deref(), Some(payload.as_slice()));
 }
 
+/// A compressed frame's decoded payload is its own buffer, so its entries
+/// must not stay a view into the encoded read: a frame in the cache would
+/// otherwise keep the whole encoded buffer alive, which its weight, its
+/// entries and decoded payload, does not count.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_decoded_compressed_frame_keeps_nothing_of_its_encoded_bytes() {
+    let key = vec![b'k'; 200];
+    let payload = vec![b'x'; 8192];
+    let entry = EntrySpec {
+        key: &key,
+        seqno: 1,
+        value_len: payload.len() as u32,
+    };
+    let mut out = Vec::new();
+    encode_frame(
+        FrameKind::Single,
+        &[entry],
+        &payload,
+        codec(CompressionType::Lz4),
+        &mut out,
+    )
+    .unwrap();
+    let encoded = Slice::from(out);
+    let mut decoded = 0;
+    let frame = decode_frame(
+        &encoded,
+        CompressionType::Lz4,
+        #[cfg(zstd_any)]
+        None,
+        &mut decoded,
+    )
+    .unwrap();
+    assert!(!frame.header.is_raw(), "the payload is stored compressed");
+    let within = |bytes: &[u8]| {
+        let range = encoded.as_ptr_range();
+        range.contains(&bytes.as_ptr())
+    };
+    assert!(!within(&frame.entries), "the entries are their own bytes");
+    assert!(!within(&frame.payload), "the payload is its own bytes");
+    assert_eq!(frame.key(0), Some(&key[..]));
+}
+
 /// A head carries its chunk table uncompressed whatever the file's codec, and
 /// the table must cover the value's length exactly.
 #[test]
