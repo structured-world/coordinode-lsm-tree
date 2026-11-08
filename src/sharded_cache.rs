@@ -622,6 +622,13 @@ where
         }
     }
 
+    /// Experiment: takes `key`'s shard write lock and releases it, inserting
+    /// nothing, to price the lock an insert holds apart from the insert.
+    pub(crate) fn lock_only(&self, key: &K) {
+        let (_, shard) = self.locate(key);
+        drop(core::hint::black_box(shard.write()));
+    }
+
     /// Inserts the value `merge` derives from what `key` holds now, read and
     /// replaced under one write lock, so a concurrent writer of the key cannot
     /// slip between the two. `merge` returning `None` leaves the entry as it

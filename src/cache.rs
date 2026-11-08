@@ -1184,15 +1184,29 @@ impl Cache {
         stage: FillStage,
     ) {
         let key = blob_record_key(vlog_id, at, index);
-        if matches!(stage, FillStage::Inline | FillStage::InlineTry) {
+        if matches!(
+            stage,
+            FillStage::Inline
+                | FillStage::InlineTry
+                | FillStage::InlineBuild
+                | FillStage::InlineLock
+        ) {
             let frame = crate::vlog::blob_file::packed::record_frame(&record, &bytes, value, index);
             let item = Item::BlobFrame(alloc::sync::Arc::new(frame));
-            if stage == FillStage::Inline {
-                self.data
-                    .insert_with_priority(key, item, Priority::Probation);
-            } else {
-                self.data
-                    .try_insert_with_priority(key, item, Priority::Probation);
+            match stage {
+                FillStage::Inline => {
+                    self.data
+                        .insert_with_priority(key, item, Priority::Probation);
+                }
+                FillStage::InlineTry => {
+                    self.data
+                        .try_insert_with_priority(key, item, Priority::Probation);
+                }
+                FillStage::InlineLock => {
+                    self.data.lock_only(&key);
+                    drop(core::hint::black_box(item));
+                }
+                _ => drop(core::hint::black_box(item)),
             }
             return;
         }
@@ -1319,6 +1333,11 @@ pub(crate) enum FillStage {
     /// Built on the read's path and inserted only when the shard's lock is
     /// free then, no worker.
     InlineTry,
+    /// Built on the read's path and dropped, no worker.
+    InlineBuild,
+    /// Built on the read's path, its shard's write lock taken and released,
+    /// and dropped, no worker.
+    InlineLock,
 }
 
 #[cfg(test)]
