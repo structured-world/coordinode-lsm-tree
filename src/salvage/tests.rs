@@ -8661,6 +8661,70 @@ fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec
         .collect()
 }
 
+/// A frame whose checksum holds but whose payload does not decompress is
+/// structural damage to that frame alone: salvage drops it and carries the
+/// records around it.
+#[cfg(feature = "lz4")]
+#[test]
+fn salvage_blob_file_drops_a_frame_that_does_not_decompress() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let value = vec![b'v'; 2000];
+    let frames = {
+        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?
+            .use_compression(crate::CompressionType::Lz4)
+            .use_frame_sizes(crate::vlog::blob_file::writer::FrameSizes {
+                block_target: 0,
+                chunk_size: crate::vlog::blob_file::writer::FrameSizes::DEFAULT.chunk_size,
+            });
+        for key in [&b"k0"[..], b"k1", b"k2"] {
+            writer.write(key, 0, &value)?;
+        }
+        writer.finish()?.2
+    };
+    // The middle frame's stored payload overwritten with bytes lz4 refuses,
+    // the frame sealed again so its checksum holds.
+    let mut bytes = std::fs::read(&source)?;
+    let (start, end) = (
+        usize::try_from(frames[1]).unwrap_or(usize::MAX),
+        usize::try_from(frames[2]).unwrap_or(usize::MAX),
+    );
+    let frame = &mut bytes[start..end];
+    let header = crate::vlog::blob_file::frame::parse_header(frame)?;
+    assert!(!header.is_raw(), "the value is stored compressed");
+    let payload_at = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + header.entries_len as usize;
+    for byte in &mut frame[payload_at..] {
+        *byte = 0xFF;
+    }
+    crate::vlog::blob_file::frame::reseal(frame);
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_blob_file(
+        &source,
+        dest.clone(),
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    assert_eq!(
+        report.records_salvaged, 2,
+        "the frames around it: {report:?}"
+    );
+    assert!(
+        matches!(
+            &report.dropped[..],
+            [d] if matches!(&d.reason, BlobDropReason::Corrupt(why) if why.contains("does not decompress"))
+        ),
+        "{report:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<()> {
     let dir = tempdir()?;
