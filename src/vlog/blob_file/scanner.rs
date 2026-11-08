@@ -390,12 +390,15 @@ impl Scanner {
         let Ok(len) = usize::try_from(len) else {
             return damaged(self, crate::Error::InvalidHeader("BlobFrame"));
         };
-        let mut bytes = alloc::vec![0_u8; len];
-        if let Err(e) = self.inner.read_exact(&mut bytes) {
-            self.is_terminated = true;
-            return Some(Err(e.into()));
-        }
-        let bytes = Slice::from(bytes);
+        // Read into an uninitialized buffer: zero-filling a frame only to
+        // overwrite every byte would cost a memory write per byte relocated.
+        let bytes = match Slice::from_reader(&mut self.inner, len) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.is_terminated = true;
+                return Some(Err(e.into()));
+            }
+        };
         let mut decoded = 0;
         let parsed = decode_frame(
             &bytes,
