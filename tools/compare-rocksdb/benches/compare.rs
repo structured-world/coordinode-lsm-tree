@@ -2357,6 +2357,8 @@ struct Diagnosis {
     data_loads: u64,
     index_loads: u64,
     filter_loads: u64,
+    blob_reads: u64,
+    blob_bytes: u64,
 }
 
 #[cfg(feature = "metrics")]
@@ -2371,6 +2373,8 @@ impl Diagnosis {
             data_loads: m.data_block_load_count() as u64,
             index_loads: m.index_block_load_count() as u64,
             filter_loads: m.filter_block_load_count() as u64,
+            blob_reads: m.blob_read_count() as u64,
+            blob_bytes: m.blob_bytes_read(),
         }
     }
 
@@ -2389,7 +2393,8 @@ impl Diagnosis {
         eprintln!(
             "sustained diagnosis: {reads} reads, l0 runs seen {:.1}, per read: \
              filter queries {:.2}, filter skips {:.2}, block loads cached {:.2} io {:.2} \
-             (data {:.2}, index {:.2}, filter {:.2}); writer stalled {:.1}% of {elapsed:?}; \
+             (data {:.2}, index {:.2}, filter {:.2}), blob reads {:.3} bytes {:.0}; \
+             writer stalled {:.1}% of {elapsed:?}; \
              {tables} tables at the end",
             l0_seen as f64 / reads.max(1) as f64,
             per(self.filter_queries, before.filter_queries),
@@ -2399,6 +2404,8 @@ impl Diagnosis {
             per(self.data_loads, before.data_loads),
             per(self.index_loads, before.index_loads),
             per(self.filter_loads, before.filter_loads),
+            per(self.blob_reads, before.blob_reads),
+            per(self.blob_bytes, before.blob_bytes),
             100.0 * stalled.as_secs_f64() / elapsed.as_secs_f64(),
         );
     }
