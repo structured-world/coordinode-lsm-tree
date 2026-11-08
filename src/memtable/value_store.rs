@@ -53,6 +53,14 @@ pub(crate) struct ValueStore {
     /// Next index to allocate (monotonically increasing). Every insert moves
     /// it, so it keeps off the segment table every read goes through.
     next_idx: OwnLine<AtomicU32>,
+
+    /// Test-only faults: the next segment allocation fails (unwinding as the
+    /// default `no_std` handler does), and fresh segments come filled with a
+    /// nonzero pattern, as a reused heap chunk may.
+    #[cfg(test)]
+    fail_next_segment: core::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    scribble_segments: core::sync::atomic::AtomicBool,
 }
 
 // Send+Sync derived automatically: all fields (Box<[AtomicPtr<_>]>, AtomicU32)
@@ -73,7 +81,24 @@ impl ValueStore {
         Self {
             segments: segments.into_boxed_slice(),
             next_idx: OwnLine(AtomicU32::new(0)),
+            #[cfg(test)]
+            fail_next_segment: core::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            scribble_segments: core::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Test-only: makes the next segment allocation fail by panicking.
+    #[cfg(test)]
+    pub(crate) fn fail_next_segment_for_test(&self) {
+        self.fail_next_segment.store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: fills every segment allocated from now on with a nonzero
+    /// pattern before use.
+    #[cfg(test)]
+    pub(crate) fn scribble_segments_for_test(&self) {
+        self.scribble_segments.store(true, Ordering::Relaxed);
     }
 
     /// Appends a value and returns its index.
@@ -151,7 +176,7 @@ impl ValueStore {
         // the value only once it is fully written.
         unsafe {
             let seg_ptr = self.segments[seg_idx].load(Ordering::Acquire);
-            debug_assert!(!seg_ptr.is_null());
+            debug_assert!(seg_ptr.addr() > TORN_ADDR);
             ptr::write(seg_ptr.add(slot), value);
         }
     }
@@ -188,7 +213,7 @@ impl ValueStore {
         // with the AcqRel CAS in ensure_segment.
         unsafe {
             let seg_ptr = self.segments[seg_idx].load(Ordering::Acquire);
-            debug_assert!(!seg_ptr.is_null());
+            debug_assert!(seg_ptr.addr() > TORN_ADDR);
             (*seg_ptr.add(slot)).clone()
         }
     }
@@ -199,45 +224,111 @@ impl ValueStore {
         reason = "seg_idx < MAX_SEGMENTS enforced by caller"
     )]
     fn ensure_segment(&self, seg_idx: usize) {
-        if self.segments[seg_idx].load(Ordering::Acquire).is_null() {
-            // A segment of uninitialised slots, each initialised by its own
-            // `write` before anything reads or drops it, so the memory is
-            // left as it comes: zeroing it cleared 2 MiB per segment, most
-            // of which a small memtable never touches, and a heap chunk
-            // that glibc hands back cleared it on every new memtable.
-            #[expect(
-                clippy::expect_used,
-                reason = "Layout::array with compile-time-known size cannot fail"
-            )]
-            let layout =
-                alloc::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
+        let segment = &self.segments[seg_idx];
+        let current = segment.load(Ordering::Acquire);
+        // One compare, as a null check was: a real segment lies above both
+        // null and the torn marker.
+        if current.addr() <= TORN_ADDR {
+            self.allocate_segment(seg_idx, current);
+        }
+    }
 
-            // SAFETY: layout is non-zero (SEGMENT_SIZE > 0, UserValue is non-ZST).
-            // The cast to *mut UserValue is safe because alloc returns memory
-            // with alignment >= align_of::<UserValue>() (Layout::array sets
-            // alignment to align_of::<UserValue>()).
-            #[expect(
-                clippy::cast_ptr_alignment,
-                reason = "Layout::array ensures correct alignment"
-            )]
-            let raw = unsafe { alloc::alloc::alloc(layout) }.cast::<UserValue>();
-            if raw.is_null() {
-                alloc::alloc::handle_alloc_error(layout);
-            }
+    /// Allocates segment `seg_idx`, found null or torn as `current`.
+    #[cold]
+    #[inline(never)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "seg_idx < MAX_SEGMENTS enforced by caller"
+    )]
+    fn allocate_segment(&self, seg_idx: usize, mut current: *mut UserValue) {
+        let segment = &self.segments[seg_idx];
+        // A segment of uninitialised slots, each initialised by its own
+        // `write` before anything reads or drops it, so the memory is left
+        // as it comes: zeroing it cleared 2 MiB per segment, most of which a
+        // small memtable never touches, and a heap chunk that glibc hands
+        // back cleared it on every new memtable. Only a torn segment is
+        // zeroed, below.
+        #[expect(
+            clippy::expect_used,
+            reason = "Layout::array with compile-time-known size cannot fail"
+        )]
+        let layout =
+            alloc::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
 
-            // CAS null → raw.  Loser frees its allocation.
-            if self.segments[seg_idx]
-                .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+        // SAFETY: layout is non-zero (SEGMENT_SIZE > 0, UserValue is non-ZST).
+        // The cast to *mut UserValue is safe because alloc returns memory
+        // with alignment >= align_of::<UserValue>() (Layout::array sets
+        // alignment to align_of::<UserValue>()).
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "Layout::array ensures correct alignment"
+        )]
+        let raw = unsafe { alloc::alloc::alloc(layout) }.cast::<UserValue>();
+        #[cfg(test)]
+        let injected = self.fail_next_segment.swap(false, Ordering::Relaxed);
+        #[cfg(test)]
+        let raw = if injected {
+            // SAFETY: raw came from alloc(layout) just above.
+            unsafe { alloc::alloc::dealloc(raw.cast::<u8>(), layout) };
+            ptr::null_mut()
+        } else {
+            raw
+        };
+
+        if raw.is_null() {
+            // The failing write's slot stays unwritten, and an allocation
+            // error handler may unwind (the default one does without `std`),
+            // so its index is taken. Marking the segment torn makes the write
+            // that allocates it later zero it: a zeroed slot is an empty
+            // inline value, which `Drop` frees as nothing. A segment another
+            // write allocated meanwhile holds the slot, to be written now.
+            if let Err(actual) =
+                segment.compare_exchange(current, torn(), Ordering::AcqRel, Ordering::Acquire)
+                && actual.addr() > TORN_ADDR
             {
-                // SAFETY: raw was just allocated with the same layout; no
-                // slots were initialised (we lost the race before any write).
-                unsafe {
-                    alloc::alloc::dealloc(raw.cast::<u8>(), layout);
+                return;
+            }
+            #[cfg(test)]
+            assert!(!injected, "ValueStore: injected segment allocation failure");
+            alloc::alloc::handle_alloc_error(layout);
+        }
+        #[cfg(test)]
+        if self.scribble_segments.load(Ordering::Relaxed) {
+            // SAFETY: raw spans layout.size() bytes it owns alone.
+            unsafe { ptr::write_bytes(raw.cast::<u8>(), 0xA5, layout.size()) };
+        }
+
+        let mut zeroed = false;
+        loop {
+            if current == torn() && !zeroed {
+                // SAFETY: raw spans layout.size() bytes it owns alone, and a
+                // zeroed `UserValue` is the empty inline value.
+                unsafe { ptr::write_bytes(raw.cast::<u8>(), 0, layout.size()) };
+                zeroed = true;
+            }
+            match segment.compare_exchange(current, raw, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(actual) if actual.addr() > TORN_ADDR => {
+                    // Lost the race: no slot of raw was written.
+                    // SAFETY: raw was just allocated with this layout.
+                    unsafe { alloc::alloc::dealloc(raw.cast::<u8>(), layout) };
+                    return;
                 }
+                // Null turned torn under us: zero raw and install it there.
+                Err(actual) => current = actual,
             }
         }
     }
+}
+
+/// Address of the torn marker: a segment whose allocation failed while a
+/// write that reserved one of its slots was waiting on it. No allocation of a
+/// `UserValue` array lies at it, as it is not aligned for one.
+const TORN_ADDR: usize = 1;
+
+/// The torn marker, never dereferenced.
+fn torn() -> *mut UserValue {
+    ptr::without_provenance_mut(TORN_ADDR)
 }
 
 impl Default for ValueStore {
@@ -268,7 +359,8 @@ impl Drop for ValueStore {
             )]
             let seg_ptr = self.segments[seg_idx].load(Ordering::Relaxed);
 
-            if seg_ptr.is_null() {
+            // Null or torn: no allocation, and no slot of it was written.
+            if seg_ptr.addr() <= TORN_ADDR {
                 continue;
             }
 
@@ -284,8 +376,10 @@ impl Drop for ValueStore {
                 for i in 0..count {
                     // SAFETY: slots 0..count were initialised via ptr::write
                     // in write(), which every reserved slot gets before its
-                    // insert can panic.  We're the only thread running (Drop
-                    // is &mut).
+                    // insert can panic, except a slot whose segment failed to
+                    // allocate: that segment was zeroed when it was allocated
+                    // after all, and a zeroed slot is the empty inline value.
+                    // We're the only thread running (Drop is &mut).
                     unsafe {
                         ptr::drop_in_place(seg_ptr.add(i));
                     }

@@ -110,3 +110,33 @@ fn concurrent_append_and_read() {
 
     assert_eq!(all.len(), n_threads * n_per_thread);
 }
+
+/// A write whose segment allocation fails unwinds with its index taken and
+/// its slot never written. When a later write allocates that segment, the
+/// slot holds whatever the fresh memory held, and dropping the store must not
+/// drop it as a value: here the memory is filled with a pattern that reads as
+/// a heap view with a wild pointer.
+#[test]
+fn a_slot_left_by_a_failed_segment_allocation_is_not_dropped_as_a_value() {
+    let store = ValueStore::new();
+    store.scribble_segments_for_test();
+    store.fail_next_segment_for_test();
+
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.append(val(b"a value too long to be held inline"));
+    }));
+    assert!(
+        failed.is_err(),
+        "the injected allocation failure must unwind"
+    );
+    assert_eq!(store.len(), 1, "the failed write keeps its index");
+
+    let idx = store.append(val(b"a second value, long enough for the heap"));
+    assert_eq!(idx, 1);
+    assert_eq!(
+        &*unsafe { store.get(idx) },
+        b"a second value, long enough for the heap"
+    );
+
+    drop(store);
+}
