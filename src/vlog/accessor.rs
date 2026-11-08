@@ -520,7 +520,8 @@ impl<'a> Accessor<'a> {
         // `inline-try` the same, inserting only when the shard's lock is free;
         // `inline-build` builds on the read's path and drops; `inline-lock`
         // builds, takes the shard's write lock and releases it, and drops;
-        // `inline-room` builds and inserts on the read's path only into room.
+        // `inline-room` builds and inserts on the read's path only into room;
+        // `full` inserts on the read's path only into a shard with no room.
         #[cfg(feature = "std")]
         let mode = {
             static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -536,6 +537,7 @@ impl<'a> Accessor<'a> {
                 Ok("inline-build") => 9,
                 Ok("inline-lock") => 10,
                 Ok("inline-room") => 11,
+                Ok("full") => 12,
                 _ => 0,
             })
         };
@@ -546,7 +548,7 @@ impl<'a> Accessor<'a> {
             5 => crate::cache::FillStage::BuildOnly,
             6 => crate::cache::FillStage::DropOnly,
             7 => crate::cache::FillStage::Inline,
-            8 => crate::cache::FillStage::InlineTry,
+            8 | 12 => crate::cache::FillStage::InlineTry,
             9 => crate::cache::FillStage::InlineBuild,
             10 => crate::cache::FillStage::InlineLock,
             11 => crate::cache::FillStage::InlineRoom,
@@ -562,6 +564,11 @@ impl<'a> Accessor<'a> {
                 let cached = packed::cached_record(record, bytes, value);
                 cache.fill_blob_record(tree_id, at, vhandle.index, cached, stage);
             }
+            return;
+        }
+        // `full` caches a value only into a shard with no room left, where the
+        // insert evicts what it replaces and the cache does not grow.
+        if mode == 12 && cache.room_for_blob_record(tree_id, at, vhandle.index, weight) {
             return;
         }
         let admitted = cache.admit_blob_record(tree_id, at, vhandle.index, weight);
