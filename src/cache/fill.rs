@@ -19,7 +19,6 @@
 use super::{CacheKey, Data, FillStage, Item};
 use crate::Slice;
 use crate::sharded_cache::Priority;
-use crate::vlog::blob_file::packed::Record;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
@@ -32,33 +31,23 @@ const POLL: Duration = Duration::from_micros(100);
 /// Empty drains in a row before the worker parks until a fill wakes it.
 const IDLE_POLLS: u32 = 64;
 
-/// A packed value read alone, as a read leaves it to be cached: the record,
-/// its bytes as read and its value decoded, at offset `index` of its packed
-/// block, its entry built by the worker.
+/// A packed value read alone, as a read leaves it to be cached: its record as
+/// the cache holds it.
 pub(crate) struct Fill {
     pub(crate) key: CacheKey,
-    pub(crate) record: Record,
-    pub(crate) bytes: Slice,
-    pub(crate) value: Slice,
-    pub(crate) index: u16,
+    pub(crate) record: Slice,
     /// Experiment: how far the worker takes the fill.
     pub(crate) stage: FillStage,
 }
 
 impl Fill {
-    /// Builds the entry and inserts it, on probation (see
+    /// Inserts the entry, on probation (see
     /// [`super::Cache::fill_blob_record`]).
     pub(crate) fn apply(self, data: &Data) {
         if self.stage == FillStage::DropOnly {
             return;
         }
-        let frame = crate::vlog::blob_file::packed::record_frame(
-            &self.record,
-            &self.bytes,
-            self.value,
-            self.index,
-        );
-        let item = Item::BlobFrame(Arc::new(frame));
+        let item = Item::BlobRecord(self.record);
         match self.stage {
             FillStage::RoomOnly => data.insert_if_room(self.key, item, Priority::Probation),
             FillStage::Insert => data.insert_with_priority(self.key, item, Priority::Probation),

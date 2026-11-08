@@ -436,7 +436,10 @@ impl BlobSource {
                 self.cache
                     .get_blob_record(self.tree_id, vhandle.frame_at(), vhandle.index)
             {
-                return match reader::value_in(&record, vhandle.index, &item.key.user_key) {
+                return match crate::vlog::blob_file::packed::cached_value(
+                    &record,
+                    &item.key.user_key,
+                ) {
                     Ok(value) => ValuePlan::Ready(value),
                     Err(_) => ValuePlan::Alone,
                 };

@@ -35,6 +35,10 @@ enum Item {
     /// it compares the key it was asked for against the one at its index, as a
     /// direct read does, rather than trusting the position.
     BlobFrame(alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>),
+    /// One value of a packed block, read alone: its record with the value
+    /// stored decoded (see [`crate::vlog::blob_file::packed::cached_record`]).
+    /// Its key is compared against the one asked for, as for a frame.
+    BlobRecord(crate::Slice),
     /// A resolved point-read result for one user key in one (immutable) SST: the
     /// newest version found there. The full key is carried in `key.user_key` so a
     /// hash collision on the cache key is caught (verified on lookup) rather than
@@ -120,6 +124,7 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
             // What it decoded and its entries. The prefetch's admission budget
             // charges itself the same way, so the two agree.
             BlobFrame(frame) => frame.weight(),
+            Item::BlobRecord(record) => record.len() as u64,
             Item::Row(iv) => row_weight(iv.key.user_key.len(), iv.value.len()),
             // Weighed by the resident decompressed prefix + covered key; the
             // shared `Arc<ResumeState>` scratch is approximated by a small fixed
@@ -316,6 +321,18 @@ pub(crate) enum BlobClaim<'a> {
     Alone,
 }
 
+/// How a miss of a packed record read alone proceeds, as [`BlobClaim`] for a
+/// frame.
+pub(crate) enum RecordClaim<'a> {
+    /// Read the record, then [`BlobLead::hand_over`] it.
+    Lead(BlobLead<'a>),
+    /// A concurrent read of the same record finished: the record as the cache
+    /// holds it.
+    Shared(crate::Slice),
+    /// Read the record without coordination.
+    Alone,
+}
+
 /// The lead of a blob frame load, as [`BlockLead`] for a block.
 pub(crate) struct BlobLead<'a>(LoadLead<'a>);
 
@@ -346,13 +363,10 @@ impl BlobLead<'_> {
         self.0.has_waiters()
     }
 
-    /// Hands `frame`, the value a read of one packed record decoded, to the
-    /// reads waiting on it.
-    pub(crate) fn hand_over(
-        self,
-        frame: alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>,
-    ) {
-        self.0.publish(Item::BlobFrame(frame));
+    /// Hands `record`, a packed record read alone as the cache holds it, to
+    /// the reads waiting on it.
+    pub(crate) fn hand_over(self, record: crate::Slice) {
+        self.0.publish(Item::BlobRecord(record));
     }
 
     /// [`Self::publish`] for the frame this read decoded: shared only when
@@ -629,18 +643,18 @@ impl Cache {
 
     /// Claims the cold read of the packed record at `at` and `index`, as
     /// [`Self::claim_blob_frame`] does for a frame: the reads waiting on it
-    /// take the value the lead decoded.
+    /// take the record the lead read.
     pub(crate) fn claim_blob_record(
         &self,
         vlog_id: crate::TreeId,
         at: BlobFrameAt,
         index: u16,
-    ) -> BlobClaim<'_> {
+    ) -> RecordClaim<'_> {
         match self
             .loads
             .claim(blob_record_key(vlog_id, at, index), LoadIdentity::BlobFrame)
         {
-            crate::inflight::Claim::Lead(lead) => BlobClaim::Lead(BlobLead(lead)),
+            crate::inflight::Claim::Lead(lead) => RecordClaim::Lead(BlobLead(lead)),
             crate::inflight::Claim::Join(join) => {
                 let shared = if crate::inflight::may_wait() {
                     join.wait()
@@ -648,11 +662,11 @@ impl Cache {
                     join.try_take()
                 };
                 match shared {
-                    Some(Item::BlobFrame(frame)) => BlobClaim::Shared(frame),
-                    _ => BlobClaim::Alone,
+                    Some(Item::BlobRecord(record)) => RecordClaim::Shared(record),
+                    _ => RecordClaim::Alone,
                 }
             }
-            crate::inflight::Claim::Alone => BlobClaim::Alone,
+            crate::inflight::Claim::Alone => RecordClaim::Alone,
         }
     }
 
@@ -860,7 +874,9 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Block(block) => block,
-            Item::BlobFrame(_) | Item::Row(_) => unreachable!("invalid cache item"),
+            Item::BlobFrame(_) | Item::BlobRecord(_) | Item::Row(_) => {
+                unreachable!("invalid cache item")
+            }
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "columnar")]
@@ -877,7 +893,9 @@ impl Cache {
 
         Some(match self.data.peek(&key)? {
             Item::Block(block) => block,
-            Item::BlobFrame(_) | Item::Row(_) => unreachable!("invalid cache item"),
+            Item::BlobFrame(_) | Item::BlobRecord(_) | Item::Row(_) => {
+                unreachable!("invalid cache item")
+            }
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "columnar")]
@@ -1170,22 +1188,15 @@ impl Cache {
     }
 
     /// Caches one value of a packed block, read alone, under its frame and
-    /// its record's offset `index`: a frame of that one value, built off the
-    /// read's path (see [`fill`]). On probation: it stays only if read again,
-    /// so a stream of values read once each cannot push table blocks out of
-    /// the main queue.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the experiment's stage rides beside the fill"
-    )]
+    /// its record's offset `index`: `record`, the record as the cache holds
+    /// it. On probation: it stays only if read again, so a stream of values
+    /// read once each cannot push table blocks out of the main queue.
     pub(crate) fn fill_blob_record(
         &self,
         vlog_id: crate::TreeId,
         at: BlobFrameAt,
         index: u16,
-        record: crate::vlog::blob_file::packed::Record,
-        bytes: crate::Slice,
-        value: crate::Slice,
+        record: crate::Slice,
         stage: FillStage,
     ) {
         let key = blob_record_key(vlog_id, at, index);
@@ -1199,8 +1210,7 @@ impl Cache {
         ) {
             #[cfg(feature = "std")]
             let started = self.timing.start();
-            let frame = crate::vlog::blob_file::packed::record_frame(&record, &bytes, value, index);
-            let item = Item::BlobFrame(alloc::sync::Arc::new(frame));
+            let item = Item::BlobRecord(record);
             match stage {
                 FillStage::Inline => {
                     self.data
@@ -1224,27 +1234,14 @@ impl Cache {
             return;
         }
         #[cfg(feature = "std")]
-        self.fills.push(
-            &self.data,
-            fill::Fill {
-                key,
-                record,
-                bytes,
-                value,
-                index,
-                stage,
-            },
-        );
-        // no-std: no worker thread, the entry is built and inserted inline
+        self.fills
+            .push(&self.data, fill::Fill { key, record, stage });
+        // no-std: no worker thread, the entry is inserted inline
         #[cfg(not(feature = "std"))]
         {
             let _ = stage;
-            let frame = crate::vlog::blob_file::packed::record_frame(&record, &bytes, value, index);
-            self.data.insert_with_priority(
-                key,
-                Item::BlobFrame(alloc::sync::Arc::new(frame)),
-                Priority::Probation,
-            );
+            self.data
+                .insert_with_priority(key, Item::BlobRecord(record), Priority::Probation);
         }
     }
 
@@ -1300,16 +1297,25 @@ impl Cache {
         self.data.admit(&blob_frame_key(vlog_id, at), weight)
     }
 
-    /// The value of a packed block cached at `at` and `index`, as a frame of
-    /// that one value. The caller compares its key, as for a frame.
+    /// The value of a packed block cached at `at` and `index`, as the record
+    /// the cache holds. The caller compares its key, as for a frame.
     #[must_use]
     pub(crate) fn get_blob_record(
         &self,
         vlog_id: crate::TreeId,
         at: BlobFrameAt,
         index: u16,
-    ) -> Option<alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>> {
-        self.blob_item(&blob_record_key(vlog_id, at, index))
+    ) -> Option<crate::Slice> {
+        match self.data.get(&blob_record_key(vlog_id, at, index))? {
+            Item::BlobRecord(record) => Some(record),
+            Item::BlobFrame(_) | Item::Block(_) | Item::Row(_) => {
+                unreachable!("invalid cache item")
+            }
+            #[cfg(feature = "zstd")]
+            Item::PartialBlock(_) => unreachable!("invalid cache item"),
+            #[cfg(feature = "columnar")]
+            Item::Directory(..) => unreachable!("invalid cache item"),
+        }
     }
 
     fn blob_item(
@@ -1318,7 +1324,9 @@ impl Cache {
     ) -> Option<alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>> {
         match self.data.get(key)? {
             Item::BlobFrame(frame) => Some(frame),
-            Item::Block(_) | Item::Row(_) => unreachable!("invalid cache item"),
+            Item::BlobRecord(_) | Item::Block(_) | Item::Row(_) => {
+                unreachable!("invalid cache item")
+            }
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "columnar")]

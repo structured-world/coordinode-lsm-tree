@@ -13,6 +13,7 @@ use crate::{
         ValueHandle,
         blob_file::{
             frame::{DecodedFrame, FrameKind},
+            packed,
             reader::{Reader, assemble, check_key, chunk_frames, covering_chunks, value_in},
         },
     },
@@ -402,28 +403,28 @@ impl<'a> Accessor<'a> {
         // for a scan or a fill, answers.
         let at = vhandle.frame_at();
         if let Some(record) = cache.get_blob_record(tree_id, at, vhandle.index) {
-            return value_in(&record, vhandle.index, key).map(Some);
+            return packed::cached_value(&record, key).map(Some);
         }
         if let Some(frame) = cache.get_blob_frame(tree_id, at) {
             return value_in(&frame, vhandle.index, key).map(Some);
         }
         // Concurrent misses of one record read it once, when reads take long
-        // enough for waiting to pay: the others take the value it decoded.
+        // enough for waiting to pay: the others take the record it read.
         let lead = match cache.claim_blob_record(tree_id, at, vhandle.index) {
-            crate::cache::BlobClaim::Shared(frame) => {
-                return value_in(&frame, vhandle.index, key).map(Some);
+            crate::cache::RecordClaim::Shared(record) => {
+                return packed::cached_value(&record, key).map(Some);
             }
-            crate::cache::BlobClaim::Lead(lead) => {
+            crate::cache::RecordClaim::Lead(lead) => {
                 // A read that finished between the miss and this claim has
                 // left its value to be cached, perhaps already.
                 if let Some(record) = cache.get_blob_record(tree_id, at, vhandle.index) {
-                    let value = value_in(&record, vhandle.index, key);
+                    let value = packed::cached_value(&record, key);
                     lead.hand_over(record);
                     return value.map(Some);
                 }
                 Some(lead)
             }
-            crate::cache::BlobClaim::Alone => None,
+            crate::cache::RecordClaim::Alone => None,
         };
         let timer = crate::cache::Cache::time_load();
         let offset = record_offset(blob_file, vhandle, len)?;
@@ -438,14 +439,9 @@ impl<'a> Accessor<'a> {
         if let Some(lead) = lead
             && lead.has_waiters()
         {
-            lead.hand_over(Arc::new(crate::vlog::blob_file::packed::record_frame(
-                &record,
-                &bytes,
-                value.clone(),
-                vhandle.index,
-            )));
+            lead.hand_over(packed::cached_record(&record, &bytes, &value));
         }
-        Self::keep_record(tree_id, vhandle, record, bytes, &value, cache);
+        Self::keep_record(tree_id, vhandle, &record, &bytes, &value, cache);
         Ok(Some(value))
     }
 
@@ -466,7 +462,7 @@ impl<'a> Accessor<'a> {
         cache: &Cache,
     ) -> crate::Result<UserValue> {
         let (record, value) = self.record_value(blob_file, key, bytes)?;
-        Self::keep_record(tree_id, vhandle, record, bytes.clone(), &value, cache);
+        Self::keep_record(tree_id, vhandle, &record, bytes, &value, cache);
         Ok(value)
     }
 
@@ -482,9 +478,7 @@ impl<'a> Accessor<'a> {
         blob_file: &BlobFile,
         key: &[u8],
         bytes: &crate::Slice,
-    ) -> crate::Result<(crate::vlog::blob_file::packed::Record, UserValue)> {
-        use crate::vlog::blob_file::packed;
-
+    ) -> crate::Result<(packed::Record, UserValue)> {
         let record = packed::parse_record(bytes)?;
         if record.len != bytes.len() || bytes.get(record.key.clone()) != Some(key) {
             return Err(crate::Error::InvalidHeader("BlobRecord"));
@@ -511,8 +505,8 @@ impl<'a> Accessor<'a> {
     fn keep_record(
         tree_id: TreeId,
         vhandle: &ValueHandle,
-        record: crate::vlog::blob_file::packed::Record,
-        bytes: crate::Slice,
+        record: &packed::Record,
+        bytes: &crate::Slice,
         value: &UserValue,
         cache: &Cache,
     ) {
@@ -562,18 +556,11 @@ impl<'a> Accessor<'a> {
             return;
         }
         let at = vhandle.frame_at();
-        let weight = crate::vlog::blob_file::packed::record_frame_weight(&record, value);
+        let weight = packed::cached_record_len(record, value) as u64;
         if mode == 2 {
             if cache.room_for_blob_record(tree_id, at, vhandle.index, weight) {
-                cache.fill_blob_record(
-                    tree_id,
-                    at,
-                    vhandle.index,
-                    record,
-                    bytes,
-                    value.clone(),
-                    stage,
-                );
+                let cached = packed::cached_record(record, bytes, value);
+                cache.fill_blob_record(tree_id, at, vhandle.index, cached, stage);
             }
             return;
         }
@@ -582,15 +569,8 @@ impl<'a> Accessor<'a> {
             return;
         }
         if admitted {
-            cache.fill_blob_record(
-                tree_id,
-                at,
-                vhandle.index,
-                record,
-                bytes,
-                value.clone(),
-                stage,
-            );
+            let cached = packed::cached_record(record, bytes, value);
+            cache.fill_blob_record(tree_id, at, vhandle.index, cached, stage);
         }
     }
 

@@ -224,52 +224,58 @@ pub(crate) fn record_value(
     )
 }
 
-/// What the frame [`record_frame`] builds of `record` and its decoded
-/// `value` weighs in the cache, known before it is built.
+/// The length of the record [`cached_record`] makes of `record` and its
+/// decoded `value`, which is what it weighs in the cache: known before it is
+/// made, so a value the cache would refuse is not copied.
 #[must_use]
-pub(crate) fn record_frame_weight(record: &Record, value: &Slice) -> u64 {
-    (record.key.len() + value.len() + size_of::<FrameEntry>()) as u64
+pub(crate) fn cached_record_len(record: &Record, value: &Slice) -> usize {
+    RECORD_HEADER_LEN + record.key.len() + value.len()
 }
 
-/// The value `value` of `record`, parsed out of `bytes` at offset `index` of
-/// its packed block, held as a frame of that one value for the cache: its
-/// key, its value decoded, and the place a handle names it by.
+/// `record`, parsed out of `bytes`, as the cache holds it: a record whose
+/// value is stored decoded, so a hit hands out a view of it with nothing to
+/// decode and nothing else to allocate. A value stored as it is already is
+/// that record, `bytes` itself; a decompressed one is copied into a record of
+/// its own beside its key, one allocation that frees `bytes`.
 #[must_use]
-pub(crate) fn record_frame(
-    record: &Record,
-    bytes: &Slice,
-    value: Slice,
-    index: u16,
-) -> DecodedFrame {
-    // Copied out, so a value decompressed out of the record does not keep the
-    // record's bytes alive behind a cache weight that leaves them out.
-    let key = Slice::from(bytes.get(record.key.clone()).unwrap_or_default());
+pub(crate) fn cached_record(record: &Record, bytes: &Slice, value: &Slice) -> Slice {
+    let stored = bytes.get(record.stored.clone()).unwrap_or_default();
+    if record.len == bytes.len() && core::ptr::eq(stored.as_ptr(), value.as_ptr()) {
+        return bytes.clone();
+    }
+    let key = bytes.get(record.key.clone()).unwrap_or_default();
+    let mut out = Vec::with_capacity(cached_record_len(record, value));
+    // The checksum is the record's as read: a cached record is not checked
+    // again, its bytes never left memory.
+    out.extend_from_slice(&record.checksum.to_le_bytes());
+    out.extend_from_slice(&record.seqno.to_le_bytes());
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "a record is a value below the block target and a u16 key"
+        reason = "the key was read through a u16 length"
     )]
-    let disk_len = record.len as u32;
-    DecodedFrame {
-        header: FrameHeader {
-            kind: FrameKind::Block,
-            flags: FLAG_PACKED,
-            count: 1,
-            entries_len: 0,
-            raw_len: record.value_len,
-            disk_len,
-            header_crc: 0,
-            checksum: u128::from(record.checksum),
-        },
-        list: FrameEntries::One(FrameEntry {
-            seqno: record.seqno,
-            key: 0..key.len(),
-            value_len: record.value_len,
-            value: 0..value.len(),
-            at: u32::from(index),
-        }),
-        entries: key,
-        payload: value,
+    out.extend_from_slice(&(key.len() as u16).to_le_bytes());
+    out.extend_from_slice(&record.value_len.to_le_bytes());
+    out.extend_from_slice(&record.value_len.to_le_bytes());
+    out.push(FLAG_RAW);
+    out.extend_from_slice(key);
+    out.extend_from_slice(value);
+    Slice::from(out)
+}
+
+/// The value of `cached`, a record [`cached_record`] made, under `key`.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for a record that is not `key`'s or whose
+/// value is not stored decoded.
+pub(crate) fn cached_value(cached: &Slice, key: &[u8]) -> crate::Result<Slice> {
+    let record = record_fields(cached)?;
+    if cached.get(record.key.clone()) != Some(key)
+        || record.stored.len() != record.value_len as usize
+    {
+        return Err(crate::Error::InvalidHeader("BlobRecord"));
     }
+    Ok(cached.slice(record.stored))
 }
 
 /// Checks the records of the packed block whose header is `header`, each

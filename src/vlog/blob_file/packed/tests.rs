@@ -81,6 +81,56 @@ fn a_damaged_record_fails_the_frame_check() {
     ));
 }
 
+/// A record whose value is stored as it is caches as the very bytes read, so
+/// caching it allocates nothing, and a hit hands back that value.
+#[test]
+fn a_record_stored_as_is_caches_as_its_bytes() {
+    let (bytes, _) = records(&[b"a value stored as it is"]);
+    let bytes = Slice::from(bytes);
+    let record = parse_record(&bytes).unwrap();
+    let mut decoded = 0;
+    let value = record_value(&record, &bytes, CompressionType::None, None, &mut decoded).unwrap();
+    let cached = cached_record(&record, &bytes, &value);
+    assert_eq!(cached.as_ptr(), bytes.as_ptr(), "the bytes read are kept");
+    assert_eq!(cached.len(), cached_record_len(&record, &value));
+    assert_eq!(
+        &*cached_value(&cached, b"k0").unwrap(),
+        b"a value stored as it is"
+    );
+}
+
+/// A value decoded into a buffer of its own is copied beside its key into one
+/// record of the length announced, which no longer holds the bytes read, and
+/// a hit hands back the decoded value.
+#[test]
+fn a_decoded_record_caches_as_a_record_of_its_own() {
+    let (bytes, _) = records(&[b"the decoded value"]);
+    let bytes = Slice::from(bytes);
+    let record = parse_record(&bytes).unwrap();
+    let value = Slice::from(b"the decoded value".to_vec());
+    let cached = cached_record(&record, &bytes, &value);
+    assert_ne!(cached.as_ptr(), bytes.as_ptr(), "a record of its own");
+    assert_eq!(cached.len(), cached_record_len(&record, &value));
+    assert_eq!(
+        &*cached_value(&cached, b"k0").unwrap(),
+        b"the decoded value"
+    );
+}
+
+/// A cached record answers only for its own key: a hash collision on the cache
+/// key, or a handle into another value, is refused rather than served.
+#[test]
+fn a_cached_record_refuses_another_key() {
+    let (bytes, _) = records(&[b"value"]);
+    let bytes = Slice::from(bytes);
+    let record = parse_record(&bytes).unwrap();
+    let cached = cached_record(&record, &bytes, &bytes.slice(record.stored.clone()));
+    assert!(matches!(
+        cached_value(&cached, b"k1"),
+        Err(crate::Error::InvalidHeader("BlobRecord"))
+    ));
+}
+
 /// Two records of the same length swapped each still check by their own
 /// checksums; the frame's checksum over their checksums in order catches it.
 #[test]
