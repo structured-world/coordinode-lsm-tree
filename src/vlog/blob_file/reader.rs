@@ -251,12 +251,7 @@ pub(crate) fn assemble<C: core::ops::Deref<Target = DecodedFrame>>(
     let len = usize::try_from(range.end - range.start).map_err(|_| malformed())?;
     let mut out = Vec::with_capacity(len);
     for (at, chunk) in covered.clone().zip(chunks) {
-        let expected = if at + 1 == count {
-            total - u64::from(at) * u64::from(size)
-        } else {
-            u64::from(size)
-        };
-        if chunk.header.kind != FrameKind::Chunk || chunk.payload.len() as u64 != expected {
+        if !chunk_fits(chunk, at, (size, count), total) {
             return Err(malformed());
         }
         let from = if at == covered.start {
@@ -272,6 +267,42 @@ pub(crate) fn assemble<C: core::ops::Deref<Target = DecodedFrame>>(
         return Err(malformed());
     }
     Ok(UserValue::from(out))
+}
+
+/// Checks that `chunks` are all a head's chunks, each the size its table
+/// gives it, without gathering the value: what a copy of the value's frames
+/// as stored needs proven.
+///
+/// # Errors
+///
+/// The head is malformed, or a chunk is missing, not a chunk, or not its size.
+pub(crate) fn check_chunks<C: core::ops::Deref<Target = DecodedFrame>>(
+    head: &DecodedFrame,
+    chunks: &[C],
+) -> crate::Result<()> {
+    let (size, count) = head.chunk_table()?;
+    let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
+    let all_fit = chunks.len() == count as usize
+        && (0..count)
+            .zip(chunks)
+            .all(|(at, chunk)| chunk_fits(chunk, at, (size, count), total));
+    if all_fit {
+        Ok(())
+    } else {
+        Err(crate::Error::InvalidHeader("Blob"))
+    }
+}
+
+/// Whether `chunk` is chunk `at` of a value of `total` bytes split by the
+/// table `(size, count)`: a chunk, holding the chunk size, the last what is
+/// left.
+fn chunk_fits(chunk: &DecodedFrame, at: u32, (size, count): (u32, u32), total: u64) -> bool {
+    let expected = if at + 1 == count {
+        total - u64::from(at) * u64::from(size)
+    } else {
+        u64::from(size)
+    };
+    chunk.header.kind == FrameKind::Chunk && chunk.payload.len() as u64 == expected
 }
 
 #[cfg(test)]

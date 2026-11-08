@@ -75,7 +75,7 @@ fn three_singles(dir: &std::path::Path) -> crate::Result<std::path::PathBuf> {
 /// Every value comes back in order with its frame and index: a block's
 /// values share their frame, and the block is consumed only with its last
 /// value; a value with frames of its own hands them over as stored; a
-/// chunked value comes back whole.
+/// chunked value comes back as its checked frames, not gathered.
 #[test]
 fn a_scan_yields_every_class() -> crate::Result<()> {
     let dir = tempdir()?;
@@ -111,8 +111,13 @@ fn a_scan_yields_every_class() -> crate::Result<()> {
         "a head and its chunks"
     );
     assert_eq!(entries[3].frame_end, index[6] as u64, "past its last chunk");
-    assert_eq!(entries[3].value, Slice::from(chunked));
-    assert_eq!(entries[2].value, Slice::from(&[b'c'; 150][..]));
+    assert_eq!(entries[3].value, None, "a chunked value is not gathered");
+    assert_eq!(
+        entries[3].whole_value()?,
+        Slice::from(chunked),
+        "its frames hold it whole"
+    );
+    assert_eq!(entries[2].value, Some(Slice::from(&[b'c'; 150][..])));
     assert!(entries.iter().all(|e| !e.resynced && e.seqno == 7));
     Ok(())
 }

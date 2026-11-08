@@ -15,7 +15,7 @@ fn entry(
             offset: u64::from(frame),
             seqno: 0,
             uncompressed_len: 0,
-            value: UserValue::empty(),
+            value: Some(UserValue::empty()),
             // These fixtures use ordinal offsets (0, 1, 2, ...), not real byte
             // positions, so the frame ends one ordinal past its start, never
             // at the start itself, which would mislead any future test that

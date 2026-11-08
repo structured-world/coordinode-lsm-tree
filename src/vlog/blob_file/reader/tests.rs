@@ -207,6 +207,34 @@ fn chunks_must_be_the_heads() -> crate::Result<()> {
     Ok(())
 }
 
+/// A head's chunks are proven whole without gathering the value: all of them,
+/// in order, each the size its table gives it, and nothing less.
+#[test]
+fn chunks_are_checked_without_gathering_the_value() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let value = vec![9_u8; 700];
+    let (blob_file, handles) = write(&folder, CompressionType::None, &[(b"big", &value)])?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    let at = handles[0].frame;
+    let head = reader.read_frame(at, &mut 0)?;
+    let chunks = (at + 1..at + 4)
+        .map(|frame| reader.read_frame(frame, &mut 0).map(Box::new))
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    assert!(check_chunks(&head, &chunks).is_ok(), "the whole value");
+    assert!(
+        check_chunks(&head, &chunks[..2]).is_err(),
+        "a chunk missing"
+    );
+    let reversed: Vec<_> = chunks.iter().rev().cloned().collect();
+    assert!(
+        check_chunks(&head, &reversed).is_err(),
+        "the short last chunk first"
+    );
+    Ok(())
+}
+
 /// A copy takes a value with frames of its own as those frames, each one
 /// checked, and a value out of a block as the value; the bytes it reports
 /// read are what it read.

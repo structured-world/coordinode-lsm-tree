@@ -8655,10 +8655,10 @@ fn an_environmental_read_failure_never_becomes_a_lossy_blob_salvage() -> crate::
 
 /// Scans a blob file into its `(key, value)` records (Ok records only).
 fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    Ok(BlobScanner::new(path, &**fs, 0)?
+    BlobScanner::new(path, &**fs, 0)?
         .filter_map(Result::ok)
-        .map(|e| (e.key.to_vec(), e.value.to_vec()))
-        .collect())
+        .map(|e| Ok((e.key.to_vec(), e.whole_value()?.to_vec())))
+        .collect()
 }
 
 #[test]
@@ -9603,12 +9603,12 @@ fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::
     let keys: Vec<&[u8]> = salvaged.iter().map(|e| &*e.key).collect();
     assert_eq!(keys, [&b"a\x03"[..], b"a\x04", b"a\x05", b"b", b"c"]);
     assert_eq!(
-        &*salvaged[4].value,
+        &*salvaged[4].whole_value()?,
         &[8_u8; 600][..],
         "the chunked value whole"
     );
     for (src, dst) in entries[3..].iter().zip(&salvaged) {
-        assert_eq!(src.value, dst.value, "{:?}", src.key);
+        assert_eq!(src.whole_value()?, dst.whole_value()?, "{:?}", src.key);
         let mapped = report
             .remap
             .iter()
@@ -10224,7 +10224,8 @@ fn salvage_blob_file_recovers_a_dictionary_source_with_the_dictionary() -> crate
         .next()
         .expect("one salvaged record")?;
     assert_eq!(
-        &*salvaged.value, b"sample payload sample payload sample payload",
+        salvaged.value.as_deref(),
+        Some(&b"sample payload sample payload sample payload"[..]),
         "the salvaged record decodes to its original value under the dictionary",
     );
     Ok(())

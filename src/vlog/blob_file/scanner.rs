@@ -5,7 +5,7 @@
 use super::frame::{
     DecodedFrame, FRAME_HEADER_LEN, FRAME_MAGIC, FrameKind, decode_frame, parse_header,
 };
-use super::reader::assemble;
+use super::reader::check_chunks;
 use crate::fs::{Fs, FsOpenOptions};
 use crate::io::BufReader;
 #[cfg(not(feature = "std"))]
@@ -442,7 +442,7 @@ impl Scanner {
                         seqno: entry.seqno,
                         // A view into the frame: a block's values are taken
                         // together, as the scan yields them in a row.
-                        value,
+                        value: Some(value),
                         frame,
                         index,
                         offset,
@@ -488,14 +488,15 @@ impl Scanner {
                 let (Some(entry), Some(key)) = (decoded.list.first(), decoded.key(0)) else {
                     return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
                 };
-                let value = match assemble(&decoded, &parts, None) {
-                    Ok(value) => value,
-                    Err(e) => return Some(Err(e)),
-                };
+                // Proven whole without being gathered: every consumer copies
+                // the value as its stored frames.
+                if let Err(e) = check_chunks(&decoded, &parts) {
+                    return Some(Err(e));
+                }
                 self.pending.push_back(ScanEntry {
                     key: UserKey::from(key),
                     seqno: entry.seqno,
-                    value,
+                    value: None,
                     frame,
                     index: 0,
                     offset,
@@ -517,8 +518,10 @@ impl Scanner {
 pub(crate) struct ScanEntry {
     pub key: UserKey,
     pub seqno: SeqNo,
-    /// The value, decoded.
-    pub value: UserValue,
+    /// The value, decoded: a view into its frame. `None` for a chunked value,
+    /// whose frames, checked, are what every consumer copies: assembling it
+    /// would copy a value of up to the cap for nothing.
+    pub value: Option<UserValue>,
     /// The frame that holds the value (a chunked value's head).
     pub frame: u32,
     /// The value's place in its frame.
@@ -539,6 +542,38 @@ pub(crate) struct ScanEntry {
     /// single frame, or a head and its chunks): what a copy under the same
     /// codec writes as it is. `None` for a value that shares a block.
     pub frames: Option<Vec<Slice>>,
+}
+
+#[cfg(test)]
+impl ScanEntry {
+    /// The value whole: decoded, or, for a chunked value of an uncompressed
+    /// file, gathered out of its frames.
+    pub(crate) fn whole_value(&self) -> crate::Result<UserValue> {
+        if let Some(value) = &self.value {
+            return Ok(value.clone());
+        }
+        let decode = |bytes: &Slice| {
+            super::frame::decode_frame(
+                bytes,
+                crate::CompressionType::None,
+                #[cfg(zstd_any)]
+                None,
+                &mut 0,
+            )
+        };
+        let malformed = || crate::Error::InvalidHeader("Blob");
+        let (head, chunks) = self
+            .frames
+            .as_deref()
+            .and_then(<[Slice]>::split_first)
+            .ok_or_else(malformed)?;
+        let chunks = chunks
+            .iter()
+            .map(decode)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let refs: Vec<&super::frame::DecodedFrame> = chunks.iter().collect();
+        super::reader::assemble(&decode(head)?, &refs, None)
+    }
 }
 
 impl Iterator for Scanner {

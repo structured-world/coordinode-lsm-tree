@@ -3367,11 +3367,14 @@ pub(crate) fn salvage_blob_file_on(
                     // the salvaged file shares with its source; a value out of
                     // a block joins a block of the salvaged file. Its new place
                     // is what re-targets the handles into the source.
-                    let written = match &entry.frames {
-                        Some(frames) => {
+                    let written = match (&entry.frames, &entry.value) {
+                        (Some(frames), _) => {
                             writer.write_verbatim(&entry.key, frames, entry.uncompressed_len)
                         }
-                        None => writer.write(&entry.key, entry.seqno, &entry.value),
+                        (None, Some(value)) => writer.write(&entry.key, entry.seqno, value),
+                        // A scan yields a value either in a block, decoded, or
+                        // with frames of its own.
+                        (None, None) => Err(crate::Error::InvalidHeader("Blob")),
                     }
                     .map_err(output_failure)?;
                     remap.push((

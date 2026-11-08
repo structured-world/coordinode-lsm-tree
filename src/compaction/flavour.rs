@@ -1606,7 +1606,7 @@ impl CompactionFlavour for RelocatingCompaction {
                 // the debit stays spent for the write that follows.
                 let _ = self
                     .rate_limiter
-                    .request_interruptible(blob_entry.value.len() as u64, || {
+                    .request_interruptible(u64::from(blob_entry.uncompressed_len), || {
                         self.stop_signal.is_stopped()
                     });
 
@@ -1628,8 +1628,8 @@ impl CompactionFlavour for RelocatingCompaction {
                     .expect("relocated frame comes from a file being rewritten");
                 self.blob_writer.select_output(source_codec, class)?;
 
-                let new_indirection = match &blob_entry.frames {
-                    Some(frames) => {
+                let new_indirection = match (&blob_entry.frames, &blob_entry.value) {
+                    (Some(frames), _) => {
                         let copy = self.blob_writer.write_verbatim(
                             &item.key.user_key,
                             frames,
@@ -1640,11 +1640,13 @@ impl CompactionFlavour for RelocatingCompaction {
                         self.blob_carried += u64::from(copy.stored.bytes());
                         copy
                     }
-                    None => self.blob_writer.write(
-                        &item.key.user_key,
-                        item.key.seqno,
-                        &blob_entry.value,
-                    )?,
+                    (None, Some(value)) => {
+                        self.blob_writer
+                            .write(&item.key.user_key, item.key.seqno, value)?
+                    }
+                    // A scan yields a value either in a block, decoded, or
+                    // with frames of its own.
+                    (None, None) => return Err(crate::Error::InvalidHeader("Blob")),
                 };
                 debug_assert_eq!(
                     new_indirection.size, indirection.size,

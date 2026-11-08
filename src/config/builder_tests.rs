@@ -63,7 +63,7 @@ fn blob_chunk_size_keeps_a_value_s_frames_within_their_record() {
         + MAX_DECOMPRESSION_SIZE as u64
         + (FRAME_HEADER_LEN + ENTRY_HEADER_LEN + usize::from(u16::MAX) + 8) as u64;
     assert!(
-        most <= u64::from(u32::MAX),
+        u32::try_from(most).is_ok(),
         "a value at the cap takes {most} bytes at chunk size {}",
         sizes.chunk_size
     );
