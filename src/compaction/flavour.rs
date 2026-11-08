@@ -1427,7 +1427,8 @@ impl RelocatingCompaction {
                 // the file's order. Only the listing is rewritten; the payload
                 // is copied as stored.
                 let mut frames = frames.clone();
-                if let Some(first) = frames.first_mut() {
+                // The first frame lists the value: a single frame or a head.
+                for first in frames.iter_mut().take(1) {
                     *first = crate::vlog::blob_file::frame::with_entry_seqno(first, seqno)?;
                 }
                 let copy = self.blob_writer.write_verbatim(key, &frames, *value_len)?;

@@ -419,7 +419,7 @@ fn item_of(indirection: &BlobIndirection) -> InternalValue {
 /// reaches the head alone hands back no value for that path to read the
 /// chunks; a read shorter than the head's frame is refused.
 #[test]
-#[expect(clippy::expect_used, reason = "test code")]
+#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 fn a_batched_read_of_a_chunked_value_falls_back_to_its_own_path() -> crate::Result<()> {
     use crate::{AbstractTree, coding::Decode};
 

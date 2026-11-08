@@ -67,6 +67,17 @@ fn an_earlier_blob_layout_names_the_release_that_wrote_it() {
         !rendered.contains("run the offline converter"),
         "the converter does not rewrite blob files: {rendered}"
     );
+    // A table part of an earlier layout, which the converter does rewrite.
+    let table = crate::Error::UnsupportedFormat {
+        part: crate::FormatPart::Columnar,
+        found: None,
+        expected: 2,
+    }
+    .to_string();
+    assert!(
+        table.contains("unstamped") && table.contains("run the offline converter"),
+        "{table}"
+    );
 }
 
 /// Build a metadata block that is structurally valid but omits a required

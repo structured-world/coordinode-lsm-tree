@@ -8666,6 +8666,7 @@ fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec
 /// records around it.
 #[cfg(feature = "lz4")]
 #[test]
+#[expect(clippy::indexing_slicing, reason = "test code")]
 fn salvage_blob_file_drops_a_frame_that_does_not_decompress() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("blob_source");
@@ -8703,7 +8704,7 @@ fn salvage_blob_file_drops_a_frame_that_does_not_decompress() -> crate::Result<(
 
     let report = salvage_blob_file(
         &source,
-        dest.clone(),
+        dest,
         &fs,
         0,
         &default_comparator(),
