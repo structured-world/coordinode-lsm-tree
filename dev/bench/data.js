@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793783368756,
+  "lastUpdate": 1794161538660,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103054,6 +103054,90 @@ window.BENCHMARK_DATA = {
             "value": 344924.2286234844,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 12.4us | P99.9: 89.2us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1327f6baf1dfda6808fb324e6c012b970086ea51",
+          "message": "perf(memtable): leave a value segment's memory as it comes (#1059)\n\n## Summary\n\n- A memtable's value segment is allocated without zeroing: every slot is\ninitialised by its own write before anything reads or drops it, so\nclearing 2 MiB per segment was pure cost, paid whole when glibc hands a\nheap chunk back to a new memtable.\n- The one slot no write initialises, that of a write whose segment\nallocation failed and unwound, is covered: the segment is marked torn,\nand the write that allocates it later fills every slot with an empty\nvalue, which owns nothing under either value backend.\n- `AGENTS.md` holds the code review rules: correctness under every\nbuild, then hot-path performance, then size on disk.\n\n## Changes\n\n- `ValueStore::ensure_segment` tests the segment with one compare and\nallocates in a cold function, with `alloc` instead of `alloc_zeroed`;\nonly a torn segment is filled, with empty values (a zeroed `Bytes` of\nthe `bytes_1` backend is no value).\n- A failed segment allocation marks the segment torn in the pointer\ntable (an address no segment can have); a segment another write\ninstalled meanwhile is used as is. `Drop` skips null and torn segments.\n- Tests fail a segment allocation and cover both races around it: a\nsegment another write installed meanwhile, and a segment that turned\ntorn before the install; fresh segments are filled with a nonzero\npattern so an unwritten slot cannot pass as a value.\n- `AGENTS.md` states the priorities and what counts as a finding; the\nrules of the former Copilot instruction files move into it, and\nCodeRabbit reads its guidelines from it.\n\n## Measurement\n\n`benches/memtable.rs`, `memtable insert` (a fresh memtable filled with\nentries of 100 bytes), against `main` on one benchmark host, three\nalternating rounds, medians:\n\n| entries | this PR | `main` | change |\n|---|---|---|---|\n| 1 000 | 145.7 µs | 210.1 µs | −31% |\n| 100 000 | 26.46 ms | 26.21 ms | +1.0%, within the 2-4% spread between\nrounds |\n| 1 000 000 | 273.5 ms | 271.2 ms | +0.8%, within the 2-4% spread\nbetween rounds |\n\n## Testing\n\nFormatting, clippy in every CI configuration, nextest, doc tests, the\ndoc build and the no-std check run in CI on Linux, macOS and Windows.\n\nPart of #1031\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved reliability when memory allocation fails while storing\nvalues. Affected entries remain safe to read and clean up, and can be\ninitialized correctly if storage becomes available later.\n* Improved handling of concurrent writes that allocate the same storage\nsegment, preventing a failed allocation from interfering with a segment\nsuccessfully installed by another write.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-08T19:48:10+02:00",
+          "tree_id": "412f59eb48c39dc0aed9ebd95262d5fcac06f36f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1327f6baf1dfda6808fb324e6c012b970086ea51"
+        },
+        "date": 1794161537477,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 141719.27166537,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 17.1us | P99.9: 30.4us\nthreads: 1 | elapsed: 3.78s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2953397.7172066756,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 934040.4106418998,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.8us | P99.9: 11.0us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 510545.3186624256,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.6us | P99.9: 23.2us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3143090.4499711148,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 323564.62344693736,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.4us | P99.9: 16.8us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 193296.40303750528,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.7us | P99.9: 19.9us\nthreads: 1 | elapsed: 1.03s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 887491.6575229511,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.1us | P99.9: 11.2us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1041696.9084300396,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 361617.3102040563,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 11.7us | P99.9: 86.2us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
           }
         ]
       }
