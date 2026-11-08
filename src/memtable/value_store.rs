@@ -247,7 +247,7 @@ impl ValueStore {
         // as it comes: zeroing it cleared 2 MiB per segment, most of which a
         // small memtable never touches, and a heap chunk that glibc hands
         // back cleared it on every new memtable. Only a torn segment is
-        // zeroed, below.
+        // filled with empty values, below.
         #[expect(
             clippy::expect_used,
             reason = "Layout::array with compile-time-known size cannot fail"
@@ -279,8 +279,8 @@ impl ValueStore {
             // The failing write's slot stays unwritten, and an allocation
             // error handler may unwind (the default one does without `std`),
             // so its index is taken. Marking the segment torn makes the write
-            // that allocates it later zero it: a zeroed slot is an empty
-            // inline value, which `Drop` frees as nothing. A segment another
+            // that allocates it later fill every slot with an empty value,
+            // which `Drop` frees as nothing. A segment another
             // write allocated meanwhile holds the slot, to be written now.
             if let Err(actual) =
                 segment.compare_exchange(current, torn(), Ordering::AcqRel, Ordering::Acquire)
@@ -298,23 +298,28 @@ impl ValueStore {
             unsafe { ptr::write_bytes(raw.cast::<u8>(), 0xA5, layout.size()) };
         }
 
-        let mut zeroed = false;
+        let mut filled = false;
         loop {
-            if current == torn() && !zeroed {
-                // SAFETY: raw spans layout.size() bytes it owns alone, and a
-                // zeroed `UserValue` is the empty inline value.
-                unsafe { ptr::write_bytes(raw.cast::<u8>(), 0, layout.size()) };
-                zeroed = true;
+            if current == torn() && !filled {
+                // Every slot gets an empty value, not zeroed memory: a zeroed
+                // `Bytes` (the `bytes_1` backend) is no value at all.
+                for slot in 0..SEGMENT_SIZE {
+                    // SAFETY: slot < SEGMENT_SIZE lies in raw, which no other
+                    // thread can reach before the CAS below publishes it.
+                    unsafe { ptr::write(raw.add(slot), UserValue::empty()) };
+                }
+                filled = true;
             }
             match segment.compare_exchange(current, raw, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return,
                 Err(actual) if actual.addr() > TORN_ADDR => {
-                    // Lost the race: no slot of raw was written.
+                    // Lost the race: no write reached raw, and an empty value
+                    // owns nothing, so freeing it drops nothing.
                     // SAFETY: raw was just allocated with this layout.
                     unsafe { alloc::alloc::dealloc(raw.cast::<u8>(), layout) };
                     return;
                 }
-                // Null turned torn under us: zero raw and install it there.
+                // Null turned torn under us: fill raw and install it there.
                 Err(actual) => current = actual,
             }
         }
@@ -377,8 +382,9 @@ impl Drop for ValueStore {
                     // SAFETY: slots 0..count were initialised via ptr::write
                     // in write(), which every reserved slot gets before its
                     // insert can panic, except a slot whose segment failed to
-                    // allocate: that segment was zeroed when it was allocated
-                    // after all, and a zeroed slot is the empty inline value.
+                    // allocate: that segment was filled with empty values when
+                    // it was allocated after all. A write over an empty value
+                    // leaks nothing, as an empty value owns nothing.
                     // We're the only thread running (Drop is &mut).
                     unsafe {
                         ptr::drop_in_place(seg_ptr.add(i));
