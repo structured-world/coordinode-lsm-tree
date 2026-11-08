@@ -212,6 +212,274 @@ fn head_frame_names_its_chunk_table() {
     ));
 }
 
+/// A frame of `kind` over these entries and stored payload, its header CRC and
+/// checksum holding: what a damaged frame that still checks looks like.
+fn sealed(
+    kind: FrameKind,
+    count: u16,
+    flags: u8,
+    raw_len: u32,
+    entries: &[u8],
+    stored: &[u8],
+) -> Vec<u8> {
+    let entries_len = entries.len() as u32;
+    let disk_len = stored.len() as u32;
+    let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
+    let checksum = frame_checksum(entries, stored, crc);
+    let mut out = Vec::new();
+    out.extend_from_slice(&FRAME_MAGIC);
+    out.extend_from_slice(&[kind as u8, flags]);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&entries_len.to_le_bytes());
+    out.extend_from_slice(&raw_len.to_le_bytes());
+    out.extend_from_slice(&disk_len.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(entries);
+    out.extend_from_slice(stored);
+    out
+}
+
+/// One entry: its seqno, key length, value length and key.
+fn entry_bytes(key_len: u16, value_len: u32, key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&7_u64.to_le_bytes());
+    out.extend_from_slice(&key_len.to_le_bytes());
+    out.extend_from_slice(&value_len.to_le_bytes());
+    out.extend_from_slice(key);
+    out
+}
+
+/// Entries that disagree with the header, though checksummed, are damage: a
+/// count that leaves the entries too short, a key of no bytes or past the
+/// entries, bytes left past the listed entries, or entries that do not fit
+/// the header's length bounds at all.
+#[test]
+fn malformed_entries_are_refused() {
+    let malformed = |bytes: &[u8]| {
+        matches!(
+            decode(bytes, CompressionType::None),
+            Err(crate::Error::InvalidHeader("BlobFrame"))
+        )
+    };
+    let one = entry_bytes(1, 3, b"k");
+    let fill = |len: usize| vec![0xAB_u8; len];
+
+    // Two entries announced in the bytes two may take, the second cut short:
+    // a first entry with a long key leaves six bytes for the second.
+    let mut short = entry_bytes(10, 3, b"0123456789");
+    short.extend_from_slice(&fill(6));
+    assert!(malformed(&sealed(
+        FrameKind::Block,
+        2,
+        0,
+        3,
+        &short,
+        b"abc"
+    )));
+    // A key of no bytes, padded to the smallest entry the header allows.
+    let mut empty_key = entry_bytes(0, 3, b"");
+    empty_key.push(0);
+    assert!(malformed(&sealed(
+        FrameKind::Single,
+        1,
+        0,
+        3,
+        &empty_key,
+        b"abc"
+    )));
+    // A key running past the entries.
+    let past = entry_bytes(9, 3, b"k");
+    assert!(malformed(&sealed(
+        FrameKind::Single,
+        1,
+        0,
+        3,
+        &past,
+        b"abc"
+    )));
+    // A byte left past the one entry the header lists.
+    let mut trailing = one.clone();
+    trailing.push(0);
+    assert!(malformed(&sealed(
+        FrameKind::Single,
+        1,
+        0,
+        3,
+        &trailing,
+        b"abc"
+    )));
+    // Entries shorter than the one entry a single frame lists can take.
+    assert!(malformed(&sealed(
+        FrameKind::Single,
+        1,
+        0,
+        3,
+        &fill(4),
+        b"abc"
+    )));
+    // The frame cut short, and one byte longer than its header says.
+    let whole = sealed(FrameKind::Single, 1, 0, 3, &one, b"abc");
+    assert!(malformed(&whole[..FRAME_HEADER_LEN + 5]));
+    let mut longer = whole.clone();
+    longer.push(0);
+    assert!(malformed(&longer));
+    assert!(decode(&whole, CompressionType::None).is_ok());
+}
+
+/// A decoded frame whose list names more than its payload holds has no value
+/// there, and a head whose table is cut short has no chunk table: neither
+/// panics, both read as nothing.
+#[test]
+fn a_decoded_frame_inconsistent_with_its_payload_yields_nothing() {
+    let header = parse_header(&sealed(
+        FrameKind::Single,
+        1,
+        0,
+        3,
+        &entry_bytes(1, 3, b"k"),
+        b"abc",
+    ))
+    .unwrap();
+    let frame = DecodedFrame {
+        header,
+        entries: Slice::from(&b"k"[..]),
+        list: vec![FrameEntry {
+            seqno: 7,
+            key: 0..1,
+            value_len: 3,
+            value: 0..3,
+        }],
+        payload: Slice::from(&b"ab"[..]),
+    };
+    assert_eq!(frame.value(0), None, "a value past the payload");
+
+    let head_header = parse_header(&sealed(
+        FrameKind::Head,
+        1,
+        FLAG_RAW,
+        HEAD_PAYLOAD_LEN as u32,
+        &entry_bytes(1, 10, b"k"),
+        &head_payload(4, 3),
+    ))
+    .unwrap();
+    let head = DecodedFrame {
+        header: head_header,
+        payload: Slice::from(&head_payload(4, 3)[..4]),
+        ..frame
+    };
+    assert!(head.chunk_table().is_err(), "a table cut short");
+}
+
+/// Relisting a value at another seqno is for a frame listing one value of its
+/// own: a block, which lists many, is refused.
+#[test]
+fn only_a_frame_of_one_value_is_relisted() {
+    let mut out = Vec::new();
+    let entries = [
+        EntrySpec {
+            key: b"a",
+            seqno: 1,
+            value_len: 1,
+        },
+        EntrySpec {
+            key: b"b",
+            seqno: 1,
+            value_len: 1,
+        },
+    ];
+    encode_frame(FrameKind::Block, &entries, b"xy", plain(), &mut out).unwrap();
+    assert!(matches!(
+        with_entry_seqno(&Slice::from(out), 9),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+}
+
+/// The decompressor is never reached for a payload stored as it is; asked to
+/// decompress under no codec, it refuses rather than hand the bytes back.
+#[test]
+fn decompressing_under_no_codec_is_refused() {
+    assert!(matches!(
+        decompress(
+            b"abc",
+            3,
+            CompressionType::None,
+            #[cfg(zstd_any)]
+            None,
+            &mut 0,
+        ),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+}
+
+/// A payload that decompresses to another length than the header declares,
+/// or does not decompress at all, is damage under every codec, a dictionary
+/// one too; compressing under a dictionary of another id is refused.
+#[cfg(zstd_any)]
+#[test]
+fn a_payload_that_decodes_to_the_wrong_length_is_refused() {
+    use crate::compression::ZstdDictionary;
+
+    let payload = vec![b'z'; 4096];
+    let decode_as = |stored: &[u8], raw_len: usize, compression, dictionary| {
+        decompress(stored, raw_len, compression, dictionary, &mut 0)
+    };
+
+    let mut out = Vec::new();
+    let entry = EntrySpec {
+        key: b"k",
+        seqno: 1,
+        value_len: payload.len() as u32,
+    };
+    encode_frame(
+        FrameKind::Single,
+        &[entry],
+        &payload,
+        codec(CompressionType::Zstd(3)),
+        &mut out,
+    )
+    .unwrap();
+    let header = parse_header(&out).unwrap();
+    let stored = &out[FRAME_HEADER_LEN + header.entries_len as usize..];
+    assert!(matches!(
+        decode_as(stored, payload.len() + 1, CompressionType::Zstd(3), None),
+        Err(crate::Error::Decompress(_))
+    ));
+
+    let dict = ZstdDictionary::new(b"a dictionary of z bytes zzzzzzzzzzzzzzzz");
+    let with_dict = CompressionType::ZstdDict {
+        level: 3,
+        dict_id: dict.id(),
+    };
+    let dict_codec = Codec {
+        compression: with_dict,
+        dictionary: Some(&dict),
+        two_pass_seed: true,
+    };
+    encode_frame(FrameKind::Single, &[entry], &payload, dict_codec, &mut out).unwrap();
+    let header = parse_header(&out).unwrap();
+    let stored = out[FRAME_HEADER_LEN + header.entries_len as usize..].to_vec();
+    assert!(matches!(
+        decode_as(&stored, payload.len() + 1, with_dict, Some(&dict)),
+        Err(crate::Error::Decompress(_))
+    ));
+    assert!(matches!(
+        decode_as(b"not a zstd frame", payload.len(), with_dict, Some(&dict)),
+        Err(crate::Error::Decompress(_))
+    ));
+
+    let other = ZstdDictionary::new(b"another dictionary entirely, its id differs");
+    let mismatched = Codec {
+        compression: with_dict,
+        dictionary: Some(&other),
+        two_pass_seed: true,
+    };
+    assert!(matches!(
+        encode_frame(FrameKind::Single, &[entry], &payload, mismatched, &mut out),
+        Err(crate::Error::ZstdDictMismatch { got: Some(_), .. })
+    ));
+}
+
 /// A head naming a value above the size a value may take is malformed, though
 /// its table covers that value: a caller sizes its chunk list and its buffer
 /// from the table, and a tiny damaged file would otherwise ask for gigabytes.

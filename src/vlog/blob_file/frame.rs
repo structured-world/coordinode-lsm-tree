@@ -180,10 +180,12 @@ impl<'b> Put<'b> {
         Self { buf, at: 0 }
     }
 
+    /// Writes `field` next. Every buffer is sized for its fields, so the
+    /// fields always fit.
     fn bytes(&mut self, field: &[u8]) {
-        if let Some(slot) = self.buf.get_mut(self.at..self.at + field.len()) {
-            slot.copy_from_slice(field);
-        }
+        let (_, rest) = self.buf.split_at_mut(self.at);
+        let (slot, _) = rest.split_at_mut(field.len());
+        slot.copy_from_slice(field);
         self.at += field.len();
     }
 }
@@ -412,16 +414,17 @@ pub(crate) fn verify_frame(bytes: &[u8]) -> crate::Result<FrameHeader> {
 /// [`verify_frame`]'s checks, the entries parsed kept.
 fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, Vec<FrameEntry>)> {
     let header = parse_header(bytes)?;
-    if header.frame_len() != bytes.len() as u64 {
-        return Err(crate::Error::InvalidHeader("BlobFrame"));
-    }
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
+    // Whole: the entries, then exactly the stored payload the header names.
     let (Some(entries), Some(stored)) = (
         bytes.get(FRAME_HEADER_LEN..entries_end),
         bytes.get(entries_end..),
     ) else {
         return Err(crate::Error::InvalidHeader("BlobFrame"));
     };
+    if stored.len() != header.disk_len as usize {
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
     let checksum = frame_checksum(entries, stored, header.header_crc);
     if checksum != header.checksum {
         return Err(crate::Error::ChecksumMismatch {
@@ -706,9 +709,9 @@ pub(crate) fn encode_frame(
     put.bytes(&disk_len.to_le_bytes());
     put.bytes(&crc.to_le_bytes());
     put.bytes(&checksum.to_le_bytes());
-    if let Some(slot) = out.get_mut(..FRAME_HEADER_LEN) {
-        slot.copy_from_slice(&header);
-    }
+    // `out` was laid out with room for the header first.
+    let (slot, _) = out.split_at_mut(FRAME_HEADER_LEN);
+    slot.copy_from_slice(&header);
     Ok(())
 }
 
@@ -739,19 +742,17 @@ pub(crate) fn with_entry_seqno(frame: &Slice, seqno: SeqNo) -> crate::Result<Sli
     if listed == Some(seqno) {
         return Ok(frame.clone());
     }
+    // The lengths were checked above: the header, the entry's seqno, the
+    // entries and the payload all lie within `out`.
     let mut out = frame.to_vec();
-    if let Some(slot) = out.get_mut(FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8) {
-        slot.copy_from_slice(&seqno.to_le_bytes());
-    }
-    let checksum = frame_checksum(
-        out.get(FRAME_HEADER_LEN..entries_end).unwrap_or_default(),
-        out.get(entries_end..frame_end).unwrap_or_default(),
-        header.header_crc,
-    );
+    let (head, entries_and_payload) = out.split_at_mut(FRAME_HEADER_LEN);
+    let (listed_seqno, _) = entries_and_payload.split_at_mut(8);
+    listed_seqno.copy_from_slice(&seqno.to_le_bytes());
+    let (entries, payload) = entries_and_payload.split_at(entries_end - FRAME_HEADER_LEN);
+    let checksum = frame_checksum(entries, payload, header.header_crc);
     // The checksum is the header's last field.
-    if let Some(slot) = out.get_mut(FRAME_HEADER_LEN - 16..FRAME_HEADER_LEN) {
-        slot.copy_from_slice(&checksum.to_le_bytes());
-    }
+    let (_, stored_checksum) = head.split_at_mut(FRAME_HEADER_LEN - 16);
+    stored_checksum.copy_from_slice(&checksum.to_le_bytes());
     Ok(Slice::from(out))
 }
 
