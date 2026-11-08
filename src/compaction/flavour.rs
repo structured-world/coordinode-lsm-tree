@@ -1421,7 +1421,16 @@ impl RelocatingCompaction {
         )?;
         let copy = match &source {
             crate::vlog::blob_file::reader::CopySource::Frames { frames, value_len } => {
-                let copy = self.blob_writer.write_verbatim(key, frames, *value_len)?;
+                // A row's objects may have been written at older sequence
+                // numbers than the row (one it borrows), and its copies follow
+                // one another at its key: listed at the row's own, they keep
+                // the file's order. Only the listing is rewritten; the payload
+                // is copied as stored.
+                let mut frames = frames.clone();
+                if let Some(first) = frames.first_mut() {
+                    *first = crate::vlog::blob_file::frame::with_entry_seqno(first, seqno)?;
+                }
+                let copy = self.blob_writer.write_verbatim(key, &frames, *value_len)?;
                 // A verbatim copy is frames of its own, its bytes exact.
                 self.blob_carried += u64::from(copy.stored.bytes());
                 copy

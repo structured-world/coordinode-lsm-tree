@@ -428,6 +428,41 @@ fn a_damaged_seqno_fails_the_checksum() {
     ));
 }
 
+/// A frame relisted at another sequence number reads back at it, its value
+/// and checksum intact, with the payload bytes as they were stored.
+#[test]
+fn a_frame_relisted_at_another_seqno_reads_back_at_it() {
+    let entry = EntrySpec {
+        key: b"doc",
+        seqno: 1,
+        value_len: 5,
+    };
+    let mut out = Vec::new();
+    encode_frame(FrameKind::Single, &[entry], b"value", plain(), &mut out).unwrap();
+
+    let relisted = with_entry_seqno(&Slice::from(&out[..]), 10).unwrap();
+    let frame = decode(&relisted, CompressionType::None).unwrap();
+    assert_eq!(frame.list[0].seqno, 10);
+    assert_eq!(frame.key(0), Some(&b"doc"[..]));
+    assert_eq!(frame.value(0).as_deref(), Some(&b"value"[..]));
+    let payload_at = FRAME_HEADER_LEN + frame.header.entries_len as usize;
+    assert_eq!(
+        relisted[payload_at..],
+        out[payload_at..],
+        "the payload as stored"
+    );
+}
+
+/// Only a frame listing one value of its own is relisted: a block's values
+/// keep the sequence numbers they were written at.
+#[test]
+fn a_block_is_not_relisted() {
+    assert!(matches!(
+        with_entry_seqno(&Slice::from(&sample_block()[..]), 10),
+        Err(crate::Error::InvalidHeader(_))
+    ));
+}
+
 /// The codec-free check proves what decoding proves short of decompression:
 /// it passes a frame as stored, compressed or not, and refuses the damage
 /// decoding refuses.

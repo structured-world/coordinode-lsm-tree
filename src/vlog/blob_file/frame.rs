@@ -703,6 +703,49 @@ pub(crate) fn encode_frame(
     Ok(())
 }
 
+/// `frame`, a single or head frame listing one value, with that value listed
+/// at `seqno`: its entry rewritten and its checksum recomputed over the same
+/// stored payload, which is not decoded or compressed again. A frame listed
+/// at `seqno` already is handed back as it is, without a copy.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] when `frame` is not one whole frame listing
+/// a single value; the header errors of [`parse_header`].
+pub(crate) fn with_entry_seqno(frame: &Slice, seqno: SeqNo) -> crate::Result<Slice> {
+    let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    let header = parse_header(frame)?;
+    if header.count != 1 || !matches!(header.kind, FrameKind::Single | FrameKind::Head) {
+        return Err(malformed());
+    }
+    let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
+    let frame_end = entries_end + header.disk_len as usize;
+    if frame.len() != frame_end || entries_end < FRAME_HEADER_LEN + ENTRY_HEADER_LEN {
+        return Err(malformed());
+    }
+    let listed = frame
+        .get(FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8)
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        .map(SeqNo::from_le_bytes);
+    if listed == Some(seqno) {
+        return Ok(frame.clone());
+    }
+    let mut out = frame.to_vec();
+    if let Some(slot) = out.get_mut(FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8) {
+        slot.copy_from_slice(&seqno.to_le_bytes());
+    }
+    let checksum = frame_checksum(
+        out.get(FRAME_HEADER_LEN..entries_end).unwrap_or_default(),
+        out.get(entries_end..frame_end).unwrap_or_default(),
+        header.header_crc,
+    );
+    // The checksum is the header's last field.
+    if let Some(slot) = out.get_mut(FRAME_HEADER_LEN - 16..FRAME_HEADER_LEN) {
+        slot.copy_from_slice(&checksum.to_le_bytes());
+    }
+    Ok(Slice::from(out))
+}
+
 /// The payload of a head naming chunks of `chunk_size` bytes, `chunks` of them.
 #[must_use]
 pub(crate) fn head_payload(chunk_size: u32, chunks: u32) -> [u8; HEAD_PAYLOAD_LEN] {
