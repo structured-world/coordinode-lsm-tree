@@ -200,10 +200,13 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
         )])),
     );
 
+    let held = Arc::new(core::sync::atomic::AtomicUsize::new(0));
     let damaged = |value_type| InternalValue::from_components("k", vec![0xff_u8; 3], 0, value_type);
     for value_type in [crate::ValueType::Indirection, crate::ValueType::CellRow] {
         assert!(
-            take_prefetched(&store, &damaged(value_type)).is_empty(),
+            take_prefetched(&store, &held, &damaged(value_type))
+                .0
+                .is_empty(),
             "{value_type:?} that does not decode takes nothing"
         );
     }
@@ -215,12 +218,18 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
         0,
         crate::ValueType::Indirection,
     );
-    let taken = take_prefetched(&store, &row);
+    let (taken, charge) = take_prefetched(&store, &held, &row);
     let [(handle, value)] = taken.as_slice() else {
         panic!("one value taken, got {}", taken.len());
     };
     assert_eq!(*handle, vhandle);
     assert_eq!(&**value, b"value");
+    assert_eq!(
+        held.load(core::sync::atomic::Ordering::Relaxed),
+        b"value".len(),
+        "the value's frame is charged"
+    );
+    drop(charge);
 
     // The frame lists its key: a row of another key naming the same place
     // takes nothing out of it.
@@ -230,7 +239,7 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
         0,
         crate::ValueType::Indirection,
     );
-    assert_eq!(take_prefetched(&store, &other), Vec::new());
+    assert_eq!(take_prefetched(&store, &held, &other).0, Vec::new());
 }
 
 /// A scan that does not cache hands each guard the values read ahead for it.
@@ -278,6 +287,61 @@ fn guards_kept_unresolved_hold_no_more_than_the_read_ahead_bound() -> crate::Res
     assert!(
         read_ahead < 3 * PREFETCH_MAX_READ as u64,
         "{read_ahead} bytes read ahead into guards nobody resolved, of {} in the scan",
+        u64::from(KEYS) * VALUE as u64,
+    );
+    for guard in kept {
+        assert_eq!(guard.into_inner()?.1.len(), VALUE);
+    }
+    Ok(())
+}
+
+/// A value taken out of a shared block keeps the whole block: a caller keeping
+/// one guard per block pins a block's bytes for each, and the bound counts
+/// those, not the values. Counted by the values, keeping every block's first
+/// guard read the whole value log ahead into blocks nobody resolved.
+#[cfg(feature = "metrics")]
+#[test]
+fn guards_kept_one_per_block_hold_no_more_than_the_read_ahead_bound() -> crate::Result<()> {
+    use crate::{AbstractTree, Guard as _};
+
+    const KEYS: u32 = 32 * 1_024;
+    const VALUE: usize = 1_024;
+    /// Fewer values than a 16 KiB block holds, so a kept guard per stride
+    /// lands in a block of its own most of the time.
+    const STRIDE: usize = 14;
+
+    let folder = crate::get_tmp_folder();
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(512),
+    ))
+    .blob_compression(crate::CompressionType::None)
+    .blob_cache_fill(crate::config::BlobCacheFill::Never)
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    for i in 0..KEYS {
+        tree.insert(format!("k{i:06}"), vec![b'v'; VALUE], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let mut iter = tree.iter(crate::SeqNo::MAX, None);
+    let Some(first) = iter.next() else {
+        panic!("the scan yields a row");
+    };
+    assert_eq!(first.into_inner()?.1.len(), VALUE);
+    let before = tree.metrics().blob_bytes_prefetched();
+    let kept: Vec<_> = iter.step_by(STRIDE).collect();
+    let read_ahead = tree.metrics().blob_bytes_prefetched() - before;
+    assert!(
+        read_ahead < 3 * PREFETCH_MAX_READ as u64,
+        "{read_ahead} bytes read ahead into blocks {} guards keep, of {} in the scan",
+        kept.len(),
         u64::from(KEYS) * VALUE as u64,
     );
     for guard in kept {

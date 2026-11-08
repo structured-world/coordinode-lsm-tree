@@ -29,18 +29,54 @@ use core::ops::Range;
 /// taken out of one only for the key its frame lists at the handle's index.
 #[derive(Default)]
 pub(crate) struct Prefetched {
-    frames: crate::HashMap<BlobFrameAt, Arc<DecodedFrame>>,
+    frames: crate::HashMap<BlobFrameAt, HeldFrame>,
+}
+
+/// A frame read ahead, with the charge that counts its payload against the
+/// read-ahead bound from the first value taken out of it.
+struct HeldFrame {
+    frame: Arc<DecodedFrame>,
+    charge: core::cell::OnceCell<Arc<FrameCharge>>,
 }
 
 impl Prefetched {
     /// The value read ahead for `vhandle` under `key`, if its frame was: a
-    /// view into the frame, which stays for the other values it holds.
+    /// view into the frame, which keeps the frame's whole payload.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(
+            dead_code,
+            reason = "a batched object read is its only uncharged reader"
+        )
+    )]
     pub(crate) fn get(&self, key: &[u8], vhandle: &ValueHandle) -> Option<UserValue> {
-        let frame = self.frames.get(&vhandle.frame_at())?;
-        if frame.header.kind == FrameKind::Head {
-            return None;
-        }
-        value_in(frame, vhandle.index, key).ok()
+        self.frame_for(vhandle)
+            .and_then(|held| value_in(&held.frame, vhandle.index, key).ok())
+    }
+
+    /// [`Self::get`], with the charge for the payload the value keeps: made
+    /// by `charge` from the payload's bytes the first time a value is taken
+    /// out of the frame, and shared by every later one.
+    pub(crate) fn get_charged(
+        &self,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        charge: impl FnOnce(usize) -> FrameCharge,
+    ) -> Option<(UserValue, Arc<FrameCharge>)> {
+        let held = self.frame_for(vhandle)?;
+        let value = value_in(&held.frame, vhandle.index, key).ok()?;
+        let charge = held
+            .charge
+            .get_or_init(|| Arc::new(charge(held.frame.payload.len())));
+        Some((value, Arc::clone(charge)))
+    }
+
+    /// The frame `vhandle` names a value of, unless it is a chunked value's
+    /// head, which holds none.
+    fn frame_for(&self, vhandle: &ValueHandle) -> Option<&HeldFrame> {
+        self.frames
+            .get(&vhandle.frame_at())
+            .filter(|held| held.frame.header.kind != FrameKind::Head)
     }
 
     /// Whether it holds nothing.
@@ -65,7 +101,43 @@ impl Prefetched {
     /// Holds `frame` as read ahead at `at`.
     #[cfg(test)]
     pub(crate) fn hold(&mut self, at: BlobFrameAt, frame: Arc<DecodedFrame>) {
-        self.frames.insert(at, frame);
+        self.frames.insert(at, HeldFrame::new(frame));
+    }
+}
+
+impl HeldFrame {
+    fn new(frame: Arc<DecodedFrame>) -> Self {
+        Self {
+            frame,
+            charge: core::cell::OnceCell::new(),
+        }
+    }
+}
+
+/// Bytes of a frame read ahead counted against a scan's read-ahead bound,
+/// held by the scan's store and by each guard holding a value out of the
+/// frame, and released with the last of them: a value is a view into its
+/// frame, so what a kept guard pins is the frame, not its value.
+pub(crate) struct FrameCharge {
+    held: Arc<core::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
+
+impl FrameCharge {
+    /// Adds `bytes` to `held` until the charge is dropped.
+    pub(crate) fn new(held: &Arc<core::sync::atomic::AtomicUsize>, bytes: usize) -> Self {
+        held.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+        Self {
+            held: Arc::clone(held),
+            bytes,
+        }
+    }
+}
+
+impl Drop for FrameCharge {
+    fn drop(&mut self) {
+        self.held
+            .fetch_sub(self.bytes, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -674,7 +746,7 @@ impl<'a> Accessor<'a> {
             match into {
                 PrefetchInto::Cache => cache.insert_blob_frame(tree_id, at, frame),
                 PrefetchInto::Local(store) => {
-                    store.frames.insert(at, frame);
+                    store.frames.insert(at, HeldFrame::new(frame));
                 }
             }
         }

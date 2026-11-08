@@ -47,24 +47,20 @@ pub struct Guard {
     /// Present when this guard came from a scan that can read ahead; resolving
     /// a value through it is what arms that read-ahead.
     prefetch: Option<Arc<ScanPrefetch>>,
-    /// Counts `prefetched` against its scan's read-ahead bound until this
-    /// guard is resolved or dropped: held for its drop alone.
-    _held: Option<HeldReadAhead>,
+    /// Counts the frames `prefetched` lies in against its scan's read-ahead
+    /// bound until this guard is resolved or dropped: held for its drop alone.
+    _held: HeldFrames,
 }
 
-/// Bytes of read-ahead values a guard holds, released with the guard: what
+/// The charges for the frames read ahead that a guard's values keep: what
 /// lets a scan see that the guards it handed out still hold a read's worth.
-struct HeldReadAhead {
-    state: Arc<ScanPrefetch>,
-    bytes: usize,
-}
-
-impl Drop for HeldReadAhead {
-    fn drop(&mut self) {
-        self.state
-            .held
-            .fetch_sub(self.bytes, core::sync::atomic::Ordering::Relaxed);
-    }
+#[expect(dead_code, reason = "the charges are held for their drop alone")]
+enum HeldFrames {
+    None,
+    /// An indirection's value, in one frame: no allocation per guard.
+    One(Arc<crate::vlog::FrameCharge>),
+    /// A cell row's objects, one charge per object.
+    Many(Vec<Arc<crate::vlog::FrameCharge>>),
 }
 
 impl IterGuard for Guard {
@@ -1330,7 +1326,7 @@ impl BlobTree {
 
         Arc::new(ScanPrefetch {
             resolving: core::sync::atomic::AtomicBool::new(false),
-            held: core::sync::atomic::AtomicUsize::new(0),
+            held: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
             fill,
             window,
             max_gap: PREFETCH_MAX_GAP,
@@ -1340,36 +1336,40 @@ impl BlobTree {
 }
 
 /// The values `kv` reads from blob files that a scan read ahead into `local`,
-/// for `kv`'s guard: its own value, or its cells' objects.
+/// for `kv`'s guard: its own value, or its cells' objects, with the charges,
+/// counted on `held`, for the frames they keep.
 fn take_prefetched(
     local: &crate::vlog::Prefetched,
+    held: &Arc<core::sync::atomic::AtomicUsize>,
     kv: &InternalValue,
-) -> Vec<(crate::vlog::ValueHandle, UserValue)> {
+) -> (Vec<(crate::vlog::ValueHandle, UserValue)>, HeldFrames) {
     let key = &kv.key.user_key;
+    let charge = |bytes| crate::vlog::FrameCharge::new(held, bytes);
     if kv.key.value_type.is_cell_row() {
         let Ok(refs) = field_row::row_refs(&kv.value) else {
-            return Vec::new();
+            return (Vec::new(), HeldFrames::None);
         };
-        return refs
+        let (values, charges): (Vec<_>, Vec<_>) = refs
             .into_iter()
             .filter_map(|(vptr, _)| {
                 local
-                    .get(key, &vptr.vhandle)
-                    .map(|value| (vptr.vhandle, value))
+                    .get_charged(key, &vptr.vhandle, charge)
+                    .map(|(value, charge)| ((vptr.vhandle, value), charge))
             })
-            .collect();
+            .unzip();
+        return (values, HeldFrames::Many(charges));
     }
     if !kv.key.value_type.is_indirection() {
-        return Vec::new();
+        return (Vec::new(), HeldFrames::None);
     }
     let mut cursor = crate::io::Cursor::new(&kv.value[..]);
     let Ok(vptr) = BlobIndirection::decode_from(&mut cursor) else {
-        return Vec::new();
+        return (Vec::new(), HeldFrames::None);
     };
-    local
-        .get(key, &vptr.vhandle)
-        .map(|value| alloc::vec![(vptr.vhandle, value)])
-        .unwrap_or_default()
+    match local.get_charged(key, &vptr.vhandle, charge) {
+        Some((value, charge)) => (alloc::vec![(vptr.vhandle, value)], HeldFrames::One(charge)),
+        None => (Vec::new(), HeldFrames::None),
+    }
 }
 
 /// Maps a raw merge-pipeline item into a KV-separated iterator guard that
@@ -1387,7 +1387,7 @@ fn blob_guard(
         prefetched: Vec::new(),
         kv: item,
         prefetch: None,
-        _held: None,
+        _held: HeldFrames::None,
     })
 }
 
@@ -1403,10 +1403,11 @@ fn blob_guard(
 /// for the first.
 pub(crate) struct ScanPrefetch {
     resolving: core::sync::atomic::AtomicBool,
-    /// Bytes of values read ahead into the scan's own store that guards it
-    /// handed out still hold, unresolved. Within two reads, so a `usize`
-    /// holds it on every target, 32-bit ones without 64-bit atomics too.
-    held: core::sync::atomic::AtomicUsize,
+    /// Bytes of the frames read ahead into the scan's own store that a value
+    /// was taken out of, while the store or a guard it handed out, unresolved,
+    /// keeps them. Within two reads, so a `usize` holds it on every target,
+    /// 32-bit ones without 64-bit atomics too.
+    held: Arc<core::sync::atomic::AtomicUsize>,
     /// Whether the scan caches the values it reads, as the tree said when the
     /// scan began; when it does not, it keeps what it reads ahead itself.
     fill: crate::config::BlobCacheFill,
@@ -1545,20 +1546,10 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
     }
 
     fn guard(&self, item: crate::Result<InternalValue>) -> IterGuardImpl {
-        let prefetched = match &item {
-            Ok(kv) if !self.local.is_empty() => take_prefetched(&self.local, kv),
-            _ => Vec::new(),
+        let (prefetched, held) = match &item {
+            Ok(kv) if !self.local.is_empty() => take_prefetched(&self.local, &self.state.held, kv),
+            _ => (Vec::new(), HeldFrames::None),
         };
-        let held = (!prefetched.is_empty()).then(|| {
-            let bytes = prefetched.iter().map(|(_, value)| value.len()).sum();
-            self.state
-                .held
-                .fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
-            HeldReadAhead {
-                state: Arc::clone(&self.state),
-                bytes,
-            }
-        });
         IterGuardImpl::Blob(Guard {
             tree: self.tree.clone(),
             version: self.version.clone(),
