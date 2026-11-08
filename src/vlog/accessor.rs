@@ -456,12 +456,10 @@ impl<'a> Accessor<'a> {
         let mut prev = None;
         for item in items.iter() {
             let at = key(item);
-            if prev == Some(at) {
-                if let Some(last) = shared.last_mut() {
-                    *last = true;
-                }
-            } else {
-                shared.push(false);
+            // A frame seen before was pushed when it was first seen.
+            match shared.last_mut() {
+                Some(last) if prev == Some(at) => *last = true,
+                _ => shared.push(false),
             }
             prev = Some(at);
         }
