@@ -739,6 +739,15 @@ fn a_relocated_row_writes_its_copies_under_its_own_seqno() -> lsm_tree::Result<(
         Some(&framed(&[b"final", &body, &notes])[..])
     );
 
+    // The files a relocation superseded are removed in the background; an
+    // open removes whatever is left of them, so the folder lists live files
+    // alone.
+    drop(tree);
+    drop(open(
+        folder.path(),
+        KvSeparationOptions::default().age_cutoff(1.0),
+    )?);
+
     let comparator: lsm_tree::SharedComparator = Arc::new(lsm_tree::DefaultUserComparator);
     let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::StdFs);
     let blobs = folder.path().join(lsm_tree::file::BLOBS_FOLDER);
