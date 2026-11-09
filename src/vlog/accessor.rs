@@ -395,7 +395,11 @@ impl<'a> Accessor<'a> {
             chunks.push(self.frame(tree_id, blob_file, frame, cache)?);
         }
         let value = assemble(&first, &chunks, Some(&range))?;
-        self.count_gather(value.len());
+        // A range within one chunk is a view into it: only a range across
+        // chunks is gathered into a buffer of its own.
+        if chunks.len() > 1 {
+            self.count_gather(value.len());
+        }
         Ok(Some(value))
     }
 

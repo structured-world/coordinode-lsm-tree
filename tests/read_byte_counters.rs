@@ -616,6 +616,59 @@ fn a_blob_admitted_to_the_blob_cache_copies_nothing() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn a_range_within_one_chunk_copies_nothing() -> lsm_tree::Result<()> {
+    // A range of a chunked value within one chunk is a view into that chunk,
+    // so it copies nothing; a range across two chunks gathers them into a
+    // buffer of its own and copies exactly what it returns.
+    const CHUNK: u64 = 16 * 1_024;
+    let folder = get_tmp_folder();
+    let AnyTree::Blob(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(CompressionType::None)
+    .with_kv_separation(Some(
+        lsm_tree::KvSeparationOptions::default()
+            .separation_threshold(1)
+            .chunk_size(core::num::NonZeroU32::new(CHUNK as u32).expect("non-zero")),
+    ))
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    tree.insert("big", vec![7_u8; 4 * CHUNK as usize], 0);
+    tree.flush_active_memtable(0)?;
+    let m = tree.metrics();
+    // The key's first lookup reads its table cold; only the ranges are
+    // measured.
+    tree.get_range("big", 0..1, SeqNo::MAX)?.expect("present");
+
+    let before = m.bytes_copied();
+    let within = tree
+        .get_range("big", CHUNK + 10..CHUNK + 4_106, SeqNo::MAX)?
+        .expect("present");
+    assert_eq!(within.len(), 4_096);
+    assert_eq!(
+        m.bytes_copied(),
+        before,
+        "a range within one chunk is a view"
+    );
+
+    let before = m.bytes_copied();
+    let across = tree
+        .get_range("big", CHUNK - 100..CHUNK + 100, SeqNo::MAX)?
+        .expect("present");
+    assert_eq!(across.len(), 200);
+    assert_eq!(
+        m.bytes_copied() - before,
+        200,
+        "a range across two chunks copies what it returns"
+    );
+    Ok(())
+}
+
+#[test]
 #[cfg(feature = "lz4")]
 fn a_compressed_blob_prefetch_copies_only_its_entries() -> lsm_tree::Result<()> {
     // A scan's read-ahead caches each frame it decodes out of its coalesced
