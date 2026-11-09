@@ -575,7 +575,17 @@ pub(crate) fn read_frame_index<F: Read + Seek>(
     (pos, len): (u64, u64),
     data: core::ops::Range<u64>,
 ) -> crate::Result<Option<Arc<[u64]>>> {
-    let Ok(len) = usize::try_from(len) else {
+    // The index lies within the file: a length past it is damage, refused
+    // before a buffer is sized from it.
+    let file_len = match file.seek(SeekFrom::End(0)) {
+        Ok(file_len) => file_len,
+        Err(e) => return environmental_or_none(e),
+    };
+    let Some(len) = pos
+        .checked_add(len)
+        .filter(|&end| end <= file_len)
+        .and_then(|_| usize::try_from(len).ok())
+    else {
         return Ok(None);
     };
     let mut bytes = alloc::vec![0_u8; len];
@@ -583,12 +593,7 @@ pub(crate) fn read_frame_index<F: Read + Seek>(
         .seek(SeekFrom::Start(pos))
         .and_then(|_| file.read_exact(&mut bytes));
     if let Err(e) = read {
-        let e = crate::Error::from(e);
-        return if e.is_environmental() {
-            Err(e)
-        } else {
-            Ok(None)
-        };
+        return environmental_or_none(e);
     }
     let Ok(frames) = super::writer::decode_frame_index(&bytes) else {
         return Ok(None);
@@ -596,6 +601,20 @@ pub(crate) fn read_frame_index<F: Read + Seek>(
     let fits = frames.first().is_some_and(|&first| first >= data.start)
         && frames.last() == Some(&data.end);
     Ok(fits.then_some(frames))
+}
+
+/// A failure reading the frame index: returned when environmental, so the
+/// caller retries, else taken as damage and answered with the chain.
+fn environmental_or_none<T, E>(e: E) -> crate::Result<Option<T>>
+where
+    crate::Error: From<E>,
+{
+    let e = crate::Error::from(e);
+    if e.is_environmental() {
+        Err(e)
+    } else {
+        Ok(None)
+    }
 }
 
 /// One value a scan reads.

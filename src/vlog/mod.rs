@@ -458,6 +458,13 @@ pub(crate) fn read_meta_and_frames(
         log::error!("frames section in blob file #{id} is missing (file may be corrupted)");
         return Err(crate::Error::Unrecoverable);
     };
+    // The index lies within the file: a length past it is damage, refused
+    // before a buffer is sized from it.
+    let file_len = file.metadata()?.len;
+    if pos.checked_add(len).is_none_or(|end| end > file_len) {
+        log::error!("frames section in blob file #{id} runs past the file (file may be corrupted)");
+        return Err(crate::Error::Unrecoverable);
+    }
     let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
     let frames =
         blob_file::writer::decode_frame_index(&crate::file::read_exact(&**file, pos, len)?)?;

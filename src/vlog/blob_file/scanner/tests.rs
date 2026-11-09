@@ -205,9 +205,14 @@ fn an_environmental_index_read_failure_is_returned_not_walked_around() -> crate:
             Err(self.0.into())
         }
     }
+    // Seeks succeed and the file is long enough to hold the index: only its
+    // reads fail.
     impl Seek for Failing {
-        fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
-            Ok(0)
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            Ok(match to {
+                SeekFrom::End(_) => 1 << 20,
+                _ => 0,
+            })
         }
     }
 
@@ -227,8 +232,19 @@ fn an_environmental_index_read_failure_is_returned_not_walked_around() -> crate:
         Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::PermissionDenied
     ));
     assert!(
-        read_frame_index(&mut Failing(std::io::ErrorKind::InvalidData), at, data)?.is_none(),
+        read_frame_index(
+            &mut Failing(std::io::ErrorKind::InvalidData),
+            at,
+            data.clone()
+        )?
+        .is_none(),
         "a read the bytes fail walks the chain"
+    );
+    // An index named as running past the file is damage, refused before
+    // anything is sized from the length it names.
+    assert!(
+        read_frame_index(&mut file, (pos as u64, u64::MAX / 2), data)?.is_none(),
+        "an index past the file walks the chain"
     );
     Ok(())
 }

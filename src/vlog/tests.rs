@@ -141,6 +141,25 @@ fn a_blob_file_missing_a_section_is_unrecoverable() -> crate::Result<()> {
     Ok(())
 }
 
+/// A frame index the table of contents says runs past the file is damage the
+/// open reports, before anything is sized from the length it names.
+#[test]
+fn a_frame_index_running_past_the_file_is_unrecoverable() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"key", 0, b"value")?;
+    writer.finish()?;
+    crate::test_forge::forge_section_len(&path, b"frames", u64::MAX / 2)?;
+
+    let mut file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    assert!(matches!(
+        read_meta_and_frames(&mut file, 7),
+        Err(crate::Error::Unrecoverable)
+    ));
+    Ok(())
+}
+
 /// The views a tight-space relocation restricts a blob file to one after
 /// another punch only above what the view before finished, from the aligned
 /// edge under it, instead of the whole relocated prefix on every slice.
