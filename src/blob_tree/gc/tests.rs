@@ -57,6 +57,53 @@ fn frag_map_roundtrip() {
     assert_eq!(map, decoded);
 }
 
+/// Statistics written by the earlier layout, whose entries lack the block
+/// bytes, are a format this release does not read: they are refused as such,
+/// so an open reports the store's format instead of reaching a repair over a
+/// read that ran out. Bytes that are neither layout's whole are damage.
+#[test]
+fn statistics_of_the_earlier_layout_are_refused_as_a_format() {
+    use crate::vlog::blob_file::meta::META_VERSION;
+
+    // The earlier entry: id, count, bytes and frame bytes.
+    let mut earlier = 2_u32.to_le_bytes().to_vec();
+    for id in [3_u64, 9] {
+        earlier.extend_from_slice(&id.to_le_bytes());
+        earlier.extend_from_slice(&4_u32.to_le_bytes());
+        earlier.extend_from_slice(&400_u64.to_le_bytes());
+        earlier.extend_from_slice(&200_u64.to_le_bytes());
+    }
+    assert!(matches!(
+        FragmentationMap::decode_whole(&earlier),
+        Err(crate::Error::UnsupportedFormat {
+            part: crate::FormatPart::BlobFiles,
+            found: Some(found),
+            expected: META_VERSION,
+        }) if found == META_VERSION - 1
+    ));
+
+    let map = FragmentationMap({
+        let mut map = HashMap::default();
+        map.insert(3, FragmentationEntry::new(4, 400, 200).with_block_bytes(9));
+        map
+    });
+    let mut current = map.encode_into_vec();
+    assert_eq!(FragmentationMap::decode_whole(&current).ok(), Some(map));
+    assert_eq!(
+        FragmentationMap::decode_whole(&2_u32.to_le_bytes()).ok(),
+        None,
+        "a count with no entries is damage"
+    );
+    current.push(0);
+    assert!(
+        matches!(
+            FragmentationMap::decode_whole(&current),
+            Err(crate::Error::InvalidHeader("BlobGcStats"))
+        ),
+        "a byte past the entries is damage"
+    );
+}
+
 #[test]
 #[expect(clippy::unwrap_used)]
 fn compaction_stream_gc_count_drops() -> crate::Result<()> {

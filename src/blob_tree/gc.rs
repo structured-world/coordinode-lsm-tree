@@ -166,6 +166,40 @@ impl crate::coding::Decode for FragmentationMap {
 }
 
 impl FragmentationMap {
+    /// Decodes a manifest's statistics, `bytes` being all of them: a snapshot
+    /// section or an edit's field, each checksummed whole.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::UnsupportedFormat`] for statistics of the earlier
+    /// layout, whose entries lack the block bytes;
+    /// [`crate::Error::InvalidHeader`] for bytes that are neither layout's.
+    pub(crate) fn decode_whole(bytes: &[u8]) -> crate::Result<Self> {
+        use crate::vlog::blob_file::meta::META_VERSION;
+
+        // Id, count, bytes, frame bytes, then this layout's block bytes.
+        const ENTRY_LEN: u64 = 8 + 4 + 8 + 8 + 8;
+        const EARLIER_ENTRY_LEN: u64 = ENTRY_LEN - 8;
+
+        let (count, entries) = bytes
+            .split_first_chunk::<4>()
+            .ok_or(crate::Error::InvalidHeader("BlobGcStats"))?;
+        let count = u64::from(u32::from_le_bytes(*count));
+        let len = entries.len() as u64;
+        // The two layouts' lengths agree only on no entries at all.
+        if len == count * ENTRY_LEN {
+            return <Self as crate::coding::Decode>::decode_from(&mut &bytes[..]);
+        }
+        if len == count * EARLIER_ENTRY_LEN {
+            return Err(crate::Error::UnsupportedFormat {
+                part: crate::error::FormatPart::BlobFiles,
+                found: Some(META_VERSION - 1),
+                expected: META_VERSION,
+            });
+        }
+        Err(crate::Error::InvalidHeader("BlobGcStats"))
+    }
+
     /// Charges the object `vptr` names as garbage in its blob file.
     pub(crate) fn charge(&mut self, vptr: &BlobIndirection) {
         let size = u64::from(vptr.size);

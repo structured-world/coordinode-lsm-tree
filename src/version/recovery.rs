@@ -745,7 +745,7 @@ impl Recovery {
         }
 
         if let Some(bytes) = &edit.gc_stats {
-            self.gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut &bytes[..])?;
+            self.gc_stats = crate::blob_tree::FragmentationMap::decode_whole(bytes)?;
         }
 
         // Tight-space restrictions REPLACE wholesale: the encoder derives every
@@ -837,9 +837,8 @@ pub fn recover(
     )?;
     debug_assert!(blob_file_ids.is_sorted_by_key(|(id, _)| id));
 
-    let gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut crate::io::Cursor::new(
-        archive.read_section("blob_gc_stats")?,
-    ))?;
+    let gc_stats =
+        crate::blob_tree::FragmentationMap::decode_whole(&archive.read_section("blob_gc_stats")?)?;
 
     // Optional tight-space restrictions section. Absent on versions that never
     // ran tight-space reclaim (→ empty). When present it is read strictly: a
