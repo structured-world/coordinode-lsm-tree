@@ -95,7 +95,7 @@ impl<'a> Reader<'a> {
             FrameKind::Head => {
                 check_key(&frame, vhandle.index, key)?;
                 let mut chunks = Vec::new();
-                for chunk in chunk_frames(&frame, vhandle.frame)? {
+                for chunk in chunk_frames(&frame, vhandle.frame, self.blob_file.frame_count())? {
                     chunks.push(alloc::boxed::Box::new(
                         self.read_frame(chunk, &mut decoded)?,
                     ));
@@ -135,7 +135,7 @@ impl<'a> Reader<'a> {
             },
             FrameKind::Head => {
                 let mut frames = alloc::vec![first];
-                for chunk in chunk_frames(&frame, vhandle.frame)? {
+                for chunk in chunk_frames(&frame, vhandle.frame, self.blob_file.frame_count())? {
                     let bytes = self.read_frame_bytes(chunk)?;
                     read += bytes.len() as u64;
                     let decoded_chunk = Self::decode(self.blob_file, &bytes, &mut decoded)?;
@@ -194,19 +194,26 @@ pub(crate) fn value_in(frame: &DecodedFrame, index: u16, key: &[u8]) -> crate::R
     }
 }
 
-/// The frame numbers of a head's chunks: the frames right after it.
+/// The frame numbers of a head's chunks, the frames right after it, in a file
+/// of `frames` frames.
 ///
 /// # Errors
 ///
-/// The head's chunk table is malformed, or the chunks would run past frame
-/// number `u32::MAX`.
-pub(crate) fn chunk_frames(head: &DecodedFrame, frame: u32) -> crate::Result<Range<u32>> {
+/// The head's chunk table is malformed, or its chunks run past the file's
+/// last frame: a damaged head that checks, which must not size the buffers
+/// its callers reserve for the chunks.
+pub(crate) fn chunk_frames(
+    head: &DecodedFrame,
+    frame: u32,
+    frames: usize,
+) -> crate::Result<Range<u32>> {
     let (_, chunks) = head.chunk_table()?;
     let first = frame
         .checked_add(1)
         .ok_or(crate::Error::InvalidHeader("Blob"))?;
     let end = first
         .checked_add(chunks)
+        .filter(|&end| end as usize <= frames)
         .ok_or(crate::Error::InvalidHeader("Blob"))?;
     Ok(first..end)
 }

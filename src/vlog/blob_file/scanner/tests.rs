@@ -269,16 +269,58 @@ fn chunks_whose_head_is_damaged_are_refused_each() -> crate::Result<()> {
 /// Rewrites the chunked value's head, frame 0 of a file written by `write`:
 /// its value length and its chunk count, sealed again so the head checks.
 fn rewrite_head(path: &std::path::Path, value_len: u32, chunks: u32) -> crate::Result<()> {
+    rewrite_head_table(path, value_len, None, chunks)
+}
+
+/// [`rewrite_head`], the chunk size rewritten too when given.
+fn rewrite_head_table(
+    path: &std::path::Path,
+    value_len: u32,
+    chunk_size: Option<u32>,
+    chunks: u32,
+) -> crate::Result<()> {
     let index = index_of(path)?;
     edit(path, |bytes| {
         let head = &mut bytes[index[0]..index[1]];
         // The entry's value length, after its seqno and key length.
         head[40 + 10..40 + 14].copy_from_slice(&value_len.to_le_bytes());
         // The chunk table after the entry: the chunk size, then the count.
-        let table = head.len() - 4;
-        head[table..].copy_from_slice(&chunks.to_le_bytes());
+        let table = head.len() - 8;
+        if let Some(size) = chunk_size {
+            head[table..table + 4].copy_from_slice(&size.to_le_bytes());
+        }
+        head[table + 4..].copy_from_slice(&chunks.to_le_bytes());
         crate::vlog::blob_file::frame::reseal(head);
     })
+}
+
+/// A head that checks but names far more chunks than the file holds, a cap's
+/// worth of one-byte chunks, is damage refused before room is reserved for
+/// them, by the index or along the chain, and the walk goes on after it.
+#[test]
+fn a_head_naming_more_chunks_than_the_file_holds_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
+    let cap = MAX_DECOMPRESSION_SIZE as u32;
+    rewrite_head_table(&path, cap, Some(1), cap)?;
+    let indexed = std::fs::read(&path)?;
+    break_index(&path)?;
+    let chained = std::fs::read(&path)?;
+    for bytes in [indexed, chained] {
+        std::fs::write(&path, &bytes)?;
+        let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+        assert!(matches!(
+            results[0],
+            Err(crate::Error::InvalidHeader("BlobFrame"))
+        ));
+        let next = results.iter().filter_map(|r| r.as_ref().ok()).last();
+        assert_eq!(
+            next.map(|e| &*e.key),
+            Some(&b"next"[..]),
+            "the walk goes on"
+        );
+    }
+    Ok(())
 }
 
 /// A head that checks but names chunks its value length does not need, or

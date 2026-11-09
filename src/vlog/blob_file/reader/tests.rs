@@ -173,10 +173,13 @@ fn a_range_covers_only_its_chunks() -> crate::Result<()> {
     assert_eq!(covering_chunks(&head, &(299..301))?, (0..2, 299));
     assert_eq!(covering_chunks(&head, &(600..700))?, (2..3, 0));
 
-    let chunks = chunk_frames(&head, handles[0].frame)?;
+    let chunks = chunk_frames(&head, handles[0].frame, blob_file.frame_count())?;
     let second = reader.read_frame(chunks.start + 1, &mut 0)?;
     let part = assemble(&head, &[Box::new(second)], Some(&(310..320)))?;
     assert_eq!(&*part, &value[310..320]);
+    // Chunks past the file's last frame: a damaged head, refused before any
+    // caller reserves room for them.
+    assert!(chunk_frames(&head, handles[0].frame, chunks.end as usize - 1).is_err());
     Ok(())
 }
 

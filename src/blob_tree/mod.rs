@@ -460,7 +460,7 @@ impl BlobSource {
         if bytes.len() as u64 == end - start {
             return Ok(None);
         }
-        let all = reader::chunk_frames(&frame, read.vhandle.frame)?;
+        let all = reader::chunk_frames(&frame, read.vhandle.frame, read.blob_file.frame_count())?;
         let mut chunks = Vec::with_capacity((all.end - all.start) as usize);
         for chunk in all {
             let (chunk_start, chunk_end) =

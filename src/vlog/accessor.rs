@@ -384,7 +384,7 @@ impl<'a> Accessor<'a> {
         if range.is_empty() {
             return Ok(Some(UserValue::empty()));
         }
-        let all = chunk_frames(&first, vhandle.frame)?;
+        let all = chunk_frames(&first, vhandle.frame, blob_file.frame_count())?;
         let (covered, _) = covering_chunks(&first, &range)?;
         let mut chunks = Vec::with_capacity((covered.end - covered.start) as usize);
         for at in covered {

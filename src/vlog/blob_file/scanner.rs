@@ -458,7 +458,20 @@ impl Scanner {
                 Some(Ok(()))
             }
             FrameKind::Head => {
-                let Ok(chunks) = super::reader::chunk_frames(&decoded, frame) else {
+                // The frames the file can hold bound a head's chunks before
+                // room is reserved for them: the index's count, or, along the
+                // chain, the frame headers the data left can hold. `frame_end`
+                // lies within the section: the frame was read whole in it.
+                let room = match &self.bounds {
+                    Bounds::Index(frames) => frames.len() - 1,
+                    Bounds::Chain => {
+                        let fit = (self.data_end - frame_end) / FRAME_HEADER_LEN as u64;
+                        // An upper bound: one past `usize::MAX` bounds nothing more.
+                        usize::try_from(fit)
+                            .map_or(usize::MAX, |fit| fit.saturating_add(frame as usize + 1))
+                    }
+                };
+                let Ok(chunks) = super::reader::chunk_frames(&decoded, frame, room) else {
                     return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
                 };
                 let mut stored = alloc::vec![bytes];
