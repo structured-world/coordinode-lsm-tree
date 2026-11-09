@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794161546980,
+  "lastUpdate": 1794255335391,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103138,6 +103138,90 @@ window.BENCHMARK_DATA = {
             "value": 361617.3102040563,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 11.7us | P99.9: 86.2us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ff4311c3448deb8f62041daf4a647a7b7ceb6fab",
+          "message": "perf(blob)!: store values in frames by size class (#1063)\n\n## Summary\n\n- Blob files hold values in frames by size class: values below the block\nsize share a compressed block, larger ones get a frame of their own, and\nvalues above the chunk size are split into a head and chunks readable by\nrange. A frame index at the end of each file locates every frame.\n- The first step of the blob size classes: the read paths that make the\nclasses fast (a decoded block cached for point reads, a chunked value\nread in one request, packed records) follow in the next PRs of the\nseries.\n\n## Changes\n\n- `KvSeparationOptions::block_size` and `chunk_size` set the classes,\nthe chunk size held between 4 KiB and the 256 MiB frame cap;\n`BlobTree::get_range` reads a byte range of a value, only the chunks it\ncovers, and `Error::ValueRange` refuses a range outside the value.\n- Garbage accounting keeps exact frame bytes for values with frames of\ntheir own and uncompressed entry bytes for values in blocks; a file's\nmetadata records its block totals. A blob file is dead when every object\nin it is charged, counted by objects, so a live zero-length object keeps\nits file.\n- Relocation, of values and of cell objects, copies whole-value frames\nverbatim, checked as stored without decoding them (a head's chunks\nagainst its table) and listed at the seqno their table gives them, and\nre-encodes block values; salvage and repair walk the frame index and\nfall back to the frame chain when the index is damaged (an index running\npast its file included, refused before anything is sized from it), while\nan environmental failure to read it is returned for a retry.\n- Read-ahead reads a block several values share once and keeps it across\na scan's batches, counting each frame a kept value pins against its\nbound, and reads no frame the cache holds, whether or not the scan fills\nit; a multi-get reads a chunked value whole in one queued read unless\nthe cache holds its head and every chunk, then it is assembled from\nthem; a range within one chunk is a view into it; values are handed out\nas views into their frame.\n- A table's blob links record the bytes of their values that share\nblocks (`import::BlobLink::block_bytes`), and tables stamp the blob\nlayout their links describe.\n- A blob file of the earlier layout and a table whose links are of it\nare refused at open and at repair with\n`Error::UnsupportedFormat(FormatPart::BlobFiles)`, whose message names\nthe release that wrote the store; garbage statistics of that layout,\nwhich outlive the files they count, decode with no block bytes. The\nconverter refuses a tree holding separated values; its conversion to\nthis layout is tracked in #1056.\n- `docs/data-integrity.md`, `docs/manifest-recovery.md` and\n`docs/INVARIANTS.md` describe frames, the frame index and block garbage\naccounting.\n- `tools/compare-rocksdb` runs both engines with values inline and in\nblob files in every group, the blob files uncompressed and at zstd level\n3 on both, each blob arm taken against RocksDB with blob files under the\nsame codec; the `blob_relocation` bench times a relocating merge of\ncompressed blob files, of whole frames and of chunked values.\n\n## Measurement\n\n`tools/compare-rocksdb` against `main` on one benchmark host, the arms\nboth sides have (`blob_tree`, `rocksdb_blob`), medians per operation:\n\n| group | `main` | this PR | RocksDB blob files |\n|---|---|---|---|\n| point_read, 1k keys | 3.91 µs | 7.66 µs | 4.90 µs |\n| point_read, 10k keys | 4.25 µs | 8.06 µs | 5.18 µs |\n| point_read, 70k keys | 4.64 µs | 9.50 µs | 5.60 µs |\n| point_read, 1 MiB values | 299 µs | 438 µs | 1300 µs |\n| point_read, 4 MiB values | 1.20 ms | 12.5 ms | 15.4 ms |\n| range_scan, 1k-70k keys | 0.69-0.72 µs | 0.46-0.48 µs | 3.08-3.27 µs |\n| range_scan, 4 MiB values | 1.25 ms | 12.5 ms | 15.4 ms |\n| multi_get, 1k-70k keys | 2.9-3.2 µs | 22-25 µs | 4.1-5.8 µs |\n| multi_get, 4 MiB values | 4.5 ms | 6.4 ms | 14.3 ms |\n\nA multi-get of values sharing a block reads, checksums and decodes that\nblock once per value in this step, which is where its time goes; reading\neach frame once and handing it to every value waiting on it comes with\nthe read-path changes below.\n\nPoint reads and multi-gets are slower than on `main` in this step: a\npoint read of a small value decodes its whole block each time, and a\nchunked value is read chunk by chunk. Caching a decoded block for point\nreads and reading a chunked value's head and chunks in one request come\nin the next PRs of the series, after which point reads are back at\n`main`'s level. Writing a frame here stages its payload in the writer's\nbuffer, one copy more than `main`, and decoding a frame of one value\nallocates its one-entry list; writing the header and the stored payload\nas separate parts, and holding a single entry in place, come with the\nread and write path changes of the series. A chunk here is a frame of\nits own, checked by its kind and length against its head, and a\nmulti-get caches a chunked value's head but not its chunks; the next PRs\ngive the head a checksum of each chunk in its place and store chunks\nafter their head without headers of their own, read whole into one\nbuffer. The sustained overwrite group has no blob arm on `main`; here\n`blob_tree` writes at 0.81 of RocksDB with blob files.\n\n## Testing\n\nFormatting, clippy in every CI configuration, nextest, doc tests, the\ndoc build, the no-std check and `tools/compare-rocksdb` clippy pass on\nLinux; CI runs its matrix on Linux, macOS and Windows.\n\nReplaces #1062 and #1060, squashed into one commit.\n\nPart of #1031\n\nBREAKING CHANGE: the blob file layout, the indirection encoding and a\ntable's blob-link records change; stores with separated values in the\nearlier layout are refused with\nError::UnsupportedFormat(FormatPart::BlobFiles). Error gains ValueRange,\nFormatPart gains BlobFiles and import::BlobLink gains block_bytes.",
+          "timestamp": "2026-11-09T21:42:42+02:00",
+          "tree_id": "447ae22a9c716b18c0074d0cf6944156bd9269dd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ff4311c3448deb8f62041daf4a647a7b7ceb6fab"
+        },
+        "date": 1794255334157,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 141328.07969441934,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.7us | P99.9: 21.0us\nthreads: 1 | elapsed: 3.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2990509.1854760596,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 902746.0487617915,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 1.9us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 485511.1068761595,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 7.0us | P99.9: 21.1us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3190476.7077891994,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 315683.4381095872,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.4us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 191202.63831419367,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.9us | P99.9: 20.6us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 902715.9699437108,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.1us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1037466.343684028,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 1.1us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 358691.47620587185,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 12.7us | P99.9: 80.4us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
           }
         ]
       }
