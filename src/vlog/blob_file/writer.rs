@@ -686,11 +686,28 @@ impl Writer {
             FrameKind::Head => chunks > 0,
             FrameKind::Block | FrameKind::Chunk => false,
         };
-        let listed_key = first.get(
-            super::frame::FRAME_HEADER_LEN + super::frame::ENTRY_HEADER_LEN
-                ..super::frame::FRAME_HEADER_LEN + header.entries_len as usize,
-        );
-        if !shape_ok || listed_key != Some(key) {
+        use super::frame::{ENTRY_HEADER_LEN, FRAME_HEADER_LEN};
+
+        let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
+        let listed_key = first.get(FRAME_HEADER_LEN + ENTRY_HEADER_LEN..entries_end);
+        // The entry's value length follows its seqno and key length; a head's
+        // payload, stored as it is, is its chunk size then its chunk count.
+        let u32_at = |at: usize| {
+            first
+                .get(at..at + 4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_le_bytes)
+        };
+        let listed_len = u32_at(FRAME_HEADER_LEN + 10);
+        let listed_chunks = match header.kind {
+            FrameKind::Head => u32_at(entries_end + 4).map(|n| n as usize),
+            _ => Some(0),
+        };
+        if !shape_ok
+            || listed_key != Some(key)
+            || listed_len != Some(value_len)
+            || listed_chunks != Some(chunks)
+        {
             return Err(malformed());
         }
         for chunk in frames.get(1..).unwrap_or_default() {
