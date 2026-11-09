@@ -390,7 +390,7 @@ fn only_a_frame_of_one_value_is_relisted() {
     ];
     encode_frame(FrameKind::Block, &entries, b"xy", plain(), &mut out).unwrap();
     assert!(matches!(
-        with_entry_seqno(&Slice::from(out), 9),
+        relist_prefix(&out, 9, &mut Vec::new()),
         Err(crate::Error::InvalidHeader("BlobFrame"))
     ));
 }
@@ -767,8 +767,9 @@ fn a_damaged_seqno_fails_the_checksum() {
     ));
 }
 
-/// A frame relisted at another sequence number reads back at it, its value
-/// and checksum intact, with the payload bytes as they were stored.
+/// A frame relisted at another sequence number, its new header and entries
+/// followed by its payload as stored, reads back at it with its value and
+/// checksum intact; a frame listed at that seqno already needs no prefix.
 #[test]
 fn a_frame_relisted_at_another_seqno_reads_back_at_it() {
     let entry = EntrySpec {
@@ -779,16 +780,19 @@ fn a_frame_relisted_at_another_seqno_reads_back_at_it() {
     let mut out = Vec::new();
     encode_frame(FrameKind::Single, &[entry], b"value", plain(), &mut out).unwrap();
 
-    let relisted = with_entry_seqno(&Slice::from(&out[..]), 10).unwrap();
+    let mut relisted = Vec::new();
+    let payload_at = relist_prefix(&out, 10, &mut relisted).unwrap().unwrap();
+    assert_eq!(relisted.len(), payload_at, "the prefix holds no payload");
+    relisted.extend_from_slice(&out[payload_at..]);
     let frame = decode(&relisted, CompressionType::None).unwrap();
     assert_eq!(frame.list[0].seqno, 10);
     assert_eq!(frame.key(0), Some(&b"doc"[..]));
     assert_eq!(frame.value(0).as_deref(), Some(&b"value"[..]));
-    let payload_at = FRAME_HEADER_LEN + frame.header.entries_len as usize;
+
     assert_eq!(
-        relisted[payload_at..],
-        out[payload_at..],
-        "the payload as stored"
+        relist_prefix(&out, 1, &mut Vec::new()).unwrap(),
+        None,
+        "listed at its seqno already"
     );
 }
 
@@ -797,7 +801,7 @@ fn a_frame_relisted_at_another_seqno_reads_back_at_it() {
 #[test]
 fn a_block_is_not_relisted() {
     assert!(matches!(
-        with_entry_seqno(&Slice::from(&sample_block()[..]), 10),
+        relist_prefix(&sample_block(), 10, &mut Vec::new()),
         Err(crate::Error::InvalidHeader(_))
     ));
 }

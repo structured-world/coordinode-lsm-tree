@@ -501,10 +501,18 @@ impl Writer {
 
     /// Writes `bytes`, one encoded frame, at the current offset.
     fn put_frame(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.put_frame_parts(bytes, &[])
+    }
+
+    /// Writes one encoded frame given as `head` then `tail`, at the current
+    /// offset, so a payload borrowed from elsewhere is not staged first.
+    fn put_frame_parts(&mut self, head: &[u8], tail: &[u8]) -> crate::Result<()> {
         self.frames.push(self.offset);
-        self.writer.write_all(bytes)?;
-        self.offset += bytes.len() as u64;
-        self.written_blob_bytes += bytes.len() as u64;
+        self.writer.write_all(head)?;
+        self.writer.write_all(tail)?;
+        let len = (head.len() + tail.len()) as u64;
+        self.offset += len;
+        self.written_blob_bytes += len;
         self.writeback_if_due()
     }
 
@@ -677,6 +685,33 @@ impl Writer {
         frames: &[crate::Slice],
         value_len: u32,
     ) -> crate::Result<FrameRef> {
+        self.write_frames(key, frames, value_len, None)
+    }
+
+    /// [`Self::write_verbatim`] with the value listed at `seqno`: only the
+    /// first frame's header and entry are rewritten, its payload written from
+    /// `frames` as stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_verbatim`].
+    pub(crate) fn write_verbatim_at(
+        &mut self,
+        key: &[u8],
+        frames: &[crate::Slice],
+        value_len: u32,
+        seqno: crate::SeqNo,
+    ) -> crate::Result<FrameRef> {
+        self.write_frames(key, frames, value_len, Some(seqno))
+    }
+
+    fn write_frames(
+        &mut self,
+        key: &[u8],
+        frames: &[crate::Slice],
+        value_len: u32,
+        relist: Option<crate::SeqNo>,
+    ) -> crate::Result<FrameRef> {
         let malformed = || crate::Error::InvalidHeader("verbatim blob frames");
         let first = frames.first().ok_or_else(malformed)?;
         let header = super::frame::parse_header(first)?;
@@ -722,12 +757,30 @@ impl Writer {
                 return Err(malformed());
             }
         }
-        self.close_block()?;
-        let frame = self.next_frame()?;
-        let before = self.offset;
-        for bytes in frames {
-            self.put_frame(bytes)?;
-        }
+        // Relisted before anything is written, so a refusal leaves the file
+        // as it was.
+        let mut prefix = core::mem::take(&mut self.scratch);
+        let relisted = match relist {
+            Some(seqno) => super::frame::relist_prefix(first, seqno, &mut prefix),
+            None => Ok(None),
+        };
+        let written = relisted.and_then(|relisted| {
+            self.close_block()?;
+            let frame = self.next_frame()?;
+            let before = self.offset;
+            match relisted {
+                Some(payload_at) => {
+                    self.put_frame_parts(&prefix, first.get(payload_at..).unwrap_or_default())?;
+                }
+                None => self.put_frame(first)?,
+            }
+            for bytes in frames.get(1..).unwrap_or_default() {
+                self.put_frame(bytes)?;
+            }
+            Ok((frame, before))
+        });
+        self.scratch = prefix;
+        let (frame, before) = written?;
         self.note_key(key, value_len);
         Ok(FrameRef {
             frame,

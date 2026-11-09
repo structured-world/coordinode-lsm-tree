@@ -741,6 +741,26 @@ impl MultiWriter {
         self.written(at, value_len)
     }
 
+    /// [`Self::write_verbatim`] with the value listed at `seqno`, its payload
+    /// still written as stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_verbatim`].
+    pub(crate) fn write_verbatim_at(
+        &mut self,
+        key: &[u8],
+        frames: &[crate::Slice],
+        value_len: u32,
+        seqno: SeqNo,
+    ) -> crate::Result<BlobIndirection> {
+        self.enter_key(key)?;
+        let at = self
+            .active_writer
+            .write_verbatim_at(key, frames, value_len, seqno)?;
+        self.written(at, value_len)
+    }
+
     /// Writes `value`, a value new to the value log, into a file of lifetime
     /// `class` under `compression`: the file a relocation copies frames of the
     /// same codec into, so a pass that both relocates and separates new values

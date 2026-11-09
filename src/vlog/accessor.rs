@@ -386,20 +386,23 @@ impl<'a> Accessor<'a> {
         }
         let all = chunk_frames(&first, vhandle.frame, blob_file.frame_count())?;
         let (covered, _) = covering_chunks(&first, &range)?;
+        let chunk_at = |at: u32| {
+            all.start
+                .checked_add(at)
+                .ok_or(crate::Error::InvalidHeader("Blob"))
+        };
+        // A range within one chunk is a view into it, with no list to gather.
+        if covered.end - covered.start == 1 {
+            let chunk = self.frame(tree_id, blob_file, chunk_at(covered.start)?, cache)?;
+            return assemble(&first, core::slice::from_ref(&chunk), Some(&range)).map(Some);
+        }
         let mut chunks = Vec::with_capacity((covered.end - covered.start) as usize);
         for at in covered {
-            let frame = all
-                .start
-                .checked_add(at)
-                .ok_or(crate::Error::InvalidHeader("Blob"))?;
-            chunks.push(self.frame(tree_id, blob_file, frame, cache)?);
+            chunks.push(self.frame(tree_id, blob_file, chunk_at(at)?, cache)?);
         }
         let value = assemble(&first, &chunks, Some(&range))?;
-        // A range within one chunk is a view into it: only a range across
-        // chunks is gathered into a buffer of its own.
-        if chunks.len() > 1 {
-            self.count_gather(value.len());
-        }
+        // A range across chunks is gathered into a buffer of its own.
+        self.count_gather(value.len());
         Ok(Some(value))
     }
 

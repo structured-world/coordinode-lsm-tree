@@ -282,6 +282,45 @@ fn verbatim_frames_are_written_as_they_are() -> crate::Result<()> {
     Ok(())
 }
 
+/// Frames written as they are but listed at another seqno take the bytes the
+/// source's do, list the value at that seqno, and check; the chunks after the
+/// head are the source's bytes.
+#[test]
+fn verbatim_frames_listed_at_another_seqno_check() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let mut source =
+        Writer::new(folder.path().join("source"), 0, 0, &StdFs)?.use_frame_sizes(SIZES);
+    source.write(b"big", 3, &[9; 700])?;
+    let source_path = source.path.clone();
+    let (_, _, source_frames) = source.finish()?;
+    let bytes = std::fs::read(&source_path)?;
+    let stored: Vec<crate::Slice> = source_frames
+        .windows(2)
+        .map(|pair| crate::Slice::from(&bytes[pair[0] as usize..pair[1] as usize]))
+        .collect();
+
+    let mut w = writer(&folder)?;
+    let copied = w.write_verbatim_at(b"big", &stored, 700, 8)?;
+    let path = w.path.clone();
+    let (_, _, frames) = w.finish()?;
+
+    assert_eq!(
+        copied.stored,
+        crate::blob_tree::handle::Stored::Frames(stored.iter().map(|f| f.len() as u32).sum())
+    );
+    let decoded = frames_of(&path, &frames);
+    assert_eq!(decoded[0].list[0].seqno, 8);
+    let written = std::fs::read(&path)?;
+    for (at, chunk) in stored.iter().enumerate().skip(1) {
+        assert_eq!(
+            written[frames[at] as usize..frames[at + 1] as usize],
+            chunk[..],
+            "chunk {at} as stored"
+        );
+    }
+    Ok(())
+}
+
 /// Frames that are not one whole value under the key are refused before
 /// anything is written: a block, a chunk without its head, another key's
 /// value, a head followed by something other than chunks or by another

@@ -745,16 +745,23 @@ pub(crate) fn encode_frame(
     Ok(())
 }
 
-/// `frame`, a single or head frame listing one value, with that value listed
-/// at `seqno`: its entry rewritten and its checksum recomputed over the same
-/// stored payload, which is not decoded or compressed again. A frame listed
-/// at `seqno` already is handed back as it is, without a copy.
+/// Relists the value `frame` lists, a single or head frame listing one, at
+/// `seqno`: `prefix` is filled with the frame's header and entries, the entry
+/// rewritten and the checksum recomputed over the same stored payload, and
+/// the offset the payload starts at in `frame` is returned. The relisted
+/// frame is `prefix` followed by `frame` from that offset, so the payload is
+/// neither decoded nor copied. `None` for a frame listed at `seqno` already,
+/// which is written as it is.
 ///
 /// # Errors
 ///
 /// [`crate::Error::InvalidHeader`] when `frame` is not one whole frame listing
 /// a single value; the header errors of [`parse_header`].
-pub(crate) fn with_entry_seqno(frame: &Slice, seqno: SeqNo) -> crate::Result<Slice> {
+pub(crate) fn relist_prefix(
+    frame: &[u8],
+    seqno: SeqNo,
+    prefix: &mut Vec<u8>,
+) -> crate::Result<Option<usize>> {
     let malformed = || crate::Error::InvalidHeader("BlobFrame");
     let header = parse_header(frame)?;
     if header.count != 1 || !matches!(header.kind, FrameKind::Single | FrameKind::Head) {
@@ -770,20 +777,21 @@ pub(crate) fn with_entry_seqno(frame: &Slice, seqno: SeqNo) -> crate::Result<Sli
         .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
         .map(SeqNo::from_le_bytes);
     if listed == Some(seqno) {
-        return Ok(frame.clone());
+        return Ok(None);
     }
-    // The lengths were checked above: the header, the entry's seqno, the
-    // entries and the payload all lie within `out`.
-    let mut out = frame.to_vec();
-    let (head, entries_and_payload) = out.split_at_mut(FRAME_HEADER_LEN);
-    let (listed_seqno, _) = entries_and_payload.split_at_mut(8);
+    // The lengths were checked above: the header and the entries lie within
+    // `frame`, the entry's seqno within the entries.
+    let (head_and_entries, payload) = frame.split_at(entries_end);
+    prefix.clear();
+    prefix.extend_from_slice(head_and_entries);
+    let (head, entries) = prefix.split_at_mut(FRAME_HEADER_LEN);
+    let (listed_seqno, _) = entries.split_at_mut(8);
     listed_seqno.copy_from_slice(&seqno.to_le_bytes());
-    let (entries, payload) = entries_and_payload.split_at(entries_end - FRAME_HEADER_LEN);
     let checksum = frame_checksum(entries, payload, header.header_crc);
     // The checksum is the header's last field.
     let (_, stored_checksum) = head.split_at_mut(FRAME_HEADER_LEN - 16);
     stored_checksum.copy_from_slice(&checksum.to_le_bytes());
-    Ok(Slice::from(out))
+    Ok(Some(entries_end))
 }
 
 /// The payload of a head naming chunks of `chunk_size` bytes, `chunks` of them.
