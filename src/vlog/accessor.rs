@@ -449,12 +449,12 @@ impl<'a> Accessor<'a> {
         }
 
         // One entry per frame to read: frames already held need no read, and
-        // the values of one block share their frame. A read that does not fill
-        // the cache is still served from it, so a cached frame is held either way.
+        // the values of one block share their frame.
         items.retain(|(_, vhandle, _)| {
-            let at = vhandle.frame_at();
-            let held = cache.contains_blob_frame(tree_id, at)
-                || matches!(&into, PrefetchInto::Local(store) if store.frames.contains_key(&at));
+            let held = match &into {
+                PrefetchInto::Cache => cache.contains_blob_frame(tree_id, vhandle.frame_at()),
+                PrefetchInto::Local(store) => store.frames.contains_key(&vhandle.frame_at()),
+            };
             !held && self.blob_files.get(vhandle.blob_file_id).is_some()
         });
         let key =
@@ -476,6 +476,24 @@ impl<'a> Accessor<'a> {
             prev = Some(at);
         }
         items.dedup_by_key(|item| key(item));
+        // A read that does not fill the cache is still served from it: a
+        // frame the cache holds needs no read either. Asked once per frame,
+        // after the values sharing one are folded into it.
+        if matches!(into, PrefetchInto::Local(_)) {
+            // `shared` is one flag per item: it keeps the flags of the items
+            // kept, in their order.
+            let (mut at, mut kept) = (0, 0);
+            items.retain(|(_, vhandle, _)| {
+                let keep = !cache.contains_blob_frame(tree_id, vhandle.frame_at());
+                if keep {
+                    shared.swap(kept, at);
+                    kept += 1;
+                }
+                at += 1;
+                keep
+            });
+            shared.truncate(kept);
+        }
         // A single cold frame of one value is exactly what `get` already does
         // well; the prefetch earns its keep by merging two or more frames, or
         // by reading once a frame several values share.
