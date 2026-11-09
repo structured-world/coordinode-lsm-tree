@@ -15807,6 +15807,110 @@ fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> cra
     Ok(())
 }
 
+/// A committed frontier at a blob file's data end is a relocation that
+/// consumed every frame and had not yet removed the file: repair queues the
+/// lagged removal, as it does for a file it finds punched whole, instead of
+/// failing over a frontier that is no frame's start.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_committed_frontier_at_the_data_end_is_a_consumed_blob_file() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::version::{BlobFileList, Level, Run, Version};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_blob_frontier_at_end")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+        tree.insert(b"zzz", vec![b'w'; 64], 100);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let (tables, blob_files, installed, blob_path) = {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        let version = tree.index.current_version();
+        let installed = version.id();
+        let blob = version
+            .blob_files
+            .iter()
+            .next()
+            .cloned()
+            .expect("the flush spilled a blob file");
+        let entries: Vec<_> = crate::vlog::BlobFileScanner::new(blob.path(), &*fs_dyn, blob.id())?
+            .collect::<crate::Result<Vec<_>>>()?;
+        // Every frame consumed: the frontier at the data end.
+        let frontier = entries.last().expect("a frame").frame_end;
+        let data_start = {
+            let mut file = fs_dyn.open(blob.path(), &crate::fs::FsOpenOptions::new().read(true))?;
+            let reader = crate::sfa::Reader::from_reader(&mut file)?;
+            reader
+                .toc()
+                .section(b"data")
+                .expect("blob file has a data section")
+                .pos()
+        };
+        memfs.punch_hole(blob.path(), data_start, frontier - data_start)?;
+        let restricted = blob.reopen_restricted(frontier)?;
+        let tables: Vec<_> = version.iter_tables().cloned().collect();
+        let mut map = crate::HashMap::default();
+        map.insert(restricted.id(), restricted);
+        (
+            tables,
+            BlobFileList::new(map),
+            installed,
+            blob.path().to_path_buf(),
+        )
+    };
+    let run = Arc::new(Run::new(tables).expect("non-empty run"));
+    let version = Version::from_levels(
+        installed + 1,
+        crate::TreeType::Blob,
+        alloc::vec![Level::from_runs(alloc::vec![run])],
+        blob_files,
+        crate::blob_tree::FragmentationMap::default(),
+    );
+    crate::version::persist_version(
+        &root,
+        &version,
+        crate::comparator::default_comparator().name(),
+        &*fs_dyn,
+        Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
+        crate::fs::SyncMode::Normal,
+    )?;
+    memfs.remove_file(&root.join("tables").join("1"))?;
+
+    let report = config().repair()?;
+    assert!(
+        !fs_dyn.exists(&blob_path)?,
+        "the consumed file is removed once the manifest is durable: {report:?}"
+    );
+    Ok(())
+}
+
 /// A recovered SST whose blob handles point BELOW a punched blob file's
 /// derived live-data frontier must not be published as-is — a read through
 /// such a handle dereferences the punched (zeroed) prefix and fails. Instead

@@ -313,7 +313,7 @@ fn a_head_naming_more_chunks_than_the_file_holds_is_refused() -> crate::Result<(
             results[0],
             Err(crate::Error::InvalidHeader("BlobFrame"))
         ));
-        let next = results.iter().filter_map(|r| r.as_ref().ok()).last();
+        let next = results.iter().filter_map(|r| r.as_ref().ok()).next_back();
         assert_eq!(
             next.map(|e| &*e.key),
             Some(&b"next"[..]),

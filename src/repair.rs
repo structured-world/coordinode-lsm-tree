@@ -3626,10 +3626,22 @@ fn recover_blob_files(
                     // frontier (a pre-relocation SST left behind by a crash)
                     // must be dropped by the table-rewrite stage. The frontier
                     // is a frame start, as its derivation and the restricted
-                    // open both hold it.
-                    let first_live = bf
-                        .frame_at_offset(frontier)
-                        .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+                    // open both hold it, or the data end: a committed frontier
+                    // there is a relocation that consumed every frame and had
+                    // not removed the file yet, whose lagged removal is queued
+                    // as for a file found punched whole.
+                    let Some(first_live) = bf.frame_at_offset(frontier) else {
+                        if !bf.is_frame_boundary(frontier) {
+                            return Err(crate::Error::InvalidHeader("BlobFile"));
+                        }
+                        discard.push((
+                            blob_path,
+                            "blob file consumed to its data end: a completed relocation's \
+                             lagged drop"
+                                .to_string(),
+                        ));
+                        continue;
+                    };
                     rewrites.insert(
                         blob_id,
                         crate::salvage::BlobFileRewrite::DropBelow(first_live),

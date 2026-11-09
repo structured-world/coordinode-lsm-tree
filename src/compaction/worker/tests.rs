@@ -5509,7 +5509,9 @@ fn frame_bytes_cover_a_block_value_the_copy_splits_into_chunks() -> crate::Resul
                 chunk_size,
             });
     let written = writer.write(key, 0, &value)?.stored.bytes();
-    writer.finish()?;
+    let (_, _, frames) = writer.finish()?;
+    // A head and four chunks, then the data end: the copy is chunked.
+    assert_eq!(frames.len(), 6, "the value is written as a head and chunks");
 
     let Ok(entry) =
         u32::try_from(crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + key.len() + value.len())
