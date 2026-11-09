@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794255340016,
+  "lastUpdate": 1794255345616,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -109686,6 +109686,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.400173812,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ff4311c3448deb8f62041daf4a647a7b7ceb6fab",
+          "message": "perf(blob)!: store values in frames by size class (#1063)\n\n## Summary\n\n- Blob files hold values in frames by size class: values below the block\nsize share a compressed block, larger ones get a frame of their own, and\nvalues above the chunk size are split into a head and chunks readable by\nrange. A frame index at the end of each file locates every frame.\n- The first step of the blob size classes: the read paths that make the\nclasses fast (a decoded block cached for point reads, a chunked value\nread in one request, packed records) follow in the next PRs of the\nseries.\n\n## Changes\n\n- `KvSeparationOptions::block_size` and `chunk_size` set the classes,\nthe chunk size held between 4 KiB and the 256 MiB frame cap;\n`BlobTree::get_range` reads a byte range of a value, only the chunks it\ncovers, and `Error::ValueRange` refuses a range outside the value.\n- Garbage accounting keeps exact frame bytes for values with frames of\ntheir own and uncompressed entry bytes for values in blocks; a file's\nmetadata records its block totals. A blob file is dead when every object\nin it is charged, counted by objects, so a live zero-length object keeps\nits file.\n- Relocation, of values and of cell objects, copies whole-value frames\nverbatim, checked as stored without decoding them (a head's chunks\nagainst its table) and listed at the seqno their table gives them, and\nre-encodes block values; salvage and repair walk the frame index and\nfall back to the frame chain when the index is damaged (an index running\npast its file included, refused before anything is sized from it), while\nan environmental failure to read it is returned for a retry.\n- Read-ahead reads a block several values share once and keeps it across\na scan's batches, counting each frame a kept value pins against its\nbound, and reads no frame the cache holds, whether or not the scan fills\nit; a multi-get reads a chunked value whole in one queued read unless\nthe cache holds its head and every chunk, then it is assembled from\nthem; a range within one chunk is a view into it; values are handed out\nas views into their frame.\n- A table's blob links record the bytes of their values that share\nblocks (`import::BlobLink::block_bytes`), and tables stamp the blob\nlayout their links describe.\n- A blob file of the earlier layout and a table whose links are of it\nare refused at open and at repair with\n`Error::UnsupportedFormat(FormatPart::BlobFiles)`, whose message names\nthe release that wrote the store; garbage statistics of that layout,\nwhich outlive the files they count, decode with no block bytes. The\nconverter refuses a tree holding separated values; its conversion to\nthis layout is tracked in #1056.\n- `docs/data-integrity.md`, `docs/manifest-recovery.md` and\n`docs/INVARIANTS.md` describe frames, the frame index and block garbage\naccounting.\n- `tools/compare-rocksdb` runs both engines with values inline and in\nblob files in every group, the blob files uncompressed and at zstd level\n3 on both, each blob arm taken against RocksDB with blob files under the\nsame codec; the `blob_relocation` bench times a relocating merge of\ncompressed blob files, of whole frames and of chunked values.\n\n## Measurement\n\n`tools/compare-rocksdb` against `main` on one benchmark host, the arms\nboth sides have (`blob_tree`, `rocksdb_blob`), medians per operation:\n\n| group | `main` | this PR | RocksDB blob files |\n|---|---|---|---|\n| point_read, 1k keys | 3.91 µs | 7.66 µs | 4.90 µs |\n| point_read, 10k keys | 4.25 µs | 8.06 µs | 5.18 µs |\n| point_read, 70k keys | 4.64 µs | 9.50 µs | 5.60 µs |\n| point_read, 1 MiB values | 299 µs | 438 µs | 1300 µs |\n| point_read, 4 MiB values | 1.20 ms | 12.5 ms | 15.4 ms |\n| range_scan, 1k-70k keys | 0.69-0.72 µs | 0.46-0.48 µs | 3.08-3.27 µs |\n| range_scan, 4 MiB values | 1.25 ms | 12.5 ms | 15.4 ms |\n| multi_get, 1k-70k keys | 2.9-3.2 µs | 22-25 µs | 4.1-5.8 µs |\n| multi_get, 4 MiB values | 4.5 ms | 6.4 ms | 14.3 ms |\n\nA multi-get of values sharing a block reads, checksums and decodes that\nblock once per value in this step, which is where its time goes; reading\neach frame once and handing it to every value waiting on it comes with\nthe read-path changes below.\n\nPoint reads and multi-gets are slower than on `main` in this step: a\npoint read of a small value decodes its whole block each time, and a\nchunked value is read chunk by chunk. Caching a decoded block for point\nreads and reading a chunked value's head and chunks in one request come\nin the next PRs of the series, after which point reads are back at\n`main`'s level. Writing a frame here stages its payload in the writer's\nbuffer, one copy more than `main`, and decoding a frame of one value\nallocates its one-entry list; writing the header and the stored payload\nas separate parts, and holding a single entry in place, come with the\nread and write path changes of the series. A chunk here is a frame of\nits own, checked by its kind and length against its head, and a\nmulti-get caches a chunked value's head but not its chunks; the next PRs\ngive the head a checksum of each chunk in its place and store chunks\nafter their head without headers of their own, read whole into one\nbuffer. The sustained overwrite group has no blob arm on `main`; here\n`blob_tree` writes at 0.81 of RocksDB with blob files.\n\n## Testing\n\nFormatting, clippy in every CI configuration, nextest, doc tests, the\ndoc build, the no-std check and `tools/compare-rocksdb` clippy pass on\nLinux; CI runs its matrix on Linux, macOS and Windows.\n\nReplaces #1062 and #1060, squashed into one commit.\n\nPart of #1031\n\nBREAKING CHANGE: the blob file layout, the indirection encoding and a\ntable's blob-link records change; stores with separated values in the\nearlier layout are refused with\nError::UnsupportedFormat(FormatPart::BlobFiles). Error gains ValueRange,\nFormatPart gains BlobFiles and import::BlobLink gains block_bytes.",
+          "timestamp": "2026-11-09T21:42:42+02:00",
+          "tree_id": "447ae22a9c716b18c0074d0cf6944156bd9269dd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ff4311c3448deb8f62041daf4a647a7b7ceb6fab"
+        },
+        "date": 1794255344331,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 628.509,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 152.99803ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 329.915,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 196.644686ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1261.525,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 231.208436ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5411.95,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 20320.943,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.551,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.741823,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.404356959,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.471,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.527103,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.404429199,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
