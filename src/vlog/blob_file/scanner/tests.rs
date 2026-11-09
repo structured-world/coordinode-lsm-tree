@@ -190,6 +190,49 @@ fn a_paced_scanner_times_the_reads_that_open_it() -> crate::Result<()> {
     Ok(())
 }
 
+/// Loading a file's frame index: an environmental read failure is returned
+/// for a retry, never taken for damage, since the index may be intact and the
+/// chain walk would give up frames past damage elsewhere; a read the bytes
+/// fail falls back to the chain; an intact index is read.
+#[cfg(feature = "std")]
+#[test]
+fn an_environmental_index_read_failure_is_returned_not_walked_around() -> crate::Result<()> {
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    struct Failing(std::io::ErrorKind);
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+    }
+    impl Seek for Failing {
+        fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let (pos, len) = section(&path, b"frames")?;
+    let (data_pos, data_len) = section(&path, b"data")?;
+    let at = (pos as u64, len as u64);
+    let data = data_pos as u64..(data_pos + data_len) as u64;
+
+    let mut file = Cursor::new(std::fs::read(&path)?);
+    let index = read_frame_index(&mut file, at, data.clone())?;
+    assert_eq!(index.map(|i| i.len()), Some(4), "three frames and the end");
+
+    assert!(matches!(
+        read_frame_index(&mut Failing(std::io::ErrorKind::PermissionDenied), at, data.clone()),
+        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::PermissionDenied
+    ));
+    assert!(
+        read_frame_index(&mut Failing(std::io::ErrorKind::InvalidData), at, data)?.is_none(),
+        "a read the bytes fail walks the chain"
+    );
+    Ok(())
+}
+
 /// A copying scan checks a frame a value has to itself as stored and leaves
 /// it undecoded: its stored payload, garbage to the codec but sealed, is
 /// handed over as its frames, which a scan proving every value refuses; a

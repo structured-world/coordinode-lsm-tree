@@ -356,6 +356,60 @@ fn a_multi_get_reads_chunked_values_whose_head_is_cached_in_one_batch() -> lsm_t
     Ok(())
 }
 
+/// A chunked value whose head and chunks the cache all holds, as a point read
+/// caching what it reads leaves it, is answered from them: a multi-get reads
+/// nothing of it again.
+#[test]
+fn a_multi_get_answers_fully_cached_chunked_values_from_the_cache() -> lsm_tree::Result<()> {
+    const VALUES: usize = 4;
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(fs.clone()))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
+        .blob_cache_fill(lsm_tree::config::BlobCacheFill::Always)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(1)
+                .chunk_size(core::num::NonZeroU32::new(16 * 1_024).expect("non-zero")),
+        ))
+    };
+    let value = |i: usize| -> Vec<u8> {
+        (0..100_000_u32)
+            .map(|b| (b % 251) as u8 ^ i as u8)
+            .collect()
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..VALUES {
+            tree.insert(key_for(i), value(i), i as u64);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config().open()?;
+    let keys: Vec<String> = (0..VALUES).map(key_for).collect();
+    for key in &keys {
+        assert!(tree.get(key, SeqNo::MAX)?.is_some());
+    }
+    fs.take();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = fs.take();
+    for (i, got) in values.iter().enumerate() {
+        assert_eq!(got.as_deref(), Some(value(i).as_slice()), "key {i}");
+    }
+    assert!(
+        calls.is_empty(),
+        "the values come from the cache: {calls:?}"
+    );
+    Ok(())
+}
+
 /// A blob file that will not open fails a multi-get as it fails a read of a
 /// key alone, with the same error.
 #[test]

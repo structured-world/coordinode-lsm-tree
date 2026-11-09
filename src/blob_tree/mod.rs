@@ -345,13 +345,11 @@ impl BlobSource {
             return ValuePlan::Alone;
         };
         let vhandle = indirection.vhandle;
-        // A cached head holds none of its value: its chunks are read with it
-        // in the one queued read planned below, not one by one on the value's
-        // own path.
-        if let Some(frame) = self.cache.get_blob_frame(self.tree_id, vhandle.frame_at())
+        let cached = self.cache.get_blob_frame(self.tree_id, vhandle.frame_at());
+        if let Some(frame) = &cached
             && frame.header.kind != FrameKind::Head
         {
-            return match reader::value_in(&frame, vhandle.index, &item.key.user_key) {
+            return match reader::value_in(frame, vhandle.index, &item.key.user_key) {
                 Ok(value) => ValuePlan::Ready(value),
                 Err(_) => ValuePlan::Alone,
             };
@@ -359,6 +357,24 @@ impl BlobSource {
         let Some(blob_file) = version.blob_files.get(vhandle.blob_file_id) else {
             return ValuePlan::Alone;
         };
+        // A cached head holds none of its value. Its chunks all cached, the
+        // value's own path assembles it from them with no read; one missing
+        // any is read whole, head and chunks, in the one queued read below,
+        // not chunk by chunk on that path.
+        if let Some(head) = &cached
+            && let Ok(chunks) = reader::chunk_frames(head, vhandle.frame, blob_file.frame_count())
+            && chunks.into_iter().all(|frame| {
+                self.cache.contains_blob_frame(
+                    self.tree_id,
+                    crate::cache::BlobFrameAt {
+                        blob_file_id: vhandle.blob_file_id,
+                        frame,
+                    },
+                )
+            })
+        {
+            return ValuePlan::Alone;
+        }
         let Ok((offset, frame_len)) = reader::Reader::frame_span(blob_file, vhandle.frame) else {
             return ValuePlan::Alone;
         };

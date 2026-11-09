@@ -225,18 +225,10 @@ impl Scanner {
 
         // The index the caller trusts, else the one the file holds if it
         // reads and fits the data, else the chain.
-        let frames = match frames {
-            Some(frames) => Some(frames),
-            None => index_at.and_then(|(pos, len)| {
-                let len = usize::try_from(len).ok()?;
-                let mut bytes = alloc::vec![0_u8; len];
-                file.seek(SeekFrom::Start(pos)).ok()?;
-                file.read_exact(&mut bytes).ok()?;
-                let frames = super::writer::decode_frame_index(&bytes).ok()?;
-                let fits = frames.first().is_some_and(|&first| first >= data_start)
-                    && frames.last() == Some(&data_end);
-                fits.then_some(frames)
-            }),
+        let frames = match (frames, index_at) {
+            (Some(frames), _) => Some(frames),
+            (None, Some(at)) => read_frame_index(&mut file, at, data_start..data_end)?,
+            (None, None) => None,
         };
 
         let seek_to = start.unwrap_or(data_start);
@@ -565,6 +557,45 @@ impl Scanner {
             FrameKind::Chunk => Some(Err(crate::Error::InvalidHeader("BlobFrame"))),
         }
     }
+}
+
+/// The frame index of a file whose data section spans `data`, read from the
+/// `(position, length)` its table of contents gives it, or `None` when the
+/// index is damaged: it does not read whole, decode or fit the data, and the
+/// scan walks the frames' chain instead.
+///
+/// # Errors
+///
+/// An environmental read failure (a transient one, a permission or a
+/// resource the host ran out of): the index may well be intact, and walking
+/// the chain past damage elsewhere would give up the frames it can still
+/// place, so the caller retries instead.
+pub(crate) fn read_frame_index<F: Read + Seek>(
+    file: &mut F,
+    (pos, len): (u64, u64),
+    data: core::ops::Range<u64>,
+) -> crate::Result<Option<Arc<[u64]>>> {
+    let Ok(len) = usize::try_from(len) else {
+        return Ok(None);
+    };
+    let mut bytes = alloc::vec![0_u8; len];
+    let read = file
+        .seek(SeekFrom::Start(pos))
+        .and_then(|_| file.read_exact(&mut bytes));
+    if let Err(e) = read {
+        let e = crate::Error::from(e);
+        return if e.is_environmental() {
+            Err(e)
+        } else {
+            Ok(None)
+        };
+    }
+    let Ok(frames) = super::writer::decode_frame_index(&bytes) else {
+        return Ok(None);
+    };
+    let fits = frames.first().is_some_and(|&first| first >= data.start)
+        && frames.last() == Some(&data.end);
+    Ok(fits.then_some(frames))
 }
 
 /// One value a scan reads.

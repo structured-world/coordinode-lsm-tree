@@ -169,13 +169,16 @@ impl FragmentationMap {
     /// Decodes a manifest's statistics, `bytes` being all of them: a snapshot
     /// section or an edit's field, each checksummed whole.
     ///
+    /// Statistics of the earlier layout, whose entries lack the block bytes,
+    /// decode with none, as that layout kept no blocks. They outlive the blob
+    /// files they count, so a store whose blob files are all gone still opens;
+    /// a live blob file of that layout is refused by its own metadata.
+    ///
     /// # Errors
     ///
-    /// [`crate::Error::UnsupportedFormat`] for statistics of the earlier
-    /// layout, whose entries lack the block bytes;
     /// [`crate::Error::InvalidHeader`] for bytes that are neither layout's.
     pub(crate) fn decode_whole(bytes: &[u8]) -> crate::Result<Self> {
-        use crate::vlog::blob_file::meta::META_VERSION;
+        use crate::io::{LE, ReadBytesExt};
 
         // Id, count, bytes, frame bytes, then this layout's block bytes.
         const ENTRY_LEN: u64 = 8 + 4 + 8 + 8 + 8;
@@ -190,14 +193,22 @@ impl FragmentationMap {
         if len == count * ENTRY_LEN {
             return <Self as crate::coding::Decode>::decode_from(&mut &bytes[..]);
         }
-        if len == count * EARLIER_ENTRY_LEN {
-            return Err(crate::Error::UnsupportedFormat {
-                part: crate::error::FormatPart::BlobFiles,
-                found: Some(META_VERSION - 1),
-                expected: META_VERSION,
-            });
+        if len != count * EARLIER_ENTRY_LEN {
+            return Err(crate::Error::InvalidHeader("BlobGcStats"));
         }
-        Err(crate::Error::InvalidHeader("BlobGcStats"))
+        let mut reader = entries;
+        let mut map = crate::HashMap::with_capacity_and_hasher(
+            usize::try_from(count).unwrap_or(0),
+            rustc_hash::FxBuildHasher,
+        );
+        for _ in 0..count {
+            let id = reader.read_u64::<LE>()?;
+            let len = reader.read_u32::<LE>()? as usize;
+            let bytes = reader.read_u64::<LE>()?;
+            let on_disk_bytes = reader.read_u64::<LE>()?;
+            map.insert(id, FragmentationEntry::new(len, bytes, on_disk_bytes));
+        }
+        Ok(Self(map))
     }
 
     /// Charges the object `vptr` names as garbage in its blob file.

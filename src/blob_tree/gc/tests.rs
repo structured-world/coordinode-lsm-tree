@@ -58,13 +58,12 @@ fn frag_map_roundtrip() {
 }
 
 /// Statistics written by the earlier layout, whose entries lack the block
-/// bytes, are a format this release does not read: they are refused as such,
-/// so an open reports the store's format instead of reaching a repair over a
-/// read that ran out. Bytes that are neither layout's whole are damage.
+/// bytes, decode with none: that layout kept no blocks. They outlive the blob
+/// files they count, so a store whose blob files are all gone still opens;
+/// a live blob file of that layout is refused by its own metadata. Bytes that
+/// are neither layout's whole are damage.
 #[test]
-fn statistics_of_the_earlier_layout_are_refused_as_a_format() {
-    use crate::vlog::blob_file::meta::META_VERSION;
-
+fn statistics_of_the_earlier_layout_decode_with_no_block_bytes() {
     // The earlier entry: id, count, bytes and frame bytes.
     let mut earlier = 2_u32.to_le_bytes().to_vec();
     for id in [3_u64, 9] {
@@ -73,14 +72,16 @@ fn statistics_of_the_earlier_layout_are_refused_as_a_format() {
         earlier.extend_from_slice(&400_u64.to_le_bytes());
         earlier.extend_from_slice(&200_u64.to_le_bytes());
     }
-    assert!(matches!(
-        FragmentationMap::decode_whole(&earlier),
-        Err(crate::Error::UnsupportedFormat {
-            part: crate::FormatPart::BlobFiles,
-            found: Some(found),
-            expected: META_VERSION,
-        }) if found == META_VERSION - 1
-    ));
+    let expected = FragmentationMap({
+        let mut map = HashMap::default();
+        map.insert(3, FragmentationEntry::new(4, 400, 200));
+        map.insert(9, FragmentationEntry::new(4, 400, 200));
+        map
+    });
+    assert_eq!(
+        FragmentationMap::decode_whole(&earlier).ok(),
+        Some(expected)
+    );
 
     let map = FragmentationMap({
         let mut map = HashMap::default();

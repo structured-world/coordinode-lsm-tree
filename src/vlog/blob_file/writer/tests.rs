@@ -344,6 +344,23 @@ fn verbatim_frames_that_are_not_one_value_are_refused() -> crate::Result<()> {
             "a chunk that is not one whole frame"
         );
     }
+    // A byte past the head leaves its chunk count readable, so only the
+    // length check refuses it.
+    let mut longer_head = head.to_vec();
+    longer_head.push(0);
+    assert!(
+        refused(w.write_verbatim(
+            b"big",
+            &[
+                crate::Slice::from(longer_head),
+                chunk.clone(),
+                frame(3),
+                frame(4)
+            ],
+            700
+        )),
+        "a head with a byte past its frame"
+    );
     assert!(
         refused(w.write_verbatim(
             b"big",
