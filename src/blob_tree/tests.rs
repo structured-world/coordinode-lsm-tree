@@ -176,6 +176,37 @@ fn a_scan_not_caching_reads_ahead_into_its_own_store() -> crate::Result<()> {
     Ok(())
 }
 
+/// A scan set not to cache what it reads still serves the frames the cache
+/// holds from it: its read-ahead plans no read of a frame the cache has, so
+/// values cached while the tree cached them are read again from nowhere.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_scan_not_caching_reads_nothing_the_cache_holds() -> crate::Result<()> {
+    const KEYS: u32 = 64;
+
+    let folder = crate::get_tmp_folder();
+    let (tree, _cache) = blob_tree_with_cache(&folder, KEYS, crate::config::BlobCacheFill::Always)?;
+    read_everything(&tree, KEYS)?;
+    tree.update_runtime_config(|c| c.blob_cache_fill = crate::config::BlobCacheFill::Never)?;
+
+    let reads = tree.metrics().blob_read_count();
+    let prefetched = tree.metrics().blob_bytes_prefetched();
+    for item in tree.iter(crate::SeqNo::MAX, None) {
+        assert_eq!(item.into_inner()?.1.len(), 4 * 1_024);
+    }
+    assert_eq!(
+        tree.metrics().blob_read_count(),
+        reads,
+        "no frame read again"
+    );
+    assert_eq!(
+        tree.metrics().blob_bytes_prefetched(),
+        prefetched,
+        "nothing read ahead"
+    );
+    Ok(())
+}
+
 /// A row's guard takes out of the scan's store exactly the values its row
 /// names: an indirection takes its value, and a row whose indirection or cell
 /// references do not decode takes nothing, leaving its resolution, and the

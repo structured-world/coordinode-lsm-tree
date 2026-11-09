@@ -449,12 +449,12 @@ impl<'a> Accessor<'a> {
         }
 
         // One entry per frame to read: frames already held need no read, and
-        // the values of one block share their frame.
+        // the values of one block share their frame. A read that does not fill
+        // the cache is still served from it, so a cached frame is held either way.
         items.retain(|(_, vhandle, _)| {
-            let held = match &into {
-                PrefetchInto::Cache => cache.contains_blob_frame(tree_id, vhandle.frame_at()),
-                PrefetchInto::Local(store) => store.frames.contains_key(&vhandle.frame_at()),
-            };
+            let at = vhandle.frame_at();
+            let held = cache.contains_blob_frame(tree_id, at)
+                || matches!(&into, PrefetchInto::Local(store) if store.frames.contains_key(&at));
             !held && self.blob_files.get(vhandle.blob_file_id).is_some()
         });
         let key =
