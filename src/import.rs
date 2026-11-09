@@ -605,157 +605,6 @@ impl TableImport {
     }
 }
 
-/// A blob file being written from value frames another store holds: each
-/// value as stored, under the file's codec, at the offset the source held it,
-/// so every value handle that names it still does.
-pub struct BlobFileImport {
-    writer: crate::vlog::blob_file::writer::Writer,
-    fs: Arc<dyn Fs>,
-    restriction: Option<BlobFileRestriction>,
-}
-
-/// A source blob file whose values below a frontier were reclaimed.
-///
-/// The imported file is restricted the same way: its first live value's
-/// offset, and what the source's metadata counts over the whole file as
-/// written. The garbage a file is charged with includes its reclaimed values,
-/// so it is measured against these totals and not against the values the
-/// import carries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlobFileRestriction {
-    /// The offset of the first live value.
-    pub live_from: u64,
-    /// Values the source file was written with.
-    pub item_count: u64,
-    /// Their bytes as stored.
-    pub compressed_bytes: u64,
-    /// Their bytes once decompressed.
-    pub uncompressed_bytes: u64,
-    /// The first key the source file was written with.
-    pub first_key: crate::UserKey,
-    /// The last key the source file was written with.
-    pub last_key: crate::UserKey,
-}
-
-impl BlobFileImport {
-    /// Starts blob file `id` at `path`, holding values compressed with
-    /// `compression` and recording `created_at` as its age. A source whose
-    /// values below a frontier were reclaimed gets the same `restriction`: its
-    /// first value lands at the frontier, the file is restricted to what
-    /// follows, and its metadata records the source's totals.
-    ///
-    /// # Errors
-    ///
-    /// Returns any error creating the file.
-    pub fn create(
-        path: &Path,
-        id: crate::vlog::BlobFileId,
-        fs: Arc<dyn Fs>,
-        compression: CompressionType,
-        created_at: u128,
-        restriction: Option<BlobFileRestriction>,
-    ) -> crate::Result<Self> {
-        let mut writer = crate::vlog::blob_file::writer::Writer::open(
-            path,
-            id,
-            0,
-            &*fs,
-            Some(crate::fs::WriteOrigin::IngestBlob),
-        )?;
-        // The values arrive compressed: the writer stores them as they are and
-        // records their codec.
-        writer.metadata_compression_override = Some(compression);
-        writer.created_at = Some(created_at);
-        // The previous format records no lifetime class: every value it holds
-        // is of class 0, the writer's own.
-        writer.write_filler(restriction.as_ref().map_or(0, |r| r.live_from))?;
-        Ok(Self {
-            writer,
-            fs,
-            restriction,
-        })
-    }
-
-    /// Appends one value as stored, which must land at `offset`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::InvalidHeader`] when the value would land at
-    /// another offset, which would leave every later handle naming the wrong
-    /// bytes, and any error writing it.
-    pub fn append(
-        &mut self,
-        offset: u64,
-        key: &[u8],
-        seqno: SeqNo,
-        stored: &[u8],
-        uncompressed_len: u32,
-    ) -> crate::Result<()> {
-        if self.writer.offset() != offset || key.is_empty() || u16::try_from(key.len()).is_err() {
-            return Err(crate::Error::InvalidHeader("imported blob frame"));
-        }
-        self.writer
-            .write_raw(key, seqno, stored, uncompressed_len)?;
-        Ok(())
-    }
-
-    /// Finishes the file and returns the checksum its manifest entry records:
-    /// of the whole file, or of what follows the frontier for a restricted
-    /// one, whose prefix is then punched where the filesystem can.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::InvalidHeader`] for a file that received no
-    /// value, or for a restricted one that received more than its source's
-    /// totals count, and any error writing its metadata or hashing its suffix.
-    pub fn finish(mut self) -> crate::Result<Checksum> {
-        if self.writer.item_count == 0 {
-            return Err(crate::Error::InvalidHeader(
-                "imported blob file holds no values",
-            ));
-        }
-        let live_from = match self.restriction.take() {
-            None => 0,
-            Some(source) => {
-                // The live suffix is part of what the source counted.
-                if self.writer.item_count > source.item_count
-                    || self.writer.written_blob_bytes > source.compressed_bytes
-                    || self.writer.uncompressed_bytes > source.uncompressed_bytes
-                {
-                    return Err(crate::Error::InvalidHeader("imported blob file totals"));
-                }
-                self.writer.item_count = source.item_count;
-                self.writer.written_blob_bytes = source.compressed_bytes;
-                self.writer.uncompressed_bytes = source.uncompressed_bytes;
-                self.writer.first_key = Some(source.first_key);
-                self.writer.last_key = source.last_key.to_vec();
-                source.live_from
-            }
-        };
-        let path = self.writer.path.clone();
-        let (_, checksum) = self.writer.finish()?;
-        let checksum = if live_from == 0 {
-            checksum
-        } else {
-            // The digest every reader of a restricted entry checks; taken
-            // before the punch, which leaves the suffix as it is.
-            let suffix = Checksum::from_raw(crate::repair::compute_table_checksum_from(
-                &*self.fs, &path, live_from,
-            )?);
-            if self.fs.capabilities(&path).punch_hole {
-                self.fs.punch_hole(&path, 0, live_from)?;
-            }
-            suffix
-        };
-        crate::file::fsync_directory(
-            crate::file::entry_directory(&path),
-            &*self.fs,
-            crate::fs::SyncMode::default(),
-        )?;
-        Ok(checksum)
-    }
-}
-
 /// One table as the imported manifest places it.
 #[derive(Clone, Copy, Debug)]
 pub struct TablePlacement {
@@ -796,11 +645,10 @@ pub fn store_dictionary(
 pub struct BlobFilePlacement {
     /// The blob file's id, also its file name in the blobs folder.
     pub id: crate::vlog::BlobFileId,
-    /// The checksum [`BlobFileImport::finish`] returned.
+    /// The checksum its writer returned.
     pub checksum: Checksum,
-    /// What it holds that no table references any more: objects, bytes as
-    /// counted, bytes as stored.
-    pub stale: (usize, u64, u64),
+    /// What it holds that no table references any more.
+    pub stale: crate::blob_tree::FragmentationEntry,
     /// The offset of its first live value: `0`, or the frontier below which a
     /// tight-space relocation reclaimed the source file.
     pub live_from: u64,
@@ -882,8 +730,11 @@ pub struct BlobLink {
     pub len: usize,
     /// Bytes of those objects, before compression.
     pub bytes: u64,
-    /// Bytes of those objects, as stored.
+    /// Bytes of the frames of their own those objects take.
     pub on_disk_bytes: u64,
+    /// Entries of those objects that share a block, before compression:
+    /// their part of the file's blocks is what they take.
+    pub block_bytes: u64,
 }
 
 impl RecordedTable {
@@ -897,6 +748,7 @@ impl RecordedTable {
                 len: link.len,
                 bytes: link.bytes,
                 on_disk_bytes: link.on_disk_bytes,
+                block_bytes: link.block_bytes,
             })
             .collect();
         blob_links.sort_unstable_by_key(|link| link.blob_file_id);
@@ -1022,12 +874,8 @@ pub fn install_manifest(
         .collect::<crate::Result<Vec<_>>>()?;
     let mut gc_stats = crate::blob_tree::FragmentationMap::default();
     for file in &image.blob_files {
-        if file.stale != (0, 0, 0) {
-            let (len, bytes, on_disk_bytes) = file.stale;
-            gc_stats.insert(
-                file.id,
-                crate::blob_tree::FragmentationEntry::new(len, bytes, on_disk_bytes),
-            );
+        if file.stale != crate::blob_tree::FragmentationEntry::new(0, 0, 0) {
+            gc_stats.insert(file.id, file.stale);
         }
     }
 

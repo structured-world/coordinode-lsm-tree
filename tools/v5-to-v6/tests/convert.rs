@@ -412,27 +412,51 @@ fn a_converted_store_with_crc32c_footers_answers_as_the_source_did()
     )
 }
 
-/// A tree that separates values: its blob files are carried value by value at
-/// their offsets, so every handle in the tables still resolves, and each
-/// table's links to them arrive with the same counts.
+/// A tree that separates values is refused before anything is written, its
+/// source left as it was: 6.0 names a separated value by the frame that holds
+/// it where 5.x named it by offset, a rewrite of every blob file and of every
+/// handle to it that this converter does not do.
 #[test]
-fn a_converted_blob_tree_answers_as_the_source_did() -> Result<(), Box<dyn std::error::Error>> {
-    round_trip_checked(
+fn a_blob_tree_is_refused_and_left_as_it_was() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    write_row_store(
+        folder.path(),
         300,
         |config| {
             config.with_kv_separation(Some(
                 lsm5::KvSeparationOptions::default().separation_threshold(4),
             ))
         },
-        |folder| {
-            let state = lsm5::export::read_manifest(folder, &lsm5::fs::StdFs, None)?;
-            assert!(
-                state.blob_files.len() > 1,
-                "the fixture holds several blob files"
-            );
-            Ok(())
-        },
-    )
+        |_| {},
+    )?;
+    let state = lsm5::export::read_manifest(folder.path(), &lsm5::fs::StdFs, None)?;
+    assert!(!state.blob_files.is_empty(), "the fixture separates values");
+    let open = OpenWith {
+        separated: true,
+        ..OpenWith::default()
+    };
+    let expected = read_v5(folder.path(), 300, &open)?;
+
+    let refused = v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default());
+    assert!(
+        matches!(
+            refused,
+            Err(v5_to_v6::Error::Unsupported(
+                "a tree holding separated values"
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !folder.path().join("v6-convert").exists(),
+        "nothing was staged"
+    );
+    assert_eq!(
+        read_v5(folder.path(), 300, &open)?,
+        expected,
+        "the source answers as it did"
+    );
+    Ok(())
 }
 
 /// An encrypted store: every block is decrypted by the 5.x read path and
@@ -624,203 +648,6 @@ fn write_restricted_store(to: &Path, keys: u32) -> Result<(), Box<dyn std::error
     Err(format!("no stop left a restricted table ({last})").into())
 }
 
-/// A 5.x blob tree whose tight-space defragmentation stopped after its first
-/// relocation slice: the stale blob file it consumed a prefix of stays in the
-/// manifest behind a frontier. Built, stopped and copied out as
-/// [`write_restricted_store`] does.
-fn write_restricted_blob_store(to: &Path, keys: u32) -> Result<(), Box<dyn std::error::Error>> {
-    use lsm5::AbstractTree as _;
-    // Values that do not compress, so the relocation's transient space is real.
-    let value = |i: u32, generation: u64| -> Vec<u8> {
-        let mut s = (u64::from(i) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (generation << 1);
-        (0..200)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                s.to_le_bytes()[3]
-            })
-            .collect()
-    };
-    let named = tempfile::tempdir()?;
-    let root = named.path();
-    let mut last = String::new();
-    for skip in 0..16 {
-        let mem = lsm5::fs::MemFs::with_capacity(u64::MAX);
-        let crash = lsm5::fs::CrashFs::new(mem.clone());
-        let fs = lsm5::fs::FaultFs::new(crash.clone());
-        let injector = fs.injector();
-        let shared: std::sync::Arc<dyn lsm5::fs::Fs> = std::sync::Arc::new(fs);
-        let tree = match lsm5::Config::new(
-            root,
-            lsm5::SequenceNumberCounter::default(),
-            lsm5::SequenceNumberCounter::default(),
-        )
-        .with_shared_fs(shared.clone())
-        .with_kv_separation(Some(
-            lsm5::KvSeparationOptions::default()
-                .separation_threshold(64)
-                // Every half-dead file is stale, and there are several of them.
-                .age_cutoff(1.0)
-                .staleness_threshold(0.1)
-                .file_target_size(48 * 1024),
-        ))
-        .open()
-        .map_err(|e| format!("opening the in-memory store: {e:?}"))?
-        {
-            lsm5::AnyTree::Blob(tree) => tree,
-            lsm5::AnyTree::Standard(_) => return Err("a blob tree was opened".into()),
-        };
-        let keys64 = u64::from(keys);
-        for i in 0..keys {
-            tree.insert(format!("k{i:05}"), value(i, 1), u64::from(i) + 1);
-        }
-        tree.flush_active_memtable(0)?;
-        // Every other key overwritten: each first-generation file is half dead.
-        for i in (0..keys).step_by(2) {
-            tree.insert(format!("k{i:05}"), value(i, 2), keys64 + u64::from(i) + 1);
-        }
-        tree.flush_active_memtable(0)?;
-        let watermark = 4 * keys64;
-        tree.index.update_runtime_config(|c| {
-            c.storage_admission_check = true;
-            c.storage_limit_bytes = None;
-        })?;
-        // A merge with room learns which blobs are dead.
-        tree.major_compact(64 * 1024 * 1024, watermark)?;
-        let used = tree.storage_stats()?.used_bytes;
-        mem.set_capacity(used + used / 4);
-        tree.index
-            .update_runtime_config(|c| c.tight_space_compaction = true)?;
-        injector.arm(
-            lsm5::fs::FaultRule::new(
-                lsm5::fs::FaultOp::SyncAll,
-                lsm5::fs::Fault::Error(lsm5::io::ErrorKind::Other),
-            )
-            .on_path("edits-")
-            .skip(skip)
-            .once(),
-        );
-        let stopped = tree.major_compact(64 * 1024 * 1024, watermark).is_err();
-        drop(tree);
-        injector.clear();
-        if !stopped {
-            last = format!("skip {skip}: the compaction was not stopped");
-            continue;
-        }
-        crash.crash();
-        let durable = crash.inner();
-        match lsm5::export::read_manifest(root, &*durable, None) {
-            Ok(state) if !state.blob_restrictions.is_empty() => {
-                let present = |folder: &str, id: u64| {
-                    durable
-                        .exists(&root.join(folder).join(id.to_string()))
-                        .unwrap_or(false)
-                };
-                let all_present = state
-                    .levels
-                    .iter()
-                    .flatten()
-                    .flatten()
-                    .all(|t| present("tables", t.id))
-                    && state.blob_files.iter().all(|b| present("blobs", b.id));
-                if all_present {
-                    copy_out(&*durable, root, to)?;
-                    return Ok(());
-                }
-                last = format!("skip {skip}: a file the manifest names is gone");
-            }
-            Ok(_) => last = format!("skip {skip}: no blob file is restricted"),
-            Err(e) => last = format!("skip {skip}: {e}"),
-        }
-    }
-    Err(format!("no stop left a restricted blob file ({last})").into())
-}
-
-/// A blob file a tight-space relocation reclaimed below a frontier: its live
-/// values are carried at their offsets past it, and the converted file is
-/// restricted to them, as every value handle of the tables expects.
-#[test]
-fn a_converted_store_with_a_restricted_blob_file_answers_as_the_source_did()
--> Result<(), Box<dyn std::error::Error>> {
-    let keys = 2_000;
-    let folder = tempfile::tempdir()?;
-    write_restricted_blob_store(folder.path(), keys)?;
-    let open = OpenWith {
-        separated: true,
-        ..OpenWith::default()
-    };
-    let expected = read_v5(folder.path(), keys, &open)
-        .map_err(|e| format!("reading the copied store: {e:?}"))?;
-    let state = lsm5::export::read_manifest(folder.path(), &lsm5::fs::StdFs, None)?;
-    let mut live_past_frontier = 0;
-    for (id, from) in &state.blob_restrictions {
-        let record = state
-            .blob_files
-            .iter()
-            .find(|b| b.id == *id)
-            .ok_or("a restricted blob file is recorded")?;
-        let blob = lsm5::export::BlobFileExport::open(
-            &folder.path().join("blobs").join(id.to_string()),
-            record,
-            *from,
-            std::sync::Arc::new(lsm5::fs::StdFs),
-        )?;
-        if *from > 0 && !blob.frames()?.is_empty() {
-            live_past_frontier += 1;
-        }
-    }
-    assert!(
-        live_past_frontier > 0,
-        "the copied store holds a blob file restricted past its start that still serves values"
-    );
-
-    assert!(
-        expected.iter().any(Snapshot::holds_data),
-        "the fixture holds data at the snapshots read"
-    );
-
-    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
-    assert_eq!(read_v6(folder.path(), keys, &open)?, expected);
-    Ok(())
-}
-
-/// A restricted blob file keeps the totals its source counted over the whole
-/// file, the reclaimed prefix included, which its garbage statistics are
-/// charged against: it is exactly as stale as the source. The fixture's
-/// files are about half stale, so under a 0.9 threshold none is relocated,
-/// and a merge that drops no version leaves every charge where it was.
-#[test]
-fn a_converted_restricted_blob_file_is_as_stale_as_its_source()
--> Result<(), Box<dyn std::error::Error>> {
-    use lsm6::AbstractTree as _;
-    let keys = 2_000;
-    let folder = tempfile::tempdir()?;
-    write_restricted_blob_store(folder.path(), keys)?;
-    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
-
-    let tree = lsm6::Config::new(
-        folder.path(),
-        lsm6::SequenceNumberCounter::default(),
-        lsm6::SequenceNumberCounter::default(),
-    )
-    .with_kv_separation(Some(
-        lsm6::KvSeparationOptions::default()
-            .age_cutoff(1.0)
-            .staleness_threshold(0.9),
-    ))
-    .open()?;
-    let stale = tree.stale_blob_bytes();
-    assert!(stale > 0, "the converted store carries its garbage charges");
-    tree.major_compact(64 * 1024 * 1024, 0)?;
-    assert_eq!(
-        tree.stale_blob_bytes(),
-        stale,
-        "no blob file under the threshold is relocated"
-    );
-    Ok(())
-}
-
 /// A table a tight-space compaction restricted: its live blocks are carried,
 /// the reclaimed ones are not read, and the restriction keeps hiding the keys
 /// below its bound that the first carried block still holds.
@@ -908,38 +735,6 @@ fn a_converted_store_with_a_dictionary_answers_as_the_source_did()
                 .map(lsm5::export::TableExport::properties)
                 .collect::<lsm5::Result<Vec<_>>>()?;
             assert!(properties.iter().all(|p| p.data_compression == codec));
-            Ok(())
-        },
-    )
-}
-
-/// Blob files whose values are compressed against a dictionary keep it too.
-#[test]
-fn a_converted_blob_tree_with_a_dictionary_answers_as_the_source_did()
--> Result<(), Box<dyn std::error::Error>> {
-    let dict = std::sync::Arc::new(lsm5::ZstdDictionary::new(&dictionary_bytes()));
-    let codec = lsm5::CompressionType::zstd_dict(3, dict.id())?;
-    round_trip_tuned(
-        300,
-        None,
-        |config| {
-            config.zstd_dictionary(Some(dict)).with_kv_separation(Some(
-                lsm5::KvSeparationOptions::default().separation_threshold(4),
-            ))
-        },
-        |runtime| runtime.blob_compression = codec,
-        |folder| {
-            let state = lsm5::export::read_manifest(folder, &lsm5::fs::StdFs, None)?;
-            for record in &state.blob_files {
-                let blob = lsm5::export::BlobFileExport::open(
-                    &folder.join("blobs").join(record.id.to_string()),
-                    record,
-                    0,
-                    std::sync::Arc::new(lsm5::fs::StdFs),
-                )?;
-                assert_eq!(blob.compression(), codec);
-            }
-            assert!(!state.blob_files.is_empty(), "the fixture separates values");
             Ok(())
         },
     )

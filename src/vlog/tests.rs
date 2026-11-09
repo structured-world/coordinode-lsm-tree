@@ -110,6 +110,98 @@ fn recover_blob_file_on_non_blob_file_errors() {
     assert!(result.is_err(), "recovering a non-blob file must fail");
 }
 
+/// A blob file of this layout missing its frame index, or missing its
+/// metadata, is damage the recovery reports, never a file it opens.
+#[test]
+fn a_blob_file_missing_a_section_is_unrecoverable() -> crate::Result<()> {
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    for section in [&b"frames"[..], b"meta"] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("7");
+        let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+        writer.write(b"key", 0, b"value")?;
+        let (_, checksum, _) = writer.finish()?;
+        crate::test_forge::forge_section_omitted(&path, section)?;
+
+        let result = recover_blob_file(
+            path.as_path(),
+            7,
+            checksum,
+            0,
+            &fs,
+            #[cfg(zstd_any)]
+            &no_dicts(),
+        );
+        assert!(
+            matches!(result, Err(crate::Error::Unrecoverable)),
+            "a file without its {} section",
+            String::from_utf8_lossy(section),
+        );
+    }
+    Ok(())
+}
+
+/// A frame index the table of contents says runs past the file is damage the
+/// open reports, before anything is sized from the length it names.
+#[test]
+fn a_frame_index_running_past_the_file_is_unrecoverable() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"key", 0, b"value")?;
+    writer.finish()?;
+    crate::test_forge::forge_section_len(&path, b"frames", u64::MAX / 2)?;
+
+    let mut file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    assert!(matches!(
+        read_meta_and_frames(&mut file, 7),
+        Err(crate::Error::Unrecoverable)
+    ));
+    Ok(())
+}
+
+/// A frame index that checks but does not span the data section, its last
+/// frame running far past the file, is damage the open reports: no read is
+/// ever sized from a span it names.
+#[test]
+fn a_frame_index_off_the_data_section_is_unrecoverable() -> crate::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"key", 0, b"value")?;
+    writer.finish()?;
+    let (index_pos, starts) = {
+        let reader = crate::sfa::Reader::new(&path)?;
+        let (pos, len) = reader
+            .toc()
+            .section(b"frames")
+            .map(|s| (s.pos(), s.len()))
+            .unwrap_or_default();
+        let bytes = std::fs::read(&path)?;
+        let at = usize::try_from(pos).unwrap_or_default();
+        let len = usize::try_from(len).unwrap_or_default();
+        let starts =
+            blob_file::writer::decode_frame_index(bytes.get(at..at + len).unwrap_or_default())?;
+        (pos, starts)
+    };
+    let frames: Vec<u64> = starts.iter().copied().take(starts.len() - 1).collect();
+    let index = blob_file::writer::encode_frame_index(&frames, 1 << 40);
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(index_pos))?;
+        file.write_all(&index)?;
+    }
+
+    let mut file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    assert!(matches!(
+        read_meta_and_frames(&mut file, 7),
+        Err(crate::Error::Unrecoverable)
+    ));
+    Ok(())
+}
+
 /// The views a tight-space relocation restricts a blob file to one after
 /// another punch only above what the view before finished, from the aligned
 /// edge under it, instead of the whole relocated prefix on every slice.
@@ -124,7 +216,7 @@ fn successive_blob_views_punch_only_above_what_the_last_one_finished() -> crate:
     let path = root.join("0");
     {
         let fs_dyn: Arc<dyn Fs> = Arc::new(memfs.clone());
-        let mut w = super::blob_file::writer::Writer::new(path.clone(), 0, 0, &*fs_dyn)?;
+        let mut w = super::blob_file::writer::Writer::one_frame_each(path.clone(), 0, 0, &*fs_dyn)?;
         for i in 0..3_000u32 {
             w.write(
                 format!("k{i:06}").as_bytes(),
@@ -198,7 +290,7 @@ fn blob_punch_on_drop_retains_the_reclaim_when_the_link_probe_cannot_answer() ->
     let path = root.join("0");
     {
         let fs_dyn: Arc<dyn Fs> = Arc::new(memfs.clone());
-        let mut w = super::blob_file::writer::Writer::new(path.clone(), 0, 0, &*fs_dyn)?;
+        let mut w = super::blob_file::writer::Writer::one_frame_each(path.clone(), 0, 0, &*fs_dyn)?;
         w.write(b"a", 1, &[b'x'; 64])?;
         w.write(b"b", 2, &[b'y'; 64])?;
         w.finish()?;
@@ -276,7 +368,7 @@ fn a_pinned_blob_file_waits_for_its_pin() -> crate::Result<()> {
     memfs.create_dir_all(&root)?;
     let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
     let write = |path: &std::path::Path| -> crate::Result<()> {
-        let mut w = super::blob_file::writer::Writer::new(path, 0, 0, &*fs)?;
+        let mut w = super::blob_file::writer::Writer::one_frame_each(path, 0, 0, &*fs)?;
         w.write(b"a", 1, &[b'x'; 64])?;
         w.write(b"b", 2, &[b'y'; 64])?;
         w.finish()?;
@@ -670,8 +762,11 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
+        // Blocks of sixteen values, so the file holds four.
         .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(64),
+            KvSeparationOptions::default()
+                .separation_threshold(64)
+                .block_size(4096),
         ))
     };
     {
@@ -709,11 +804,19 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
     };
     // The frontier must land on a FRAME boundary, as a real relocation's does:
     // a punch inside a frame leaves an unparseable record and the file is
-    // rejected outright rather than recovered restricted.
-    let frontier = super::BlobFileScanner::new(&blob, &*memfs, 0)?
-        .next()
-        .expect("the blob file holds at least one frame")?
-        .frame_end;
+    // rejected outright rather than recovered restricted. The first block is
+    // consumed with its last value.
+    let mut frontier = data_start;
+    for entry in super::BlobFileScanner::new(&blob, &*memfs, 0)? {
+        frontier = entry?.frame_end;
+        if frontier > data_start {
+            break;
+        }
+    }
+    assert!(
+        frontier > data_start,
+        "the first block ends before the data"
+    );
 
     // Punch, then rebuild the manifest from the on-disk geometry so the
     // frontier is COMMITTED, exactly as a completed relocation leaves it.

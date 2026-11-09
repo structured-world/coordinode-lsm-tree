@@ -140,6 +140,116 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
     Ok(())
 }
 
+/// A blob tree installed from an image records each table's blob links, the
+/// entries its values keep in shared blocks apart from frames of their own,
+/// and carries over the stale bytes the image gives each blob file.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn an_imported_blob_tree_records_its_links_and_stale_bytes() -> crate::Result<()> {
+    use crate::AbstractTree as _;
+    use crate::version::recovery::{log_id_of, snapshot_id_of};
+
+    let folder = crate::get_tmp_folder();
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::StdFs);
+    let comparator: SharedComparator = Arc::new(crate::DefaultUserComparator);
+    let config = || {
+        crate::Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            crate::KvSeparationOptions::default().separation_threshold(1),
+        ))
+    };
+    // Small values, in a shared block of one blob file.
+    let (table, blob_file) = {
+        let crate::AnyTree::Blob(tree) = config().open()? else {
+            panic!("a tree with kv separation opens as a blob tree");
+        };
+        for i in 0..16_u32 {
+            tree.insert(format!("k{i:02}"), format!("value {i}"), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+        let version = tree.current_version();
+        let table = version.iter_tables().next().cloned().expect("one table");
+        let blob_file = version
+            .blob_files
+            .iter()
+            .next()
+            .cloned()
+            .expect("one blob file");
+        (
+            (table.id(), table.checksum()),
+            (blob_file.id(), blob_file.checksum()),
+        )
+    };
+    for entry in fs.read_dir(folder.path())? {
+        if snapshot_id_of(&entry.file_name)
+            .or_else(|| log_id_of(&entry.file_name))
+            .is_some()
+        {
+            fs.remove_file(&entry.path)?;
+        }
+    }
+
+    let stale = crate::blob_tree::FragmentationEntry::new(1, 7, 7);
+    let tables = folder.path().join(crate::file::TABLES_FOLDER);
+    let mut levels = vec![Vec::new(); 7];
+    levels[0] = vec![vec![TablePlacement {
+        id: table.0,
+        checksum: table.1,
+        global_seqno: 0,
+        recency: table.0,
+    }]];
+    let recorded = install_manifest(
+        folder.path(),
+        &|_| tables.clone(),
+        &ManifestImage {
+            tree_type: TreeType::Blob,
+            version_id: 0,
+            levels,
+            blob_files: vec![BlobFilePlacement {
+                id: blob_file.0,
+                checksum: blob_file.1,
+                stale,
+                live_from: 0,
+            }],
+            restrictions: Vec::new(),
+            retention_floor: 0,
+            dicts: Vec::new(),
+            comparator_name: "default",
+        },
+        &fs,
+        &comparator,
+        None,
+        #[cfg(zstd_any)]
+        &crate::compression::ZstdDictionaries::new(),
+    )?;
+    let [recorded] = recorded.as_slice() else {
+        panic!("one table recorded");
+    };
+    let [link] = recorded.blob_links.as_slice() else {
+        panic!("one blob link");
+    };
+    assert_eq!((link.blob_file_id, link.len), (blob_file.0, 16));
+    assert!(link.block_bytes > 0, "its values share a block");
+    assert_eq!(link.on_disk_bytes, 0, "no value has a frame of its own");
+
+    let crate::AnyTree::Blob(tree) = config().open()? else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    assert_eq!(
+        tree.current_version().gc_stats().get(&blob_file.0),
+        Some(&stale)
+    );
+    assert_eq!(
+        tree.get("k03", SeqNo::MAX)?.as_deref(),
+        Some(&b"value 3"[..])
+    );
+    Ok(())
+}
+
 /// A valid-looking membership solution: 128 slots of `r = 8` in blocks of 64.
 fn burr_image() -> BurrImage {
     BurrImage {
@@ -222,40 +332,4 @@ fn locator_section_refuses_a_solution_it_cannot_address_with() {
         solution,
     };
     assert!(refused(&wrong_split), "block and slot bits other than r");
-}
-
-/// A restricted blob file's reclaimed prefix is skipped, not written: on a
-/// filesystem with sparse files it takes no space while the import runs, so
-/// a large frontier needs no room for it.
-#[cfg(unix)]
-#[test]
-fn restricted_blob_file_import_leaves_its_prefix_unwritten() -> crate::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-    let folder = crate::get_tmp_folder();
-    let path = folder.path().join("1");
-    let live_from = 64 * 1024 * 1024;
-    let fs: Arc<dyn Fs> = Arc::new(crate::fs::StdFs);
-    let mut file = BlobFileImport::create(
-        &path,
-        1,
-        fs,
-        CompressionType::None,
-        1,
-        Some(BlobFileRestriction {
-            live_from,
-            item_count: 2,
-            compressed_bytes: 10,
-            uncompressed_bytes: 10,
-            first_key: UserKey::from("a"),
-            last_key: UserKey::from("b"),
-        }),
-    )?;
-    file.append(live_from, b"b", 1, b"value", 5)?;
-    let allocated = std::fs::metadata(&path)?.blocks() * 512;
-    assert!(
-        allocated < live_from / 16,
-        "{allocated} bytes allocated for a {live_from}-byte prefix"
-    );
-    file.finish()?;
-    Ok(())
 }

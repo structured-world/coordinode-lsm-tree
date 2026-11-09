@@ -16,6 +16,51 @@ fn u32_f(mut buf: &[u8]) -> u32 {
     buf.read_u32::<BE>().unwrap()
 }
 
+/// A filter reading a value split into chunks gets the whole value, gathered
+/// out of its chunks, as a read of the key does.
+#[test]
+fn a_filter_reads_a_chunked_value_whole() -> lsm_tree::Result<()> {
+    struct Filter(Arc<Mutex<Option<Vec<u8>>>>);
+    impl CompactionFilter for Filter {
+        fn filter_item(
+            &mut self,
+            item: ItemAccessor<'_>,
+            _ctx: &CompactionFilterContext,
+        ) -> lsm_tree::Result<Verdict> {
+            *self.0.lock().unwrap() = Some(item.value()?.to_vec());
+            Ok(Verdict::Keep)
+        }
+    }
+    struct FilterFactory(Arc<Mutex<Option<Vec<u8>>>>);
+    impl Factory for FilterFactory {
+        fn name(&self) -> &str {
+            "chunked"
+        }
+        fn make_filter(&self, _ctx: &CompactionFilterContext) -> Box<dyn CompactionFilter> {
+            Box::new(Filter(self.0.clone()))
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(None));
+    let folder = get_tmp_folder();
+    let tree = lsm_tree::Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(2)))
+    .with_compaction_filter_factory(Some(Arc::new(FilterFactory(seen.clone()))))
+    .open()?;
+    // Three chunks of the default size and part of a fourth.
+    let value: Vec<u8> = (0..800 * 1_024).map(|i| (i % 251) as u8).collect();
+    tree.insert("big", &value, 0);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, SeqNo::MAX)?;
+
+    assert_eq!(seen.lock().unwrap().as_deref(), Some(value.as_slice()));
+    Ok(())
+}
+
 fn filter_basic(blob: bool) -> lsm_tree::Result<()> {
     struct FilterState {
         expect_blob: bool,

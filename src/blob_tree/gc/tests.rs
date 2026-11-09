@@ -1,5 +1,6 @@
 use super::*;
 use crate::HashMap;
+use crate::blob_tree::handle::Stored;
 use crate::{
     ValueType,
     coding::{Decode, Encode},
@@ -14,73 +15,39 @@ fn frag_map_merge_into() {
     let mut map = FragmentationMap(HashMap::default());
     map.0.insert(
         0,
-        FragmentationEntry {
-            len: 1,
-            bytes: 1_000,
-            on_disk_bytes: 500,
-        },
+        FragmentationEntry::new(1, 1_000, 500).with_block_bytes(10),
     );
-    map.0.insert(
-        1,
-        FragmentationEntry {
-            len: 2,
-            bytes: 2_000,
-            on_disk_bytes: 1_000,
-        },
-    );
+    map.0.insert(1, FragmentationEntry::new(2, 2_000, 1_000));
 
     // test merge_into
     let mut diff = FragmentationMap(HashMap::default());
     diff.0.insert(
         0,
-        FragmentationEntry {
-            len: 3,
-            bytes: 3_000,
-            on_disk_bytes: 1_500,
-        },
+        FragmentationEntry::new(3, 3_000, 1_500).with_block_bytes(30),
     );
-    diff.0.insert(
-        3,
-        FragmentationEntry {
-            len: 4,
-            bytes: 4_000,
-            on_disk_bytes: 2_000,
-        },
-    );
+    diff.0.insert(3, FragmentationEntry::new(4, 4_000, 2_000));
 
     diff.merge_into(&mut map);
 
     assert_eq!(map.0.len(), 3);
-    assert_eq!(map.0[&0].len, 4);
-    assert_eq!(map.0[&0].bytes, 4_000);
-    assert_eq!(map.0[&0].on_disk_bytes, 2_000);
-    assert_eq!(map.0[&1].len, 2);
-    assert_eq!(map.0[&1].bytes, 2_000);
-    assert_eq!(map.0[&1].on_disk_bytes, 1_000);
-    assert_eq!(map.0[&3].len, 4);
-    assert_eq!(map.0[&3].bytes, 4_000);
-    assert_eq!(map.0[&3].on_disk_bytes, 2_000);
+    assert_eq!(
+        map.0[&0],
+        FragmentationEntry::new(4, 4_000, 2_000).with_block_bytes(40)
+    );
+    assert_eq!(map.0[&1], FragmentationEntry::new(2, 2_000, 1_000));
+    assert_eq!(map.0[&3], FragmentationEntry::new(4, 4_000, 2_000));
 }
 
+/// Both halves of an entry, frames of their own and block entries, survive a
+/// round trip through the manifest's encoding.
 #[test]
 fn frag_map_roundtrip() {
     let map = FragmentationMap({
         let mut map = HashMap::default();
-        map.insert(
-            0,
-            FragmentationEntry {
-                len: 1,
-                bytes: 1_000,
-                on_disk_bytes: 500,
-            },
-        );
+        map.insert(0, FragmentationEntry::new(1, 1_000, 500));
         map.insert(
             1,
-            FragmentationEntry {
-                len: 2,
-                bytes: 2_000,
-                on_disk_bytes: 1_000,
-            },
+            FragmentationEntry::new(2, 2_000, 1_000).with_block_bytes(77),
         );
         map
     });
@@ -88,6 +55,54 @@ fn frag_map_roundtrip() {
     let encoded = map.encode_into_vec();
     let decoded = FragmentationMap::decode_from(&mut &encoded[..]).expect("should decode map");
     assert_eq!(map, decoded);
+}
+
+/// Statistics written by the earlier layout, whose entries lack the block
+/// bytes, decode with none: that layout kept no blocks. They outlive the blob
+/// files they count, so a store whose blob files are all gone still opens;
+/// a live blob file of that layout is refused by its own metadata. Bytes that
+/// are neither layout's whole are damage.
+#[test]
+fn statistics_of_the_earlier_layout_decode_with_no_block_bytes() {
+    // The earlier entry: id, count, bytes and frame bytes.
+    let mut earlier = 2_u32.to_le_bytes().to_vec();
+    for id in [3_u64, 9] {
+        earlier.extend_from_slice(&id.to_le_bytes());
+        earlier.extend_from_slice(&4_u32.to_le_bytes());
+        earlier.extend_from_slice(&400_u64.to_le_bytes());
+        earlier.extend_from_slice(&200_u64.to_le_bytes());
+    }
+    let expected = FragmentationMap({
+        let mut map = HashMap::default();
+        map.insert(3, FragmentationEntry::new(4, 400, 200));
+        map.insert(9, FragmentationEntry::new(4, 400, 200));
+        map
+    });
+    assert_eq!(
+        FragmentationMap::decode_whole(&earlier).ok(),
+        Some(expected)
+    );
+
+    let map = FragmentationMap({
+        let mut map = HashMap::default();
+        map.insert(3, FragmentationEntry::new(4, 400, 200).with_block_bytes(9));
+        map
+    });
+    let mut current = map.encode_into_vec();
+    assert_eq!(FragmentationMap::decode_whole(&current).ok(), Some(map));
+    assert_eq!(
+        FragmentationMap::decode_whole(&2_u32.to_le_bytes()).ok(),
+        None,
+        "a count with no entries is damage"
+    );
+    current.push(0);
+    assert!(
+        matches!(
+            FragmentationMap::decode_whole(&current),
+            Err(crate::Error::InvalidHeader("BlobGcStats"))
+        ),
+        "a byte past the entries is damage"
+    );
 }
 
 #[test]
@@ -99,10 +114,11 @@ fn compaction_stream_gc_count_drops() -> crate::Result<()> {
 
         InternalValue::from_components("a", BlobIndirection {
           size: 1000,
+          stored: Stored::Frames(500),
           vhandle: ValueHandle {
             blob_file_id: 0,
-            on_disk_size: 500,
-            offset: 0,
+            frame: 0,
+            index: 0,
           }
         }.encode_into_vec(), 0, ValueType::Indirection),
     ];
@@ -121,20 +137,37 @@ fn compaction_stream_gc_count_drops() -> crate::Result<()> {
     assert_eq!(
         {
             let mut map = HashMap::default();
-            map.insert(
-                0,
-                FragmentationEntry {
-                    len: 1,
-                    bytes: 1_000,
-                    on_disk_bytes: 500,
-                },
-            );
+            map.insert(0, FragmentationEntry::new(1, 1_000, 500));
             map
         },
         my_watcher.0,
     );
 
     Ok(())
+}
+
+/// A dropped value that shares a block is charged its uncompressed entry as
+/// block bytes, apart from the exact bytes of values with frames of their
+/// own, so its share of the compressed block can be told later.
+#[test]
+fn a_dropped_value_in_a_block_charges_its_entry_as_block_bytes() {
+    let at = |frame, stored| BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 4,
+            frame,
+            index: 0,
+        },
+        size: 10,
+        stored,
+    };
+    let mut map = FragmentationMap::default();
+    map.charge(&at(0, Stored::InBlock(25)));
+    map.charge(&at(1, Stored::Frames(60)));
+    map.charge(&at(2, Stored::InBlock(30)));
+    assert_eq!(
+        map.0.get(&4),
+        Some(&FragmentationEntry::new(3, 30, 60).with_block_bytes(55))
+    );
 }
 
 /// A dropped cell row charges only the objects it owns: a borrowed object is
@@ -144,13 +177,14 @@ fn compaction_stream_gc_count_drops() -> crate::Result<()> {
 fn a_dropped_cell_row_charges_only_its_owned_objects() -> crate::Result<()> {
     use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
 
-    let at = |offset, size| BlobIndirection {
+    let at = |frame, size| BlobIndirection {
         vhandle: ValueHandle {
             blob_file_id: 3,
-            offset,
-            on_disk_size: size,
+            frame,
+            index: 0,
         },
         size,
+        stored: Stored::Frames(size),
     };
     let row = encode_row(&[
         RowField::bytes(
@@ -164,7 +198,7 @@ fn a_dropped_cell_row_charges_only_its_owned_objects() -> crate::Result<()> {
         RowField::bytes(
             5,
             RowCell::Ref {
-                indirection: at(100, 40),
+                indirection: at(1, 40),
                 owner: false,
             },
         ),
@@ -177,13 +211,6 @@ fn a_dropped_cell_row_charges_only_its_owned_objects() -> crate::Result<()> {
         5,
         ValueType::CellRow,
     ));
-    assert_eq!(
-        map.0.get(&3),
-        Some(&FragmentationEntry {
-            len: 1,
-            bytes: 100,
-            on_disk_bytes: 100,
-        })
-    );
+    assert_eq!(map.0.get(&3), Some(&FragmentationEntry::new(1, 100, 100)));
     Ok(())
 }

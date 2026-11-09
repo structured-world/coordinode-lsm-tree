@@ -555,7 +555,7 @@ pub(crate) fn logical_len(row: &[u8]) -> crate::Result<u32> {
 
 /// Moves every value cell of `row` at or above its column's `threshold` into
 /// a blob file through `write`, which stores the bytes and returns their
-/// handle, and returns the row with those cells replaced by owning
+/// indirection, and returns the row with those cells replaced by owning
 /// references; `None` when no cell reaches its threshold and the row stays as
 /// it is.
 ///
@@ -565,7 +565,7 @@ pub(crate) fn logical_len(row: &[u8]) -> crate::Result<u32> {
 pub(crate) fn separate_row(
     row: &[u8],
     threshold: impl Fn(u16) -> u32,
-    mut write: impl FnMut(&[u8]) -> crate::Result<crate::vlog::ValueHandle>,
+    mut write: impl FnMut(&[u8]) -> crate::Result<BlobIndirection>,
 ) -> crate::Result<Option<Vec<u8>>> {
     let mut fields = decode_row(row)?;
     let mut separated = false;
@@ -575,10 +575,7 @@ pub(crate) fn separate_row(
             let size = u32::try_from(bytes.len()).map_err(|_| CORRUPT)?;
             if size >= threshold(field.column) {
                 field.cell = RowCell::Ref {
-                    indirection: BlobIndirection {
-                        vhandle: write(bytes)?,
-                        size,
-                    },
+                    indirection: write(bytes)?,
                     owner: true,
                 };
                 separated = true;

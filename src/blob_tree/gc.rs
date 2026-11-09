@@ -16,18 +16,40 @@ pub struct FragmentationEntry {
     /// Unreferenced (garbage) blob bytes that could be freed (compressed)
     pub(crate) bytes: u64,
 
-    /// Unreferenced (garbage) blob bytes that could be freed from disk
+    /// Unreferenced (garbage) bytes of frames of their own, freed from disk
+    /// exactly
     pub(crate) on_disk_bytes: u64,
+
+    /// Unreferenced (garbage) entries of values that share a block,
+    /// uncompressed: their part of the file's blocks on disk is what they
+    /// free
+    pub(crate) block_bytes: u64,
 }
 
 impl FragmentationEntry {
+    /// Garbage of `len` values of `bytes` in all, whose frames of their own
+    /// take `on_disk_bytes`.
     #[must_use]
     pub fn new(len: usize, bytes: u64, on_disk_bytes: u64) -> Self {
         Self {
             len,
             bytes,
             on_disk_bytes,
+            block_bytes: 0,
         }
+    }
+
+    /// This garbage with `block_bytes` of uncompressed entries of values that
+    /// share a block.
+    #[must_use]
+    pub fn with_block_bytes(mut self, block_bytes: u64) -> Self {
+        self.block_bytes = block_bytes;
+        self
+    }
+
+    /// The bytes this garbage takes on disk in `meta`'s file.
+    pub(crate) fn on_disk(&self, meta: &crate::vlog::blob_file::meta::Metadata) -> u64 {
+        self.on_disk_bytes + meta.block_share(self.block_bytes)
     }
 }
 
@@ -50,10 +72,14 @@ impl core::ops::DerefMut for FragmentationMap {
 }
 
 impl FragmentationMap {
-    /// Returns the number of bytes that could be freed from disk.
+    /// Returns the number of bytes that could be freed from disk in the blob
+    /// files of `value_log`.
     #[must_use]
-    pub fn stale_bytes(&self) -> u64 {
-        self.0.values().map(|x| x.on_disk_bytes).sum()
+    pub fn stale_bytes(&self, value_log: &BlobFileList) -> u64 {
+        self.0
+            .iter()
+            .filter_map(|(id, x)| value_log.get(*id).map(|file| x.on_disk(file.meta())))
+            .sum()
     }
 
     /// Removes blob file entries that are not part of the value log (anymore)
@@ -75,6 +101,7 @@ impl FragmentationMap {
                     counter.bytes += diff.bytes;
                     counter.len += diff.len;
                     counter.on_disk_bytes += diff.on_disk_bytes;
+                    counter.block_bytes += diff.block_bytes;
                 })
                 .or_insert(diff);
         }
@@ -103,6 +130,8 @@ impl crate::coding::Encode for FragmentationMap {
             writer.write_u64::<LE>(item.bytes)?;
 
             writer.write_u64::<LE>(item.on_disk_bytes)?;
+
+            writer.write_u64::<LE>(item.block_bytes)?;
         }
 
         Ok(())
@@ -125,7 +154,11 @@ impl crate::coding::Decode for FragmentationMap {
             let len = reader.read_u32::<LE>()? as usize;
             let bytes = reader.read_u64::<LE>()?;
             let on_disk_bytes = reader.read_u64::<LE>()?;
-            map.insert(id, FragmentationEntry::new(len, bytes, on_disk_bytes));
+            let block_bytes = reader.read_u64::<LE>()?;
+            map.insert(
+                id,
+                FragmentationEntry::new(len, bytes, on_disk_bytes).with_block_bytes(block_bytes),
+            );
         }
 
         Ok(Self(map))
@@ -133,22 +166,66 @@ impl crate::coding::Decode for FragmentationMap {
 }
 
 impl FragmentationMap {
+    /// Decodes a manifest's statistics, `bytes` being all of them: a snapshot
+    /// section or an edit's field, each checksummed whole.
+    ///
+    /// Statistics of the earlier layout, whose entries lack the block bytes,
+    /// decode with none, as that layout kept no blocks. They outlive the blob
+    /// files they count, so a store whose blob files are all gone still opens;
+    /// a live blob file of that layout is refused by its own metadata.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] for bytes that are neither layout's.
+    pub(crate) fn decode_whole(bytes: &[u8]) -> crate::Result<Self> {
+        use crate::io::{LE, ReadBytesExt};
+
+        // Id, count, bytes, frame bytes, then this layout's block bytes.
+        const ENTRY_LEN: u64 = 8 + 4 + 8 + 8 + 8;
+        const EARLIER_ENTRY_LEN: u64 = ENTRY_LEN - 8;
+
+        let (count, entries) = bytes
+            .split_first_chunk::<4>()
+            .ok_or(crate::Error::InvalidHeader("BlobGcStats"))?;
+        let count = u64::from(u32::from_le_bytes(*count));
+        let len = entries.len() as u64;
+        // The two layouts' lengths agree only on no entries at all.
+        if len == count * ENTRY_LEN {
+            return <Self as crate::coding::Decode>::decode_from(&mut &bytes[..]);
+        }
+        if len != count * EARLIER_ENTRY_LEN {
+            return Err(crate::Error::InvalidHeader("BlobGcStats"));
+        }
+        let mut reader = entries;
+        let mut map = crate::HashMap::with_capacity_and_hasher(
+            usize::try_from(count).unwrap_or(0),
+            rustc_hash::FxBuildHasher,
+        );
+        for _ in 0..count {
+            let id = reader.read_u64::<LE>()?;
+            let len = reader.read_u32::<LE>()? as usize;
+            let bytes = reader.read_u64::<LE>()?;
+            let on_disk_bytes = reader.read_u64::<LE>()?;
+            map.insert(id, FragmentationEntry::new(len, bytes, on_disk_bytes));
+        }
+        Ok(Self(map))
+    }
+
     /// Charges the object `vptr` names as garbage in its blob file.
     pub(crate) fn charge(&mut self, vptr: &BlobIndirection) {
         let size = u64::from(vptr.size);
-        let on_disk_size = u64::from(vptr.vhandle.on_disk_size);
+        let (frame_bytes, block_bytes) = vptr.stored.split();
 
         self.0
             .entry(vptr.vhandle.blob_file_id)
             .and_modify(|counter| {
                 counter.len += 1;
                 counter.bytes += size;
-                counter.on_disk_bytes += on_disk_size;
+                counter.on_disk_bytes += frame_bytes;
+                counter.block_bytes += block_bytes;
             })
-            .or_insert_with(|| FragmentationEntry {
-                bytes: size,
-                on_disk_bytes: on_disk_size,
-                len: 1,
+            .or_insert_with(|| {
+                FragmentationEntry::new(1, size, frame_bytes).with_block_bytes(block_bytes)
             });
     }
 }

@@ -3038,7 +3038,7 @@ pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64)
 /// human-readable reason when the section's payload cannot have the shape
 /// the writer emits.
 ///
-/// - `linked_blob_files`: `u32 count` followed by `count` records, each 32
+/// - `linked_blob_files`: `u32 count` followed by `count` records, each 40
 ///   fixed bytes then a first and a last key, each prefixed by its `u16`
 ///   length; the records must end exactly at the section's end.
 /// - `table_version`: exactly one byte.

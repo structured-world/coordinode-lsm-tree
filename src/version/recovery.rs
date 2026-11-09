@@ -4,8 +4,8 @@
 
 use crate::io::{LittleEndian, ReadBytesExt};
 use crate::{
-    Checksum, SeqNo, TableId, TreeType, coding::Decode, config::ManifestRecoveryMode, fs::Fs,
-    version::VersionId, vlog::BlobFileId,
+    Checksum, SeqNo, TableId, TreeType, config::ManifestRecoveryMode, fs::Fs, version::VersionId,
+    vlog::BlobFileId,
 };
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -31,14 +31,14 @@ const TABLE_ENTRY_PAYLOAD_LEN: u32 = 1 + 4 + 8 + 1 + 16 + 8 + 8;
 /// within that level. Runs are numbered from 0 in the order the level holds
 /// them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct TablePlace {
+pub(crate) struct TablePlace {
     pub level: u8,
     pub run: u32,
 }
 
 /// Encodes one `tables`-section record payload; the inverse of
 /// [`decode_table_entry_payload`].
-pub fn encode_table_entry_payload(
+pub(crate) fn encode_table_entry_payload(
     payload: &mut Vec<u8>,
     place: TablePlace,
     id: TableId,
@@ -442,7 +442,7 @@ fn named_version(
 ///
 /// Returns the reader's error for a snapshot that does not open, and refuses
 /// one of another format or one naming another version.
-pub fn verify_snapshot(
+pub(crate) fn verify_snapshot(
     folder: &Path,
     id: VersionId,
     fs: &dyn Fs,
@@ -460,7 +460,7 @@ pub fn verify_snapshot(
 /// Propagates a failure to list the folder, and an environmental failure to
 /// read the snapshot.
 #[cfg(feature = "std")]
-pub fn owed_repair_report(
+pub(crate) fn owed_repair_report(
     folder: &Path,
     fs: &dyn Fs,
     encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
@@ -509,7 +509,7 @@ pub fn owed_repair_report(
 /// A repair report the installed snapshot owes.
 #[cfg(feature = "std")]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OwedReport {
+pub(crate) enum OwedReport {
     /// The report's encoded bytes.
     Readable(Vec<u8>),
 
@@ -527,19 +527,19 @@ const PREVIOUS_FORMAT: u8 = 5;
 
 /// The version id `name` holds as a snapshot (`v{id}`), if it is one.
 #[must_use]
-pub fn snapshot_id_of(name: &str) -> Option<VersionId> {
+pub(crate) fn snapshot_id_of(name: &str) -> Option<VersionId> {
     crate::file::canonical_id(name.strip_prefix('v')?)
 }
 
 /// The snapshot id whose edit log `name` is (`edits-{id}`), if it is one.
 #[must_use]
-pub fn log_id_of(name: &str) -> Option<VersionId> {
+pub(crate) fn log_id_of(name: &str) -> Option<VersionId> {
     crate::file::canonical_id(name.strip_prefix("edits-")?)
 }
 
 /// A manifest file of the tree root, as the engine names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ManifestFile {
+pub(crate) enum ManifestFile {
     /// An installed snapshot, `v{id}`.
     Snapshot(VersionId),
 
@@ -553,7 +553,7 @@ pub enum ManifestFile {
 /// The manifest file `name` is, if the engine could have written it. Any
 /// other name in the tree root is not the engine's to remove.
 #[must_use]
-pub fn manifest_file_of(name: &str) -> Option<ManifestFile> {
+pub(crate) fn manifest_file_of(name: &str) -> Option<ManifestFile> {
     if let Some(id) = snapshot_id_of(name) {
         return Some(ManifestFile::Snapshot(id));
     }
@@ -590,7 +590,7 @@ pub fn manifest_file_of(name: &str) -> Option<ManifestFile> {
 ///
 /// Propagates a failure to list `folder`, and refuses a store with a version
 /// pointer.
-pub fn installed_snapshot(folder: &Path, fs: &dyn Fs) -> crate::Result<Option<VersionId>> {
+pub(crate) fn installed_snapshot(folder: &Path, fs: &dyn Fs) -> crate::Result<Option<VersionId>> {
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
@@ -615,7 +615,7 @@ pub fn installed_snapshot(folder: &Path, fs: &dyn Fs) -> crate::Result<Option<Ve
 /// # Errors
 ///
 /// Returns the reader's error for a snapshot that does not open.
-pub fn open_snapshot(
+pub(crate) fn open_snapshot(
     folder: &Path,
     id: VersionId,
     fs: &dyn Fs,
@@ -632,7 +632,7 @@ pub fn open_snapshot(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveredTable {
+pub(crate) struct RecoveredTable {
     pub id: TableId,
     pub checksum: Checksum,
     pub global_seqno: SeqNo,
@@ -642,7 +642,7 @@ pub struct RecoveredTable {
 }
 
 #[derive(Debug)]
-pub struct Recovery {
+pub(crate) struct Recovery {
     pub tree_type: TreeType,
     /// Version id of the installed on-disk snapshot: the base the edit log
     /// is replayed on top of. The snapshot file
@@ -745,7 +745,7 @@ impl Recovery {
         }
 
         if let Some(bytes) = &edit.gc_stats {
-            self.gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut &bytes[..])?;
+            self.gc_stats = crate::blob_tree::FragmentationMap::decode_whole(bytes)?;
         }
 
         // Tight-space restrictions REPLACE wholesale: the encoder derives every
@@ -791,7 +791,7 @@ impl Recovery {
     }
 }
 
-pub fn recover(
+pub(crate) fn recover(
     folder: &Path,
     fs: &dyn Fs,
     mode: ManifestRecoveryMode,
@@ -837,9 +837,8 @@ pub fn recover(
     )?;
     debug_assert!(blob_file_ids.is_sorted_by_key(|(id, _)| id));
 
-    let gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut crate::io::Cursor::new(
-        archive.read_section("blob_gc_stats")?,
-    ))?;
+    let gc_stats =
+        crate::blob_tree::FragmentationMap::decode_whole(&archive.read_section("blob_gc_stats")?)?;
 
     // Optional tight-space restrictions section. Absent on versions that never
     // ran tight-space reclaim (→ empty). When present it is read strictly: a

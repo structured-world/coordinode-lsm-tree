@@ -5,24 +5,65 @@ use crate::{UserKey, UserValue, vlog::ValueHandle};
 fn entry(
     blob_file_id: BlobFileId,
     key: &[u8],
-    offset: u64,
+    frame: u32,
 ) -> crate::Result<(ScanEntry, BlobFileId)> {
     Ok((
         ScanEntry {
             key: UserKey::from(key),
-            offset,
+            frame,
+            index: 0,
+            offset: u64::from(frame),
             seqno: 0,
             uncompressed_len: 0,
-            value: UserValue::empty(),
+            value: Some(UserValue::empty()),
             // These fixtures use ordinal offsets (0, 1, 2, ...), not real byte
-            // positions, so the frame ends one ordinal past its start — never
+            // positions, so the frame ends one ordinal past its start, never
             // at the start itself, which would mislead any future test that
             // inspects the consumed-frontier argument.
-            frame_end: offset + 1,
+            frame_end: u64::from(frame) + 1,
             resynced: false,
+            frames: None,
         },
         blob_file_id,
     ))
+}
+
+/// The indirection naming `frame`, `index` of blob file `blob_file_id`.
+fn naming(blob_file_id: BlobFileId, frame: u32, index: u16) -> BlobIndirection {
+    BlobIndirection {
+        size: 0,
+        stored: crate::blob_tree::handle::Stored::Frames(0),
+        vhandle: ValueHandle {
+            blob_file_id,
+            frame,
+            index,
+        },
+    }
+}
+
+/// Values of one block share its frame: a drain toward one of them passes
+/// the block's earlier values and stops at its own index.
+#[test]
+fn drain_blobs_stops_at_the_index_within_a_block() -> crate::Result<()> {
+    let in_block = |index: u16| -> crate::Result<(ScanEntry, BlobFileId)> {
+        let (mut scanned, file) = entry(0, b"a", 3)?;
+        scanned.index = index;
+        Ok((scanned, file))
+    };
+    let mut iter = [in_block(0), in_block(1), in_block(2)]
+        .into_iter()
+        .peekable();
+
+    drain_blobs(
+        &mut iter,
+        b"a",
+        &naming(0, 3, 2),
+        crate::comparator::default_comparator().as_ref(),
+        &mut |_, _| {},
+    )?;
+
+    assert_eq!(in_block(2)?, iter.next().unwrap()?);
+    Ok(())
 }
 
 #[test]
@@ -40,14 +81,7 @@ fn drain_blobs_simple() -> crate::Result<()> {
     drain_blobs(
         &mut iter,
         b"a",
-        &BlobIndirection {
-            size: 0,
-            vhandle: ValueHandle {
-                blob_file_id: 0,
-                offset: 4,
-                on_disk_size: 0,
-            },
-        },
+        &naming(0, 4, 0),
         crate::comparator::default_comparator().as_ref(),
         &mut |_, _| {},
     )?;
@@ -72,14 +106,7 @@ fn drain_blobs_multiple_keys() -> crate::Result<()> {
     drain_blobs(
         &mut iter,
         b"e",
-        &BlobIndirection {
-            size: 0,
-            vhandle: ValueHandle {
-                blob_file_id: 0,
-                offset: 0,
-                on_disk_size: 0,
-            },
-        },
+        &naming(0, 0, 0),
         crate::comparator::default_comparator().as_ref(),
         &mut |_, _| {},
     )?;
@@ -107,20 +134,7 @@ fn drain_blobs_follows_the_tree_comparator() -> crate::Result<()> {
     let mut iter = [entry(0, b"e", 0), entry(0, b"c", 1), entry(0, b"a", 2)]
         .into_iter()
         .peekable();
-    drain_blobs(
-        &mut iter,
-        b"a",
-        &BlobIndirection {
-            size: 0,
-            vhandle: ValueHandle {
-                blob_file_id: 0,
-                offset: 2,
-                on_disk_size: 0,
-            },
-        },
-        &Reverse,
-        &mut |_, _| {},
-    )?;
+    drain_blobs(&mut iter, b"a", &naming(0, 2, 0), &Reverse, &mut |_, _| {})?;
 
     assert_eq!(entry(0, b"a", 2)?, iter.next().unwrap()?);
     Ok(())
@@ -228,14 +242,7 @@ fn drain_blobs_does_not_advance_the_frontier_past_a_resynced_frame() -> crate::R
     drain_blobs(
         &mut iter,
         b"a",
-        &BlobIndirection {
-            size: 0,
-            vhandle: ValueHandle {
-                blob_file_id: 0,
-                offset: 9,
-                on_disk_size: 0,
-            },
-        },
+        &naming(0, 9, 0),
         crate::comparator::default_comparator().as_ref(),
         &mut |_, frame_end| max_recorded = max_recorded.max(frame_end),
     )?;

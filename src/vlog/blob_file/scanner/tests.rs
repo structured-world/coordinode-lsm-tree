@@ -1,113 +1,157 @@
 use super::*;
-use crate::{Slice, fs::StdFs, vlog::blob_file::writer::Writer as BlobFileWriter};
+use crate::vlog::blob_file::frame::{forged_header, restamp_header_crc};
+use crate::vlog::blob_file::writer::{
+    FrameSizes, MAX_DECOMPRESSION_SIZE, Writer as BlobFileWriter,
+};
+use crate::{Slice, fs::StdFs};
 use tempfile::tempdir;
 use test_log::test;
 
-// Blob frame header field offsets, derived from the field widths (magic 4 +
-// checksum 16 + seqno 8 + key_len 2 + real_val_len 4 + on_disk_val_len 4 +
-// header_crc 4 = BLOB_HEADER_LEN), so a header-layout change moves these in
-// lockstep with the writer instead of desyncing hard-coded literals.
-const OD_LEN_OFF: usize = 4 + 16 + 8 + 2 + 4;
-const HDR_CRC_OFF: usize = OD_LEN_OFF + 4;
-// `real_val_len` sits immediately before `on_disk_val_len`, so derive it from
-// the same chain instead of restating a literal that a header-layout change
-// could desync.
-const RV_LEN_OFF: usize = OD_LEN_OFF - core::mem::size_of::<u32>();
-const _: () = assert!(
-    HDR_CRC_OFF + 4 == crate::vlog::blob_file::writer::BLOB_HEADER_LEN
-        && RV_LEN_OFF + core::mem::size_of::<u32>() == OD_LEN_OFF,
-    "the derived header field offsets must tile the blob header",
-);
+/// Small sizes, so a test reaches every class with a few bytes: values of
+/// 100 to 300 bytes are frames of their own.
+const SIZES: FrameSizes = FrameSizes {
+    block_target: 100,
+    chunk_size: 300,
+};
 
-#[test]
-fn blob_scanner() -> crate::Result<()> {
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    let keys = [b"a", b"b", b"c", b"d", b"e"];
-
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-
-        for key in keys {
-            writer.write(key, 0, &key.repeat(100))?;
-        }
-
-        writer.finish()?;
+/// Writes `values` into a blob file at `dir/0` and returns its path.
+fn write(dir: &std::path::Path, values: &[(&[u8], &[u8])]) -> crate::Result<std::path::PathBuf> {
+    let path = dir.join("0");
+    let mut writer = BlobFileWriter::new(&path, 0, 0, &StdFs)?.use_frame_sizes(SIZES);
+    for (key, value) in values {
+        writer.write(key, 7, value)?;
     }
+    writer.finish()?;
+    Ok(path)
+}
 
-    {
-        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+/// Where the file's `name` section lies.
+fn section(path: &std::path::Path, name: &[u8]) -> crate::Result<(usize, usize)> {
+    let reader = crate::sfa::Reader::new(path)?;
+    let section = reader.toc().section(name).expect("the section exists");
+    Ok((
+        usize::try_from(section.pos()).expect("small file"),
+        usize::try_from(section.len()).expect("small file"),
+    ))
+}
 
-        for key in keys {
-            let entry = scanner.next().unwrap()?;
-            assert_eq!(entry.key, Slice::from(key));
-            assert_eq!(entry.value, Slice::from(key.repeat(100)));
-            assert!(
-                !entry.resynced,
-                "a cleanly writer-chained frame is never tainted; an \
-                 always-resynced implementation would fail here",
-            );
-        }
+/// The starts of the file's frames, then its data end, as its index lists them.
+fn index_of(path: &std::path::Path) -> crate::Result<Vec<usize>> {
+    let (pos, len) = section(path, b"frames")?;
+    let bytes = std::fs::read(path)?;
+    let index = crate::vlog::blob_file::writer::decode_frame_index(&bytes[pos..pos + len])?;
+    Ok(index.iter().map(|&at| at as usize).collect())
+}
 
-        assert!(scanner.next().is_none());
-    }
-
+/// Damages the file's frame index, so a scan walks the frames' own lengths.
+fn break_index(path: &std::path::Path) -> crate::Result<()> {
+    let (pos, _) = section(path, b"frames")?;
+    let mut bytes = std::fs::read(path)?;
+    bytes[pos] ^= 0xFF;
+    std::fs::write(path, bytes)?;
     Ok(())
 }
 
-/// `Scanner::resume` re-opens at a carried frame boundary and reads only the
-/// suffix (the tight-space relocation loop's per-slice resume), and rejects an
-/// offset outside the data section.
+/// Applies `edit` to the file's bytes.
+fn edit(path: &std::path::Path, edit: impl FnOnce(&mut Vec<u8>)) -> crate::Result<()> {
+    let mut bytes = std::fs::read(path)?;
+    edit(&mut bytes);
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Three values of frames of their own.
+fn three_singles(dir: &std::path::Path) -> crate::Result<std::path::PathBuf> {
+    write(
+        dir,
+        &[
+            (b"aaa", &[b'1'; 120]),
+            (b"bbb", &[b'2'; 130]),
+            (b"ccc", &[b'3'; 140]),
+        ],
+    )
+}
+
+/// Every value comes back in order with its frame and index: a block's
+/// values share their frame, and the block is consumed only with its last
+/// value; a value with frames of its own hands them over as stored; a
+/// chunked value comes back as its checked frames, not gathered.
 #[test]
-fn blob_scanner_resume_reads_suffix_and_rejects_bad_offset() -> crate::Result<()> {
+fn a_scan_yields_every_class() -> crate::Result<()> {
     let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
+    let chunked: Vec<u8> = (0..700_u32).map(|i| (i % 251) as u8).collect();
+    let path = write(
+        dir.path(),
+        &[
+            (b"a", b"x1"),
+            (b"b", b"x2"),
+            (b"c", &[b'c'; 150]),
+            (b"d", &chunked),
+            (b"e", b"x3"),
+        ],
+    )?;
+    let index = index_of(&path)?;
+    let entries = Scanner::new(&path, &StdFs, 0)?.collect::<crate::Result<Vec<_>>>()?;
 
-    let keys = [b"a", b"b", b"c", b"d", b"e"];
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        for key in keys {
-            writer.write(key, 0, &key.repeat(100))?;
-        }
-        writer.finish()?;
-    }
-
-    // Scan the first two frames and capture the frame boundary after "b".
-    let resume_at = {
-        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-        let _a = scanner.next().unwrap()?;
-        let b = scanner.next().unwrap()?;
-        b.frame_end
-    };
-
-    // Resuming at that boundary yields exactly the suffix c, d, e.
-    {
-        let mut scanner = Scanner::resume(&blob_file_path, &StdFs, 0, resume_at)?;
-        for key in [b"c", b"d", b"e"] {
-            assert_eq!(
-                Slice::from(&key[..]),
-                scanner.next().map(|r| r.map(|e| e.key)).unwrap()?,
-            );
-        }
-        assert!(scanner.next().is_none());
-    }
-
-    // An offset past the data section is rejected, never silently mis-seeked.
-    assert!(
-        matches!(
-            Scanner::resume(&blob_file_path, &StdFs, 0, u64::MAX),
-            Err(crate::Error::InvalidHeader("BlobFile")),
-        ),
-        "resume offset past the data section must error",
+    let places: Vec<_> = entries.iter().map(|e| (e.frame, e.index)).collect();
+    assert_eq!(places, [(0, 0), (0, 1), (1, 0), (2, 0), (6, 0)]);
+    assert_eq!(
+        entries[0].frame_end, index[0] as u64,
+        "the block is not consumed yet"
     );
+    assert_eq!(
+        entries[1].frame_end, index[1] as u64,
+        "its last value consumes it"
+    );
+    assert!(entries[0].frames.is_none() && entries[1].frames.is_none());
+    assert_eq!(entries[2].frames.as_ref().map(Vec::len), Some(1));
+    assert_eq!(
+        entries[3].frames.as_ref().map(Vec::len),
+        Some(4),
+        "a head and its chunks"
+    );
+    assert_eq!(entries[3].frame_end, index[6] as u64, "past its last chunk");
+    assert_eq!(entries[3].value, None, "a chunked value is not gathered");
+    assert_eq!(
+        entries[3].whole_value()?,
+        Slice::from(chunked),
+        "its frames hold it whole"
+    );
+    assert_eq!(entries[2].value, Some(Slice::from(&[b'c'; 150][..])));
+    assert!(entries.iter().all(|e| !e.resynced && e.seqno == 7));
+    Ok(())
+}
+
+/// A scan resumed at a frame boundary a previous scan reported yields the
+/// suffix; an offset outside the data section, or inside a frame, is refused.
+#[test]
+fn a_resumed_scan_reads_the_suffix_and_refuses_a_bad_offset() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let resume_at = {
+        let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+        scanner.next().expect("a")?.frame_end
+    };
+    let keys = Scanner::resume(&path, &StdFs, 0, resume_at)?
+        .map(|entry| entry.map(|e| e.key))
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(keys, [Slice::from(&b"bbb"[..]), Slice::from(&b"ccc"[..])]);
+
+    for offset in [u64::MAX, resume_at + 1] {
+        assert!(
+            matches!(
+                Scanner::resume(&path, &StdFs, 0, offset),
+                Err(crate::Error::InvalidHeader("BlobFile"))
+            ),
+            "offset {offset} must be refused"
+        );
+    }
     Ok(())
 }
 
 /// Opening a scanner reads the file's trailer and table of contents before
 /// the first frame: a paced scanner times those reads too, so a relocation
-/// that opens many cold blob files up front tells its pacer about every one,
-/// including a file whose metadata read then fails.
+/// that opens many cold blob files up front tells its pacer about every one.
 #[cfg(feature = "std")]
 #[test]
 fn a_paced_scanner_times_the_reads_that_open_it() -> crate::Result<()> {
@@ -126,16 +170,19 @@ fn a_paced_scanner_times_the_reads_that_open_it() -> crate::Result<()> {
     }
 
     let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        writer.write(b"a", 0, &[b'v'; 100])?;
-        writer.finish()?;
-    }
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        crate::SequenceNumberCounter::default(),
+        dir.path(),
+        0,
+        None,
+        alloc::sync::Arc::new(StdFs),
+    )?;
+    writer.write(b"a", 0, &[b'v'; 100])?;
+    let files = writer.finish()?;
 
     let timed = alloc::sync::Arc::new(Timed(AtomicU64::new(0)));
     let pace: Pacer = timed.clone();
-    let _scanner = Scanner::open_paced(&blob_file_path, &StdFs, 0, None, Some(pace))?;
+    let _scanner = Scanner::of_paced(&files[0], None, Some(pace))?;
     assert!(
         timed.0.load(Ordering::Relaxed) > 0,
         "opening the scanner read its trailer and table of contents untimed",
@@ -143,869 +190,777 @@ fn a_paced_scanner_times_the_reads_that_open_it() -> crate::Result<()> {
     Ok(())
 }
 
-/// Tamper seqno in first blob frame and verify the scanner's header
-/// CRC catches the corruption.
+/// Loading a file's frame index: an environmental read failure is returned
+/// for a retry, never taken for damage, since the index may be intact and the
+/// chain walk would give up frames past damage elsewhere; a read the bytes
+/// fail falls back to the chain; an intact index is read.
+#[cfg(feature = "std")]
 #[test]
-fn blob_scanner_corrupted_seqno_detected_by_header_crc() -> crate::Result<()> {
-    use crate::vlog::blob_file::writer::BLOB_HEADER_MAGIC;
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        writer.write(b"key", 42, &b"v".repeat(100))?;
-        writer.finish()?;
-    }
-
-    // BlobFileWriter writes the first frame at file offset 0
-    // (sfa has no inline section headers), so use deterministic offset.
-    let mut raw = std::fs::read(&blob_file_path)?;
-    let frame_start = 0usize;
-
-    // Tamper seqno: header layout is [magic][checksum][seqno]...
-    let seqno_offset = frame_start + BLOB_HEADER_MAGIC.len() + std::mem::size_of::<u128>();
-    let seqno_len = std::mem::size_of::<u64>();
-    raw[seqno_offset..seqno_offset + seqno_len].copy_from_slice(&99u64.to_le_bytes()[..seqno_len]);
-    std::fs::write(&blob_file_path, &raw)?;
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let result = scanner.next().unwrap();
-    assert!(
-        matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
-        "expected HeaderCrcMismatch for corrupted seqno, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// Tamper value payload in blob frame and verify scanner's data
-/// checksum catches the corruption.
-#[test]
-fn blob_scanner_corrupted_value_detected_by_data_checksum() -> crate::Result<()> {
-    use crate::vlog::blob_file::writer::BLOB_HEADER_LEN;
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        writer.write(b"key", 0, &b"v".repeat(100))?;
-        writer.finish()?;
-    }
-
-    // BlobFileWriter writes the first frame at file offset 0
-    // (sfa has no inline section headers), so use deterministic offset.
-    let mut raw = std::fs::read(&blob_file_path)?;
-    let frame_start = 0usize;
-
-    // Tamper value payload: frame_start + header + key
-    let key = b"key";
-    let value_offset = frame_start + BLOB_HEADER_LEN + key.len();
-    raw[value_offset] ^= 0xFF;
-    std::fs::write(&blob_file_path, &raw)?;
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let result = scanner.next().unwrap();
-    assert!(
-        matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
-        "expected ChecksumMismatch for corrupted value, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// A frame under the retired pre-V5 `b"BLOB"` magic (no header CRC) is NOT
-/// readable: the engine supports exactly one on-disk format, so the scanner
-/// reports it as corruption (and, finding no other frame, terminates).
-#[test]
-fn blob_scanner_rejects_retired_blob_magic_frame() -> crate::Result<()> {
-    use crate::io::{LittleEndian, WriteBytesExt};
-    use std::io::Write;
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    let key = b"abc";
-    let value = b"hello_v3";
-
-    // Retired-format data checksum: xxh3_128(key + value), no header_crc.
-    let checksum = {
-        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-        hasher.update(key);
-        hasher.update(value);
-        hasher.digest128()
-    };
-
-    // Manually write a retired-format blob file using sfa framing.
-    {
-        let file = std::fs::File::create(&blob_file_path)?;
-        let mut sfa_writer = crate::sfa::Writer::from_writer(file);
-        sfa_writer.start("data")?;
-
-        // Retired frame: BLOB magic, no header_crc.
-        sfa_writer.write_all(b"BLOB")?;
-        sfa_writer.write_u128::<LittleEndian>(checksum)?;
-        sfa_writer.write_u64::<LittleEndian>(42)?; // seqno
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test key length fits in u16"
-        )]
-        sfa_writer.write_u16::<LittleEndian>(key.len() as u16)?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test value length fits in u32"
-        )]
-        sfa_writer.write_u32::<LittleEndian>(value.len() as u32)?; // real_val_len
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test value length fits in u32"
-        )]
-        sfa_writer.write_u32::<LittleEndian>(value.len() as u32)?; // on_disk_val_len
-        sfa_writer.write_all(key)?;
-        sfa_writer.write_all(value)?;
-
-        // Write metadata section
-        sfa_writer.start("meta")?;
-        let metadata = crate::vlog::blob_file::meta::Metadata {
-            id: 0,
-            version: crate::vlog::blob_file::meta::META_VERSION,
-            created_at: 0,
-            item_count: 1,
-            total_compressed_bytes: value.len() as u64,
-            total_uncompressed_bytes: value.len() as u64,
-            key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
-            compression: crate::CompressionType::None,
-            lifetime_class: 0,
-        };
-        metadata.encode_into(&mut sfa_writer)?;
-        let inner = sfa_writer.into_inner()?;
-        inner.sync_all()?;
-    }
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let result = scanner.next().unwrap();
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "a retired-format frame must be rejected, got: {result:?}",
-    );
-    assert!(
-        scanner.next().is_none(),
-        "no readable frame exists past the rejected one"
-    );
-
-    Ok(())
-}
-
-/// A frame whose declared `on_disk_val_len` runs past the data section must
-/// be rejected by the checked frame-fit bound, not read past the section.
-/// The header CRC is forged CONSISTENT with the oversized length so the
-/// declaration survives CRC validation and reaches the fit check — the shape
-/// of a truncated file, whose remaining declared bytes simply do not exist.
-#[test]
-fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
-    use crate::io::{LittleEndian, WriteBytesExt};
-    use std::io::Write;
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    let key = b"abc";
-    let value = b"hi";
-    {
-        let file = std::fs::File::create(&blob_file_path)?;
-        let mut sfa_writer = crate::sfa::Writer::from_writer(file);
-        sfa_writer.start("data")?;
-        sfa_writer.write_all(crate::vlog::blob_file::writer::BLOB_HEADER_MAGIC)?;
-        sfa_writer.write_u128::<LittleEndian>(0)?; // checksum (unreached)
-        sfa_writer.write_u64::<LittleEndian>(1)?; // seqno
-        #[expect(clippy::cast_possible_truncation, reason = "test key fits u16")]
-        sfa_writer.write_u16::<LittleEndian>(key.len() as u16)?;
-        sfa_writer.write_u32::<LittleEndian>(2)?; // real_val_len
-        // on_disk_val_len far exceeds the data section → frame-fit reject.
-        sfa_writer.write_u32::<LittleEndian>(u32::MAX)?;
-        #[expect(clippy::cast_possible_truncation, reason = "test key fits u16")]
-        let crc =
-            crate::vlog::blob_file::writer::compute_header_crc(1, key.len() as u16, 2, u32::MAX);
-        sfa_writer.write_u32::<LittleEndian>(crc)?;
-        sfa_writer.write_all(key)?;
-        sfa_writer.write_all(value)?;
-
-        sfa_writer.start("meta")?;
-        let metadata = crate::vlog::blob_file::meta::Metadata {
-            id: 0,
-            version: crate::vlog::blob_file::meta::META_VERSION,
-            created_at: 0,
-            item_count: 1,
-            total_compressed_bytes: 2,
-            total_uncompressed_bytes: 2,
-            key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
-            compression: crate::CompressionType::None,
-            lifetime_class: 0,
-        };
-        metadata.encode_into(&mut sfa_writer)?;
-        sfa_writer.into_inner()?.sync_all()?;
-    }
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let result = scanner.next().unwrap();
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "an oversized on_disk_val_len must be rejected, got: {result:?}",
-    );
-    assert!(
-        scanner.next().is_none(),
-        "a CRC-vouched oversized declaration means truncation: the scan terminates"
-    );
-    Ok(())
-}
-
-/// A `data` section that ends fewer than `BLOB_HEADER_LEN` bytes past a frame
-/// magic (a partial tail at the section boundary) must be rejected BEFORE the
-/// fixed-header reads, so those reads never consume bytes from the following
-/// SFA section. Without the pre-read bound, the header fields are read into the
-/// adjacent `meta` section and the frame is only rejected afterward by the
-/// header-CRC / span check, having already crossed the boundary. The bound
-/// rejects the incomplete tail directly as `InvalidHeader`.
-#[test]
-fn blob_scanner_rejects_a_partial_header_at_the_section_boundary() -> crate::Result<()> {
-    use crate::io::{LittleEndian, WriteBytesExt};
-    use std::io::Write;
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    // A `data` section holding a frame magic plus only a few of the header's
-    // fixed bytes, then the `meta` section. `data_end` therefore falls INSIDE
-    // the header: `magic_offset + BLOB_HEADER_LEN` overruns it.
-    {
-        let file = std::fs::File::create(&blob_file_path)?;
-        let mut sfa_writer = crate::sfa::Writer::from_writer(file);
-        sfa_writer.start("data")?;
-        sfa_writer.write_all(crate::vlog::blob_file::writer::BLOB_HEADER_MAGIC)?;
-        // Only 8 of the remaining BLOB_HEADER_LEN - 4 header bytes: the section
-        // ends mid-header (well under a full BLOB_HEADER_LEN from the magic).
-        sfa_writer.write_u64::<LittleEndian>(0)?;
-
-        sfa_writer.start("meta")?;
-        let metadata = crate::vlog::blob_file::meta::Metadata {
-            id: 0,
-            version: crate::vlog::blob_file::meta::META_VERSION,
-            created_at: 0,
-            item_count: 0,
-            total_compressed_bytes: 0,
-            total_uncompressed_bytes: 0,
-            key_range: crate::KeyRange::new((b"a"[..].into(), b"a"[..].into())),
-            compression: crate::CompressionType::None,
-            lifetime_class: 0,
-        };
-        metadata.encode_into(&mut sfa_writer)?;
-        sfa_writer.into_inner()?.sync_all()?;
-    }
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let result = scanner.next().unwrap();
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "the partial tail is rejected before the header read, not parsed into \
-         the adjacent section, got: {result:?}",
-    );
-    assert!(
-        scanner.next().is_none(),
-        "no whole frame fits in the truncated data section: the scan terminates",
-    );
-    Ok(())
-}
-
-/// A CRC-valid frame whose declared `real_val_len` exceeds the 256 MiB
-/// decompression cap must be rejected by the pre-allocation cap check even when
-/// the frame still FITS the data section. Only `on_disk_val_len` feeds the
-/// frame-fit bound, so an over-cap `real_val_len` sails past the fit check and
-/// the cap check is the sole thing that can reject it: a path the
-/// section-overrun test does not exercise. The header CRC is recomputed
-/// CONSISTENT with the oversized length so the declaration survives CRC
-/// validation and reaches the cap check.
-#[test]
-fn blob_scanner_rejects_over_cap_real_val_len() -> crate::Result<()> {
-    use crate::vlog::blob_file::writer::compute_header_crc;
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-    let key = b"aaa";
-    let value = b"hi";
-    let seqno = 7u64;
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        writer.write(key, seqno, value)?;
-        writer.finish()?;
-    }
-
-    // Over the cap by one, but the ON-DISK length stays `value.len()` so the
-    // frame still fits the tiny data section. Only `real_val_len` breaks the
-    // cap, so the reject cannot be attributed to a section overrun. Derived from
-    // the scanner's own cap so the two never desync.
-    let over_cap: u32 = u32::try_from(MAX_DECOMPRESSION_SIZE).unwrap() + 1;
-    {
-        let mut bytes = std::fs::read(&blob_file_path)?;
-        bytes[RV_LEN_OFF..RV_LEN_OFF + 4].copy_from_slice(&over_cap.to_le_bytes());
-        // Recompute the header CRC so the oversized length survives validation
-        // and reaches the cap check instead of tripping the header CRC first.
-        let key_len = u16::try_from(key.len()).unwrap();
-        let on_disk_val_len = u32::try_from(value.len()).unwrap();
-        let crc = compute_header_crc(seqno, key_len, over_cap, on_disk_val_len);
-        bytes[HDR_CRC_OFF..HDR_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
-        std::fs::write(&blob_file_path, bytes)?;
-    }
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let result = scanner.next().unwrap();
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "an over-cap real_val_len must be rejected before allocation, got: {result:?}",
-    );
-    Ok(())
-}
-
-/// Writes two frames with the real writer and returns the path. Frame 1
-/// starts at data-section offset 0 (sfa has no inline section headers).
-fn write_two_frames(dir: &std::path::Path) -> crate::Result<std::path::PathBuf> {
-    let blob_file_path = dir.join("0");
-    let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-    writer.write(b"aaa", 7, b"first_value")?;
-    writer.write(b"bbb", 7, b"second_value")?;
-    writer.finish()?;
-    Ok(blob_file_path)
-}
-
-/// Rot in a frame's LENGTH field (caught by the header CRC) must not cost
-/// the readable tail: the consumed lengths are untrusted, so the scanner
-/// resynchronizes at the next frame magic instead of terminating —
-/// otherwise blob salvage drops every intact later record over one rotted
-/// header field.
-#[test]
-fn blob_scanner_header_crc_rot_resyncs_to_next_frame() -> crate::Result<()> {
-    let dir = tempdir()?;
-    let blob_file_path = write_two_frames(dir.path())?;
-
-    // Inflate frame 1's on_disk_val_len field (offset derived from the header
-    // layout). The header CRC no longer matches, so the lengths are untrusted.
-    {
-        let mut bytes = std::fs::read(&blob_file_path)?;
-        bytes[OD_LEN_OFF..OD_LEN_OFF + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        std::fs::write(&blob_file_path, bytes)?;
-    }
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let first = scanner.next().unwrap();
-    assert!(
-        matches!(first, Err(crate::Error::HeaderCrcMismatch { .. })),
-        "the rotted length field fails the header CRC: {first:?}",
-    );
-    let Some(second) = scanner.next() else {
-        panic!("the intact second frame must survive the rotted first");
-    };
-    let second = second?;
-    assert_eq!(second.key, Slice::from(&b"bbb"[..]));
-    assert_eq!(second.value, Slice::from(&b"second_value"[..]));
-    assert!(scanner.next().is_none());
-
-    Ok(())
-}
-
-/// Rot in a frame's MAGIC bytes must not cost the readable tail either: the
-/// frame's lengths are unreachable (nothing vouches for the header), so the
-/// scanner resynchronizes at the next frame magic.
-#[test]
-fn blob_scanner_magic_rot_resyncs_to_next_frame() -> crate::Result<()> {
-    let dir = tempdir()?;
-    let blob_file_path = write_two_frames(dir.path())?;
-
-    // Rot frame 1's magic (frame offset 0..4).
-    {
-        let mut bytes = std::fs::read(&blob_file_path)?;
-        bytes[0] ^= 0xFF;
-        std::fs::write(&blob_file_path, bytes)?;
-    }
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let first = scanner.next().unwrap();
-    assert!(
-        matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
-        "the rotted magic is rejected: {first:?}",
-    );
-    let Some(second) = scanner.next() else {
-        panic!("the intact second frame must survive the rotted first");
-    };
-    let second = second?;
-    assert_eq!(second.key, Slice::from(&b"bbb"[..]));
-    assert_eq!(second.value, Slice::from(&b"second_value"[..]));
-    assert!(scanner.next().is_none());
-
-    Ok(())
-}
-
-/// Writes three frames where frame 1's VALUE embeds a fake frame header
-/// (real magic + header-CRC-valid fields) whose declared lengths end exactly
-/// at frame 3's offset — the shape a resynchronizing scan must not trust.
-/// `fake_extra_len` widens the fake on-disk value length beyond that (0 =
-/// "skip exactly frame 2"; large = "declare past the data section").
-/// Returns the blob file path.
-fn write_frames_with_embedded_fake_header(
-    dir: &std::path::Path,
-    fake_extra_len: u32,
-) -> crate::Result<std::path::PathBuf> {
-    use crate::vlog::blob_file::writer::{BLOB_HEADER_LEN, compute_header_crc};
-
-    let blob_file_path = dir.join("0");
-
-    // Layout (data section starts at file offset 0):
-    //   f1: header 42 + key "aaa" (3) + value 52   -> [0, 97)
-    //   f2: header 42 + key "bbb" (3) + "second_value" (12) -> [97, 154)
-    //   f3: header 42 + key "ccc" (3) + "third_value" (11)  -> [154, 210)
-    // The fake header sits inside f1's value at absolute offset 55
-    // (10-byte prefix), so a resync from f1's rotted magic finds it first.
-    let header = BLOB_HEADER_LEN as u64;
-    let f2_off = header + 3 + 52;
-    let f3_off = f2_off + header + 3 + 12;
-    let fake_pos = header + 3 + 10;
-    // Declared end = fake_pos + header + fake_key(3) + odl == f3_off (+extra).
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "test layout offsets are tiny"
-    )]
-    let odl = (f3_off - fake_pos - header - 3) as u32 + fake_extra_len;
-    let fake_seqno = 1u64;
-    let crc = compute_header_crc(fake_seqno, 3, odl, odl);
-
-    let mut fake = Vec::with_capacity(BLOB_HEADER_LEN);
-    fake.extend_from_slice(BLOB_HEADER_MAGIC);
-    fake.extend_from_slice(&0u128.to_le_bytes()); // payload checksum: never matches
-    fake.extend_from_slice(&fake_seqno.to_le_bytes());
-    fake.extend_from_slice(&3u16.to_le_bytes());
-    fake.extend_from_slice(&odl.to_le_bytes());
-    fake.extend_from_slice(&odl.to_le_bytes());
-    fake.extend_from_slice(&crc.to_le_bytes());
-    assert_eq!(fake.len(), BLOB_HEADER_LEN, "fake header fills the layout");
-
-    let mut value1 = alloc::vec![0xAAu8; 10];
-    value1.extend_from_slice(&fake);
-    assert_eq!(value1.len(), 52, "f1 value matches the planned layout");
-
-    let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-    writer.write(b"aaa", 7, &value1)?;
-    writer.write(b"bbb", 7, b"second_value")?;
-    writer.write(b"ccc", 7, b"third_value")?;
-    writer.finish()?;
-
-    // Rot f1's real magic so the scan resynchronizes into f1's value and
-    // lands on the embedded fake magic.
-    let mut bytes = std::fs::read(&blob_file_path)?;
-    bytes[0] ^= 0xFF;
-    std::fs::write(&blob_file_path, bytes)?;
-    Ok(blob_file_path)
-}
-
-/// A resync CANDIDATE whose payload checksum fails must not have its
-/// declared lengths trusted: the candidate magic came from user-controlled
-/// value bytes, so a CRC-valid fake header can declare an end past intact
-/// later records. The scanner must resynchronize again strictly after the
-/// candidate instead of continuing from its declared end — otherwise the
-/// fake frame silently costs frame 2.
-#[test]
-fn blob_scanner_resyncs_again_when_a_candidate_frame_fails_its_checksum() -> crate::Result<()> {
-    let dir = tempdir()?;
-    // Fake declared end == frame 3's offset: trusting it skips frame 2.
-    let blob_file_path = write_frames_with_embedded_fake_header(dir.path(), 0)?;
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let first = scanner.next().unwrap();
-    assert!(
-        matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
-        "the rotted real magic is rejected: {first:?}",
-    );
-    let second = scanner.next().unwrap();
-    assert!(
-        matches!(second, Err(crate::Error::ChecksumMismatch { .. })),
-        "the fake candidate fails its payload checksum: {second:?}",
-    );
-    let Some(third) = scanner.next() else {
-        panic!("the intact second frame must survive the fake candidate");
-    };
-    let third = third?;
-    assert_eq!(
-        third.key,
-        Slice::from(&b"bbb"[..]),
-        "frame 2 is recovered, not skipped by the fake declared end",
-    );
-    assert_eq!(third.value, Slice::from(&b"second_value"[..]));
-    assert!(
-        third.resynced,
-        "the first frame recovered after a resync is tainted",
-    );
-    let Some(fourth) = scanner.next() else {
-        panic!("frame 3 follows");
-    };
-    let fourth = fourth?;
-    assert_eq!(fourth.key, Slice::from(&b"ccc"[..]));
-    assert!(
-        fourth.resynced,
-        "the taint is STICKY: every frame chained after a resync stays untrusted \
-         through EOF, since its boundary was re-established by search",
-    );
-    assert!(scanner.next().is_none());
-    Ok(())
-}
-
-/// A resync CANDIDATE whose declared end exceeds the data section must not
-/// TERMINATE the scan: for a chained (writer-vouched) frame that means real
-/// truncation, but a candidate's lengths come from user-controlled bytes —
-/// terminating hands one crafted value the whole readable tail. The scanner
-/// must resynchronize past the candidate instead.
-#[test]
-fn blob_scanner_resyncs_when_a_candidate_frame_declares_past_the_section() -> crate::Result<()> {
-    let dir = tempdir()?;
-    // Fake declared end far past the data section: bounds-reject the candidate.
-    let blob_file_path = write_frames_with_embedded_fake_header(dir.path(), 1_000_000)?;
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let first = scanner.next().unwrap();
-    assert!(
-        matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
-        "the rotted real magic is rejected: {first:?}",
-    );
-    let second = scanner.next().unwrap();
-    assert!(
-        matches!(second, Err(crate::Error::InvalidHeader("Blob"))),
-        "the fake candidate is bounds-rejected: {second:?}",
-    );
-    let Some(third) = scanner.next() else {
-        panic!("the intact second frame must survive the fake candidate");
-    };
-    let third = third?;
-    assert_eq!(
-        third.key,
-        Slice::from(&b"bbb"[..]),
-        "frame 2 is recovered, not lost to a terminated scan",
-    );
-    let Some(fourth) = scanner.next() else {
-        panic!("frame 3 follows");
-    };
-    let fourth = fourth?;
-    assert_eq!(fourth.key, Slice::from(&b"ccc"[..]));
-    assert!(scanner.next().is_none());
-    Ok(())
-}
-
-/// A CRC-VALID frame at a WRITER-CHAINED position whose length was
-/// re-stamped so the declared payload OVERRUNS the data section (a bounds
-/// rejection, not a checksum one) must resynchronize too: a bounds
-/// rejection makes the declared span untrusted regardless of how the
-/// position was reached, so terminating would leave every intact later
-/// frame uninspected while salvage reports only the one corrupt record.
-#[test]
-fn blob_scanner_resyncs_when_a_chained_frame_declares_past_the_section() -> crate::Result<()> {
-    use crate::vlog::blob_file::writer::compute_header_crc;
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        writer.write(b"aaa", 7, b"first_value")?;
-        writer.write(b"bbb", 7, b"second_value")?;
-        writer.write(b"ccc", 7, b"third_value")?;
-        writer.finish()?;
-    }
-
-    // Re-stamp frame 1's on_disk_val_len so its declared end overruns the
-    // whole data section, and recompute the header CRC so the frame is
-    // CRC-valid (the bounds check then rejects it before any allocation).
-    {
-        let mut bytes = std::fs::read(&blob_file_path)?;
-        let huge = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        bytes[OD_LEN_OFF..OD_LEN_OFF + 4].copy_from_slice(&huge.to_le_bytes());
-        let crc = compute_header_crc(7, 3, 11, huge);
-        bytes[HDR_CRC_OFF..HDR_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
-        std::fs::write(&blob_file_path, bytes)?;
-    }
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let first = scanner.next().unwrap();
-    assert!(
-        matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
-        "the over-section frame is bounds-rejected: {first:?}",
-    );
-    let Some(second) = scanner.next() else {
-        panic!("the intact frame 2 must survive the over-section frame");
-    };
-    let second = second?;
-    assert_eq!(
-        second.key,
-        Slice::from(&b"bbb"[..]),
-        "frame 2 is recovered, not lost to a terminated scan",
-    );
-    let Some(third) = scanner.next() else {
-        panic!("frame 3 follows");
-    };
-    assert_eq!(third?.key, Slice::from(&b"ccc"[..]));
-    assert!(scanner.next().is_none());
-    Ok(())
-}
-
-/// A CRC-VALID frame at a WRITER-CHAINED position (not a resync candidate)
-/// whose on-disk length was re-stamped to consume an intact later frame,
-/// then fails its payload checksum, must resynchronize — a checksum
-/// rejection means the declared span is untrusted regardless of how the
-/// position was reached. Otherwise the scan resumes past the swallowed
-/// frame and salvage drops it without reporting the loss.
-#[test]
-fn blob_scanner_resyncs_when_a_chained_frame_swallows_the_next() -> crate::Result<()> {
-    use crate::vlog::blob_file::writer::{BLOB_HEADER_LEN, compute_header_crc};
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        writer.write(b"aaa", 7, b"first_value")?; // 11-byte value
-        writer.write(b"bbb", 7, b"second_value")?;
-        writer.write(b"ccc", 7, b"third_value")?;
-        writer.finish()?;
-    }
-
-    // Frame 1 at offset 0: header 42 + key 3 + value 11 -> ends at 56.
-    // Frame 2: 42 + 3 + 12 -> ends at 113 (= frame 3's offset).
-    // Re-stamp frame 1's on_disk_val_len so its declared end reaches frame
-    // 3, swallowing frame 2, and recompute the header CRC so the frame is
-    // CRC-valid (the payload checksum then fails on the wrong-length value).
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "BLOB_HEADER_LEN is the 42-byte header constant, well within u32"
-    )]
-    let header = BLOB_HEADER_LEN as u32;
-    // Frame 3's offset = frame 1 + frame 2, each `header + key_len + value_len`
-    // (3-byte keys; 11- and 12-byte values), derived from the header constant so
-    // a header-layout change moves it in lockstep.
-    let key_len = 3u32;
-    let f3_off = (header + key_len + 11) + (header + key_len + 12);
-    let swallow_odl = f3_off - header - key_len; // header + key + odl == f3_off
-    {
-        let mut bytes = std::fs::read(&blob_file_path)?;
-        bytes[OD_LEN_OFF..OD_LEN_OFF + 4].copy_from_slice(&swallow_odl.to_le_bytes());
-        let crc = compute_header_crc(7, 3, 11, swallow_odl);
-        bytes[HDR_CRC_OFF..HDR_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
-        std::fs::write(&blob_file_path, bytes)?;
-    }
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let first = scanner.next().unwrap();
-    assert!(
-        matches!(first, Err(crate::Error::ChecksumMismatch { .. })),
-        "the swallowing frame fails its payload checksum: {first:?}",
-    );
-    let Some(second) = scanner.next() else {
-        panic!("the intact frame 2 must survive the swallowing frame");
-    };
-    let second = second?;
-    assert_eq!(
-        second.key,
-        Slice::from(&b"bbb"[..]),
-        "frame 2 is recovered, not skipped by the re-stamped declared end",
-    );
-    assert_eq!(second.value, Slice::from(&b"second_value"[..]));
-    let Some(third) = scanner.next() else {
-        panic!("frame 3 follows");
-    };
-    assert_eq!(third?.key, Slice::from(&b"ccc"[..]));
-    assert!(scanner.next().is_none());
-    Ok(())
-}
-
-/// Scanner rejects frames with invalid magic (neither V3 nor V4).
-#[test]
-fn blob_scanner_rejects_invalid_magic() -> crate::Result<()> {
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        writer.write(b"key", 0, b"value")?;
-        writer.finish()?;
-    }
-
-    // Corrupt magic bytes at offset 0 (start of first frame).
-    let mut raw = std::fs::read(&blob_file_path)?;
-    // First frame starts at offset 0 because sfa has no inline headers.
-    raw[0..4].copy_from_slice(b"XXXX");
-    std::fs::write(&blob_file_path, &raw)?;
-
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-    let result = scanner.next().unwrap();
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "expected InvalidHeader for bad magic, got: {result:?}",
-    );
-
-    // Scanner must be terminated — subsequent next() returns None,
-    // not garbage parsed from an invalid stream position.
-    assert!(scanner.next().is_none());
-
-    Ok(())
-}
-
-/// Corruption that produces META bytes at a frame boundary must
-/// surface as an error, not silently terminate iteration.
-///
-/// Regression test for #50: the old scanner checked for `b"META"`
-/// magic to detect the metadata section boundary, which meant
-/// corruption matching those bytes caused silent data loss.
-#[test]
-fn blob_scanner_meta_corruption_is_not_silent_eof() -> crate::Result<()> {
-    use crate::vlog::blob_file::writer::BLOB_HEADER_LEN;
-
-    let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    {
-        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
-        writer.write(b"a", 0, &b"v".repeat(50))?;
-        writer.write(b"b", 1, &b"w".repeat(50))?;
-        writer.finish()?;
-    }
-
-    // Get data section start from SFA TOC so the offset calculation
-    // stays correct even if SFA ever places data at non-zero offset.
-    let data_start = {
-        let sfa_reader = crate::sfa::Reader::new(&blob_file_path)?;
-        let section = sfa_reader.toc().section(b"data").unwrap();
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test blob file is tiny, pos fits in usize"
-        )]
-        {
-            section.pos() as usize
+fn an_environmental_index_read_failure_is_returned_not_walked_around() -> crate::Result<()> {
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    struct Failing(std::io::ErrorKind);
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
         }
-    };
+    }
+    // Seeks succeed and the file is long enough to hold the index: only its
+    // reads fail.
+    impl Seek for Failing {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            Ok(match to {
+                SeekFrom::End(_) => 1 << 20,
+                _ => 0,
+            })
+        }
+    }
 
-    let mut raw = std::fs::read(&blob_file_path)?;
-    // Second frame offset: data_start + first frame (header + key + value).
-    let second_frame_offset = data_start + BLOB_HEADER_LEN + 1 + 50;
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let (pos, len) = section(&path, b"frames")?;
+    let (data_pos, data_len) = section(&path, b"data")?;
+    let at = (pos as u64, len as u64);
+    let data = data_pos as u64..(data_pos + data_len) as u64;
 
-    // Corrupt the second frame's magic to b"META".
-    raw.get_mut(second_frame_offset..second_frame_offset + 4)
-        .unwrap()
-        .copy_from_slice(b"META");
-    std::fs::write(&blob_file_path, &raw)?;
+    let mut file = Cursor::new(std::fs::read(&path)?);
+    let index = read_frame_index(&mut file, at, data.clone())?;
+    assert_eq!(index.map(|i| i.len()), Some(4), "three frames and the end");
 
-    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
-
-    // First frame should still be readable (it's intact).
-    let first = scanner.next().unwrap();
-    assert!(first.is_ok(), "first frame should be OK: {first:?}");
-
-    // Second frame has corrupted magic — scanner must return an
-    // error, NOT silently terminate.
-    let second = scanner.next().unwrap();
+    assert!(matches!(
+        read_frame_index(&mut Failing(std::io::ErrorKind::PermissionDenied), at, data.clone()),
+        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::PermissionDenied
+    ));
     assert!(
-        matches!(second, Err(crate::Error::InvalidHeader("Blob"))),
-        "expected InvalidHeader for META-corrupted magic, got: {second:?}",
+        read_frame_index(
+            &mut Failing(std::io::ErrorKind::InvalidData),
+            at,
+            data.clone()
+        )?
+        .is_none(),
+        "a read the bytes fail walks the chain"
     );
-
+    // A file whose length cannot be asked is handled as its reads are.
+    struct NoLength(std::io::ErrorKind);
+    impl Read for NoLength {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Seek for NoLength {
+        fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+            Err(self.0.into())
+        }
+    }
+    assert!(matches!(
+        read_frame_index(
+            &mut NoLength(std::io::ErrorKind::PermissionDenied),
+            at,
+            data.clone()
+        ),
+        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::PermissionDenied
+    ));
+    assert!(
+        read_frame_index(
+            &mut NoLength(std::io::ErrorKind::InvalidData),
+            at,
+            data.clone()
+        )?
+        .is_none()
+    );
+    // An index named as running past the file is damage, refused before
+    // anything is sized from the length it names.
+    assert!(
+        read_frame_index(&mut file, (pos as u64, u64::MAX / 2), data)?.is_none(),
+        "an index past the file walks the chain"
+    );
     Ok(())
 }
 
-/// Scanner rejects blob files that have no SFA "data" section.
+/// A copying scan checks a frame a value has to itself as stored and leaves
+/// it undecoded: its stored payload, garbage to the codec but sealed, is
+/// handed over as its frames, which a scan proving every value refuses; a
+/// block is still decoded, its values taken one by one; and stored bytes
+/// that no longer match the checksum are refused either way.
+#[cfg(all(feature = "std", feature = "lz4"))]
 #[test]
-fn blob_scanner_rejects_missing_data_section() -> crate::Result<()> {
+fn a_copying_scan_leaves_frames_of_their_own_undecoded() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let chunked: Vec<u8> = (0..700_u32).map(|i| (i % 7) as u8).collect();
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        crate::SequenceNumberCounter::default(),
+        dir.path(),
+        0,
+        None,
+        alloc::sync::Arc::new(StdFs),
+    )?
+    .use_target_size(u64::MAX)
+    .use_frame_sizes(SIZES)
+    .use_compression(CompressionType::Lz4);
+    for (key, value) in [
+        (&b"a"[..], &b"x1x1x1x1"[..]),
+        (b"b", b"x2x2x2x2"),
+        (b"c", &[b'c'; 150]),
+        (b"d", &chunked),
+    ] {
+        writer.write(key, 0, value)?;
+    }
+    let file = writer.finish()?.remove(0);
+    let path = file.path().to_path_buf();
+    let index = index_of(&path)?;
+    // Frame 1 is the single frame, frame 3 the head's first chunk.
+    let garble = |bytes: &mut Vec<u8>, frame: usize| {
+        let at = &mut bytes[index[frame]..index[frame + 1]];
+        let header = parse_header(at).expect("a frame");
+        assert!(!header.is_raw(), "lz4 compressed frame {frame}");
+        let stored = FRAME_HEADER_LEN + header.entries_len as usize;
+        at[stored..].fill(0xFF);
+        crate::vlog::blob_file::frame::reseal(at);
+    };
+    edit(&path, |bytes| {
+        garble(bytes, 1);
+        garble(bytes, 3);
+    })?;
+    let on_disk = std::fs::read(&path)?;
+
+    let copied = Scanner::of_paced(&file, None, None)?.collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(copied.len(), 4, "every value, none refused");
+    assert_eq!(
+        copied[0].value.as_deref(),
+        Some(&b"x1x1x1x1"[..]),
+        "a block decodes"
+    );
+    assert_eq!(copied[2].value, None, "the single frame is not decoded");
+    assert_eq!(
+        copied[2].frames.as_deref(),
+        Some(&[Slice::from(&on_disk[index[1]..index[2]])][..]),
+        "it goes over as stored",
+    );
+    assert_eq!(copied[3].frames.as_ref().map(Vec::len), Some(4));
+
+    let proven: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+    assert!(
+        matches!(proven[2], Err(crate::Error::Decompress(_))),
+        "a scan proving every value decodes the single frame: {:?}",
+        proven[2],
+    );
+
+    edit(&path, |bytes| bytes[index[2] - 1] ^= 1)?;
+    let damaged: Vec<_> = Scanner::of_paced(&file, None, None)?.collect();
+    assert!(
+        matches!(damaged[2], Err(crate::Error::ChecksumMismatch { .. })),
+        "the stored bytes are still checked: {:?}",
+        damaged[2],
+    );
+    Ok(())
+}
+
+/// By the index, a damaged frame costs that frame alone, wherever the damage
+/// is: the next frame is where the index puts it, and its boundary is the
+/// index's, so nothing after it is tainted.
+#[test]
+fn by_the_index_a_damaged_frame_costs_only_itself() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let index = index_of(&path)?;
+    let pristine = std::fs::read(&path)?;
+    // The magic, a length field, the header CRC, a key byte, a value byte.
+    for at in [0, 12, 20, 40 + 14, index[2] - index[1] - 1] {
+        std::fs::write(&path, &pristine)?;
+        edit(&path, |bytes| bytes[index[1] + at] ^= 0x40)?;
+        let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+        assert_eq!(scanner.next().expect("aaa")?.key, Slice::from(&b"aaa"[..]));
+        assert!(
+            scanner.next().expect("bbb").is_err(),
+            "byte {at} of frame 1"
+        );
+        let third = scanner.next().expect("ccc")?;
+        assert_eq!(third.key, Slice::from(&b"ccc"[..]));
+        assert!(!third.resynced, "a boundary from the index is not tainted");
+        assert!(scanner.next().is_none());
+    }
+    Ok(())
+}
+
+/// A damaged chunk costs its value alone: the walk goes on after the value's
+/// last chunk, so the chunks left are not reported one by one.
+#[test]
+fn a_damaged_chunk_costs_its_value_alone() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
+    let index = index_of(&path)?;
+    // The first chunk is frame 1.
+    edit(&path, |bytes| bytes[index[2] - 1] ^= 0x40)?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(matches!(
+        scanner.next(),
+        Some(Err(crate::Error::ChecksumMismatch { .. }))
+    ));
+    let next = scanner.next().expect("the value after it")?;
+    assert_eq!(next.key, Slice::from(&b"next"[..]));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
+/// A head lost to damage leaves its chunks behind it: by the index, each is
+/// reached and refused as a chunk without its head, and the walk goes on to
+/// the value after them.
+#[test]
+fn chunks_whose_head_is_damaged_are_refused_each() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
+    let index = index_of(&path)?;
+    // A key byte of the head, frame 0.
+    edit(&path, |bytes| bytes[index[0] + 40 + 14] ^= 0x40)?;
+    let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+    assert_eq!(results.len(), 5, "the head, three chunks, the next value");
+    assert!(matches!(
+        results[0],
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+    for chunk in &results[1..4] {
+        assert!(matches!(
+            chunk,
+            Err(crate::Error::InvalidHeader("BlobFrame"))
+        ));
+    }
+    assert_eq!(
+        results[4].as_ref().expect("the next value").key,
+        Slice::from(&b"next"[..])
+    );
+    Ok(())
+}
+
+/// Rewrites the chunked value's head, frame 0 of a file written by `write`:
+/// its value length and its chunk count, sealed again so the head checks.
+fn rewrite_head(path: &std::path::Path, value_len: u32, chunks: u32) -> crate::Result<()> {
+    rewrite_head_table(path, value_len, None, chunks)
+}
+
+/// [`rewrite_head`], the chunk size rewritten too when given.
+fn rewrite_head_table(
+    path: &std::path::Path,
+    value_len: u32,
+    chunk_size: Option<u32>,
+    chunks: u32,
+) -> crate::Result<()> {
+    let index = index_of(path)?;
+    edit(path, |bytes| {
+        let head = &mut bytes[index[0]..index[1]];
+        // The entry's value length, after its seqno and key length.
+        head[40 + 10..40 + 14].copy_from_slice(&value_len.to_le_bytes());
+        // The chunk table after the entry: the chunk size, then the count.
+        let table = head.len() - 8;
+        if let Some(size) = chunk_size {
+            head[table..table + 4].copy_from_slice(&size.to_le_bytes());
+        }
+        head[table + 4..].copy_from_slice(&chunks.to_le_bytes());
+        crate::vlog::blob_file::frame::reseal(head);
+    })
+}
+
+/// A head whose chunks are all their size but run into a frame that is no
+/// chunk is refused: the frame after its last true chunk is another value's.
+#[test]
+fn a_head_whose_chunk_run_meets_another_frame_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    // Two chunks of 300 bytes, then a value of its own.
+    let path = write(dir.path(), &[(b"big", &[9; 600]), (b"next", &[1; 120])])?;
+    // Three full chunks named: the third is the next value's frame.
+    rewrite_head(&path, 900, 3)?;
+    let first = Scanner::new(&path, &StdFs, 0)?.next().expect("the head");
+    assert!(matches!(
+        first,
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    Ok(())
+}
+
+/// A head that checks but names far more chunks than the file holds, a cap's
+/// worth of one-byte chunks, is damage refused before room is reserved for
+/// them, by the index or along the chain, and the walk goes on after it.
+#[test]
+fn a_head_naming_more_chunks_than_the_file_holds_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
+    let cap = MAX_DECOMPRESSION_SIZE as u32;
+    rewrite_head_table(&path, cap, Some(1), cap)?;
+    let indexed = std::fs::read(&path)?;
+    break_index(&path)?;
+    let chained = std::fs::read(&path)?;
+    for bytes in [indexed, chained] {
+        std::fs::write(&path, &bytes)?;
+        let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+        assert!(matches!(
+            results[0],
+            Err(crate::Error::InvalidHeader("BlobFrame"))
+        ));
+        let next = results.iter().filter_map(|r| r.as_ref().ok()).next_back();
+        assert_eq!(
+            next.map(|e| &*e.key),
+            Some(&b"next"[..]),
+            "the walk goes on"
+        );
+    }
+    Ok(())
+}
+
+/// A head that checks but names chunks its value length does not need, or
+/// chunks the file does not hold where they should lie, is damage: the walk
+/// reports it for the value instead of taking another frame, or the end of the
+/// data, for a chunk.
+#[test]
+fn a_head_naming_chunks_that_are_not_there_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let value = [9; 700];
+
+    // Four chunks of 300 bytes for 700: the table does not cover the value.
+    let path = write(dir.path(), &[(b"big", &value), (b"next", &[1; 120])])?;
+    rewrite_head(&path, 700, 4)?;
+    let first = Scanner::new(&path, &StdFs, 0)?.next().expect("the head");
+    assert!(matches!(
+        first,
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+
+    // A thousand bytes in four chunks: the fourth is where the next value lies.
+    rewrite_head(&path, 1000, 4)?;
+    let first = Scanner::new(&path, &StdFs, 0)?.next().expect("the head");
+    assert!(matches!(
+        first,
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+
+    // The same with nothing after the value: the fourth is past the data.
+    let alone = tempdir()?;
+    let path = write(alone.path(), &[(b"big", &value)])?;
+    rewrite_head(&path, 1000, 4)?;
+    let first = Scanner::new(&path, &StdFs, 0)?.next().expect("the head");
+    assert!(matches!(
+        first,
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    Ok(())
+}
+
+/// An index that checks but ends past the data section is not the file's:
+/// the scan walks the frame chain instead and reads every value, none past
+/// the section.
+#[test]
+fn an_index_ending_past_the_data_is_walked_around() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let index = index_of(&path)?;
+    let (pos, len) = section(&path, b"frames")?;
+    let starts: Vec<u64> = index[..index.len() - 1]
+        .iter()
+        .map(|&at| at as u64)
+        .collect();
+    let past = index[index.len() - 1] as u64 + 1;
+    let encoded = crate::vlog::blob_file::writer::encode_frame_index(&starts, past);
+    assert_eq!(encoded.len(), len, "the same count of frames");
+    edit(&path, |bytes| {
+        bytes[pos..pos + len].copy_from_slice(&encoded);
+    })?;
+
+    let keys: Vec<_> = Scanner::new(&path, &StdFs, 0)?
+        .map(|entry| entry.map(|entry| entry.key))
+        .collect::<crate::Result<_>>()?;
+    assert_eq!(keys.len(), 3, "every value, along the chain");
+    Ok(())
+}
+
+/// A read that fails anywhere in a scan, by the index or along the frame
+/// chain, surfaces as an error and ends the scan: it never reads as a short
+/// file or an empty value.
+#[test]
+fn a_failed_read_ends_the_scan_with_its_error() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempdir()?;
+    // More than the scanner's buffer, so the frames take reads of their own.
+    let values: Vec<(Vec<u8>, Vec<u8>)> =
+        (0..40_u8).map(|i| (vec![b'k', i], vec![i; 280])).collect();
+    let borrowed: Vec<(&[u8], &[u8])> = values.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+    let path = write(dir.path(), &borrowed)?;
+    let indexed = std::fs::read(&path)?;
+    break_index(&path)?;
+    let chained = std::fs::read(&path)?;
+
+    for bytes in [indexed, chained] {
+        std::fs::write(&path, &bytes)?;
+        let mut failed_any = false;
+        for skip in 0..64 {
+            let fs = FaultFs::new(StdFs);
+            let mut scanner = Scanner::new(&path, &fs, 0)?;
+            fs.injector().arm(
+                FaultRule::new(FaultOp::Read, Fault::Error(crate::io::ErrorKind::Other))
+                    .skip(skip)
+                    .once(),
+            );
+            let results: Vec<_> = scanner.by_ref().collect();
+            if let Some(at) = results.iter().position(Result::is_err) {
+                failed_any = true;
+                assert_eq!(at, results.len() - 1, "the scan ends at the failure");
+            } else {
+                assert_eq!(results.len(), values.len(), "an untouched scan reads all");
+                break;
+            }
+        }
+        assert!(failed_any, "some read of the scan was faulted");
+    }
+    Ok(())
+}
+
+/// A field past the decompression cap under a header CRC that holds is
+/// refused before anything is allocated for it.
+#[test]
+fn an_over_cap_length_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let over_cap = u32::try_from(MAX_DECOMPRESSION_SIZE).expect("fits") + 1;
+    edit(&path, |bytes| {
+        bytes[12..16].copy_from_slice(&over_cap.to_le_bytes());
+        restamp_header_crc(&mut bytes[..]);
+    })?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    let result = scanner.next().expect("a result");
+    assert!(
+        matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
+        "got: {result:?}"
+    );
+    assert_eq!(scanner.next().expect("bbb")?.key, Slice::from(&b"bbb"[..]));
+    Ok(())
+}
+
+/// The earlier record layout is not readable: a frame under its magic is
+/// refused, and the walk goes on.
+#[test]
+fn an_earlier_record_magic_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    edit(&path, |bytes| bytes[..4].copy_from_slice(b"BLO4"))?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(matches!(
+        scanner.next(),
+        Some(Err(crate::Error::InvalidHeader("BlobFrame")))
+    ));
+    assert_eq!(scanner.next().expect("bbb")?.key, Slice::from(&b"bbb"[..]));
+    Ok(())
+}
+
+/// Without a readable index the walk follows the frames' own lengths, and
+/// reads the file as the index would.
+#[test]
+fn without_its_index_a_file_is_walked_by_its_frames() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = write(
+        dir.path(),
+        &[(b"a", b"x1"), (b"b", b"x2"), (b"c", &[9; 700])],
+    )?;
+    let indexed = Scanner::new(&path, &StdFs, 0)?.collect::<crate::Result<Vec<_>>>()?;
+    break_index(&path)?;
+    let chained = Scanner::new(&path, &StdFs, 0)?.collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(chained, indexed);
+    Ok(())
+}
+
+/// Without an index, a resumed walk could not number its frames: it is
+/// refused rather than handing out wrong frame numbers.
+#[test]
+fn without_its_index_a_scan_cannot_resume() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let at = index_of(&path)?[1] as u64;
+    break_index(&path)?;
+    assert!(matches!(
+        Scanner::resume(&path, &StdFs, 0, at),
+        Err(crate::Error::InvalidHeader("BlobFile"))
+    ));
+    Ok(())
+}
+
+/// In a walk by the frames' lengths, a rotted length field fails the header
+/// CRC and the walk searches for the next magic instead of ending: the
+/// readable tail survives, and everything past the search is tainted.
+#[test]
+fn without_its_index_header_rot_resyncs_to_the_next_frame() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    edit(&path, |bytes| {
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    })?;
+    break_index(&path)?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(matches!(
+        scanner.next(),
+        Some(Err(crate::Error::HeaderCrcMismatch { .. }))
+    ));
+    let second = scanner.next().expect("bbb")?;
+    assert_eq!(second.key, Slice::from(&b"bbb"[..]));
+    assert!(second.resynced, "a boundary found by search is tainted");
+    let third = scanner.next().expect("ccc")?;
+    assert!(third.resynced, "and the taint is sticky");
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
+/// In a walk by the frames' lengths, a rotted magic is refused and the walk
+/// searches on.
+#[test]
+fn without_its_index_magic_rot_resyncs_to_the_next_frame() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    edit(&path, |bytes| bytes[0] ^= 0xFF)?;
+    break_index(&path)?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(matches!(
+        scanner.next(),
+        Some(Err(crate::Error::InvalidHeader("BlobFrame")))
+    ));
+    assert_eq!(scanner.next().expect("bbb")?.key, Slice::from(&b"bbb"[..]));
+    Ok(())
+}
+
+/// Three frames, frame 0's value carrying a forged frame header 10 bytes in
+/// whose declared length ends `past` bytes after frame 2's start, and frame
+/// 0's own magic rotted: a search from it lands on the forgery first.
+fn write_with_a_forged_header(
+    dir: &std::path::Path,
+    past: u32,
+) -> crate::Result<std::path::PathBuf> {
+    // A first pass places the frames: the value's bytes do not move them.
+    let filler = [0xAA_u8; 150];
+    let path = write(
+        dir,
+        &[(b"aaa", &filler), (b"bbb", &[2; 130]), (b"ccc", &[3; 140])],
+    )?;
+    let index = index_of(&path)?;
+    std::fs::remove_file(&path)?;
+
+    // The forgery sits in frame 0's value, which starts after its header,
+    // its entry and the key.
+    let forged_at = 40 + 14 + 3 + 10;
+    let entries_len = 14 + 3;
+    let disk_len = u32::try_from(index[2] - forged_at - 40 - entries_len).expect("small") + past;
+    let header = forged_header(FrameKind::Single, 1, entries_len as u32, disk_len, disk_len);
+    let mut value = filler.to_vec();
+    value[10..10 + header.len()].copy_from_slice(&header);
+
+    let path = write(
+        dir,
+        &[(b"aaa", &value), (b"bbb", &[2; 130]), (b"ccc", &[3; 140])],
+    )?;
+    edit(&path, |bytes| bytes[0] ^= 0xFF)?;
+    break_index(&path)?;
+    Ok(path)
+}
+
+/// A search candidate whose checksum fails does not have its declared length
+/// trusted: it came from a value's bytes, and a header CRC that holds can
+/// declare an end past intact frames. The search goes on strictly after it,
+/// so frame 1 is recovered, not skipped.
+#[test]
+fn a_forged_candidate_failing_its_checksum_is_searched_past() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = write_with_a_forged_header(dir.path(), 0)?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(scanner.next().expect("the rotted frame").is_err());
+    assert!(
+        matches!(
+            scanner.next(),
+            Some(Err(crate::Error::ChecksumMismatch { .. }))
+        ),
+        "the forgery fails its checksum"
+    );
+    let second = scanner.next().expect("bbb")?;
+    assert_eq!(
+        second.key,
+        Slice::from(&b"bbb"[..]),
+        "recovered, not skipped"
+    );
+    assert!(second.resynced);
+    assert_eq!(scanner.next().expect("ccc")?.key, Slice::from(&b"ccc"[..]));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
+/// A search candidate declaring an end past the data section does not end
+/// the walk: that would hand one crafted value the whole readable tail.
+#[test]
+fn a_forged_candidate_declaring_past_the_section_is_searched_past() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = write_with_a_forged_header(dir.path(), 1_000_000)?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(scanner.next().expect("the rotted frame").is_err());
+    assert!(scanner.next().expect("the forgery").is_err());
+    assert_eq!(scanner.next().expect("bbb")?.key, Slice::from(&b"bbb"[..]));
+    assert_eq!(scanner.next().expect("ccc")?.key, Slice::from(&b"ccc"[..]));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
+/// A frame at a chained position whose length was rewritten, under a header
+/// CRC that holds, to swallow the next frame fails its checksum, and the walk
+/// searches on rather than resuming past what it swallowed.
+#[test]
+fn a_chained_frame_swallowing_the_next_is_searched_past() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let index = index_of(&path)?;
+    let swallowing = u32::try_from(index[2] - 40 - 14 - 3).expect("small");
+    edit(&path, |bytes| {
+        bytes[16..20].copy_from_slice(&swallowing.to_le_bytes());
+        restamp_header_crc(&mut bytes[..]);
+    })?;
+    break_index(&path)?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(scanner.next().expect("the swallowing frame").is_err());
+    assert_eq!(
+        scanner.next().expect("bbb")?.key,
+        Slice::from(&b"bbb"[..]),
+        "not skipped by the rewritten length"
+    );
+    assert_eq!(scanner.next().expect("ccc")?.key, Slice::from(&b"ccc"[..]));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
+/// A frame at a chained position declaring an end past the data section is
+/// refused and searched past, not taken for the end of the file.
+#[test]
+fn a_chained_frame_declaring_past_the_section_is_searched_past() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    edit(&path, |bytes| {
+        let huge = u32::try_from(bytes.len()).expect("small");
+        bytes[16..20].copy_from_slice(&huge.to_le_bytes());
+        restamp_header_crc(&mut bytes[..]);
+    })?;
+    break_index(&path)?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(matches!(
+        scanner.next(),
+        Some(Err(crate::Error::InvalidHeader("BlobFrame")))
+    ));
+    assert_eq!(scanner.next().expect("bbb")?.key, Slice::from(&b"bbb"[..]));
+    Ok(())
+}
+
+/// Bytes that spell another section's magic where a frame starts are damage,
+/// reported as such, never read as the end of the data.
+#[test]
+fn a_frame_rotted_into_meta_is_not_a_silent_end() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = three_singles(dir.path())?;
+    let index = index_of(&path)?;
+    edit(&path, |bytes| {
+        bytes[index[1]..index[1] + 4].copy_from_slice(b"META");
+    })?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(scanner.next().expect("aaa").is_ok());
+    assert!(matches!(
+        scanner.next(),
+        Some(Err(crate::Error::InvalidHeader("BlobFrame")))
+    ));
+    assert!(scanner.next().expect("ccc").is_ok());
+    Ok(())
+}
+
+/// A data section ending inside a frame header is refused before the header
+/// is read, so the read never takes bytes of the section after it.
+#[test]
+fn a_partial_header_at_the_section_end_is_refused() -> crate::Result<()> {
     use std::io::Write;
 
     let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    // Write an SFA file with only a "meta" section (no "data").
+    let path = dir.path().join("0");
     {
-        let file = std::fs::File::create(&blob_file_path)?;
+        let file = std::fs::File::create(&path)?;
+        let mut sfa_writer = crate::sfa::Writer::from_writer(file);
+        sfa_writer.start("data")?;
+        sfa_writer.write_all(&super::super::frame::FRAME_MAGIC)?;
+        sfa_writer.write_all(&[0; 8])?;
+        sfa_writer.start("meta")?;
+        sfa_writer.write_all(b"unread")?;
+        sfa_writer.into_inner()?.sync_all()?;
+    }
+    let codec = ScanCodec {
+        compression: CompressionType::None,
+        #[cfg(zstd_any)]
+        dictionary: None,
+    };
+    let mut scanner = Scanner::open(&path, &StdFs, 0, codec, None)?;
+    assert!(matches!(
+        scanner.next(),
+        Some(Err(crate::Error::InvalidHeader("BlobFrame")))
+    ));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
+fn plain() -> ScanCodec {
+    ScanCodec {
+        compression: CompressionType::None,
+        #[cfg(zstd_any)]
+        dictionary: None,
+    }
+}
+
+/// A file without a data section is refused at open.
+#[test]
+fn a_file_without_a_data_section_is_refused() -> crate::Result<()> {
+    use std::io::Write;
+
+    let dir = tempdir()?;
+    let path = dir.path().join("0");
+    {
+        let file = std::fs::File::create(&path)?;
         let mut sfa_writer = crate::sfa::Writer::from_writer(file);
         sfa_writer.start("meta")?;
         sfa_writer.write_all(b"dummy")?;
         sfa_writer.finish()?;
     }
-
-    let result = Scanner::new(&blob_file_path, &StdFs, 0);
-    assert!(result.is_err(), "expected error for missing data section");
-    let err = result.err().unwrap();
-    assert!(
-        matches!(err, crate::Error::InvalidHeader("BlobFile")),
-        "expected InvalidHeader for missing data section, got: {err:?}",
-    );
-
+    assert!(matches!(
+        Scanner::open(&path, &StdFs, 0, plain(), None),
+        Err(crate::Error::InvalidHeader("BlobFile"))
+    ));
     Ok(())
 }
 
-/// Scanner rejects blob files where the SFA TOC reports a data
-/// section whose pos + len overflows u64.
+/// A data section whose end does not fit a `u64` is refused at open.
 #[test]
-fn blob_scanner_rejects_data_section_offset_overflow() -> crate::Result<()> {
+fn a_data_section_past_u64_is_refused() -> crate::Result<()> {
     use crate::io::{LittleEndian, WriteBytesExt};
     use std::io::Write;
 
     let dir = tempdir()?;
-    let blob_file_path = dir.path().join("0");
-
-    // Craft a valid SFA file with a "data" TOC entry where
-    // pos=1 and len=u64::MAX, causing pos+len to overflow.
-    //
-    // Hand-encoding is intentional: the sfa crate derives TOC
-    // values from real stream positions, so it cannot produce
-    // overflowing entries through its public API. The binary
-    // format below matches sfa 1.x's stable on-disk layout.
-    //
-    // SFA layout: [section data...] [TOC] [Trailer]
-    // TOC entry:  [pos: u64 LE] [len: u64 LE] [name_len: u16 LE] [name]
-    // TOC header: [magic: "TOC!"] [entry_count: u32 LE] [entries...]
-    // Trailer:    [magic: "SFA!"] [version: u8] [checksum_type: u8]
-    //             [toc_checksum: u128 LE] [toc_pos: u64 LE] [toc_len: u64 LE]
+    let path = dir.path().join("0");
+    // Hand-encoded: the sfa crate derives table-of-contents entries from real
+    // stream positions, so it cannot produce an overflowing one.
     {
-        let mut file = std::fs::File::create(&blob_file_path)?;
-
-        // Write 1 byte of dummy data so toc_pos > 0.
+        let mut file = std::fs::File::create(&path)?;
         file.write_all(b"\x00")?;
-        let toc_pos: u64 = 1;
-
-        // Build TOC bytes: one entry named "data" with pos=1, len=u64::MAX.
-        let mut toc_buf = Vec::new();
-        toc_buf.write_all(b"TOC!")?;
-        toc_buf.write_u32::<LittleEndian>(1)?; // 1 entry
-        toc_buf.write_u64::<LittleEndian>(1)?; // pos = 1
-        toc_buf.write_u64::<LittleEndian>(u64::MAX)?; // len = u64::MAX → overflow
-        toc_buf.write_u16::<LittleEndian>(4)?; // name len
-        toc_buf.write_all(b"data")?; // name
-
-        // Compute TOC checksum (xxh3-128 over the raw TOC bytes).
-        let toc_checksum = xxhash_rust::xxh3::xxh3_128(&toc_buf);
-
-        let toc_len = toc_buf.len() as u64;
-        file.write_all(&toc_buf)?;
-
-        // Write trailer.
+        let mut toc = Vec::new();
+        toc.write_all(b"TOC!")?;
+        toc.write_u32::<LittleEndian>(1)?;
+        toc.write_u64::<LittleEndian>(1)?;
+        toc.write_u64::<LittleEndian>(u64::MAX)?;
+        toc.write_u16::<LittleEndian>(4)?;
+        toc.write_all(b"data")?;
+        let checksum = xxhash_rust::xxh3::xxh3_128(&toc);
+        file.write_all(&toc)?;
         file.write_all(b"SFA!")?;
-        file.write_u8(0x1)?; // version
-        file.write_u8(0x0)?; // checksum type (xxh3)
-        file.write_u128::<LittleEndian>(toc_checksum)?;
-        file.write_u64::<LittleEndian>(toc_pos)?;
-        file.write_u64::<LittleEndian>(toc_len)?;
-
+        file.write_u8(0x1)?;
+        file.write_u8(0x0)?;
+        file.write_u128::<LittleEndian>(checksum)?;
+        file.write_u64::<LittleEndian>(1)?;
+        file.write_u64::<LittleEndian>(toc.len() as u64)?;
         file.sync_all()?;
     }
-
-    let result = Scanner::new(&blob_file_path, &StdFs, 0);
-    assert!(
-        result.is_err(),
-        "expected error for overflowing data section"
-    );
-    let err = result.err().unwrap();
-    assert!(
-        matches!(err, crate::Error::InvalidHeader("BlobFile")),
-        "expected InvalidHeader(\"BlobFile\") for overflow, got: {err:?}",
-    );
-
+    assert!(matches!(
+        Scanner::open(&path, &StdFs, 0, plain(), None),
+        Err(crate::Error::InvalidHeader("BlobFile"))
+    ));
     Ok(())
 }

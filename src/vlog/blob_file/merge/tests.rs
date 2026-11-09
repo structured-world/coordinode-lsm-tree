@@ -27,14 +27,14 @@ fn blob_file_merger_seqno() -> crate::Result<()> {
         );
 
         assert_eq!(
-            (Slice::from(b"a"), Slice::from(b"1".repeat(100))),
+            (Slice::from(b"a"), Some(Slice::from(b"1".repeat(100)))),
             merger
                 .next()
                 .map(|result| result.map(|(entry, _)| (entry.key, entry.value)))
                 .unwrap()?,
         );
         assert_eq!(
-            (Slice::from(b"a"), Slice::from(b"0".repeat(100))),
+            (Slice::from(b"a"), Some(Slice::from(b"0".repeat(100)))),
             merger
                 .next()
                 .map(|result| result.map(|(entry, _)| (entry.key, entry.value)))
@@ -95,7 +95,7 @@ fn blob_file_merger() -> crate::Result<()> {
 
         for key in merged_keys {
             assert_eq!(
-                (Slice::from(key), Slice::from(key.repeat(100))),
+                (Slice::from(key), Some(Slice::from(key.repeat(100)))),
                 merger
                     .next()
                     .map(|result| result.map(|(entry, _)| (entry.key, entry.value)))
