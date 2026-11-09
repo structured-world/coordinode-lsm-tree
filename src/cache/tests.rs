@@ -266,6 +266,34 @@ fn reads_waiting_on_one_frame_share_it() {
     );
 }
 
+/// A read that caches what it reads publishes its frame into the cache as it
+/// hands it to its waiters, so a miss after it finds the frame there.
+#[test]
+fn a_lead_that_fills_caches_the_frame_it_publishes() {
+    use super::BlobClaim;
+    use crate::vlog::blob_file::frame::decoded_frame;
+    use std::sync::Arc;
+
+    let cache = Cache::with_capacity_bytes(1024 * 1024)
+        .with_load_coalescing_after(core::time::Duration::ZERO);
+    let at = super::BlobFrameAt {
+        blob_file_id: 3,
+        frame: 0,
+    };
+    let BlobClaim::Lead(lead) = cache.claim_blob_frame(0, at) else {
+        panic!("the first read leads");
+    };
+    lead.publish(
+        &cache,
+        0,
+        at,
+        &Arc::new(decoded_frame(&[(b"owner", b"value")])),
+        true,
+    );
+    let cached = cache.get_blob_frame(0, at).expect("the frame is cached");
+    assert_eq!(cached.key(0), Some(&b"owner"[..]));
+}
+
 /// A partial-tier entry whose prefix decoded `decoded` inner blocks and served
 /// `hits` reads.
 #[cfg(feature = "zstd")]

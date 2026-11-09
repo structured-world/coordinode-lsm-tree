@@ -657,6 +657,36 @@ fn forge(kind: FrameKind, stored: &[u8], raw_len: u32) -> Vec<u8> {
     out
 }
 
+/// A frame checked without decoding, stored as it is, must store the length
+/// it declares: its checksums hold, yet a payload shorter than the value is
+/// refused, as a decode refuses it.
+#[test]
+fn an_undecoded_frame_stored_short_of_its_length_is_refused() {
+    let short = Slice::from(forge(FrameKind::Single, b"abc", 5));
+    assert!(matches!(
+        undecoded_frame(&short, CompressionType::None),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    let whole = Slice::from(forge(FrameKind::Single, b"abcde", 5));
+    assert!(undecoded_frame(&whole, CompressionType::None).is_ok());
+}
+
+/// Relisting takes one whole frame: bytes past it, or a frame cut short, are
+/// refused rather than relisted with the payload out of step.
+#[test]
+fn only_one_whole_frame_is_relisted() {
+    let frame = forge(FrameKind::Single, b"abcde", 5);
+    let mut longer = frame.clone();
+    longer.push(0);
+    for bad in [&longer[..], &frame[..frame.len() - 1]] {
+        assert!(matches!(
+            relist_prefix(bad, 9, &mut Vec::new()),
+            Err(crate::Error::InvalidHeader("BlobFrame"))
+        ));
+    }
+    assert!(relist_prefix(&frame, 9, &mut Vec::new()).unwrap().is_some());
+}
+
 /// A match reaching 16 bytes back with one byte written: the decoder alone
 /// refuses it, which is what keeps it off the value's unwritten bytes.
 #[test]

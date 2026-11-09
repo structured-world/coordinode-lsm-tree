@@ -207,6 +207,49 @@ fn a_scan_not_caching_reads_nothing_the_cache_holds() -> crate::Result<()> {
     Ok(())
 }
 
+/// A read-ahead whose reads fit its bound but whose frames decode past it
+/// stops admitting frames where the decoded bytes would exceed it: a scan of
+/// values that compress well still returns each as written, the ones past
+/// the bound read on their own.
+#[cfg(feature = "lz4")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_read_ahead_stops_where_its_decoded_frames_reach_its_bound() -> crate::Result<()> {
+    use crate::{AbstractTree, Guard as _};
+
+    const KEYS: u32 = 24;
+    const LEN: usize = 512 * 1_024;
+    let folder = crate::get_tmp_folder();
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Lz4)
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default()
+            .separation_threshold(1)
+            .chunk_size(core::num::NonZeroU32::new(1_024 * 1_024).expect("non-zero")),
+    ))
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    // A frame each, a few hundred bytes stored for half a MiB decoded: one
+    // coalesced read holds them all, their frames decode to three times the
+    // bound.
+    let value = |i: u32| vec![u8::try_from(i).expect("small"); LEN];
+    for i in 0..KEYS {
+        tree.insert(format!("k{i:04}"), value(i), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    for (i, item) in (0..KEYS).zip(tree.iter(crate::SeqNo::MAX, None)) {
+        assert!(*item.into_inner()?.1 == *value(i), "value {i}");
+    }
+    Ok(())
+}
+
 /// A row's guard takes out of the scan's store exactly the values its row
 /// names: an indirection takes its value, and a row whose indirection or cell
 /// references do not decode takes nothing, leaving its resolution, and the

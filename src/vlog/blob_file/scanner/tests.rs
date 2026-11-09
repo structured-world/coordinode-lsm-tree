@@ -240,6 +240,34 @@ fn an_environmental_index_read_failure_is_returned_not_walked_around() -> crate:
         .is_none(),
         "a read the bytes fail walks the chain"
     );
+    // A file whose length cannot be asked is handled as its reads are.
+    struct NoLength(std::io::ErrorKind);
+    impl Read for NoLength {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Seek for NoLength {
+        fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+            Err(self.0.into())
+        }
+    }
+    assert!(matches!(
+        read_frame_index(
+            &mut NoLength(std::io::ErrorKind::PermissionDenied),
+            at,
+            data.clone()
+        ),
+        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::PermissionDenied
+    ));
+    assert!(
+        read_frame_index(
+            &mut NoLength(std::io::ErrorKind::InvalidData),
+            at,
+            data.clone()
+        )?
+        .is_none()
+    );
     // An index named as running past the file is damage, refused before
     // anything is sized from the length it names.
     assert!(
@@ -429,6 +457,23 @@ fn rewrite_head_table(
         head[table + 4..].copy_from_slice(&chunks.to_le_bytes());
         crate::vlog::blob_file::frame::reseal(head);
     })
+}
+
+/// A head whose chunks are all their size but run into a frame that is no
+/// chunk is refused: the frame after its last true chunk is another value's.
+#[test]
+fn a_head_whose_chunk_run_meets_another_frame_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    // Two chunks of 300 bytes, then a value of its own.
+    let path = write(dir.path(), &[(b"big", &[9; 600]), (b"next", &[1; 120])])?;
+    // Three full chunks named: the third is the next value's frame.
+    rewrite_head(&path, 900, 3)?;
+    let first = Scanner::new(&path, &StdFs, 0)?.next().expect("the head");
+    assert!(matches!(
+        first,
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    Ok(())
 }
 
 /// A head that checks but names far more chunks than the file holds, a cap's

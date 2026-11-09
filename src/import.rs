@@ -730,9 +730,10 @@ pub struct BlobLink {
     pub len: usize,
     /// Bytes of those objects, before compression.
     pub bytes: u64,
-    /// Bytes of those objects, as stored.
+    /// Bytes of the frames of their own those objects take.
     pub on_disk_bytes: u64,
-    /// The share of `on_disk_bytes` stored as entries of shared blocks.
+    /// Entries of those objects that share a block, before compression:
+    /// their part of the file's blocks is what they take.
     pub block_bytes: u64,
 }
 

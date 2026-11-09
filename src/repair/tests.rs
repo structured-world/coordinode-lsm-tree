@@ -15297,6 +15297,111 @@ fn a_whole_blob_file_without_its_frame_index_is_whole() -> crate::Result<()> {
     Ok(())
 }
 
+/// A blob file of two frames of its own each, its data starting with zeros so
+/// the frontier probe goes past its whole-file check; returns its path, the
+/// data section's start and end, and its frames' starts.
+fn zero_led_blob_file(dir: &std::path::Path) -> crate::Result<(std::path::PathBuf, u64, u64)> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let path = dir.join("7");
+    let mut writer = crate::vlog::blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"a", 0, &vec![1; 64 * 1_024])?;
+    writer.write(b"b", 0, &vec![2; 64 * 1_024])?;
+    writer.finish()?;
+    let reader = crate::sfa::Reader::new(&path)?;
+    let data = reader.toc().section(b"data").map(|s| (s.pos(), s.len()));
+    let (data_start, data_len) = data.unwrap_or_default();
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(data_start))?;
+        file.write_all(&[0; 4])?;
+    }
+    Ok((path, data_start, data_start + data_len))
+}
+
+/// A frame index that checks but does not span the data section is damage
+/// the frontier probe reports, not frames it places a frontier among.
+#[test]
+fn a_frame_index_off_the_data_is_refused_by_the_frontier_probe() -> crate::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir()?;
+    let (path, data_start, data_end) = zero_led_blob_file(dir.path())?;
+    let (index_pos, starts) = {
+        let reader = crate::sfa::Reader::new(&path)?;
+        let index = reader.toc().section(b"frames").map(|s| (s.pos(), s.len()));
+        let (pos, len) = index.unwrap_or_default();
+        let bytes = std::fs::read(&path)?;
+        let at = usize::try_from(pos).unwrap_or_default();
+        let len = usize::try_from(len).unwrap_or_default();
+        let starts = crate::vlog::blob_file::writer::decode_frame_index(
+            bytes.get(at..at + len).unwrap_or_default(),
+        )?;
+        (pos, starts)
+    };
+    // The same frames, the first named a byte past the data start.
+    let mut shifted: Vec<u64> = starts.iter().copied().take(starts.len() - 1).collect();
+    if let Some(first) = shifted.first_mut() {
+        *first = data_start + 1;
+    }
+    let index = crate::vlog::blob_file::writer::encode_frame_index(&shifted, data_end);
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(index_pos))?;
+        file.write_all(&index)?;
+    }
+
+    let fs: std::sync::Arc<dyn crate::fs::Fs> = std::sync::Arc::new(crate::fs::StdFs);
+    assert!(matches!(
+        super::derive_blob_frontier(&fs, &path),
+        Err(crate::Error::InvalidHeader("BlobFile"))
+    ));
+    Ok(())
+}
+
+/// A punched run whose next frame does not check is not punch geometry: the
+/// probe keeps the last anchored frontier, none here, and reports the file
+/// whole for validation to surface the damage.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_punched_run_before_a_damaged_frame_leaves_the_file_whole() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*memfs, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    let frontier = entries.get(1).expect("second frame").frame_end;
+    let data_start = entries.first().expect("first frame").offset;
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+    // The frame at the run's end, damaged inside its payload.
+    let flip_at = entries.get(2).expect("third frame").frame_end - 8;
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+        file.seek(SeekFrom::Start(flip_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+
+    let fs: Arc<dyn Fs> = memfs;
+    let derived = super::derive_blob_frontier(&fs, &blob_path)?;
+    assert!(matches!(derived, super::BlobFrontier::Whole), "{derived:?}");
+    Ok(())
+}
+
 /// A frame index the table of contents says runs past the file is damage the
 /// frontier probe reports, before anything is sized from the length it names.
 #[test]
