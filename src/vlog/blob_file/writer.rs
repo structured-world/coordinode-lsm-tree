@@ -703,7 +703,11 @@ impl Writer {
             FrameKind::Head => u32_at(entries_end + 4).map(|n| n as usize),
             _ => Some(0),
         };
+        // Each slice is one whole frame: the index records one offset per
+        // slice, so a slice cut short or running past its frame would put the
+        // index out of step with the frames.
         if !shape_ok
+            || first.len() as u64 != header.frame_len()
             || listed_key != Some(key)
             || listed_len != Some(value_len)
             || listed_chunks != Some(chunks)
@@ -711,7 +715,10 @@ impl Writer {
             return Err(malformed());
         }
         for chunk in frames.get(1..).unwrap_or_default() {
-            if super::frame::parse_header(chunk)?.kind != FrameKind::Chunk {
+            let chunk_header = super::frame::parse_header(chunk)?;
+            if chunk_header.kind != FrameKind::Chunk
+                || chunk.len() as u64 != chunk_header.frame_len()
+            {
                 return Err(malformed());
             }
         }

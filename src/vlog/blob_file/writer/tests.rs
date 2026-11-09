@@ -285,7 +285,8 @@ fn verbatim_frames_are_written_as_they_are() -> crate::Result<()> {
 /// Frames that are not one whole value under the key are refused before
 /// anything is written: a block, a chunk without its head, another key's
 /// value, a head followed by something other than chunks or by another
-/// number of chunks than it names, a length its entry does not list.
+/// number of chunks than it names, a length its entry does not list, a slice
+/// that is not one whole frame.
 #[test]
 fn verbatim_frames_that_are_not_one_value_are_refused() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
@@ -325,12 +326,31 @@ fn verbatim_frames_that_are_not_one_value_are_refused() -> crate::Result<()> {
         "a chunk alone"
     );
     assert!(
-        refused(w.write_verbatim(b"other", &[head.clone(), chunk], 700)),
+        refused(w.write_verbatim(b"other", &chunks, 700)),
         "another key"
     );
     assert!(
-        refused(w.write_verbatim(b"big", &[head.clone(), block], 700)),
+        refused(w.write_verbatim(b"big", &[head.clone(), chunk.clone(), frame(3), block], 700)),
         "a head and a block"
+    );
+    // Each slice is one whole frame: a chunk cut short or carrying a byte
+    // past its frame would put the index out of step with the frames.
+    let cut = chunk.slice(..chunk.len() - 1);
+    let mut longer = chunk.to_vec();
+    longer.push(0);
+    for bad in [cut, crate::Slice::from(longer)] {
+        assert!(
+            refused(w.write_verbatim(b"big", &[head.clone(), bad, frame(3), frame(4)], 700)),
+            "a chunk that is not one whole frame"
+        );
+    }
+    assert!(
+        refused(w.write_verbatim(
+            b"big",
+            &[head.slice(..head.len() - 1), chunk, frame(3), frame(4)],
+            700
+        )),
+        "a head that is not one whole frame"
     );
     assert!(
         refused(w.write_verbatim(b"big", std::slice::from_ref(&head), 700)),
