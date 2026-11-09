@@ -210,8 +210,9 @@ fn chunks_must_be_the_heads() -> crate::Result<()> {
     Ok(())
 }
 
-/// A head's chunks are proven whole without gathering the value: all of them,
-/// in order, each the size its table gives it, and nothing less.
+/// A head's chunks are proven whole without gathering the value: each in its
+/// place the size its table gives it, and a chunk out of its place or a frame
+/// that is no chunk refused.
 #[test]
 fn chunks_are_checked_without_gathering_the_value() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
@@ -222,19 +223,23 @@ fn chunks_are_checked_without_gathering_the_value() -> crate::Result<()> {
     let at = handles[0].frame;
     let head = reader.read_frame(at, &mut 0)?;
     let chunks = (at + 1..at + 4)
-        .map(|frame| reader.read_frame(frame, &mut 0).map(Box::new))
+        .map(|frame| reader.read_frame(frame, &mut 0))
         .collect::<crate::Result<Vec<_>>>()?;
+    let table = ChunkTable::of(&head)?;
 
-    assert!(check_chunks(&head, &chunks).is_ok(), "the whole value");
+    for (nth, chunk) in (0..).zip(&chunks) {
+        assert!(table.check(nth, chunk).is_ok(), "chunk {nth} in its place");
+    }
     assert!(
-        check_chunks(&head, &chunks[..2]).is_err(),
-        "a chunk missing"
-    );
-    let reversed: Vec<_> = chunks.iter().rev().cloned().collect();
-    assert!(
-        check_chunks(&head, &reversed).is_err(),
+        table.check(0, &chunks[2]).is_err(),
         "the short last chunk first"
     );
+    assert!(table.check(2, &chunks[0]).is_err(), "a full chunk last");
+    assert!(
+        table.check(0, &head).is_err(),
+        "a head where a chunk belongs"
+    );
+    assert!(ChunkTable::of(&chunks[0]).is_err(), "a chunk has no table");
     Ok(())
 }
 

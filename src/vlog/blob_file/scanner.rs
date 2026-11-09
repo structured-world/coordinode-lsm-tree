@@ -6,7 +6,7 @@ use super::frame::{
     DecodedFrame, FRAME_HEADER_LEN, FRAME_MAGIC, FrameKind, decode_frame, parse_header,
     undecoded_frame,
 };
-use super::reader::check_chunks;
+use super::reader::ChunkTable;
 use crate::fs::{Fs, FsOpenOptions};
 use crate::io::BufReader;
 #[cfg(not(feature = "std"))]
@@ -503,21 +503,28 @@ impl Scanner {
                             .map_or(usize::MAX, |fit| fit.saturating_add(frame as usize + 1))
                     }
                 };
-                let Ok(chunks) = super::reader::chunk_frames(&decoded, frame, room) else {
+                let (Ok(chunks), Ok(table)) = (
+                    super::reader::chunk_frames(&decoded, frame, room),
+                    ChunkTable::of(&decoded),
+                ) else {
                     return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
                 };
                 let mut stored = alloc::vec![bytes];
-                let mut parts = Vec::with_capacity((chunks.end - chunks.start) as usize);
                 let mut end = frame_end;
-                for _ in chunks.clone() {
+                // Proven whole without being gathered, each chunk checked
+                // against the head's table as it is read: every consumer copies
+                // the value as its stored frames.
+                for nth in 0..chunks.end - chunks.start {
                     let failure = match self.read_one() {
                         Some(Ok((_, at, chunk_bytes, chunk)))
                             if chunk.header.kind == FrameKind::Chunk =>
                         {
-                            end = at + chunk_bytes.len() as u64;
-                            stored.push(chunk_bytes);
-                            parts.push(alloc::boxed::Box::new(chunk));
-                            continue;
+                            if table.check(nth, &chunk).is_ok() {
+                                end = at + chunk_bytes.len() as u64;
+                                stored.push(chunk_bytes);
+                                continue;
+                            }
+                            crate::Error::InvalidHeader("BlobFrame")
                         }
                         Some(Ok(_)) | None => crate::Error::InvalidHeader("BlobFrame"),
                         Some(Err(e)) => e,
@@ -534,11 +541,6 @@ impl Scanner {
                 let (Some(entry), Some(key)) = (decoded.list.first(), decoded.key(0)) else {
                     return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
                 };
-                // Proven whole without being gathered: every consumer copies
-                // the value as its stored frames.
-                if let Err(e) = check_chunks(&decoded, &parts) {
-                    return Some(Err(e));
-                }
                 self.pending.push_back(ScanEntry {
                     key: UserKey::from(key),
                     seqno: entry.seqno,

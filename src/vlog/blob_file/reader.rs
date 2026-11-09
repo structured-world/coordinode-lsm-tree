@@ -150,21 +150,17 @@ impl<'a> Reader<'a> {
             },
             FrameKind::Head => {
                 let all = chunk_frames(&frame, vhandle.frame, self.blob_file.frame_count())?;
-                let mut frames = Vec::with_capacity(all.len() + 1);
-                frames.push(first);
-                let mut chunks = Vec::with_capacity(all.len());
-                for chunk in all {
-                    let bytes = self.read_frame_bytes(chunk)?;
-                    read += bytes.len() as u64;
-                    chunks.push(alloc::boxed::Box::new(undecoded_frame(
-                        &bytes,
-                        compression,
-                    )?));
-                    frames.push(bytes);
-                }
                 // Copied as they lie, the chunks must still make the value
                 // the head names, each the length its table gives it.
-                check_chunks(&frame, &chunks)?;
+                let table = ChunkTable::of(&frame)?;
+                let mut frames = Vec::with_capacity(all.len() + 1);
+                frames.push(first);
+                for (at, chunk) in (0..).zip(all) {
+                    let bytes = self.read_frame_bytes(chunk)?;
+                    read += bytes.len() as u64;
+                    table.check(at, &undecoded_frame(&bytes, compression)?)?;
+                    frames.push(bytes);
+                }
                 CopySource::Frames { frames, value_len }
             }
         };
@@ -310,27 +306,40 @@ pub(crate) fn assemble<C: core::ops::Deref<Target = DecodedFrame>>(
     Ok(UserValue::from(out))
 }
 
-/// Checks that `chunks` are all a head's chunks, each the size its table
-/// gives it, without gathering the value: what a copy of the value's frames
-/// as stored needs proven.
-///
-/// # Errors
-///
-/// The head is malformed, or a chunk is missing, not a chunk, or not its size.
-pub(crate) fn check_chunks<C: core::ops::Deref<Target = DecodedFrame>>(
-    head: &DecodedFrame,
-    chunks: &[C],
-) -> crate::Result<()> {
-    let (size, count) = head.chunk_table()?;
-    let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
-    let all_fit = chunks.len() == count as usize
-        && (0..count)
-            .zip(chunks)
-            .all(|(at, chunk)| chunk_fits(chunk, at, (size, count), total));
-    if all_fit {
-        Ok(())
-    } else {
-        Err(crate::Error::InvalidHeader("Blob"))
+/// A head's chunk table, against which its chunks are checked one by one as
+/// they are read, without gathering the value or holding what each chunk
+/// decoded: what a copy of the value's frames as stored needs proven. The
+/// chunks are the frames [`chunk_frames`] names, as many as the table counts.
+pub(crate) struct ChunkTable {
+    size: u32,
+    count: u32,
+    total: u64,
+}
+
+impl ChunkTable {
+    /// The chunk table of `head`.
+    ///
+    /// # Errors
+    ///
+    /// The head is not one, or its table does not cover its value.
+    pub(crate) fn of(head: &DecodedFrame) -> crate::Result<Self> {
+        let (size, count) = head.chunk_table()?;
+        let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
+        Ok(Self { size, count, total })
+    }
+
+    /// Checks that `chunk` is chunk `at` of the value, the size the table
+    /// gives it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when it is not a chunk or not its size.
+    pub(crate) fn check(&self, at: u32, chunk: &DecodedFrame) -> crate::Result<()> {
+        if chunk_fits(chunk, at, (self.size, self.count), self.total) {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidHeader("Blob"))
+        }
     }
 }
 
