@@ -1230,7 +1230,7 @@ impl<'a> Accessor<'a> {
                     let frame = if whole {
                         frame
                     } else {
-                        let (frame, copied) = own_frame(frame, blob_file.compression(), true);
+                        let (frame, copied) = own_frame(frame, bytes, true);
                         self.count_gather(copied);
                         frame
                     };
@@ -1240,7 +1240,7 @@ impl<'a> Accessor<'a> {
                     let frame = if whole {
                         frame
                     } else {
-                        let (frame, copied) = own_frame(frame, blob_file.compression(), false);
+                        let (frame, copied) = own_frame(frame, bytes, false);
                         self.count_gather(copied);
                         frame
                     };
@@ -1306,28 +1306,34 @@ fn span_extent(
 /// and its own entries too when `entries` says so, and the bytes copied for
 /// that: a frame stored as it is and decoded out of a larger read is a view
 /// into it; a compressed one already holds its own.
-pub(crate) fn own_frame(
-    frame: DecodedFrame,
-    compression: crate::CompressionType,
-    entries: bool,
-) -> (DecodedFrame, usize) {
-    let stored_as_is = frame.header.is_raw() || compression == crate::CompressionType::None;
-    if !stored_as_is {
-        // Decoding a compressed frame already gave it entries and a payload
-        // of its own.
-        return (frame, 0);
-    }
-    let copied = if entries { frame.entries.len() } else { 0 } + frame.payload.len();
+pub(crate) fn own_frame(frame: DecodedFrame, read: &[u8], entries: bool) -> (DecodedFrame, usize) {
+    // Only what lies in `read` is copied: a payload the decode built for
+    // itself (decompressed, or gathered out of a packed block's records)
+    // already holds no part of the read.
+    let copy_entries = entries && views(&frame.entries, read);
+    let copy_payload = views(&frame.payload, read);
+    let copied = if copy_entries { frame.entries.len() } else { 0 }
+        + if copy_payload { frame.payload.len() } else { 0 };
     let frame = DecodedFrame {
-        entries: if entries {
+        entries: if copy_entries {
             crate::Slice::new(&frame.entries)
         } else {
             frame.entries
         },
-        payload: crate::Slice::new(&frame.payload),
+        payload: if copy_payload {
+            crate::Slice::new(&frame.payload)
+        } else {
+            frame.payload
+        },
         ..frame
     };
     (frame, copied)
+}
+
+/// Whether `part` is a view into `read`: a non-empty run of its bytes.
+fn views(part: &[u8], read: &[u8]) -> bool {
+    let (part, read) = (part.as_ptr_range(), read.as_ptr_range());
+    part.start != part.end && read.start <= part.start && part.end <= read.end
 }
 
 /// Checks that `range` lies within a value of `len` bytes.

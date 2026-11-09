@@ -586,8 +586,7 @@ impl BlobSource {
                 let frame = if bytes.len() as u64 == end - start {
                     frame
                 } else {
-                    let (owned, copied) =
-                        crate::vlog::accessor::own_frame(frame, read.blob_file.compression(), true);
+                    let (owned, copied) = crate::vlog::accessor::own_frame(frame, bytes, true);
                     accessor.count_gather(copied);
                     owned
                 };
