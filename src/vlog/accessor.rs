@@ -379,6 +379,11 @@ impl<'a> Accessor<'a> {
         let total = first.list.first().map_or(0, |e| u64::from(e.value_len));
         let range = range.unwrap_or(0..total);
         check_range(&range, total)?;
+        // An empty range inside a chunk covers that chunk by its rounding,
+        // but needs none of its bytes.
+        if range.is_empty() {
+            return Ok(Some(UserValue::empty()));
+        }
         let all = chunk_frames(&first, vhandle.frame)?;
         let (covered, _) = covering_chunks(&first, &range)?;
         let mut chunks = Vec::with_capacity((covered.end - covered.start) as usize);

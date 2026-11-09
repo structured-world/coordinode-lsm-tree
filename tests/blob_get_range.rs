@@ -90,6 +90,28 @@ fn a_range_of_a_chunked_value_reads_only_its_chunks() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// An empty range inside a chunk is the empty value, and reads no chunk:
+/// only the head that says where the value lies.
+#[cfg(feature = "metrics")]
+#[test]
+fn an_empty_range_of_a_chunked_value_reads_no_chunk() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path())?;
+    let value = pattern(4 * 256 * 1_024);
+    tree.insert("big", &value, 0);
+    tree.flush_active_memtable(0)?;
+
+    let m = tree.metrics();
+    let before = m.blob_bytes_read();
+    let got = tree
+        .get_range("big", 77..77, SeqNo::MAX)?
+        .expect("the key has a value");
+    assert!(got.is_empty());
+    let read = m.blob_bytes_read() - before;
+    assert!(read < 1_024, "{read} bytes read for an empty range");
+    Ok(())
+}
+
 /// The chunk size is the tree's setting: under 64 KiB chunks, a range inside
 /// one chunk reads about 64 KiB, a quarter of a default chunk.
 #[cfg(feature = "metrics")]
