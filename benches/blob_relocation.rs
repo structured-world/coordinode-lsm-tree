@@ -8,7 +8,8 @@
 //! and the timed merge relocates their live halves. The live values are
 //! copied as stored, so what the relocation reads it does not have to decode.
 //! One arm per codec, for plain values and for cell rows whose one cell holds
-//! the value; each iteration builds its tree outside the timer, and each arm
+//! the value, and arms whose values are split into chunks, each copied with
+//! its head; each iteration builds its tree outside the timer, and each arm
 //! prints the P50, P99 and P999 of its timed merges.
 
 use core::num::NonZeroU32;
@@ -48,10 +49,12 @@ fn put(tree: &BlobTree, cells: bool, i: u64, generation: u8, seqno: u64) {
 }
 
 /// The tree, its first blob files half garbage and known as such: its next
-/// merge under `watermark` relocates their live values.
+/// merge under `watermark` relocates their live values. A value above
+/// `chunk_size` is a head and its chunks.
 fn build(
     compression: CompressionType,
     cells: bool,
+    chunk_size: u32,
     watermark: u64,
 ) -> (BlobTree, tempfile::TempDir) {
     let folder = tempfile::tempdir().expect("tempdir");
@@ -64,10 +67,10 @@ fn build(
     .with_kv_separation(Some(
         KvSeparationOptions::default()
             .separation_threshold(64)
-            // Values above the block size and within one chunk: a frame
-            // each.
+            // Values above the block size: a frame each, or a head and its
+            // chunks when above the chunk size.
             .block_size(1_024)
-            .chunk_size(NonZeroU32::new(1_024 * 1_024).expect("non-zero"))
+            .chunk_size(NonZeroU32::new(chunk_size).expect("non-zero"))
             .age_cutoff(1.0)
             .staleness_threshold(0.1)
             .file_target_size(4 * 1_024 * 1_024),
@@ -117,19 +120,29 @@ fn bench_relocation(c: &mut Criterion) {
     let mut group = c.benchmark_group("blob_relocation");
     group.sample_size(10);
     let watermark = 4 * KEYS;
+    // Within one frame, and split into chunks of the smallest size, two to a
+    // value.
+    let (whole, chunked) = (1_024 * 1_024, 4_096);
     let arms = [
-        ("lz4", CompressionType::Lz4, false),
-        ("zstd3", CompressionType::Zstd(3), false),
-        ("cells_lz4", CompressionType::Lz4, true),
-        ("cells_zstd3", CompressionType::Zstd(3), true),
+        ("lz4", CompressionType::Lz4, false, whole),
+        ("zstd3", CompressionType::Zstd(3), false, whole),
+        ("cells_lz4", CompressionType::Lz4, true, whole),
+        ("cells_zstd3", CompressionType::Zstd(3), true, whole),
+        ("chunked_zstd3", CompressionType::Zstd(3), false, chunked),
+        (
+            "cells_chunked_zstd3",
+            CompressionType::Zstd(3),
+            true,
+            chunked,
+        ),
     ];
-    for (name, compression, cells) in arms {
+    for (name, compression, cells, chunk_size) in arms {
         let mut samples = Vec::new();
         group.bench_function(name, |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    let (tree, _folder) = build(compression, cells, watermark);
+                    let (tree, _folder) = build(compression, cells, chunk_size, watermark);
                     let relocated = tree.metrics().blob_bytes_relocated();
                     let start = Instant::now();
                     tree.major_compact(64 * 1_024 * 1_024, watermark)
