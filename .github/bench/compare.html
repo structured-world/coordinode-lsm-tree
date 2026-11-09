@@ -94,8 +94,9 @@
     major_compact_zstd3: "compaction", subcompaction_zstd3: "compaction",
   };
   const KIND_TITLE = { write: "Writes", read: "Reads", compaction: "Compaction" };
-  // How a baseline engine reads in an axis title.
-  const BASELINE_TITLE = { rocksdb: "RocksDB", rocksdb_blob: "RocksDB with blob files" };
+  // How a value layout's baselines read in an axis title: a blob arm is taken
+  // against RocksDB with blob files under its own codec.
+  const BASELINE_TITLE = { inline: "RocksDB", separated: "RocksDB with blob files, same codec" };
 
   const fmtTime = function (ns) {
     if (ns >= 1e6) { return (ns / 1e6).toFixed(2) + " ms"; }
@@ -116,7 +117,7 @@
       document.getElementById("empty").style.display = "block";
       return;
     }
-    // The engine each value layout's ratios are taken against.
+    // The engines each value layout's ratios are taken against.
     const baselines = summary.baselines;
     if (meta) {
       const m = document.getElementById("meta");
@@ -163,7 +164,7 @@
       container.innerHTML = "";
       const ratio = viewSel.value === "ratio";
       const layout = valuesSel.value;
-      const baseline = baselines[layout];
+      const layoutBaselines = baselines[layout] || [];
       const grids = {};
       ordered.forEach(function (group) {
         const kind = KIND[base(group)] || "other";
@@ -183,8 +184,8 @@
           Object.keys(engines[e]).forEach(function (n) { if (sizes.indexOf(Number(n)) < 0) { sizes.push(Number(n)); } });
         });
         sizes.sort(function (a, b) { return a - b; });
-        // The baseline is the ratio's denominator, so it has no bar of its own there.
-        const shown = Object.keys(engines).filter(function (e) { return !ratio || e !== baseline; });
+        // A baseline is a ratio's denominator, so it has no bar of its own there.
+        const shown = Object.keys(engines).filter(function (e) { return !ratio || layoutBaselines.indexOf(e) < 0; });
         const datasets = shown.map(function (engine) {
           const color = COLORS[engine] || "#8b949e";
           const pick = function (r) { return ratio ? r.vs_baseline : r.ns_per_op; };
@@ -280,7 +281,7 @@
                 grid: { color: function (ctx) { return ctx.tick && ctx.tick.value === 1 ? "#8b949e" : "#21262d"; } },
                 title: {
                   display: true, color: "#8b949e",
-                  text: "time relative to " + (BASELINE_TITLE[baseline] || baseline) + " (below 1 is faster)",
+                  text: "time relative to " + (BASELINE_TITLE[layout] || layoutBaselines.join(", ")) + " (below 1 is faster)",
                 },
               } : {
                 beginAtZero: true,
@@ -300,7 +301,7 @@
                   if (!r.vs_baseline) { return item.dataset.label + ": " + time + ", " + r.rounds + " rounds"; }
                   const v = r.vs_baseline;
                   return item.dataset.label + ": " + fmtRatio(v.median) + " (" + fmtRatio(v.lower) + " – " + fmtRatio(v.upper) + ")"
-                    + " of " + baseline + ", " + time + ", " + r.rounds + " rounds";
+                    + " of " + r.baseline + ", " + time + ", " + r.rounds + " rounds";
                 },
               } },
             },

@@ -3074,8 +3074,9 @@ const GROUP_NOTES: &[(&str, &str)] = &[
 ];
 
 /// Where an arm keeps its values, which decides the arm its ratio is taken
-/// against: a tree with blob files against RocksDB with blob files, every
-/// other arm against plain RocksDB. The page shows one layout at a time.
+/// against: a tree with blob files against RocksDB with blob files under the
+/// same codec, every other arm against plain RocksDB. The page shows one
+/// layout at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layout {
     /// Values in the tables.
@@ -3090,11 +3091,7 @@ impl Layout {
     /// A blob arm keeps its values in blob files whatever its codec; every
     /// blob arm is one of [`HEAD_TO_HEAD`].
     fn of(label: &str) -> Self {
-        let separated = HEAD_TO_HEAD.iter().any(|engine| {
-            engine.label() == label
-                && (engine.kv_separated().is_some() || engine.blob_files().is_some())
-        });
-        if separated {
+        if blob_codec_of(label).is_some() {
             Self::Separated
         } else {
             Self::Inline
@@ -3108,17 +3105,34 @@ impl Layout {
         }
     }
 
-    fn baseline(self) -> Engine {
-        match self {
-            Self::Inline => Engine::RocksDb,
-            Self::Separated => Engine::RocksDbBlob(BlobCodec::Off),
-        }
+    /// The arms the ratios of this layout are taken against.
+    fn baselines(self) -> Vec<&'static str> {
+        let mut baselines: Vec<&'static str> = HEAD_TO_HEAD
+            .iter()
+            .filter(|engine| Self::of(engine.label()) == self)
+            .map(|engine| baseline_of(engine.label()))
+            .collect();
+        baselines.dedup();
+        baselines
     }
 }
 
-/// The arm the ratio of the arm labelled `label` is taken against.
+/// The codec of the blob arm labelled `label`, ours or RocksDB's; `None` for
+/// an arm that keeps its values in the tables.
+fn blob_codec_of(label: &str) -> Option<BlobCodec> {
+    HEAD_TO_HEAD
+        .iter()
+        .find(|engine| engine.label() == label)
+        .and_then(|engine| engine.kv_separated().or(engine.blob_files()))
+}
+
+/// The arm the ratio of the arm labelled `label` is taken against: RocksDB
+/// with blob files under the same codec for a blob arm, so the ratio compares
+/// the engines and not the codecs, plain RocksDB for every other arm.
 fn baseline_of(label: &str) -> &'static str {
-    Layout::of(label).baseline().label()
+    blob_codec_of(label)
+        .map_or(Engine::RocksDb, Engine::RocksDbBlob)
+        .label()
 }
 
 /// One run of the harness: how groups are measured, which run, and what they
@@ -3267,8 +3281,8 @@ fn estimate_json(e: paired::Estimate) -> serde_json::Value {
 }
 
 /// Writes the summary the published page is drawn from: the run's preset, the
-/// baseline of each value layout, what each group measures, and every arm's
-/// layout, time per operation and time relative to its baseline, each a
+/// baselines of each value layout, what each group measures, and every arm's
+/// layout, time per operation, baseline and time relative to it, each a
 /// median with its 95% interval.
 fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
     let results: Vec<serde_json::Value> = run
@@ -3282,6 +3296,7 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
                 "n": r.n,
                 "rounds": r.rounds,
                 "ns_per_op": estimate_json(r.ns_per_op),
+                "baseline": r.baseline,
                 "vs_baseline": r.vs_baseline.map(estimate_json),
                 "metrics": r.metrics.iter().map(|(name, e)| serde_json::json!({
                     "name": name,
@@ -3300,7 +3315,7 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
         "preset": active_preset().label(),
         "baselines": Layout::ALL
             .iter()
-            .map(|layout| (layout.label().to_owned(), layout.baseline().label().into()))
+            .map(|layout| (layout.label().to_owned(), layout.baselines().into()))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
         "settings": {
             "warm_up_s": run.settings.warm_up.as_secs_f64(),
