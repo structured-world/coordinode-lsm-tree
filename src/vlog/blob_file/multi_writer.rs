@@ -3,6 +3,7 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use super::writer::Writer;
+use crate::blob_tree::handle::BlobIndirection;
 use crate::fs::FsFile;
 use crate::path::{Path, PathBuf};
 use crate::{
@@ -55,6 +56,9 @@ pub(crate) struct MultiWriter {
 
     compression: CompressionType,
     passthrough_compression: CompressionType,
+
+    /// How every file this writer produces sizes its frames.
+    sizes: super::writer::FrameSizes,
 
     /// Durability level wired from `Config::sync_mode`, stamped on every
     /// rotated blob writer.
@@ -177,6 +181,7 @@ impl MultiWriter {
 
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
+            sizes: super::writer::FrameSizes::DEFAULT,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
@@ -291,17 +296,56 @@ impl MultiWriter {
         self
     }
 
-    /// Sets the compression method in blob file writer metadata, but does not actually compress blobs.
-    ///
-    /// This is used in garbage collection to pass through already-compressed blobs, but correctly
-    /// set the compression type in the metadata.
+    /// Sets the codec the files this writer produces hold, for a writer that
+    /// copies the frames of files under that codec: a copied frame goes as it
+    /// is, and a block's values, which are copied out of the block they shared,
+    /// are compressed into new blocks under the same codec.
     pub(crate) fn use_passthrough_compression(mut self, compression: CompressionType) -> Self {
         assert_eq!(self.compression, CompressionType::None);
         self.passthrough_compression = compression;
-        // The bytes handed to `write_raw` are already compressed, so the writer
-        // keeps `compression = None` (no re-compress) but must RECORD the real
-        // codec in the file metadata or a reopened reader cannot decode it.
-        self.active_writer.metadata_compression_override = Some(compression);
+        self.restamp_active(compression);
+        self
+    }
+
+    /// The codec a file of output `passthrough` compresses with and records:
+    /// the passthrough codec of a copying writer, this writer's own otherwise.
+    fn codec_for(&self, passthrough: CompressionType) -> CompressionType {
+        if passthrough == CompressionType::None {
+            self.compression
+        } else {
+            passthrough
+        }
+    }
+
+    /// The dictionary `codec` compresses with: the one this writer was given
+    /// for its own codec, else the one the tree's set holds for it.
+    #[cfg(zstd_any)]
+    fn dictionary_for(
+        &self,
+        codec: CompressionType,
+    ) -> Option<alloc::sync::Arc<crate::compression::ZstdDictionary>> {
+        if codec == self.compression {
+            return self.zstd_dictionary.clone();
+        }
+        self.zstd_dictionaries.for_compression(codec).ok().flatten()
+    }
+
+    /// Makes the active writer, which holds nothing yet, compress with and
+    /// record output `passthrough`'s codec.
+    fn restamp_active(&mut self, passthrough: CompressionType) {
+        let codec = self.codec_for(passthrough);
+        self.active_writer.compression = codec;
+        #[cfg(zstd_any)]
+        {
+            self.active_writer.zstd_dictionary = self.dictionary_for(codec);
+        }
+    }
+
+    /// Sizes the frames of every file this writer produces by `sizes`.
+    #[must_use]
+    pub(crate) fn use_frame_sizes(mut self, sizes: super::writer::FrameSizes) -> Self {
+        self.sizes = sizes;
+        self.active_writer.sizes = sizes;
         self
     }
 
@@ -362,12 +406,12 @@ impl MultiWriter {
             .position(|(c, k, _)| *c == compression && *k == class)
         {
             self.parked.swap_remove(at).2
-        } else if self.active_writer.item_count == 0 {
+        } else if self.active_writer.item_count == 0 && self.active_writer.len_written() == 0 {
             // Nothing written constrains an untouched writer: restamp it.
             // Only a codec switch restamps the codec: a class switch keeps what
             // the writer records, which for a compressing writer is its own.
             if compression != self.passthrough_compression {
-                self.active_writer.metadata_compression_override = Some(compression);
+                self.restamp_active(compression);
             }
             self.active_writer
                 .set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
@@ -385,8 +429,8 @@ impl MultiWriter {
         Ok(())
     }
 
-    /// A new writer for the next blob file of lifetime `class`, recording
-    /// `passthrough` when this writer copies already-encoded frames.
+    /// A new writer for the next blob file of lifetime `class`, under output
+    /// `passthrough`'s codec (see [`Self::codec_for`]).
     fn fresh_writer(&self, passthrough: CompressionType, class: u8) -> crate::Result<Writer> {
         let id = self.id_generator.next();
         let path = self.folder.join(id.to_string());
@@ -395,21 +439,18 @@ impl MultiWriter {
         if let Some(outputs) = &self.outputs {
             outputs.record_blob_file(id, w.path.clone(), self.fs.clone());
         }
+        let codec = self.codec_for(passthrough);
         let mut w = w
-            .use_compression(self.compression)
+            .use_compression(codec)
+            .use_frame_sizes(self.sizes)
             .use_sync_mode(self.sync_mode)
             .use_writeback_bytes(self.writeback_bytes)
             .use_clock(self.clock.clone());
         w.durability = self.durability;
-        // Carry the passthrough metadata codec onto the new writer so every
-        // file in a relocation records the real compression.
-        if passthrough != CompressionType::None {
-            w.metadata_compression_override = Some(passthrough);
-        }
         w.set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
         #[cfg(zstd_any)]
         let w = w
-            .use_zstd_dictionary(self.zstd_dictionary.clone())
+            .use_zstd_dictionary(self.dictionary_for(codec))
             .use_zstd_two_pass_seed(self.zstd_two_pass_seed);
         Ok(w)
     }
@@ -519,7 +560,20 @@ impl MultiWriter {
             #[cfg(zstd_any)]
             let writer_dictionary = writer.zstd_dictionary.clone();
 
-            let (metadata, checksum) = writer.finish()?;
+            // A failed finish (the last block's compression, a write, the
+            // sync) leaves a partial file no handle will ever own.
+            let (metadata, checksum, frames) = match writer.finish() {
+                Ok(finished) => finished,
+                Err(e) => {
+                    if let Err(remove) = fs.remove_file(&path) {
+                        log::warn!(
+                            "Could not delete unfinished blob file at {}: {remove:?}",
+                            path.display(),
+                        );
+                    }
+                    return Err(e);
+                }
+            };
 
             // What the FILE will record, which is what its reader resolves
             // against: the passthrough codec when relocation is stamping the
@@ -583,6 +637,7 @@ impl MultiWriter {
                 punched_through: once_cell::race::OnceBox::new(),
                 // A freshly written file is whole: nothing has been reclaimed.
                 live_data_start: 0,
+                frames,
                 id: blob_file_id,
                 file_accessor,
                 #[cfg(zstd_any)]
@@ -594,6 +649,8 @@ impl MultiWriter {
                     item_count: metadata.item_count,
                     total_compressed_bytes: metadata.total_compressed_bytes,
                     total_uncompressed_bytes: metadata.total_uncompressed_bytes,
+                    block_entry_bytes: metadata.block_entry_bytes,
+                    block_frame_bytes: metadata.block_frame_bytes,
                     key_range: metadata.key_range,
 
                     compression: recorded_compression,
@@ -624,9 +681,32 @@ impl MultiWriter {
         }
     }
 
-    /// Writes an item.
+    /// The indirection of a value of `size` bytes written into the active
+    /// file at `at`, rotating to the next file once the active one reached
+    /// its target.
+    fn written(
+        &mut self,
+        at: super::writer::FrameRef,
+        size: u32,
+    ) -> crate::Result<BlobIndirection> {
+        let indirection = BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id: self.active_writer.blob_file_id(),
+                frame: at.frame,
+                index: at.index,
+            },
+            size,
+            stored: at.stored,
+        };
+        if self.active_writer.len_written() >= self.target_size {
+            self.rotate()?;
+        }
+        Ok(indirection)
+    }
+
+    /// Writes an item, into the frame its size calls for.
     ///
-    /// Returns the [`ValueHandle`] of the written blob.
+    /// Returns the [`BlobIndirection`] the table stores for it.
     ///
     /// # Errors
     ///
@@ -636,94 +716,55 @@ impl MultiWriter {
         key: &[u8],
         seqno: SeqNo,
         value: &[u8],
-    ) -> crate::Result<ValueHandle> {
+    ) -> crate::Result<BlobIndirection> {
+        let size = super::writer::check_size_cap(value.len())?;
         self.enter_key(key)?;
-        let target_size = self.target_size;
-
-        // Write actual value into blob file
-        let writer = &mut self.active_writer;
-
-        let offset = writer.offset();
-        let on_disk_value_len = writer.write(key, seqno, value)?;
-
-        let handle = ValueHandle {
-            blob_file_id: writer.blob_file_id(),
-            offset,
-            on_disk_size: on_disk_value_len,
-        };
-
-        // Check for blob file size target, maybe rotate to next writer
-        if writer.offset() >= target_size {
-            self.rotate()?;
-        }
-
-        Ok(handle)
+        let at = self.active_writer.write(key, seqno, value)?;
+        self.written(at, size)
     }
 
-    /// Writes `encoded`, a value already encoded under this writer's codec.
-    /// `uncompressed_len` is its decoded length.
+    /// Writes `frames`, the frames of one whole value under the codec the
+    /// active file records, as they are. `value_len` is the value's decoded
+    /// length.
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
-    pub(crate) fn write_encoded(
+    /// The frames are not one whole value under `key`, or an IO error occurs.
+    pub(crate) fn write_verbatim(
         &mut self,
         key: &[u8],
-        seqno: SeqNo,
-        encoded: &[u8],
-        uncompressed_len: u32,
-    ) -> crate::Result<ValueHandle> {
+        frames: &[crate::Slice],
+        value_len: u32,
+    ) -> crate::Result<BlobIndirection> {
         self.enter_key(key)?;
-        let target_size = self.target_size;
-
-        let writer = &mut self.active_writer;
-        let offset = writer.offset();
-        let on_disk_size = writer.write_encoded(key, seqno, encoded, uncompressed_len)?;
-        let handle = ValueHandle {
-            blob_file_id: writer.blob_file_id(),
-            offset,
-            on_disk_size,
-        };
-        if writer.offset() >= target_size {
-            self.rotate()?;
-        }
-        Ok(handle)
+        let at = self.active_writer.write_verbatim(key, frames, value_len)?;
+        self.written(at, value_len)
     }
 
-    pub(crate) fn write_raw(
+    /// [`Self::write_verbatim`] with the value listed at `seqno`, its payload
+    /// still written as stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_verbatim`].
+    pub(crate) fn write_verbatim_at(
         &mut self,
         key: &[u8],
+        frames: &[crate::Slice],
+        value_len: u32,
         seqno: SeqNo,
-        value: &[u8],
-        uncompressed_len: u32,
-    ) -> crate::Result<ValueHandle> {
+    ) -> crate::Result<BlobIndirection> {
         self.enter_key(key)?;
-        let target_size = self.target_size;
-
-        // Write actual value into blob file
-        let writer = &mut self.active_writer;
-
-        let offset = writer.offset();
-        let on_disk_value_len = writer.write_raw(key, seqno, value, uncompressed_len)?;
-
-        let handle = ValueHandle {
-            blob_file_id: writer.blob_file_id(),
-            offset,
-            on_disk_size: on_disk_value_len,
-        };
-
-        // Check for blob file size target, maybe rotate to next writer
-        if writer.offset() >= target_size {
-            self.rotate()?;
-        }
-
-        Ok(handle)
+        let at = self
+            .active_writer
+            .write_verbatim_at(key, frames, value_len, seqno)?;
+        self.written(at, value_len)
     }
 
-    /// Writes `value`, a value new to the value log, encoded under
-    /// `compression` into a file of lifetime `class` that records that codec:
-    /// the file a relocation copies frames of the same codec into, so a pass
-    /// that both relocates and separates new values cuts one set of files.
+    /// Writes `value`, a value new to the value log, into a file of lifetime
+    /// `class` under `compression`: the file a relocation copies frames of the
+    /// same codec into, so a pass that both relocates and separates new values
+    /// cuts one set of files.
     ///
     /// # Errors
     ///
@@ -736,35 +777,12 @@ impl MultiWriter {
         value: &[u8],
         compression: CompressionType,
         class: u8,
-    ) -> crate::Result<ValueHandle> {
-        super::writer::check_size_cap(value.len())?;
-        let encoded = super::writer::encode_value(
-            compression,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-            #[cfg(zstd_any)]
-            self.zstd_two_pass_seed,
-            value,
-        )?;
+    ) -> crate::Result<BlobIndirection> {
+        let size = super::writer::check_size_cap(value.len())?;
         self.enter_key(key)?;
         self.select_output(compression, class)?;
-
-        let writer = &mut self.active_writer;
-        let offset = writer.offset();
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the size cap above bounds the value far below u32::MAX"
-        )]
-        let on_disk_size = writer.write_encoded(key, seqno, &encoded, value.len() as u32)?;
-        let handle = ValueHandle {
-            blob_file_id: writer.blob_file_id(),
-            offset,
-            on_disk_size,
-        };
-        if writer.offset() >= self.target_size {
-            self.rotate()?;
-        }
-        Ok(handle)
+        let at = self.active_writer.write(key, seqno, value)?;
+        self.written(at, size)
     }
 
     pub(crate) fn finish(mut self) -> crate::Result<Vec<BlobFile>> {

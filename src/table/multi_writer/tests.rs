@@ -1,3 +1,4 @@
+use crate::blob_tree::handle::Stored;
 use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter, config::CompressionPolicy};
 use test_log::test;
 
@@ -105,14 +106,15 @@ fn the_linked_blob_files_count_toward_a_full_table() -> crate::Result<()> {
     assert!(!mw.table_full());
     let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..10 {
-        mw.linked_blobs.register(blob_file_id, 1, 1, &key, true);
+        mw.linked_blobs
+            .register(blob_file_id, 1, Stored::Frames(1), &key, true);
     }
-    assert!(mw.table_full(), "ten linked files take 384 bytes");
+    assert!(mw.table_full(), "ten linked files take 464 bytes");
     Ok(())
 }
 
 /// Each linked blob file is an entry in the multi-writer's map and, once the
-/// table rotates, a copy in its writer, far more than the 32 bytes it takes
+/// table rotates, a copy in its writer, far more than the 40 bytes it takes
 /// on disk: the held state counts both, so a table linking many files is full
 /// by its memory before its size.
 #[test]
@@ -139,7 +141,8 @@ fn the_linked_blob_files_count_toward_the_held_state() -> crate::Result<()> {
     mw.writer.spill_block()?;
     let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..FILES {
-        mw.linked_blobs.register(blob_file_id, 1, 1, &key, true);
+        mw.linked_blobs
+            .register(blob_file_id, 1, Stored::Frames(1), &key, true);
     }
     // Their bytes on disk fit; their entries in memory do not.
     let linked = mw.linked_blobs.section_len();
@@ -211,7 +214,8 @@ fn rotation_frees_the_linked_blob_map() -> crate::Result<()> {
     ))?;
     let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..1_000 {
-        mw.linked_blobs.register(blob_file_id, 1, 1, &key, true);
+        mw.linked_blobs
+            .register(blob_file_id, 1, Stored::Frames(1), &key, true);
     }
     mw.pinned_key = Some(UserKey::from(b"b" as &[u8]));
     mw.rotate_at(None)?;

@@ -1,133 +1,23 @@
 use super::*;
-use crate::SequenceNumberCounter;
-use crate::fs::StdFs;
+use crate::vlog::blob_file::writer::FrameSizes;
+use crate::{CompressionType, SequenceNumberCounter, fs::StdFs};
 use std::fs::File;
 use std::sync::Arc;
 use test_log::test;
 
-#[test]
-fn blob_reader_roundtrip() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
+/// Small sizes, so a test reaches every class with a few bytes.
+const SIZES: FrameSizes = FrameSizes {
+    block_target: 100,
+    chunk_size: 300,
+};
 
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX);
-
-    let handle = writer.write(b"a", 0, b"abcdef")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    assert_eq!(reader.get(b"a", &handle)?, b"abcdef");
-
-    Ok(())
-}
-
-#[test]
-#[cfg(feature = "lz4")]
-fn blob_reader_roundtrip_lz4() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(CompressionType::Lz4);
-
-    let handle0 = writer.write(b"a", 0, b"abcdef")?;
-    let handle1 = writer.write(b"b", 0, b"ghi")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    assert_eq!(reader.get(b"a", &handle0)?, b"abcdef");
-    assert_eq!(reader.get(b"b", &handle1)?, b"ghi");
-
-    Ok(())
-}
-
-/// Tamper `real_val_len` to an absurd value: V4 header CRC catches the
-/// corruption before the size-cap check is even reached.
-#[test]
-#[cfg(feature = "lz4")]
-fn blob_reader_reject_absurd_real_val_len() {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir().unwrap();
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))
-            .unwrap()
-            .use_target_size(u64::MAX)
-            .use_compression(CompressionType::Lz4);
-
-    let handle = writer.write_raw(b"k", 0, b"value", 5).unwrap();
-
-    let blob_file = writer.finish().unwrap();
-    let blob_file = blob_file.first().unwrap();
-
-    // Patch real_val_len at handle.offset + magic(4) + checksum(16) + seqno(8) + key_len(2) = +30
-    let mut raw = std::fs::read(&blob_file.0.path).unwrap();
-    let real_val_len_offset = usize::try_from(handle.offset).unwrap() + 30;
-    raw[real_val_len_offset..real_val_len_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-    std::fs::write(&blob_file.0.path, &raw).unwrap();
-
-    let file = File::open(&blob_file.0.path).unwrap();
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"k", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
-        "expected HeaderCrcMismatch, got: {result:?}",
-    );
-}
-
-#[test]
-#[cfg(feature = "lz4")]
-fn blob_reader_zero_real_val_len_with_data_fails_decompress() {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir().unwrap();
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))
-            .unwrap()
-            .use_target_size(u64::MAX)
-            .use_compression(CompressionType::Lz4);
-
-    // Zero real_val_len is allowed (valid for empty values), but when
-    // compressed data is present, lz4 decompression fails on the mismatch.
-    let handle = writer.write_raw(b"k", 0, b"value", 0).unwrap();
-
-    let blob_file = writer.finish().unwrap();
-    let blob_file = blob_file.first().unwrap();
-
-    let file = File::open(&blob_file.0.path).unwrap();
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"k", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::Decompress(_))),
-        "expected Decompress error, got: {result:?}",
-    );
-}
-
-/// `frame`, under checksums that hold, as a record of a blob file of
-/// `compression` declaring `len` decoded bytes: the reader gets `Err` from the
-/// decoder alone, which is what keeps a back-reference off the value's
-/// uninitialized bytes.
-#[cfg(any(feature = "lz4", zstd_any))]
-fn read_crafted_frame(
+/// Writes `values` into one blob file under `compression` and returns the
+/// file with the handle of each value.
+fn write(
+    folder: &tempfile::TempDir,
     compression: CompressionType,
-    frame: &[u8],
-    len: u32,
-) -> crate::Result<UserValue> {
-    let folder = tempfile::tempdir()?;
+    values: &[(&[u8], &[u8])],
+) -> crate::Result<(BlobFile, Vec<ValueHandle>)> {
     let mut writer = crate::vlog::BlobFileWriter::new(
         SequenceNumberCounter::default(),
         folder.path(),
@@ -136,765 +26,429 @@ fn read_crafted_frame(
         Arc::new(StdFs),
     )?
     .use_target_size(u64::MAX)
+    .use_frame_sizes(SIZES)
     .use_compression(compression);
-    let handle = writer.write_encoded(b"k", 0, frame, len)?;
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-    let file = File::open(&blob_file.0.path)?;
-    Reader::new(blob_file, &file).get(b"k", &handle)
+    let handles = values
+        .iter()
+        .map(|(key, value)| writer.write(key, 0, value).map(|ind| ind.vhandle))
+        .collect::<crate::Result<Vec<_>>>()?;
+    let mut files = writer.finish()?;
+    Ok((files.remove(0), handles))
 }
 
-/// A match reaching 16 bytes back with one byte written.
+/// One value of each class.
+fn one_of_each() -> [(&'static [u8], Vec<u8>); 4] {
+    [
+        (b"a", b"small".to_vec()),
+        (b"b", b"also small".to_vec()),
+        (b"c", vec![b'c'; 150]),
+        (b"d", (0..700_u32).map(|i| (i % 251) as u8).collect()),
+    ]
+}
+
+fn round_trip(compression: CompressionType) -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let values = one_of_each();
+    let refs: Vec<(&[u8], &[u8])> = values.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+    let (blob_file, handles) = write(&folder, compression, &refs)?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    for ((key, value), handle) in values.iter().zip(&handles) {
+        assert_eq!(&*reader.get(key, handle)?, value.as_slice(), "{key:?}");
+    }
+    Ok(())
+}
+
+/// Every class reads back through its handle, uncompressed.
+#[test]
+fn every_class_round_trips() -> crate::Result<()> {
+    round_trip(CompressionType::None)
+}
+
+/// Every class reads back through its handle under lz4.
 #[test]
 #[cfg(feature = "lz4")]
-fn blob_reader_refuses_an_lz4_match_before_the_value() {
-    let frame = [0x10, b'a', 0x10, 0x00, 0x10, b'b'];
-    let result = read_crafted_frame(CompressionType::Lz4, &frame, 6);
-    assert!(
-        matches!(result, Err(crate::Error::Decompress(_))),
-        "expected Decompress error, got: {result:?}",
-    );
+fn every_class_round_trips_under_lz4() -> crate::Result<()> {
+    round_trip(CompressionType::Lz4)
 }
 
-/// One sequence with a match reaching 29 bytes back with one byte written: RLE
-/// tables, so the bitstream is the offset's five extra bits and its end marker.
+/// Every class reads back through its handle under zstd.
 #[test]
 #[cfg(zstd_any)]
-fn blob_reader_refuses_a_zstd_match_before_the_value() {
-    #[rustfmt::skip]
-    let frame = [
-        0x28, 0xB5, 0x2F, 0xFD, // magic
-        0x20, 0x05,             // single segment, 5 bytes
-        0x45, 0x00, 0x00,       // last compressed block of 8 bytes
-        0x08, b'a',             // one raw literal
-        0x01, 0x54,             // one sequence, three RLE tables
-        0x01, 0x05, 0x01,       // literal, offset and match length codes
-        0x20,                   // bitstream
-    ];
-    let result = read_crafted_frame(CompressionType::Zstd(3), &frame, 5);
-    assert!(
-        matches!(result, Err(crate::Error::Decompress(_))),
-        "expected Decompress error, got: {result:?}",
-    );
+fn every_class_round_trips_under_zstd() -> crate::Result<()> {
+    round_trip(CompressionType::Zstd(3))
 }
 
-/// A record whose checksums hold but whose value decompresses to fewer bytes
-/// than its header declares is refused after the decompressor ran: the length
-/// it produced is reported all the same, so a read that fails there is not
-/// charged as having decoded nothing.
+/// A handle checks its key against the one its frame lists at its index: a
+/// different key, of the same or another length, or an index past the list
+/// is refused, never served the value there.
 #[test]
-#[cfg(feature = "lz4")]
-fn blob_reader_reports_the_decoded_length_of_a_record_it_then_refuses() -> crate::Result<()> {
+fn a_value_is_served_only_to_its_key() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let mut writer = crate::vlog::BlobFileWriter::new(
-        SequenceNumberCounter::default(),
-        folder.path(),
-        0,
-        None,
-        Arc::new(StdFs),
-    )?
-    .use_target_size(u64::MAX)
-    .use_compression(CompressionType::Lz4);
-
-    // Compressed as written, but declared twice as long as it expands to.
-    let value = b"0123456789abcdef";
-    let handle = writer.write_raw(b"k", 0, value, 32)?;
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
+    let (blob_file, handles) = write(
+        &folder,
+        CompressionType::None,
+        &[(b"aaa", b"one"), (b"aab", b"two")],
+    )?;
     let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-    let record = reader.read_record(&handle, record_len(1, &handle)?)?;
-    let mut decoded = 0;
-    let result = reader.parse_record(b"k", &handle, &record, &mut decoded);
-    assert!(
-        matches!(result, Err(crate::Error::Decompress(_))),
-        "a value shorter than its declared length must be refused, got: {result:?}",
-    );
-    assert_eq!(
-        decoded,
-        value.len(),
-        "the decompressor produced the whole value"
-    );
-    Ok(())
-}
-
-/// The uncompressed twin: a stored value whose length disagrees with the one
-/// its header declares is refused, but it was read and inspected in full, so
-/// its length is reported like a decompressor's output.
-#[test]
-fn blob_reader_reports_the_length_of_an_uncompressed_record_it_then_refuses() -> crate::Result<()> {
-    let folder = tempfile::tempdir()?;
-    let mut writer = crate::vlog::BlobFileWriter::new(
-        SequenceNumberCounter::default(),
-        folder.path(),
-        0,
-        None,
-        Arc::new(StdFs),
-    )?
-    .use_target_size(u64::MAX);
-
-    let value = b"0123456789abcdef";
-    let handle = writer.write_raw(b"k", 0, value, 32)?;
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-    let record = reader.read_record(&handle, record_len(1, &handle)?)?;
-    let mut decoded = 0;
-    let result = reader.parse_record(b"k", &handle, &record, &mut decoded);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "a value shorter than its declared length must be refused, got: {result:?}",
-    );
-    assert_eq!(decoded, value.len(), "the whole stored value was produced");
-    Ok(())
-}
-
-/// Tamper `real_val_len` in lz4 blob: V4 header CRC catches the
-/// corruption before decompression is attempted.
-#[test]
-#[cfg(feature = "lz4")]
-fn blob_reader_lz4_corrupted_real_val_len_triggers_header_crc_mismatch() -> crate::Result<()> {
-    use crate::io::WriteBytesExt;
-
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(CompressionType::Lz4);
-
-    let handle = writer.write(b"a", 0, b"abcdef")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    // RealValLen is at offset 30 from the blob start.
-    let real_val_len_offset = handle.offset + 4 + 16 + 8 + 2;
-
-    {
-        use std::io::{Seek, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&blob_file.0.path)?;
-        file.seek(std::io::SeekFrom::Start(real_val_len_offset))?;
-        file.write_u32::<LittleEndian>(u32::try_from(b"abcdef".len()).unwrap() + 1)?;
-        file.flush()?;
+    let reader = Reader::new(&blob_file, &file);
+    assert_eq!(&*reader.get(b"aab", &handles[1])?, b"two");
+    for key in [&b"aaa"[..], b"aa", b"aabb"] {
+        let result = reader.get(key, &handles[1]);
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
+            "{key:?}: {result:?}"
+        );
     }
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    match reader.get(b"a", &handle) {
-        Err(crate::Error::HeaderCrcMismatch { .. }) => { /* header CRC catches it */ }
-        Ok(_) => panic!("expected HeaderCrcMismatch, but got Ok"),
-        Err(other) => panic!("expected HeaderCrcMismatch, got: {other:?}"),
-    }
-
-    Ok(())
-}
-
-#[test]
-fn blob_reader_reject_oversized_on_disk_size() {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir().unwrap();
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))
-            .unwrap()
-            .use_target_size(u64::MAX);
-
-    let mut handle = writer.write(b"a", 0, b"hello").unwrap();
-
-    let blob_file = writer.finish().unwrap();
-    let blob_file = blob_file.first().unwrap();
-
-    // Tamper the handle to declare an absurd on_disk_size
-    handle.on_disk_size = u32::MAX;
-
-    let file = File::open(&blob_file.0.path).unwrap();
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"a", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
-        "expected DecompressedSizeTooLarge, got: {result:?}",
-    );
-}
-
-/// Tamper `real_val_len` in zstd blob: V4 header CRC catches the
-/// corruption before decompression is attempted.
-#[test]
-#[cfg(zstd_any)]
-fn blob_reader_zstd_corrupted_real_val_len_triggers_header_crc_mismatch() -> crate::Result<()> {
-    use crate::io::WriteBytesExt;
-
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(CompressionType::Zstd(3));
-
-    let handle = writer.write(b"a", 0, b"abcdef")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    // RealValLen is at offset 30 from the blob start.
-    let real_val_len_offset = handle.offset + 4 + 16 + 8 + 2;
-
-    {
-        use std::io::{Seek, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&blob_file.0.path)?;
-        file.seek(std::io::SeekFrom::Start(real_val_len_offset))?;
-        file.write_u32::<LittleEndian>(u32::try_from(b"abcdef".len()).unwrap() + 1)?;
-        file.flush()?;
-    }
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    match reader.get(b"a", &handle) {
-        Err(crate::Error::HeaderCrcMismatch { .. }) => { /* header CRC catches it */ }
-        Ok(_) => panic!("expected HeaderCrcMismatch, but got Ok"),
-        Err(other) => panic!("expected HeaderCrcMismatch, got: {other:?}"),
-    }
-
-    Ok(())
-}
-
-/// Tamper `real_val_len` to exceed size cap: V4 header CRC catches the
-/// corruption before the size-cap check is reached.
-#[test]
-fn blob_reader_rejects_oversized_real_val_len() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX);
-
-    let handle = writer.write(b"a", 0, b"abcdef")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    // Byte-patch real_val_len in the blob header
-    let mut raw = std::fs::read(&blob_file.0.path)?;
-    let real_val_len_offset = usize::try_from(handle.offset).unwrap() + 4 + 16 + 8 + 2;
-    let oversize = u32::try_from(MAX_DECOMPRESSION_SIZE).unwrap() + 1;
-    raw[real_val_len_offset..real_val_len_offset + 4].copy_from_slice(&oversize.to_le_bytes());
-    std::fs::write(&blob_file.0.path, &raw)?;
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"a", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
-        "expected HeaderCrcMismatch, got: {result:?}",
-    );
-    Ok(())
-}
-
-#[test]
-#[cfg(zstd_any)]
-fn blob_reader_roundtrip_zstd() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(CompressionType::Zstd(3));
-
-    let handle0 = writer.write(b"a", 0, b"abcdef")?;
-    let handle1 = writer.write(b"b", 0, b"ghi")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    assert_eq!(reader.get(b"a", &handle0)?, b"abcdef");
-    assert_eq!(reader.get(b"b", &handle1)?, b"ghi");
-
-    Ok(())
-}
-
-/// Tamper on-disk key bytes and verify two detection layers:
-/// 1. Original caller key → `InvalidHeader` from cross-check (fast path)
-/// 2. Tampered key as caller → `ChecksumMismatch` (checksum path, upstream #277)
-#[test]
-fn blob_reader_corrupted_on_disk_key_detected_by_cross_check_and_checksum() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX);
-
-    let handle = writer.write(b"abc", 0, b"value")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    // Tamper on-disk key bytes.
-    // V4 header layout: MAGIC(4) + Checksum(16) + SeqNo(8) + KeyLen(2) + RealValLen(4) + OnDiskValLen(4) + HeaderCrc(4) = 42
-    // Key starts at offset 42 from blob start (BLOB_HEADER_LEN).
-    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN;
-    let mut raw = std::fs::read(&blob_file.0.path)?;
-    raw[key_offset] ^= 0xFF; // flip bits in first key byte
-    let corrupted_key = raw[key_offset..key_offset + 3].to_vec();
-    std::fs::write(&blob_file.0.path, &raw)?;
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    // Layer 1: original caller key vs tampered on-disk key → InvalidHeader
-    let result = reader.get(b"abc", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "expected InvalidHeader(Blob) from key cross-check, got: {result:?}",
-    );
-
-    // Layer 2: pass the tampered key as caller so cross-check passes,
-    // but checksum (computed over tampered key + value) won't match the
-    // stored checksum (computed over original key + value).
-    let result = reader.get(&corrupted_key, &handle);
-    assert!(
-        matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
-        "expected ChecksumMismatch for tampered on-disk key, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// Verify that reading a blob with a caller key that differs from the
-/// stored key (same length, different bytes) is rejected.
-#[test]
-fn blob_reader_wrong_caller_key_same_length_returns_invalid_header() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX);
-
-    let handle = writer.write(b"aaa", 0, b"value")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    // Correct key works
-    assert_eq!(reader.get(b"aaa", &handle)?, b"value");
-
-    // Wrong key with same length → InvalidHeader from cross-check
-    let result = reader.get(b"bbb", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "expected InvalidHeader(Blob) for wrong caller key, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// Wrong caller key with different length is caught by the `key_len`
-/// cross-check (header field vs caller key length) before the on-disk
-/// key bytes are even read.
-#[test]
-fn blob_reader_wrong_caller_key_different_length_returns_invalid_header() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX);
-
-    let handle = writer.write(b"abc", 0, b"value")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    // Shorter key
-    let result = reader.get(b"ab", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "expected InvalidHeader for shorter key, got: {result:?}",
-    );
-
-    // Longer key
-    let result = reader.get(b"abcd", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "expected InvalidHeader for longer key, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// Tamper the value payload bytes (after the key) and verify the checksum
-/// catches the corruption. This validates the end-to-end checksum path
-/// for uncompressed blobs.
-#[test]
-fn blob_reader_corrupted_value_payload_triggers_checksum_mismatch() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX);
-
-    let handle = writer.write(b"key", 0, b"payload_data")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    // Value payload starts after header + key: offset + BLOB_HEADER_LEN + key_len
-    let payload_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN + b"key".len();
-    let mut raw = std::fs::read(&blob_file.0.path)?;
-    raw[payload_offset] ^= 0xFF; // flip bits in first value byte
-    std::fs::write(&blob_file.0.path, &raw)?;
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"key", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
-        "expected ChecksumMismatch for corrupted value, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// Tamper on-disk key bytes in an lz4-compressed blob and verify the
-/// cross-check catches the corruption before decompression runs.
-#[test]
-#[cfg(feature = "lz4")]
-fn blob_reader_corrupted_on_disk_key_lz4_returns_invalid_header() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(CompressionType::Lz4);
-
-    let handle = writer.write(b"abc", 0, b"value")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN;
-    let mut raw = std::fs::read(&blob_file.0.path)?;
-    raw[key_offset] ^= 0xFF;
-    std::fs::write(&blob_file.0.path, &raw)?;
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"abc", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "expected InvalidHeader for corrupted lz4 key, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// Tamper on-disk key bytes in a zstd-compressed blob and verify the
-/// cross-check catches the corruption before decompression runs.
-#[test]
-#[cfg(zstd_any)]
-fn blob_reader_corrupted_on_disk_key_zstd_returns_invalid_header() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(CompressionType::Zstd(3));
-
-    let handle = writer.write(b"abc", 0, b"value")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN;
-    let mut raw = std::fs::read(&blob_file.0.path)?;
-    raw[key_offset] ^= 0xFF;
-    std::fs::write(&blob_file.0.path, &raw)?;
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"abc", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "expected InvalidHeader for corrupted zstd key, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// V4 header CRC detects seqno corruption — the primary motivating
-/// case for upstream #278. A corrupted seqno could cause MVCC
-/// time-travel returning wrong versions.
-#[test]
-fn blob_reader_v4_corrupted_seqno_detected_by_header_crc() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX);
-
-    let handle = writer.write(b"key", 42, b"value")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    // Tamper seqno: offset + magic(4) + checksum(16) = 20
-    let seqno_offset = usize::try_from(handle.offset).unwrap() + 20;
-    let mut raw = std::fs::read(&blob_file.0.path)?;
-    // Change seqno from 42 to 99
-    raw[seqno_offset..seqno_offset + 8].copy_from_slice(&99u64.to_le_bytes());
-    std::fs::write(&blob_file.0.path, &raw)?;
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"key", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
-        "expected HeaderCrcMismatch for corrupted seqno, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// V4 header CRC field itself corrupted (header fields intact) is
-/// detected before the data checksum check.
-#[test]
-fn blob_reader_v4_corrupted_header_crc_field_detected() -> crate::Result<()> {
-    let id_generator = SequenceNumberCounter::default();
-
-    let folder = tempfile::tempdir()?;
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX);
-
-    let handle = writer.write(b"key", 0, b"value")?;
-
-    let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
-
-    // header_crc is at offset 38 (after magic+checksum+seqno+key_len+real_val_len+on_disk_val_len)
-    let header_crc_offset = usize::try_from(handle.offset).unwrap() + 4 + 16 + 8 + 2 + 4 + 4;
-    let mut raw = std::fs::read(&blob_file.0.path)?;
-    raw[header_crc_offset] ^= 0xFF; // flip bits
-    std::fs::write(&blob_file.0.path, &raw)?;
-
-    let file = File::open(&blob_file.0.path)?;
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"key", &handle);
-    assert!(
-        matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
-        "expected HeaderCrcMismatch for corrupted header_crc field, got: {result:?}",
-    );
-
-    Ok(())
-}
-
-/// Verify the frame header layout: `BLOB_HEADER_LEN` = 42 bytes
-/// (`magic:4` + `checksum:16` + `seqno:8` + `key_len:2` + `real_val_len:4` + `on_disk_val_len:4` + `header_crc:4`).
-#[test]
-fn blob_header_len_is_42() {
-    assert_eq!(BLOB_HEADER_LEN, 42);
-}
-
-/// A frame under the retired pre-V5 `b"BLOB"` magic (no header CRC) must be
-/// REJECTED: the engine reads exactly one on-disk format — there is no
-/// backward-compat decode path.
-#[test]
-fn blob_reader_rejects_retired_blob_magic_frame() -> crate::Result<()> {
-    use crate::file_accessor::FileAccessor;
-    use crate::io::WriteBytesExt;
-    use crate::vlog::{ValueHandle, blob_file::Inner as BlobFileInner};
-    use std::io::Write;
-    use std::sync::{Arc, atomic::AtomicBool};
-
-    let folder = tempfile::tempdir()?;
-    let blob_file_path = folder.path().join("0");
-
-    let key = b"abc";
-    let value = b"hello_v3";
-
-    // V3 data checksum: xxh3_128(key + value) — no header_crc
-    let checksum = {
-        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-        hasher.update(key);
-        hasher.update(value);
-        hasher.digest128()
+    let past = ValueHandle {
+        index: 2,
+        ..handles[1]
     };
+    assert!(matches!(
+        reader.get(b"aab", &past),
+        Err(crate::Error::InvalidHeader("Blob"))
+    ));
+    Ok(())
+}
 
-    // Write V3 blob file manually using sfa framing
-    {
-        let file = std::fs::File::create(&blob_file_path)?;
-        let mut sfa_writer = crate::sfa::Writer::from_writer(file);
-        sfa_writer.start("data")?;
+/// A handle naming a frame the file does not have is refused.
+#[test]
+fn a_frame_the_file_lacks_is_refused() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let (blob_file, handles) = write(&folder, CompressionType::None, &[(b"k", b"v")])?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    let missing = ValueHandle {
+        frame: 9,
+        ..handles[0]
+    };
+    assert!(matches!(
+        reader.get(b"k", &missing),
+        Err(crate::Error::InvalidHeader("Blob"))
+    ));
+    Ok(())
+}
 
-        // V3 frame: BLOB magic, no header_crc
-        sfa_writer.write_all(b"BLOB")?;
-        sfa_writer.write_u128::<crate::io::LittleEndian>(checksum)?;
-        sfa_writer.write_u64::<crate::io::LittleEndian>(42)?; // seqno
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test key length fits in u16"
-        )]
-        sfa_writer.write_u16::<crate::io::LittleEndian>(key.len() as u16)?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test value length fits in u32"
-        )]
-        sfa_writer.write_u32::<crate::io::LittleEndian>(value.len() as u32)?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test value length fits in u32"
-        )]
-        sfa_writer.write_u32::<crate::io::LittleEndian>(value.len() as u32)?;
-        sfa_writer.write_all(key)?;
-        sfa_writer.write_all(value)?;
-
-        // Write metadata
-        sfa_writer.start("meta")?;
-        let metadata = crate::vlog::blob_file::meta::Metadata {
-            id: 0,
-            version: 3,
-            created_at: 0,
-            item_count: 1,
-            total_compressed_bytes: value.len() as u64,
-            total_uncompressed_bytes: value.len() as u64,
-            key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
-            compression: CompressionType::None,
-            lifetime_class: 0,
-        };
-        metadata.encode_into(&mut sfa_writer)?;
-        let inner = sfa_writer.into_inner()?;
-        inner.sync_all()?;
+/// A byte flipped on disk in a frame, wherever it is, is caught before any
+/// value is served: by the header CRC in the header, by the checksum past it.
+#[test]
+fn damage_on_disk_is_caught() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let (blob_file, handles) = write(&folder, CompressionType::None, &[(b"key", b"payload_data")])?;
+    let (start, end) = blob_file.frame_span(0).expect("one frame");
+    let pristine = std::fs::read(&blob_file.0.path)?;
+    for at in start..end {
+        let mut raw = pristine.clone();
+        raw[at as usize] ^= 0x40;
+        std::fs::write(&blob_file.0.path, &raw)?;
+        let file = File::open(&blob_file.0.path)?;
+        let result = Reader::new(&blob_file, &file).get(b"key", &handles[0]);
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::HeaderCrcMismatch { .. }
+                    | crate::Error::ChecksumMismatch { .. }
+                    | crate::Error::InvalidHeader(_))
+            ),
+            "byte {} of the frame: {result:?}",
+            at - start
+        );
     }
+    Ok(())
+}
 
-    // Construct a BlobFile with V3 metadata for the reader
-    let file = File::open(&blob_file_path)?;
-    let file2 = File::open(&blob_file_path)?;
-    let blob_file = crate::BlobFile(Arc::new(BlobFileInner {
-        id: 0,
-        tree_id: 0,
-        live_data_start: 0,
-        path: blob_file_path,
-        meta: crate::vlog::blob_file::meta::Metadata {
-            id: 0,
-            version: 3,
-            created_at: 0,
-            item_count: 1,
-            total_compressed_bytes: value.len() as u64,
-            total_uncompressed_bytes: value.len() as u64,
-            key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
-            compression: CompressionType::None,
-            lifetime_class: 0,
-        },
-        is_deleted: AtomicBool::new(false),
-        punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
-        punched_through: once_cell::race::OnceBox::new(),
-        checksum: crate::Checksum::from_raw(0),
-        file_accessor: FileAccessor::File(Arc::new(file2)),
-        fs: Arc::new(crate::fs::StdFs),
-        deletion_pause: once_cell::race::OnceBox::new(),
-        #[cfg(zstd_any)]
-        zstd_dictionary: None,
+/// The chunks a range of a chunked value covers, and where it starts in the
+/// first of them.
+#[test]
+fn a_range_covers_only_its_chunks() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let value: Vec<u8> = (0..700_u32).map(|i| (i % 251) as u8).collect();
+    let (blob_file, handles) = write(&folder, CompressionType::None, &[(b"big", &value)])?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    let head = reader.read_frame(handles[0].frame, &mut 0)?;
 
-        #[cfg(feature = "std")]
-        background_deleter: once_cell::race::OnceBox::new(),
-    }));
+    assert_eq!(covering_chunks(&head, &(0..700))?, (0..3, 0));
+    assert_eq!(covering_chunks(&head, &(310..320))?, (1..2, 10));
+    assert_eq!(covering_chunks(&head, &(299..301))?, (0..2, 299));
+    assert_eq!(covering_chunks(&head, &(600..700))?, (2..3, 0));
 
+    let chunks = chunk_frames(&head, handles[0].frame, blob_file.frame_count())?;
+    let second = reader.read_frame(chunks.start + 1, &mut 0)?;
+    let part = assemble(&head, &[Box::new(second)], Some(&(310..320)))?;
+    assert_eq!(&*part, &value[310..320]);
+    // Chunks past the file's last frame: a damaged head, refused before any
+    // caller reserves room for them.
+    assert!(chunk_frames(&head, handles[0].frame, chunks.end as usize - 1).is_err());
+    Ok(())
+}
+
+/// Chunks that are not the head's are refused: of another size than its
+/// table gives them, or not chunks at all.
+#[test]
+fn chunks_must_be_the_heads() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let value = vec![9_u8; 700];
+    let (blob_file, handles) = write(
+        &folder,
+        CompressionType::None,
+        &[(b"big", &value), (b"z", b"tail")],
+    )?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    let head = reader.read_frame(handles[0].frame, &mut 0)?;
+    let first = reader.read_frame(handles[0].frame + 1, &mut 0)?;
+    let last = reader.read_frame(handles[0].frame + 3, &mut 0)?;
+    let tail = reader.read_frame(handles[1].frame, &mut 0)?;
+
+    // The last chunk (100 bytes) where the first (300) belongs.
+    assert!(assemble(&head, &[Box::new(last)], Some(&(0..10))).is_err());
+    // A block where a chunk belongs.
+    assert!(assemble(&head, &[Box::new(tail)], Some(&(0..10))).is_err());
+    // Too few chunks for the range.
+    assert!(assemble(&head, &[Box::new(first)], Some(&(0..400))).is_err());
+    Ok(())
+}
+
+/// A head's chunks are proven whole without gathering the value: each in its
+/// place the size its table gives it, and a chunk out of its place or a frame
+/// that is no chunk refused.
+#[test]
+fn chunks_are_checked_without_gathering_the_value() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let value = vec![9_u8; 700];
+    let (blob_file, handles) = write(&folder, CompressionType::None, &[(b"big", &value)])?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    let at = handles[0].frame;
+    let head = reader.read_frame(at, &mut 0)?;
+    let chunks = (at + 1..at + 4)
+        .map(|frame| reader.read_frame(frame, &mut 0))
+        .collect::<crate::Result<Vec<_>>>()?;
+    let table = ChunkTable::of(&head)?;
+
+    for (nth, chunk) in (0..).zip(&chunks) {
+        assert!(table.check(nth, chunk).is_ok(), "chunk {nth} in its place");
+    }
+    assert!(
+        table.check(0, &chunks[2]).is_err(),
+        "the short last chunk first"
+    );
+    assert!(table.check(2, &chunks[0]).is_err(), "a full chunk last");
+    assert!(
+        table.check(0, &head).is_err(),
+        "a head where a chunk belongs"
+    );
+    assert!(ChunkTable::of(&chunks[0]).is_err(), "a chunk has no table");
+    Ok(())
+}
+
+/// A head is not a value a frame holds, and a range running past a chunked
+/// value's end is not gathered short: both are refused.
+#[test]
+fn a_head_holds_no_value_and_a_range_past_the_value_is_refused() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let value = vec![9_u8; 700];
+    let (blob_file, handles) = write(&folder, CompressionType::None, &[(b"big", &value)])?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    let at = handles[0].frame;
+    let head = reader.read_frame(at, &mut 0)?;
+    assert!(value_in(&head, 0, b"big").is_err(), "a head holds no value");
+
+    let chunks = (at + 1..at + 4)
+        .map(|frame| reader.read_frame(frame, &mut 0).map(Box::new))
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(
+        assemble(&head, &chunks, Some(&(0..701))).is_err(),
+        "a byte past the value"
+    );
+    assert_eq!(&*assemble(&head, &chunks, None)?, &value[..]);
+    Ok(())
+}
+
+/// A copy of a chunked value checks each frame it takes is a chunk: a head
+/// naming one chunk more than were written finds the next value's frame in
+/// its place, and the copy is refused rather than carrying that frame along.
+#[test]
+fn a_copy_refuses_a_frame_that_is_not_its_value_s_chunk() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let (blob_file, handles) = write(
+        &folder,
+        CompressionType::None,
+        &[(b"big", &[9; 700]), (b"next", &[1; 150])],
+    )?;
+    let (start, end) = blob_file
+        .frame_span(handles[0].frame)
+        .expect("the head's frame");
+    let (start, end) = (start as usize, end as usize);
+    let mut bytes = std::fs::read(&blob_file.0.path)?;
+    {
+        // A thousand bytes in four chunks of 300: one more than written.
+        let head = &mut bytes[start..end];
+        head[40 + 10..40 + 14].copy_from_slice(&1000_u32.to_le_bytes());
+        let table = head.len() - 4;
+        head[table..].copy_from_slice(&4_u32.to_le_bytes());
+        crate::vlog::blob_file::frame::reseal(head);
+    }
+    std::fs::write(&blob_file.0.path, &bytes)?;
+
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    assert!(matches!(
+        reader.copy_source(b"big", &handles[0]),
+        Err(crate::Error::InvalidHeader("Blob"))
+    ));
+    Ok(())
+}
+
+/// A copy takes a value with frames of its own as those frames, each one
+/// checked, and a value out of a block as the value; the bytes it reports
+/// read are what it read.
+#[test]
+fn a_copy_takes_frames_or_the_value() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let values = one_of_each();
+    let refs: Vec<(&[u8], &[u8])> = values.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+    let (blob_file, handles) = write(&folder, CompressionType::None, &refs)?;
+    let file = File::open(&blob_file.0.path)?;
     let reader = Reader::new(&blob_file, &file);
 
-    // V3 frame offset: sfa "data" segment header comes first.
-    // Find actual data start via sfa reader.
-    let sfa_reader = crate::sfa::Reader::new(&blob_file.0.path)?;
-    let data_section = sfa_reader.toc().section(b"data").unwrap();
-    let data_start = data_section.pos();
+    let (small, read) = reader.copy_source(b"a", &handles[0])?;
+    assert!(matches!(&small, CopySource::Value(v) if &**v == b"small"));
+    let (start, end) = blob_file.frame_span(handles[0].frame).expect("frame");
+    assert_eq!(read, end - start, "the block was read");
 
-    let handle = ValueHandle {
-        blob_file_id: 0,
-        offset: data_start,
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test value length fits in u32"
-        )]
-        on_disk_size: value.len() as u32,
+    let (single, _) = reader.copy_source(b"c", &handles[2])?;
+    assert!(matches!(&single, CopySource::Frames { frames, value_len: 150 } if frames.len() == 1));
+
+    let (chunked, read) = reader.copy_source(b"d", &handles[3])?;
+    let CopySource::Frames { frames, value_len } = chunked else {
+        panic!("a chunked value is copied by its frames");
     };
-
-    let result = reader.get(key, &handle);
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
-        "a retired-format frame must be rejected, got: {result:?}",
+    assert_eq!(
+        (frames.len(), value_len),
+        (4, 700),
+        "a head and three chunks"
     );
+    assert_eq!(read, frames.iter().map(|f| f.len() as u64).sum::<u64>());
 
+    assert!(
+        reader.copy_source(b"x", &handles[3]).is_err(),
+        "another key"
+    );
+    Ok(())
+}
+
+/// A copy refuses chunks that do not fit their head's table, though each one
+/// checks: written as they are, the value would be one no read can assemble.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_copy_refuses_chunks_that_do_not_fit_their_head() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let values = one_of_each();
+    let refs: Vec<(&[u8], &[u8])> = values.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+    let (blob_file, handles) = write(&folder, CompressionType::None, &refs)?;
+
+    // The head now names 650 bytes, still three chunks, while the chunks
+    // hold 700: its last chunk is 100 bytes, not the 50 the table asks.
+    let (start, end) = blob_file.frame_span(handles[3].frame).expect("the head");
+    let mut bytes = std::fs::read(&blob_file.0.path)?;
+    let head = &mut bytes[start as usize..end as usize];
+    let len_at = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + 10;
+    head[len_at..len_at + 4].copy_from_slice(&650_u32.to_le_bytes());
+    crate::vlog::blob_file::frame::reseal(head);
+    std::fs::write(&blob_file.0.path, &bytes)?;
+
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    assert!(
+        matches!(
+            reader.copy_source(b"d", &handles[3]),
+            Err(crate::Error::InvalidHeader("Blob"))
+        ),
+        "the chunks do not fit the head",
+    );
+    Ok(())
+}
+
+/// A copy checks a frame of a value's own as stored and does not decode it:
+/// a single frame and a chunk whose payloads, sealed, the codec cannot decode
+/// are handed over as they lie, while a read refuses them.
+#[test]
+#[cfg(feature = "lz4")]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_copy_hands_over_frames_of_their_own_undecoded() -> crate::Result<()> {
+    use crate::vlog::blob_file::frame::{FRAME_HEADER_LEN, parse_header, reseal};
+
+    let folder = tempfile::tempdir()?;
+    let chunked: Vec<u8> = (0..700_u32).map(|i| (i % 7) as u8).collect();
+    let refs: [(&[u8], &[u8]); 2] = [(b"c", &[b'c'; 150]), (b"d", &chunked)];
+    let (blob_file, handles) = write(&folder, CompressionType::Lz4, &refs)?;
+
+    let mut bytes = std::fs::read(&blob_file.0.path)?;
+    for frame in [handles[0].frame, handles[1].frame + 1] {
+        let (start, end) = blob_file.frame_span(frame).expect("the frame");
+        let at = &mut bytes[start as usize..end as usize];
+        let header = parse_header(at)?;
+        assert!(!header.is_raw(), "frame {frame} is compressed");
+        let stored = FRAME_HEADER_LEN + header.entries_len as usize;
+        at[stored..].fill(0xFF);
+        reseal(at);
+    }
+    std::fs::write(&blob_file.0.path, &bytes)?;
+
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    for (key, handle, frames) in [(b"c", &handles[0], 1), (b"d", &handles[1], 4)] {
+        let (source, _) = reader.copy_source(key, handle)?;
+        assert!(
+            matches!(&source, CopySource::Frames { frames: f, .. } if f.len() == frames),
+            "copied as its frames"
+        );
+        assert!(
+            reader.get(key, handle).is_err(),
+            "a read decodes and refuses it"
+        );
+    }
     Ok(())
 }
 
 /// A writer that compressed against a dictionary produces a handle carrying it,
 /// so the read needs nothing supplied: it just used those bytes, and they are
-/// the file's by construction. The opposite case — a handle recovered by a tree
-/// that does not hold the recorded id — is covered by
-/// [`blob_reader_uses_the_dictionary_pinned_on_its_file`].
+/// the file's by construction.
 #[test]
 #[cfg(zstd_any)]
 fn blob_reader_reads_a_written_dictionary_blob_with_nothing_supplied() -> crate::Result<()> {
     use crate::compression::ZstdDictionary;
 
-    let id_generator = SequenceNumberCounter::default();
     let folder = tempfile::tempdir()?;
-
     let dict = ZstdDictionary::new(b"some_dictionary_content_for_testing");
     let compression = CompressionType::ZstdDict {
         level: 3,
         dict_id: dict.id(),
     };
-    let dict_arc = Arc::new(dict);
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        SequenceNumberCounter::default(),
+        folder.path(),
+        0,
+        None,
+        Arc::new(StdFs),
+    )?
+    .use_target_size(u64::MAX)
+    .use_compression(compression)
+    .use_zstd_dictionary(Some(Arc::new(dict)));
 
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(compression)
-            .use_zstd_dictionary(Some(dict_arc));
-
-    let handle = writer.write(b"key", 0, b"value-to-compress-with-dict")?;
+    let handle = writer
+        .write(b"key", 0, b"value-to-compress-with-dict")?
+        .vhandle;
     let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
+    let blob_file = blob_file.first().expect("one blob file written");
 
     let file = File::open(&blob_file.0.path)?;
     // The reader takes no dictionary at all: the file's handle carries it.
     let value = Reader::new(blob_file, &file).get(b"key", &handle)?;
     assert_eq!(&*value, b"value-to-compress-with-dict");
-
     Ok(())
 }
 
@@ -935,13 +489,18 @@ fn blob_reader_uses_the_dictionary_pinned_on_its_file() -> crate::Result<()> {
     .use_zstd_dictionary(Some(dict_a_arc))
     .use_zstd_dictionaries(both);
 
-    let handle = writer.write(b"key", 0, b"value-compressed-with-dict-a")?;
+    // Compressible, so its frame is stored compressed: a frame compression
+    // left raw decodes without any dictionary, rightly.
+    let value = b"value-compressed-with-dict-a ".repeat(20);
+    let handle = writer.write(b"key", 0, &value)?.vhandle;
     let blob_file = writer.finish()?;
-    let blob_file = blob_file.first().unwrap();
+    let blob_file = blob_file.first().expect("one blob file written");
 
     let file = File::open(&blob_file.0.path)?;
-    let value = Reader::new(blob_file, &file).get(b"key", &handle)?;
-    assert_eq!(&*value, b"value-compressed-with-dict-a");
+    assert_eq!(
+        &*Reader::new(blob_file, &file).get(b"key", &handle)?,
+        value.as_slice()
+    );
 
     // The same file recovered by a tree that does NOT hold A pins nothing, and
     // says which id it wanted rather than decoding against something else.
@@ -962,6 +521,5 @@ fn blob_reader_uses_the_dictionary_pinned_on_its_file() -> crate::Result<()> {
         ),
         "a tree without the recorded dictionary must report it missing; got: {result:?}",
     );
-
     Ok(())
 }

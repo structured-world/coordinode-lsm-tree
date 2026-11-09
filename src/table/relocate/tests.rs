@@ -449,17 +449,28 @@ fn relocated_mor_table_passes_the_blob_link_cross_check() -> crate::Result<()> {
         .use_zone_map(true);
     let mut bytes_sum = 0u64;
     let mut on_disk_sum = 0u64;
+    let mut block_sum = 0u64;
     for i in 0..n {
+        // Values with frames of their own and values in blocks, so both
+        // halves of the accounting are cross-checked.
+        let stored = if i % 2 == 0 {
+            crate::blob_tree::handle::Stored::Frames(40)
+        } else {
+            crate::blob_tree::handle::Stored::InBlock(30)
+        };
         let ind = BlobIndirection {
             vhandle: ValueHandle {
                 blob_file_id: 5,
-                offset: u64::from(i) * 100,
-                on_disk_size: 40,
+                frame: i,
+                index: 0,
             },
             size: 80,
+            stored,
         };
         bytes_sum += u64::from(ind.size);
-        on_disk_sum += u64::from(ind.vhandle.on_disk_size);
+        let (frames, block) = ind.stored.split();
+        on_disk_sum += frames;
+        block_sum += block;
         let mut val = alloc::vec::Vec::new();
         ind.encode_into(&mut val)?;
         writer.write(InternalValue::from_components(
@@ -474,6 +485,7 @@ fn relocated_mor_table_passes_the_blob_link_cross_check() -> crate::Result<()> {
         len: n as usize,
         bytes: bytes_sum,
         on_disk_bytes: on_disk_sum,
+        block_bytes: block_sum,
         first_key: b"k0000".into(),
         last_key: format!("k{:04}", n - 1).into_bytes().into(),
     });

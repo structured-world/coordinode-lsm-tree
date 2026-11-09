@@ -437,6 +437,25 @@ matching entry (and add one for a new subsystem).
   lose the value. Enforced in `src/blob_tree` / `src/vlog` (GC in
   `src/blob_tree/gc.rs`).
 
+- **A value lies in one frame, and a handle names it by frame and place.** A
+  value below the block size shares a block, sized by its entries, keys and
+  values together; one up to the chunk size has a frame of its own; a larger
+  one is a head and its chunks, which lie right after it. A handle holds the
+  frame number and the value's index in the frame's list, never a byte offset,
+  so it is known before the block is compressed; the file's checksummed frame
+  index maps numbers to offsets. A frame lists the key of every value it holds,
+  and a read checks the key at the handle's index, so a handle never yields
+  another value. Enforced in `src/vlog/blob_file/writer.rs` and
+  `src/vlog/blob_file/frame.rs`.
+
+- **Garbage is charged in the units the file is written in.** A value with
+  frames of its own is charged their exact bytes; a value in a block its
+  uncompressed entry, and its share on disk is that entry's part of the bytes
+  the file's blocks take, which the file's metadata records. A file is dead
+  when every one of its objects is charged, counted by objects, so a live value
+  of zero bytes keeps its file. Enforced in `src/blob_tree/gc.rs`,
+  `src/vlog/blob_file/meta.rs` and `src/vlog/blob_file/mod.rs`.
+
 - **Only a value is separated, and a separated base merges like an inline one.**
   An indirection reads as a put, so merge operands stay inline whatever their size
   (flush and compaction-filter rewrites alike), or the key would stop merging onto

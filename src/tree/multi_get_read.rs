@@ -259,7 +259,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 fs: &pending.read.blob_file.0.fs,
                 cache: &source.cache,
                 file,
-                offset: pending.read.vhandle.offset,
+                offset: pending.read.offset,
                 buf: crate::fs::QueuedBuf::new(len),
             });
             self.blob_bytes_out += len;
@@ -429,26 +429,22 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
     /// it failed or does not check out, left to the value's own path.
     fn blob_read_done(&mut self, pending: BlobRead<'a>, done: crate::fs::ReadDone) {
         self.blob_bytes_out -= pending.read.len;
-        let file = self
-            .blob_files
-            .get(pending.slot)
-            .and_then(|slot| slot.file.as_ref());
         // A read reported done and left short goes on its own path, as a
         // failed one does.
-        let record = match done.result {
+        let frame = match done.result {
             Ok(()) => done.buf.into_slice(),
             Err(_) => None,
         };
-        let value = match (&self.ctx.values, file, record) {
-            (Values::Blob(source), Some(file), Some(record)) => source
+        let value = match (&self.ctx.values, frame) {
+            (Values::Blob(source), Some(frame)) => source
                 .finish_value(
                     self.ctx.version(),
                     &pending.item.key.user_key,
                     &pending.read,
-                    file.as_ref(),
-                    &record,
+                    &frame,
                 )
-                .ok(),
+                .ok()
+                .flatten(),
             _ => None,
         };
         // Its last read back, the file is given back: the descriptor cache can

@@ -1047,6 +1047,8 @@ impl Version {
                         .and_modify(|counter| {
                             counter.bytes += blob_file.bytes;
                             counter.len += blob_file.len;
+                            counter.on_disk_bytes += blob_file.on_disk_bytes;
+                            counter.block_bytes += blob_file.block_bytes;
                         })
                         .or_insert_with(|| {
                             FragmentationEntry::new(
@@ -1054,6 +1056,7 @@ impl Version {
                                 blob_file.bytes,
                                 blob_file.on_disk_bytes,
                             )
+                            .with_block_bytes(blob_file.block_bytes)
                         });
                 }
             }

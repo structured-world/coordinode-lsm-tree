@@ -1742,12 +1742,14 @@ struct SliceOutputs<'a> {
 }
 
 /// What a relocating pass moves: the frames its inputs point at in the
-/// `stale` blob files, written into files of `target_size` bytes, a file for
-/// each of `file_groups` codecs and lifetime classes at once.
+/// `stale` blob files, written into files of `target_size` bytes split into
+/// chunks of `chunk_size`, a file for each of `file_groups` codecs and
+/// lifetime classes at once.
 #[cfg(feature = "std")]
 struct Relocated<'a> {
     stale: &'a HashSet<BlobFileId>,
     target_size: u64,
+    chunk_size: u32,
     file_groups: u64,
 }
 
@@ -1756,27 +1758,61 @@ struct Relocated<'a> {
 #[cfg(feature = "std")]
 const BLOB_META_BYTES: u64 = 1_024;
 
-/// The bytes a relocated frame of `value` under `key` takes in a blob file.
+/// At most the bytes the relocated copy of the value `indirection` names
+/// takes in a blob file written with `chunk_size`: what it takes now, its
+/// frames' headers included, for a value with frames of its own; for a value
+/// that shares a block, which is re-encoded, its entry and a frame header the
+/// copy may open, or, when the value is above `chunk_size` (a tree reopened
+/// with a smaller one), a head with its chunk table and a header per chunk.
+/// A block's share is its uncompressed entry, which compression only shrinks.
+/// Each frame the copy writes also takes an entry of the output file's frame
+/// index: a value with frames of its own is split into chunks of at least
+/// [`MIN_CHUNK_SIZE`](crate::vlog::blob_file::writer::MIN_CHUNK_SIZE), which
+/// bounds how many it has.
 #[cfg(feature = "std")]
-fn frame_bytes(key: &[u8], on_disk_size: u32) -> u64 {
-    crate::vlog::blob_file::writer::BLOB_HEADER_LEN as u64
-        + key.len() as u64
-        + u64::from(on_disk_size)
+fn frame_bytes(indirection: &crate::blob_tree::handle::BlobIndirection, chunk_size: u32) -> u64 {
+    use crate::blob_tree::handle::Stored;
+    use crate::vlog::blob_file::{frame::FRAME_HEADER_LEN, writer::MIN_CHUNK_SIZE};
+
+    /// A head's chunk table: the chunk size and the chunk count.
+    const CHUNK_TABLE_LEN: u64 = 8;
+    /// A frame's entry in the file's frame index: its offset.
+    const INDEX_ENTRY_LEN: u64 = 8;
+
+    match indirection.stored {
+        // Copied as those frames, under the same codec: at most a head and
+        // a chunk per smallest chunk of the value.
+        Stored::Frames(bytes) => {
+            let frames = 1 + u64::from(indirection.size.div_ceil(MIN_CHUNK_SIZE));
+            u64::from(bytes) + INDEX_ENTRY_LEN * frames
+        }
+        Stored::InBlock(bytes) if indirection.size > chunk_size => {
+            let frames = 1 + u64::from(indirection.size.div_ceil(chunk_size));
+            u64::from(bytes)
+                + (FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN) * frames
+                + CHUNK_TABLE_LEN
+        }
+        Stored::InBlock(bytes) => u64::from(bytes) + FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN,
+    }
 }
 
 /// The bytes of the blob frames `item` points at in the `stale` files, which
-/// a relocation copies: its own value, or the references among its cells.
+/// a relocation into files written with `chunk_size` copies: its own value,
+/// or the references among its cells.
 #[cfg(feature = "std")]
-fn stale_frame_bytes(item: &InternalValue, stale: &HashSet<BlobFileId>) -> crate::Result<u64> {
+fn stale_frame_bytes(
+    item: &InternalValue,
+    stale: &HashSet<BlobFileId>,
+    chunk_size: u32,
+) -> crate::Result<u64> {
     use crate::blob_tree::field_row::{RowCell, decode_row};
     use crate::blob_tree::handle::BlobIndirection;
     use crate::coding::Decode;
 
-    let key = &item.key.user_key;
     if item.key.value_type.is_indirection() {
         let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
         return Ok(if stale.contains(&indirection.vhandle.blob_file_id) {
-            frame_bytes(key, indirection.vhandle.on_disk_size)
+            frame_bytes(&indirection, chunk_size)
         } else {
             0
         });
@@ -1787,7 +1823,7 @@ fn stale_frame_bytes(item: &InternalValue, stale: &HashSet<BlobFileId>) -> crate
             if let RowCell::Ref { indirection, .. } = field.cell
                 && stale.contains(&indirection.vhandle.blob_file_id)
             {
-                bytes += frame_bytes(key, indirection.vhandle.on_disk_size);
+                bytes += frame_bytes(&indirection, chunk_size);
             }
         }
         return Ok(bytes);
@@ -1878,7 +1914,7 @@ fn tight_slices(
                 block.try_for_each_entry(comparator.clone(), |item| {
                     longest_key = longest_key.max(item.key.user_key.len() as u64);
                     // Bounded by the stale files' bytes.
-                    blobs += stale_frame_bytes(&item, relocated.stale)?;
+                    blobs += stale_frame_bytes(&item, relocated.stale, relocated.chunk_size)?;
                     Ok(())
                 })?;
             }
@@ -1967,7 +2003,7 @@ fn tight_slices(
                     u64::try_from(u128::from(raw) * u128::from(file_len) / u128::from(data_bytes))
                         .unwrap_or(u64::MAX);
                 if let Some(relocated) = relocated {
-                    weight.1 += stale_frame_bytes(&item, relocated.stale)?;
+                    weight.1 += stale_frame_bytes(&item, relocated.stale, relocated.chunk_size)?;
                 }
                 Ok(())
             })?;
@@ -2238,6 +2274,13 @@ fn run_tight_space_compaction(
             .kv_separation_opts
             .as_ref()
             .map_or(u64::MAX, |blob_opts| blob_opts.file_target_size),
+        // The output files are written with the sizes the options give now,
+        // which may chunk a value its source file holds in a block.
+        chunk_size: opts
+            .config
+            .kv_separation_opts
+            .as_ref()
+            .map_or(u32::MAX, |blob_opts| blob_opts.frame_sizes().chunk_size),
         file_groups: stale_codecs
             * opts
                 .config
@@ -3292,6 +3335,7 @@ fn run_subcompaction(
             .use_sync_mode(opts.config.sync_mode)
             .use_writeback_bytes(opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
+            .use_frame_sizes(blob_opts.frame_sizes())
             .use_clock(opts.config.clock.clone())
             .use_key_domains(
                 opts.config.key_domains.clone(),
@@ -3700,17 +3744,10 @@ fn open_blob_scanner_at_frontier(
     from: u64,
     opts: &Options,
 ) -> crate::Result<BlobFileScanner> {
-    let off = from.max(bf.live_data_start());
     // The relocation reads the blob files of its inputs, their trailer and
     // table of contents included: they report their latency as the table
     // reads do, and count to the run's work.
-    BlobFileScanner::open_paced(
-        &bf.0.path,
-        &*bf.0.fs,
-        bf.id(),
-        (off != 0).then_some(off),
-        Some(input_pacer(opts)),
-    )
+    BlobFileScanner::of_paced(bf, Some(from), Some(input_pacer(opts)))
 }
 
 /// Whether merging a move's tables instead would relocate blob files for
@@ -3804,8 +3841,8 @@ fn pick_blob_files_for_locality(
         let len = table.file_len();
         table_bytes += len.checked_sub(table.punch_offset()?).unwrap_or(len);
         for link in table.blob_links()? {
-            if stale.iter().any(|bf| bf.id() == link.blob_file_id) {
-                stale_written += link.on_disk_bytes;
+            if let Some(bf) = stale.iter().find(|bf| bf.id() == link.blob_file_id) {
+                stale_written += link.on_disk(bf.meta());
             }
         }
     }
@@ -4668,6 +4705,7 @@ fn merge_tables(
                 .use_sync_mode(opts.config.sync_mode)
                 .use_writeback_bytes(opts.config.writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
+                .use_frame_sizes(blob_opts.frame_sizes())
                 .use_clock(opts.config.clock.clone())
                 .use_key_domains(
                     opts.config.key_domains.clone(),

@@ -926,17 +926,16 @@ fn recover_rejects_a_truncated_blob_files_section_in_every_mode() -> crate::Resu
     Ok(())
 }
 
-/// Writes a `vN` archive whose `blob_gc_stats` section is empty, so
-/// `FragmentationMap::decode_from` hits `UnexpectedEof` on the first byte.
+/// Writes a `vN` archive whose `blob_gc_stats` section is empty, too short
+/// for its entry count.
 fn write_truncated_blob_gc_stats(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_header(&mut w)?;
     write_empty_tables(&mut w)?;
     w.start("blob_files")?;
     w.write_u32::<LittleEndian>(0)?;
-    // blob_gc_stats section started but no payload written —
-    // section.len() == 0, FragmentationMap::decode_from will
-    // surface UnexpectedEof on its first read.
+    // blob_gc_stats section started but no payload written: section.len()
+    // is 0, too short for even the entry count.
     w.start("blob_gc_stats")?;
     w.finish()?;
     Ok(())
@@ -953,11 +952,9 @@ fn recover_rejects_a_truncated_blob_gc_stats_section_in_every_mode() -> crate::R
     write_truncated_blob_gc_stats(folder, 1, &fs)?;
     install_fixture(folder, 1, &fs)?;
 
-    assert_refused_in_every_mode(
-        folder,
-        &fs,
-        |e| matches!(e, crate::Error::Io(io) if io.kind() == crate::io::ErrorKind::UnexpectedEof),
-    );
+    assert_refused_in_every_mode(folder, &fs, |e| {
+        matches!(e, crate::Error::InvalidHeader("BlobGcStats"))
+    });
     Ok(())
 }
 

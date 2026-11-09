@@ -2207,7 +2207,10 @@ fn restrict_salvaged_output(
 struct BlobLiveTotals {
     items: u64,
     uncompressed_bytes: u64,
-    compressed_bytes: u64,
+    /// Bytes the frames of values with frames of their own take.
+    own_frame_bytes: u64,
+    /// The uncompressed entries of the values in blocks.
+    block_entry_bytes: u64,
 }
 
 /// What a blob file's punch-geometry walk proved about its live data.
@@ -2261,46 +2264,68 @@ enum BlobFrontier {
 fn derive_blob_frontier(
     fs: &Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
-    blob_id: crate::vlog::BlobFileId,
 ) -> crate::Result<BlobFrontier> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
-    let (data_start, data_end) = {
+    let (data_start, data_end, index_at) = {
         let reader = crate::sfa::Reader::from_reader(&mut file)?;
-        let data = reader
-            .toc()
+        let toc = reader.toc();
+        let data = toc
             .section(b"data")
             .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
         let end = data
             .pos()
             .checked_add(data.len())
             .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
-        (data.pos(), end)
+        let index = toc
+            .section(b"frames")
+            .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+        (data.pos(), end, (index.pos(), index.len()))
     };
     if data_start >= data_end {
         return Ok(BlobFrontier::Whole);
     }
 
-    // Ends of the contiguous all-zero run starting at `from` (chunked reads,
-    // capped by the data-section end).
-    let skip_zeros = |from: u64| -> crate::Result<u64> {
-        const CHUNK: u64 = 64 * 1024;
-        let mut pos = from;
-        while pos < data_end {
-            // `#[allow]`, not `#[expect]`: target-width-dependent lint (`u64 as
-            // usize`) — on 64-bit targets Clippy proves the `min()` bound fits
-            // usize and an `#[expect]` would be unfulfilled under `-D warnings`.
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "min() bounds the window by CHUNK, which fits usize"
-            )]
-            let want = (data_end - pos).min(CHUNK) as usize;
-            let chunk = crate::file::read_exact(&*file, pos, want)?;
-            match chunk.iter().position(|b| *b != 0) {
-                Some(hit) => return Ok(pos + hit as u64),
-                None => pos += want as u64,
-            }
+    // Fast path: an unpunched file's first frame magic (non-zero) sits at the
+    // data start. Taken before the frame index is read, so a file whose index
+    // rotted is still reported whole and reaches salvage, which walks its
+    // frame chain.
+    let magic = crate::file::read_exact(
+        &*file,
+        data_start,
+        crate::vlog::blob_file::frame::FRAME_MAGIC.len(),
+    )?;
+    if magic.iter().any(|b| *b != 0) {
+        return Ok(BlobFrontier::Whole);
+    }
+
+    // A punch ends on a frame boundary, so the frames the file's index places
+    // are the only candidates for the frontier.
+    let index_len =
+        usize::try_from(index_at.1).map_err(|_| crate::Error::InvalidHeader("BlobFile"))?;
+    let starts = crate::vlog::blob_file::writer::decode_frame_index(&crate::file::read_exact(
+        &*file, index_at.0, index_len,
+    )?)?;
+    if starts.first() != Some(&data_start) || starts.last() != Some(&data_end) {
+        return Err(crate::Error::InvalidHeader("BlobFile"));
+    }
+    let frames = starts.len() - 1;
+    let start_of = |at: usize| starts.get(at).copied().unwrap_or(data_end);
+    let frame_bytes = |at: usize| -> crate::Result<crate::Slice> {
+        let (from, to) = (start_of(at), start_of(at + 1));
+        let len =
+            usize::try_from(to - from).map_err(|_| crate::Error::InvalidHeader("BlobFile"))?;
+        Ok(crate::file::read_exact(&*file, from, len)?)
+    };
+    // Whether frame `at` reads as zeros through, as a punched frame does.
+    let zeroed =
+        |at: usize| -> crate::Result<bool> { Ok(frame_bytes(at)?.iter().all(|b| *b == 0)) };
+    // Whether frame `at` checks as stored: its codec is not needed for that.
+    let intact = |at: usize| -> crate::Result<bool> {
+        match crate::vlog::blob_file::frame::verify_frame(&frame_bytes(at)?) {
+            Ok(_) => Ok(true),
+            Err(e) if is_environmental(&e) => Err(e),
+            Err(_) => Ok(false),
         }
-        Ok(data_end)
     };
 
     // Whether a zero run was physically RECLAIMED rather than merely zeroed.
@@ -2324,12 +2349,6 @@ fn derive_blob_frontier(
         Ok(fs.extent_contains_hole(path, from, to - from)? == Some(true))
     };
 
-    // Fast path: an unpunched file's first frame magic (non-zero) sits at the
-    // data start.
-    if skip_zeros(data_start)? == data_start {
-        return Ok(BlobFrontier::Whole);
-    }
-
     // The last structure-anchored frontier: committed only once a frame has
     // decoded cleanly at a zeroed run's end. Zero = no run was ever anchored,
     // which reports the file whole (an unproven punch is content, not
@@ -2341,21 +2360,25 @@ fn derive_blob_frontier(
             BlobFrontier::Punched(c)
         }
     };
-    let mut pos = data_start;
+    let mut at = 0;
     let mut anchored: u64 = 0;
     loop {
-        let run_end = skip_zeros(pos)?;
+        let run_start = start_of(at);
+        while at < frames && zeroed(at)? {
+            at += 1;
+        }
+        let run_end = start_of(at);
         // An UNRECLAIMED run is destroyed content, not geometry: stop at the
         // last proven frontier and let validation surface the damage exactly as
         // it would on an unpunched file.
-        if !is_reclaimed(pos, run_end)? {
+        if !is_reclaimed(run_start, run_end)? {
             return Ok(committed(anchored));
         }
-        if run_end >= data_end {
+        if at == frames {
             // Zeros to the section end. Only a completed relocation when
             // NOTHING was anchored below them: reclaim punches the consumed
             // prefix top-down from the data start, so a zeroed tail that
-            // FOLLOWS intact anchored frames cannot be punch geometry — it is
+            // FOLLOWS intact anchored frames cannot be punch geometry; it is
             // destroyed data. Reporting it as consumed would drop a file whose
             // live frames are still referenced (and every table pointing at
             // it); keeping the anchored frontier instead lets the damaged
@@ -2367,35 +2390,28 @@ fn derive_blob_frontier(
                 committed(anchored)
             });
         }
-        let mut scanner = crate::vlog::BlobFileScanner::resume(path, &**fs, blob_id, run_end)?;
-        match scanner.next() {
-            Some(Ok(entry)) if !entry.resynced => {
-                anchored = run_end;
-                pos = entry.frame_end;
-            }
-            Some(Err(e)) if is_environmental(&e) => return Err(e),
-            // The zeroed run is not punch geometry (no frame decodes at its
-            // end): keep the last anchored frontier.
-            _ => return Ok(committed(anchored)),
+        // The zeroed run is punch geometry only when the frame at its end
+        // checks: keep the last anchored frontier otherwise.
+        if !intact(at)? {
+            return Ok(committed(anchored));
         }
+        anchored = run_end;
+        at += 1;
         // Chain frames from the anchor until the section ends cleanly or the
-        // chain breaks (another hole, or content corruption).
+        // chain breaks: another zeroed run continues the walk, a frame that
+        // does not check is content corruption and ends it at the last
+        // anchored frontier.
         loop {
-            match scanner.next() {
-                None => return Ok(committed(anchored)),
-                Some(Ok(entry)) if !entry.resynced => pos = entry.frame_end,
-                Some(Err(e)) if is_environmental(&e) => return Err(e),
-                Some(Ok(_) | Err(_)) => {
-                    // The frame starting at `pos` failed (or the scanner
-                    // resynced past unproven bytes). Another zeroed hole
-                    // continues the walk; anything else is content corruption
-                    // and ends it at the last anchored frontier.
-                    if skip_zeros(pos)? == pos {
-                        return Ok(committed(anchored));
-                    }
-                    break;
-                }
+            if at == frames {
+                return Ok(committed(anchored));
             }
+            if zeroed(at)? {
+                break;
+            }
+            if !intact(at)? {
+                return Ok(committed(anchored));
+            }
+            at += 1;
         }
     }
 }
@@ -2480,18 +2496,29 @@ fn validate_blob_frames(
     // by the caller, which alone knows whether a missing one stops the repair.
     #[cfg(zstd_any)] dict: Option<&Arc<crate::compression::ZstdDictionary>>,
 ) -> crate::Result<Option<BlobLiveTotals>> {
-    let fs = &config.fs;
-    let compression = handle.compression();
     let comparator = &config.comparator;
 
-    let scanner = if live_data_start > 0 {
-        crate::vlog::BlobFileScanner::resume(path, &**fs, blob_id, live_data_start)?
-    } else {
-        crate::vlog::BlobFileScanner::new(path, &**fs, blob_id)?
-    };
+    // The scan decodes every frame under the file's codec, the dictionary its
+    // descriptor names included: a frame whose payload does not decompress
+    // despite a clean checksum fails it like any other damage.
+    let scanner = crate::vlog::BlobFileScanner::open(
+        path,
+        &*config.fs,
+        blob_id,
+        crate::vlog::blob_file::scanner::ScanCodec {
+            compression: handle.compression(),
+            #[cfg(zstd_any)]
+            dictionary: dict.cloned(),
+        },
+        (live_data_start > 0).then_some(live_data_start),
+    )?;
     let mut count: u64 = 0;
     let mut uncompressed_total: u64 = 0;
-    let mut compressed_total: u64 = 0;
+    let mut own_frame_total: u64 = 0;
+    let mut block_entry_total: u64 = 0;
+    // The frames scanned, from the first one's start to the last one's end.
+    let mut frames_from: Option<u64> = None;
+    let mut frames_to: u64 = 0;
     let mut first_key: Option<crate::UserKey> = None;
     let mut prev: Option<(crate::UserKey, crate::SeqNo)> = None;
     for item in scanner {
@@ -2499,35 +2526,27 @@ fn validate_blob_frames(
             Ok(entry) if !entry.resynced => {
                 if crate::salvage::blob_key_regresses(comparator, prev.as_ref(), &entry) {
                     log::warn!(
-                        "blob file {blob_id} at {}: frame at {} regresses below the \
-                         previous frame's key — the frames were reordered",
+                        "blob file {blob_id} at {}: frame {} regresses below the \
+                         previous frame's key: the frames were reordered",
                         path.display(),
-                        entry.offset,
-                    );
-                    return Ok(None);
-                }
-                if crate::salvage::decompress_blob_value(
-                    compression,
-                    &entry.value,
-                    entry.uncompressed_len as usize,
-                    #[cfg(zstd_any)]
-                    dict.map(Arc::as_ref),
-                )
-                .is_err()
-                {
-                    log::warn!(
-                        "blob file {blob_id} at {}: frame at {} does not decompress \
-                         despite a clean checksum",
-                        path.display(),
-                        entry.offset,
+                        entry.frame,
                     );
                     return Ok(None);
                 }
                 count += 1;
                 uncompressed_total += u64::from(entry.uncompressed_len);
-                // Sum of u32-bounded on-disk lengths within one file: cannot
-                // overflow u64 (the file itself cannot reach 2^64 bytes).
-                compressed_total += entry.value.len() as u64;
+                match &entry.frames {
+                    Some(frames) => {
+                        own_frame_total += frames.iter().map(|f| f.len() as u64).sum::<u64>();
+                    }
+                    None => {
+                        block_entry_total += (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN
+                            + entry.key.len()) as u64
+                            + u64::from(entry.uncompressed_len);
+                    }
+                }
+                frames_from.get_or_insert(entry.offset);
+                frames_to = frames_to.max(entry.frame_end);
                 if first_key.is_none() {
                     first_key = Some(entry.key.clone());
                 }
@@ -2541,6 +2560,10 @@ fn validate_blob_frames(
         }
     }
 
+    let compressed_total = frames_from.map_or(0, |from| frames_to - from);
+    // Every frame scanned is a value's own or a block, so the own ones are
+    // within the span.
+    let block_frame_total = compressed_total.checked_sub(own_frame_total);
     let meta = handle.meta();
     if live_data_start == 0 {
         let range_matches = match (&first_key, &prev) {
@@ -2553,6 +2576,8 @@ fn validate_blob_frames(
         if meta.item_count != count
             || meta.total_uncompressed_bytes != uncompressed_total
             || meta.total_compressed_bytes != compressed_total
+            || meta.block_entry_bytes != block_entry_total
+            || Some(meta.block_frame_bytes) != block_frame_total
             || !range_matches
         {
             log::warn!(
@@ -2586,6 +2611,9 @@ fn validate_blob_frames(
         if meta.item_count < count
             || meta.total_uncompressed_bytes < uncompressed_total
             || meta.total_compressed_bytes < compressed_total
+            || meta.own_frame_bytes() < own_frame_total
+            || meta.block_entry_bytes < block_entry_total
+            || block_frame_total.is_none_or(|total| meta.block_frame_bytes < total)
             || !range_contains
         {
             log::warn!(
@@ -2602,12 +2630,13 @@ fn validate_blob_frames(
     Ok(Some(BlobLiveTotals {
         items: count,
         uncompressed_bytes: uncompressed_total,
-        compressed_bytes: compressed_total,
+        own_frame_bytes: own_frame_total,
+        block_entry_bytes: block_entry_total,
     }))
 }
 
 /// Whether any of `table`'s blob indirections points BELOW a recovered punched
-/// blob file's live-data frontier — i.e. into its zeroed prefix. The
+/// blob file's first live frame (in `frontiers`), into its zeroed prefix. The
 /// id-presence dependency check cannot see this case: the blob EXISTS, but a
 /// pre-relocation SST file left behind by a crash still holds handles into the
 /// prefix the relocation punched, and publishing it would resolve those reads
@@ -2618,7 +2647,7 @@ fn validate_blob_frames(
 #[cfg(feature = "std")]
 fn handle_below_blob_frontier(
     table: &Table,
-    frontiers: &crate::HashMap<crate::vlog::BlobFileId, u64>,
+    frontiers: &crate::HashMap<crate::vlog::BlobFileId, u32>,
 ) -> crate::Result<Option<String>> {
     use crate::coding::Decode;
 
@@ -2638,13 +2667,13 @@ fn handle_below_blob_frontier(
             continue;
         };
         for ind in handles {
-            if let Some(&frontier) = frontiers.get(&ind.vhandle.blob_file_id)
-                && ind.vhandle.offset < frontier
+            if let Some(&first_live) = frontiers.get(&ind.vhandle.blob_file_id)
+                && ind.vhandle.frame < first_live
             {
                 return Ok(Some(format!(
-                    "blob handle into file {} at offset {} lies below its recovered \
-                     live-data frontier {frontier}",
-                    ind.vhandle.blob_file_id, ind.vhandle.offset,
+                    "blob handle into file {} at frame {} lies below its recovered \
+                     first live frame {first_live}",
+                    ind.vhandle.blob_file_id, ind.vhandle.frame,
                 )));
             }
         }
@@ -2682,7 +2711,7 @@ fn owner_promotions(
         seqno: SeqNo,
         column: u16,
     }
-    type Object = (crate::vlog::BlobFileId, u64);
+    type Object = crate::vlog::ValueHandle;
 
     // Only borrowed references can lose their owner, and they are rare: a
     // first pass finds them and the oldest of each object's borrowers.
@@ -2708,7 +2737,7 @@ fn owner_promotions(
                 seqno,
                 column,
             };
-            let object = (field.file, field.offset);
+            let object = field.vhandle;
             match borrowed.get_mut(&object) {
                 Some((oldest, holders)) if eff == *oldest => holders.push(holder),
                 Some((oldest, holders)) if eff < *oldest => {
@@ -2731,7 +2760,7 @@ fn owner_promotions(
 
     // Then every owning reference into the files those objects are in.
     let files: crate::HashSet<crate::vlog::BlobFileId> =
-        borrowed.keys().map(|&(file, _)| file).collect();
+        borrowed.keys().map(|object| object.blob_file_id).collect();
     for ((table, ..), rewrite) in tables {
         let linked = table
             .list_blob_file_references()?
@@ -2741,7 +2770,7 @@ fn owner_promotions(
         }
         visit_kept_refs(table, rewrite.then_some(rewrites), |_, _, field| {
             if field.owner.is_none_or(|(_, borrows)| !borrows) {
-                borrowed.remove(&(field.file, field.offset));
+                borrowed.remove(&field.vhandle);
             }
             Ok(())
         })?;
@@ -2761,14 +2790,13 @@ fn owner_promotions(
     Ok(promotions)
 }
 
-/// A blob reference a row holds: the object's file and offset, and for a
-/// cell row's field its column and whether the row owns the object, `None`
-/// for an indirection, which always does.
+/// A blob reference a row holds: the object's handle, and for a cell row's
+/// field its column and whether the row owns the object, `None` for an
+/// indirection, which always does.
 #[cfg(feature = "std")]
 #[derive(Clone, Copy)]
 struct HeldRef {
-    file: crate::vlog::BlobFileId,
-    offset: u64,
+    vhandle: crate::vlog::ValueHandle,
     /// The field's column and whether the row only BORROWS the object.
     owner: Option<(u16, bool)>,
 }
@@ -2785,14 +2813,12 @@ fn visit_kept_refs(
 ) -> crate::Result<()> {
     use crate::blob_tree::field_row::{RowCell, decode_row};
     use crate::coding::Decode;
-    use crate::salvage::BlobFileRewrite;
 
-    let lost =
-        |file: crate::vlog::BlobFileId, offset: u64| match rewrites.and_then(|r| r.get(&file)) {
-            Some(BlobFileRewrite::Remap { offsets, .. }) => !offsets.contains_key(&offset),
-            Some(BlobFileRewrite::DropBelow(frontier)) => offset < *frontier,
-            None => false,
-        };
+    let lost = |vhandle: &crate::vlog::ValueHandle| {
+        rewrites
+            .and_then(|r| r.get(&vhandle.blob_file_id))
+            .is_some_and(|rewrite| !rewrite.keeps(vhandle))
+    };
     let mut headless: Option<UserKey> = None;
     let mut refs: Vec<HeldRef> = Vec::new();
     for entry in table.scan()? {
@@ -2811,8 +2837,7 @@ fn visit_kept_refs(
                 let mut cursor = &entry.value[..];
                 let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
                 refs.push(HeldRef {
-                    file: ind.vhandle.blob_file_id,
-                    offset: ind.vhandle.offset,
+                    vhandle: ind.vhandle,
                     owner: None,
                 });
             }
@@ -2820,8 +2845,7 @@ fn visit_kept_refs(
                 for field in decode_row(&entry.value)? {
                     if let RowCell::Ref { indirection, owner } = field.cell {
                         refs.push(HeldRef {
-                            file: indirection.vhandle.blob_file_id,
-                            offset: indirection.vhandle.offset,
+                            vhandle: indirection.vhandle,
                             owner: Some((field.column, !owner)),
                         });
                     }
@@ -2829,7 +2853,7 @@ fn visit_kept_refs(
             }
             _ => continue,
         }
-        if refs.iter().any(|r| lost(r.file, r.offset)) {
+        if refs.iter().any(|r| lost(&r.vhandle)) {
             headless = Some(key.clone());
             continue;
         }
@@ -3037,7 +3061,7 @@ fn recover_blob_files(
     let resolve_frontier = |blob_id, blob_path: &std::path::Path| -> crate::Result<BlobFrontier> {
         match committed_frontiers.and_then(|m| m.get(&blob_id).copied()) {
             Some(committed) => Ok(BlobFrontier::Punched(committed)),
-            None => derive_blob_frontier(&config.fs, blob_path, blob_id),
+            None => derive_blob_frontier(&config.fs, blob_path),
         }
     };
 
@@ -3239,12 +3263,55 @@ fn recover_blob_files(
                 unreadable.push((blob_path, e.to_string()));
             };
 
+        // IDENTITY and FORMAT before anything else: the metadata carries the
+        // file's layout version, and a file of an earlier layout, which lists
+        // no frame index, must be refused as a format this engine does not
+        // read (propagated, the file left in place) before the frontier walk
+        // reads its missing index as damage and sets the file aside.
+        //
+        // The id under which this file will be published comes from its
+        // FILENAME, but the metadata records the id it was written as. A
+        // mismatch means a renamed or swapped file — not damaged content —
+        // and publishing it under the filename's id would resolve existing SST
+        // handles into foreign frames (a read fails on the key cross-check,
+        // or, when the foreign frame happens to hold the same key, silently
+        // serves another generation's value). Salvage is the WRONG remedy here
+        // (it would re-emit the foreign records under the filename's id,
+        // laundering the swap); set the file aside.
+        // The metadata alone, not the frame index: the identity check needs
+        // the stored id and the dictionary below the compression descriptor,
+        // and a file whose index rotted is salvaged along its frame chain
+        // rather than set aside. Same transient/persistent split as every
+        // other per-file step: an unreadable meta section sets THIS file
+        // aside, never the repair.
+        let meta = match crate::vlog::read_blob_meta(&blob_path, &*config.fs, blob_id) {
+            Ok(meta) => meta,
+            Err(e) if is_environmental(&e) => return Err(e),
+            Err(e) => {
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+                continue;
+            }
+        };
+        let stored = meta.id;
+        if stored != blob_id {
+            let e = crate::Error::InvalidHeader(
+                "blob file's stored metadata id disagrees with its file name",
+            );
+            log::warn!(
+                "blob file at {}: metadata records id {stored}, file name says \
+                 {blob_id} — a renamed or swapped file; setting it aside",
+                blob_path.display(),
+            );
+            discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+            continue;
+        }
+
         // The committed frontier, when the manifest loaded cleanly, is exact
         // and free: no geometry walk, and no dependence on the backend being
         // able to attribute zeros to a hole (which, unanswered, reports a
         // punched file WHOLE — publishing handles that dereference the hole).
-        // Everything downstream — identity, frame validation, the handle
-        // rewrite — runs on it exactly as on a derived one.
+        // Everything downstream — frame validation, the handle rewrite — runs
+        // on it exactly as on a derived one.
         let frontier = match resolve_frontier(blob_id, &blob_path) {
             Ok(BlobFrontier::Whole) => 0,
             Ok(BlobFrontier::Punched(f)) => f,
@@ -3288,51 +3355,6 @@ fn recover_blob_files(
             }
         };
 
-        // IDENTITY before content: the id under which this file will be
-        // published comes from its FILENAME, but the metadata records the id
-        // it was written as. A mismatch means a renamed or swapped file — not
-        // damaged content — and publishing it under the filename's id would
-        // resolve existing SST handles into foreign frames (a read fails on
-        // the key cross-check, or, when the foreign frame happens to hold the
-        // same key, silently serves another generation's value). Salvage is
-        // the WRONG remedy here (it would re-emit the foreign records under
-        // the filename's id, laundering the swap); set the file aside.
-        // Placeholder-checksum open (stored, never verified). Same
-        // transient/persistent split as every other per-file step: an
-        // unreadable meta section sets THIS file aside, never the repair.
-        // Read ONCE and kept: the identity check needs the stored id and the
-        // frame validation below needs the compression descriptor, and both
-        // live in this same meta section.
-        let handle = match crate::vlog::recover_blob_file(
-            &blob_path,
-            blob_id,
-            crate::Checksum::from_raw(0),
-            0,
-            &config.fs,
-            #[cfg(zstd_any)]
-            &config.current_zstd_dictionaries(),
-        ) {
-            Ok(handle) => handle,
-            Err(e) if is_environmental(&e) => return Err(e),
-            Err(e) => {
-                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
-                continue;
-            }
-        };
-        let stored = handle.meta().id;
-        if stored != blob_id {
-            let e = crate::Error::InvalidHeader(
-                "blob file's stored metadata id disagrees with its file name",
-            );
-            log::warn!(
-                "blob file at {}: metadata records id {stored}, file name says \
-                 {blob_id} — a renamed or swapped file; setting it aside",
-                blob_path.display(),
-            );
-            discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
-            continue;
-        }
-
         // Validate the live frame range BEFORE recording a digest: hashing
         // damaged frames would restamp (launder) the corruption past every
         // later integrity check while reads of the affected values still
@@ -3359,7 +3381,7 @@ fn recover_blob_files(
         // supplies the dictionary and re-runs. One nothing references holds no
         // value anyone can reach, and goes to the sweep like any other.
         #[cfg(zstd_any)]
-        let dict = match blob_file_dictionary(config, handle.compression()) {
+        let dict = match blob_file_dictionary(config, meta.compression) {
             Ok(dict) => dict,
             Err(e) if referenced.contains(&blob_id) => return Err(e),
             Err(e) => {
@@ -3377,16 +3399,37 @@ fn recover_blob_files(
                 continue;
             }
         };
-        let Some(live) = validate_blob_frames(
-            config,
+        // The frames are validated through the file's handle, which reads its
+        // frame index. An index that does not read leaves an unpunched file to
+        // salvage, whose walk chains frame to frame from the data start; a
+        // punched one has no chain to follow from its frontier and is set
+        // aside. Placeholder checksum: stored, never verified.
+        let validated = match crate::vlog::recover_blob_file(
             &blob_path,
             blob_id,
-            frontier,
-            &handle,
+            crate::Checksum::from_raw(0),
+            0,
+            &config.fs,
             #[cfg(zstd_any)]
-            dict.as_ref(),
-        )?
-        else {
+            &config.current_zstd_dictionaries(),
+        ) {
+            Ok(handle) => validate_blob_frames(
+                config,
+                &blob_path,
+                blob_id,
+                frontier,
+                &handle,
+                #[cfg(zstd_any)]
+                dict.as_ref(),
+            )?,
+            Err(e) if is_environmental(&e) => return Err(e),
+            Err(_) if frontier == 0 => None,
+            Err(e) => {
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+                continue;
+            }
+        };
+        let Some(live) = validated else {
             // An INVALID blob no recovered table references never reaches the
             // manifest: salvaging it would allocate a fresh id and burn disk
             // space on a replacement the reference filter deletes anyway —
@@ -3510,7 +3553,7 @@ fn recover_blob_files(
                 blob_id,
                 crate::salvage::BlobFileRewrite::Remap {
                     new_id,
-                    offsets: report.offset_remap.iter().copied().collect(),
+                    records: report.remap.iter().copied().collect(),
                 },
             );
             // The damaged original is left in place for now and set aside once
@@ -3581,10 +3624,27 @@ fn recover_blob_files(
                 if frontier > 0 {
                     // A punched-but-intact file: a stale handle below its
                     // frontier (a pre-relocation SST left behind by a crash)
-                    // must be dropped by the table-rewrite stage.
+                    // must be dropped by the table-rewrite stage. The frontier
+                    // is a frame start, as its derivation and the restricted
+                    // open both hold it, or the data end: a committed frontier
+                    // there is a relocation that consumed every frame and had
+                    // not removed the file yet, whose lagged removal is queued
+                    // as for a file found punched whole.
+                    let Some(first_live) = bf.frame_at_offset(frontier) else {
+                        if !bf.is_frame_boundary(frontier) {
+                            return Err(crate::Error::InvalidHeader("BlobFile"));
+                        }
+                        discard.push((
+                            blob_path,
+                            "blob file consumed to its data end: a completed relocation's \
+                             lagged drop"
+                                .to_string(),
+                        ));
+                        continue;
+                    };
                     rewrites.insert(
                         blob_id,
-                        crate::salvage::BlobFileRewrite::DropBelow(frontier),
+                        crate::salvage::BlobFileRewrite::DropBelow(first_live),
                     );
                     // Seed the punched prefix's garbage: the recovered handle
                     // keeps its WHOLE-FILE metadata totals, while the prefix's
@@ -3603,8 +3663,9 @@ fn recover_blob_files(
                         crate::blob_tree::FragmentationEntry::new(
                             prefix_len,
                             meta.total_uncompressed_bytes - live.uncompressed_bytes,
-                            meta.total_compressed_bytes - live.compressed_bytes,
-                        ),
+                            meta.own_frame_bytes() - live.own_frame_bytes,
+                        )
+                        .with_block_bytes(meta.block_entry_bytes - live.block_entry_bytes),
                     );
                 }
                 kept_paths.insert(blob_id, blob_path);
@@ -6035,10 +6096,11 @@ fn rebuild_from_scan(
     // Shared with the ownership pass below, which rewrites tables again.
     let blob_rewrites = Arc::new(blob_rewrites);
     if config.kv_separation_opts.is_some() {
-        // Frontiers of the punched-but-intact blob files (the `DropBelow`
-        // rewrite entries): a handle below one dereferences zeroed bytes.
-        // Empty on the common path, so no table's handles are scanned.
-        let punched_frontiers: crate::HashMap<crate::vlog::BlobFileId, u64> = blob_rewrites
+        // First live frames of the punched-but-intact blob files (the
+        // `DropBelow` rewrite entries): a handle into an earlier frame
+        // dereferences zeroed bytes. Empty on the common path, so no table's
+        // handles are scanned.
+        let punched_frontiers: crate::HashMap<crate::vlog::BlobFileId, u32> = blob_rewrites
             .iter()
             .filter_map(|(id, rw)| match rw {
                 crate::salvage::BlobFileRewrite::DropBelow(f) => Some((*id, *f)),

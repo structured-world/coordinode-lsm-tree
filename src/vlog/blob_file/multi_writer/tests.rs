@@ -59,14 +59,14 @@ fn blob_files_never_hold_values_of_two_key_domains() -> crate::Result<()> {
     Ok(())
 }
 
-/// A finished blob file whose recorded dictionary cannot be resolved must leave
-/// nothing behind.
+/// A blob file whose dictionary cannot be resolved must leave nothing behind.
 ///
-/// `finish` writes and syncs the file, then the handle is built. If building it
-/// fails, no `BlobFile` exists, so the `Drop` that normally unlinks the file and
+/// The writer compresses the frames under the codec the file records, so the
+/// missing dictionary fails the finish when the last block is compressed.
+/// No `BlobFile` exists then, so the `Drop` that normally unlinks the file and
 /// evicts its descriptor never runs: the file would linger as an orphan no
-/// version references, and the shared descriptor table would keep an open handle
-/// to it for the life of the process.
+/// version references, and the shared descriptor table would keep an open
+/// handle to it for the life of the process.
 // Imported inside the test rather than at module scope: every item here is
 // zstd-only, and the module itself is not.
 #[test_log::test]
@@ -98,9 +98,9 @@ fn a_finished_file_whose_dictionary_is_missing_leaves_nothing_behind() -> crate:
 
     let blob_file_id = writer.active_writer.blob_file_id();
     let path = writer.active_writer.path.clone();
-    // Raw, because passthrough means the caller hands over already-encoded
-    // bytes; the writer itself compresses nothing.
-    writer.write_raw(b"key", 0, b"already-encoded-by-the-source", 29)?;
+    // A small value waits for its block, which compresses when the file
+    // finishes.
+    writer.write(b"key", 0, b"a value under a dictionary nobody holds")?;
 
     // `BlobFile` is not `Debug`, so match rather than `expect_err`.
     let Err(err) = writer.finish() else {
@@ -164,10 +164,10 @@ fn a_failed_finish_leaves_no_file_behind() -> crate::Result<()> {
         },
         0,
     )?;
-    writer.write_raw(b"a", 0, b"encoded-under-a-dictionary", 26)?;
+    writer.write(b"a", 0, b"a value under a dictionary nobody holds")?;
     let dict_path = writer.active_writer.path.clone();
     writer.select_output(CompressionType::None, 0)?;
-    writer.write_raw(b"b", 0, b"plain", 5)?;
+    writer.write(b"b", 0, b"plain")?;
     let plain_id = writer.active_writer.blob_file_id();
     let plain_path = writer.active_writer.path.clone();
 
@@ -225,7 +225,7 @@ fn interleaved_lifetime_classes_fill_one_file_per_group() -> crate::Result<()> {
         "one file per group, however many classes asked"
     );
     for (class, handle) in &handles {
-        let Some(file) = files.iter().find(|f| f.id() == handle.blob_file_id) else {
+        let Some(file) = files.iter().find(|f| f.id() == handle.vhandle.blob_file_id) else {
             panic!("handle {handle:?} points at a file the writer did not produce");
         };
         assert_eq!(
@@ -289,14 +289,14 @@ fn interleaved_source_codecs_fill_one_file_each() -> crate::Result<()> {
         };
         writer.select_output(codec, 0)?;
         let key = format!("key-{i:05}");
-        let handle = writer.write_raw(key.as_bytes(), 0, b"frame-bytes", 11)?;
+        let handle = writer.write(key.as_bytes(), 0, b"frame-bytes")?;
         handles.push((codec, handle));
     }
     let files = writer.finish()?;
 
     assert_eq!(files.len(), 2, "one file per codec, not one per switch");
     for (codec, handle) in &handles {
-        let Some(file) = files.iter().find(|f| f.id() == handle.blob_file_id) else {
+        let Some(file) = files.iter().find(|f| f.id() == handle.vhandle.blob_file_id) else {
             panic!("handle {handle:?} points at a file the writer did not produce");
         };
         assert_eq!(

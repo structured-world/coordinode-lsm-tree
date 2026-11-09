@@ -108,7 +108,8 @@ fn a_damaged_value_fails_a_multi_get_as_it_fails_a_single_read() -> lsm_tree::Re
     let fs = BatchCountFs::default();
     drop(cold_tree(dir.path(), &fs)?);
 
-    // A byte in the middle of the first blob file lies in a value's payload.
+    // A byte in the middle of the first blob file's data lies in a value's
+    // frame: its frame index and metadata stay intact, so the tree opens.
     let mut blobs: Vec<_> = std::fs::read_dir(dir.path().join("blobs"))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -116,8 +117,18 @@ fn a_damaged_value_fails_a_multi_get_as_it_fails_a_single_read() -> lsm_tree::Re
         .collect();
     blobs.sort();
     let first = blobs.first().expect("a blob file");
+    let middle = {
+        let mut file = std::fs::File::open(first)?;
+        let reader = lsm_tree::sfa::Reader::from_reader(&mut file)
+            .map_err(|e| std::io::Error::other(format!("read SFA TOC: {e}")))?;
+        let data = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"data")
+            .expect("a blob file has a data section");
+        usize::try_from(data.pos() + data.len() / 2).expect("fits usize")
+    };
     let mut bytes = std::fs::read(first)?;
-    let middle = bytes.len() / 2;
     *bytes.get_mut(middle).expect("in the file") ^= 0xFF;
     std::fs::write(first, &bytes)?;
 
@@ -284,6 +295,113 @@ fn a_blob_tree_multi_get_caching_its_values_reads_them_once() -> lsm_tree::Resul
     assert_eq!(second, first);
     for (i, value) in second.iter().enumerate() {
         assert_eq!(value.as_deref(), Some(value_for(i).as_slice()), "key {i}");
+    }
+    assert!(
+        calls.is_empty(),
+        "the values come from the cache: {calls:?}"
+    );
+    Ok(())
+}
+
+/// A chunked value whose head a first multi-get cached, its chunks not, is
+/// read again head and chunks in one queued read with the others, not left to
+/// its own path, which reads the chunks one at a time.
+#[test]
+fn a_multi_get_reads_chunked_values_whose_head_is_cached_in_one_batch() -> lsm_tree::Result<()> {
+    const VALUES: usize = 4;
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(fs.clone()))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
+        .blob_cache_fill(lsm_tree::config::BlobCacheFill::Always)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(1)
+                .chunk_size(core::num::NonZeroU32::new(16 * 1_024).expect("non-zero")),
+        ))
+    };
+    let value = |i: usize| -> Vec<u8> {
+        (0..100_000_u32)
+            .map(|b| (b % 251) as u8 ^ i as u8)
+            .collect()
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..VALUES {
+            tree.insert(key_for(i), value(i), i as u64);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config().open()?;
+    let keys: Vec<String> = (0..VALUES).map(key_for).collect();
+    tree.multi_get(&keys, SeqNo::MAX)?;
+    fs.take();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = fs.take();
+    for (i, got) in values.iter().enumerate() {
+        assert_eq!(got.as_deref(), Some(value(i).as_slice()), "key {i}");
+    }
+    assert_eq!(
+        calls,
+        [VALUES],
+        "one batch carries each value, head and chunks: {calls:?}"
+    );
+    Ok(())
+}
+
+/// A chunked value whose head and chunks the cache all holds, as a point read
+/// caching what it reads leaves it, is answered from them: a multi-get reads
+/// nothing of it again.
+#[test]
+fn a_multi_get_answers_fully_cached_chunked_values_from_the_cache() -> lsm_tree::Result<()> {
+    const VALUES: usize = 4;
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(fs.clone()))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
+        .blob_cache_fill(lsm_tree::config::BlobCacheFill::Always)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(1)
+                .chunk_size(core::num::NonZeroU32::new(16 * 1_024).expect("non-zero")),
+        ))
+    };
+    let value = |i: usize| -> Vec<u8> {
+        (0..100_000_u32)
+            .map(|b| (b % 251) as u8 ^ i as u8)
+            .collect()
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..VALUES {
+            tree.insert(key_for(i), value(i), i as u64);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config().open()?;
+    let keys: Vec<String> = (0..VALUES).map(key_for).collect();
+    for key in &keys {
+        assert!(tree.get(key, SeqNo::MAX)?.is_some());
+    }
+    fs.take();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = fs.take();
+    for (i, got) in values.iter().enumerate() {
+        assert_eq!(got.as_deref(), Some(value(i).as_slice()), "key {i}");
     }
     assert!(
         calls.is_empty(),

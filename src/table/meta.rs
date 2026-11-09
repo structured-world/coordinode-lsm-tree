@@ -323,6 +323,16 @@ pub struct ParsedMeta {
     /// row groups to misread.
     pub columnar_format: Option<u8>,
 
+    /// Which blob-file layout this table's `linked_blob_files` records
+    /// describe, from the optional `descriptor#blob_format` property.
+    ///
+    /// `None` means the key is ABSENT: a table written before the stamp
+    /// existed, whose records lack the block-entry bytes. The recover path
+    /// refuses a table that links blob files and does not carry the current
+    /// layout, rather than grading its records as damage; a table without
+    /// links is unaffected.
+    pub blob_format: Option<u8>,
+
     /// How the table stores each row's value; [`ValueLayout::Whole`] for a
     /// table without the property, and for a row-major table, which has no
     /// value columns.
@@ -599,6 +609,16 @@ impl ParsedMeta {
                     _ => return Err(crate::Error::InvalidHeader("TableMeta")),
                 },
             };
+
+        // Optional blob-link layout stamp. Absent = a table written before the
+        // stamp existed; see the field's doc comment.
+        let blob_format = match block.point_read(b"descriptor#blob_format", SeqNo::MAX, &cmp)? {
+            None => None,
+            Some(v) => match v.value.as_ref() {
+                [b] => Some(*b),
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+        };
 
         // Optional value layout, one byte. Every columnar table this format
         // writes carries it, and a store of the previous format reaches this
@@ -916,6 +936,7 @@ impl ParsedMeta {
             columnar,
             filter_format,
             columnar_format,
+            blob_format,
             value_layout,
             group_shape,
             bulk_ingested,

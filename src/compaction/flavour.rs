@@ -36,7 +36,7 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
             Ok((entry, blob_file_id)) => {
                 entry.key != key
                     || (*blob_file_id != vptr.vhandle.blob_file_id)
-                    || (entry.offset < vptr.vhandle.offset)
+                    || ((entry.frame, entry.index) < (vptr.vhandle.frame, vptr.vhandle.index))
             }
             Err(_) => true,
         }) else {
@@ -633,8 +633,9 @@ pub(super) struct ProducedOutput {
     /// install for the references read before it (see
     /// [`crate::blob_tree::released`]).
     released_objects: Vec<crate::vlog::ValueHandle>,
-    /// On-disk blob bytes this output's relocation copied into new blob
-    /// files, charged to the tree's metrics once the output is installed.
+    /// Blob bytes this output's relocation moved into new blob files, charged
+    /// to the tree's metrics once the output is installed: what each value
+    /// takes (see [`BlobIndirection::stored`]).
     relocated_bytes: u64,
     /// What this output copied instead of encoding, charged to the tree's
     /// metrics once the output is installed.
@@ -642,6 +643,10 @@ pub(super) struct ProducedOutput {
     /// The bytes a relocated segment's file copied from its source as they
     /// lay.
     segment_copied: u64,
+    /// The bytes of the blob frames its relocation copied as they lay: the
+    /// frames of values with frames of their own. A value out of a block is
+    /// encoded again, into a block of the output.
+    blob_carried: u64,
     /// The bytes of blob frames this output read by their handles, outside
     /// the paced reads of the run's inputs.
     frames_read: u64,
@@ -739,7 +744,7 @@ impl ProducedOutput {
         }
         Ok(super::work::Installed {
             written: tables + blob_files,
-            carried: self.carried.bytes + self.segment_copied + self.relocated_bytes,
+            carried: self.carried.bytes + self.segment_copied + self.blob_carried,
             read: self.frames_read,
         })
     }
@@ -774,6 +779,7 @@ impl ProducedOutput {
             relocated_bytes: 0,
             carried: super::carry::Carried::default(),
             segment_copied: copied,
+            blob_carried: 0,
             frames_read: 0,
         }
     }
@@ -975,8 +981,9 @@ pub(super) fn install_merge(
             // What the stats and this pass charged so far, as objects,
             // uncompressed bytes and bytes on disk.
             let charged = |map: &FragmentationMap| {
-                map.get(&id)
-                    .map_or((0, 0, 0), |e| (e.len, e.bytes, e.on_disk_bytes))
+                map.get(&id).map_or((0, 0, 0, 0), |e| {
+                    (e.len, e.bytes, e.on_disk_bytes, e.block_bytes)
+                })
             };
             let (stats, pass) = (
                 charged(current_version.version.gc_stats()),
@@ -993,15 +1000,17 @@ pub(super) fn install_merge(
                 .unwrap_or(usize::MAX)
                 .saturating_sub(stats.0 + pass.0);
             let bytes = rest(meta.total_uncompressed_bytes, stats.1, pass.1);
-            let on_disk = rest(meta.total_compressed_bytes, stats.2, pass.2);
+            let on_disk = rest(meta.own_frame_bytes(), stats.2, pass.2);
+            let block = rest(meta.block_entry_bytes, stats.3, pass.3);
             // Any counter short of its total: objects of zero bytes still
             // count, and a file is dead only when its entry reaches every
             // total, so an entry is made for them too.
-            if len > 0 || bytes > 0 || on_disk > 0 {
+            if len > 0 || bytes > 0 || on_disk > 0 || block > 0 {
                 let mut fill = FragmentationMap::default();
                 fill.insert(
                     id,
-                    crate::blob_tree::FragmentationEntry::new(len, bytes, on_disk),
+                    crate::blob_tree::FragmentationEntry::new(len, bytes, on_disk)
+                        .with_block_bytes(block),
                 );
                 fill.merge_into(&mut blob_frag_map);
             }
@@ -1184,9 +1193,11 @@ pub(crate) struct RelocatingCompaction {
     cell_copies: crate::HashMap<crate::vlog::ValueHandle, BlobIndirection>,
     /// The key `cell_copies` belongs to.
     cell_copies_key: Option<crate::UserKey>,
-    /// On-disk bytes of the frames copied into the new blob file so far,
-    /// whole values and cell-row objects alike.
+    /// Bytes of the values moved into the new blob files so far, whole
+    /// values and cell-row objects alike (see [`BlobIndirection::stored`]).
     relocated_bytes: u64,
+    /// The part of them copied as frames as they lay.
+    blob_carried: u64,
     /// The bytes of the records read by handle for cell rows so far, outside
     /// the paced scan of the rewritten files.
     frames_read: u64,
@@ -1246,6 +1257,7 @@ impl RelocatingCompaction {
             cell_copies: crate::HashMap::default(),
             cell_copies_key: None,
             relocated_bytes: 0,
+            blob_carried: 0,
             frames_read: 0,
             fresh: None,
             encoded: Vec::new(),
@@ -1290,21 +1302,13 @@ impl RelocatingCompaction {
         class: u8,
         item: InternalValue,
     ) -> crate::Result<()> {
-        let vhandle = self.blob_writer.write_fresh(
+        let indirection = self.blob_writer.write_fresh(
             &item.key.user_key,
             item.key.seqno,
             &item.value,
             compression,
             class,
         )?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a value is at most u32::MAX bytes long"
-        )]
-        let indirection = BlobIndirection {
-            vhandle,
-            size: item.value.len() as u32,
-        };
         self.write_pointer(item.key.user_key, item.key.seqno, &indirection)?;
         self.inner.table_writer.register_blob(indirection);
         Ok(())
@@ -1377,8 +1381,9 @@ impl RelocatingCompaction {
         self.inner.table_writer.register_cell_row(&row)
     }
 
-    /// Copies the frame `indirection` names, verbatim, into this pass's
-    /// output and returns the copy's indirection.
+    /// Copies the value `indirection` names into this pass's output and
+    /// returns the copy's indirection: its frames verbatim when it has frames
+    /// of its own, the value itself when it shares a block.
     fn copy_frame(
         &mut self,
         key: &[u8],
@@ -1399,17 +1404,14 @@ impl RelocatingCompaction {
         let (file, _) = blob_file
             .file_accessor()
             .get_or_open_blob_file(&file_id, &blob_file.0.path)?;
-        let (stored, uncompressed_len) =
-            crate::vlog::blob_file::reader::Reader::new(blob_file, file.as_ref())
-                .read_raw(key, &indirection.vhandle)?;
-        // The read took the record whole, its header and key included.
-        self.frames_read +=
-            crate::vlog::blob_file::reader::record_len(key.len(), &indirection.vhandle)? as u64;
+        let (source, read) = crate::vlog::blob_file::reader::Reader::new(blob_file, file.as_ref())
+            .copy_source(key, &indirection.vhandle)?;
+        self.frames_read += read;
 
         // Paced like a matched frame: see the whole-value path in `write`.
         let _ = self
             .rate_limiter
-            .request_interruptible(stored.len() as u64, || self.stop_signal.is_stopped());
+            .request_interruptible(read, || self.stop_signal.is_stopped());
 
         self.blob_writer.select_output(
             blob_file.compression(),
@@ -1417,18 +1419,26 @@ impl RelocatingCompaction {
                 .lifetime_groups()
                 .relocated(blob_file.lifetime_class()),
         )?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a frame's decoded length is bounded by the 256 MiB value cap"
-        )]
-        let vhandle = self
-            .blob_writer
-            .write_raw(key, seqno, &stored, uncompressed_len as u32)?;
-        self.relocated_bytes += u64::from(vhandle.on_disk_size);
-        Ok(BlobIndirection {
-            vhandle,
-            size: indirection.size,
-        })
+        let copy = match &source {
+            crate::vlog::blob_file::reader::CopySource::Frames { frames, value_len } => {
+                // A row's objects may have been written at older sequence
+                // numbers than the row (one it borrows), and its copies follow
+                // one another at its key: listed at the row's own, they keep
+                // the file's order. Only the listing is rewritten; the payload
+                // is written from the frame read, as stored.
+                let copy = self
+                    .blob_writer
+                    .write_verbatim_at(key, frames, *value_len, seqno)?;
+                // A verbatim copy is frames of its own, its bytes exact.
+                self.blob_carried += u64::from(copy.stored.bytes());
+                copy
+            }
+            crate::vlog::blob_file::reader::CopySource::Value(value) => {
+                self.blob_writer.write(key, seqno, value)?
+            }
+        };
+        self.relocated_bytes += u64::from(copy.stored.bytes());
+        Ok(copy)
     }
 
     /// Marks this as a tight-space slice ending (exclusively) at `bound`; see
@@ -1552,8 +1562,9 @@ impl CompactionFlavour for RelocatingCompaction {
                     "matched blob has different key than vptr",
                 );
                 assert_eq!(
-                    blob_entry.offset, indirection.vhandle.offset,
-                    "matched blob has different offset than vptr",
+                    (blob_entry.frame, blob_entry.index),
+                    (indirection.vhandle.frame, indirection.vhandle.index),
+                    "matched blob lies elsewhere than vptr names",
                 );
 
                 // A RESYNCHRONIZED frame was reached by a byte-wise scan after
@@ -1574,10 +1585,11 @@ impl CompactionFlavour for RelocatingCompaction {
                 self.record_consumed(blob_file_id, blob_entry.frame_end);
 
                 log::trace!(
-                    "=> use blob: {:?}:{} offset: {} from BF {}",
+                    "=> use blob: {:?}:{} frame: {} index: {} from BF {}",
                     blob_entry.key,
                     blob_entry.seqno,
-                    blob_entry.offset,
+                    blob_entry.frame,
+                    blob_entry.index,
                     blob_file_id,
                 );
 
@@ -1592,7 +1604,7 @@ impl CompactionFlavour for RelocatingCompaction {
                 // the debit stays spent for the write that follows.
                 let _ = self
                     .rate_limiter
-                    .request_interruptible(blob_entry.value.len() as u64, || {
+                    .request_interruptible(u64::from(blob_entry.uncompressed_len), || {
                         self.stop_signal.is_stopped()
                     });
 
@@ -1614,21 +1626,44 @@ impl CompactionFlavour for RelocatingCompaction {
                     .expect("relocated frame comes from a file being rewritten");
                 self.blob_writer.select_output(source_codec, class)?;
 
-                let new_indirection = BlobIndirection {
-                    vhandle: self.blob_writer.write_raw(
-                        &item.key.user_key,
-                        item.key.seqno,
-                        &blob_entry.value,
-                        blob_entry.uncompressed_len,
-                    )?,
-                    size: indirection.size,
+                let new_indirection = match (&blob_entry.frames, &blob_entry.value) {
+                    (Some(frames), _) => {
+                        // A value is listed at the seqno its table gives it.
+                        // An ingestion writes its blob entries before it is
+                        // given one, so its frames are relisted as they are
+                        // copied; any other frame lists its table's already.
+                        let copy = if blob_entry.seqno == item.key.seqno {
+                            self.blob_writer.write_verbatim(
+                                &item.key.user_key,
+                                frames,
+                                blob_entry.uncompressed_len,
+                            )?
+                        } else {
+                            self.blob_writer.write_verbatim_at(
+                                &item.key.user_key,
+                                frames,
+                                blob_entry.uncompressed_len,
+                                item.key.seqno,
+                            )?
+                        };
+                        // A verbatim copy is frames of its own, its bytes
+                        // exact.
+                        self.blob_carried += u64::from(copy.stored.bytes());
+                        copy
+                    }
+                    (None, Some(value)) => {
+                        self.blob_writer
+                            .write(&item.key.user_key, item.key.seqno, value)?
+                    }
+                    // A scan yields a value either in a block, decoded, or
+                    // with frames of its own.
+                    (None, None) => return Err(crate::Error::InvalidHeader("Blob")),
                 };
-
                 debug_assert_eq!(
-                    new_indirection.vhandle.on_disk_size, indirection.vhandle.on_disk_size,
-                    "redirecting blob should not change its size",
+                    new_indirection.size, indirection.size,
+                    "relocating a value does not change it",
                 );
-                self.relocated_bytes += u64::from(new_indirection.vhandle.on_disk_size);
+                self.relocated_bytes += u64::from(new_indirection.stored.bytes());
 
                 self.write_pointer(item.key.user_key, item.key.seqno, &new_indirection)?;
 
@@ -1703,6 +1738,7 @@ impl CompactionFlavour for RelocatingCompaction {
             // A relocating run writes its rows; it copies no group or block.
             carried: super::carry::Carried::default(),
             segment_copied: 0,
+            blob_carried: self.blob_carried,
             frames_read: self.frames_read,
         })
     }
@@ -2101,6 +2137,7 @@ impl CompactionFlavour for StandardCompaction {
             // The producer owns the carry matcher and sets this after.
             carried: super::carry::Carried::default(),
             segment_copied: 0,
+            blob_carried: 0,
             frames_read: 0,
         })
     }

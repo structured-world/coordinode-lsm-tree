@@ -3,8 +3,8 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use crate::{
-    SeqNo, UserKey, UserValue, blob_tree::handle::BlobIndirection, file::BLOBS_FOLDER,
-    table::Table, tree::ingest::Ingestion as TableIngestion, vlog::BlobFileWriter,
+    SeqNo, UserKey, UserValue, file::BLOBS_FOLDER, table::Table,
+    tree::ingest::Ingestion as TableIngestion, vlog::BlobFileWriter,
 };
 #[cfg(not(feature = "std"))]
 use alloc::{string::ToString, vec::Vec};
@@ -71,6 +71,7 @@ impl<'a> BlobIngestion<'a> {
         .use_sync_mode(tree.index.config.sync_mode)
         .use_writeback_bytes(tree.index.config.writeback_bytes)
         .use_lifetime_groups(kv.lifetime_groups)
+        .use_frame_sizes(kv.frame_sizes())
         .use_clock(tree.index.config.clock.clone())
         .use_key_domains(
             tree.index.config.key_domains.clone(),
@@ -128,12 +129,7 @@ impl<'a> BlobIngestion<'a> {
             // An ingested key has a single version: nothing overwrote it.
             self.blob
                 .select_lifetime_class(self.lifetime.class_of(&key, false))?;
-            let vhandle = self.blob.write(&key, self.seqno, &value)?;
-
-            let indirection = BlobIndirection {
-                vhandle,
-                size: value_size,
-            };
+            let indirection = self.blob.write(&key, self.seqno, &value)?;
 
             let cloned_key = key.clone();
             let res = self.table.write_indirection(key, indirection);
