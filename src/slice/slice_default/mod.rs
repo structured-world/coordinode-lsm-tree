@@ -100,6 +100,11 @@ impl Slice {
         self.0 == other.0
     }
 
+    /// Whether no other slice shares its bytes.
+    pub(crate) fn is_unique(&self) -> bool {
+        self.0.is_unique()
+    }
+
     #[doc(hidden)]
     #[cfg(feature = "std")]
     pub fn from_reader<R: std::io::Read>(reader: &mut R, len: usize) -> std::io::Result<Self> {

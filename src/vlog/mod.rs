@@ -9,7 +9,7 @@ mod handle;
 pub use blob_file::BlobFile;
 
 pub(crate) use {
-    accessor::{Accessor, FrameCharge, PrefetchInto, Prefetched},
+    accessor::{Accessor, PrefetchInto, Prefetched},
     blob_file::merge::MergeScanner as BlobFileMergeScanner,
     blob_file::multi_writer::MultiWriter as BlobFileWriter,
     blob_file::scanner::Scanner as BlobFileScanner,

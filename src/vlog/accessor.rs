@@ -54,54 +54,50 @@ impl core::borrow::Borrow<DecodedFrame> for HeldFrame {
 /// taken out of one only for the key its frame lists at the handle's index.
 #[derive(Default)]
 pub(crate) struct Prefetched {
-    frames: crate::HashMap<BlobFrameAt, AheadFrame>,
-}
-
-/// A frame read ahead, with the charge that counts its payload against the
-/// read-ahead bound from the first value taken out of it.
-struct AheadFrame {
-    frame: DecodedFrame,
-    charge: core::cell::OnceCell<Arc<FrameCharge>>,
+    frames: crate::HashMap<BlobFrameAt, DecodedFrame>,
+    /// Payloads of frames the store let go while a value taken out of one
+    /// still shared its bytes. A value is a view into its frame's payload, so
+    /// the payload's own reference count says whether a caller still keeps
+    /// it: nothing per value is counted.
+    released: Vec<UserValue>,
 }
 
 impl Prefetched {
     /// The value read ahead for `vhandle` under `key`, if its frame was: a
     /// view into the frame, which keeps the frame's whole payload.
-    #[cfg_attr(
-        not(feature = "columnar"),
-        expect(
-            dead_code,
-            reason = "a batched object read is its only uncharged reader"
-        )
-    )]
     pub(crate) fn get(&self, key: &[u8], vhandle: &ValueHandle) -> Option<UserValue> {
-        self.frame_for(vhandle)
-            .and_then(|held| value_in(&held.frame, vhandle.index, key).ok())
-    }
-
-    /// [`Self::get`], with the charge for the payload the value keeps: made
-    /// by `charge` from the payload's bytes the first time a value is taken
-    /// out of the frame, and shared by every later one.
-    pub(crate) fn get_charged(
-        &self,
-        key: &[u8],
-        vhandle: &ValueHandle,
-        charge: impl FnOnce(usize) -> FrameCharge,
-    ) -> Option<(UserValue, Arc<FrameCharge>)> {
-        let held = self.frame_for(vhandle)?;
-        let value = value_in(&held.frame, vhandle.index, key).ok()?;
-        let charge = held
-            .charge
-            .get_or_init(|| Arc::new(charge(held.frame.payload.len())));
-        Some((value, Arc::clone(charge)))
-    }
-
-    /// The frame `vhandle` names a value of, unless it is a chunked value's
-    /// head, which holds none.
-    fn frame_for(&self, vhandle: &ValueHandle) -> Option<&AheadFrame> {
         self.frames
             .get(&vhandle.frame_at())
-            .filter(|held| held.frame.header.kind != FrameKind::Head)
+            .filter(|frame| frame.header.kind != FrameKind::Head)
+            .and_then(|frame| value_in(frame, vhandle.index, key).ok())
+    }
+
+    /// Bytes of what was read ahead that are still kept: the frames held
+    /// here, and the payloads let go that a value taken out of them still
+    /// shares. A payload nothing else shares is dropped here.
+    pub(crate) fn held_bytes(&mut self) -> usize {
+        self.released.retain(|payload| !payload.is_unique());
+        // Bounded by two reads' worth: the read-ahead stops at one.
+        self.released
+            .iter()
+            .map(|payload| payload.len())
+            .sum::<usize>()
+            + self
+                .frames
+                .values()
+                .map(|frame| frame.payload.len())
+                .sum::<usize>()
+    }
+
+    /// Lets `frame` go, keeping its payload in view while a value taken out
+    /// of it shares the bytes.
+    fn release(&mut self, frame: DecodedFrame) {
+        // The rest of the frame goes first: its entries may share the bytes.
+        let payload = frame.payload.clone();
+        drop(frame);
+        if !payload.is_empty() && !payload.is_unique() {
+            self.released.push(payload);
+        }
     }
 
     /// Whether it holds nothing.
@@ -128,48 +124,15 @@ impl Prefetched {
                 break;
             }
         }
+        for (_, frame) in held {
+            self.release(frame);
+        }
     }
 
     /// Holds `frame` as read ahead at `at`.
     #[cfg(test)]
     pub(crate) fn hold(&mut self, at: BlobFrameAt, frame: DecodedFrame) {
-        self.frames.insert(at, AheadFrame::new(frame));
-    }
-}
-
-impl AheadFrame {
-    fn new(frame: DecodedFrame) -> Self {
-        Self {
-            frame,
-            charge: core::cell::OnceCell::new(),
-        }
-    }
-}
-
-/// Bytes of a frame read ahead counted against a scan's read-ahead bound,
-/// held by the scan's store and by each guard holding a value out of the
-/// frame, and released with the last of them: a value is a view into its
-/// frame, so what a kept guard pins is the frame, not its value.
-pub(crate) struct FrameCharge {
-    held: Arc<core::sync::atomic::AtomicUsize>,
-    bytes: usize,
-}
-
-impl FrameCharge {
-    /// Adds `bytes` to `held` until the charge is dropped.
-    pub(crate) fn new(held: &Arc<core::sync::atomic::AtomicUsize>, bytes: usize) -> Self {
-        held.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
-        Self {
-            held: Arc::clone(held),
-            bytes,
-        }
-    }
-}
-
-impl Drop for FrameCharge {
-    fn drop(&mut self) {
-        self.held
-            .fetch_sub(self.bytes, core::sync::atomic::Ordering::Relaxed);
+        self.frames.insert(at, frame);
     }
 }
 
@@ -1244,7 +1207,9 @@ impl<'a> Accessor<'a> {
                         self.count_gather(copied);
                         frame
                     };
-                    store.frames.insert(at, AheadFrame::new(frame));
+                    if let Some(replaced) = store.frames.insert(at, frame) {
+                        store.release(replaced);
+                    }
                 }
             }
         }
