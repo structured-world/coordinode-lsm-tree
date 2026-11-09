@@ -287,7 +287,10 @@ pub(crate) fn assemble<C: core::borrow::Borrow<DecodedFrame>>(
         }
         return Ok(chunk.payload.slice(from..to));
     }
-    let mut out = Vec::with_capacity(len);
+    // Gathered straight into the value's own allocation: a buffer of its own
+    // would be copied into a slice once more.
+    let mut out = crate::slice::UnfilledSlice::new(len);
+    let mut target = out.target();
     for (at, chunk) in covered.clone().zip(chunks) {
         let chunk = chunk.borrow();
         if !chunk_fits(chunk, at, (size, count), total) {
@@ -298,14 +301,17 @@ pub(crate) fn assemble<C: core::borrow::Borrow<DecodedFrame>>(
         } else {
             0
         };
-        let wanted = len - out.len();
+        let wanted = len - target.filled();
         let bytes = chunk.payload.get(from..).ok_or_else(malformed)?;
-        out.extend_from_slice(bytes.get(..wanted.min(bytes.len())).ok_or_else(malformed)?);
+        // Within what is left: `append` takes no more than the buffer holds.
+        target.append(bytes.get(..wanted.min(bytes.len())).ok_or_else(malformed)?);
     }
-    if out.len() != len {
+    if target.filled() != len {
         return Err(malformed());
     }
-    Ok(UserValue::from(out))
+    // SAFETY: the target counted every one of the `len` bytes written.
+    #[expect(unsafe_code, reason = "see safety")]
+    Ok(unsafe { out.assume_filled() })
 }
 
 /// A head's chunk table, against which its chunks are checked one by one as
