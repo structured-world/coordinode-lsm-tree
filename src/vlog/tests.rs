@@ -160,6 +160,48 @@ fn a_frame_index_running_past_the_file_is_unrecoverable() -> crate::Result<()> {
     Ok(())
 }
 
+/// A frame index that checks but does not span the data section, its last
+/// frame running far past the file, is damage the open reports: no read is
+/// ever sized from a span it names.
+#[test]
+fn a_frame_index_off_the_data_section_is_unrecoverable() -> crate::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"key", 0, b"value")?;
+    writer.finish()?;
+    let (index_pos, starts) = {
+        let reader = crate::sfa::Reader::new(&path)?;
+        let (pos, len) = reader
+            .toc()
+            .section(b"frames")
+            .map(|s| (s.pos(), s.len()))
+            .unwrap_or_default();
+        let bytes = std::fs::read(&path)?;
+        let at = usize::try_from(pos).unwrap_or_default();
+        let len = usize::try_from(len).unwrap_or_default();
+        let starts =
+            blob_file::writer::decode_frame_index(bytes.get(at..at + len).unwrap_or_default())?;
+        (pos, starts)
+    };
+    let frames: Vec<u64> = starts.iter().copied().take(starts.len() - 1).collect();
+    let index = blob_file::writer::encode_frame_index(&frames, 1 << 40);
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(index_pos))?;
+        file.write_all(&index)?;
+    }
+
+    let mut file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    assert!(matches!(
+        read_meta_and_frames(&mut file, 7),
+        Err(crate::Error::Unrecoverable)
+    ));
+    Ok(())
+}
+
 /// The views a tight-space relocation restricts a blob file to one after
 /// another punch only above what the view before finished, from the aligned
 /// edge under it, instead of the whole relocated prefix on every slice.

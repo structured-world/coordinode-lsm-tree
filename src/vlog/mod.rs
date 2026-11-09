@@ -453,9 +453,9 @@ pub(crate) fn read_meta_and_frames(
     file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
     id: BlobFileId,
 ) -> crate::Result<(Metadata, Arc<[u64]>)> {
-    let (meta, frames_at) = read_meta_and_index_at(file, id)?;
-    let Some((pos, len)) = frames_at else {
-        log::error!("frames section in blob file #{id} is missing (file may be corrupted)");
+    let (meta, frames_at, data) = read_meta_and_index_at(file, id)?;
+    let (Some((pos, len)), Some(data)) = (frames_at, data) else {
+        log::error!("frames or data section in blob file #{id} is missing (file may be corrupted)");
         return Err(crate::Error::Unrecoverable);
     };
     // The index lies within the file: a length past it is damage, refused
@@ -468,6 +468,16 @@ pub(crate) fn read_meta_and_frames(
     let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
     let frames =
         blob_file::writer::decode_frame_index(&crate::file::read_exact(&**file, pos, len)?)?;
+    // Every frame a read is sized from lies in the data section: the index
+    // rises from within it to its end, as the writer lays it down.
+    let fits = frames.first().is_some_and(|&first| first >= data.start)
+        && frames.last() == Some(&data.end);
+    if !fits {
+        log::error!(
+            "frame index of blob file #{id} does not span its data (file may be corrupted)"
+        );
+        return Err(crate::Error::Unrecoverable);
+    }
     Ok((meta, frames))
 }
 
@@ -480,17 +490,21 @@ pub(crate) fn read_meta_and_frames(
 #[cfg(feature = "std")]
 pub(crate) fn read_blob_meta(path: &Path, fs: &dyn Fs, id: BlobFileId) -> crate::Result<Metadata> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
-    read_meta_and_index_at(&mut file, id).map(|(meta, _)| meta)
+    read_meta_and_index_at(&mut file, id).map(|(meta, ..)| meta)
 }
 
-/// The metadata, and where the frame index lies when the file lists one: a
-/// missing index is reported by the caller that needs it, after the metadata
-/// has said whether the file is of this layout at all.
+/// Where a section lies: its position and length.
+type SectionAt = (u64, u64);
+
+/// The metadata, where the frame index lies, and the span of the data
+/// section, when the file lists them: a missing section is reported by the
+/// caller that needs it, after the metadata has said whether the file is of
+/// this layout at all.
 fn read_meta_and_index_at(
     file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
     id: BlobFileId,
-) -> crate::Result<(Metadata, Option<(u64, u64)>)> {
-    let (meta_at, frames_at) = {
+) -> crate::Result<(Metadata, Option<SectionAt>, Option<core::ops::Range<u64>>)> {
+    let (meta_at, frames_at, data) = {
         let reader = crate::sfa::Reader::from_reader(file)?;
         let toc = reader.toc();
         let section = |name: &[u8]| toc.section(name).map(|entry| (entry.pos(), entry.len()));
@@ -498,12 +512,13 @@ fn read_meta_and_index_at(
             log::error!("meta section in blob file #{id} is missing (file may be corrupted)");
             return Err(crate::Error::Unrecoverable);
         };
-        (meta_at, section(b"frames"))
+        let data = section(b"data").and_then(|(pos, len)| pos.checked_add(len).map(|end| pos..end));
+        (meta_at, section(b"frames"), data)
     };
     let (pos, len) = meta_at;
     let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
     let meta = Metadata::from_slice(&crate::file::read_exact(&**file, pos, len)?)?;
-    Ok((meta, frames_at))
+    Ok((meta, frames_at, data))
 }
 
 /// The unique identifier for a value log blob file.
