@@ -3,14 +3,15 @@ use crate::table::column_type::{ByteOrder, Number, NumberKind};
 use crate::vlog::ValueHandle;
 use test_log::test;
 
-fn indirection(blob_file_id: u64, offset: u64, size: u32) -> BlobIndirection {
+fn indirection(blob_file_id: u64, frame: u32, size: u32) -> BlobIndirection {
     BlobIndirection {
         vhandle: ValueHandle {
             blob_file_id,
-            offset,
-            on_disk_size: size,
+            frame,
+            index: 0,
         },
         size,
+        stored: crate::blob_tree::handle::Stored::Frames(size),
     }
 }
 
@@ -32,7 +33,7 @@ const C: u16 = FIRST_FIELD_COLUMN;
 /// marked as such, so the engine can list them without the caller's schema.
 #[test]
 fn a_row_round_trips_its_values_and_references() {
-    let payload = indirection(7, 4_096, 1_000);
+    let payload = indirection(7, 40, 1_000);
     let row = encode_row(&[
         RowField::bytes(C, RowCell::Value(b"status")),
         RowField::bytes(C + 6, reference(payload)),
@@ -89,7 +90,7 @@ fn a_row_round_trips_its_field_types() {
 #[test]
 fn ownership_round_trips_per_reference() {
     let owned = indirection(4, 0, 30);
-    let borrowed = indirection(4, 30, 40);
+    let borrowed = indirection(4, 1, 40);
     let row = encode_row(&[
         RowField::bytes(
             C,
@@ -111,7 +112,7 @@ fn ownership_round_trips_per_reference() {
 /// its ownership, are still found.
 #[test]
 fn a_reference_past_the_eighth_field_is_found() {
-    let far = indirection(3, 64, 10);
+    let far = indirection(3, 6, 10);
     let mut fields: Vec<RowField<'_>> = (C..C + 9)
         .map(|column| RowField::bytes(column, RowCell::Value(b"x")))
         .collect();
@@ -343,11 +344,7 @@ fn separation_follows_the_column_threshold() {
         |column| if column == C { 0 } else { u32::MAX },
         |bytes| {
             written.push(bytes.to_vec());
-            Ok(ValueHandle {
-                blob_file_id: 1,
-                offset: 0,
-                on_disk_size: 4,
-            })
+            Ok(indirection(1, 0, 4))
         },
     )
     .unwrap()
@@ -381,16 +378,26 @@ fn an_object_of_another_size_is_an_error() {
     assert!(matches!(result, Err(Error::InvalidHeader(_))), "{result:?}");
 }
 
-/// Two references are the same object when they name the same frame,
-/// whichever key they were read from.
+/// Two references are the same object when they name the same place in the
+/// same file, whichever key they were read from; two values of one block are
+/// two objects.
 #[test]
-fn references_to_one_frame_are_equal() {
-    let at = |offset| BlobRef {
-        indirection: indirection(2, offset, 9),
+fn references_to_one_place_are_equal() {
+    let at = |frame, index| BlobRef {
+        indirection: BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id: 2,
+                frame,
+                index,
+            },
+            size: 9,
+            stored: crate::blob_tree::handle::Stored::Frames(9),
+        },
         key: b"k",
         tree: 0,
         source: 0,
     };
-    assert_eq!(at(128), at(128));
-    assert_ne!(at(128), at(256));
+    assert_eq!(at(12, 0), at(12, 0));
+    assert_ne!(at(12, 0), at(13, 0));
+    assert_ne!(at(12, 0), at(12, 1));
 }

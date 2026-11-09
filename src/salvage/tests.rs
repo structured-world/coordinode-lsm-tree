@@ -44,24 +44,34 @@ fn reconcile_clean(
     }
 }
 
-/// Rot in a frame's length field is caught by the header CRC, after which the
-/// consumed lengths cannot locate the next frame: the salvage walk resyncs at
-/// the next magic instead of stopping. But the resync magic may be an original
-/// boundary OR a `BLO4` frame nested in the rotted frame's user bytes, and every
-/// frame CHAINED past it inherits that unproven anchor: a fabricated chain can
-/// plant one valid frame after another. There is no independent anchor
-/// mid-stream, so the taint is STICKY: the whole tail after the first resync is
-/// dropped (fail closed), not just the frame reached immediately by the scan.
-#[test]
-fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> {
-    let dir = tempdir()?;
-    let source = dir.path().join("blob_rot");
-    let dest = dir.path().join("blob_rot_salvaged");
-    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+/// Where the frames of the blob file at `path` start, then its data end, by
+/// its frame index.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    reason = "test code: a test file fits in memory"
+)]
+fn blob_frame_starts(path: &std::path::Path) -> crate::Result<Vec<usize>> {
+    let reader = crate::sfa::Reader::new(path)?;
+    let Some(section) = reader.toc().section(b"frames") else {
+        panic!("a blob file has a frame index");
+    };
+    let bytes = std::fs::read(path)?;
+    let (pos, len) = (section.pos() as usize, section.len() as usize);
+    let index = crate::vlog::blob_file::writer::decode_frame_index(&bytes[pos..pos + len])?;
+    Ok(index.iter().map(|&at| at as usize).collect())
+}
 
+/// Four records of a frame each, the second's length field rotted: caught by
+/// the header CRC.
+#[expect(clippy::indexing_slicing, reason = "test code")]
+fn write_four_with_a_rotted_second(
+    source: &std::path::Path,
+    fs: &Arc<dyn Fs>,
+) -> crate::Result<()> {
     build_blob(
-        &source,
-        &fs,
+        source,
+        fs,
         &[
             (b"aaaa", b"AAAAAAAA"),
             (b"bbbb", b"BBBBBBBB"),
@@ -69,19 +79,82 @@ fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> 
             (b"dddd", b"DDDDDDDD"),
         ],
     )?;
+    let raw_len = blob_frame_starts(source)?[1] + 12;
+    let mut bytes = std::fs::read(source)?;
+    bytes[raw_len..raw_len + 4].copy_from_slice(&6u32.to_le_bytes());
+    std::fs::write(source, &bytes)?;
+    Ok(())
+}
 
-    // Rot the SECOND frame's key_len (4 -> 6). Frame layout: magic 4 |
-    // checksum 16 | seqno 8 | key_len 2 | real_val_len 4 | on_disk_val_len 4
-    // | header_crc 4 | key | value = 42 + 4 + 8 bytes; the data section
-    // starts at file offset 0.
-    let frame_len = 42 + 4 + 8;
-    let kl_off = frame_len + 4 + 16 + 8;
-    let mut bytes = std::fs::read(&source)?;
-    let Some(slot) = bytes.get_mut(kl_off..kl_off + 2) else {
-        panic!("second frame's key_len within the file");
+/// By the source's frame index, a frame whose header rotted costs that frame
+/// alone: the next one is where the index puts it, a boundary the damaged
+/// bytes did not choose, so the records after it are salvaged.
+#[test]
+fn salvage_blob_file_by_its_index_drops_only_the_rotted_frame() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_rot");
+    let dest = dir.path().join("blob_rot_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    write_four_with_a_rotted_second(&source, &fs)?;
+
+    let report = salvage_blob_file(
+        &source,
+        dest,
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    assert_eq!(report.records_salvaged, 3, "{report:?}");
+    assert!(
+        matches!(&report.dropped[..], [d] if matches!(&d.reason, BlobDropReason::Corrupt(msg) if msg.contains("HeaderCrcMismatch"))),
+        "the rotted frame alone drops: {report:?}",
+    );
+    let Some(salvaged) = report.salvaged_path else {
+        panic!("records were salvaged");
     };
-    slot.copy_from_slice(&6u16.to_le_bytes());
-    std::fs::write(&source, &bytes)?;
+    let keys: Vec<Vec<u8>> = BlobScanner::new(&salvaged, &*fs, 0)?
+        .map(|r| r.map(|e| e.key.to_vec()))
+        .collect::<crate::Result<_>>()?;
+    assert_eq!(
+        keys,
+        vec![b"aaaa".to_vec(), b"cccc".to_vec(), b"dddd".to_vec()]
+    );
+    Ok(())
+}
+
+/// Without a readable frame index, rot in a frame's length field is caught by
+/// the header CRC, after which the consumed lengths cannot locate the next
+/// frame: the salvage walk resyncs at the next magic instead of stopping. But
+/// the resync magic may be an original boundary OR a frame nested in the
+/// rotted frame's user bytes, and every frame CHAINED past it inherits that
+/// unproven anchor: a fabricated chain can plant one valid frame after
+/// another. There is no independent anchor mid-stream, so the taint is
+/// STICKY: the whole tail after the first resync is dropped (fail closed),
+/// not just the frame reached immediately by the scan.
+#[test]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    reason = "test code: a test file fits in memory"
+)]
+fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_rot");
+    let dest = dir.path().join("blob_rot_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    write_four_with_a_rotted_second(&source, &fs)?;
+    {
+        let reader = crate::sfa::Reader::new(&source)?;
+        let Some(index) = reader.toc().section(b"frames") else {
+            panic!("a blob file has a frame index");
+        };
+        let mut bytes = std::fs::read(&source)?;
+        bytes[index.pos() as usize] ^= 0xFF;
+        std::fs::write(&source, &bytes)?;
+    }
 
     let report = salvage_blob_file(
         &source,
@@ -8299,7 +8372,14 @@ fn build_blob(
     fs: &Arc<dyn Fs>,
     records: &[(&[u8], &[u8])],
 ) -> crate::Result<()> {
-    let mut writer = BlobWriter::new(path, 0, 0, &**fs)?;
+    // One frame per record, so damage to one record is damage to its frame
+    // alone: what the record-level salvage tests below probe.
+    let mut writer = BlobWriter::new(path, 0, 0, &**fs)?.use_frame_sizes(
+        crate::vlog::blob_file::writer::FrameSizes {
+            block_target: 0,
+            chunk_size: crate::vlog::blob_file::writer::FrameSizes::DEFAULT.chunk_size,
+        },
+    );
     for (k, v) in records {
         writer.write(k, 0, v)?;
     }
@@ -8575,10 +8655,75 @@ fn an_environmental_read_failure_never_becomes_a_lossy_blob_salvage() -> crate::
 
 /// Scans a blob file into its `(key, value)` records (Ok records only).
 fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    Ok(BlobScanner::new(path, &**fs, 0)?
+    BlobScanner::new(path, &**fs, 0)?
         .filter_map(Result::ok)
-        .map(|e| (e.key.to_vec(), e.value.to_vec()))
-        .collect())
+        .map(|e| Ok((e.key.to_vec(), e.whole_value()?.to_vec())))
+        .collect()
+}
+
+/// A frame whose checksum holds but whose payload does not decompress is
+/// structural damage to that frame alone: salvage drops it and carries the
+/// records around it.
+#[cfg(feature = "lz4")]
+#[test]
+#[expect(clippy::indexing_slicing, reason = "test code")]
+fn salvage_blob_file_drops_a_frame_that_does_not_decompress() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let value = vec![b'v'; 2000];
+    let frames = {
+        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?
+            .use_compression(crate::CompressionType::Lz4)
+            .use_frame_sizes(crate::vlog::blob_file::writer::FrameSizes {
+                block_target: 0,
+                chunk_size: crate::vlog::blob_file::writer::FrameSizes::DEFAULT.chunk_size,
+            });
+        for key in [&b"k0"[..], b"k1", b"k2"] {
+            writer.write(key, 0, &value)?;
+        }
+        writer.finish()?.2
+    };
+    // The middle frame's stored payload overwritten with bytes lz4 refuses,
+    // the frame sealed again so its checksum holds.
+    let mut bytes = std::fs::read(&source)?;
+    let (start, end) = (
+        usize::try_from(frames[1]).unwrap_or(usize::MAX),
+        usize::try_from(frames[2]).unwrap_or(usize::MAX),
+    );
+    let frame = &mut bytes[start..end];
+    let header = crate::vlog::blob_file::frame::parse_header(frame)?;
+    assert!(!header.is_raw(), "the value is stored compressed");
+    let payload_at = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + header.entries_len as usize;
+    for byte in &mut frame[payload_at..] {
+        *byte = 0xFF;
+    }
+    crate::vlog::blob_file::frame::reseal(frame);
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_blob_file(
+        &source,
+        dest,
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    assert_eq!(
+        report.records_salvaged, 2,
+        "the frames around it: {report:?}"
+    );
+    assert!(
+        matches!(
+            &report.dropped[..],
+            [d] if matches!(&d.reason, BlobDropReason::Corrupt(why) if why.contains("does not decompress"))
+        ),
+        "{report:?}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -9367,13 +9512,16 @@ fn salvage_blob_file_keeps_a_preexisting_dest_on_open_failure() -> crate::Result
 }
 
 /// The salvaged blob file is COMPACTED: after a dropped record every later
-/// record shifts to a new offset, and existing SST `ValueHandle::offset`
-/// values point into the SOURCE. The report's `offset_remap` must map every
-/// salvaged record's source frame offset to its offset in the recovered file
-/// (and omit the dropped one), so a caller can re-target handles before
-/// swapping the file in.
+/// record lands in another frame, and existing SST handles name places in the
+/// SOURCE. The report's `remap` must map every salvaged record's source place
+/// to its place in the recovered file, with what it takes there, and omit the
+/// dropped one, so a caller can re-target handles before swapping the file in.
+/// By the source's frame index, the damaged record is the only one lost.
 #[test]
-fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crate::Result<()> {
+#[expect(clippy::indexing_slicing, reason = "test code")]
+fn salvage_blob_file_reports_a_remap_for_every_salvaged_record() -> crate::Result<()> {
+    use super::BlobRecordPlace;
+
     let dir = tempdir()?;
     let source = dir.path().join("blob_source");
     let dest = dir.path().join("blob_salvaged");
@@ -9387,24 +9535,15 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
     ];
     build_blob(&source, &fs, &records)?;
 
-    // Source frame offsets, in order, from a clean pre-corruption scan.
-    let source_offsets: Vec<u64> = BlobScanner::new(&source, &*fs, 0)?
+    // Source places and frame offsets, in order, from a clean scan.
+    let source_entries: Vec<_> = BlobScanner::new(&source, &*fs, 0)?
         .filter_map(Result::ok)
-        .map(|e| e.offset)
         .collect();
-    assert_eq!(source_offsets.len(), 4, "four source records");
+    assert_eq!(source_entries.len(), 4, "four source records");
 
-    // Corrupt the SECOND record's value bytes (a checksum break): the scanner
-    // re-syncs at the next magic. k2, reached by that byte scan through k1's
-    // damaged bytes, has an unprovable boundary; the taint is sticky, so the walk
-    // STOPS there and reports the surrendered tail (k2, k3) as ONE drop. So only
-    // record 0 (before the corruption) survives.
+    // Damage the SECOND record's bytes: a checksum break of that frame alone.
     {
-        let Some(&second) = source_offsets.get(1) else {
-            panic!("second record offset");
-        };
-        // Past the frame header, inside key/value bytes.
-        let flip = usize::try_from(second).unwrap_or(0) + 45;
+        let flip = usize::try_from(source_entries[1].offset).unwrap_or(0) + 45;
         let mut bytes = std::fs::read(&source)?;
         if let Some(b) = bytes.get_mut(flip) {
             *b ^= 0xFF;
@@ -9422,57 +9561,134 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
         #[cfg(zstd_any)]
         None,
     )?;
-    assert_eq!(report.records_salvaged, 1, "{report:?}");
+    assert_eq!(report.records_salvaged, 3, "{report:?}");
     assert_eq!(
         report.dropped.len(),
-        2,
-        "the corrupt record + the surrendered tail (recorded once) drop: {report:?}"
+        1,
+        "only the damaged record drops: {report:?}"
     );
 
     // The remap covers exactly the salvaged records, keyed by their SOURCE
-    // offsets, and its targets are the actual frame offsets AND on-disk value
-    // sizes in the recovered file (verified against a scan of the destination —
-    // a live read cross-checks the handle's size against the frame header, so
-    // the relocation must carry the re-emitted size, not the source's).
-    let dest_records: Vec<(u64, u32)> = BlobScanner::new(&dest, &*fs, 0)?
+    // places, and its targets are their places in the recovered file, with
+    // the frame bytes each takes there.
+    let dest_entries: Vec<_> = BlobScanner::new(&dest, &*fs, 0)?
         .filter_map(Result::ok)
-        .map(|e| {
-            let value_start = e.offset
-                + u64::try_from(crate::vlog::blob_file::writer::BLOB_HEADER_LEN).unwrap_or(0)
-                + u64::try_from(e.key.len()).unwrap_or(0);
-            (
-                e.offset,
-                u32::try_from(e.frame_end - value_start).unwrap_or(0),
-            )
-        })
         .collect();
-    let expected: Vec<(u64, super::BlobRecordRelocation)> = std::iter::once(&0usize)
-        .zip(&dest_records)
-        .map(|(&src_idx, &(offset, on_disk_size))| {
+    let expected: Vec<(BlobRecordPlace, super::BlobRecordRelocation)> = [0_usize, 2, 3]
+        .iter()
+        .zip(&dest_entries)
+        .map(|(&src, dest)| {
             (
-                source_offsets.get(src_idx).copied().unwrap_or(u64::MAX),
+                BlobRecordPlace {
+                    frame: source_entries[src].frame,
+                    index: source_entries[src].index,
+                },
                 super::BlobRecordRelocation {
-                    offset,
-                    on_disk_size,
+                    place: BlobRecordPlace {
+                        frame: dest.frame,
+                        index: dest.index,
+                    },
+                    stored: crate::blob_tree::handle::Stored::Frames(
+                        u32::try_from(dest.frame_end - dest.offset).unwrap_or(0),
+                    ),
                 },
             )
         })
         .collect();
     assert_eq!(
-        report.offset_remap, expected,
-        "the remap maps each surviving source frame to its compacted target",
+        report.remap, expected,
+        "the remap maps each surviving source record to its compacted target",
     );
-    // The dropped record's source offset is NOT in the map: its handle is lost.
-    let Some(&dropped_src) = source_offsets.get(1) else {
-        panic!("second record offset");
+    let dropped = BlobRecordPlace {
+        frame: source_entries[1].frame,
+        index: source_entries[1].index,
     };
     assert!(
-        report
-            .offset_remap
-            .iter()
-            .all(|(src, _)| *src != dropped_src),
+        report.remap.iter().all(|(src, _)| *src != dropped),
         "a dropped record has no remap target: {report:?}",
     );
+    Ok(())
+}
+
+/// Values that shared a block in the source are salvaged out of it into a
+/// block of the recovered file, each to its own place; a damaged block loses
+/// the values it held, and only those.
+#[test]
+#[expect(clippy::indexing_slicing, reason = "test code")]
+fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::Result<()> {
+    use crate::vlog::blob_file::writer::FrameSizes;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    {
+        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?.use_frame_sizes(FrameSizes {
+            block_target: 100,
+            chunk_size: 256,
+        });
+        // Two blocks of three values (an entry of 36 bytes each), a single
+        // value, a chunked one.
+        for i in 0..6_u8 {
+            writer.write(&[b'a', i], 0, &[i; 20])?;
+        }
+        writer.write(b"b", 0, &[7; 100])?;
+        writer.write(b"c", 0, &[8; 600])?;
+        writer.finish()?;
+    }
+    let entries: Vec<_> = BlobScanner::new(&source, &*fs, 0)?
+        .filter_map(Result::ok)
+        .collect();
+    let blocks: Vec<_> = entries.iter().map(|e| e.frame).collect();
+    assert_eq!(&blocks[..6], &[0, 0, 0, 1, 1, 1], "two blocks of three");
+
+    // Damage the first block.
+    {
+        let mut bytes = std::fs::read(&source)?;
+        bytes[usize::try_from(entries[0].offset).unwrap_or(0) + 45] ^= 0xFF;
+        std::fs::write(&source, &bytes)?;
+    }
+    let report = salvage_blob_file(
+        &source,
+        dest.clone(),
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    assert_eq!(
+        report.records_salvaged, 5,
+        "the second block, b and c: {report:?}"
+    );
+    assert_eq!(report.dropped.len(), 1, "one damaged frame: {report:?}");
+
+    let salvaged: Vec<_> = BlobScanner::new(&dest, &*fs, 0)?.collect::<crate::Result<Vec<_>>>()?;
+    let keys: Vec<&[u8]> = salvaged.iter().map(|e| &*e.key).collect();
+    assert_eq!(keys, [&b"a\x03"[..], b"a\x04", b"a\x05", b"b", b"c"]);
+    assert_eq!(
+        &*salvaged[4].whole_value()?,
+        &[8_u8; 600][..],
+        "the chunked value whole"
+    );
+    for (src, dst) in entries[3..].iter().zip(&salvaged) {
+        assert_eq!(src.whole_value()?, dst.whole_value()?, "{:?}", src.key);
+        let mapped = report
+            .remap
+            .iter()
+            .find(|(from, _)| from.frame == src.frame && from.index == src.index)
+            .map(|(_, to)| to.place);
+        assert_eq!(
+            mapped,
+            Some(super::BlobRecordPlace {
+                frame: dst.frame,
+                index: dst.index,
+            }),
+            "{:?} is re-targeted to where it landed",
+            src.key
+        );
+    }
     Ok(())
 }
 
@@ -9563,48 +9779,21 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
         #[cfg(zstd_any)]
         None,
     )?;
-    // The corrupt k1 drops on its checksum, and the scanner then RESYNCS to the
-    // next magic. k2's frame is reached by that byte scan through k1's damaged
-    // bytes, so its boundary is UNPROVEN. The taint is sticky, so the walk STOPS at
-    // k2 and reports the whole surrendered tail (k2 and k3 chained past it) as ONE
-    // drop, rather than re-emitting a possibly-fabricated chain. Only k0, before
-    // the corruption, is provable.
-    assert_eq!(
-        report.dropped.len(),
-        2,
-        "the corrupt record + the surrendered tail (recorded once) drop: {report:?}"
-    );
+    // The corrupt k1 drops on its checksum; the source's frame index puts the
+    // next frame where it is, a boundary the damaged bytes did not choose, so
+    // k2 and k3 are provable and salvaged.
     assert!(
-        matches!(
-            report.dropped.first().map(|d| &d.reason),
-            Some(BlobDropReason::ChecksumMismatch)
-        ),
-        "the corrupt record reports a checksum mismatch: {report:?}",
+        matches!(&report.dropped[..], [d] if matches!(d.reason, BlobDropReason::ChecksumMismatch)),
+        "the corrupt record alone drops, on its checksum: {report:?}",
     );
-    assert_eq!(
-        report
-            .dropped
-            .iter()
-            .filter(
-                |d| matches!(&d.reason, BlobDropReason::Corrupt(m) if m.contains("surrendered"))
-            )
-            .count(),
-        1,
-        "the surrendered tail after the resync is recorded ONCE: {report:?}",
-    );
-    assert_eq!(
-        report.records_salvaged, 1,
-        "only k0 is recovered; k1 (corrupt) and the surrendered tail (k2, k3) are not"
-    );
+    assert_eq!(report.records_salvaged, 3, "k0, k2 and k3 are recovered");
 
-    // The salvaged file holds only k0: k1 (corrupt) and the whole tainted tail
-    // (k2, k3) after the resync are absent.
     let recovered = scan_blob(&dest, &fs)?;
     let keys: Vec<Vec<u8>> = recovered.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(
         keys,
-        vec![b"k0".to_vec()],
-        "only the provable frame before the corruption survives",
+        vec![b"k0".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
+        "every record but the corrupt one survives",
     );
     Ok(())
 }
@@ -10010,17 +10199,14 @@ fn salvage_blob_file_recovers_a_compressed_source() -> crate::Result<()> {
         crate::CompressionType::Lz4,
         "the copy keeps the source's compression descriptor",
     );
-    // A live SST handle is rebuilt straight from the relocation: BOTH its
-    // fields come from the salvaged file (the reader cross-checks the size
-    // against the frame header, so the relocation's size must be the
-    // re-emitted one).
-    let (_, relocation) = *report.offset_remap.first().expect("one remap entry");
+    // A live SST handle is rebuilt straight from the relocation.
+    let (_, relocation) = *report.remap.first().expect("one remap entry");
     let file = std::fs::File::open(&dest)?;
     let reader = crate::vlog::blob_file::reader::Reader::new(&handle, &file);
     let vhandle = crate::vlog::ValueHandle {
         blob_file_id: 0,
-        offset: relocation.offset,
-        on_disk_size: relocation.on_disk_size,
+        frame: relocation.place.frame,
+        index: relocation.place.index,
     };
     assert_eq!(
         reader.get(b"k0", &vhandle)?.as_ref(),
@@ -10053,8 +10239,17 @@ fn salvage_blob_file_recovers_a_dictionary_source_with_the_dictionary() -> crate
         dict_id: dict.id(),
     };
 
+    // Each record a frame of its own, so damage to one leaves the other.
+    let codec = || crate::vlog::blob_file::scanner::ScanCodec {
+        compression,
+        dictionary: Some(Arc::clone(&dict)),
+    };
     {
         let mut w = BlobWriter::new(&source, 0, 0, &*fs)?
+            .use_frame_sizes(crate::vlog::blob_file::writer::FrameSizes {
+                block_target: 0,
+                chunk_size: 1 << 20,
+            })
             .use_compression(compression)
             .use_zstd_dictionary(Some(Arc::clone(&dict)));
         w.write(b"a", 1, b"sample payload sample payload sample payload")?;
@@ -10064,8 +10259,8 @@ fn salvage_blob_file_recovers_a_dictionary_source_with_the_dictionary() -> crate
 
     // Rot the SECOND record's payload (checksum fails, the record drops; the
     // first record is the intact survivor the dictionary must decode).
-    let entries: Vec<_> =
-        crate::vlog::BlobFileScanner::new(&source, &*fs, 0)?.collect::<crate::Result<Vec<_>>>()?;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::open(&source, &*fs, 0, codec(), None)?
+        .collect::<crate::Result<Vec<_>>>()?;
     let second = entries.get(1).expect("two records");
     {
         let mut f = std::fs::OpenOptions::new().write(true).open(&source)?;
@@ -10090,19 +10285,12 @@ fn salvage_blob_file_recovers_a_dictionary_source_with_the_dictionary() -> crate
     assert_eq!(report.dropped.len(), 1, "the rotted record drops");
 
     // The re-emitted record round-trips under the SAME dictionary descriptor.
-    let salvaged = crate::vlog::BlobFileScanner::new(&dest, &*fs, 0)?
+    let salvaged = crate::vlog::BlobFileScanner::open(&dest, &*fs, 0, codec(), None)?
         .next()
         .expect("one salvaged record")?;
-    let value = super::decompress_blob_value(
-        compression,
-        &salvaged.value,
-        salvaged.uncompressed_len as usize,
-        #[cfg(zstd_any)]
-        Some(&dict),
-    )?;
     assert_eq!(
-        value.as_ref(),
-        b"sample payload sample payload sample payload",
+        salvaged.value.as_deref(),
+        Some(&b"sample payload sample payload sample payload"[..]),
         "the salvaged record decodes to its original value under the dictionary",
     );
     Ok(())
@@ -10118,51 +10306,49 @@ fn salvage_blob_file_rejects_a_dictionary_compressed_source() -> crate::Result<(
 
     // A dictionary descriptor with no dictionary context on this standalone
     // path: fail closed rather than re-emit undecodable values.
+    let dict = Arc::new(crate::compression::ZstdDictionary::new(
+        b"some dictionary some dictionary some dictionary",
+    ));
+    let dict_id = dict.id();
     {
-        let mut writer =
-            BlobWriter::new(&source, 0, 0, &*fs)?.use_compression(crate::CompressionType::Lz4);
-        writer.metadata_compression_override = Some(crate::CompressionType::ZstdDict {
-            level: 3,
-            dict_id: 7,
-        });
+        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?
+            .use_compression(crate::CompressionType::ZstdDict { level: 3, dict_id })
+            .use_zstd_dictionary(Some(dict));
         writer.write(b"k0", 0, b"some compressible value aaaaaaaaaaaaaaaa")?;
         writer.finish()?;
     }
 
+    let result = salvage_blob_file(
+        &source,
+        dest,
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        #[cfg(zstd_any)]
+        None,
+    );
     assert!(
+        // The SAME error a wrong dictionary raises, with `got: None`: both
+        // are a mis-supplied recovery context, and repair propagates that
+        // class instead of grading the file damaged.
         matches!(
-            salvage_blob_file(
-                &source,
-                dest,
-                &fs,
-                0,
-                &default_comparator(),
-                0,
-                #[cfg(zstd_any)]
-                None
-            ),
-            // The SAME error a wrong dictionary raises, with `got: None`:
-            // both are a mis-supplied recovery context, and repair
-            // propagates that class instead of grading the file damaged.
-            Err(crate::Error::ZstdDictMismatch {
-                expected: 7,
-                got: None
-            }),
+            result,
+            Err(crate::Error::ZstdDictMismatch { expected, got: None }) if expected == dict_id
         ),
         "a dictionary-compressed blob file must be rejected rather than mis-salvaged",
     );
     Ok(())
 }
 
-/// The blob-handle rewrite must install BOTH relocation fields into a remapped
-/// indirection: the salvaged file is compacted (offset moves) AND its records
-/// are re-compressed (the on-disk size may change — compressor output is not
-/// stable across versions), while `Reader::get` cross-checks the handle's size
-/// against the frame header and rejects a mismatch. Carrying only the offset
-/// would leave otherwise-salvaged values unreadable.
+/// The blob-handle rewrite installs the whole relocation into a remapped
+/// indirection: the replacement file, the record's place there and what it
+/// takes there, which garbage accounting charges once it is dropped. The
+/// value's length is the value's and stays.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
+fn blob_handle_rewrite_installs_the_relocation() -> crate::Result<()> {
+    use super::BlobRecordPlace;
     use crate::blob_tree::handle::BlobIndirection;
     use crate::coding::{Decode, Encode};
     use crate::vlog::ValueHandle;
@@ -10171,10 +10357,11 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
     let ind = BlobIndirection {
         vhandle: ValueHandle {
             blob_file_id: 7,
-            offset: 400,
-            on_disk_size: 64,
+            frame: 40,
+            index: 2,
         },
         size: 100,
+        stored: crate::blob_tree::handle::Stored::Frames(64),
     };
     let mut value = Vec::new();
     ind.encode_into(&mut value)?;
@@ -10185,26 +10372,23 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
         ValueType::Indirection,
     )];
 
-    // The salvaged replacement re-emitted this record at a new offset AND a
-    // new (re-compressed) on-disk size.
-    let mut map = crate::HashMap::default();
-    map.insert(
-        400u64,
+    // The salvaged replacement re-emitted this record at another place.
+    let mut records = crate::HashMap::default();
+    records.insert(
+        BlobRecordPlace {
+            frame: 40,
+            index: 2,
+        },
+        // The copy joined a block, so its charge changes kind as well.
         super::BlobRecordRelocation {
-            offset: 16,
-            on_disk_size: 61,
+            place: BlobRecordPlace { frame: 3, index: 0 },
+            stored: crate::blob_tree::handle::Stored::InBlock(61),
         },
     );
     let mut rewrite = crate::HashMap::default();
     // The replacement is a FRESH blob file, so the handle must be retargeted
-    // at its id as well as at the new offset.
-    rewrite.insert(
-        7u64,
-        super::BlobFileRewrite::Remap {
-            new_id: 9,
-            offsets: map,
-        },
-    );
+    // at its id as well as at the new place.
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, records });
 
     let mut dropped = 0u64;
     let (out, carry) = super::rewrite_block_indirections(
@@ -10220,12 +10404,17 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
         rewritten.vhandle.blob_file_id, 9,
         "the handle names the salvaged replacement, not the damaged original",
     );
-    assert_eq!(rewritten.vhandle.offset, 16, "the offset is re-targeted");
     assert_eq!(
-        rewritten.vhandle.on_disk_size, 61,
-        "the on-disk size is the RE-EMITTED record's, not the source's: the \
-         reader rejects a handle whose size disagrees with the frame header",
+        (rewritten.vhandle.frame, rewritten.vhandle.index),
+        (3, 0),
+        "the place is re-targeted"
     );
+    assert_eq!(
+        rewritten.stored,
+        crate::blob_tree::handle::Stored::InBlock(61),
+        "what the copy takes, not the source"
+    );
+    assert_eq!(rewritten.size, 100, "the value's length stays");
     Ok(())
 }
 
@@ -10239,15 +10428,16 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
     use crate::vlog::ValueHandle;
     use crate::{InternalValue, ValueType};
 
-    let indirection = |offset: u64| -> crate::Result<Vec<u8>> {
+    let indirection = |frame: u32| -> crate::Result<Vec<u8>> {
         let mut value = Vec::new();
         BlobIndirection {
             vhandle: ValueHandle {
                 blob_file_id: 7,
-                offset,
-                on_disk_size: 64,
+                frame,
+                index: 0,
             },
             size: 100,
+            stored: crate::blob_tree::handle::Stored::Frames(64),
         }
         .encode_into(&mut value)?;
         Ok(value)
@@ -10260,7 +10450,7 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         7u64,
         super::BlobFileRewrite::Remap {
             new_id: 9,
-            offsets: crate::HashMap::default(),
+            records: crate::HashMap::default(),
         },
     );
 
@@ -10333,14 +10523,15 @@ fn blob_handle_rewrite_remaps_and_beheads_cell_rows() -> crate::Result<()> {
     use crate::vlog::ValueHandle;
     use crate::{InternalValue, ValueType};
 
-    let reference = |blob_file_id: u64, offset: u64, owner: bool| RowCell::Ref {
+    let reference = |blob_file_id: u64, frame: u32, owner: bool| RowCell::Ref {
         indirection: BlobIndirection {
             vhandle: ValueHandle {
                 blob_file_id,
-                offset,
-                on_disk_size: 64,
+                frame,
+                index: 0,
             },
             size: 100,
+            stored: crate::blob_tree::handle::Stored::Frames(64),
         },
         owner,
     };
@@ -10356,16 +10547,22 @@ fn blob_handle_rewrite_remaps_and_beheads_cell_rows() -> crate::Result<()> {
         InternalValue::from_components(key.to_vec(), value, seqno, ValueType::CellRow)
     };
 
-    let mut offsets = crate::HashMap::default();
-    offsets.insert(
-        400u64,
+    let mut records = crate::HashMap::default();
+    records.insert(
+        super::BlobRecordPlace {
+            frame: 400,
+            index: 0,
+        },
         super::BlobRecordRelocation {
-            offset: 16,
-            on_disk_size: 61,
+            place: super::BlobRecordPlace {
+                frame: 16,
+                index: 0,
+            },
+            stored: crate::blob_tree::handle::Stored::Frames(61),
         },
     );
     let mut rewrite = crate::HashMap::default();
-    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, records });
     rewrite.insert(8u64, super::BlobFileRewrite::DropBelow(500));
 
     let entries = vec![
@@ -10410,11 +10607,11 @@ fn blob_handle_rewrite_remaps_and_beheads_cell_rows() -> crate::Result<()> {
     assert_eq!(
         (
             indirection.vhandle.blob_file_id,
-            indirection.vhandle.offset,
-            indirection.vhandle.on_disk_size,
+            indirection.vhandle.frame,
+            indirection.stored,
             owner
         ),
-        (9, 16, 61, true),
+        (9, 16, crate::blob_tree::handle::Stored::Frames(61), true),
         "remapped to the re-emitted record, ownership kept"
     );
     assert!(
@@ -10442,10 +10639,11 @@ fn recovered_cell_row_references_link_their_files_by_ownership() -> crate::Resul
         indirection: BlobIndirection {
             vhandle: ValueHandle {
                 blob_file_id,
-                offset: 0,
-                on_disk_size: 64,
+                frame: 0,
+                index: 0,
             },
             size: 100,
+            stored: crate::blob_tree::handle::Stored::Frames(64),
         },
         owner,
     };
@@ -10821,6 +11019,30 @@ fn salvage_suppresses_only_the_shadowed_key_itself() -> crate::Result<()> {
     Ok(())
 }
 
+/// A remap moving each record at frame `from` (index 0) to frame `to`.
+fn frame_remap(
+    moves: &[(u32, u32)],
+) -> crate::HashMap<super::BlobRecordPlace, super::BlobRecordRelocation> {
+    moves
+        .iter()
+        .map(|&(from, to)| {
+            (
+                super::BlobRecordPlace {
+                    frame: from,
+                    index: 0,
+                },
+                super::BlobRecordRelocation {
+                    place: super::BlobRecordPlace {
+                        frame: to,
+                        index: 0,
+                    },
+                    stored: crate::blob_tree::handle::Stored::Frames(61),
+                },
+            )
+        })
+        .collect()
+}
+
 /// The blob-handle rewrite suppresses a beheaded chain the same way, and asks
 /// the same question: losing a key's newest record takes every OLDER version of
 /// THAT key with it, and leaves a different key alone.
@@ -10829,14 +11051,15 @@ fn the_blob_rewrite_suppresses_only_the_beheaded_key() -> crate::Result<()> {
     use crate::coding::Encode;
     use crate::{InternalValue, ValueType};
 
-    let indirection = |offset: u64| -> crate::Result<Vec<u8>> {
+    let indirection = |frame: u32| -> crate::Result<Vec<u8>> {
         let ind = crate::blob_tree::handle::BlobIndirection {
             vhandle: crate::vlog::ValueHandle {
                 blob_file_id: 7,
-                offset,
-                on_disk_size: 16,
+                frame,
+                index: 0,
             },
             size: 16,
+            stored: crate::blob_tree::handle::Stored::Frames(16),
         };
         let mut buf = Vec::new();
         ind.encode_into(&mut buf)?;
@@ -10851,17 +11074,15 @@ fn the_blob_rewrite_suppresses_only_the_beheaded_key() -> crate::Result<()> {
         InternalValue::from_components(b"z", indirection(200)?, 1, ValueType::Indirection),
     ];
 
-    // The remap holds only offset 200: the record behind `a`'s newest is gone.
-    let mut offsets = crate::HashMap::default();
-    offsets.insert(
-        200u64,
-        super::BlobRecordRelocation {
-            offset: 300,
-            on_disk_size: 16,
+    // The remap holds only frame 200: the record behind `a`'s newest is gone.
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(
+        7u64,
+        super::BlobFileRewrite::Remap {
+            new_id: 9,
+            records: frame_remap(&[(200, 300)]),
         },
     );
-    let mut rewrite = crate::HashMap::default();
-    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
 
     let mut dropped = 0u64;
     let (kept, carry) = super::rewrite_block_indirections(
@@ -10905,7 +11126,7 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
     let source = dir.path().join("source");
     let dest = dir.path().join("dest");
 
-    let row = |offset: u64| -> crate::Result<Vec<u8>> {
+    let row = |frame: u32| -> crate::Result<Vec<u8>> {
         encode_row(&[
             RowField::bytes(3, RowCell::Value(b"status")),
             RowField::bytes(
@@ -10914,10 +11135,11 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
                     indirection: BlobIndirection {
                         vhandle: ValueHandle {
                             blob_file_id: 7,
-                            offset,
-                            on_disk_size: 64,
+                            frame,
+                            index: 0,
                         },
                         size: 100,
+                        stored: crate::blob_tree::handle::Stored::Frames(64),
                     },
                     owner: true,
                 },
@@ -10928,28 +11150,24 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
         .use_columnar(true)
         .use_cell_rows(true)
         .use_row_group_size(1);
-    for (key, offset) in [(b"a", 400u64), (b"b", 999), (b"c", 500)] {
+    for (key, frame) in [(b"a", 400u32), (b"b", 999), (b"c", 500)] {
         writer.write(InternalValue::from_components(
             key.as_slice(),
-            row(offset)?,
+            row(frame)?,
             1,
             ValueType::CellRow,
         ))?;
     }
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    let mut offsets = crate::HashMap::default();
-    for (from, to) in [(400u64, 16u64), (500, 80)] {
-        offsets.insert(
-            from,
-            super::BlobRecordRelocation {
-                offset: to,
-                on_disk_size: 61,
-            },
-        );
-    }
     let mut rewrite = crate::HashMap::default();
-    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    rewrite.insert(
+        7u64,
+        super::BlobFileRewrite::Remap {
+            new_id: 9,
+            records: frame_remap(&[(400, 16), (500, 80)]),
+        },
+    );
     let options = SalvageOptions {
         encryption: None,
         #[cfg(zstd_any)]
@@ -10970,7 +11188,7 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
     salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
 
     let recovered = open(dest, &fs)?;
-    let field_ref = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+    let field_ref = |key: &[u8]| -> crate::Result<Option<(u64, u32)>> {
         let Some(entry) = recovered.get(key, crate::SeqNo::MAX, crate::hash::hash64(key))? else {
             return Ok(None);
         };
@@ -10981,7 +11199,7 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
         };
         Ok(Some((
             indirection.vhandle.blob_file_id,
-            indirection.vhandle.offset,
+            indirection.vhandle.frame,
         )))
     };
     assert_eq!(field_ref(b"a")?, Some((9, 16)));
@@ -11009,7 +11227,7 @@ fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> cr
     let source = dir.path().join("source");
     let dest = dir.path().join("dest");
 
-    let row = |offset: u64| -> crate::Result<Vec<u8>> {
+    let row = |frame: u32| -> crate::Result<Vec<u8>> {
         encode_row(&[
             RowField::bytes(3, RowCell::Value(b"status")),
             RowField::bytes(
@@ -11018,10 +11236,11 @@ fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> cr
                     indirection: BlobIndirection {
                         vhandle: ValueHandle {
                             blob_file_id: 7,
-                            offset,
-                            on_disk_size: 64,
+                            frame,
+                            index: 0,
                         },
                         size: 100,
+                        stored: crate::blob_tree::handle::Stored::Frames(64),
                     },
                     owner: true,
                 },
@@ -11034,10 +11253,10 @@ fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> cr
         .use_zone_map(true)
         .use_row_group_size(4_096)
         .delete_strategy(DeleteStrategy::MergeOnRead);
-    for (key, offset) in [(b"a", 400u64), (b"b", 450), (b"c", 500), (b"d", 999)] {
+    for (key, frame) in [(b"a", 400u32), (b"b", 450), (b"c", 500), (b"d", 999)] {
         writer.write(InternalValue::from_components(
             key.as_slice(),
-            row(offset)?,
+            row(frame)?,
             1,
             ValueType::CellRow,
         ))?;
@@ -11046,18 +11265,14 @@ fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> cr
     writer.delete_bitmap_mut().insert(1);
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    let mut offsets = crate::HashMap::default();
-    for (from, to) in [(400u64, 16u64), (450, 48), (500, 80)] {
-        offsets.insert(
-            from,
-            super::BlobRecordRelocation {
-                offset: to,
-                on_disk_size: 61,
-            },
-        );
-    }
     let mut rewrite = crate::HashMap::default();
-    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    rewrite.insert(
+        7u64,
+        super::BlobFileRewrite::Remap {
+            new_id: 9,
+            records: frame_remap(&[(400, 16), (450, 48), (500, 80)]),
+        },
+    );
     let options = SalvageOptions {
         blob_rewrite: Some(Arc::new(rewrite)),
         ..SalvageOptions::default()
@@ -11065,7 +11280,7 @@ fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> cr
     salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
 
     let recovered = open(dest, &fs)?;
-    let field_ref = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+    let field_ref = |key: &[u8]| -> crate::Result<Option<(u64, u32)>> {
         let Some(entry) = recovered.get(key, crate::SeqNo::MAX, crate::hash::hash64(key))? else {
             return Ok(None);
         };
@@ -11076,7 +11291,7 @@ fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> cr
         };
         Ok(Some((
             indirection.vhandle.blob_file_id,
-            indirection.vhandle.offset,
+            indirection.vhandle.frame,
         )))
     };
     assert_eq!(field_ref(b"a")?, Some((9, 16)));

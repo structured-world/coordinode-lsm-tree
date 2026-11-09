@@ -40,14 +40,22 @@ fn open_with(
     columnar: bool,
     fill: BlobCacheFill,
 ) -> lsm_tree::Result<(AnyTree, BlobTree)> {
+    open_sized(path, columnar, fill, KvSeparationOptions::default())
+}
+
+/// [`open_with`], its blob files sized by `opts`.
+fn open_sized(
+    path: &std::path::Path,
+    columnar: bool,
+    fill: BlobCacheFill,
+    opts: KvSeparationOptions,
+) -> lsm_tree::Result<(AnyTree, BlobTree)> {
     let any = Config::new(
         path,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_kv_separation(Some(
-        KvSeparationOptions::default().separation_threshold(THRESHOLD),
-    ))
+    .with_kv_separation(Some(opts.separation_threshold(THRESHOLD)))
     .blob_compression(lsm_tree::CompressionType::None)
     .blob_cache_fill(fill)
     .open()?;
@@ -238,12 +246,32 @@ fn a_scan_reads_its_objects_ahead_into_the_cache_only_when_caching() -> lsm_tree
 /// The predicate runs on the newest visible version of each key: an older
 /// version that matches does not stand in for a newer one that does not,
 /// whatever source each sits in. And the body is read only for the rows the
-/// predicate keeps.
+/// predicate keeps: with every body a frame of its own, only the four kept
+/// ones; with the bodies sharing a block, that block, once.
 #[test]
 fn the_predicate_judges_the_newest_version_and_gates_the_body() -> lsm_tree::Result<()> {
-    for columnar in [false, true] {
+    let layouts = [
+        (KvSeparationOptions::default().block_size(0), 6 * 300),
+        (KvSeparationOptions::default(), 21 * (14 + 3 + 300) + 64),
+    ];
+    for (opts, most_read) in layouts {
+        for columnar in [false, true] {
+            gated_by_the_newest_version(columnar, opts.clone(), most_read)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`the_predicate_judges_the_newest_version_and_gates_the_body`] for one
+/// layout, reading fewer than `most_read` body bytes.
+fn gated_by_the_newest_version(
+    columnar: bool,
+    opts: KvSeparationOptions,
+    most_read: u64,
+) -> lsm_tree::Result<()> {
+    {
         let folder = get_tmp_folder();
-        let (any, tree) = open(folder.path(), columnar)?;
+        let (any, tree) = open_sized(folder.path(), columnar, BlobCacheFill::default(), opts)?;
         for i in 0..20u32 {
             insert(
                 &tree,
@@ -280,7 +308,7 @@ fn the_predicate_judges_the_newest_version_and_gates_the_body() -> lsm_tree::Res
             "columnar={columnar}: k00's newest version is not cheap"
         );
         // The four bodies sit next to each other in one blob file: read in
-        // one request, and nothing of the sixteen bodies the predicate drops.
+        // one request, and nothing beyond the frames that hold them.
         assert_eq!(
             m.blob_read_count() - requests,
             1,
@@ -292,7 +320,7 @@ fn the_predicate_judges_the_newest_version_and_gates_the_body() -> lsm_tree::Res
         );
         let read = m.blob_bytes_read() - bytes;
         assert!(
-            read < 6 * 300,
+            read < most_read,
             "columnar={columnar}: {read} body bytes read for four bodies of 300"
         );
     }
@@ -1062,6 +1090,69 @@ fn a_dense_start_of_a_referenced_predicate_gives_way_to_its_sparse_tail() -> lsm
         notes_read * 5 < all_notes * 3,
         "{notes_read} bytes of notes read for a third of the rows, out of {all_notes}"
     );
+    Ok(())
+}
+
+/// Objects small enough to share blocks are read a block at a time, and a
+/// block the scan's batches share is read once: the scan keeps the frames it
+/// read ahead from one batch to the next rather than reading the block again
+/// for each batch's few objects.
+#[test]
+fn a_scan_reads_a_block_its_batches_share_once() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(1 << 20)
+            .cell_separation_threshold(PRICE, 0),
+    ))
+    .blob_compression(lsm_tree::CompressionType::None)
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(64 * 1_024))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1_024))
+    .open()?;
+    let AnyTree::Blob(tree) = &any else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    tree.index.update_runtime_config(|rc| rc.columnar = true)?;
+    let rows = 2_000u32;
+    for i in 0..rows {
+        insert(
+            tree,
+            &format!("k{i:05}"),
+            b"s",
+            i,
+            &[b'n'; 200],
+            u64::from(i),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = any.metrics();
+    let all = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(rows.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    let prices = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()));
+    let (requests, bytes) = (m.blob_read_count(), m.blob_bytes_read());
+    assert_eq!(rows_of_scan(&any, prices, Some(&all))?.len(), rows as usize);
+    // Each price is an entry of 14 bytes, its six-byte key and four bytes:
+    // three blocks of 16 KiB hold them all.
+    let entries = u64::from(rows) * (14 + 6 + 4);
+    let read = m.blob_bytes_read() - bytes;
+    let issued = m.blob_read_count() - requests;
+    assert!(
+        read <= 2 * entries,
+        "{read} bytes read for {entries} bytes of blocks in {issued} requests"
+    );
+    assert!(issued <= 8, "{issued} requests for three blocks");
     Ok(())
 }
 

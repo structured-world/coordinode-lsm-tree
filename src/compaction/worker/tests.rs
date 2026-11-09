@@ -2774,11 +2774,16 @@ fn blob_file_picking_simple() -> crate::Result<()> {
     assert_eq!(2, tree.table_count());
     assert_eq!(1, tree.blob_file_count());
 
+    // `a` shares a block with the others: it is charged its entry
+    // uncompressed as block bytes, its key and one byte with the entry's
+    // fixed part, nothing of frames of its own.
+    let charged = (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + 2) as u64;
+    let garbage = crate::blob_tree::FragmentationEntry::new(1, 1, 0).with_block_bytes(charged);
     {
         assert_eq!(
             &{
                 let mut map = crate::HashMap::default();
-                map.insert(0, crate::blob_tree::FragmentationEntry::new(1, 1, 1));
+                map.insert(0, garbage);
                 map
             },
             &**tree.current_version().gc_stats(),
@@ -2795,7 +2800,7 @@ fn blob_file_picking_simple() -> crate::Result<()> {
         assert_eq!(
             &{
                 let mut map = crate::HashMap::default();
-                map.insert(0, crate::blob_tree::FragmentationEntry::new(1, 1, 1));
+                map.insert(0, garbage);
                 map
             },
             &**tree.current_version().gc_stats(),
@@ -3778,6 +3783,7 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
     let relocated = super::Relocated {
         stale: &stale,
         target_size: 48 * 1024,
+        chunk_size: blob_reloc_kv_options().frame_sizes().chunk_size,
         file_groups: codecs.len() as u64 * u64::from(blob_reloc_kv_options().lifetime_groups.get()),
     };
     let slices = super::tight_slices(
@@ -5381,33 +5387,154 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
     use crate::vlog::ValueHandle;
     use crate::{InternalValue, vlog::BlobFileId};
 
-    let reference = |blob_file_id: u64, size: u32| RowCell::Ref {
-        indirection: BlobIndirection {
-            vhandle: ValueHandle {
-                blob_file_id,
-                offset: 0,
-                on_disk_size: size,
-            },
-            size,
+    let indirection = |blob_file_id: u64, frame: u32, stored: u32| BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id,
+            frame,
+            index: 0,
         },
+        size: stored,
+        stored: crate::blob_tree::handle::Stored::Frames(stored),
+    };
+    let reference = |indirection| RowCell::Ref {
+        indirection,
         owner: true,
     };
+    let (first, other, second) = (
+        indirection(7, 0, 100),
+        indirection(8, 0, 300),
+        indirection(7, 1, 40),
+    );
     let row = encode_row(&[
         RowField::bytes(3, RowCell::Value(b"inline")),
-        RowField::bytes(4, reference(7, 100)),
-        RowField::bytes(5, reference(8, 300)),
-        RowField::bytes(6, reference(7, 40)),
+        RowField::bytes(4, reference(first)),
+        RowField::bytes(5, reference(other)),
+        RowField::bytes(6, reference(second)),
     ])?;
     let stale: crate::HashSet<BlobFileId> = core::iter::once(7).collect();
     let key = b"row-key";
 
     let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
     assert_eq!(
-        super::stale_frame_bytes(&item, &stale)?,
-        super::frame_bytes(key, 100) + super::frame_bytes(key, 40),
+        super::stale_frame_bytes(&item, &stale, u32::MAX)?,
+        super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
     );
     let plain = InternalValue::from_components(*key, b"v".to_vec(), 2, crate::ValueType::Value);
-    assert_eq!(super::stale_frame_bytes(&plain, &stale)?, 0);
+    assert_eq!(super::stale_frame_bytes(&plain, &stale, u32::MAX)?, 0);
+    Ok(())
+}
+
+/// What a relocated copy takes is bounded tight: a value with frames of its
+/// own is copied as those frames, headers included, so it takes its stored
+/// bytes and their index entries; a value sharing a block is re-encoded, and
+/// its copy may open a block, so its bound is its entry, one frame header and
+/// its index entry. A header too many on every value would refuse a
+/// tight-space slice that fits its budget.
+#[test]
+fn frame_bytes_add_a_header_only_to_a_value_that_shares_a_block() {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::ValueHandle;
+
+    let indirection = |stored| BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 7,
+            frame: 0,
+            index: 0,
+        },
+        size: 100,
+        stored,
+    };
+    let header = crate::vlog::blob_file::frame::FRAME_HEADER_LEN as u64;
+    let index_entry = 8;
+    // A 100-byte value is one frame; the bound allows one chunk more.
+    assert_eq!(
+        super::frame_bytes(&indirection(Stored::Frames(140)), u32::MAX),
+        140 + 2 * index_entry
+    );
+    assert_eq!(
+        super::frame_bytes(&indirection(Stored::InBlock(114)), u32::MAX),
+        114 + header + index_entry
+    );
+}
+
+/// A copied value adds its frames to the output file's frame index too, eight
+/// bytes a frame: a value split into many chunks adds hundreds. The bound a
+/// tight-space pass charges covers them, or a slice sized to its room fails
+/// to land.
+#[test]
+fn frame_bytes_cover_the_frame_index_a_chunked_copy_adds() {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::ValueHandle;
+
+    let size = 1024 * 1024;
+    let chunk_size = crate::vlog::blob_file::writer::MIN_CHUNK_SIZE;
+    let Ok(header) = u32::try_from(crate::vlog::blob_file::frame::FRAME_HEADER_LEN) else {
+        panic!("a frame header fits u32");
+    };
+    let frames = 1 + size / chunk_size;
+    let stored = size + header * frames;
+    let chunked = BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 7,
+            frame: 0,
+            index: 0,
+        },
+        size,
+        stored: Stored::Frames(stored),
+    };
+    let index = 8 * u64::from(frames);
+    assert!(
+        super::frame_bytes(&chunked, chunk_size) >= u64::from(stored) + index,
+        "the bound covers the value's frames and their {index} index bytes"
+    );
+}
+
+/// A value that shares a block was written below the block size of its day;
+/// reopened with a smaller chunk size, its relocated copy is split into a head
+/// and chunks, a header each. Its bound covers what the writer then writes:
+/// one header more alone would let a tight-space slice outgrow its room.
+#[test]
+fn frame_bytes_cover_a_block_value_the_copy_splits_into_chunks() -> crate::Result<()> {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::{ValueHandle, blob_file::writer::FrameSizes};
+
+    let dir = tempfile::tempdir()?;
+    let key = b"key";
+    let value = vec![b'v'; 16 * 1_024];
+    let chunk_size = 4 * 1_024;
+    let mut writer =
+        crate::vlog::blob_file::writer::Writer::new(dir.path().join("0"), 0, 0, &crate::fs::StdFs)?
+            .use_frame_sizes(FrameSizes {
+                block_target: chunk_size,
+                chunk_size,
+            });
+    let written = writer.write(key, 0, &value)?.stored.bytes();
+    let (_, _, frames) = writer.finish()?;
+    // A head and four chunks, then the data end: the copy is chunked.
+    assert_eq!(frames.len(), 6, "the value is written as a head and chunks");
+
+    let Ok(entry) =
+        u32::try_from(crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + key.len() + value.len())
+    else {
+        panic!("a block entry fits u32");
+    };
+    let Ok(size) = u32::try_from(value.len()) else {
+        panic!("the value fits u32");
+    };
+    let in_block = BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 7,
+            frame: 0,
+            index: 0,
+        },
+        size,
+        stored: Stored::InBlock(entry),
+    };
+    let bound = super::frame_bytes(&in_block, chunk_size);
+    assert!(
+        bound >= u64::from(written),
+        "bound {bound} under the {written} bytes the copy writes"
+    );
     Ok(())
 }
 
@@ -6206,6 +6333,9 @@ mod locality_relocation {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
+        // Tables close at a block, so small blocks let a small target split
+        // the keys into several tables whatever a reference's encoded width.
+        .data_block_size_policy(crate::config::BlockSizePolicy::all(512))
         .blob_compression(crate::CompressionType::None)
         .with_kv_separation(Some(blob_opts))
         .open()
@@ -6465,13 +6595,13 @@ mod locality_relocation {
             let mut stale_written = 0;
             let mut smallest = u64::MAX;
             for link in table.blob_links()? {
+                let Some(bf) = version.blob_files.get(link.blob_file_id) else {
+                    panic!("a linked file exists");
+                };
                 if interleaved.contains(&link.blob_file_id) {
-                    let Some(bf) = version.blob_files.get(link.blob_file_id) else {
-                        panic!("a linked file exists");
-                    };
                     smallest = smallest.min(bf.physical_size()?);
                 } else {
-                    stale_written += link.on_disk_bytes;
+                    stale_written += link.on_disk(bf.meta());
                 }
             }
             #[expect(clippy::cast_precision_loss, reason = "test budget from byte counts")]
@@ -6549,7 +6679,7 @@ mod locality_relocation {
                 if interleaved.contains(&link.blob_file_id) {
                     sizes.insert(link.blob_file_id, bf.physical_size()?);
                 } else {
-                    stale_written += link.on_disk_bytes;
+                    stale_written += link.on_disk(bf.meta());
                     stale_len += bf.physical_size()?;
                 }
             }

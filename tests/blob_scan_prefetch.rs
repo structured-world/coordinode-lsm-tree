@@ -99,6 +99,127 @@ fn a_scan_yields_the_same_values_with_and_without_prefetch() -> lsm_tree::Result
     Ok(())
 }
 
+/// A block several upcoming values share, wider than what a scan may prefetch
+/// into the cache (half of it), is left to the direct read: admitting it for
+/// serving many values took more than the budget left, which underflowed it.
+#[test_log::test]
+fn a_shared_block_wider_than_the_prefetch_budget_is_left_to_the_direct_read() -> lsm_tree::Result<()>
+{
+    const N: usize = 120;
+
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+        // Half of it, the prefetch budget, is narrower than one 16 KiB block.
+        .use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
+            16 * 1024,
+        )))
+        .blob_compression(lsm_tree::CompressionType::None)
+        // Prefetched into the cache, the budget is half of it.
+        .blob_cache_fill(lsm_tree::config::BlobCacheFill::Always)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(1)
+                .scan_prefetch(64),
+        ))
+        .open()?;
+    for i in 0..N {
+        tree.insert(key_for(i).as_bytes(), value_for(i), seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+
+    let scanned = collect(&tree)?;
+    assert_eq!(scanned.len(), N);
+    for (i, (key, value)) in scanned.iter().enumerate() {
+        assert_eq!(key.as_slice(), key_for(i).as_bytes());
+        assert_eq!(value.as_ref(), value_for(i).as_slice());
+    }
+    Ok(())
+}
+
+/// A read-ahead into a cache that holds only a few blocks admits what fits
+/// its budget and leaves the rest to their own reads: every value reads back.
+#[test_log::test]
+fn a_read_ahead_past_its_admission_budget_leaves_the_rest_to_their_reads() -> lsm_tree::Result<()> {
+    const N: usize = 600;
+
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+        // Half of it, the budget, holds two or three 16 KiB blocks.
+        .use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
+            96 * 1024,
+        )))
+        .blob_compression(lsm_tree::CompressionType::None)
+        .blob_cache_fill(lsm_tree::config::BlobCacheFill::Always)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(1)
+                .scan_prefetch(256),
+        ))
+        .open()?;
+    for i in 0..N {
+        tree.insert(key_for(i).as_bytes(), value_for(i), seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+
+    let scanned = collect(&tree)?;
+    assert_eq!(scanned.len(), N);
+    for (i, (_, value)) in scanned.iter().enumerate() {
+        assert_eq!(value.as_ref(), value_for(i).as_slice());
+    }
+    Ok(())
+}
+
+/// A frame damaged on disk is left out of a read-ahead rather than ending
+/// it: the frames around it are still read ahead and read back, and only
+/// the values the damaged frame holds fail, when they are read.
+#[test_log::test]
+fn a_damaged_frame_in_a_read_ahead_fails_only_its_own_values() -> lsm_tree::Result<()> {
+    const N: usize = 300;
+
+    let dir = tempfile::tempdir()?;
+    let build = || {
+        let seqno = SequenceNumberCounter::default();
+        Config::new(dir.path(), seqno, SequenceNumberCounter::default())
+            .blob_compression(lsm_tree::CompressionType::None)
+            .blob_cache_fill(lsm_tree::config::BlobCacheFill::Never)
+            .with_kv_separation(Some(
+                KvSeparationOptions::default()
+                    .separation_threshold(1)
+                    .scan_prefetch(256),
+            ))
+            .open()
+    };
+    {
+        let tree = build()?;
+        let seqno = SequenceNumberCounter::default();
+        for i in 0..N {
+            tree.insert(key_for(i).as_bytes(), value_for(i), seqno.next());
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    // A byte in the middle of the data, inside some frame past the first.
+    let blob = std::fs::read_dir(dir.path().join(lsm_tree::file::BLOBS_FOLDER))?
+        .find_map(|entry| entry.ok().map(|entry| entry.path()))
+        .expect("a blob file");
+    let mut bytes = std::fs::read(&blob)?;
+    let at = bytes.len() / 3;
+    bytes[at] ^= 0x40;
+    std::fs::write(&blob, &bytes)?;
+
+    let tree = build()?;
+    let results: Vec<_> = tree
+        .iter(SeqNo::MAX, None)
+        .map(|guard| guard.into_inner())
+        .collect();
+    assert_eq!(results.len(), N, "every key is yielded");
+    let failed = results.iter().filter(|r| r.is_err()).count();
+    assert!(failed > 0, "the damaged frame's values fail");
+    assert!(failed < N / 2, "the rest read back: {failed} failed");
+    Ok(())
+}
+
 /// A window whose records lie in several blob files coalesces into a span per
 /// file, and the spans of one window go to the backend in ONE batched read,
 /// not one read each.

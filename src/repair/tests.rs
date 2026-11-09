@@ -3910,7 +3910,8 @@ fn repair_skips_salvaging_an_unreferenced_invalid_blob() -> crate::Result<()> {
     let fs_dyn: Arc<dyn Fs> = memfs.clone();
     let orphan = blobs.join("9");
     {
-        let mut w = crate::vlog::blob_file::writer::Writer::new(orphan.clone(), 9, 0, &*fs_dyn)?;
+        let mut w =
+            crate::vlog::blob_file::writer::Writer::one_frame_each(orphan.clone(), 9, 0, &*fs_dyn)?;
         w.write(b"o1", 1, &[b'x'; 300])?;
         w.write(b"o2", 2, &[b'y'; 300])?;
         w.write(b"o3", 3, &[b'z'; 300])?;
@@ -6997,6 +6998,279 @@ fn repairing_a_columnar_table_in_a_superseded_layout_refuses_and_keeps_it() -> c
     Ok(())
 }
 
+/// A table whose blob links are in an earlier layout is a format this engine
+/// does not read, even under a repair that does not separate values and so
+/// never reaches the blob files' own refusal: the repair refuses it as such
+/// and leaves it as it found it. Graded by its links' shape, the table was
+/// damaged, left out of the rebuilt manifest and removed with its values.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repairing_a_table_with_blob_links_of_an_earlier_layout_refuses_and_keeps_it() -> crate::Result<()>
+{
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?;
+        for i in 0..8_u32 {
+            tree.insert(format!("k{i:04}"), vec![b'a'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    remove_manifest(&StdFs, dir.path())?;
+
+    // The links rewritten as the release before wrote them: each record
+    // without the block-entry bytes this layout adds after the on-disk bytes.
+    let sst = dir.path().join(crate::file::TABLES_FOLDER).join("0");
+    let links = {
+        let reader = crate::sfa::Reader::new(&sst)?;
+        let section = reader
+            .toc()
+            .section(b"linked_blob_files")
+            .expect("a table of separated values links its blob file");
+        let bytes = std::fs::read(&sst)?;
+        let at = usize::try_from(section.pos()).expect("fits");
+        let len = usize::try_from(section.len()).expect("fits");
+        crate::table::writer::parse_linked_blob_files(
+            bytes.get(at..at + len).expect("the section is in the file"),
+        )?
+    };
+    let mut earlier = Vec::new();
+    earlier.extend_from_slice(&u32::try_from(links.len()).expect("fits").to_le_bytes());
+    for link in &links {
+        earlier.extend_from_slice(&link.blob_file_id.to_le_bytes());
+        earlier.extend_from_slice(&(link.len as u64).to_le_bytes());
+        earlier.extend_from_slice(&link.bytes.to_le_bytes());
+        earlier.extend_from_slice(&link.on_disk_bytes.to_le_bytes());
+        for key in [&link.first_key, &link.last_key] {
+            earlier.extend_from_slice(&u16::try_from(key.len()).expect("fits").to_le_bytes());
+            earlier.extend_from_slice(key);
+        }
+    }
+    crate::test_forge::forge_rename_and_replace_section(
+        &sst,
+        (b"linked_blob_files", b"linked_blob_files"),
+        &earlier,
+        (0, None),
+    )?;
+    // The stamp a table of that release carries for its links' layout: none
+    // at all, which reads as the version before this one.
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst,
+        b"descriptor#blob_format",
+        &[crate::vlog::blob_file::meta::META_VERSION - 1],
+    )?;
+    let before = std::fs::read(&sst)?;
+
+    let err = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()
+    {
+        Ok(report) => panic!(
+            "repair must refuse a table whose links it cannot read rather than rebuild \
+             without it: {report:?}",
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::BlobFiles,
+                ..
+            }
+        ),
+        "repair must propagate the format refusal, not grade the table as damaged: {err:?}",
+    );
+    assert_eq!(
+        std::fs::read(&sst)?,
+        before,
+        "repair must leave the refused table exactly as it found it",
+    );
+    Ok(())
+}
+
+/// A blob file of an earlier layout lacks the frame index this one writes: a
+/// repair refuses it by its metadata's version before looking for the index,
+/// and leaves it in place. Looked for first, the missing index read as damage
+/// and the file was set aside for removal with the values it holds.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repairing_a_blob_file_of_an_earlier_layout_without_an_index_refuses_and_keeps_it()
+-> crate::Result<()> {
+    use crate::vlog::blob_file::meta::{META_VERSION, Metadata};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..8_u32 {
+            tree.insert(format!("k{i:04}"), vec![b'a'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    remove_manifest(&StdFs, dir.path())?;
+
+    // The metadata stamped with the version before this one, then the frame
+    // index that version did not write taken out of the file.
+    let blob = dir.path().join(crate::file::BLOBS_FOLDER).join("0");
+    let mut bytes = std::fs::read(&blob)?;
+    let (pos, len) = {
+        let reader = crate::sfa::Reader::new(&blob)?;
+        let meta = reader
+            .toc()
+            .section(b"meta")
+            .expect("a blob file has metadata");
+        (
+            usize::try_from(meta.pos()).expect("fits"),
+            usize::try_from(meta.len()).expect("fits"),
+        )
+    };
+    let section = bytes
+        .get(pos..pos + len)
+        .expect("the section is in the file");
+    let mut meta = Metadata::from_slice(&crate::Slice::from(section))?;
+    meta.version = META_VERSION - 1;
+    let mut forged = Vec::new();
+    meta.encode_into(&mut forged)?;
+    bytes
+        .get_mut(pos..pos + len)
+        .expect("the section is in the file")
+        .copy_from_slice(&forged);
+    std::fs::write(&blob, &bytes)?;
+    crate::test_forge::forge_section_omitted(&blob, b"frames")?;
+    let before = std::fs::read(&blob)?;
+
+    let err = match config().repair() {
+        Ok(report) => panic!(
+            "repair must refuse a blob file it cannot read rather than rebuild without it: \
+             {report:?}",
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::BlobFiles,
+                ..
+            }
+        ),
+        "repair must propagate the format refusal, not grade the file as damaged: {err:?}",
+    );
+    assert_eq!(
+        std::fs::read(&blob)?,
+        before,
+        "repair must leave the refused blob file exactly as it found it",
+    );
+    Ok(())
+}
+
+/// A blob file of an earlier layout is a format this engine does not read: a
+/// repair refuses it as such and leaves it exactly as it found it, never
+/// grading it damaged and setting it aside with the values it holds.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repairing_a_blob_file_of_an_earlier_layout_refuses_and_keeps_it() -> crate::Result<()> {
+    use crate::vlog::blob_file::meta::{META_VERSION, Metadata};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..8_u32 {
+            tree.insert(format!("k{i:04}"), vec![b'a'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    remove_manifest(&StdFs, dir.path())?;
+
+    // The file's metadata stamped with the layout version before this one,
+    // its bytes otherwise as written.
+    let blob = dir.path().join(crate::file::BLOBS_FOLDER).join("0");
+    let mut bytes = std::fs::read(&blob)?;
+    let (pos, len) = {
+        let reader = crate::sfa::Reader::new(&blob)?;
+        let meta = reader
+            .toc()
+            .section(b"meta")
+            .expect("a blob file has metadata");
+        (
+            usize::try_from(meta.pos()).expect("fits"),
+            usize::try_from(meta.len()).expect("fits"),
+        )
+    };
+    let section = bytes
+        .get(pos..pos + len)
+        .expect("the section is in the file");
+    let mut meta = Metadata::from_slice(&crate::Slice::from(section))?;
+    meta.version = META_VERSION - 1;
+    let mut forged = Vec::new();
+    meta.encode_into(&mut forged)?;
+    assert_eq!(forged.len(), len, "the version is one byte either way");
+    bytes
+        .get_mut(pos..pos + len)
+        .expect("the section is in the file")
+        .copy_from_slice(&forged);
+    std::fs::write(&blob, &bytes)?;
+
+    let err = match config().repair() {
+        Ok(report) => panic!(
+            "repair must refuse a blob file it cannot read rather than rebuild without it: \
+             {report:?}",
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::BlobFiles,
+                found: Some(found),
+                ..
+            } if found == META_VERSION - 1
+        ),
+        "repair must propagate the format refusal, not grade the file as damaged: {err:?}",
+    );
+    assert_eq!(
+        std::fs::read(&blob)?,
+        bytes,
+        "repair must leave the refused blob file exactly as it found it",
+    );
+    Ok(())
+}
+
 /// `repair_with_salvage` must QUARANTINE (not salvage) an SST whose TOC HIDES a
 /// deletion section: an omitted `range_tombstones` entry makes the parsed table
 /// report NO tombstones, so the positional salvage walk would re-emit the keys
@@ -7567,7 +7841,13 @@ fn write_three_frame_blob(
     path: &std::path::Path,
 ) -> crate::Result<()> {
     let fs_dyn: std::sync::Arc<dyn crate::fs::Fs> = memfs.clone();
-    let mut w = crate::vlog::blob_file::writer::Writer::new(path, 0, 0, &*fs_dyn)?;
+    // Each value a frame of its own.
+    let mut w = crate::vlog::blob_file::writer::Writer::new(path, 0, 0, &*fs_dyn)?.use_frame_sizes(
+        crate::vlog::blob_file::writer::FrameSizes {
+            block_target: 0,
+            chunk_size: 1 << 20,
+        },
+    );
     w.write(b"a", 1, &[b'x'; 300])?;
     w.write(b"b", 2, &[b'y'; 300])?;
     w.write(b"c", 3, &[b'z'; 300])?;
@@ -7766,26 +8046,31 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     }
 
     // Overwrite the compressed payload with same-length garbage and RE-STAMP
-    // the frame checksum (xxh3_128 over key + value + header_crc bytes), so
-    // the frame verifies while the payload no longer decompresses.
+    // the frame checksum (xxh3-128 over the entries, the stored payload and
+    // the header CRC), so the frame verifies while the payload no longer
+    // decompresses.
     let entry = crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
         .next()
         .expect("one frame")?;
-    let header_len = u64::try_from(crate::vlog::blob_file::writer::BLOB_HEADER_LEN).expect("small");
-    let value_start = entry.offset + header_len + 1; // 1-byte key
-    let value_len = usize::try_from(entry.frame_end - value_start).expect("fits");
-    let crc_bytes = crate::file::read_exact(
+    let frame_bytes = crate::file::read_exact(
         &*memfs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?,
-        entry.offset + 38, // header_crc sits last in the 42-byte header
-        4,
+        entry.offset,
+        usize::try_from(entry.frame_end - entry.offset).expect("fits"),
     )?
     .to_vec();
-    let garbage = vec![0xA5u8; value_len];
+    let header = crate::vlog::blob_file::frame::parse_header(&frame_bytes)?;
+    assert!(!header.is_raw(), "fixture: the payload is compressed");
+    let entries_end = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + header.entries_len as usize;
+    let garbage = vec![0xA5u8; frame_bytes.len() - entries_end];
     let restamped = {
         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-        hasher.update(b"a");
+        hasher.update(
+            frame_bytes
+                .get(crate::vlog::blob_file::frame::FRAME_HEADER_LEN..entries_end)
+                .expect("the frame holds its entries"),
+        );
         hasher.update(&garbage);
-        hasher.update(&crc_bytes);
+        hasher.update(&header.header_crc.to_le_bytes());
         hasher.digest128()
     };
     {
@@ -7793,19 +8078,21 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
             &path,
             &crate::fs::FsOpenOptions::new().read(true).write(true),
         )?;
-        f.seek(SeekFrom::Start(entry.offset + 4))?;
+        f.seek(SeekFrom::Start(entry.offset + 24))?;
         f.write_all(&restamped.to_le_bytes())?;
-        f.seek(SeekFrom::Start(value_start))?;
+        f.seek(SeekFrom::Start(entry.offset + entries_end as u64))?;
         f.write_all(&garbage)?;
     }
-    // The scanner (framing + raw checksum only) must accept the tampered file:
-    // the whole point is that framing checks cannot see this shape.
+    // The codec-free check (framing and checksum) accepts the tampered frame:
+    // the whole point is that those checks cannot see this shape.
+    let tampered = crate::file::read_exact(
+        &*memfs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?,
+        entry.offset,
+        frame_bytes.len(),
+    )?;
     assert!(
-        crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
-            .next()
-            .expect("one frame")
-            .is_ok(),
-        "fixture: the restamped frame must still pass the raw scan",
+        crate::vlog::blob_file::frame::verify_frame(&tampered).is_ok(),
+        "fixture: the restamped frame must still pass the codec-free check",
     );
 
     let config = blob_validation_config(memfs);
@@ -7840,7 +8127,7 @@ fn blob_frame_validation_rejects_lying_metadata_counters() -> crate::Result<()> 
     let fs_dyn: Arc<dyn Fs> = memfs.clone();
     write_three_frame_blob(&memfs, &victim)?;
     {
-        let mut w = crate::vlog::blob_file::writer::Writer::new(&donor, 0, 0, &*fs_dyn)?;
+        let mut w = crate::vlog::blob_file::writer::Writer::one_frame_each(&donor, 0, 0, &*fs_dyn)?;
         w.write(b"a", 1, &[b'x'; 300])?;
         w.write(b"c", 3, &[b'z'; 300])?;
         w.finish()?;
@@ -7905,7 +8192,7 @@ fn blob_frame_validation_rejects_understated_metadata_on_a_punched_file() -> cra
     let fs_dyn: Arc<dyn Fs> = memfs.clone();
     write_three_frame_blob(&memfs, &victim)?;
     {
-        let mut w = crate::vlog::blob_file::writer::Writer::new(&donor, 0, 0, &*fs_dyn)?;
+        let mut w = crate::vlog::blob_file::writer::Writer::one_frame_each(&donor, 0, 0, &*fs_dyn)?;
         w.write(b"a", 1, &[b'x'; 300])?;
         w.finish()?;
     }
@@ -7982,7 +8269,7 @@ fn blob_frame_validation_rejects_a_range_not_containing_the_punched_suffix() -> 
     let fs_dyn: Arc<dyn Fs> = memfs.clone();
     write_three_frame_blob(&memfs, &victim)?;
     {
-        let mut w = crate::vlog::blob_file::writer::Writer::new(&donor, 0, 0, &*fs_dyn)?;
+        let mut w = crate::vlog::blob_file::writer::Writer::one_frame_each(&donor, 0, 0, &*fs_dyn)?;
         w.write(b"a", 1, &[b'x'; 300])?;
         w.write(b"b", 2, &[b'y'; 300])?;
         w.finish()?;
@@ -8044,7 +8331,7 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
 
     let fs_dyn: Arc<dyn Fs> = memfs.clone();
     for (id, path) in [(0u64, &punched_path), (1u64, &whole_path)] {
-        let mut w = crate::vlog::blob_file::writer::Writer::new(path, id, 0, &*fs_dyn)?;
+        let mut w = crate::vlog::blob_file::writer::Writer::one_frame_each(path, id, 0, &*fs_dyn)?;
         w.write(b"a", 1, &[b'x'; 300])?;
         w.write(b"b", 2, &vec![0u8; 400])?; // zero payload in the live suffix
         w.write(b"c", 3, &[b'y'; 300])?;
@@ -8140,8 +8427,11 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
+        // Every value a frame of its own, so two values make a prefix.
         .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
+            KvSeparationOptions::default()
+                .separation_threshold(16)
+                .block_size(0),
         ))
     };
     {
@@ -8169,7 +8459,8 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
     let prefix: Vec<_> = entries.iter().take(2).collect();
     let frontier = prefix.last().expect("two frames").frame_end;
     let prefix_bytes: u64 = prefix.iter().map(|e| u64::from(e.uncompressed_len)).sum();
-    let prefix_on_disk: u64 = prefix.iter().map(|e| e.value.len() as u64).sum();
+    // What the two frames take, headers and entries included.
+    let prefix_on_disk: u64 = prefix.iter().map(|e| e.frame_end - e.offset).sum();
     let data_start = {
         let mut f = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
         let reader = crate::sfa::Reader::from_reader(&mut f)?;
@@ -8196,7 +8487,104 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
     );
     assert_eq!(entry.bytes, prefix_bytes, "stale uncompressed bytes");
     assert_eq!(entry.on_disk_bytes, prefix_on_disk, "stale on-disk bytes");
+    assert_eq!(entry.block_bytes, 0, "no value of the file shares a block");
     assert_eq!(entry.len, 2, "two punched-away records");
+    Ok(())
+}
+
+/// [`repair_seeds_garbage_accounting_for_a_punched_blob_prefix`] for values
+/// that share blocks: a punched block's values are seeded as block bytes, their
+/// entries uncompressed, so their share of the file's blocks is what the file
+/// is charged, and none as frames of their own.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+
+    let open_config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        // Blocks of four 64-byte values each, an entry of 83 bytes with its
+        // 14-byte header and five-byte key.
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(16)
+                .block_size(340),
+        ))
+    };
+    {
+        let tree = match open_config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(
+                format!("k{i:04}").as_bytes(),
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64],
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = blobs.join("0");
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 8, "eight separated values");
+    let block: Vec<_> = entries.iter().take_while(|e| e.frame == 0).collect();
+    assert_eq!(block.len(), 4, "the first block holds four values");
+    assert!(block.iter().all(|e| e.frames.is_none()), "they share it");
+    let frontier = block.last().expect("four values").frame_end;
+    let prefix_bytes: u64 = block.iter().map(|e| u64::from(e.uncompressed_len)).sum();
+    let prefix_entries: u64 = block
+        .iter()
+        .map(|e| {
+            (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + e.key.len()) as u64
+                + u64::from(e.uncompressed_len)
+        })
+        .sum();
+    let data_start = {
+        let mut f = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+    remove_manifest(&*memfs, &root)?;
+
+    open_config().repair()?;
+
+    let tree = match open_config().open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    let binding = tree.index.version_history.read().latest_version();
+    let entry = binding
+        .version
+        .gc_stats()
+        .get(&0)
+        .copied()
+        .expect("the punched block is seeded as garbage");
+    assert_eq!(
+        entry,
+        crate::blob_tree::FragmentationEntry::new(4, prefix_bytes, 0)
+            .with_block_bytes(prefix_entries),
+    );
     Ok(())
 }
 
@@ -8535,7 +8923,7 @@ fn blob_recovery_queues_the_drop_of_a_fully_punched_blob_file() -> crate::Result
 
     let fs_dyn: Arc<dyn Fs> = memfs.clone();
     for (id, path) in [(0u64, &consumed_path), (1u64, &live_path)] {
-        let mut w = crate::vlog::blob_file::writer::Writer::new(path, id, 0, &*fs_dyn)?;
+        let mut w = crate::vlog::blob_file::writer::Writer::one_frame_each(path, id, 0, &*fs_dyn)?;
         w.write(b"a", 1, &[b'x'; 300])?;
         w.write(b"b", 2, &[b'y'; 300])?;
         w.finish()?;
@@ -8788,7 +9176,7 @@ fn repair_rewrites_a_restricted_table_that_references_a_reshaped_blob() -> crate
 fn repair_swaps_a_routed_rewrite_through_its_own_backend() -> crate::Result<()> {
     use crate::config::LevelRoute;
     use crate::fs::{Fs, MemFs};
-    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::sync::Arc;
 
     let memfs = Arc::new(MemFs::new());
@@ -8808,9 +9196,7 @@ fn repair_swaps_a_routed_rewrite_through_its_own_backend() -> crate::Result<()> 
             path: hot.clone(),
             fs: hotfs.clone(),
         }])
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
     };
 
     {
@@ -9416,30 +9802,32 @@ fn repair_drops_a_blob_referenced_only_by_a_lineage_excluded_output() -> crate::
     // Output 2 records lineage [0, 1] and is the ONLY table referencing
     // blob file 7.
     let blob_path = blobs.join("7");
-    let (offset, on_disk_size) = {
+    let at = {
         let mut w = crate::vlog::blob_file::writer::Writer::new(&blob_path, 7, 0, &*fs_dyn)?;
-        let offset = w.offset();
-        let on_disk_size = w.write(b"k", 2, &[b'x'; 300])?;
+        let at = w.write(b"k", 2, &[b'x'; 300])?;
         w.finish()?;
-        (offset, on_disk_size)
+        at
     };
     let indirection = crate::blob_tree::handle::BlobIndirection {
         vhandle: crate::vlog::ValueHandle {
             blob_file_id: 7,
-            offset,
-            on_disk_size,
+            frame: at.frame,
+            index: at.index,
         },
         size: 300,
+        stored: at.stored,
     };
     {
         let mut w = crate::table::Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs_dyn))?
             .use_recency(0)
             .use_lineage(Some(vec![0, 1]));
+        let (on_disk_bytes, block_bytes) = at.stored.split();
         w.link_blob_file(crate::table::writer::LinkedFile {
             blob_file_id: 7,
             len: 1,
             bytes: 300,
-            on_disk_bytes: u64::from(on_disk_size),
+            on_disk_bytes,
+            block_bytes,
             first_key: b"k".into(),
             last_key: b"k".into(),
         });
@@ -9574,7 +9962,7 @@ fn blob_recovery_keeps_a_file_whose_zeroed_tail_follows_live_frames() -> crate::
     let path = blobs.join("0");
 
     let fs_dyn: Arc<dyn Fs> = memfs.clone();
-    let mut w = crate::vlog::blob_file::writer::Writer::new(&path, 0, 0, &*fs_dyn)?;
+    let mut w = crate::vlog::blob_file::writer::Writer::one_frame_each(&path, 0, 0, &*fs_dyn)?;
     w.write(b"a", 1, &[b'x'; 300])?;
     w.write(b"b", 2, &[b'y'; 300])?;
     w.write(b"c", 3, &[b'z'; 300])?;
@@ -12343,30 +12731,32 @@ fn a_corrupt_reference_section_does_not_abort_the_blob_repair() -> crate::Result
     // count header is corrupted (the digest died with the manifest, so the
     // table still recovers structurally).
     let blob_path = blobs.join("7");
-    let (offset, on_disk_size) = {
+    let at = {
         let mut w = crate::vlog::blob_file::writer::Writer::new(&blob_path, 7, 0, &*fs_dyn)?;
-        let offset = w.offset();
-        let on_disk = w.write(b"m", 2, &[b'x'; 300])?;
+        let at = w.write(b"m", 2, &[b'x'; 300])?;
         w.finish()?;
-        (offset, on_disk)
+        at
     };
     let checksum = {
         let mut w = crate::table::Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs_dyn))?;
+        let (on_disk_bytes, block_bytes) = at.stored.split();
         w.link_blob_file(crate::table::writer::LinkedFile {
             blob_file_id: 7,
             len: 1,
             bytes: 300,
-            on_disk_bytes: u64::from(on_disk_size),
+            on_disk_bytes,
+            block_bytes,
             first_key: b"m".into(),
             last_key: b"m".into(),
         });
         let ind = crate::blob_tree::handle::BlobIndirection {
             vhandle: crate::vlog::ValueHandle {
                 blob_file_id: 7,
-                offset,
-                on_disk_size,
+                frame: at.frame,
+                index: at.index,
             },
             size: 300,
+            stored: at.stored,
         };
         w.write(InternalValue::from_components(
             b"m".to_vec(),
@@ -12459,30 +12849,32 @@ fn a_corrupt_reference_section_is_never_published_as_standard() -> crate::Result
         assert!(w.finish()?.is_some(), "table 0 is non-empty");
     }
     let blob_path = blobs.join("7");
-    let (offset, on_disk_size) = {
+    let at = {
         let mut w = crate::vlog::blob_file::writer::Writer::new(&blob_path, 7, 0, &*fs_dyn)?;
-        let offset = w.offset();
-        let on_disk = w.write(b"m", 2, &[b'x'; 300])?;
+        let at = w.write(b"m", 2, &[b'x'; 300])?;
         w.finish()?;
-        (offset, on_disk)
+        at
     };
     let checksum = {
         let mut w = crate::table::Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs_dyn))?;
+        let (on_disk_bytes, block_bytes) = at.stored.split();
         w.link_blob_file(crate::table::writer::LinkedFile {
             blob_file_id: 7,
             len: 1,
             bytes: 300,
-            on_disk_bytes: u64::from(on_disk_size),
+            on_disk_bytes,
+            block_bytes,
             first_key: b"m".into(),
             last_key: b"m".into(),
         });
         let ind = crate::blob_tree::handle::BlobIndirection {
             vhandle: crate::vlog::ValueHandle {
                 blob_file_id: 7,
-                offset,
-                on_disk_size,
+                frame: at.frame,
+                index: at.index,
             },
             size: 300,
+            stored: at.stored,
         };
         w.write(InternalValue::from_components(
             b"m".to_vec(),
@@ -12564,14 +12956,13 @@ fn blob_salvage_never_allocates_a_missing_referenced_id() -> crate::Result<()> {
     // Blob 0: three frames; the LAST frame's trailer is corrupted so the
     // scan salvages the two live frames into a fresh-id replacement.
     let blob0 = blobs.join("0");
-    let (offset0, on_disk0) = {
-        let mut w = crate::vlog::blob_file::writer::Writer::new(&blob0, 0, 0, &*fs_dyn)?;
-        let offset = w.offset();
-        let on_disk = w.write(b"a", 1, &[b'x'; 300])?;
+    let at0 = {
+        let mut w = crate::vlog::blob_file::writer::Writer::one_frame_each(&blob0, 0, 0, &*fs_dyn)?;
+        let at = w.write(b"a", 1, &[b'x'; 300])?;
         w.write(b"b", 2, &[b'y'; 300])?;
         w.write(b"c", 3, &[b'z'; 300])?;
         w.finish()?;
-        (offset, on_disk)
+        at
     };
     {
         let last = crate::vlog::BlobFileScanner::new(&blob0, &*fs_dyn, 0)?
@@ -12592,11 +12983,13 @@ fn blob_salvage_never_allocates_a_missing_referenced_id() -> crate::Result<()> {
     // pre-fix allocator would hand the salvage replacement.
     {
         let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        let (on_disk_bytes, block_bytes) = at0.stored.split();
         w.link_blob_file(crate::table::writer::LinkedFile {
             blob_file_id: 0,
             len: 1,
             bytes: 300,
-            on_disk_bytes: u64::from(on_disk0),
+            on_disk_bytes,
+            block_bytes,
             first_key: b"a".into(),
             last_key: b"a".into(),
         });
@@ -12605,24 +12998,27 @@ fn blob_salvage_never_allocates_a_missing_referenced_id() -> crate::Result<()> {
             len: 1,
             bytes: 300,
             on_disk_bytes: 100,
+            block_bytes: 0,
             first_key: b"m".into(),
             last_key: b"m".into(),
         });
         let ind0 = crate::blob_tree::handle::BlobIndirection {
             vhandle: crate::vlog::ValueHandle {
                 blob_file_id: 0,
-                offset: offset0,
-                on_disk_size: on_disk0,
+                frame: at0.frame,
+                index: at0.index,
             },
             size: 300,
+            stored: at0.stored,
         };
         let ind1 = crate::blob_tree::handle::BlobIndirection {
             vhandle: crate::vlog::ValueHandle {
                 blob_file_id: 1,
-                offset: 0,
-                on_disk_size: 100,
+                frame: 0,
+                index: 0,
             },
             size: 300,
+            stored: crate::blob_tree::handle::Stored::Frames(100),
         };
         w.write(InternalValue::from_components(
             b"a".to_vec(),
@@ -13073,7 +13469,7 @@ fn open_or_repair_carries_the_report_when_the_follow_up_open_fails() -> crate::R
 fn a_failed_salvage_output_never_costs_the_source() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
-    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
@@ -13086,9 +13482,7 @@ fn a_failed_salvage_output_never_costs_the_source() -> crate::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(fs)
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
     };
 
     for skip in 0u64..10 {
@@ -13183,9 +13577,7 @@ fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Resu
                 SequenceNumberCounter::default(),
             )
             .with_shared_fs(memfs.clone())
-            .with_kv_separation(Some(
-                KvSeparationOptions::default().separation_threshold(16),
-            ))
+            .with_kv_separation(Some(frame_per_value()))
             .open()?
             {
                 crate::AnyTree::Blob(t) => t,
@@ -13730,7 +14122,7 @@ fn a_blob_tree_with_a_damaged_tail() -> crate::Result<(
     std::path::PathBuf,
 )> {
     use crate::fs::{Fs, MemFs};
-    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
@@ -13745,9 +14137,7 @@ fn a_blob_tree_with_a_damaged_tail() -> crate::Result<(
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
         .open()?
         {
             crate::AnyTree::Blob(t) => t,
@@ -13813,9 +14203,7 @@ fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate
                 SequenceNumberCounter::default(),
             )
             .with_shared_fs(memfs.clone())
-            .with_kv_separation(Some(
-                KvSeparationOptions::default().separation_threshold(16),
-            ))
+            .with_kv_separation(Some(frame_per_value()))
             .open()?
             {
                 crate::AnyTree::Blob(t) => t,
@@ -14060,9 +14448,7 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
         .open()?
         {
             crate::AnyTree::Blob(t) => t,
@@ -14074,8 +14460,8 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
         tree.flush_active_memtable(0)?;
     }
 
-    // Corrupt the LAST record's payload (the salvage walk keeps everything
-    // before the first damaged frame, so only this record is lost).
+    // Corrupt the LAST record's payload (the salvage walk keeps every other
+    // frame, so only this record is lost).
     let blobs = root.join(crate::file::BLOBS_FOLDER);
     let blob_path = memfs
         .read_dir(&blobs)?
@@ -14162,6 +14548,186 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
         None,
         "the corrupt record's key reads as absent, never as an error",
     );
+    Ok(())
+}
+
+/// A blob file whose frame index rotted while its metadata and every value
+/// frame are intact is salvaged along its frame chain, not set aside whole:
+/// the index only says where frames start, and an unpunched file's frames
+/// chain from the data start. Every value reads back after the repair.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_salvages_a_blob_whose_frame_index_rotted() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64];
+    {
+        let tree = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(frame_per_value()))
+        .open()?;
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Rot a byte inside the frame index section; the frames and the metadata
+    // stay as written.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let index_at = {
+        let mut file = memfs.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let section = reader.toc().section(b"frames").expect("a frame index");
+        section.pos() + section.len() / 2
+    };
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, index_at, 1)?;
+        file.seek(SeekFrom::Start(index_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    remove_manifest(&*memfs, &root)?;
+
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    let report = config().repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the referencing table survives: {report:?}"
+    );
+    assert_eq!(
+        report.blob_files_salvaged.len(),
+        1,
+        "the file is salvaged, not set aside: {report:?}"
+    );
+
+    let tree = config().open()?;
+    for i in 0..8u32 {
+        assert_eq!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(value(i).as_slice()),
+            "k{i:04} must survive a rotted frame index",
+        );
+    }
+    Ok(())
+}
+
+/// A table pointing into two blob files, one salvaged, is rewritten onto the
+/// salvaged copy for that file alone: its handles into the file left intact
+/// carry over as they were, and every value reads back.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_rewrites_only_the_handles_into_a_salvaged_blob_file() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64];
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(frame_per_value()))
+    };
+    {
+        let tree = config().open()?;
+        for half in [0..4u32, 4..8] {
+            for i in half {
+                tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        // One table pointing into both files.
+        tree.major_compact(64_000_000, 0)?;
+        assert_eq!(tree.table_count(), 1);
+        assert_eq!(tree.blob_file_count(), 2);
+    }
+
+    // Rot the frame index of the first blob file only.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let mut files: Vec<_> = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.path)
+        .collect();
+    files.sort();
+    let blob_path = files.first().expect("two blob files").clone();
+    let index_at = {
+        let mut file = memfs.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let section = reader.toc().section(b"frames").expect("a frame index");
+        section.pos() + section.len() / 2
+    };
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, index_at, 1)?;
+        file.seek(SeekFrom::Start(index_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    remove_manifest(&*memfs, &root)?;
+
+    let repair_config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    let report = repair_config().repair()?;
+    assert_eq!(report.blob_files_salvaged.len(), 1, "{report:?}");
+
+    let tree = repair_config().open()?;
+    for i in 0..8u32 {
+        assert_eq!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(value(i).as_slice()),
+            "k{i:04} reads back after the repair",
+        );
+    }
     Ok(())
 }
 
@@ -14254,9 +14820,7 @@ fn chained_config(root: &std::path::Path, fs: std::sync::Arc<dyn crate::fs::Fs>)
     )
     .with_shared_fs(fs)
     .data_block_size_policy(crate::config::BlockSizePolicy::all(128))
-    .with_kv_separation(Some(
-        crate::KvSeparationOptions::default().separation_threshold(16),
-    ))
+    .with_kv_separation(Some(frame_per_value()))
 }
 
 /// The value of key `i` in the chained-rewrite tree.
@@ -14396,9 +14960,7 @@ fn a_failed_repair_leaves_the_originals_intact_and_the_retry_succeeds() -> crate
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
         .open()?
         {
             crate::AnyTree::Blob(t) => t,
@@ -14569,9 +15131,7 @@ fn a_retry_handles_damage_that_appeared_after_the_failed_attempt() -> crate::Res
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
         .open()?
         {
             crate::AnyTree::Blob(t) => t,
@@ -14709,7 +15269,7 @@ fn a_zeroed_blob_prefix_without_a_hole_is_not_a_frontier() -> crate::Result<()> 
     }
 
     let fs: Arc<dyn Fs> = memfs;
-    let derived = super::derive_blob_frontier(&fs, &blob_path, 0)?;
+    let derived = super::derive_blob_frontier(&fs, &blob_path)?;
     assert!(
         matches!(derived, super::BlobFrontier::Whole),
         "allocated zeros are corruption the validation scan must surface, not a \
@@ -14759,7 +15319,7 @@ fn a_wholly_zeroed_blob_section_without_holes_is_not_fully_consumed() -> crate::
     }
 
     let fs: Arc<dyn Fs> = memfs;
-    let derived = super::derive_blob_frontier(&fs, &blob_path, 0)?;
+    let derived = super::derive_blob_frontier(&fs, &blob_path)?;
     assert!(
         matches!(derived, super::BlobFrontier::Whole),
         "a fully allocated zeroed section is destroyed data, not a relocation \
@@ -14768,13 +15328,22 @@ fn a_wholly_zeroed_blob_section_without_holes_is_not_fully_consumed() -> crate::
     Ok(())
 }
 
+/// Separation of every value from 16 bytes, each into a frame of its own: a
+/// fixture whose damage to one value's frame is damage to that value alone,
+/// what the frame-level repair tests probe.
+fn frame_per_value() -> crate::KvSeparationOptions {
+    crate::KvSeparationOptions::default()
+        .separation_threshold(16)
+        .block_size(0)
+}
+
 /// Builds a one-blob tree with its manifest removed, ready for a repair.
 #[expect(clippy::expect_used, reason = "test code")]
 fn blob_tree_without_manifest(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
     root: &std::path::Path,
 ) -> crate::Result<()> {
-    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
 
     {
         let tree = match Config::new(
@@ -14783,9 +15352,7 @@ fn blob_tree_without_manifest(
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
         .open()?
         {
             crate::AnyTree::Blob(t) => t,
@@ -15053,7 +15620,7 @@ fn a_salvaged_blob_is_stamped_on_the_configured_clock() -> crate::Result<()> {
 #[expect(clippy::expect_used, reason = "test code")]
 fn a_blob_rewrite_preserves_a_zero_ingest_offset() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
-    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use crate::{Config, SequenceNumberCounter};
     use std::sync::Arc;
 
     let memfs = Arc::new(MemFs::new());
@@ -15066,9 +15633,7 @@ fn a_blob_rewrite_preserves_a_zero_ingest_offset() -> crate::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
     };
     {
         let tree = match config().open()? {
@@ -15242,6 +15807,110 @@ fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> cra
     Ok(())
 }
 
+/// A committed frontier at a blob file's data end is a relocation that
+/// consumed every frame and had not yet removed the file: repair queues the
+/// lagged removal, as it does for a file it finds punched whole, instead of
+/// failing over a frontier that is no frame's start.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_committed_frontier_at_the_data_end_is_a_consumed_blob_file() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::version::{BlobFileList, Level, Run, Version};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_blob_frontier_at_end")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+        tree.insert(b"zzz", vec![b'w'; 64], 100);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let (tables, blob_files, installed, blob_path) = {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        let version = tree.index.current_version();
+        let installed = version.id();
+        let blob = version
+            .blob_files
+            .iter()
+            .next()
+            .cloned()
+            .expect("the flush spilled a blob file");
+        let entries: Vec<_> = crate::vlog::BlobFileScanner::new(blob.path(), &*fs_dyn, blob.id())?
+            .collect::<crate::Result<Vec<_>>>()?;
+        // Every frame consumed: the frontier at the data end.
+        let frontier = entries.last().expect("a frame").frame_end;
+        let data_start = {
+            let mut file = fs_dyn.open(blob.path(), &crate::fs::FsOpenOptions::new().read(true))?;
+            let reader = crate::sfa::Reader::from_reader(&mut file)?;
+            reader
+                .toc()
+                .section(b"data")
+                .expect("blob file has a data section")
+                .pos()
+        };
+        memfs.punch_hole(blob.path(), data_start, frontier - data_start)?;
+        let restricted = blob.reopen_restricted(frontier)?;
+        let tables: Vec<_> = version.iter_tables().cloned().collect();
+        let mut map = crate::HashMap::default();
+        map.insert(restricted.id(), restricted);
+        (
+            tables,
+            BlobFileList::new(map),
+            installed,
+            blob.path().to_path_buf(),
+        )
+    };
+    let run = Arc::new(Run::new(tables).expect("non-empty run"));
+    let version = Version::from_levels(
+        installed + 1,
+        crate::TreeType::Blob,
+        alloc::vec![Level::from_runs(alloc::vec![run])],
+        blob_files,
+        crate::blob_tree::FragmentationMap::default(),
+    );
+    crate::version::persist_version(
+        &root,
+        &version,
+        crate::comparator::default_comparator().name(),
+        &*fs_dyn,
+        Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
+        crate::fs::SyncMode::Normal,
+    )?;
+    memfs.remove_file(&root.join("tables").join("1"))?;
+
+    let report = config().repair()?;
+    assert!(
+        !fs_dyn.exists(&blob_path)?,
+        "the consumed file is removed once the manifest is durable: {report:?}"
+    );
+    Ok(())
+}
+
 /// A recovered SST whose blob handles point BELOW a punched blob file's
 /// derived live-data frontier must not be published as-is — a read through
 /// such a handle dereferences the punched (zeroed) prefix and fails. Instead
@@ -15268,9 +15937,7 @@ fn repair_rewrites_tables_with_handles_below_a_blob_frontier() -> crate::Result<
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
         .open()?
         {
             crate::AnyTree::Blob(t) => t,
@@ -15381,9 +16048,7 @@ fn repair_rewrites_cell_rows_with_references_below_a_blob_frontier() -> crate::R
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
         .open()?
         {
             crate::AnyTree::Blob(t) => Ok(t),
@@ -16429,28 +17094,30 @@ fn repair_rejects_an_exhausted_blob_id_space() -> crate::Result<()> {
     // cannot mint it, but a repair-published salvage chain or a foreign copy
     // can place one), plus an SST whose indirection references it.
     let blob_path = blobs.join(u64::MAX.to_string());
-    let (offset, on_disk_size) = {
+    let at = {
         let mut w = crate::vlog::blob_file::writer::Writer::new(&blob_path, u64::MAX, 0, &*fs_dyn)?;
-        let offset = w.offset();
-        let on_disk_size = w.write(b"k", 1, &[b'x'; 300])?;
+        let at = w.write(b"k", 1, &[b'x'; 300])?;
         w.finish()?;
-        (offset, on_disk_size)
+        at
     };
     let indirection = crate::blob_tree::handle::BlobIndirection {
         vhandle: crate::vlog::ValueHandle {
             blob_file_id: u64::MAX,
-            offset,
-            on_disk_size,
+            frame: at.frame,
+            index: at.index,
         },
         size: 300,
+        stored: at.stored,
     };
     {
         let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        let (on_disk_bytes, block_bytes) = at.stored.split();
         w.link_blob_file(crate::table::writer::LinkedFile {
             blob_file_id: u64::MAX,
             len: 1,
             bytes: 300,
-            on_disk_bytes: u64::from(on_disk_size),
+            on_disk_bytes,
+            block_bytes,
             first_key: b"k".into(),
             last_key: b"k".into(),
         });
@@ -18190,7 +18857,7 @@ fn an_intact_blob_duplicate_wins_over_a_salvage_of_the_canonical_copy() -> crate
 #[expect(clippy::expect_used, reason = "test code")]
 fn open_or_repair_reports_what_the_cleanup_after_the_commit_did() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
-    use crate::{AbstractTree, Config, KvSeparationOptions, RepairPolicy, SequenceNumberCounter};
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
@@ -18205,9 +18872,7 @@ fn open_or_repair_reports_what_the_cleanup_after_the_commit_did() -> crate::Resu
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(Arc::clone(&fs))
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
     };
     {
         let tree = config().open()?;
@@ -18259,7 +18924,7 @@ fn open_or_repair_reports_what_the_cleanup_after_the_commit_did() -> crate::Resu
 fn a_salvaged_blob_is_reported_even_when_its_original_cannot_be_removed() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
-    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
@@ -18276,9 +18941,7 @@ fn a_salvaged_blob_is_reported_even_when_its_original_cannot_be_removed() -> cra
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(Arc::clone(&fs))
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
+        .with_kv_separation(Some(frame_per_value()))
     };
 
     {

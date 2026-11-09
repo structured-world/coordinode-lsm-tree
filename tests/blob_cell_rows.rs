@@ -479,7 +479,8 @@ fn a_row_of_a_range_read_keeps_its_read() -> lsm_tree::Result<()> {
 }
 
 /// Builds a blob file holding `doc`'s body and a garbage value, so a major
-/// compaction relocates the body.
+/// compaction relocates the body. The body is separated: a non-empty one by
+/// the default threshold, an empty one only where the caller set it to zero.
 fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> {
     let filler = vec![b'f'; 8_192];
     tree.insert_cells("doc", &bytes(&[b"draft", body]), 0)?;
@@ -490,7 +491,19 @@ fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> 
     // The compaction that drops the old filler charges it; files are picked
     // for relocation by what is charged before a compaction starts.
     tree.major_compact(64_000_000, SeqNo::MAX)?;
-    assert_eq!(tree.stale_blob_bytes(), 8_192, "the filler is garbage");
+    // The filler shares a block with the body: it is charged its entry,
+    // uncompressed, as block bytes. The body is live, so it is not charged,
+    // an empty one too: its file holds a live object of zero bytes.
+    let filler_entry = 14 + b"filler".len() as u64 + filler.len() as u64;
+    let gc_stats = tree.current_version().gc_stats().clone();
+    assert_eq!(
+        gc_stats.values().copied().collect::<Vec<_>>(),
+        [
+            lsm_tree::blob_tree::FragmentationEntry::new(1, filler.len() as u64, 0)
+                .with_block_bytes(filler_entry)
+        ],
+        "the filler is garbage"
+    );
     Ok(())
 }
 
@@ -678,6 +691,91 @@ fn a_relocation_copies_an_object_its_versions_share_once() -> lsm_tree::Result<(
     Ok(())
 }
 
+/// A row that borrows an older object and holds a newer one, both moved by a
+/// relocation, has the copies written under the row's sequence number. Copied
+/// under their own, the older object's copy lands before the newer one's at
+/// the same key with a lower sequence number, which the blob file's order
+/// forbids: salvage reads the later copy as out of order and drops it.
+#[test]
+fn a_relocated_row_writes_its_copies_under_its_own_seqno() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        KvSeparationOptions::default().age_cutoff(1.0),
+    )?;
+    // Above the block size, so each object is a frame of its own and the
+    // relocation copies that frame as it is.
+    let body = vec![b'b'; 20_000];
+    let notes = vec![b'n'; 20_000];
+    tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
+    tree.insert("filler", vec![b'f'; 8_192], 0);
+    tree.flush_active_memtable(0)?;
+
+    // The row at seqno 2 borrows the body written at seqno 0 and adds notes,
+    // flushed into a second file. Each file holds garbage charged before the
+    // same pass, so that pass relocates both.
+    let row = row_of(&tree, "doc")?;
+    tree.insert_cells(
+        "doc",
+        &[
+            Field::bytes(STATUS, b"final"),
+            reference(&row, BODY)?,
+            Field::bytes(BODY + 1, &notes),
+        ],
+        2,
+    )?;
+    drop(row);
+    tree.insert("filler2", vec![b'g'; 8_192], 2);
+    tree.flush_active_memtable(0)?;
+    tree.insert("filler", "small", 3);
+    tree.insert("filler2", "small", 3);
+    tree.flush_active_memtable(0)?;
+    // The first pass charges both fillers, the second relocates both files.
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.stale_blob_bytes(), 0, "both files were relocated");
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body, &notes])[..])
+    );
+
+    // The files a relocation superseded are removed in the background; an
+    // open removes whatever is left of them, so the folder lists live files
+    // alone.
+    drop(tree);
+    drop(open(
+        folder.path(),
+        KvSeparationOptions::default().age_cutoff(1.0),
+    )?);
+
+    let comparator: lsm_tree::SharedComparator = Arc::new(lsm_tree::DefaultUserComparator);
+    let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::StdFs);
+    let blobs = folder.path().join(lsm_tree::file::BLOBS_FOLDER);
+    let salvaged = tempfile::tempdir()?;
+    for (n, entry) in std::fs::read_dir(&blobs)?.enumerate() {
+        let path = entry?.path();
+        if std::fs::metadata(&path)?.len() == 0 {
+            continue;
+        }
+        let report = lsm_tree::salvage::salvage_blob_file(
+            &path,
+            salvaged.path().join(n.to_string()),
+            &fs,
+            0,
+            &comparator,
+            0,
+            #[cfg(feature = "zstd")]
+            None,
+        )?;
+        assert!(
+            report.dropped.is_empty(),
+            "{} holds its records out of order: {report:?}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// A relocation rewrites only the references into the files it relocates: a
 /// row holding one reference into a relocated file and one into a file that
 /// stays has only the first moved, and a row holding references only into
@@ -752,10 +850,19 @@ fn a_memtable_reference_keeps_its_file_through_relocation() -> lsm_tree::Result<
         "the memtable row still reads its object"
     );
     // The relocated file stays for that row, all of it garbage: the body was
-    // copied out and the filler was dead, and the stale bytes say so.
+    // copied out and the filler was dead, and the stale bytes say so. Both
+    // shared one block, so both are charged their entries as block bytes.
+    let entries = (14 + b"doc".len() + body.len()) + (14 + b"filler".len() + 8_192);
     assert_eq!(
-        tree.stale_blob_bytes(),
-        (body.len() + 8_192) as u64,
+        tree.current_version()
+            .gc_stats()
+            .values()
+            .copied()
+            .collect::<Vec<_>>(),
+        [
+            lsm_tree::blob_tree::FragmentationEntry::new(2, (body.len() + 8_192) as u64, 0)
+                .with_block_bytes(entries as u64)
+        ],
         "the whole relocated file is stale"
     );
 

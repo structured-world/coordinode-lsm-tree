@@ -958,7 +958,7 @@ impl MultiWriter {
         self.linked_blobs.register(
             indirection.vhandle.blob_file_id,
             u64::from(indirection.size),
-            u64::from(indirection.vhandle.on_disk_size),
+            indirection.stored,
             key,
             true,
         );
@@ -984,13 +984,15 @@ impl MultiWriter {
                     self.linked_blobs.register(
                         indirection.vhandle.blob_file_id,
                         u64::from(indirection.size),
-                        u64::from(indirection.vhandle.on_disk_size),
+                        indirection.stored,
                         key,
                         owned,
                     );
                     if owned {
-                        self.owned_objects
-                            .push((indirection.vhandle.blob_file_id, indirection.vhandle.offset));
+                        self.owned_objects.push((
+                            indirection.vhandle.blob_file_id,
+                            indirection.vhandle.object(),
+                        ));
                     }
                 }
             } else if row.key.value_type.is_indirection() {
@@ -998,7 +1000,7 @@ impl MultiWriter {
                 self.linked_blobs.register(
                     indirection.vhandle.blob_file_id,
                     u64::from(indirection.size),
-                    u64::from(indirection.vhandle.on_disk_size),
+                    indirection.stored,
                     key,
                     true,
                 );
@@ -1027,13 +1029,15 @@ impl MultiWriter {
             self.linked_blobs.register(
                 indirection.vhandle.blob_file_id,
                 u64::from(indirection.size),
-                u64::from(indirection.vhandle.on_disk_size),
+                indirection.stored,
                 key,
                 owned,
             );
             if owned {
-                self.owned_objects
-                    .push((indirection.vhandle.blob_file_id, indirection.vhandle.offset));
+                self.owned_objects.push((
+                    indirection.vhandle.blob_file_id,
+                    indirection.vhandle.object(),
+                ));
             }
         }
         Ok(())

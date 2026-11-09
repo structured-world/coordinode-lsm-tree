@@ -36,6 +36,7 @@ fn encode_links(links: &[LinkedFile]) -> Vec<u8> {
         out.extend_from_slice(&narrow(link.len).to_le_bytes());
         out.extend_from_slice(&link.bytes.to_le_bytes());
         out.extend_from_slice(&link.on_disk_bytes.to_le_bytes());
+        out.extend_from_slice(&link.block_bytes.to_le_bytes());
         for key in [&link.first_key, &link.last_key] {
             let Ok(len) = u16::try_from(key.len()) else {
                 panic!("a test key is short");
@@ -54,6 +55,7 @@ fn sample_links() -> Vec<LinkedFile> {
             len: 2,
             bytes: 200,
             on_disk_bytes: 120,
+            block_bytes: 33,
             first_key: b"apple".into(),
             last_key: b"banana".into(),
         },
@@ -62,6 +64,7 @@ fn sample_links() -> Vec<LinkedFile> {
             len: 1,
             bytes: 50,
             on_disk_bytes: 40,
+            block_bytes: 0,
             first_key: b"cherry".into(),
             last_key: b"cherry".into(),
         },
@@ -92,7 +95,13 @@ fn linked_blob_files_track_their_section_len_as_entries_register() {
         (3, "elderberry"),
         (5, "fig"),
     ] {
-        linked.register(file, 10, 7, &UserKey::from(key.as_bytes()), true);
+        linked.register(
+            file,
+            10,
+            crate::blob_tree::handle::Stored::InBlock(7),
+            &UserKey::from(key.as_bytes()),
+            true,
+        );
         let links: Vec<LinkedFile> = linked.files.values().cloned().collect();
         assert_eq!(linked.section_len(), encode_links(&links).len() as u64);
     }
@@ -106,11 +115,13 @@ fn linked_blob_files_track_their_section_len_as_entries_register() {
 /// link alone keeps the file from being removed or relocated under it.
 #[test]
 fn a_borrowed_reference_links_its_file_without_counts() {
+    use crate::blob_tree::handle::Stored;
+
     let mut linked = LinkedBlobFiles::default();
-    linked.register(4, 100, 60, &UserKey::from("a"), false);
-    linked.register(4, 30, 20, &UserKey::from("b"), true);
-    linked.register(4, 100, 60, &UserKey::from("c"), false);
-    linked.register(8, 50, 40, &UserKey::from("d"), false);
+    linked.register(4, 100, Stored::Frames(60), &UserKey::from("a"), false);
+    linked.register(4, 30, Stored::Frames(20), &UserKey::from("b"), true);
+    linked.register(4, 100, Stored::InBlock(60), &UserKey::from("c"), false);
+    linked.register(8, 50, Stored::Frames(40), &UserKey::from("d"), false);
     let mut links: Vec<LinkedFile> = linked.take().collect();
     links.sort_by_key(|link| link.blob_file_id);
     assert_eq!(
@@ -120,6 +131,7 @@ fn a_borrowed_reference_links_its_file_without_counts() {
                 blob_file_id: 4,
                 bytes: 30,
                 on_disk_bytes: 20,
+                block_bytes: 0,
                 len: 1,
                 first_key: UserKey::from("a"),
                 last_key: UserKey::from("c"),
@@ -128,6 +140,7 @@ fn a_borrowed_reference_links_its_file_without_counts() {
                 blob_file_id: 8,
                 bytes: 0,
                 on_disk_bytes: 0,
+                block_bytes: 0,
                 len: 0,
                 first_key: UserKey::from("d"),
                 last_key: UserKey::from("d"),

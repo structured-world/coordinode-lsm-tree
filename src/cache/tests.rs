@@ -110,86 +110,41 @@ fn metadata_priority_defaults_on_and_toggles() {
     assert!(off.with_metadata_priority(true).metadata_priority());
 }
 
-/// A blob cache entry is keyed by a POSITION in a blob file, and a corrupt
-/// index entry can point a second key at a position that already holds another
-/// key's value. A direct read catches that: the reader compares the key it was
-/// asked for against the one stored in the record, and refuses the mismatch.
-/// The cached path has to reach the same verdict, or a corrupt entry served
-/// from cache would silently return the neighbouring key's value instead of
-/// reporting the corruption.
+/// A blob cache entry is a frame, keyed by its place in a blob file, and a
+/// corrupt index entry can point a key at a place that holds another key's
+/// value. A cached frame still lists the keys of its values, so a value taken
+/// out of it is checked exactly as one read from disk is: the key it was asked
+/// for against the one at the handle's index. A conflicting key, or an index
+/// the frame does not have, is refused rather than served the neighbour's
+/// value.
 #[test]
-fn a_blob_lookup_under_a_conflicting_key_misses_rather_than_serving_the_other_value() {
-    use crate::vlog::ValueHandle;
+fn a_cached_frame_serves_a_value_only_to_the_key_it_lists() {
+    use crate::vlog::blob_file::{frame::decoded_frame, reader::value_in};
+    use std::sync::Arc;
 
     let cache = Cache::with_capacity_bytes(1024 * 1024);
-    let vhandle = ValueHandle {
+    let at = super::BlobFrameAt {
         blob_file_id: 7,
-        offset: 4096,
-        on_disk_size: 5,
+        frame: 40,
     };
-
-    let copied = cache.insert_blob(
+    cache.insert_blob_frame(
         0,
-        &vhandle,
-        b"real-key",
-        crate::UserValue::from(&b"value"[..]),
+        at,
+        Arc::new(decoded_frame(&[(b"first", b"one"), (b"second", b"two")])),
     );
-    assert_eq!(
-        copied,
-        b"real-key".len(),
-        "the entry owns a copy of its key"
-    );
-
-    // The key it was stored under still finds it.
-    assert_eq!(
-        cache.get_blob(0, &vhandle, b"real-key").as_deref(),
-        Some(&b"value"[..]),
-        "the owning key must still hit",
-    );
-
-    // A different key pointed at the same position must NOT be served this
-    // value; it reads as a miss so the caller does the real read and gets the
-    // real error.
+    let frame = cache.get_blob_frame(0, at).expect("the frame is cached");
+    assert_eq!(&*value_in(&frame, 1, b"second").expect("listed"), b"two");
     assert!(
-        cache.get_blob(0, &vhandle, b"other-key").is_none(),
-        "a conflicting key must not be served the value at that offset",
+        value_in(&frame, 1, b"first").is_err(),
+        "another key at that index is refused"
     );
-}
-
-/// The key is not the only thing a direct read checks: `Reader::parse_record`
-/// also rejects a handle whose declared `on_disk_size` disagrees with the size
-/// in the record header. A corrupt handle can name the right key at the right
-/// offset and still be wrong about the size, so the cached path has to compare
-/// that too or it serves a value the reader would have refused.
-#[test]
-fn a_blob_lookup_with_a_conflicting_size_misses_rather_than_serving_the_value() {
-    use crate::vlog::ValueHandle;
-
-    let cache = Cache::with_capacity_bytes(1024 * 1024);
-    let stored = ValueHandle {
-        blob_file_id: 7,
-        offset: 4096,
-        on_disk_size: 5,
-    };
-
-    let copied = cache.insert_blob(0, &stored, b"key", crate::UserValue::from(&b"value"[..]));
-    assert_eq!(copied, b"key".len(), "the entry owns a copy of its key");
-
-    assert_eq!(
-        cache.get_blob(0, &stored, b"key").as_deref(),
-        Some(&b"value"[..]),
-        "the handle it was stored under must still hit",
-    );
-
-    // Same file, same offset, same key, different declared size: the reader
-    // would reject this handle, so the cache must not answer for it.
-    let conflicting = ValueHandle {
-        on_disk_size: 9,
-        ..stored
-    };
     assert!(
-        cache.get_blob(0, &conflicting, b"key").is_none(),
-        "a handle declaring a different size must not be served the cached value",
+        value_in(&frame, 2, b"second").is_err(),
+        "an index past the frame's list is refused"
+    );
+    assert!(
+        cache.get_blob_frame(1, at).is_none(),
+        "another tree's frame of that number is another entry"
     );
 }
 
@@ -257,53 +212,57 @@ fn a_thread_leading_a_batched_load_never_waits() {
     assert!(waiter.join().expect("waiter"), "took the published block");
 }
 
-/// A read waiting on another read of the same blob position takes the value
-/// only when it was read for the same key: a corrupt index entry can name a
-/// position that holds another key's record, and such a read must meet the
-/// real outcome on its own rather than receive the other key's value.
+/// Reads waiting on another read of the same blob frame take the frame it
+/// published, whatever keys they read it for: the frame lists its keys, so a
+/// read for a key it does not hold at its index is refused when it takes its
+/// value out (see the test above), and never receives another key's value.
 #[test]
-fn a_blob_read_for_another_key_at_the_same_position_is_not_shared() {
+fn reads_waiting_on_one_frame_share_it() {
     use super::BlobClaim;
+    use crate::vlog::blob_file::{frame::decoded_frame, reader::value_in};
     use std::sync::Arc;
 
     let cache = Arc::new(
         Cache::with_capacity_bytes(1024 * 1024)
             .with_load_coalescing_after(core::time::Duration::ZERO),
     );
-    let vhandle = crate::vlog::ValueHandle {
+    let at = super::BlobFrameAt {
         blob_file_id: 3,
-        offset: 0,
-        on_disk_size: 5,
+        frame: 0,
     };
-    let BlobClaim::Lead(lead) = cache.claim_blob(0, &vhandle, b"owner") else {
+    let BlobClaim::Lead(lead) = cache.claim_blob_frame(0, at) else {
         panic!("the first read leads");
     };
-    let other_key = std::thread::spawn({
+    let waiter = |key: &'static [u8]| {
         let cache = Arc::clone(&cache);
-        move || matches!(cache.claim_blob(0, &vhandle, b"intruder"), BlobClaim::Alone)
-    });
-    let same_key = std::thread::spawn({
-        let cache = Arc::clone(&cache);
-        move || match cache.claim_blob(0, &vhandle, b"owner") {
-            BlobClaim::Shared(value) => &*value == b"value",
-            _ => false,
-        }
-    });
+        std::thread::spawn(move || match cache.claim_blob_frame(0, at) {
+            BlobClaim::Shared(frame) => Some(value_in(&frame, 0, key).ok()),
+            _ => None,
+        })
+    };
+    let owner = waiter(b"owner");
+    let intruder = waiter(b"intruder");
     while cache.load_waiters() < 2 {
         std::thread::yield_now();
     }
-    let _ = lead.publish(
+    lead.publish(
         &cache,
         0,
-        &vhandle,
-        b"owner",
-        crate::UserValue::from(&b"value"[..]),
+        at,
+        &Arc::new(decoded_frame(&[(b"owner", b"value")])),
         false,
     );
-    assert!(other_key.join().expect("reader"), "another key reads alone");
+    let owner = owner.join().expect("reader").expect("shared");
+    assert_eq!(
+        owner.as_deref(),
+        Some(&b"value"[..]),
+        "the listed key takes its value"
+    );
+    let intruder = intruder.join().expect("reader").expect("shared");
+    assert!(intruder.is_none(), "another key is refused its value");
     assert!(
-        same_key.join().expect("reader"),
-        "the same key takes the value"
+        cache.get_blob_frame(0, at).is_none(),
+        "a read that does not cache what it reads leaves the cache empty"
     );
 }
 

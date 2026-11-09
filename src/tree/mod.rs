@@ -1739,7 +1739,7 @@ impl AbstractTree for Tree {
             // possible without reading data blocks.
             let num = u128::from(idx_bytes);
             let den = u128::from(data_end);
-            let blob_bytes = table.referenced_blob_bytes()?;
+            let blob_bytes = table.referenced_blob_bytes(&super_version.version.blob_files)?;
             // `num <= den` (both offsets are bounded by `data_end`), so
             // `x * num / den <= x` and the u128 -> u64 narrowing is total —
             // no fallback value to mask a range error with.
@@ -5657,7 +5657,7 @@ impl Tree {
                 .version
                 .blob_files
                 .get(reference.vhandle.blob_file_id)
-                .is_some_and(|file| reference.vhandle.offset >= file.live_data_start());
+                .is_some_and(|file| file.holds_frame(reference.vhandle.frame));
             if !held {
                 return Err(crate::Error::BlobRef(
                     "stale reference: the object has moved, read the key again",

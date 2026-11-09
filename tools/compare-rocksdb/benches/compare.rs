@@ -65,10 +65,11 @@
 //! in exactly one place per engine and the workload code stays
 //! engine-agnostic. The engines: `ours`, `rocksdb`, `surrealkv` (pure-Rust
 //! embedded LSM/MVCC), and each of ours and RocksDB with its values in blob
-//! files, `blob_tree` and `rocksdb_blob`. SurrealKV compresses with zstd at a
-//! fixed level 3 only, so it overlays ONLY on the `None`-compression groups
-//! (see [`engines_for`]), as do the two blob engines; the `_zstd22` groups
-//! stay ours-vs-rocksdb.
+//! files, uncompressed (`blob_tree`, `rocksdb_blob`) and at zstd level 3
+//! (`blob_tree_zstd`, `rocksdb_blob_zstd`, see [`BlobCodec`]). Every group runs
+//! the inline and blob arms of both engines ([`HEAD_TO_HEAD`]); SurrealKV
+//! compresses with zstd at a fixed level 3 only, so it overlays ONLY on the
+//! `None`-compression groups (see [`engines_for`]).
 //!
 //! ## Blob groups
 //!
@@ -129,10 +130,8 @@
 //!   reader alongside. Time per write, with write and space amplification and
 //!   the read percentiles reported beside it (see [`Sustained`]).
 //!
-//! Each of the above also has a `_zstd22` sibling. The read siblings run 70k
-//! only, the one size whose working set overflows the block cache so a read
-//! decodes a block at all (see [`read_sizes`]); the write siblings run every
-//! size.
+//! Each of the above also has a `_zstd22` sibling, run at every size (see
+//! [`SIZES`]).
 //!
 //! Values carry the compressibility RocksDB's own `db_bench` gives its values
 //! by default (see [`ValuePool`]), and every RocksDB read borrows the value
@@ -279,14 +278,14 @@ enum Engine {
     /// Our engine in its KV-separated (`blob_tree`) configuration: values at or
     /// above [`BLOB_SEPARATION_THRESHOLD`] are stored out-of-line in blob files,
     /// so the key-LSM the reads walk is smaller (like surrealkv's vlog). Drives
-    /// the same `AbstractTree` API as `Ours`; participates only in the
-    /// None-compression groups where surrealkv overlays (see [`engines_for`]).
-    BlobTree,
+    /// the same `AbstractTree` API as `Ours`, its blob files compressed as the
+    /// codec says.
+    BlobTree(BlobCodec),
     /// RocksDB with blob files: values at or above [`BLOB_SEPARATION_THRESHOLD`]
     /// in blob files, no blob cache, as RocksDB defaults it, so a value is read
     /// from its file through the page cache. The counterpart `blob_tree` is
-    /// measured against.
-    RocksDbBlob,
+    /// measured against, its blob files compressed as the codec says.
+    RocksDbBlob(BlobCodec),
 }
 
 impl Engine {
@@ -295,21 +294,75 @@ impl Engine {
             Self::Ours => "ours",
             Self::RocksDb => "rocksdb",
             Self::SurrealKv => "surrealkv",
-            Self::BlobTree => "blob_tree",
-            Self::RocksDbBlob => "rocksdb_blob",
+            Self::BlobTree(BlobCodec::Off) => "blob_tree",
+            Self::BlobTree(BlobCodec::Zstd) => "blob_tree_zstd",
+            Self::RocksDbBlob(BlobCodec::Off) => "rocksdb_blob",
+            Self::RocksDbBlob(BlobCodec::Zstd) => "rocksdb_blob_zstd",
         }
     }
 
-    /// Whether this engine opens our tree with KV-separation enabled.
-    fn kv_separated(self) -> bool {
-        matches!(self, Self::BlobTree)
+    /// The blob codec this engine opens our tree with, if it separates values.
+    fn kv_separated(self) -> Option<BlobCodec> {
+        match self {
+            Self::BlobTree(codec) => Some(codec),
+            _ => None,
+        }
     }
 
-    /// Whether this engine opens RocksDB with blob files.
-    fn blob_files(self) -> bool {
-        matches!(self, Self::RocksDbBlob)
+    /// The blob codec this engine opens RocksDB with, if it uses blob files.
+    fn blob_files(self) -> Option<BlobCodec> {
+        match self {
+            Self::RocksDbBlob(codec) => Some(codec),
+            _ => None,
+        }
     }
 }
+
+/// How the blob arms compress their blob files, the same on both engines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BlobCodec {
+    /// Blob files uncompressed.
+    Off,
+    /// Blob files at zstd level [`BlobCodec::ZSTD_LEVEL`], whatever the group
+    /// compresses its tables with.
+    Zstd,
+}
+
+impl BlobCodec {
+    /// zstd's default level. RocksDB's C API sets the blob codec but not the
+    /// blob level, which stays at its `blob_compression_opts` default, zstd's
+    /// own default; ours is set to the same.
+    const ZSTD_LEVEL: i32 = 3;
+
+    /// Our blob compression. Set in both arms, so a default that changes with a
+    /// feature of the bench crate cannot compress the uncompressed arm.
+    fn ours(self) -> CompressionType {
+        match self {
+            Self::Off => CompressionType::None,
+            Self::Zstd => CompressionType::Zstd(Self::ZSTD_LEVEL),
+        }
+    }
+
+    /// RocksDB's blob compression type; its level stays at the default, which
+    /// is [`BlobCodec::ZSTD_LEVEL`].
+    fn rocksdb(self) -> rocksdb::DBCompressionType {
+        match self {
+            Self::Off => rocksdb::DBCompressionType::None,
+            Self::Zstd => rocksdb::DBCompressionType::Zstd,
+        }
+    }
+}
+
+/// Our engine and RocksDB, each with its values inline and in blob files, the
+/// blob files uncompressed and compressed: the arms of every group.
+const HEAD_TO_HEAD: &[Engine] = &[
+    Engine::Ours,
+    Engine::RocksDb,
+    Engine::BlobTree(BlobCodec::Off),
+    Engine::RocksDbBlob(BlobCodec::Off),
+    Engine::BlobTree(BlobCodec::Zstd),
+    Engine::RocksDbBlob(BlobCodec::Zstd),
+];
 
 /// KV-separation threshold for the `blob_tree` arm: values at or above this many
 /// bytes are stored out-of-line. The benchmark value is 256 bytes (see
@@ -325,31 +378,27 @@ const BLOB_SEPARATION_THRESHOLD: u32 = 128;
 /// SurrealKV's zstd is fixed at level 3 (no level setting), so it cannot match
 /// the `Zstd22` variant apples-to-apples: adding a level-3 line to a zstd22
 /// graph would misrepresent the comparison. It is
-/// therefore restricted to the `None`-compression groups, where all three
-/// engines run codec-neutral. The `_zstd22` groups stay ours-vs-rocksdb.
+/// therefore restricted to the `None`-compression groups, where every engine
+/// runs codec-neutral. The `_zstd22` groups run the [`HEAD_TO_HEAD`] arms.
 fn engines_for(compression: Compression) -> &'static [Engine] {
     match compression {
         Compression::None => &[
             Engine::Ours,
             Engine::RocksDb,
             Engine::SurrealKv,
-            Engine::BlobTree,
-            Engine::RocksDbBlob,
+            Engine::BlobTree(BlobCodec::Off),
+            Engine::RocksDbBlob(BlobCodec::Off),
+            Engine::BlobTree(BlobCodec::Zstd),
+            Engine::RocksDbBlob(BlobCodec::Zstd),
         ],
-        Compression::Zstd22 => &[Engine::Ours, Engine::RocksDb],
+        Compression::Zstd22 => HEAD_TO_HEAD,
     }
 }
 
-/// Engines of the blob groups: each engine with its values inline and in blob
-/// files. SurrealKV writes its values to its log whatever their size and is
-/// not seeded (see [`SeedStates`]); at these sizes its arms would mostly time
-/// writing the state they start from.
-const BLOB_ENGINES: &[Engine] = &[
-    Engine::Ours,
-    Engine::RocksDb,
-    Engine::BlobTree,
-    Engine::RocksDbBlob,
-];
+/// Engines of the blob groups. SurrealKV writes its values to its log whatever
+/// their size and is not seeded (see [`SeedStates`]); at these sizes its arms
+/// would mostly time writing the state they start from.
+const BLOB_ENGINES: &[Engine] = HEAD_TO_HEAD;
 
 /// What a group's values are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -375,7 +424,7 @@ impl Spec {
     /// The key counts and engines every write group of `compression` runs.
     fn writes(compression: Compression) -> Self {
         Self {
-            sizes: &[1_000, 10_000, 70_000],
+            sizes: SIZES,
             values: Values::Pool,
             engines: engines_for(compression),
         }
@@ -384,7 +433,7 @@ impl Spec {
     /// The key counts and engines every warm read group of `compression` runs.
     fn reads(compression: Compression) -> Self {
         Self {
-            sizes: read_sizes(compression),
+            sizes: SIZES,
             values: Values::Pool,
             engines: engines_for(compression),
         }
@@ -412,21 +461,14 @@ const BLOB_SPECS: &[(&str, Spec)] = &[
     ),
 ];
 
-/// Element counts of a warm-read group (`point_read`, `multi_get`,
-/// `range_scan`, `seek_random`).
+/// Element counts of every write and warm-read group, compressed or not.
 ///
 /// The block cache is 16 MiB on both engines and every value is 256 bytes, so
-/// at 1k and 10k the whole key set stays in the cache after the warm-up: no
-/// timed read decodes a block, and a zstd-22 group at those sizes measures
-/// exactly what the uncompressed group at the same size does (it did, within
-/// noise, on every engine and size). Only 70k overflows the cache, so the
-/// zstd-22 read groups run that size alone.
-fn read_sizes(compression: Compression) -> &'static [u64] {
-    match compression {
-        Compression::None => &[1_000, 10_000, 70_000],
-        Compression::Zstd22 => &[70_000],
-    }
-}
+/// at 1k and 10k the inline arms of a zstd-22 read group decode no block after
+/// the warm-up and measure what the uncompressed group does; the blob arms read
+/// their values from blob files, whose frames RocksDB does not cache, so those
+/// sizes still tell the blob paths apart.
+const SIZES: &[u64] = &[1_000, 10_000, 70_000];
 
 /// Compression axis of the engine matrix. Each workload runs once per
 /// variant so the dashboard plots the `None` baseline and the
@@ -688,12 +730,12 @@ impl WorkloadInputs {
 /// `set_compression_options`.
 ///
 /// `blob_files` stores values at or above [`BLOB_SEPARATION_THRESHOLD`] in blob
-/// files, uncompressed as `blob_tree` keeps them, without a blob cache: the
-/// RocksDB default, as not caching values is ours.
+/// files, compressed as the codec says, the same as `blob_tree` keeps them,
+/// without a blob cache: the RocksDB default, as not caching values is ours.
 fn rocksdb_options(
     compression: Compression,
     hash_index: bool,
-    blob_files: bool,
+    blob_files: Option<BlobCodec>,
 ) -> rocksdb::Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     let cache = rocksdb::Cache::new_lru_cache(16 * 1024 * 1024);
@@ -727,12 +769,18 @@ fn rocksdb_options(
         i32::try_from(COMPRESSION_THREADS).expect("COMPRESSION_THREADS fits i32"),
     );
     opts.set_block_based_table_factory(&block_opts);
-    if blob_files {
-        opts.set_enable_blob_files(true);
-        opts.set_min_blob_size(u64::from(BLOB_SEPARATION_THRESHOLD));
-        opts.set_blob_compression_type(rocksdb::DBCompressionType::None);
+    if let Some(codec) = blob_files {
+        set_blob_files(&mut opts, codec);
     }
     opts
+}
+
+/// RocksDB's blob files as the blob arms use them: values at or above
+/// [`BLOB_SEPARATION_THRESHOLD`], compressed as `codec` says.
+fn set_blob_files(opts: &mut rocksdb::Options, codec: BlobCodec) {
+    opts.set_enable_blob_files(true);
+    opts.set_min_blob_size(u64::from(BLOB_SEPARATION_THRESHOLD));
+    opts.set_blob_compression_type(codec.rocksdb());
 }
 
 /// Threads compressing a table's blocks, on both engines and in every group:
@@ -749,7 +797,7 @@ const COMPRESSION_THREADS: usize = 4;
 fn open_ours(
     dir: &std::path::Path,
     compression: Compression,
-    kv_separated: bool,
+    kv_separated: Option<BlobCodec>,
     strategy: IndexStrategy,
     row_cache: bool,
 ) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
@@ -766,12 +814,12 @@ fn open_ours(
 /// apples with RocksDB's `DBCompressionType::None`.
 ///
 /// When `kv_separated` is set, values at or above [`BLOB_SEPARATION_THRESHOLD`]
-/// are stored out-of-line (the `blob_tree` arm); the blob files inherit the
-/// `None`-compression baseline so the separated path stays codec-neutral too.
+/// are stored out-of-line (the `blob_tree` arms), the blob files compressed as
+/// its codec says whatever the tables are compressed with.
 fn ours_config(
     dir: &std::path::Path,
     compression: Compression,
-    kv_separated: bool,
+    kv_separated: Option<BlobCodec>,
     strategy: IndexStrategy,
     row_cache: bool,
 ) -> Config {
@@ -829,17 +877,19 @@ fn ours_config(
             CompressionType::Zstd(Compression::ZSTD_MAX_LEVEL),
         )),
     };
-    if kv_separated {
-        // Blobs stay `None`-compressed (the bench crate has no `lz4` feature, so
-        // the default blob compression is already `None`; set it explicitly so a
-        // future feature flip cannot silently compress blobs).
-        config
+    separate_values(config, kv_separated)
+}
+
+/// `config` with values at or above [`BLOB_SEPARATION_THRESHOLD`] in blob files
+/// compressed as `blobs` says, or unchanged without it.
+fn separate_values(config: Config, blobs: Option<BlobCodec>) -> Config {
+    match blobs {
+        Some(codec) => config
             .with_kv_separation(Some(
                 KvSeparationOptions::default().separation_threshold(BLOB_SEPARATION_THRESHOLD),
             ))
-            .blob_compression(CompressionType::None)
-    } else {
-        config
+            .blob_compression(codec.ours()),
+        None => config,
     }
 }
 
@@ -888,7 +938,7 @@ fn run_write_throughput(
     let dir = tempfile::tempdir()?;
     let start = std::time::Instant::now();
     let elapsed = match engine {
-        Engine::Ours | Engine::BlobTree => {
+        Engine::Ours | Engine::BlobTree(_) => {
             let tree = open_ours(
                 dir.path(),
                 compression,
@@ -912,7 +962,7 @@ fn run_write_throughput(
             // work doesn't leak into the timed window.
             start.elapsed()
         }
-        Engine::RocksDb | Engine::RocksDbBlob => {
+        Engine::RocksDb | Engine::RocksDbBlob(_) => {
             // Bloom (10 bits/key) + 16 MiB cache + no compression, matching
             // our engine's defaults — see `rocksdb_options`. Our engine
             // builds a bloom filter at flush, so giving RocksDB the same
@@ -1254,7 +1304,7 @@ fn open_rocksdb(
     dir: &std::path::Path,
     compression: Compression,
     hash_index: bool,
-    blob_files: bool,
+    blob_files: Option<BlobCodec>,
 ) -> rocksdb::DB {
     let opts = rocksdb_options(compression, hash_index, blob_files);
     // Open through a column-family descriptor that carries the SAME options:
@@ -1275,7 +1325,7 @@ fn populate_rocksdb(
     dir: &std::path::Path,
     compression: Compression,
     hash_index: bool,
-    blob_files: bool,
+    blob_files: Option<BlobCodec>,
     inputs: &WorkloadInputs,
 ) -> rocksdb::DB {
     let db = open_rocksdb(dir, compression, hash_index, blob_files);
@@ -1290,13 +1340,13 @@ fn populate_rocksdb(
 
 /// Populates our engine at `dir` and flushes, returning the handle.
 /// Companion to [`populate_rocksdb`] for our [`SeedStates`]. `kv_separated`
-/// selects the `blob_tree` (KV-separated) configuration; `strategy` /
+/// selects a `blob_tree` (KV-separated) configuration; `strategy` /
 /// `row_cache` select the `point_read` index-strategy series.
 fn populate_ours(
     dir: &std::path::Path,
     compression: Compression,
     inputs: &WorkloadInputs,
-    kv_separated: bool,
+    kv_separated: Option<BlobCodec>,
     strategy: IndexStrategy,
     row_cache: bool,
 ) -> lsm_tree::AnyTree {
@@ -1395,7 +1445,7 @@ fn settle() {
 fn write_seed(key: SeedKey, inputs: &WorkloadInputs) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("seed tempdir");
     match key.engine {
-        Engine::Ours | Engine::BlobTree => drop(populate_ours(
+        Engine::Ours | Engine::BlobTree(_) => drop(populate_ours(
             dir.path(),
             key.compression,
             inputs,
@@ -1403,7 +1453,7 @@ fn write_seed(key: SeedKey, inputs: &WorkloadInputs) -> tempfile::TempDir {
             key.strategy,
             false,
         )),
-        Engine::RocksDb | Engine::RocksDbBlob => drop(populate_rocksdb(
+        Engine::RocksDb | Engine::RocksDbBlob(_) => drop(populate_rocksdb(
             dir.path(),
             key.compression,
             key.strategy == IndexStrategy::HashIndex,
@@ -1460,8 +1510,10 @@ fn bench_seeded(run: &mut Run) {
         Spec::writes(zstd),
         &mut seeds,
     );
-    // Blobs: uncompressed, as random bytes give a codec nothing to do. No
-    // seek group: with one key per blob it reads what a point read does.
+    // Blobs: tables uncompressed, as random bytes give a codec nothing to do;
+    // the compressed blob arms show what each engine stores and reads for a
+    // value its codec cannot shrink. No seek group: with one key per blob it
+    // reads what a point read does.
     for (suffix, spec) in BLOB_SPECS {
         let spec = *spec;
         point_read_variant(
@@ -1516,7 +1568,7 @@ impl WarmEngine {
         seeds: &mut SeedStates,
     ) -> Self {
         match engine {
-            Engine::Ours | Engine::BlobTree => {
+            Engine::Ours | Engine::BlobTree(_) => {
                 let dir = copy_of(seeds.seed(engine, compression, strategy, inputs));
                 let tree = open_ours(
                     dir.path(),
@@ -1528,7 +1580,7 @@ impl WarmEngine {
                 .expect("ours: open");
                 Self::Ours { tree, _dir: dir }
             }
-            Engine::RocksDb | Engine::RocksDbBlob => {
+            Engine::RocksDb | Engine::RocksDbBlob(_) => {
                 let dir = copy_of(seeds.seed(engine, compression, strategy, inputs));
                 let db = open_rocksdb(
                     dir.path(),
@@ -1992,7 +2044,7 @@ fn overwrite_variant(
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         match engine {
-                            Engine::Ours | Engine::BlobTree => {
+                            Engine::Ours | Engine::BlobTree(_) => {
                                 // First copy (untimed): the seed, so the timed
                                 // pass overwrites existing keys.
                                 let dir = copy_of(seed.as_deref().expect("ours is seeded"));
@@ -2016,7 +2068,7 @@ fn overwrite_variant(
                                     .expect("ours: overwrite flush");
                                 total += start.elapsed();
                             }
-                            Engine::RocksDb | Engine::RocksDbBlob => {
+                            Engine::RocksDb | Engine::RocksDbBlob(_) => {
                                 let dir = copy_of(seed.as_deref().expect("rocksdb is seeded"));
                                 let db = open_rocksdb(
                                     dir.path(),
@@ -2069,7 +2121,7 @@ fn overwrite_variant(
                 for _ in 0..iters {
                     let dir = copy_of(&seed);
                     let tree =
-                        ours_config(dir.path(), compression, false, IndexStrategy::Binary, false)
+                        ours_config(dir.path(), compression, None, IndexStrategy::Binary, false)
                             .flush_durability(FlushDurability::Deferred)
                             .open()
                             .expect("ours-deferred-wal: open");
@@ -2329,11 +2381,12 @@ fn spawn_named<'scope, 'env, T: Send + 'scope>(
 fn sustained_ours(
     shape: Sustained,
     compression: Compression,
+    blobs: Option<BlobCodec>,
     keys: &[[u8; 16]],
     pool: &ValuePool,
 ) -> (Duration, SustainedSample) {
     let dir = tempfile::tempdir().expect("ours sustained dir");
-    let tree = ours_config(dir.path(), compression, false, IndexStrategy::Binary, false)
+    let tree = ours_config(dir.path(), compression, blobs, IndexStrategy::Binary, false)
         .flush_durability(FlushDurability::Deferred)
         .open()
         .expect("ours sustained: open");
@@ -2506,8 +2559,11 @@ fn sustained_ours(
 /// RocksDB's options for the sustained run: the matched ones every group uses,
 /// with the memtable, table and level sizes [`Sustained`] sets for both
 /// engines, and statistics on to count compaction bytes.
-fn rocksdb_sustained_options(compression: Compression) -> rocksdb::Options {
-    let mut opts = rocksdb_options(compression, false, false);
+fn rocksdb_sustained_options(
+    compression: Compression,
+    blob_files: Option<BlobCodec>,
+) -> rocksdb::Options {
+    let mut opts = rocksdb_options(compression, false, blob_files);
     opts.set_write_buffer_size(
         usize::try_from(Sustained::MEMTABLE_BYTES).expect("the memtable size fits usize"),
     );
@@ -2540,11 +2596,12 @@ fn rocksdb_quiesce(db: &rocksdb::DB) {
 fn sustained_rocksdb(
     shape: Sustained,
     compression: Compression,
+    blob_files: Option<BlobCodec>,
     keys: &[[u8; 16]],
     pool: &ValuePool,
 ) -> (Duration, SustainedSample) {
     let dir = tempfile::tempdir().expect("rocksdb sustained dir");
-    let opts = rocksdb_sustained_options(compression);
+    let opts = rocksdb_sustained_options(compression, blob_files);
     let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb sustained: open");
     let mut write_opts = rocksdb::WriteOptions::default();
     write_opts.disable_wal(true);
@@ -2600,7 +2657,8 @@ fn bench_overwrite_sustained(run: &mut Run) {
         if !run.wants(group) {
             continue;
         }
-        let arms = [Engine::Ours, Engine::RocksDb]
+        let arms = run
+            .engines_of(HEAD_TO_HEAD)
             .into_iter()
             .map(|engine| {
                 let last = Rc::new(Cell::new(SustainedSample::default()));
@@ -2609,11 +2667,22 @@ fn bench_overwrite_sustained(run: &mut Run) {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         let (elapsed, measured) = match engine {
-                            Engine::RocksDb | Engine::RocksDbBlob => {
-                                sustained_rocksdb(shape, compression, keys, pool)
-                            }
-                            Engine::Ours | Engine::BlobTree | Engine::SurrealKv => {
-                                sustained_ours(shape, compression, keys, pool)
+                            Engine::RocksDb | Engine::RocksDbBlob(_) => sustained_rocksdb(
+                                shape,
+                                compression,
+                                engine.blob_files(),
+                                keys,
+                                pool,
+                            ),
+                            Engine::Ours | Engine::BlobTree(_) => sustained_ours(
+                                shape,
+                                compression,
+                                engine.kv_separated(),
+                                keys,
+                                pool,
+                            ),
+                            Engine::SurrealKv => {
+                                unreachable!("the sustained groups run ours and rocksdb only")
                             }
                         };
                         total += elapsed;
@@ -2670,11 +2739,13 @@ impl CompactionShape {
 }
 
 /// Our tree as the compaction benches open it, on a fresh or a copied
-/// directory: zstd at `level` and the shape's threads.
+/// directory: zstd at `level`, the shape's threads, and values in blob files
+/// when `blobs` names their codec.
 fn open_ours_for_compaction(
     dir: &std::path::Path,
     level: i32,
     shape: CompactionShape,
+    blobs: Option<BlobCodec>,
 ) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
     let config = Config::new(
         dir,
@@ -2689,7 +2760,7 @@ fn open_ours_for_compaction(
         CompactionShape::Major => u64::MAX,
         CompactionShape::Split => 0,
     });
-    Ok(apply_preset(config, active_preset()).open()?)
+    Ok(separate_values(apply_preset(config, active_preset()), blobs).open()?)
 }
 
 /// RocksDB as the compaction benches open it. The block options are the
@@ -2700,8 +2771,9 @@ fn open_rocksdb_for_compaction(
     dir: &std::path::Path,
     level: i32,
     shape: CompactionShape,
+    blob_files: Option<BlobCodec>,
 ) -> Result<rocksdb::DB, Box<dyn std::error::Error>> {
-    let mut opts = rocksdb_options(Compression::None, false, false);
+    let mut opts = rocksdb_options(Compression::None, false, blob_files);
     // Hold every table where the setup put it until the compaction timed.
     opts.set_disable_auto_compactions(true);
     opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
@@ -2754,8 +2826,8 @@ fn write_compaction_state(
         .collect();
     let rows = || inputs.keys.iter().zip(inputs.values.iter());
     match engine {
-        Engine::Ours => {
-            let tree = open_ours_for_compaction(dir, level, shape)?;
+        Engine::Ours | Engine::BlobTree(_) => {
+            let tree = open_ours_for_compaction(dir, level, shape, engine.kv_separated())?;
             let mut base = 0;
             if matches!(shape, CompactionShape::Split) {
                 for ((key, value), seqno) in rows().zip(0u64..) {
@@ -2774,8 +2846,8 @@ fn write_compaction_state(
             }
             tree.flush_active_memtable(0)?;
         }
-        Engine::RocksDb => {
-            let db = open_rocksdb_for_compaction(dir, level, shape)?;
+        Engine::RocksDb | Engine::RocksDbBlob(_) => {
+            let db = open_rocksdb_for_compaction(dir, level, shape, engine.blob_files())?;
             let mut write_opts = rocksdb::WriteOptions::default();
             write_opts.disable_wal(true);
             if matches!(shape, CompactionShape::Split) {
@@ -2793,11 +2865,9 @@ fn write_compaction_state(
             }
             db.flush()?;
         }
-        // The compaction benches are zstd-level workloads; SurrealKV has no zstd
-        // codec, and blob_tree overlays only the read/write groups, so the
-        // compaction loop is fixed to ours+rocksdb. The arms exist only for
-        // exhaustiveness.
-        Engine::SurrealKv | Engine::BlobTree | Engine::RocksDbBlob => {
+        // The compaction benches are zstd-level workloads and SurrealKV has no
+        // level setting, so they run the head-to-head arms only.
+        Engine::SurrealKv => {
             unreachable!("the compaction benches run ours and rocksdb only")
         }
     }
@@ -2813,20 +2883,20 @@ fn time_compaction(
     dir: &std::path::Path,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     match engine {
-        Engine::Ours => {
-            let tree = open_ours_for_compaction(dir, level, shape)?;
+        Engine::Ours | Engine::BlobTree(_) => {
+            let tree = open_ours_for_compaction(dir, level, shape, engine.kv_separated())?;
             let start = std::time::Instant::now();
             tree.major_compact(u64::MAX, 0)?;
             Ok(start.elapsed())
         }
-        Engine::RocksDb => {
-            let db = open_rocksdb_for_compaction(dir, level, shape)?;
+        Engine::RocksDb | Engine::RocksDbBlob(_) => {
+            let db = open_rocksdb_for_compaction(dir, level, shape, engine.blob_files())?;
             let compact_opts = force_bottommost();
             let start = std::time::Instant::now();
             db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &compact_opts);
             Ok(start.elapsed())
         }
-        Engine::SurrealKv | Engine::BlobTree | Engine::RocksDbBlob => {
+        Engine::SurrealKv => {
             unreachable!("the compaction benches run ours and rocksdb only")
         }
     }
@@ -2864,7 +2934,8 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
             CompactionShape::Major => WorkloadInputs::build(n),
             CompactionShape::Split => WorkloadInputs::incompressible(n),
         };
-        let states: Vec<(Engine, tempfile::TempDir)> = [Engine::Ours, Engine::RocksDb]
+        let states: Vec<(Engine, tempfile::TempDir)> = run
+            .engines_of(HEAD_TO_HEAD)
             .into_iter()
             .map(|engine| {
                 let dir = tempfile::tempdir().expect("compaction state tempdir");
@@ -3016,8 +3087,14 @@ enum Layout {
 impl Layout {
     const ALL: [Self; 2] = [Self::Inline, Self::Separated];
 
+    /// A blob arm keeps its values in blob files whatever its codec; every
+    /// blob arm is one of [`HEAD_TO_HEAD`].
     fn of(label: &str) -> Self {
-        if label == Engine::BlobTree.label() || label == Engine::RocksDbBlob.label() {
+        let separated = HEAD_TO_HEAD.iter().any(|engine| {
+            engine.label() == label
+                && (engine.kv_separated().is_some() || engine.blob_files().is_some())
+        });
+        if separated {
             Self::Separated
         } else {
             Self::Inline
@@ -3034,7 +3111,7 @@ impl Layout {
     fn baseline(self) -> Engine {
         match self {
             Self::Inline => Engine::RocksDb,
-            Self::Separated => Engine::RocksDbBlob,
+            Self::Separated => Engine::RocksDbBlob(BlobCodec::Off),
         }
     }
 }

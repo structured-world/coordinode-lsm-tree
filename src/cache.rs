@@ -2,13 +2,13 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+use crate::GlobalTableId;
 #[cfg(feature = "zstd")]
 use crate::UserKey;
 use crate::sharded_cache::{Priority, ShardedCache, Weighter};
 use crate::table::block::{BlockType, Header};
 use crate::table::{Block, BlockOffset};
 use crate::value::InternalValue;
-use crate::{GlobalTableId, UserValue};
 
 const TAG_BLOCK: u8 = 0;
 const TAG_BLOB: u8 = 1;
@@ -26,16 +26,12 @@ const TAG_DIRECTORY: u8 = 4;
 #[derive(Clone)]
 enum Item {
     Block(Block),
-    /// A separated value, carrying everything about the handle that the cache
-    /// key does not: the user key it belongs to and the record's on-disk size.
+    /// A blob file frame, checked and decoded, under its file and frame number.
     ///
-    /// The cache key is the blob file id plus the offset, which identifies a
-    /// POSITION, not a record. A corrupt index entry can name that position
-    /// with a different key, or with the right key and the wrong size. A direct
-    /// read rejects both (the reader compares the key it was asked for AND the
-    /// declared size against the record header), so the cached path keeps the
-    /// same two fields and compares them, rather than trusting the position.
-    Blob(crate::UserKey, u32, UserValue),
+    /// The frame lists the key of every value it holds, so a reader that finds
+    /// it compares the key it was asked for against the one at its index, as a
+    /// direct read does, rather than trusting the position.
+    BlobFrame(alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>),
     /// A resolved point-read result for one user key in one (immutable) SST: the
     /// newest version found there. The full key is carried in `key.user_key` so a
     /// hash collision on the cache key is caught (verified on lookup) rather than
@@ -114,13 +110,13 @@ struct BlockWeighter;
 
 impl Weighter<CacheKey, Item> for BlockWeighter {
     fn weight(&self, _: &CacheKey, item: &Item) -> u64 {
-        use Item::{Blob, Block};
+        use Item::{BlobFrame, Block};
 
         match item {
             Block(b) => block_weight(b),
-            // Key + value; the size field is an inline scalar. The prefetch's
-            // admission budget charges itself the same way, so the two agree.
-            Blob(key, _, b) => (key.len() + b.len()) as u64,
+            // What it decoded and its entries. The prefetch's admission budget
+            // charges itself the same way, so the two agree.
+            BlobFrame(frame) => frame.weight(),
             Item::Row(iv) => row_weight(iv.key.user_key.len(), iv.value.len()),
             // Weighed by the resident decompressed prefix + covered key; the
             // shared `Arc<ResumeState>` scratch is approximated by a small fixed
@@ -207,9 +203,9 @@ pub(crate) enum LoadIdentity {
         compression: crate::CompressionType,
         encrypted: bool,
     },
-    /// A separated value: its record's on-disk size. The user key is checked
-    /// against the value the load returns, as a cache hit checks it.
-    Blob { on_disk_size: u32 },
+    /// A blob file frame. The key a reader asks for is checked against the
+    /// frame the load returns, as a cache hit checks it.
+    BlobFrame,
     /// Growth of a block's partially decoded prefix. Waiters take no value:
     /// once the growth ends they look at the cached prefix again.
     #[cfg(feature = "zstd")]
@@ -297,48 +293,50 @@ impl DirectoryLead<'_> {
     }
 }
 
-/// How a blob miss proceeds, as [`BlockClaim`] for a block.
+/// How a blob frame miss proceeds, as [`BlockClaim`] for a block.
 pub(crate) enum BlobClaim<'a> {
-    /// Read the value, then [`BlobLead::publish`].
+    /// Read the frame, then [`BlobLead::publish`].
     Lead(BlobLead<'a>),
-    /// A concurrent read of the same record, for the same key, finished.
-    Shared(UserValue),
-    /// Read the value without coordination.
+    /// A concurrent read of the same frame finished.
+    Shared(alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>),
+    /// Read the frame without coordination.
     Alone,
 }
 
-/// The lead of a blob load, as [`BlockLead`] for a block.
+/// The lead of a blob frame load, as [`BlockLead`] for a block.
 pub(crate) struct BlobLead<'a>(LoadLead<'a>);
 
 impl BlobLead<'_> {
-    /// Hands the value read for `user_key` to the waiters, caching it first
-    /// when `fill` says so. Returns the bytes copied to own the key, which the
-    /// cache entry and the waiters share: none when the value is neither
-    /// cached nor awaited.
+    /// Hands the frame read to the waiters, caching it first when `fill` says
+    /// so.
     pub(crate) fn publish(
         self,
         cache: &Cache,
         vlog_id: crate::TreeId,
-        vhandle: &crate::vlog::ValueHandle,
-        user_key: &[u8],
-        value: UserValue,
+        at: BlobFrameAt,
+        frame: &alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>,
         fill: bool,
-    ) -> usize {
+    ) {
         if !fill && !self.0.has_waiters() {
-            // Dropped unpublished: nothing to share, and the key is not
-            // copied for nobody.
-            return 0;
+            return;
         }
-        let item = Item::Blob(user_key.into(), vhandle.on_disk_size, value);
+        let item = Item::BlobFrame(alloc::sync::Arc::clone(frame));
         if fill {
-            cache.data.insert(
-                (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
-                item.clone(),
-            );
+            cache.data.insert(blob_frame_key(vlog_id, at), item.clone());
         }
         self.0.publish(item);
-        user_key.len()
     }
+}
+
+/// Where a blob frame lies: its file and its number in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BlobFrameAt {
+    pub(crate) blob_file_id: crate::vlog::BlobFileId,
+    pub(crate) frame: u32,
+}
+
+fn blob_frame_key(vlog_id: crate::TreeId, at: BlobFrameAt) -> CacheKey {
+    (TAG_BLOB, vlog_id, at.blob_file_id, u64::from(at.frame)).into()
 }
 
 /// Shards of the load registry: as many as the cache, so two loads that
@@ -545,21 +543,17 @@ impl Cache {
             .estimate(&(TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into())
     }
 
-    /// Claims the cold read of the separated value `vhandle` names for
-    /// `user_key`, as [`Self::claim_block`] does for a block. A shared value
-    /// is returned only when the read it came from was for the same key and
-    /// size: the position alone names a record, not whose it is.
-    pub(crate) fn claim_blob(
+    /// Claims the cold read of the blob frame at `at`, as
+    /// [`Self::claim_block`] does for a block.
+    pub(crate) fn claim_blob_frame(
         &self,
         vlog_id: crate::TreeId,
-        vhandle: &crate::vlog::ValueHandle,
-        user_key: &[u8],
+        at: BlobFrameAt,
     ) -> BlobClaim<'_> {
-        let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
-        let identity = LoadIdentity::Blob {
-            on_disk_size: vhandle.on_disk_size,
-        };
-        match self.loads.claim(key, identity) {
+        match self
+            .loads
+            .claim(blob_frame_key(vlog_id, at), LoadIdentity::BlobFrame)
+        {
             crate::inflight::Claim::Lead(lead) => BlobClaim::Lead(BlobLead(lead)),
             crate::inflight::Claim::Join(join) => {
                 let shared = if crate::inflight::may_wait() {
@@ -568,11 +562,7 @@ impl Cache {
                     join.try_take()
                 };
                 match shared {
-                    Some(Item::Blob(read_key, size, value))
-                        if &*read_key == user_key && size == vhandle.on_disk_size =>
-                    {
-                        BlobClaim::Shared(value)
-                    }
+                    Some(Item::BlobFrame(frame)) => BlobClaim::Shared(frame),
                     _ => BlobClaim::Alone,
                 }
             }
@@ -711,18 +701,14 @@ impl Cache {
         self.loads.record_batch_wait(timer, reads);
     }
 
-    /// Records the cold read of the separated value `vhandle` names that
-    /// `timer` timed.
+    /// Records the cold read of the blob frame at `at` that `timer` timed.
     pub(crate) fn record_blob_load(
         &self,
         vlog_id: crate::TreeId,
-        vhandle: &crate::vlog::ValueHandle,
+        at: BlobFrameAt,
         timer: crate::inflight::LoadTimer,
     ) {
-        self.loads.record_load(
-            &(TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
-            timer,
-        );
+        self.loads.record_load(&blob_frame_key(vlog_id, at), timer);
     }
 
     /// Records the cold read of the row group at `offset` that `timer` timed.
@@ -775,7 +761,7 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Block(block) => block,
-            Item::Blob(..) | Item::Row(_) => unreachable!("invalid cache item"),
+            Item::BlobFrame(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "columnar")]
@@ -792,7 +778,7 @@ impl Cache {
 
         Some(match self.data.peek(&key)? {
             Item::Block(block) => block,
-            Item::Blob(..) | Item::Row(_) => unreachable!("invalid cache item"),
+            Item::BlobFrame(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "columnar")]
@@ -1050,70 +1036,39 @@ impl Cache {
         user_key.len() + value.len()
     }
 
-    /// Caches a separated value under its position, together with the two
-    /// fields the position does not carry (`user_key` and the handle's declared
-    /// on-disk size) so a lookup can prove the entry belongs to the handle it
-    /// is asked about. Returns the bytes copied to own the entry's key.
-    #[doc(hidden)]
-    #[must_use = "the bytes copied belong to the reading caller's gather count"]
-    pub fn insert_blob(
+    /// Caches a blob file frame, checked and decoded, under its file and
+    /// frame number.
+    pub(crate) fn insert_blob_frame(
         &self,
         vlog_id: crate::TreeId,
-        vhandle: &crate::vlog::ValueHandle,
-        user_key: &[u8],
-        value: UserValue,
-    ) -> usize {
-        self.data.insert(
-            (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
-            Item::Blob(user_key.into(), vhandle.on_disk_size, value),
-        );
-        user_key.len()
+        at: BlobFrameAt,
+        frame: alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>,
+    ) {
+        self.data
+            .insert(blob_frame_key(vlog_id, at), Item::BlobFrame(frame));
     }
 
-    /// Whether a separated value is already cached.
+    /// Whether a blob file frame is already cached.
     ///
-    /// For a caller deciding whether it has to read, not what the value is:
-    /// [`get_blob`](Self::get_blob) would clone the value out (an atomic bump
-    /// on the refcounted payload) and count a cache hit for a read that never
-    /// happens, skewing the eviction policy toward entries nobody consumed.
-    #[doc(hidden)]
+    /// For a caller deciding whether it has to read, not what the frame
+    /// holds: [`get_blob_frame`](Self::get_blob_frame) counts a cache hit for
+    /// a read that never happens, skewing the eviction policy toward entries
+    /// nobody consumed.
     #[must_use]
-    pub fn contains_blob(
-        &self,
-        vlog_id: crate::TreeId,
-        vhandle: &crate::vlog::ValueHandle,
-    ) -> bool {
-        let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
-        self.data.contains(&key)
+    pub(crate) fn contains_blob_frame(&self, vlog_id: crate::TreeId, at: BlobFrameAt) -> bool {
+        self.data.contains(&blob_frame_key(vlog_id, at))
     }
 
-    /// The cached value for `vhandle`, but only if it belongs to that exact
-    /// handle: same `user_key` and same declared on-disk size.
-    ///
-    /// The cache key is a POSITION in a blob file, and a corrupt index entry
-    /// can name that position with a different key, or with the right key and
-    /// the wrong size. The reader rejects both on a direct read, comparing what
-    /// it was asked for against the record header; these comparisons are how
-    /// the cached path reaches the same verdict instead of serving whatever
-    /// sits at the offset. A mismatch reads as a miss, so the caller does the
-    /// real read and gets the real error.
-    #[doc(hidden)]
+    /// The cached frame at `at`. The caller compares the key at the index it
+    /// wants against the one it asked for, as a direct read does.
     #[must_use]
-    pub fn get_blob(
+    pub(crate) fn get_blob_frame(
         &self,
         vlog_id: crate::TreeId,
-        vhandle: &crate::vlog::ValueHandle,
-        user_key: &[u8],
-    ) -> Option<UserValue> {
-        let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
-
-        match self.data.get(&key)? {
-            Item::Blob(cached_key, cached_size, blob)
-                if &*cached_key == user_key && cached_size == vhandle.on_disk_size =>
-            {
-                Some(blob)
-            }
-            Item::Blob(..) => None,
+        at: BlobFrameAt,
+    ) -> Option<alloc::sync::Arc<crate::vlog::blob_file::frame::DecodedFrame>> {
+        match self.data.get(&blob_frame_key(vlog_id, at))? {
+            Item::BlobFrame(frame) => Some(frame),
             Item::Block(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),

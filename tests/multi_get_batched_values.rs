@@ -108,7 +108,8 @@ fn a_damaged_value_fails_a_multi_get_as_it_fails_a_single_read() -> lsm_tree::Re
     let fs = BatchCountFs::default();
     drop(cold_tree(dir.path(), &fs)?);
 
-    // A byte in the middle of the first blob file lies in a value's payload.
+    // A byte in the middle of the first blob file's data lies in a value's
+    // frame: its frame index and metadata stay intact, so the tree opens.
     let mut blobs: Vec<_> = std::fs::read_dir(dir.path().join("blobs"))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -116,8 +117,18 @@ fn a_damaged_value_fails_a_multi_get_as_it_fails_a_single_read() -> lsm_tree::Re
         .collect();
     blobs.sort();
     let first = blobs.first().expect("a blob file");
+    let middle = {
+        let mut file = std::fs::File::open(first)?;
+        let reader = lsm_tree::sfa::Reader::from_reader(&mut file)
+            .map_err(|e| std::io::Error::other(format!("read SFA TOC: {e}")))?;
+        let data = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"data")
+            .expect("a blob file has a data section");
+        usize::try_from(data.pos() + data.len() / 2).expect("fits usize")
+    };
     let mut bytes = std::fs::read(first)?;
-    let middle = bytes.len() / 2;
     *bytes.get_mut(middle).expect("in the file") ^= 0xFF;
     std::fs::write(first, &bytes)?;
 

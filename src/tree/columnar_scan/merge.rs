@@ -311,6 +311,9 @@ pub(super) struct MergeStream {
     started: bool,
     /// A source off the heap until the output taking its chosen rows is out.
     parked: Option<usize>,
+    /// The blob frames read ahead for the rows' objects, kept from one batch
+    /// to the next so a block two batches share is read once.
+    objects: crate::vlog::Prefetched,
 }
 
 impl MergeStream {
@@ -454,6 +457,7 @@ impl MergeStream {
             heap: Vec::with_capacity(segments.len()),
             started: false,
             parked: None,
+            objects: crate::vlog::Prefetched::default(),
         })
     }
 
@@ -767,7 +771,7 @@ impl MergeStream {
         let (merged, resolved) = if self.late == Late::No {
             (merged, Resolved::default())
         } else {
-            let (merged, resolved) = scan.read_late(merged, early)?;
+            let (merged, resolved) = scan.read_late(merged, early, &mut self.objects)?;
             // Every declared column now holds its declared type: read out of
             // a value, or conformed when its source was loaded.
             let (merged, mistyped) = conform_lenient(merged, &scan.fields, self.predicate_column)?;
@@ -1279,7 +1283,8 @@ impl MergeStream {
                     && !JUDGE_COLUMNS.contains(&id)
             })
             .collect();
-        let verdicts = super::cells::judge(scan, cells, self.build(&asked, layout, &skip)?)?;
+        let batch = self.build(&asked, layout, &skip)?;
+        let verdicts = super::cells::judge(scan, cells, batch, &mut self.objects)?;
         debug_assert_eq!(verdicts.len(), asked.len());
 
         let mut verdicts = verdicts.into_iter();

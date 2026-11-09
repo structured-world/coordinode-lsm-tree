@@ -143,26 +143,60 @@ pub struct SalvageOptions {
 #[derive(Debug, Clone)]
 pub enum BlobFileRewrite {
     /// The blob file was salvaged into a COMPACTED copy under a FRESH blob
-    /// file id: every surviving record moved (and, when re-compressed, may
-    /// have changed on-disk size), per [`BlobSalvageReport::offset_remap`].
-    /// A rewritten handle is retargeted at `new_id` as well as at the new
-    /// offset, because the replacement is a new file — the damaged original
-    /// keeps its own id and stays untouched until the manifest commit makes
-    /// the replacement live. A handle whose source offset is absent points at
-    /// a record the salvage dropped — its entry is removed from the rewritten
-    /// SST (its key then reads as absent instead of erroring on damaged
-    /// bytes).
+    /// file id: every surviving record moved, per
+    /// [`BlobSalvageReport::remap`]. A rewritten handle is retargeted at
+    /// `new_id` as well as at the new place, because the replacement is a new
+    /// file: the damaged original keeps its own id and stays untouched until
+    /// the manifest commit makes the replacement live. A handle whose source
+    /// place is absent points at a record the salvage dropped: its entry is
+    /// removed from the rewritten SST (its key then reads as absent instead
+    /// of erroring on damaged bytes).
     Remap {
         /// Id of the salvaged replacement the rewritten handles must target.
         new_id: crate::vlog::BlobFileId,
-        /// Source offset -> where that record landed in the replacement.
-        offsets: crate::HashMap<u64, BlobRecordRelocation>,
+        /// Source place -> where that record landed in the replacement.
+        records: crate::HashMap<BlobRecordPlace, BlobRecordRelocation>,
     },
-    /// The blob file is intact but its consumed prefix was punched at this
-    /// live-data frontier: a handle below it (a pre-relocation SST left behind
-    /// by a crash) points into zeroed bytes — its entry is removed; handles at
-    /// or above the frontier are kept untouched.
-    DropBelow(u64),
+    /// The blob file is intact but its consumed prefix was punched below this
+    /// frame, its first live one: a handle into an earlier frame (a
+    /// pre-relocation SST left behind by a crash) points into zeroed bytes, so
+    /// its entry is removed; handles at or past it are kept untouched.
+    DropBelow(u32),
+}
+
+impl BlobFileRewrite {
+    /// Whether the record `vhandle` names still exists under this rewrite.
+    pub(crate) fn keeps(&self, vhandle: &crate::vlog::ValueHandle) -> bool {
+        match self {
+            Self::DropBelow(first_live) => vhandle.frame >= *first_live,
+            Self::Remap { records, .. } => records.contains_key(&BlobRecordPlace::of(vhandle)),
+        }
+    }
+
+    /// `indirection` retargeted under this rewrite: `None` when the record it
+    /// names no longer exists, unchanged when the rewrite keeps it in place.
+    fn apply(
+        &self,
+        indirection: &crate::blob_tree::handle::BlobIndirection,
+    ) -> Option<crate::blob_tree::handle::BlobIndirection> {
+        let vhandle = &indirection.vhandle;
+        match self {
+            Self::DropBelow(_) => self.keeps(vhandle).then_some(*indirection),
+            Self::Remap { new_id, records } => {
+                records
+                    .get(&BlobRecordPlace::of(vhandle))
+                    .map(|relocation| crate::blob_tree::handle::BlobIndirection {
+                        vhandle: crate::vlog::ValueHandle {
+                            blob_file_id: *new_id,
+                            frame: relocation.place.frame,
+                            index: relocation.place.index,
+                        },
+                        size: indirection.size,
+                        stored: relocation.stored,
+                    })
+            }
+        }
+    }
 }
 
 /// The cell rows a salvage makes the owners of objects they reference, each
@@ -1502,35 +1536,24 @@ fn rewrite_block_indirections(
             continue;
         }
         let mut cursor = &entry.value[..];
-        let mut ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-        match rewrite.blob(ind.vhandle.blob_file_id) {
-            None => out.push(entry),
-            Some(BlobFileRewrite::Remap { new_id, offsets }) => {
-                if let Some(&relocation) = offsets.get(&ind.vhandle.offset) {
-                    // ALL THREE fields: the replacement is a NEW file, so the
-                    // handle must name it; and a live read cross-checks the
-                    // handle's size against the frame header, so a stale size
-                    // from the source file would reject the salvaged record.
-                    ind.vhandle.blob_file_id = *new_id;
-                    ind.vhandle.offset = relocation.offset;
-                    ind.vhandle.on_disk_size = relocation.on_disk_size;
-                    let mut buf = Vec::new();
-                    ind.encode_into(&mut buf)?;
-                    entry.value = buf.into();
-                    out.push(entry);
-                } else {
-                    *dropped_entries += 1;
-                    headless = Some(entry.key.user_key);
-                }
+        let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
+        let Some(rule) = rewrite.blob(ind.vhandle.blob_file_id) else {
+            out.push(entry);
+            continue;
+        };
+        // The handle, the file it names and what it takes all follow the
+        // record: the replacement is a new file, and garbage accounting
+        // charges what the copy takes.
+        if let Some(moved) = rule.apply(&ind) {
+            if matches!(rule, BlobFileRewrite::Remap { .. }) {
+                let mut buf = Vec::new();
+                moved.encode_into(&mut buf)?;
+                entry.value = buf.into();
             }
-            Some(BlobFileRewrite::DropBelow(frontier)) => {
-                if ind.vhandle.offset < *frontier {
-                    *dropped_entries += 1;
-                    headless = Some(entry.key.user_key);
-                } else {
-                    out.push(entry);
-                }
-            }
+            out.push(entry);
+        } else {
+            *dropped_entries += 1;
+            headless = Some(entry.key.user_key);
         }
     }
     Ok((out, headless))
@@ -1572,22 +1595,15 @@ fn rewrite_row_refs(
             *owner = true;
             changed = true;
         }
-        match rewrite.blob(indirection.vhandle.blob_file_id) {
-            Some(BlobFileRewrite::DropBelow(frontier))
-                if indirection.vhandle.offset < *frontier =>
-            {
-                return Ok(RowRewrite::Lost);
-            }
-            None | Some(BlobFileRewrite::DropBelow(_)) => {}
-            Some(BlobFileRewrite::Remap { new_id, offsets }) => {
-                let Some(&relocation) = offsets.get(&indirection.vhandle.offset) else {
-                    return Ok(RowRewrite::Lost);
-                };
-                indirection.vhandle.blob_file_id = *new_id;
-                indirection.vhandle.offset = relocation.offset;
-                indirection.vhandle.on_disk_size = relocation.on_disk_size;
-                changed = true;
-            }
+        let Some(rule) = rewrite.blob(indirection.vhandle.blob_file_id) else {
+            continue;
+        };
+        let Some(moved) = rule.apply(indirection) else {
+            return Ok(RowRewrite::Lost);
+        };
+        if matches!(rule, BlobFileRewrite::Remap { .. }) {
+            *indirection = moved;
+            changed = true;
         }
     }
     Ok(if changed {
@@ -3010,17 +3026,15 @@ pub struct BlobSalvageReport {
     pub records_total: usize,
     /// Records successfully re-emitted into the salvaged blob file.
     pub records_salvaged: usize,
-    /// `(source_offset, relocation)` for every re-emitted record, in walk
-    /// order. The salvaged file is written COMPACTED — after the first dropped
-    /// record every later record lands at a NEW offset, and a compressed
-    /// record is re-compressed, so its on-disk size may change too — so
-    /// existing SST entries whose `ValueHandle`
-    /// points into the source file must be rewritten through this table
-    /// (BOTH fields; a live read cross-checks the handle against the frame
-    /// header) before the salvaged file can replace the original under the
-    /// same id. A source offset absent from this map (and implied by
-    /// [`Self::dropped`]) is lost: its handle has no target.
-    pub offset_remap: Vec<(u64, BlobRecordRelocation)>,
+    /// `(source place, relocation)` for every re-emitted record, in walk
+    /// order. The salvaged file is written COMPACTED: after the first dropped
+    /// record every later record lands in another frame, or at another place
+    /// in a block, so existing SST entries whose `ValueHandle` points into
+    /// the source file must be rewritten through this table before the
+    /// salvaged file can replace the original. A source place absent from
+    /// this map (and implied by [`Self::dropped`]) is lost: its handle has no
+    /// target.
+    pub remap: Vec<(BlobRecordPlace, BlobRecordRelocation)>,
     /// Records the walk had to drop.
     pub dropped: Vec<DroppedBlob>,
 }
@@ -3033,101 +3047,40 @@ impl BlobSalvageReport {
     }
 }
 
-/// Where one blob record landed in the salvaged replacement file.
-///
-/// Carried per source offset in [`BlobSalvageReport::offset_remap`]. Both
-/// fields must be installed into a referencing SST's rewritten
-/// `ValueHandle`: the compacted rewrite moves the
-/// record, and the decompress + re-compress re-emit may change its on-disk
-/// size (compressor output is not stable across versions or implementations),
-/// while a live read cross-checks the handle's size against the frame header
-/// and rejects a mismatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlobRecordRelocation {
-    /// Offset of the re-emitted record in the salvaged file.
-    pub offset: u64,
-    /// On-disk size of the re-emitted (possibly re-compressed) value.
-    pub on_disk_size: u32,
+/// Where one blob record lies in its file: the frame that holds it (a chunked
+/// value's head) and its place in that frame's list, as a `ValueHandle`
+/// names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlobRecordPlace {
+    /// The frame that holds the record.
+    pub frame: u32,
+    /// The record's place in the frame's list.
+    pub index: u16,
 }
 
-/// Decompresses one blob record's on-disk bytes, mirroring the live reader's
-/// per-compression dispatch: the frame checksum covered the ON-DISK bytes, so
-/// a clean-checksum record must additionally prove its content round-trips —
-/// the salvage re-emit and repair's frame validation both gate on this.
-/// `None` verifies the length equality the uncompressed format guarantees.
-/// Dictionary compression decodes only when the caller supplies the matching
-/// dictionary (repair has the tree's config); the standalone salvage entry
-/// passes none and rejects dictionary sources up front.
-// The lifetime is only elidable when the dictionary parameter is compiled
-// out: with it there are two input references and elision cannot tie the
-// output to the right one, so the name has to stay.
-#[cfg_attr(
-    not(zstd_any),
-    expect(
-        clippy::elidable_lifetime_names,
-        reason = "named to stay valid in the zstd build, where a second reference parameter exists"
-    )
-)]
-pub(crate) fn decompress_blob_value<'a>(
-    compression: crate::CompressionType,
-    on_disk: &'a [u8],
-    real_len: usize,
-    #[cfg(zstd_any)] zstd_dictionary: Option<&crate::compression::ZstdDictionary>,
-) -> crate::Result<alloc::borrow::Cow<'a, [u8]>> {
-    match compression {
-        crate::CompressionType::None => {
-            if on_disk.len() != real_len {
-                return Err(crate::Error::InvalidHeader("Blob"));
-            }
-            Ok(alloc::borrow::Cow::Borrowed(on_disk))
-        }
-        #[cfg(feature = "lz4")]
-        crate::CompressionType::Lz4 => {
-            let mut buf = alloc::vec![0u8; real_len];
-            let written = lz4_flex::block::decompress_into(on_disk, &mut buf)
-                .map_err(|_| crate::Error::Decompress(compression))?;
-            if written != real_len {
-                return Err(crate::Error::Decompress(compression));
-            }
-            Ok(alloc::borrow::Cow::Owned(buf))
-        }
-        #[cfg(zstd_any)]
-        crate::CompressionType::Zstd(_) => {
-            use crate::compression::CompressionProvider as _;
-            let decompressed = crate::compression::ZstdBackend::decompress(on_disk, real_len)
-                .map_err(|_| crate::Error::Decompress(compression))?;
-            if decompressed.len() != real_len {
-                return Err(crate::Error::Decompress(compression));
-            }
-            Ok(alloc::borrow::Cow::Owned(decompressed))
-        }
-        #[cfg(zstd_any)]
-        crate::CompressionType::ZstdDict { dict_id, .. } => {
-            use crate::compression::CompressionProvider as _;
-            // A blob file carries ONE compression descriptor, so the caller
-            // resolves `dict_id` against whatever set it holds and passes the
-            // one dictionary the file names. Here that id is only cross-checked.
-            let Some(dict) = zstd_dictionary else {
-                return Err(crate::Error::ZstdDictMismatch {
-                    expected: dict_id,
-                    got: None,
-                });
-            };
-            if dict.id() != dict_id {
-                return Err(crate::Error::ZstdDictMismatch {
-                    expected: dict_id,
-                    got: Some(dict.id()),
-                });
-            }
-            let decompressed =
-                crate::compression::ZstdBackend::decompress_with_dict(on_disk, dict, real_len)
-                    .map_err(|_| crate::Error::Decompress(compression))?;
-            if decompressed.len() != real_len {
-                return Err(crate::Error::Decompress(compression));
-            }
-            Ok(alloc::borrow::Cow::Owned(decompressed))
+impl BlobRecordPlace {
+    /// The place `vhandle` names.
+    #[must_use]
+    pub(crate) fn of(vhandle: &crate::vlog::ValueHandle) -> Self {
+        Self {
+            frame: vhandle.frame,
+            index: vhandle.index,
         }
     }
+}
+
+/// Where one blob record landed in the salvaged replacement file.
+///
+/// Carried per source place in [`BlobSalvageReport::remap`]. Both fields go
+/// into a referencing SST's rewritten indirection: the compacted rewrite
+/// moves the record, and what it takes in the replacement is what garbage
+/// accounting charges once it is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobRecordRelocation {
+    /// The record's place in the salvaged file.
+    pub place: BlobRecordPlace,
+    /// The bytes the re-emitted record takes there.
+    pub stored: crate::blob_tree::handle::Stored,
 }
 
 /// Whether `entry`'s internal key sorts BEFORE `prev` under the blob-file order
@@ -3172,9 +3125,9 @@ pub(crate) fn blob_key_regresses(
 ///
 /// `blob_file_id` is the source's id (its file name), recorded in the recovered
 /// file's metadata. The recovered file PRESERVES the source's value-compression
-/// descriptor: each surviving value is decompressed (validating the payload)
-/// and re-emitted through the writer under the same codec, so LZ4 and Zstd
-/// sources salvage in full. A dictionary-compressed source additionally needs
+/// descriptor: each surviving value is decoded (validating the payload), and
+/// re-emitted under the same codec, its frames as they are when it has frames
+/// of its own, so LZ4 and Zstd sources salvage in full. A dictionary-compressed source additionally needs
 /// the dictionary its descriptor names via `zstd_dictionary`, and the recovered
 /// file is written against that same one. Without it, or with a dictionary of
 /// another id, the values cannot be decoded and the salvage is rejected with
@@ -3182,11 +3135,10 @@ pub(crate) fn blob_key_regresses(
 /// the source's id against the tree's dictionaries and passes that one).
 ///
 /// The salvaged file is written COMPACTED: after the first dropped record,
-/// every later record lands at a new offset, so it is **not a drop-in
-/// replacement** for the source while SST entries still hold
-/// `ValueHandle::offset` values into it. Re-target those handles through
-/// [`BlobSalvageReport::offset_remap`] first; a source offset absent from the
-/// map is a lost record.
+/// every later record lands at a new place, so it is **not a drop-in
+/// replacement** for the source while SST entries still hold handles into it.
+/// Re-target those handles through [`BlobSalvageReport::remap`] first; a
+/// source place absent from the map is a lost record.
 ///
 /// `live_data_start` is the source's tight-space live-data frontier (`0` for a
 /// whole, unreclaimed file): the walk starts there, so a punched prefix — which
@@ -3261,34 +3213,16 @@ pub(crate) fn salvage_blob_file_on(
     // one the source's descriptor names); without it this entry fails closed, the same
     // way SST salvage fails closed on range tombstones.
     //
-    // A placeholder checksum is passed on purpose: `recover_blob_file` only STORES
-    // it (it never verifies the source against it), and only `compression()` and
-    // `lifetime_class()` are read from the handle. Computing the real whole-file digest here would stream
-    // every byte — including a persistently unreadable later frame or truncated
-    // tail sector — and abort before the scanner and writer are even created,
-    // making the valid-prefix recovery below unreachable. The salvaged dest gets
-    // its own digest on finish.
-    // The handle is a probe for its metadata; nothing is read THROUGH it
-    // here (the scanner below reads the frames). It still gets the caller's
-    // dictionary, so a handle that names one is never built without it.
-    #[cfg(zstd_any)]
-    let source_dicts = zstd_dictionary
-        .cloned()
-        .map_or_else(crate::compression::ZstdDictionaries::new, |d| {
-            crate::compression::ZstdDictionaries::new().with(d)
-        });
-    let source_handle = crate::vlog::recover_blob_file(
-        source,
-        blob_file_id,
-        crate::Checksum::from_raw(0),
-        0,
-        fs,
-        #[cfg(zstd_any)]
-        &source_dicts,
-    )?;
-    let compression = source_handle.compression();
+    // The metadata alone, not a handle: a handle needs the frame index, and a
+    // damaged index is one of the things a salvage recovers from (the scan
+    // below then walks the frames' own lengths). Nor is the whole-file digest
+    // computed: it would stream every byte, a persistently unreadable later
+    // frame included, and abort before the valid frames are recovered. The
+    // salvaged dest gets its own digest on finish.
+    let source_meta = crate::vlog::read_blob_meta(source, &**fs, blob_file_id)?;
+    let compression = source_meta.compression;
     // The salvaged file holds the source's values, so it keeps their class.
-    let lifetime_class = source_handle.lifetime_class();
+    let lifetime_class = source_meta.lifetime_class;
     #[cfg(zstd_any)]
     if let crate::CompressionType::ZstdDict { dict_id, .. } = compression {
         let Some(dict) = zstd_dictionary else {
@@ -3314,11 +3248,21 @@ pub(crate) fn salvage_blob_file_on(
         }
     }
 
-    let scanner = if live_data_start > 0 {
-        Scanner::resume(source, &**fs, blob_file_id, live_data_start)?
-    } else {
-        Scanner::new(source, &**fs, blob_file_id)?
-    };
+    // The scan checks and decodes every frame under the source's codec, so a
+    // value it yields has proven it round-trips. It takes the source's frame
+    // index when that reads and fits the data: a damaged frame then costs
+    // that frame alone.
+    let scanner = Scanner::open(
+        source,
+        &**fs,
+        blob_file_id,
+        crate::vlog::blob_file::scanner::ScanCodec {
+            compression,
+            #[cfg(zstd_any)]
+            dictionary: zstd_dictionary.cloned(),
+        },
+        (live_data_start > 0).then_some(live_data_start),
+    )?;
     // Destination ownership is decided by the writer's `create_new` open, and
     // the CONSTRUCTOR owns cleanup of any partial file it created: on a
     // constructor error this call created nothing (or the constructor already
@@ -3354,7 +3298,7 @@ pub(crate) fn salvage_blob_file_on(
 
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
-    let mut offset_remap: Vec<(u64, BlobRecordRelocation)> = Vec::new();
+    let mut remap: Vec<(BlobRecordPlace, BlobRecordRelocation)> = Vec::new();
     let mut dropped: Vec<DroppedBlob> = Vec::new();
     // The internal key of the last record accepted for re-emit, to enforce the
     // `BlobWriter` sorted-input contract on the salvaged file (see the accept
@@ -3371,14 +3315,15 @@ pub(crate) fn salvage_blob_file_on(
             match item {
                 // A frame the scanner reached at or after a byte-wise RESYNC has
                 // an UNPROVEN boundary: the resync magic may be an original frame
-                // boundary OR a checksum-valid `BLO4` frame nested inside the
-                // damaged frame's user-controlled value bytes, and every frame
-                // CHAINED past it inherits that unanchored start; the two are
+                // boundary OR a checksum-valid frame nested inside the damaged
+                // frame's user-controlled value bytes, and every frame CHAINED
+                // past it inherits that unanchored start; the two are
                 // byte-for-byte indistinguishable. The taint is sticky, so this
                 // arm drops the ENTIRE tail after the first resync: re-emitting
-                // any of it would FABRICATE records (and bogus `offset_remap`
-                // entries pointing inside the damaged region), which is worse
-                // than losing the tail (fail closed on unprovable provenance).
+                // any of it would FABRICATE records (and bogus `remap` entries
+                // pointing inside the damaged region), which is worse than
+                // losing the tail (fail closed on unprovable provenance). A walk
+                // by the source's frame index never resyncs.
                 Ok(entry) if entry.resynced => {
                     // The taint is STICKY: every frame from here to EOF inherits the
                     // same unprovable boundary, so the whole tail is surrendered.
@@ -3397,35 +3342,6 @@ pub(crate) fn salvage_blob_file_on(
                         ),
                     });
                     break;
-                }
-                // A frame whose CRCs are internally consistent but whose
-                // key_len is ZERO is malformed input (the writer's ingest
-                // never emits an empty key and asserts against one): route it
-                // through the corrupt-record path — the scanner is already
-                // positioned past the frame, so the walk continues.
-                Ok(entry) if entry.key.is_empty() => {
-                    dropped.push(DroppedBlob {
-                        reason: BlobDropReason::Corrupt("frame carries an empty key".to_string()),
-                    });
-                }
-                // A frame whose declared `real_val_len` disagrees with the
-                // bytes actually stored (for an UNCOMPRESSED source the two
-                // must be equal; a compressed record proves its length through
-                // the decompression below instead) is rejected by the live
-                // blob reader — re-emitting it would restamp a consistent
-                // length and launder a record live reads treat as corrupt.
-                // Drop it; the scanner is already past the frame, so the walk
-                // continues.
-                Ok(entry)
-                    if compression == crate::CompressionType::None
-                        && entry.uncompressed_len as usize != entry.value.len() =>
-                {
-                    dropped.push(DroppedBlob {
-                        reason: BlobDropReason::Corrupt(
-                            "frame's declared value length disagrees with its stored bytes"
-                                .to_string(),
-                        ),
-                    });
                 }
                 // A frame whose internal key regresses below the last accepted
                 // record: `BlobWriter` requires records in key order (ascending
@@ -3446,68 +3362,59 @@ pub(crate) fn salvage_blob_file_on(
                     });
                 }
                 Ok(entry) => {
-                    // A compressed record's frame checksum covered its ON-DISK
-                    // bytes; prove the content itself round-trips by
-                    // decompressing here (the re-emit below re-compresses it
-                    // under the same descriptor). A record that fails to
-                    // decompress despite a clean checksum is structural
-                    // corruption — drop it and keep walking.
-                    let value = match decompress_blob_value(
-                        compression,
-                        &entry.value,
-                        entry.uncompressed_len as usize,
-                        #[cfg(zstd_any)]
-                        zstd_dictionary.map(alloc::sync::Arc::as_ref),
-                    ) {
-                        Ok(value) => value,
-                        // The caller brought the wrong dictionary: the frame is
-                        // intact and every later one fails identically, so
-                        // grading them corrupt would "salvage" the whole file
-                        // into nothing. The id check above catches this before
-                        // the walk; this arm keeps the classification honest on
-                        // any path that reaches here anyway.
-                        #[cfg(zstd_any)]
-                        Err(e @ crate::Error::ZstdDictMismatch { .. }) => return Err(e),
-                        Err(e) => {
-                            dropped.push(DroppedBlob {
-                                reason: BlobDropReason::Corrupt(format!(
-                                    "frame's value does not decompress: {e:?}"
-                                )),
-                            });
-                            continue;
+                    // The scan proved the value round-trips. A value with
+                    // frames of its own goes over as they are, under the codec
+                    // the salvaged file shares with its source; a value out of
+                    // a block joins a block of the salvaged file. Its new place
+                    // is what re-targets the handles into the source.
+                    let written = match (&entry.frames, &entry.value) {
+                        (Some(frames), _) => {
+                            writer.write_verbatim(&entry.key, frames, entry.uncompressed_len)
                         }
-                    };
-                    // Record the frame relocation BEFORE the write advances the
-                    // writer: existing SST ValueHandles point at SOURCE frame
-                    // offsets, and the compacted rewrite shifts every record
-                    // after the first drop, so the caller needs this map to
-                    // re-target handles before the salvaged file can replace
-                    // the original.
-                    let salvaged_offset = writer.offset();
-                    // `write` re-compresses under the salvaged file's own
-                    // descriptor and returns the resulting ON-DISK value size —
-                    // recorded per record because compressor output is not
-                    // stable across versions, so the source handle's size
-                    // cannot be assumed to survive the round-trip.
-                    let on_disk_size = writer
-                        .write(&entry.key, entry.seqno, &value)
-                        .map_err(output_failure)?;
-                    offset_remap.push((
-                        entry.offset,
+                        (None, Some(value)) => writer.write(&entry.key, entry.seqno, value),
+                        // A scan yields a value either in a block, decoded, or
+                        // with frames of its own.
+                        (None, None) => Err(crate::Error::InvalidHeader("Blob")),
+                    }
+                    .map_err(output_failure)?;
+                    remap.push((
+                        BlobRecordPlace {
+                            frame: entry.frame,
+                            index: entry.index,
+                        },
                         BlobRecordRelocation {
-                            offset: salvaged_offset,
-                            on_disk_size,
+                            place: BlobRecordPlace {
+                                frame: written.frame,
+                                index: written.index,
+                            },
+                            stored: written.stored,
                         },
                     ));
                     prev_written = Some((entry.key.clone(), entry.seqno));
                     records_salvaged += 1;
                 }
-                // Payload rot: the checksum failed, so the scanner RESYNCS at the
-                // next magic and arms the sticky taint. This record drops here;
-                // every frame after it comes back through the `resynced` arm
-                // above and drops too (the tail's provenance is now unprovable).
+                // The caller brought the wrong dictionary: the frame is intact
+                // and every later one fails identically, so grading them
+                // corrupt would "salvage" the whole file into nothing. The id
+                // check above catches this before the walk; this arm keeps the
+                // classification honest on any path that reaches here anyway.
+                #[cfg(zstd_any)]
+                Err(e @ crate::Error::ZstdDictMismatch { .. }) => return Err(e),
+                // Payload rot: the checksum failed. By the index the next frame
+                // is where it puts it; in a chain walk the scanner RESYNCS at
+                // the next magic and arms the sticky taint, and every frame
+                // after it comes back through the `resynced` arm above and drops
+                // too (the tail's provenance is now unprovable).
                 Err(crate::Error::ChecksumMismatch { .. }) => dropped.push(DroppedBlob {
                     reason: BlobDropReason::ChecksumMismatch,
+                }),
+                // A payload that does not decompress despite a clean checksum
+                // is structural corruption of that frame: dropped, and the
+                // walk goes on past it as past a checksum failure.
+                Err(e @ crate::Error::Decompress(_)) => dropped.push(DroppedBlob {
+                    reason: BlobDropReason::Corrupt(format!(
+                        "frame's payload does not decompress: {e:?}"
+                    )),
                 }),
                 // Header rot (rotted magic or a length field caught by the
                 // header CRC): the scanner has RESYNCHRONIZED at the next
@@ -3595,7 +3502,7 @@ pub(crate) fn salvage_blob_file_on(
         salvaged_path,
         records_total,
         records_salvaged,
-        offset_remap,
+        remap,
         dropped,
     })
 }

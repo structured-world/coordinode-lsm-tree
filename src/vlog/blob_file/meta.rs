@@ -38,51 +38,81 @@ macro_rules! read_u128 {
     }};
 }
 
-pub const METADATA_HEADER_MAGIC: &[u8] = b"META";
+pub(crate) const METADATA_HEADER_MAGIC: &[u8] = b"META";
 
-/// The one accepted blob-file metadata version. The writer stamps it and
-/// `decode_from` rejects anything else: there is a single readable on-disk
-/// format (per-frame header CRC), never a compat range. Under the V5 disk
-/// contract this is the blob-file meta version, distinct from the tree format
-/// version.
-pub const META_VERSION: u8 = 4;
+/// The one accepted blob-file layout version. The writer stamps it and
+/// `from_slice` rejects anything else: there is a single readable on-disk
+/// layout, values in frames by size class with a frame index, never a compat
+/// range. Distinct from the tree format version.
+pub(crate) const META_VERSION: u8 = 5;
 
-// Note: `pub` for crate-internal use; parent `vlog` module is NOT
-// exported from `lib.rs`, so this struct is not public API.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Metadata {
-    pub id: BlobFileId,
+pub(crate) struct Metadata {
+    pub(crate) id: BlobFileId,
 
     /// Blob file format version. Always [`META_VERSION`] (the only readable
-    /// format, with per-frame header CRC); `decode_from` rejects anything else.
-    pub version: u8,
+    /// format, of frames and a frame index); `decode_from` rejects anything
+    /// else.
+    pub(crate) version: u8,
 
-    pub created_at: u128,
+    pub(crate) created_at: u128,
 
     /// Number of KV-pairs in the blob file
-    pub item_count: u64,
+    pub(crate) item_count: u64,
 
-    /// compressed size in bytes (on disk) (without metadata or trailer)
-    pub total_compressed_bytes: u64,
+    /// Bytes the frames take on disk, headers and entries included: the data
+    /// section, without the frame index, metadata or trailer
+    pub(crate) total_compressed_bytes: u64,
 
     /// true size in bytes (if no compression were used)
-    pub total_uncompressed_bytes: u64,
+    pub(crate) total_uncompressed_bytes: u64,
+
+    /// The uncompressed entries of the values the file's blocks hold, what
+    /// those values are charged ([`crate::blob_tree::handle::Stored::InBlock`])
+    pub(crate) block_entry_bytes: u64,
+
+    /// Bytes the file's blocks take on disk, headers included
+    pub(crate) block_frame_bytes: u64,
 
     /// Key range
-    pub key_range: KeyRange,
+    pub(crate) key_range: KeyRange,
 
     /// Compression type used for all blobs in this file
-    pub compression: CompressionType,
+    pub(crate) compression: CompressionType,
 
     /// The lifetime class of the values this file holds: `0` for values a
     /// flush wrote, higher for values that outlived more collections or that
     /// a hint placed there. Values of one class share files, so a file holds
     /// values expected to die together.
-    pub lifetime_class: u8,
+    pub(crate) lifetime_class: u8,
 }
 
 impl Metadata {
-    pub fn encode_into<W: Write>(&self, writer: &mut W) -> crate::Result<()> {
+    /// The bytes on disk that `entry_bytes` of this file's block entries take:
+    /// their part of its blocks, each block compressed as a whole.
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a block takes at most its entries plus its header on disk, so the share is a \
+                  small multiple of `entry_bytes`, a sum of charges bounded by filesystem capacity"
+    )]
+    pub(crate) fn block_share(&self, entry_bytes: u64) -> u64 {
+        if self.block_entry_bytes == 0 {
+            return 0;
+        }
+        (u128::from(entry_bytes) * u128::from(self.block_frame_bytes)
+            / u128::from(self.block_entry_bytes)) as u64
+    }
+
+    /// Bytes the frames of values with frames of their own take on disk: every
+    /// frame but the blocks.
+    #[must_use]
+    pub(crate) fn own_frame_bytes(&self) -> u64 {
+        // `from_slice` refuses metadata whose blocks take more than its frames.
+        self.total_compressed_bytes - self.block_frame_bytes
+    }
+
+    pub(crate) fn encode_into<W: Write>(&self, writer: &mut W) -> crate::Result<()> {
         fn meta(key: &str, value: &[u8]) -> InternalValue {
             InternalValue::from_components(key, value, 0, crate::ValueType::Value)
         }
@@ -93,6 +123,8 @@ impl Metadata {
         #[rustfmt::skip]
         let meta_items = [
             meta("blob_file_version", &[self.version]),
+            meta("block_entry_bytes", &self.block_entry_bytes.to_le_bytes()),
+            meta("block_frame_bytes", &self.block_frame_bytes.to_le_bytes()),
             meta("checksum_type", &[u8::from(ChecksumType::Xxh3)]),
             meta("compression", &self.compression.encode_into_vec()),
             meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
@@ -156,7 +188,7 @@ impl Metadata {
         Ok(())
     }
 
-    pub fn from_slice(slice: &Slice) -> crate::Result<Self> {
+    pub(crate) fn from_slice(slice: &Slice) -> crate::Result<Self> {
         let reader = &mut &slice[..];
 
         // Check header
@@ -203,14 +235,16 @@ impl Metadata {
                 .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?
         };
 
-        // Exactly one blob-file format is readable (single-format contract):
-        // [`META_VERSION`] is what the current writer stamps. Anything else,
-        // including the retired version 3, is corruption or an unsupported file,
-        // never a compat case. Covered end-to-end by
-        // `tests::test_blob_file_meta_retired_version_rejected`, which serializes a
-        // version-3 block through the production encoder and asserts this rejection.
+        // Exactly one blob-file layout is readable (single-format contract):
+        // [`META_VERSION`] is what the current writer stamps. An earlier one
+        // is a file of an earlier release, refused as a version, never read
+        // and never taken for damage a repair would act on.
         if version != META_VERSION {
-            return Err(crate::Error::InvalidHeader("BlobFileMeta"));
+            return Err(crate::Error::UnsupportedFormat {
+                part: crate::error::FormatPart::BlobFiles,
+                found: Some(version),
+                expected: META_VERSION,
+            });
         }
 
         let id = read_u64!(block, b"id", &cmp);
@@ -218,6 +252,11 @@ impl Metadata {
         let item_count = read_u64!(block, b"item_count", &cmp);
         let file_size = read_u64!(block, b"file_size", &cmp);
         let total_uncompressed_bytes = read_u64!(block, b"uncompressed_size", &cmp);
+        let block_entry_bytes = read_u64!(block, b"block_entry_bytes", &cmp);
+        let block_frame_bytes = read_u64!(block, b"block_frame_bytes", &cmp);
+        if block_frame_bytes > file_size {
+            return Err(crate::Error::InvalidHeader("BlobFileMeta"));
+        }
 
         let compression = {
             let bytes = block
@@ -261,6 +300,8 @@ impl Metadata {
             item_count,
             total_compressed_bytes: file_size,
             total_uncompressed_bytes,
+            block_entry_bytes,
+            block_frame_bytes,
             key_range,
             lifetime_class,
         })
