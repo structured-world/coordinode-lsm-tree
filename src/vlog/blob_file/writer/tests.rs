@@ -333,7 +333,7 @@ fn verbatim_frames_that_are_not_one_value_are_refused() -> crate::Result<()> {
         "a head and a block"
     );
     assert!(
-        refused(w.write_verbatim(b"big", &[head.clone()], 700)),
+        refused(w.write_verbatim(b"big", std::slice::from_ref(&head), 700)),
         "a head without chunks"
     );
     assert!(refused(w.write_verbatim(b"big", &[], 700)), "nothing");
