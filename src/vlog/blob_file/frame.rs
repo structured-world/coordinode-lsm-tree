@@ -667,13 +667,14 @@ pub(crate) struct EntrySpec<'k> {
 ///
 /// A key is empty or longer than `u16::MAX`, or a frame lists more than
 /// `u16::MAX` entries: the writer never builds one.
-pub(crate) fn encode_frame(
+pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
     kind: FrameKind,
-    entries: &[EntrySpec<'_>],
+    entries: impl IntoIterator<Item = E, IntoIter: ExactSizeIterator>,
     payload: &[u8],
     codec: Codec<'_>,
     out: &mut Vec<u8>,
 ) -> crate::Result<()> {
+    let entries = entries.into_iter();
     super::writer::check_size_cap(payload.len())?;
     #[expect(
         clippy::expect_used,
@@ -699,6 +700,7 @@ pub(crate) fn encode_frame(
     out.clear();
     out.resize(FRAME_HEADER_LEN, 0);
     for entry in entries {
+        let entry = entry.borrow();
         assert!(
             !entry.key.is_empty(),
             "a blob is written under a non-empty key"

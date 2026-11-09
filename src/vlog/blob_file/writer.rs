@@ -517,10 +517,10 @@ impl Writer {
     }
 
     /// Encodes and writes one frame.
-    fn emit(
+    fn emit<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
         &mut self,
         kind: FrameKind,
-        entries: &[EntrySpec<'_>],
+        entries: impl IntoIterator<Item = E, IntoIter: ExactSizeIterator>,
         payload: &[u8],
     ) -> crate::Result<()> {
         let mut scratch = core::mem::take(&mut self.scratch);
@@ -537,22 +537,19 @@ impl Writer {
         }
         let block = core::mem::take(&mut self.block);
         let mut key_start = 0;
-        let entries: Vec<EntrySpec<'_>> = block
-            .entries
-            .iter()
-            .map(|&(seqno, key_end, value_len)| {
-                let key = block.keys.get(key_start..key_end).unwrap_or_default();
-                key_start = key_end;
-                EntrySpec {
-                    key,
-                    seqno,
-                    value_len,
-                }
-            })
-            .collect();
+        // Taken out of the block's own storage as they are encoded, with no
+        // list built for them.
+        let entries = block.entries.iter().map(|&(seqno, key_end, value_len)| {
+            let key = block.keys.get(key_start..key_end).unwrap_or_default();
+            key_start = key_end;
+            EntrySpec {
+                key,
+                seqno,
+                value_len,
+            }
+        });
         let before = self.offset;
-        let written = self.emit(FrameKind::Block, &entries, &block.payload);
-        drop(entries);
+        let written = self.emit(FrameKind::Block, entries, &block.payload);
         self.block_frame_bytes += self.offset - before;
         self.block = block;
         self.block.clear();
