@@ -280,6 +280,16 @@ pub(crate) fn assemble<C: core::ops::Deref<Target = DecodedFrame>>(
         return Err(malformed());
     }
     let len = usize::try_from(range.end - range.start).map_err(|_| malformed())?;
+    // A range within one chunk is a view into that chunk, as a range of a
+    // value with one frame is: no buffer, no copy.
+    if let [chunk] = chunks {
+        let from = usize::try_from(skip).map_err(|_| malformed())?;
+        let to = from.checked_add(len).ok_or_else(malformed)?;
+        if !chunk_fits(chunk, covered.start, (size, count), total) || to > chunk.payload.len() {
+            return Err(malformed());
+        }
+        return Ok(chunk.payload.slice(from..to));
+    }
     let mut out = Vec::with_capacity(len);
     for (at, chunk) in covered.clone().zip(chunks) {
         if !chunk_fits(chunk, at, (size, count), total) {

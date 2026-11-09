@@ -303,6 +303,59 @@ fn a_blob_tree_multi_get_caching_its_values_reads_them_once() -> lsm_tree::Resul
     Ok(())
 }
 
+/// A chunked value whose head a first multi-get cached, its chunks not, is
+/// read again head and chunks in one queued read with the others, not left to
+/// its own path, which reads the chunks one at a time.
+#[test]
+fn a_multi_get_reads_chunked_values_whose_head_is_cached_in_one_batch() -> lsm_tree::Result<()> {
+    const VALUES: usize = 4;
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(fs.clone()))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
+        .blob_cache_fill(lsm_tree::config::BlobCacheFill::Always)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(1)
+                .chunk_size(core::num::NonZeroU32::new(16 * 1_024).expect("non-zero")),
+        ))
+    };
+    let value = |i: usize| -> Vec<u8> {
+        (0..100_000_u32)
+            .map(|b| (b % 251) as u8 ^ i as u8)
+            .collect()
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..VALUES {
+            tree.insert(key_for(i), value(i), i as u64);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config().open()?;
+    let keys: Vec<String> = (0..VALUES).map(key_for).collect();
+    tree.multi_get(&keys, SeqNo::MAX)?;
+    fs.take();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = fs.take();
+    for (i, got) in values.iter().enumerate() {
+        assert_eq!(got.as_deref(), Some(value(i).as_slice()), "key {i}");
+    }
+    assert_eq!(
+        calls,
+        [VALUES],
+        "one batch carries each value, head and chunks: {calls:?}"
+    );
+    Ok(())
+}
+
 /// A blob file that will not open fails a multi-get as it fails a read of a
 /// key alone, with the same error.
 #[test]

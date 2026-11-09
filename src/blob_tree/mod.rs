@@ -345,10 +345,15 @@ impl BlobSource {
             return ValuePlan::Alone;
         };
         let vhandle = indirection.vhandle;
-        if let Some(frame) = self.cache.get_blob_frame(self.tree_id, vhandle.frame_at()) {
+        // A cached head holds none of its value: its chunks are read with it
+        // in the one queued read planned below, not one by one on the value's
+        // own path.
+        if let Some(frame) = self.cache.get_blob_frame(self.tree_id, vhandle.frame_at())
+            && frame.header.kind != FrameKind::Head
+        {
             return match reader::value_in(&frame, vhandle.index, &item.key.user_key) {
-                Ok(value) if frame.header.kind != FrameKind::Head => ValuePlan::Ready(value),
-                _ => ValuePlan::Alone,
+                Ok(value) => ValuePlan::Ready(value),
+                Err(_) => ValuePlan::Alone,
             };
         }
         let Some(blob_file) = version.blob_files.get(vhandle.blob_file_id) else {

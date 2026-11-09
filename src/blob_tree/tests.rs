@@ -415,9 +415,10 @@ fn item_of(indirection: &BlobIndirection) -> InternalValue {
 }
 
 /// A batched read plans a chunked value's read through its head: a head the
-/// cache holds is no value, so the value goes on its own path; a read that
-/// reaches the head alone hands back no value for that path to read the
-/// chunks; a read shorter than the head's frame is refused.
+/// cache holds is no value, so the value is still read, head and chunks in one
+/// go; a read that reaches the head alone hands back no value for the value's
+/// own path to read the chunks; a read shorter than the head's frame is
+/// refused.
 #[test]
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 fn a_batched_read_of_a_chunked_value_falls_back_to_its_own_path() -> crate::Result<()> {
@@ -472,7 +473,7 @@ fn a_batched_read_of_a_chunked_value_falls_back_to_its_own_path() -> crate::Resu
     let short = crate::Slice::from(&file[at..at + read.len - 1]);
     assert!(source.finish_value(&version, b"k", &read, &short).is_err());
 
-    // Cached, the head is found by the plan and is no value.
+    // Cached, the head is no value: the value is read, head and chunks.
     drop(tree);
     let crate::AnyTree::Blob(tree) = open(crate::config::BlobCacheFill::Always)? else {
         panic!("a tree with kv separation opens as a blob tree");
@@ -482,10 +483,16 @@ fn a_batched_read_of_a_chunked_value_falls_back_to_its_own_path() -> crate::Resu
         Some(1024 * 1024)
     );
     let version = tree.current_version();
-    assert!(matches!(
-        tree.blob_source()
-            .plan_value(&version, &item_of(&indirection)),
-        ValuePlan::Alone
-    ));
+    let ValuePlan::Read(read) = tree
+        .blob_source()
+        .plan_value(&version, &item_of(&indirection))
+    else {
+        panic!("a value whose head alone is cached is read");
+    };
+    assert_eq!(
+        read.len,
+        indirection.stored.bytes() as usize,
+        "the head and its chunks in one read"
+    );
     Ok(())
 }
