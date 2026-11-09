@@ -4014,6 +4014,185 @@ fn relocating_ingested_frames_lists_them_at_their_table_seqno() -> crate::Result
     Ok(())
 }
 
+/// A relocation never copies whole a block whose values a key domain set
+/// after it was written splits: copied as stored, it would carry keys of two
+/// domains into one file, which expiring either could then not drop. Its
+/// values are written anew, each file held to one domain, as any written
+/// value is.
+#[test]
+fn relocation_rewrites_a_block_a_key_domain_splits() -> crate::Result<()> {
+    const KEYS: u64 = 400;
+    const BOUNDARY: u64 = 202;
+
+    /// Two domains, split at `BOUNDARY`'s key.
+    struct Split;
+    impl crate::KeyDomains for Split {
+        fn domain_end(&self, key: &[u8]) -> Option<crate::UserKey> {
+            let boundary = blob_reloc_key(BOUNDARY);
+            (key < boundary.as_bytes()).then(|| crate::UserKey::from(boundary.as_bytes()))
+        }
+    }
+
+    let folder = crate::get_tmp_folder();
+    let open = |domains: bool| -> crate::Result<crate::BlobTree> {
+        let mut config = crate::Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)));
+        if domains {
+            config = config.key_domains(alloc::sync::Arc::new(Split));
+        }
+        match config.open()? {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+        }
+    };
+    // Values below the block size, several to a block, written before the
+    // domains: a block holds keys on both sides of the boundary.
+    {
+        let tree = open(false)?;
+        for i in 0..KEYS {
+            tree.insert(blob_reloc_key(i), blob_reloc_value(i, 1), 0);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = open(true)?;
+    // The first quarter shadowed in a run: its blocks die whole and the file
+    // turns stale, while the rest stay whole and live.
+    for i in 0..KEYS / 4 {
+        tree.insert(blob_reloc_key(i), blob_reloc_value(i, 2), 1);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+
+    let boundary = blob_reloc_key(BOUNDARY);
+    let mut relocated = 0;
+    for file in tree.index.current_version().blob_files.iter() {
+        let scanner = crate::vlog::blob_file::scanner::Scanner::new(
+            &file.0.path,
+            &crate::fs::StdFs,
+            file.id(),
+        )?;
+        let keys = scanner
+            .map(|entry| entry.map(|entry| entry.key))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let below = keys
+            .iter()
+            .filter(|key| ***key < *boundary.as_bytes())
+            .count();
+        assert!(
+            below == 0 || below == keys.len(),
+            "file {} holds keys of both domains",
+            file.id()
+        );
+        relocated += keys.len();
+    }
+    assert!(relocated > 0, "the fixture needs the merge to relocate");
+    for i in 0..KEYS {
+        let expected = blob_reloc_value(i, if i < KEYS / 4 { 2 } else { 1 });
+        assert_eq!(
+            tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+            Some(&expected[..]),
+            "key {i} reads back"
+        );
+    }
+    Ok(())
+}
+
+/// [`relocating_ingested_frames_lists_them_at_their_table_seqno`] for values
+/// that share blocks: a block of ingested values, whole and live, would be
+/// copied as stored, its entries listed at the zero the ingestion wrote them
+/// under. A block whose claimed values are listed at another seqno than their
+/// table's is written anew instead, each value at its table's seqno, as a
+/// block below the copy share is.
+#[test]
+fn relocating_ingested_blocks_lists_them_at_their_table_seqno() -> crate::Result<()> {
+    const KEYS: u64 = 400;
+    let folder = crate::get_tmp_folder();
+    let tree = match crate::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    // Values below the block size: several to a block.
+    let value = blob_reloc_value;
+    // As in the frame test: a seqno other than zero for the ingestion, and a
+    // range tombstone that keeps the covered keys at their real seqnos.
+    tree.insert("a", value(0, 0), 0);
+    tree.remove_range("key", "kez", 0);
+    tree.flush_active_memtable(0)?;
+    let mut ingestion = crate::blob_tree::ingest::BlobIngestion::new(&tree)?;
+    for i in 0..KEYS {
+        ingestion.write(blob_reloc_key(i).into_bytes().into(), value(i, 1).into())?;
+    }
+    ingestion.finish()?;
+    let Some(ingested) = tree.get_highest_seqno() else {
+        panic!("the ingestion is given a seqno");
+    };
+    assert!(ingested > 0);
+    // The first half shadowed in a run: its blocks die whole and the file
+    // turns stale, while the second half's blocks stay whole and live, the
+    // share a block is copied whole at.
+    for i in 0..KEYS / 2 {
+        tree.insert(blob_reloc_key(i), value(i, 2), ingested + 1 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let watermark = ingested + 2 * KEYS;
+    // The first merge learns which values died; the second relocates.
+    tree.major_compact(64 * 1024 * 1024, watermark)?;
+    let before: crate::HashSet<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    tree.major_compact(64 * 1024 * 1024, watermark)?;
+
+    let version = tree.index.current_version();
+    let mut relocated = 0;
+    for file in version
+        .blob_files
+        .iter()
+        .filter(|f| !before.contains(&f.id()))
+    {
+        let scanner = crate::vlog::blob_file::scanner::Scanner::new(
+            &file.0.path,
+            &crate::fs::StdFs,
+            file.id(),
+        )?;
+        for entry in scanner {
+            let entry = entry?;
+            assert_eq!(
+                entry.seqno, ingested,
+                "{:?} listed at its table's seqno",
+                entry.key
+            );
+            assert!(entry.block.is_some(), "{:?} shares a block", entry.key);
+            relocated += 1;
+        }
+    }
+    assert!(relocated > 0, "the fixture needs the merge to relocate");
+    for i in 0..KEYS {
+        let expected = value(i, if i < KEYS / 2 { 2 } else { 1 });
+        assert_eq!(
+            tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+            Some(&expected[..]),
+            "key {i} reads back"
+        );
+    }
+    Ok(())
+}
+
 /// A block alone past the room the pass found makes a slice no cut can bring
 /// within it. The pass runs the slices before it and stops there, the rest
 /// of its inputs left in place, rather than write past the room.

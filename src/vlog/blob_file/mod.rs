@@ -644,7 +644,6 @@ impl BlobFile {
     }
 
     /// How many frames the file holds.
-    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn frame_count(&self) -> usize {
         // The index always ends with the data end: a written and a decoded one

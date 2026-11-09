@@ -1230,6 +1230,11 @@ pub(crate) struct RelocatingCompaction {
     /// stream order: the table takes rows in key order, so a row waits for
     /// every row before it.
     held: alloc::collections::VecDeque<Held>,
+    /// The bytes `held` holds, bounded by [`HELD_BYTES_MAX`].
+    held_bytes: usize,
+    /// The blocks given up at that bound: their values are written anew, and
+    /// the rest of them is not tallied again.
+    abandoned: HashSet<(BlobFileId, u32)>,
     /// The dead values the blocks copied whole carry into the new files.
     carried_garbage: FragmentationMap,
 }
@@ -1238,29 +1243,71 @@ pub(crate) struct RelocatingCompaction {
 struct BlockTally {
     /// The block as stored, for a copy.
     stored: crate::Slice,
-    /// How many values the block holds, and how many were seen.
+    /// The key of its first value, which the scan reaches first.
+    first_key: crate::UserKey,
+    /// How many values the block holds, how many were seen, and their
+    /// decoded bytes so far.
     values: u16,
     seen: u16,
-    /// The entry bytes of the values a pointer claimed.
+    value_bytes: u64,
+    /// The entry bytes of the values a pointer claimed, and how many.
     live: u64,
+    claimed: u16,
     /// The values no pointer claimed: how many, their bytes and their entry
     /// bytes.
     dead: (usize, u64, u64),
     /// A value was reached by a resynchronized scan.
     resynced: bool,
+    /// A claimed value is listed at another seqno than its table row's (an
+    /// ingested one): a copy as stored would keep the wrong listing.
+    relisted: bool,
 }
 
-/// How a relocation moves the values of one block.
+/// How a value the scan reached counts in its block's tally.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// No pointer claimed it.
+    Dead,
+    /// A pointer claimed it, listed at the seqno its frame lists.
+    Live,
+    /// A pointer claimed it, listed at another seqno than its frame lists.
+    Relisted,
+}
+
+/// How a relocation moves the values of a block it copies whole; a block
+/// with no fate has its live values written into new blocks. Each kind counts
+/// the claimed values still to place, and the fate is dropped with the last
+/// of them, so a pass holds the blocks of its scan window, not of all it
+/// copied.
 enum BlockFate {
-    /// The block is copied as it was stored, once, into the frame `at` names
-    /// once copied; its dead values go with it.
-    Whole {
-        stored: crate::Slice,
-        dead: (usize, u64, u64),
-        at: Option<(BlobFileId, u32)>,
-    },
-    /// Its live values are written into new blocks.
-    Values,
+    /// The block is to be copied as it was stored, once; its dead values go
+    /// with it.
+    Whole { block: WholeBlock, pending: u16 },
+    /// The block was copied whole into the frame `at` names: the values
+    /// still to place point there, and the stored bytes are let go.
+    Copied { at: (BlobFileId, u32), pending: u16 },
+}
+
+/// At most the bytes of the rows a relocation holds back while the blocks
+/// they wait for are tallied. A block's last value arrives within a few rows
+/// of its first unless the block spans keys a denser input fills, such as a
+/// block of a sparse flush merged into a full level: past this much, the
+/// blocks still tallied are given up and their values written anew, which
+/// costs only the copy as stored, not the rows' memory.
+const HELD_BYTES_MAX: usize = 8 * 1024 * 1024;
+
+/// A block a relocation copies whole, and what the scan counted of it: what
+/// the copy adds to the new file, so the block is not read again for it.
+struct WholeBlock {
+    stored: crate::Slice,
+    first_key: crate::UserKey,
+    last_key: crate::UserKey,
+    values: u16,
+    value_bytes: u64,
+    entry_bytes: u64,
+    /// Its values no pointer claimed: how many, their bytes and their entry
+    /// bytes.
+    dead: (usize, u64, u64),
 }
 
 /// A row a relocation holds back.
@@ -1273,6 +1320,17 @@ enum Held {
         indirection: BlobIndirection,
         claimed: Claimed,
     },
+}
+
+/// The bytes `held` keeps in memory: its row's key and value, and for a
+/// pointer the value it claimed.
+fn held_len(held: &Held) -> usize {
+    match held {
+        Held::Row(item) => item.key.user_key.len() + item.value.len(),
+        Held::Pointer { item, claimed, .. } => {
+            item.key.user_key.len() + item.value.len() + claimed.uncompressed_len as usize
+        }
+    }
 }
 
 /// What a relocation keeps of a value it claimed from the scan to place it.
@@ -1314,32 +1372,43 @@ impl Claimed {
 fn tally_block(
     blocks: &mut crate::HashMap<(BlobFileId, u32), BlockTally>,
     fates: &mut crate::HashMap<(BlobFileId, u32), BlockFate>,
+    abandoned: &HashSet<(BlobFileId, u32)>,
     share: Option<f64>,
     blob_file_id: BlobFileId,
     entry: &ScanEntry,
-    claimed: bool,
+    claim: Claim,
 ) {
     let (Some(share), Some(block)) = (share, &entry.block) else {
         return;
     };
     let at = (blob_file_id, entry.frame);
+    if abandoned.contains(&at) {
+        return;
+    }
     let tally = blocks.entry(at).or_insert_with(|| BlockTally {
         stored: block.stored.clone(),
+        first_key: entry.key.clone(),
         values: block.values,
         seen: 0,
+        value_bytes: 0,
         live: 0,
+        claimed: 0,
         dead: (0, 0, 0),
         resynced: false,
+        relisted: false,
     });
     let bytes = block.entry_bytes;
     tally.seen += 1;
+    tally.value_bytes += u64::from(entry.uncompressed_len);
     tally.resynced |= entry.resynced;
-    if claimed {
-        tally.live += bytes;
-    } else {
+    tally.relisted |= claim == Claim::Relisted;
+    if claim == Claim::Dead {
         tally.dead.0 += 1;
         tally.dead.1 += u64::from(entry.uncompressed_len);
         tally.dead.2 += bytes;
+    } else {
+        tally.live += bytes;
+        tally.claimed += 1;
     }
     if tally.seen < tally.values {
         return;
@@ -1353,19 +1422,28 @@ fn tally_block(
     }
     // Entry bytes stay far below 2^53, where an f64 holds every integer.
     #[expect(clippy::cast_precision_loss, reason = "exact below 2^53")]
-    let whole = !tally.resynced && tally.live as f64 >= share * (tally.live + tally.dead.2) as f64;
-    fates.insert(
-        at,
-        if whole {
+    let whole = !tally.resynced
+        && !tally.relisted
+        && tally.live as f64 >= share * (tally.live + tally.dead.2) as f64;
+    // A block below the share gets no fate: its values are written anew.
+    if whole {
+        fates.insert(
+            at,
             BlockFate::Whole {
-                stored: tally.stored,
-                dead: tally.dead,
-                at: None,
-            }
-        } else {
-            BlockFate::Values
-        },
-    );
+                block: WholeBlock {
+                    stored: tally.stored,
+                    first_key: tally.first_key,
+                    // The value counted last is the block's last.
+                    last_key: entry.key.clone(),
+                    values: tally.values,
+                    value_bytes: tally.value_bytes,
+                    entry_bytes: tally.live + tally.dead.2,
+                    dead: tally.dead,
+                },
+                pending: tally.claimed,
+            },
+        );
+    }
 }
 
 /// What a relocating pass separates new values under: the tree's separation
@@ -1422,6 +1500,8 @@ impl RelocatingCompaction {
             blocks: crate::HashMap::default(),
             fates: crate::HashMap::default(),
             held: alloc::collections::VecDeque::new(),
+            held_bytes: 0,
+            abandoned: HashSet::default(),
             carried_garbage: FragmentationMap::default(),
         }
     }
@@ -1641,6 +1721,7 @@ impl RelocatingCompaction {
             stop_signal,
             blocks,
             fates,
+            abandoned,
             block_copy_share,
             ..
         } = self;
@@ -1652,17 +1733,28 @@ impl RelocatingCompaction {
                 let slot = consumed_through.entry(id).or_insert(0);
                 *slot = (*slot).max(frame_end);
             },
-            &mut |id, entry| tally_block(blocks, fates, *block_copy_share, id, entry, false),
+            &mut |id, entry| {
+                tally_block(
+                    blocks,
+                    fates,
+                    abandoned,
+                    *block_copy_share,
+                    id,
+                    entry,
+                    Claim::Dead,
+                );
+            },
             &|| stop_signal.is_stopped(),
         )
     }
 
-    /// Claims the value `indirection` names for the pointer of `key` from the
-    /// scan of the rewritten files, the values before it drained as no
-    /// pointer's, and advances the frontier past it.
+    /// Claims the value `indirection` names for the pointer of `key` at
+    /// `seqno` from the scan of the rewritten files, the values before it
+    /// drained as no pointer's, and advances the frontier past it.
     fn claim(
         &mut self,
         key: &crate::UserKey,
+        seqno: crate::SeqNo,
         indirection: &BlobIndirection,
     ) -> crate::Result<Claimed> {
         self.drain_blobs(key, indirection)?;
@@ -1703,13 +1795,21 @@ impl RelocatingCompaction {
         // Advance the consumed frontier past this relocated frame so the
         // tight-space loop can punch / resume here once the slice installs.
         self.record_consumed(blob_file_id, blob_entry.frame_end);
+        // An ingestion lists its values before its table is given a seqno: a
+        // block holding one is relisted value by value, never copied whole.
+        let claim = if blob_entry.seqno == seqno {
+            Claim::Live
+        } else {
+            Claim::Relisted
+        };
         tally_block(
             &mut self.blocks,
             &mut self.fates,
+            &self.abandoned,
             self.block_copy_share,
             blob_file_id,
             &blob_entry,
-            true,
+            claim,
         );
         Ok(Claimed::of(blob_entry, blob_file_id))
     }
@@ -1751,24 +1851,12 @@ impl RelocatingCompaction {
             .expect("relocated frame comes from a file being rewritten");
 
         let block_at = (blob_file_id, claimed.frame);
-        let whole = match self.fates.get(&block_at) {
-            Some(BlockFate::Whole { stored, dead, at }) if claimed.in_block => {
-                Some((stored.clone(), *dead, *at))
-            }
-            _ => None,
+        let whole = if claimed.in_block {
+            self.place_in_block(&item.key.user_key, block_at, (source_codec, class))?
+        } else {
+            None
         };
-        let new_indirection = if let Some((stored, dead, at)) = whole {
-            let (file, frame) = if let Some(at) = at {
-                at
-            } else {
-                self.copy_whole(
-                    &item.key.user_key,
-                    block_at,
-                    (source_codec, class),
-                    &stored,
-                    dead,
-                )?
-            };
+        let new_indirection = if let Some((file, frame)) = whole {
             // The value keeps its place in the block, and its entry the bytes
             // it is charged.
             BlobIndirection {
@@ -1848,26 +1936,89 @@ impl RelocatingCompaction {
         Ok(())
     }
 
-    /// Copies `stored`, the block `block_at` names, whole into the output of
-    /// its source under `output`'s codec and class, records where in its
-    /// fate, and counts its `dead` values as the new file's garbage.
-    fn copy_whole(
+    /// Where a value of the block `block_at` goes when the block is copied
+    /// whole: the copy, made by the first of its claimed values to arrive,
+    /// under `output`'s codec and class. `None` when its values are written
+    /// anew, or it has no fate. Counts the value placed off the block's fate,
+    /// which goes with the last.
+    fn place_in_block(
         &mut self,
         key: &[u8],
         block_at: (BlobFileId, u32),
         output: (crate::CompressionType, u8),
-        stored: &[u8],
-        dead: (usize, u64, u64),
+    ) -> crate::Result<Option<(BlobFileId, u32)>> {
+        let (placed, done) = match self.fates.get_mut(&block_at) {
+            None => return Ok(None),
+            Some(BlockFate::Copied { at, pending }) => {
+                debug_assert!(*pending > 0, "a fate counts the values still to place");
+                *pending -= 1;
+                (*at, *pending == 0)
+            }
+            Some(BlockFate::Whole { .. }) => {
+                let Some(BlockFate::Whole { block, pending }) = self.fates.remove(&block_at) else {
+                    return Ok(None);
+                };
+                // A block a key domain splits (the policy set after it was
+                // written), or of a source past the ones the writer copies
+                // blocks of, keeps no fate and has its values written anew:
+                // copied whole, its file would span two domains, or one more
+                // file would be held open for its source.
+                if !self
+                    .blob_writer
+                    .can_copy_block(block_at.0, &block.first_key, &block.last_key)
+                {
+                    return Ok(None);
+                }
+                let at = self.copy_whole(key, block_at.0, output, &block)?;
+                // The stored bytes go here: the values after this one need
+                // only where the copy lies.
+                if pending > 1 {
+                    self.fates.insert(
+                        block_at,
+                        BlockFate::Copied {
+                            at,
+                            pending: pending - 1,
+                        },
+                    );
+                }
+                return Ok(Some(at));
+            }
+        };
+        if done {
+            self.fates.remove(&block_at);
+        }
+        Ok(Some(placed))
+    }
+
+    /// Copies `stored`, the block `block_at` names, whole into the output of
+    /// its source under `output`'s codec and class, and counts its `dead`
+    /// values as the new file's garbage.
+    fn copy_whole(
+        &mut self,
+        key: &[u8],
+        source: BlobFileId,
+        output: (crate::CompressionType, u8),
+        block: &WholeBlock,
     ) -> crate::Result<(BlobFileId, u32)> {
+        let stored = &block.stored;
         // Paced once for the block, as a whole-value copy is.
         let _ = self
             .rate_limiter
             .request_interruptible(stored.len() as u64, || self.stop_signal.is_stopped());
+        let copied = crate::vlog::blob_file::writer::CopiedBlock {
+            stored,
+            first_key: &block.first_key,
+            last_key: &block.last_key,
+            values: block.values,
+            value_bytes: block.value_bytes,
+            entry_bytes: block.entry_bytes,
+        };
         let at = self
             .blob_writer
-            .copy_block(key, block_at.0, output.0, output.1, stored)?;
+            .copy_block(key, source, output.0, output.1, &copied)?;
         self.blob_carried += stored.len() as u64;
         // The block's dead values arrive dead in the new file.
+        let dead = block.dead;
         if dead.0 > 0 {
             let mut carried = FragmentationMap::default();
             carried.insert(
@@ -1876,9 +2027,6 @@ impl RelocatingCompaction {
                     .with_block_bytes(dead.2),
             );
             carried.merge_into(&mut self.carried_garbage);
-        }
-        if let Some(BlockFate::Whole { at: slot, .. }) = self.fates.get_mut(&block_at) {
-            *slot = Some(at);
         }
         Ok(at)
     }
@@ -1931,28 +2079,39 @@ impl RelocatingCompaction {
     /// Writes the held rows from the front as long as they are ready.
     fn release_ready(&mut self) -> crate::Result<()> {
         while self.held.front().is_some_and(|held| self.is_ready(held)) {
-            match self.held.pop_front() {
-                Some(Held::Row(item)) => self.write_row(item)?,
-                Some(Held::Pointer {
+            let Some(held) = self.held.pop_front() else {
+                break;
+            };
+            self.held_bytes -= held_len(&held);
+            match held {
+                Held::Row(item) => self.write_row(item)?,
+                Held::Pointer {
                     item,
                     indirection,
                     claimed,
-                }) => self.place(item, &indirection, &claimed)?,
-                None => break,
+                } => self.place(item, &indirection, &claimed)?,
             }
         }
         Ok(())
     }
 
-    /// Writes every held row: a block whose values were not all seen, its last
-    /// ones lying past where this pass reads, has its live values written
-    /// anew, its live share unknown.
-    fn release_all(&mut self) -> crate::Result<()> {
-        for (at, tally) in self.blocks.drain() {
-            if tally.live > 0 {
-                self.fates.insert(at, BlockFate::Values);
-            }
+    /// Holds `held` back behind the rows before it, and writes what is ready.
+    /// Past [`HELD_BYTES_MAX`], the blocks still tallied are given up so the
+    /// rows waiting for them go out.
+    fn hold(&mut self, held: Held) -> crate::Result<()> {
+        self.held_bytes += held_len(&held);
+        self.held.push_back(held);
+        if self.held_bytes > HELD_BYTES_MAX {
+            self.abandoned.extend(self.blocks.drain().map(|(at, _)| at));
         }
+        self.release_ready()
+    }
+
+    /// Writes every held row: a block whose values were not all seen, its last
+    /// ones lying past where this pass reads, keeps no fate and has its live
+    /// values written anew, its live share unknown.
+    fn release_all(&mut self) -> crate::Result<()> {
+        self.blocks.clear();
         self.release_ready()
     }
 
@@ -1973,6 +2132,7 @@ impl RelocatingCompaction {
             comparator,
             blocks,
             fates,
+            abandoned,
             block_copy_share,
             ..
         } = self;
@@ -1985,7 +2145,17 @@ impl RelocatingCompaction {
                 let slot = consumed_through.entry(id).or_insert(0);
                 *slot = (*slot).max(frame_end);
             },
-            &mut |id, entry| tally_block(blocks, fates, *block_copy_share, id, entry, false),
+            &mut |id, entry| {
+                tally_block(
+                    blocks,
+                    fates,
+                    abandoned,
+                    *block_copy_share,
+                    id,
+                    entry,
+                    Claim::Dead,
+                );
+            },
         )
     }
 }
@@ -2024,16 +2194,15 @@ impl CompactionFlavour for RelocatingCompaction {
                 .rewriting_blob_file_outputs
                 .contains_key(&indirection.vhandle.blob_file_id)
             {
-                let claimed = self.claim(&item.key.user_key, &indirection)?;
+                let claimed = self.claim(&item.key.user_key, item.key.seqno, &indirection)?;
                 if self.held.is_empty() && !self.waits_for(claimed.blob_file_id, claimed.frame) {
                     return self.place(item, &indirection, &claimed);
                 }
-                self.held.push_back(Held::Pointer {
+                return self.hold(Held::Pointer {
                     item,
                     indirection,
                     claimed,
                 });
-                return self.release_ready();
             }
         }
         if self.held.is_empty() {
@@ -2043,8 +2212,7 @@ impl CompactionFlavour for RelocatingCompaction {
         // keys no pointer claimed never will be: drained, they complete the
         // tallies of the blocks a held pointer waits for.
         self.drain_unclaimed_below(&item.key.user_key)?;
-        self.held.push_back(Held::Row(item));
-        self.release_ready()
+        self.hold(Held::Row(item))
     }
 
     fn produce(

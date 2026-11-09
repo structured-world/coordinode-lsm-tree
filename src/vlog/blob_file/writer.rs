@@ -68,6 +68,22 @@ pub(crate) struct FrameSizes {
     pub(crate) chunk_size: u32,
 }
 
+/// A block copied as it was stored, with what it adds to the file that
+/// copies it, as the scan that read and checked it counted it.
+pub(crate) struct CopiedBlock<'a> {
+    /// The block's frame as stored.
+    pub(crate) stored: &'a [u8],
+    /// The keys of its first and last values.
+    pub(crate) first_key: &'a [u8],
+    pub(crate) last_key: &'a [u8],
+    /// How many values it holds, and their decoded bytes.
+    pub(crate) values: u16,
+    pub(crate) value_bytes: u64,
+    /// The block entry bytes its values are charged, as its writer counted
+    /// them.
+    pub(crate) entry_bytes: u64,
+}
+
 impl FrameSizes {
     /// A block of 8 KiB, chunks of 256 KiB, chosen from the blob file sweep in
     /// `docs/BENCHMARKING.md`. Against a frame per value an 8 KiB block takes
@@ -1059,6 +1075,18 @@ impl Writer {
         self.uncompressed_bytes += u64::from(value_len);
     }
 
+    /// [`Self::note_key`] for a run of values written at once: `count` of
+    /// them from `first` to `last`, `value_bytes` decoded.
+    fn note_keys(&mut self, first: &[u8], last: &[u8], count: u64, value_bytes: u64) {
+        if self.first_key.is_none() {
+            self.first_key = Some(first.into());
+        }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(last);
+        self.item_count += count;
+        self.uncompressed_bytes += value_bytes;
+    }
+
     /// Writes an item into the file, into the frame its size calls for, and
     /// returns where it lies.
     ///
@@ -1421,41 +1449,39 @@ impl Writer {
         })
     }
 
-    /// Writes `stored`, a block frame as stored under the codec this file
-    /// records, without encoding it again, and returns its frame number: each
-    /// of its values keeps its place in it.
+    /// Writes `block.stored`, a block frame as stored under the codec this
+    /// file records, without encoding it again, and returns its frame number:
+    /// each of its values keeps its place in it.
+    ///
+    /// The scan that read the block checked it whole and counted what it
+    /// holds into `block`, so it is neither checked nor parsed again here:
+    /// only its header is read, to refuse a frame that is no such block.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when `stored` is not a block, a frame
-    /// that does not check, and any IO error.
-    pub(crate) fn write_block_verbatim(&mut self, stored: &[u8]) -> crate::Result<u32> {
+    /// [`crate::Error::InvalidHeader`] when `block.stored` is not one whole
+    /// block of `block.values` values, and any IO error.
+    pub(crate) fn write_block_verbatim(&mut self, block: &CopiedBlock<'_>) -> crate::Result<u32> {
         self.leave_file_dictionary()?;
-        let (header, list) = super::frame::check_frame(stored)?;
-        if header.kind != FrameKind::Block {
+        let header = super::frame::parse_header(block.stored)?;
+        if header.kind != FrameKind::Block
+            || header.count != block.values
+            || header.frame_len() != block.stored.len() as u64
+        {
             return Err(crate::Error::InvalidHeader("verbatim blob block"));
         }
-        let entries = stored
-            .get(super::frame::FRAME_HEADER_LEN..)
-            .unwrap_or_default();
         self.close_block()?;
         let frame = self.next_frame()?;
         let before = self.offset;
-        self.put_frame(stored)?;
+        self.put_frame(block.stored)?;
         self.block_frame_bytes += self.offset - before;
-        let packed = header.flags & super::packed::FLAG_PACKED != 0;
-        if packed {
-            // Its values are its records, each charged as it lies.
-            self.block_entry_bytes += entries.len() as u64;
-        }
-        for entry in list.iter() {
-            let key = entries.get(entry.key.clone()).unwrap_or_default();
-            if !packed {
-                self.block_entry_bytes += (super::frame::ENTRY_HEADER_LEN + key.len()) as u64
-                    + u64::from(entry.value_len);
-            }
-            self.note_key(key, entry.value_len);
-        }
+        self.block_entry_bytes += block.entry_bytes;
+        self.note_keys(
+            block.first_key,
+            block.last_key,
+            u64::from(block.values),
+            block.value_bytes,
+        );
         self.writeback_if_due()?;
         Ok(frame)
     }

@@ -136,7 +136,17 @@ pub(crate) struct MultiWriter {
 
     /// What the blob files are written for.
     origin: Option<WriteOrigin>,
+
+    /// The sources whose blocks this writer copied whole, each into files of
+    /// its own, at most [`MAX_COPY_SOURCES`].
+    copy_sources: Vec<crate::vlog::BlobFileId>,
 }
+
+/// At most how many sources one writer copies blocks of whole. Each holds a
+/// writer of its own open, a file and its buffer, until the pass ends; past
+/// this many, a relocation over many stale files writes the blocks of the
+/// rest value by value instead of opening a file per source.
+const MAX_COPY_SOURCES: usize = 16;
 
 impl MultiWriter {
     /// A blob file writer whose files carry no origin.
@@ -234,6 +244,7 @@ impl MultiWriter {
             outputs: None,
             landed: 0,
             domain: None,
+            copy_sources: Vec::new(),
         })
     }
 
@@ -573,10 +584,29 @@ impl MultiWriter {
         Ok(())
     }
 
-    /// Writes `stored`, a block frame of `source` under `compression`, as it is
-    /// into a file of lifetime `class` that holds blocks of `source` alone, and
-    /// returns that file and the block's frame in it: each value keeps its
-    /// place in the block. `key` is one of the block's keys.
+    /// Whether a block of `source` holding the keys from `first` to `last` can
+    /// be copied whole: its keys lie in one key domain (always, without a
+    /// domain policy), so its file spans none, and `source` is one of the
+    /// sources this writer copies blocks of, or one more fits.
+    pub(crate) fn can_copy_block(
+        &self,
+        source: crate::vlog::BlobFileId,
+        first: &[u8],
+        last: &[u8],
+    ) -> bool {
+        let source_fits =
+            self.copy_sources.len() < MAX_COPY_SOURCES || self.copy_sources.contains(&source);
+        source_fits
+            && self
+                .domain
+                .as_ref()
+                .is_none_or(|(domain, comparator)| domain.holds(first, last, comparator.as_ref()))
+    }
+
+    /// Writes `block`, a block frame of `source` under `compression` a scan
+    /// checked, as it is into a file of lifetime `class` that holds blocks of
+    /// `source` alone, and returns that file and the block's frame in it: each
+    /// value keeps its place in the block. `key` is one of the block's keys.
     ///
     /// A source's blocks reach this in the source's order, which is key order,
     /// while the other values of the pass interleave with them: a file of its
@@ -584,18 +614,21 @@ impl MultiWriter {
     ///
     /// # Errors
     ///
-    /// `stored` is not a block frame that checks, or an IO error occurs.
+    /// `block` is not one whole block frame, or an IO error occurs.
     pub(crate) fn copy_block(
         &mut self,
         key: &[u8],
         source: crate::vlog::BlobFileId,
         compression: CompressionType,
         class: u8,
-        stored: &[u8],
+        block: &super::writer::CopiedBlock<'_>,
     ) -> crate::Result<(crate::vlog::BlobFileId, u32)> {
         self.enter_key(key)?;
         self.select(compression, class, Some(source))?;
-        let frame = self.active_writer.write_block_verbatim(stored)?;
+        if !self.copy_sources.contains(&source) {
+            self.copy_sources.push(source);
+        }
+        let frame = self.active_writer.write_block_verbatim(block)?;
         let file = self.active_writer.blob_file_id();
         if self.active_writer.len_written() >= self.target_size {
             self.rotate()?;
