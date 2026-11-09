@@ -1106,8 +1106,10 @@ fn verify_blob_links_rejects_undercounted_block_bytes() -> crate::Result<()> {
     use crate::{InternalValue, ValueType};
 
     let dir = tempdir()?;
-    let file = dir.path().join("0");
-    let checksum = {
+    // A table whose values each take 120 block bytes, the link of id 9
+    // recording `last_block_bytes`.
+    let write = |name: &str, last_block_bytes: u64| -> crate::Result<_> {
+        let file = dir.path().join(name);
         let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
         for i in 0u64..10 {
             let value = BlobIndirection {
@@ -1134,23 +1136,41 @@ fn verify_blob_links_rejects_undercounted_block_bytes() -> crate::Result<()> {
                 len: 1,
                 bytes: 100,
                 on_disk_bytes: 0,
-                block_bytes: if i == 9 { 1 } else { 120 },
+                block_bytes: if i == 9 { last_block_bytes } else { 120 },
                 first_key: key.clone(),
                 last_key: key,
             });
         }
-        w.finish()?.expect("the SST is non-empty").1
+        let checksum = w.finish()?.expect("the SST is non-empty").1;
+        Ok(move || -> crate::Result<Table> {
+            Table::recover(test_recover_params(file.clone(), checksum))
+        })
     };
+    let restrict = |table: Table| table.reopen_restricted(crate::UserKey::from(&b"key00005"[..]));
 
-    let recover =
-        || -> crate::Result<Table> { Table::recover(test_recover_params(file.clone(), checksum)) };
+    // Control: honest block bytes pass the exact and the containment check.
+    let honest = write("honest", 120)?;
+    honest()?.verify_blob_links()?;
+    restrict(honest()?)?.verify_blob_links()?;
+
+    let recover = write("undercounted", 1)?;
     assert!(
-        recover()?.verify_blob_links().is_err(),
+        matches!(
+            recover()?.verify_blob_links(),
+            Err(crate::Error::InvalidHeader(
+                "linked_blob_files disagrees with the table's indirection entries"
+            ))
+        ),
         "the exact check must reject the under-counted block bytes",
     );
-    let restricted = recover()?.reopen_restricted(crate::UserKey::from(&b"key00005"[..]))?;
     assert!(
-        restricted.verify_blob_links().is_err(),
+        matches!(
+            restrict(recover()?)?.verify_blob_links(),
+            Err(crate::Error::InvalidHeader(
+                "linked_blob_files omits or under-counts a blob id the restricted suffix still \
+                 references"
+            ))
+        ),
         "the containment check must reject the under-counted block bytes",
     );
     Ok(())

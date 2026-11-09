@@ -7061,8 +7061,9 @@ fn repairing_a_table_with_blob_links_of_an_earlier_layout_refuses_and_keeps_it()
         &earlier,
         (0, None),
     )?;
-    // The stamp a table of that release carries for its links' layout: none
-    // at all, which reads as the version before this one.
+    // An explicit stamp one version below the current layout. A table of the
+    // earlier release carries none at all, which the same comparison against
+    // the current version refuses.
     crate::test_forge::forge_meta_value_both_mirrors(
         &sst,
         b"descriptor#blob_format",
