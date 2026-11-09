@@ -2276,10 +2276,12 @@ fn derive_blob_frontier(
             .pos()
             .checked_add(data.len())
             .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+        // Needed only to place a frontier: a whole file without one reaches
+        // salvage, which walks its frame chain.
         let index = toc
             .section(b"frames")
-            .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
-        (data.pos(), end, (index.pos(), index.len()))
+            .map(|index| (index.pos(), index.len()));
+        (data.pos(), end, index)
     };
     if data_start >= data_end {
         return Ok(BlobFrontier::Whole);
@@ -2299,11 +2301,18 @@ fn derive_blob_frontier(
     }
 
     // A punch ends on a frame boundary, so the frames the file's index places
-    // are the only candidates for the frontier.
-    let index_len =
-        usize::try_from(index_at.1).map_err(|_| crate::Error::InvalidHeader("BlobFile"))?;
+    // are the only candidates for the frontier. The index lies within the
+    // file: a length past it is damage, refused before a buffer is sized from
+    // it.
+    let (index_pos, index_len) = index_at.ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+    let file_len = file.metadata()?.len;
+    let index_len = index_pos
+        .checked_add(index_len)
+        .filter(|&end| end <= file_len)
+        .and_then(|_| usize::try_from(index_len).ok())
+        .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
     let starts = crate::vlog::blob_file::writer::decode_frame_index(&crate::file::read_exact(
-        &*file, index_at.0, index_len,
+        &*file, index_pos, index_len,
     )?)?;
     if starts.first() != Some(&data_start) || starts.last() != Some(&data_end) {
         return Err(crate::Error::InvalidHeader("BlobFile"));

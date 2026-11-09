@@ -791,12 +791,20 @@ impl BlobTree {
         else {
             return Ok(None);
         };
-        // A merged value exists only whole, as its operands fold onto the base.
-        if item.key.value_type.is_merge_operand() && self.index.config.merge_operator.is_some() {
-            return self
-                .resolve_key(&super_version, &source, key, seqno)?
-                .map(|value| crate::vlog::accessor::slice_range(&value, &range))
-                .transpose();
+        // A merged value exists only whole, as its operands fold onto the base:
+        // merged from the lookup above, not a second one.
+        if item.key.value_type.is_merge_operand()
+            && let Some(merge_operator) = &self.index.config.merge_operator
+        {
+            return crate::Tree::resolve_point_merge(
+                &super_version,
+                key,
+                seqno,
+                merge_operator,
+                Some(&source),
+            )?
+            .map(|value| crate::vlog::accessor::slice_range(&value, &range))
+            .transpose();
         }
         source
             .value_range(&super_version.version, item, range)

@@ -15279,6 +15279,56 @@ fn a_zeroed_blob_prefix_without_a_hole_is_not_a_frontier() -> crate::Result<()> 
     Ok(())
 }
 
+/// A blob file whose frame index is missing but whose data starts with a frame
+/// is whole: the index is needed only to place a frontier, and salvage walks
+/// the frame chain of a file without one, so the file is kept, not refused.
+#[test]
+fn a_whole_blob_file_without_its_frame_index_is_whole() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = crate::vlog::blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"key", 0, b"value")?;
+    writer.finish()?;
+    crate::test_forge::forge_section_omitted(&path, b"frames")?;
+
+    let fs: std::sync::Arc<dyn crate::fs::Fs> = std::sync::Arc::new(crate::fs::StdFs);
+    let derived = super::derive_blob_frontier(&fs, &path)?;
+    assert!(matches!(derived, super::BlobFrontier::Whole), "{derived:?}");
+    Ok(())
+}
+
+/// A frame index the table of contents says runs past the file is damage the
+/// frontier probe reports, before anything is sized from the length it names.
+#[test]
+fn a_frame_index_past_the_file_is_refused_by_the_frontier_probe() -> crate::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = crate::vlog::blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"key", 0, b"value")?;
+    writer.finish()?;
+    // Zeros at the data start, so the probe goes past its whole-file check.
+    let data_start = crate::sfa::Reader::new(&path)?
+        .toc()
+        .section(b"data")
+        .map(crate::sfa::TocEntry::pos)
+        .unwrap_or_default();
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(data_start))?;
+        file.write_all(&[0; 4])?;
+    }
+    crate::test_forge::forge_section_len(&path, b"frames", u64::MAX / 2)?;
+
+    let fs: std::sync::Arc<dyn crate::fs::Fs> = std::sync::Arc::new(crate::fs::StdFs);
+    assert!(matches!(
+        super::derive_blob_frontier(&fs, &path),
+        Err(crate::Error::InvalidHeader("BlobFile"))
+    ));
+    Ok(())
+}
+
 /// The same rule at the extreme: a data section zeroed end to end by corruption
 /// must not read as a completed relocation, which REMOVES the file (and every
 /// table referencing it) while its records were merely damaged.
