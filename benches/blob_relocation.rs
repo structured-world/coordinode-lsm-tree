@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 const KEYS: u64 = 4_000;
 const VALUE_LEN: usize = 8_192;
-const PAYLOAD_COLUMN: u16 = 1;
+const PAYLOAD_COLUMN: u16 = lsm_tree::blob_tree::field_row::FIRST_FIELD_COLUMN;
 
 /// A value that compresses as real data does: a seed-dependent header, then
 /// a run of one seed-dependent byte.
