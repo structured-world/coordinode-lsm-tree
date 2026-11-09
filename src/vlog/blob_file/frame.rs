@@ -414,13 +414,24 @@ pub(crate) fn verify_frame(bytes: &[u8]) -> crate::Result<FrameHeader> {
 /// [`verify_frame`]'s checks, the frame kept with its payload not decoded:
 /// `payload` is empty, so [`DecodedFrame::value`] has nothing to give and the
 /// header's `raw_len` is the payload's length. For a frame a consumer copies
-/// as stored, whose decompression would buy nothing.
+/// as stored, whose decompression would buy nothing; a payload stored as it
+/// is under `compression` is checked to be the length it declares, as a
+/// decode checks it.
 ///
 /// # Errors
 ///
-/// As [`verify_frame`].
-pub(crate) fn undecoded_frame(bytes: &Slice) -> crate::Result<DecodedFrame> {
+/// As [`verify_frame`], and a payload stored as it is whose length is not
+/// the one declared.
+pub(crate) fn undecoded_frame(
+    bytes: &Slice,
+    compression: CompressionType,
+) -> crate::Result<DecodedFrame> {
     let (header, list) = check_frame(bytes)?;
+    if (header.is_raw() || compression == CompressionType::None)
+        && header.disk_len != header.raw_len
+    {
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
     Ok(DecodedFrame {
         header,

@@ -4,8 +4,8 @@
 
 use crate::io::{LittleEndian, ReadBytesExt};
 use crate::{
-    Checksum, SeqNo, TableId, TreeType, coding::Decode, config::ManifestRecoveryMode, fs::Fs,
-    version::VersionId, vlog::BlobFileId,
+    Checksum, SeqNo, TableId, TreeType, config::ManifestRecoveryMode, fs::Fs, version::VersionId,
+    vlog::BlobFileId,
 };
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;

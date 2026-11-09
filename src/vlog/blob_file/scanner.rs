@@ -428,7 +428,7 @@ impl Scanner {
             Some(Ok(FrameKind::Single | FrameKind::Chunk))
         );
         let parsed = if own && self.decode == Decode::Blocks {
-            undecoded_frame(&bytes)
+            undecoded_frame(&bytes, self.codec.compression)
         } else {
             decode_frame(
                 &bytes,

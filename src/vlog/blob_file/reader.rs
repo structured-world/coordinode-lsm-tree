@@ -2,7 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use super::frame::{DecodedFrame, FrameKind, decode_frame};
+use super::frame::{DecodedFrame, FRAME_MAGIC, FrameKind, decode_frame, undecoded_frame};
 use crate::{BlobFile, Slice, UserValue, fs::FsFile, vlog::ValueHandle};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -117,10 +117,25 @@ impl<'a> Reader<'a> {
         key: &[u8],
         vhandle: &ValueHandle,
     ) -> crate::Result<(CopySource, u64)> {
-        let mut decoded = 0;
+        let compression = self.blob_file.0.meta.compression;
         let first = self.read_frame_bytes(vhandle.frame)?;
         let mut read = first.len() as u64;
-        let frame = Self::decode(self.blob_file, &first, &mut decoded)?;
+        // A single frame is copied as it lies, so it is checked as stored and
+        // not decoded; a block is decoded for the value, and a head's payload
+        // is its chunk table, stored as it is. The kind byte follows the
+        // magic; one naming no single frame is decoded and refused there.
+        let single = matches!(
+            first
+                .get(FRAME_MAGIC.len())
+                .copied()
+                .map(FrameKind::try_from),
+            Some(Ok(FrameKind::Single))
+        );
+        let frame = if single {
+            undecoded_frame(&first, compression)?
+        } else {
+            Self::decode(self.blob_file, &first, &mut 0)?
+        };
         check_key(&frame, vhandle.index, key)?;
         let value_len = frame.list.first().map_or(0, |e| e.value_len);
         let source = match frame.header.kind {
@@ -134,16 +149,22 @@ impl<'a> Reader<'a> {
                 value_len,
             },
             FrameKind::Head => {
-                let mut frames = alloc::vec![first];
-                for chunk in chunk_frames(&frame, vhandle.frame, self.blob_file.frame_count())? {
+                let all = chunk_frames(&frame, vhandle.frame, self.blob_file.frame_count())?;
+                let mut frames = Vec::with_capacity(all.len() + 1);
+                frames.push(first);
+                let mut chunks = Vec::with_capacity(all.len());
+                for chunk in all {
                     let bytes = self.read_frame_bytes(chunk)?;
                     read += bytes.len() as u64;
-                    let decoded_chunk = Self::decode(self.blob_file, &bytes, &mut decoded)?;
-                    if decoded_chunk.header.kind != FrameKind::Chunk {
-                        return Err(crate::Error::InvalidHeader("Blob"));
-                    }
+                    chunks.push(alloc::boxed::Box::new(undecoded_frame(
+                        &bytes,
+                        compression,
+                    )?));
                     frames.push(bytes);
                 }
+                // Copied as they lie, the chunks must still make the value
+                // the head names, each the length its table gives it.
+                check_chunks(&frame, &chunks)?;
                 CopySource::Frames { frames, value_len }
             }
         };

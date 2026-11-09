@@ -335,6 +335,80 @@ fn a_copy_takes_frames_or_the_value() -> crate::Result<()> {
     Ok(())
 }
 
+/// A copy refuses chunks that do not fit their head's table, though each one
+/// checks: written as they are, the value would be one no read can assemble.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_copy_refuses_chunks_that_do_not_fit_their_head() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let values = one_of_each();
+    let refs: Vec<(&[u8], &[u8])> = values.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+    let (blob_file, handles) = write(&folder, CompressionType::None, &refs)?;
+
+    // The head now names 650 bytes, still three chunks, while the chunks
+    // hold 700: its last chunk is 100 bytes, not the 50 the table asks.
+    let (start, end) = blob_file.frame_span(handles[3].frame).expect("the head");
+    let mut bytes = std::fs::read(&blob_file.0.path)?;
+    let head = &mut bytes[start as usize..end as usize];
+    let len_at = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + 10;
+    head[len_at..len_at + 4].copy_from_slice(&650_u32.to_le_bytes());
+    crate::vlog::blob_file::frame::reseal(head);
+    std::fs::write(&blob_file.0.path, &bytes)?;
+
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    assert!(
+        matches!(
+            reader.copy_source(b"d", &handles[3]),
+            Err(crate::Error::InvalidHeader("Blob"))
+        ),
+        "the chunks do not fit the head",
+    );
+    Ok(())
+}
+
+/// A copy checks a frame of a value's own as stored and does not decode it:
+/// a single frame and a chunk whose payloads, sealed, the codec cannot decode
+/// are handed over as they lie, while a read refuses them.
+#[test]
+#[cfg(feature = "lz4")]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_copy_hands_over_frames_of_their_own_undecoded() -> crate::Result<()> {
+    use crate::vlog::blob_file::frame::{FRAME_HEADER_LEN, parse_header, reseal};
+
+    let folder = tempfile::tempdir()?;
+    let chunked: Vec<u8> = (0..700_u32).map(|i| (i % 7) as u8).collect();
+    let refs: [(&[u8], &[u8]); 2] = [(b"c", &[b'c'; 150]), (b"d", &chunked)];
+    let (blob_file, handles) = write(&folder, CompressionType::Lz4, &refs)?;
+
+    let mut bytes = std::fs::read(&blob_file.0.path)?;
+    for frame in [handles[0].frame, handles[1].frame + 1] {
+        let (start, end) = blob_file.frame_span(frame).expect("the frame");
+        let at = &mut bytes[start as usize..end as usize];
+        let header = parse_header(at)?;
+        assert!(!header.is_raw(), "frame {frame} is compressed");
+        let stored = FRAME_HEADER_LEN + header.entries_len as usize;
+        at[stored..].fill(0xFF);
+        reseal(at);
+    }
+    std::fs::write(&blob_file.0.path, &bytes)?;
+
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    for (key, handle, frames) in [(b"c", &handles[0], 1), (b"d", &handles[1], 4)] {
+        let (source, _) = reader.copy_source(key, handle)?;
+        assert!(
+            matches!(&source, CopySource::Frames { frames: f, .. } if f.len() == frames),
+            "copied as its frames"
+        );
+        assert!(
+            reader.get(key, handle).is_err(),
+            "a read decodes and refuses it"
+        );
+    }
+    Ok(())
+}
+
 /// A writer that compressed against a dictionary produces a handle carrying it,
 /// so the read needs nothing supplied: it just used those bytes, and they are
 /// the file's by construction.
