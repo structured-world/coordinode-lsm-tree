@@ -377,6 +377,12 @@ path = "benches/tight_space.rs"
 required-features = ["std"]
 
 [[bench]]
+name = "blob_chunked_reads"
+harness = false
+path = "benches/blob_chunked_reads.rs"
+required-features = ["std"]
+
+[[bench]]
 name = "blob_relocation"
 harness = false
 path = "benches/blob_relocation.rs"
