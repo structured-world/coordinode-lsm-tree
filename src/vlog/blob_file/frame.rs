@@ -219,6 +219,9 @@ impl<'b> Put<'b> {
 /// The checksum of a frame's entries and stored payload, `stored` the two as
 /// they lie back to back, seeded with `header_crc` so a header recomputed
 /// after tampering is still caught.
+///
+/// Blob layout 5 is in no release yet, so changing how it is checksummed keeps
+/// its version: no supported store holds frames checksummed the other way.
 pub(crate) fn frame_checksum(stored: &[u8], header_crc: u32) -> u128 {
     xxhash_rust::xxh3::xxh3_128_with_seed(stored, u64::from(header_crc))
 }
