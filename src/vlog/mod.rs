@@ -518,6 +518,16 @@ pub(crate) fn read_file_dictionary(
     let Some((pos, len)) = at else {
         return Ok(None);
     };
+    // The dictionary lies within the file: a length past it is damage, refused
+    // before a buffer is sized from it.
+    let file_len = file.metadata()?.len;
+    if pos.checked_add(len).is_none_or(|end| end > file_len) {
+        log::error!(
+            "dict section in blob file #{} runs past the file (file may be corrupted)",
+            meta.id
+        );
+        return Err(crate::Error::Unrecoverable);
+    }
     let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
     let dict =
         crate::compression::ZstdDictionary::new(&crate::file::read_exact(&**file, pos, len)?);

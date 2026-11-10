@@ -1166,6 +1166,10 @@ pub(crate) struct RelocatingCompaction {
     /// a different question and need not agree.
     rewriting_blob_file_outputs: crate::HashMap<BlobFileId, (crate::CompressionType, u8)>,
     rewriting_blob_files: Vec<BlobFile>,
+    /// The source whose dictionary the writer was last lent: a writer keeps
+    /// what it is lent for the pass, so values of one source in a row lend it
+    /// once.
+    lent_source: Option<BlobFileId>,
     /// Paces relocated-blob I/O. The merge loop's limiter only sees the
     /// encoded handle in `item.value`; the real payload moved here is
     /// debited at the relocation write site so KV-separated compactions
@@ -1483,6 +1487,7 @@ impl RelocatingCompaction {
                 })
                 .collect(),
             rewriting_blob_files,
+            lent_source: None,
             rate_limiter,
             stop_signal,
             consumed_through: crate::HashMap::default(),
@@ -1503,6 +1508,22 @@ impl RelocatingCompaction {
             held_bytes: 0,
             abandoned: HashSet::default(),
             carried_garbage: FragmentationMap::default(),
+        }
+    }
+
+    /// Lends the writer the own dictionary of the rewritten file `source`, so
+    /// the frames and blocks copied from it land in a file that holds it.
+    fn lend_source_dictionary(&mut self, source: BlobFileId) {
+        if self.lent_source == Some(source) {
+            return;
+        }
+        self.lent_source = Some(source);
+        if let Some(file) = self
+            .rewriting_blob_files
+            .iter()
+            .find(|file| file.id() == source)
+        {
+            self.blob_writer.lend_dictionary(file);
         }
     }
 
@@ -1883,13 +1904,7 @@ impl RelocatingCompaction {
                 });
             // A file's own dictionary goes with its frames into the file that
             // copies them, which holds it as its own.
-            if let Some(file) = self
-                .rewriting_blob_files
-                .iter()
-                .find(|file| file.id() == blob_file_id)
-            {
-                self.blob_writer.lend_dictionary(file);
-            }
+            self.lend_source_dictionary(blob_file_id);
             self.blob_writer.select_output(source_codec, class)?;
             match (&claimed.frames, &claimed.value) {
                 (Some(frames), _) => {
@@ -2015,13 +2030,7 @@ impl RelocatingCompaction {
         };
         // A file's own dictionary goes with its blocks into the file that
         // copies them, as it does with its values in `place`.
-        if let Some(file) = self
-            .rewriting_blob_files
-            .iter()
-            .find(|file| file.id() == source)
-        {
-            self.blob_writer.lend_dictionary(file);
-        }
+        self.lend_source_dictionary(source);
         let at = self
             .blob_writer
             .copy_block(key, source, output.0, output.1, &copied)?;

@@ -616,7 +616,11 @@ where
                 return true;
             }
         }
-        shard.write().push_ghost(h);
+        // A hint, taken on the read path: a read never waits for the shard
+        // for it, and a hint lost to a held lock costs the key one more miss.
+        if let Some(mut core) = shard.try_write() {
+            core.push_ghost(h);
+        }
         false
     }
 

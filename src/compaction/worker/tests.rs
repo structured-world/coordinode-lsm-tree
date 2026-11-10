@@ -4121,18 +4121,21 @@ fn relocation_copies_whole_blocks_of_a_file_with_its_own_dictionary() -> crate::
     }
 
     let folder = crate::get_tmp_folder();
-    let tree = match crate::Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .blob_compression(crate::CompressionType::Zstd(3))
-    .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
-    .open()?
-    {
-        crate::AnyTree::Blob(t) => t,
-        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    let open = || -> crate::Result<crate::BlobTree> {
+        match crate::Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .blob_compression(crate::CompressionType::Zstd(3))
+        .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+        }
     };
+    let tree = open()?;
     for i in 0..KEYS {
         tree.insert(blob_reloc_key(i), value(i, 1), 0);
     }
@@ -4168,14 +4171,22 @@ fn relocation_copies_whole_blocks_of_a_file_with_its_own_dictionary() -> crate::
         "the files with their own dictionary are relocated"
     );
 
-    for i in 0..KEYS {
-        let expected = value(i, if shadowed(i) { 2 } else { 1 });
-        assert_eq!(
-            tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
-            Some(&expected[..]),
-            "key {i} reads back"
-        );
-    }
+    // Read back as written, and again after a reopen, which loads each
+    // file's dictionary from the file itself.
+    let read_back = |tree: &crate::BlobTree| -> crate::Result<()> {
+        for i in 0..KEYS {
+            let expected = value(i, if shadowed(i) { 2 } else { 1 });
+            assert_eq!(
+                tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+                Some(&expected[..]),
+                "key {i} reads back"
+            );
+        }
+        Ok(())
+    };
+    read_back(&tree)?;
+    drop(tree);
+    read_back(&open()?)?;
     Ok(())
 }
 

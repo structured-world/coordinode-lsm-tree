@@ -812,8 +812,24 @@ impl MultiWriter {
             // matching dictionary needs no set to pin it, since it just used
             // those bytes. The set is what answers for a relocation, which
             // compresses nothing and records the source's codec.
+            //
+            // A file that stores its own dictionary decodes with that one
+            // alone, so the writer's comes first there: a dictionary of the
+            // set under the same 32-bit id would be another dictionary.
             #[cfg(zstd_any)]
-            let zstd_dictionary = match zstd_dictionaries.for_compression(recorded_compression) {
+            let own_dictionary = match (&recorded_compression, &writer_dictionary) {
+                (CompressionType::ZstdDict { dict_id, .. }, Some(d))
+                    if dictionary_in_file && d.id() == *dict_id =>
+                {
+                    Some(alloc::sync::Arc::clone(d))
+                }
+                _ => None,
+            };
+            #[cfg(zstd_any)]
+            let zstd_dictionary = match own_dictionary.map_or_else(
+                || zstd_dictionaries.for_compression(recorded_compression),
+                |own| Ok(Some(own)),
+            ) {
                 Ok(dict) => dict,
                 Err(e) => match (&recorded_compression, &writer_dictionary) {
                     (CompressionType::ZstdDict { dict_id, .. }, Some(d)) if d.id() == *dict_id => {

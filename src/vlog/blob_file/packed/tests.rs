@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-#![cfg(zstd_any)]
-
 use super::*;
 use crate::vlog::blob_file::frame::{Codec, check_frame, decode_frame};
 
 const UNCOMPRESSED: Codec<'static> = Codec {
     compression: CompressionType::None,
+    #[cfg(zstd_any)]
     dictionary: None,
+    #[cfg(zstd_any)]
     two_pass_seed: false,
+    #[cfg(not(zstd_any))]
+    dictionary: core::marker::PhantomData,
     plain: false,
 };
 
@@ -57,7 +59,14 @@ fn a_packed_block_decodes_every_value_in_order() {
     let raw = values.iter().map(|v| v.len()).sum::<usize>();
     let frame = Slice::from(frame(&bytes, &starts, u32::try_from(raw).unwrap()));
     let mut decoded = 0;
-    let frame = decode_frame(&frame, CompressionType::None, None, &mut decoded).unwrap();
+    let frame = decode_frame(
+        &frame,
+        CompressionType::None,
+        #[cfg(zstd_any)]
+        None,
+        &mut decoded,
+    )
+    .unwrap();
     assert_eq!(frame.list.len(), 3);
     for (place, (value, at)) in values.iter().zip(&starts).enumerate() {
         assert_eq!(frame.place_of(u16::try_from(*at).unwrap()), Some(place));
@@ -89,7 +98,15 @@ fn a_record_stored_as_is_caches_as_its_bytes() {
     let bytes = Slice::from(bytes);
     let record = parse_record(&bytes).unwrap();
     let mut decoded = 0;
-    let value = record_value(&record, &bytes, CompressionType::None, None, &mut decoded).unwrap();
+    let value = record_value(
+        &record,
+        &bytes,
+        CompressionType::None,
+        #[cfg(zstd_any)]
+        None,
+        &mut decoded,
+    )
+    .unwrap();
     let cached = cached_record(&record, &bytes, &value);
     assert_eq!(cached.as_ptr(), bytes.as_ptr(), "the bytes read are kept");
     assert_eq!(cached.len(), cached_record_len(&record, &value));
