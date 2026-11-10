@@ -1531,12 +1531,24 @@ impl<W: Write> BufWriter<W> {
         &self.inner
     }
 
+    /// Hands the buffer down. What the inner writer took leaves the buffer
+    /// even when a later write of the flush fails, so a retry does not put
+    /// it down again.
     fn flush_buf(&mut self) -> BufResult<()> {
-        if !self.buf.is_empty() {
-            self.inner.write_all(&self.buf)?;
-            self.buf.clear();
-        }
-        Ok(())
+        let mut written = 0;
+        let result = loop {
+            let Some(rest) = self.buf.get(written..).filter(|rest| !rest.is_empty()) else {
+                break Ok(());
+            };
+            match self.inner.write(rest) {
+                Ok(0) => break Err(write_zero()),
+                Ok(n) => written += n,
+                Err(e) if interrupted(&e) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.buf.drain(..written);
+        result
     }
 
     /// Takes a prefix of `data`, all of it unless it overflows the buffer.
@@ -1559,16 +1571,48 @@ impl<W: Write> BufWriter<W> {
             return self.inner.write(data);
         }
         // Otherwise the buffer goes down full and the caller retries the rest.
-        let held = self.buf.len();
         self.buf
             .extend_from_slice(data.get(..room).unwrap_or_default());
         if let Err(e) = self.flush_buf() {
-            // Nothing of `data` was taken.
-            self.buf.truncate(held);
-            return Err(e);
+            // The flush took a prefix of the buffer. Short of the bytes held
+            // before, nothing of `data` went down and it leaves the buffer;
+            // past them, all of `room` is taken, written or still buffered,
+            // and the error comes back on the next flush.
+            let left = self.buf.len();
+            if left >= room {
+                self.buf.truncate(left - room);
+                return Err(e);
+            }
         }
         Ok(room)
     }
+}
+
+/// The error a write that takes nothing ends a flush with.
+#[cfg(feature = "std")]
+fn write_zero() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "failed to write whole buffer",
+    )
+}
+
+/// [`write_zero`] without `std`.
+#[cfg(not(feature = "std"))]
+fn write_zero() -> Error {
+    Error::new(ErrorKind::WriteZero, "failed to write whole buffer")
+}
+
+/// Whether `e` asks for the write to be tried again.
+#[cfg(feature = "std")]
+fn interrupted(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Interrupted
+}
+
+/// [`interrupted`] without `std`.
+#[cfg(not(feature = "std"))]
+fn interrupted(e: &Error) -> bool {
+    e.kind() == ErrorKind::Interrupted
 }
 
 #[cfg(feature = "std")]

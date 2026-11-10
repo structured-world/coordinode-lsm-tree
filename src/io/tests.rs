@@ -340,6 +340,81 @@ fn buf_writer_passes_a_write_of_a_whole_buffer_straight_down() -> std::io::Resul
     Ok(())
 }
 
+/// An inner writer that takes `accept` bytes of its first write, fails its
+/// second, and takes everything after.
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct FailsOnce {
+    accept: usize,
+    calls: usize,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "std")]
+impl std::io::Write for FailsOnce {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        let taken = match self.calls {
+            1 => self.accept.min(buf.len()),
+            2 => return Err(std::io::Error::other("injected")),
+            _ => buf.len(),
+        };
+        self.bytes
+            .extend_from_slice(buf.get(..taken).unwrap_or_default());
+        Ok(taken)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A flush the inner writer fails after taking part of the buffer leaves only
+/// what it did not take: a write retried after the error, and the flush
+/// after it, put every byte down once.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_keeps_only_what_a_failed_flush_did_not_write() -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut out = BufWriter::with_capacity(
+        8,
+        FailsOnce {
+            accept: 6,
+            ..FailsOnce::default()
+        },
+    );
+    out.write_all(b"abcdef")?;
+    assert!(
+        out.write_all(b"ghij").is_err(),
+        "the injected failure surfaces"
+    );
+    out.write_all(b"ghij")?;
+    out.flush()?;
+    assert_eq!(out.get_ref().bytes, b"abcdefghij");
+    Ok(())
+}
+
+/// A flush that fails after taking bytes of the write being buffered has
+/// taken that write's prefix: the write reports it taken, and what it put in
+/// the buffer goes down with the next flush, once.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_takes_a_write_a_failed_flush_wrote_part_of() -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut out = BufWriter::with_capacity(
+        8,
+        FailsOnce {
+            accept: 7,
+            ..FailsOnce::default()
+        },
+    );
+    out.write_all(b"abcdef")?;
+    out.write_all(b"ghij")?;
+    out.flush()?;
+    assert_eq!(out.get_ref().bytes, b"abcdefghij");
+    Ok(())
+}
+
 /// Every `ErrorKind` discriminant — kept in one place so the
 /// exhaustive bridge tests below stay total. A new variant added
 /// to the enum without a row here fails the per-arm assertions
