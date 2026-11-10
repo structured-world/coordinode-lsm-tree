@@ -25,6 +25,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -178,9 +179,21 @@ async function chain(blocks: string, transactions: string, limit: number): Promi
   return count;
 }
 
+/// Where a part is written before it is complete: a run that stops part way
+/// leaves no file under the part's own name, so the next run builds it again.
+function partial(path: string): string {
+  return `${path}.part`;
+}
+
 async function download(url: string, out: string): Promise<void> {
   const response = await fetchOk(url);
-  writeFileSync(out, Buffer.from(await response.arrayBuffer()));
+  writeFileSync(partial(out), Buffer.from(await response.arrayBuffer()));
+  renameSync(partial(out), out);
+}
+
+function writeManifest(): void {
+  writeFileSync(partial(manifestPath), `${JSON.stringify(manifest, null, 2)}\n`);
+  renameSync(partial(manifestPath), manifestPath);
 }
 
 async function files(out: string): Promise<void> {
@@ -203,28 +216,46 @@ async function files(out: string): Promise<void> {
   const silesiaDir = join(out, "silesia");
   mkdirSync(silesiaDir, { recursive: true });
   execFileSync("unzip", ["-o", "-q", silesiaZip, "-d", silesiaDir]);
-  execFileSync("tar", ["-cf", join(out, "silesia.tar"), "-C", silesiaDir, "."]);
+  // The tar is the part's mark of completion, so it lands last.
+  const silesiaTar = join(out, "silesia.tar");
+  execFileSync("tar", ["-cf", partial(silesiaTar), "-C", silesiaDir, "."]);
+  renameSync(partial(silesiaTar), silesiaTar);
 }
 
+// Each part lands under its own name only once complete, and the manifest is
+// written after each, so a run that fails keeps what it finished.
 const documentsDir = join(dir, "documents");
-if (!existsSync(join(documentsDir, "records.jsonl"))) {
+const recordsPath = join(documentsDir, "records.jsonl");
+if (!existsSync(recordsPath)) {
   mkdirSync(documentsDir, { recursive: true });
-  const records = await documents(join(documentsDir, "records.jsonl"), DOCUMENTS_BYTES);
-  manifest.documents = { source: GHARCHIVE_HOUR, bytes: sizeOf(documentsDir), records };
+  const records = await documents(partial(recordsPath), DOCUMENTS_BYTES);
+  renameSync(partial(recordsPath), recordsPath);
+  manifest.documents = { source: GHARCHIVE_HOUR, bytes: sizeOf(recordsPath), records };
+  writeManifest();
 }
 
 const chainDir = join(dir, "chain");
-if (!existsSync(join(chainDir, "blocks.jsonl"))) {
+const blocksPath = join(chainDir, "blocks.jsonl");
+const transactionsPath = join(chainDir, "transactions.jsonl");
+if (!existsSync(blocksPath)) {
   mkdirSync(chainDir, { recursive: true });
-  const blocks = await chain(join(chainDir, "blocks.jsonl"), join(chainDir, "transactions.jsonl"), CHAIN_BYTES);
-  manifest.chain = { source: `TronGrid blocks from ${TRON_START}`, bytes: sizeOf(chainDir), records: blocks };
+  const blocks = await chain(partial(blocksPath), partial(transactionsPath), CHAIN_BYTES);
+  // The blocks are the part's mark of completion, so they land last.
+  renameSync(partial(transactionsPath), transactionsPath);
+  renameSync(partial(blocksPath), blocksPath);
+  manifest.chain = {
+    source: `TronGrid blocks from ${TRON_START}`,
+    bytes: sizeOf(blocksPath) + sizeOf(transactionsPath),
+    records: blocks,
+  };
+  writeManifest();
 }
 
 const filesDir = join(dir, "files");
 if (!existsSync(join(filesDir, "silesia.tar"))) {
   await files(filesDir);
   manifest.files = { source: `${CANTERBURY}, ${SILESIA}`, bytes: sizeOf(filesDir) };
+  writeManifest();
 }
 
-writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 console.log(`blob sweep data in ${dir}`);

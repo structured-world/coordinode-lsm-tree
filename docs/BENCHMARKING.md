@@ -335,15 +335,18 @@ bytes each decodes, and the most heap a whole read and a range read of the
 largest value take; and the write amplification of collection, three rounds
 each overwriting a third of the keys, flushed and compacted, as relocated blob
 bytes over removed blob bytes. Every value is separated (threshold 64 bytes),
-so the runs measure the blob files alone. The trees go to `--work`, which is
-to be the disk the products run on: a RAM disk measures no read.
+so the runs measure the blob files alone. The trees go to `--work`. The sweep
+does not drop the OS page cache between its passes, so a point read with the
+small cache misses the engine's cache but finds its bytes in the page cache:
+the figures are the cost of locating, decoding and copying a value, not of a
+device read.
 
 ### What the defaults rest on
 
 A run on Linux (the benchmark host, NVMe), chunks of 256 KiB unless named.
 Documents are 20,049 values (64 MiB), chain 70,258 values (142 MiB), files
-25 values (472 MiB). A point read is the mean per key with the cache smaller
-than the data.
+25 values (472 MiB). A point read is the mean per key with the engine's cache
+smaller than the data, the OS page cache warm.
 
 | Corpus | Layout | Ratio lz4 | Ratio zstd 3 | Point read lz4 | Point read zstd 3 | Collection WA lz4 |
 |---|---|---|---|---|---|---|
@@ -368,7 +371,10 @@ With the cache holding the data, every layout reads a key in 1.4 to 2.1 µs.
 | chunk 1M | 0.412 | 2.5 s | 1.36 s | 1.9 ms | | | |
 | chunk 4M | 0.408 | 2.8 s | 1.56 s | 9.1 ms | | | |
 
-A dictionary trained on the corpus, zstd 3 with 16 KiB blocks:
+A dictionary trained on the corpus, zstd 3 with 16 KiB blocks. It is trained
+on the first values of the corpus and the ratio counts those values too, so the
+gain is in-sample: a dictionary trained on past values sees less of what it
+later compresses.
 
 | Dictionary on | Ratio documents | Ratio chain | Ratio files |
 |---|---|---|---|
@@ -379,7 +385,8 @@ A dictionary trained on the corpus, zstd 3 with 16 KiB blocks:
 
 The defaults that follow:
 
-- **Blocks of 8 KiB.** On documents a cold point read costs what it did with a
+- **Blocks of 8 KiB.** On documents a point read that misses the engine's cache
+  costs what it did with a
   frame per value (7.6 against 7.3 µs under lz4, 12.6 against 13.6 µs under
   zstd) for a fifth less on disk; 16 KiB saves another 4% and costs about a
   third more per read, 32 KiB nearly triples it. Chain values are small enough

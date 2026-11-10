@@ -207,6 +207,9 @@ fn open(
         .block_size(layout.block_size)
         .chunk_size(layout.chunk_size)
         .dictionary_classes(layout.dictionary)
+        // The layouts compare blocks, chunks and a trained dictionary; a
+        // dictionary each zstd file builds of its own would blur them.
+        .file_dictionary(0)
         .age_cutoff(1.0);
     if let Codec::ZstdDict(_, dict) = codec {
         kv = kv.dict(Arc::clone(dict));
@@ -273,17 +276,21 @@ pub fn measure(
             BlobCacheFill::Never,
         )?;
         heap.reset();
-        let start = Instant::now();
+        // Only the writes are timed: reading the corpus is not the engine's.
+        let mut write = std::time::Duration::ZERO;
         for (seqno, (key, source)) in (0..).zip(&corpus.values) {
             let value = read(source)?;
             measured.value_bytes += value.len() as u64;
+            let start = Instant::now();
             tree.insert(key, value, seqno);
             if tree.active_memtable().size() >= MEMTABLE {
                 tree.flush_active_memtable(0)?;
             }
+            write += start.elapsed();
         }
+        let start = Instant::now();
         tree.flush_active_memtable(0)?;
-        measured.write = start.elapsed();
+        measured.write = write + start.elapsed();
         measured.write_peak = heap.peak();
         measured.blob_bytes = blob_bytes(&tree);
     }

@@ -91,7 +91,10 @@
 //! RocksDB via `DBCompressionType::Zstd` pinned to level 22. The blob files,
 //! which hold the separated values, are the arm's axis within the group:
 //! uncompressed, zstd 3 or zstd 22, ours through its blob compression and
-//! RocksDB through its blob compression type and `blob_compression_opts`.
+//! RocksDB through its blob compression type and `blob_compression_opts`. Each
+//! engine runs its own defaults around that codec: ours, under zstd, gives each
+//! blob file a dictionary of its own (`COMPARE_BLOB_DICT=0` turns it off), and
+//! RocksDB's blob files have none.
 //!
 //! Within each group every engine runs in the SAME process and the SAME
 //! rounds (ours vs rocksdb, plus surrealkv on the `None` groups). Because the
@@ -921,7 +924,10 @@ fn separate_values(config: Config, blobs: Option<BlobCodec>) -> Config {
                 opts = opts.block_size(bytes);
             }
             // A dictionary of each zstd blob file's own: `COMPARE_BLOB_DICT`
-            // bytes, none without it.
+            // bytes, `0` for none, the library default (64 KiB) without it.
+            // The zstd blob arms therefore run our default layout, a file's
+            // own dictionary included, against RocksDB's blob files, which
+            // have none: the comparison is of the two engines' defaults.
             if let Some(bytes) = std::env::var("COMPARE_BLOB_DICT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -3605,13 +3611,20 @@ fn check_rocksdb_blob_levels() {
             )
             .expect("rocksdb: open"),
         );
-        let options = std::fs::read_dir(dir.path())
+        // RocksDB can leave several OPTIONS files and `read_dir` lists them in
+        // no order; the newest has the highest number, and the zero-padded
+        // names sort by it.
+        let newest = std::fs::read_dir(dir.path())
             .expect("rocksdb: list")
             .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("OPTIONS-"))
-            .map(|e| std::fs::read_to_string(e.path()).expect("rocksdb: OPTIONS"))
-            .last()
+            .map(|e| e.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("OPTIONS-"))
+            })
+            .max()
             .expect("rocksdb wrote no OPTIONS file");
+        let options = std::fs::read_to_string(newest).expect("rocksdb: OPTIONS");
         let blob = options
             .lines()
             .find(|line| line.trim_start().starts_with("blob_compression_opts="))

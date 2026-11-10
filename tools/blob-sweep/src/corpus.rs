@@ -17,12 +17,16 @@ pub struct Corpus {
 
 impl Corpus {
     /// The bytes of the values together.
-    pub fn bytes(&self) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// A file of the corpus cannot be inspected.
+    pub fn bytes(&self) -> std::io::Result<u64> {
         self.values
             .iter()
             .map(|(_, source)| match source {
-                Source::Line { len, .. } => u64::from(*len),
-                Source::File(path) => std::fs::metadata(path).map_or(0, |m| m.len()),
+                Source::Line { len, .. } => Ok(u64::from(*len)),
+                Source::File(path) => std::fs::metadata(path).map(|m| m.len()),
             })
             .sum()
     }
@@ -83,8 +87,9 @@ fn lines(name: &str, dir: &Path, files: &[&str]) -> std::io::Result<Corpus> {
 fn tree_of_files(name: &str, dir: &Path) -> std::io::Result<Corpus> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(Vec<u8>, Source)>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
                 walk(root, &path, out)?;
             } else {
                 let key = path
@@ -111,15 +116,16 @@ fn tree_of_files(name: &str, dir: &Path) -> std::io::Result<Corpus> {
 ///
 /// # Errors
 ///
-/// A corpus that is present cannot be read.
+/// A corpus that is present cannot be read; only a corpus that is not there
+/// is left out.
 pub fn load(data: &Path) -> std::io::Result<Vec<Corpus>> {
     let mut corpora = Vec::new();
     let documents = data.join("documents");
-    if documents.join("records.jsonl").exists() {
+    if documents.join("records.jsonl").try_exists()? {
         corpora.push(lines("documents", &documents, &["records.jsonl"])?);
     }
     let chain = data.join("chain");
-    if chain.join("blocks.jsonl").exists() {
+    if chain.join("blocks.jsonl").try_exists()? {
         corpora.push(lines(
             "chain",
             &chain,
@@ -127,7 +133,7 @@ pub fn load(data: &Path) -> std::io::Result<Vec<Corpus>> {
         )?);
     }
     let files = data.join("files");
-    if files.exists() {
+    if files.try_exists()? {
         corpora.push(tree_of_files("files", &files)?);
     }
     Ok(corpora)

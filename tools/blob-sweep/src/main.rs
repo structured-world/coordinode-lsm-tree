@@ -159,7 +159,7 @@ fn main() -> Result<(), Error> {
             "# {}: {} values, {} bytes",
             corpus.name,
             corpus.values.len(),
-            corpus.bytes()
+            corpus.bytes()?
         );
         for (layout, codec) in runs(corpus)? {
             let label = format!("{} {} {}", corpus.name, layout.name, codec.name());

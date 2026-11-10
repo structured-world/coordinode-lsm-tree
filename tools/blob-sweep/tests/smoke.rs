@@ -40,7 +40,7 @@ fn every_kind_of_run_measures_what_it_wrote() -> Result<(), blob_sweep::Error> {
             (Layout::sized(4 << 10, 64 << 10), dictionary),
         ] {
             let measured = measure(corpus, &layout, &codec, work.path(), &NoProbe)?;
-            assert_eq!(measured.value_bytes, corpus.bytes(), "{}", corpus.name);
+            assert_eq!(measured.value_bytes, corpus.bytes()?, "{}", corpus.name);
             assert!(measured.blob_bytes > 0);
             assert_eq!(measured.gets, corpus.values.len() as u64);
             if corpus.name == "files" {
