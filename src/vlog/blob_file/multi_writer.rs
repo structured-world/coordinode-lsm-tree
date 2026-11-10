@@ -182,6 +182,16 @@ fn own_key(own: Option<&OwnDictionary>) -> Option<u64> {
     }
 }
 
+/// `codec` with its dictionary left out: the codec a value of a file with a
+/// dictionary of its own is written anew under, decoded.
+fn without_dictionary(codec: CompressionType) -> CompressionType {
+    #[cfg(zstd_any)]
+    if let CompressionType::ZstdDict { level, .. } = codec {
+        return CompressionType::Zstd(level);
+    }
+    codec
+}
+
 /// The dictionary of its own `source` holds, which the file its frames are
 /// copied into holds as its own.
 fn own_dictionary(source: &BlobFile) -> Option<&OwnDictionary> {
@@ -577,11 +587,7 @@ impl MultiWriter {
     ) -> crate::Result<bool> {
         let own = own_dictionary(source);
         if own.is_some() && !self.holds_own_output(own) && self.own_outputs() >= MAX_COPY_SOURCES {
-            let codec = match source.compression() {
-                CompressionType::ZstdDict { level, .. } => CompressionType::Zstd(level),
-                codec => codec,
-            };
-            self.select(codec, class, None, None)?;
+            self.select(without_dictionary(source.compression()), class, None, None)?;
             return Ok(false);
         }
         self.select(source.compression(), class, None, own)?;
