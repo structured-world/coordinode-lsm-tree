@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794255345616,
+  "lastUpdate": 1794337597738,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103222,6 +103222,90 @@ window.BENCHMARK_DATA = {
             "value": 358691.47620587185,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 12.7us | P99.9: 80.4us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b543d5265d5908a05986f3f717ea8c9b124db0ff",
+          "message": "ci(deps): bump release-plz/action from 0.5.147 to 0.5.148 (#1067)\n\nBumps [release-plz/action](https://github.com/release-plz/action) from\n0.5.147 to 0.5.148.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/release-plz/action/releases\">release-plz/action's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v0.5.148</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.33 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/588\">release-plz/action#588</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.88.0 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/589\">release-plz/action#589</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.88.1 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/590\">release-plz/action#590</a></li>\n<li>chore(deps): update dependency cargo-bins/cargo-binstall to v1.26.2\nby <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/591\">release-plz/action#591</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.89.0 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/592\">release-plz/action#592</a></li>\n<li>chore(deps): lock file maintenance by <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/593\">release-plz/action#593</a></li>\n<li>Update to 0.4.3 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/594\">release-plz/action#594</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.147...v0.5.148\">https://github.com/release-plz/action/compare/v0.5.147...v0.5.148</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/66b324fd6c72d05d2a08568492ecdd62bfb8a62b\"><code>66b324f</code></a>\nUpdate to 0.4.3 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/594\">#594</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/f5cc4d970be6a3397caf8469d9c2a544be4759c0\"><code>f5cc4d9</code></a>\nchore(deps): lock file maintenance (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/593\">#593</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/1269ff54db678f60e3d7e5a9a0f5d3e00ae6b052\"><code>1269ff5</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.89.0 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/592\">#592</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/31331efbee296ad29e56c604767e04144a468931\"><code>31331ef</code></a>\nchore(deps): update dependency cargo-bins/cargo-binstall to v1.26.2 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/591\">#591</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/7fa34b0ca33cec30a5d4fa897b053e90231a0f0a\"><code>7fa34b0</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.88.1 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/590\">#590</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/f5380069c7ca03fe7466630c5012feb28d84373c\"><code>f538006</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.88.0 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/589\">#589</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/8b6afa3e61e9a573d331a4037005204f87f38576\"><code>8b6afa3</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.33 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/588\">#588</a>)</li>\n<li>See full diff in <a\nhref=\"https://github.com/release-plz/action/compare/f67a7e724bdad4a0f6875f186060a0ca2770d76c...66b324fd6c72d05d2a08568492ecdd62bfb8a62b\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=release-plz/action&package-manager=github_actions&previous-version=0.5.147&new-version=0.5.148)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-11-10T18:35:20Z",
+          "tree_id": "5165805cb7915c9de70413fc9fe7cef2a1513095",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b543d5265d5908a05986f3f717ea8c9b124db0ff"
+        },
+        "date": 1794337596464,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 138492.33252262717,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 17.0us | P99.9: 27.7us\nthreads: 1 | elapsed: 3.86s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2966071.845675282,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 1.1us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 877132.594954636,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.1us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 484000.57685124746,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.9us | P99.9: 22.8us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3122331.1874175547,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 307356.705850902,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.5us | P99.9: 16.4us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 192317.82005997025,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 10.2us | P99.9: 19.9us\nthreads: 1 | elapsed: 1.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 876464.3791554053,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.0us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1046513.2658219254,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 359063.7804023656,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 11.8us | P99.9: 84.8us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
           }
         ]
       }
