@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794337602170,
+  "lastUpdate": 1794337606308,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -110706,6 +110706,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.404429199,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b543d5265d5908a05986f3f717ea8c9b124db0ff",
+          "message": "ci(deps): bump release-plz/action from 0.5.147 to 0.5.148 (#1067)\n\nBumps [release-plz/action](https://github.com/release-plz/action) from\n0.5.147 to 0.5.148.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/release-plz/action/releases\">release-plz/action's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v0.5.148</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.33 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/588\">release-plz/action#588</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.88.0 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/589\">release-plz/action#589</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.88.1 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/590\">release-plz/action#590</a></li>\n<li>chore(deps): update dependency cargo-bins/cargo-binstall to v1.26.2\nby <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/591\">release-plz/action#591</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.89.0 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/592\">release-plz/action#592</a></li>\n<li>chore(deps): lock file maintenance by <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/593\">release-plz/action#593</a></li>\n<li>Update to 0.4.3 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/594\">release-plz/action#594</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.147...v0.5.148\">https://github.com/release-plz/action/compare/v0.5.147...v0.5.148</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/66b324fd6c72d05d2a08568492ecdd62bfb8a62b\"><code>66b324f</code></a>\nUpdate to 0.4.3 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/594\">#594</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/f5cc4d970be6a3397caf8469d9c2a544be4759c0\"><code>f5cc4d9</code></a>\nchore(deps): lock file maintenance (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/593\">#593</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/1269ff54db678f60e3d7e5a9a0f5d3e00ae6b052\"><code>1269ff5</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.89.0 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/592\">#592</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/31331efbee296ad29e56c604767e04144a468931\"><code>31331ef</code></a>\nchore(deps): update dependency cargo-bins/cargo-binstall to v1.26.2 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/591\">#591</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/7fa34b0ca33cec30a5d4fa897b053e90231a0f0a\"><code>7fa34b0</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.88.1 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/590\">#590</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/f5380069c7ca03fe7466630c5012feb28d84373c\"><code>f538006</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.88.0 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/589\">#589</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/8b6afa3e61e9a573d331a4037005204f87f38576\"><code>8b6afa3</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.33 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/588\">#588</a>)</li>\n<li>See full diff in <a\nhref=\"https://github.com/release-plz/action/compare/f67a7e724bdad4a0f6875f186060a0ca2770d76c...66b324fd6c72d05d2a08568492ecdd62bfb8a62b\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=release-plz/action&package-manager=github_actions&previous-version=0.5.147&new-version=0.5.148)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-11-10T18:35:20Z",
+          "tree_id": "5165805cb7915c9de70413fc9fe7cef2a1513095",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b543d5265d5908a05986f3f717ea8c9b124db0ff"
+        },
+        "date": 1794337605033,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 679.968,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 179.657768ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 287.142,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 198.716362ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1260.024,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 242.23413ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 6151.961,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 22771.003,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.583,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.283071,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.397318438,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.727,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 51.544063,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.398000465,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
