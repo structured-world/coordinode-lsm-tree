@@ -1013,7 +1013,7 @@ pub(crate) fn decode_chunk(
 /// `stored` decompressed under `compression` into `out`: without a codec
 /// built in, nothing is compressed, so nothing decompresses.
 #[cfg(not(any(feature = "lz4", zstd_any)))]
-fn decompress_to(
+pub(super) fn decompress_to(
     _stored: &[u8],
     _out: &mut [u8],
     _compression: CompressionType,
@@ -1024,7 +1024,7 @@ fn decompress_to(
 
 /// `stored` decompressed under `compression` into `out`, exactly its length.
 #[cfg(any(feature = "lz4", zstd_any))]
-fn decompress_to(
+pub(super) fn decompress_to(
     stored: &[u8],
     out: &mut [u8],
     compression: CompressionType,

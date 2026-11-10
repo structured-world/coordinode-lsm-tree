@@ -160,7 +160,9 @@ fn record_fields(bytes: &[u8]) -> crate::Result<Record> {
     let stored_len = u32_at(22)? as usize;
     let flags = *field(26, 1)?.first().ok_or_else(malformed)?;
     let key = RECORD_HEADER_LEN..RECORD_HEADER_LEN + key_len;
-    let stored = key.end..key.end + stored_len;
+    // A stored length off the disk can pass a 32-bit `usize` once added to
+    // the key's end: past it, the record is damage, not a wrapped range.
+    let stored = key.end..key.end.checked_add(stored_len).ok_or_else(malformed)?;
     let len = stored.end;
     let flags_ok = flags & !(FLAG_RAW | FLAG_PLAIN) == 0 && flags != FLAG_RAW | FLAG_PLAIN;
     let raw_ok = flags & FLAG_RAW == 0 || stored_len == value_len as usize;
@@ -222,6 +224,51 @@ pub(crate) fn record_value(
         dictionary,
         decoded,
     )
+}
+
+/// The value of `record`, parsed out of `bytes`, decoded under the file's
+/// `compression` into `out`, which takes exactly the value and is filled
+/// whole: what a read of a whole packed block writes in place, with no
+/// buffer of the value's own. A value stored as it is is copied into the
+/// unwritten memory as it is; only a decompression's target is zeroed first.
+///
+/// # Errors
+///
+/// An `out` of another length than the value, and a decompression that fails
+/// or produces another length.
+fn record_value_into(
+    record: &Record,
+    bytes: &[u8],
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    out: &mut crate::fs::ReadBuf<'_>,
+    decoded: &mut usize,
+) -> crate::Result<()> {
+    #[cfg(zstd_any)]
+    let (compression, dictionary) =
+        super::frame::frame_codec(record.flags, compression, dictionary)?;
+    #[cfg(not(zstd_any))]
+    if record.flags & FLAG_PLAIN != 0 {
+        return Err(crate::Error::InvalidHeader("BlobRecord"));
+    }
+    let stored = bytes.get(record.stored.clone()).unwrap_or_default();
+    if record.flags & FLAG_RAW != 0 || compression == CompressionType::None {
+        *decoded = stored.len();
+        if stored.len() != out.capacity() {
+            return Err(crate::Error::InvalidHeader("BlobRecord"));
+        }
+        out.append(stored);
+        return Ok(());
+    }
+    super::frame::decompress_to(
+        stored,
+        out.init_mut(),
+        compression,
+        #[cfg(zstd_any)]
+        dictionary,
+        decoded,
+    )?;
+    Ok(out.set_filled(out.capacity())?)
 }
 
 /// The length of the record [`cached_record`] makes of `record` and its
@@ -329,9 +376,13 @@ pub(crate) fn check_packed(header: &FrameHeader, records: &[u8]) -> crate::Resul
 /// decoded whole: every value, for a read of the frame whole (a scan, a
 /// collection, a cache fill).
 ///
+/// Each value is decoded straight into its place in the payload, one
+/// allocation for the block.
+///
 /// # Errors
 ///
-/// A record that does not decode to the length it declares.
+/// A record that does not decode to the length it declares, or values that
+/// do not add up to the header's decoded length.
 pub(crate) fn decode_packed(
     header: FrameHeader,
     records: &Slice,
@@ -340,28 +391,45 @@ pub(crate) fn decode_packed(
     #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
     decoded: &mut usize,
 ) -> crate::Result<DecodedFrame> {
-    let mut payload = Vec::with_capacity(header.raw_len as usize);
+    let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    let raw_len = header.raw_len as usize;
+    let mut payload = crate::slice::UnfilledSlice::new(raw_len);
+    let mut target = payload.target();
     *decoded = 0;
     for entry in list.iter() {
-        let rest = records.slice(entry.at as usize..records.len());
-        let record = record_fields(&rest)?;
+        let rest = records.get(entry.at as usize..).unwrap_or_default();
+        let record = record_fields(rest)?;
+        let len = record.value_len as usize;
+        if target.filled() + len > raw_len {
+            return Err(malformed());
+        }
+        let mut part = target.portion(target.filled(), len);
         let mut produced = 0;
-        let value = record_value(
+        let written = record_value_into(
             &record,
-            &rest,
+            rest,
             compression,
             #[cfg(zstd_any)]
             dictionary,
+            &mut part,
             &mut produced,
         );
         *decoded += produced;
-        payload.extend_from_slice(&value?);
+        written?;
+        target.extend_from_portion(len);
     }
+    if target.filled() != raw_len {
+        return Err(malformed());
+    }
+    // SAFETY: every byte of the payload was written above, value by value,
+    // as `target` counted them, and they add up to its length.
+    #[expect(unsafe_code, reason = "see safety")]
+    let payload = unsafe { payload.assume_filled() };
     Ok(DecodedFrame {
         header,
         entries: records.clone(),
         list,
-        payload: Slice::from(payload),
+        payload,
     })
 }
 

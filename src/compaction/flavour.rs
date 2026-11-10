@@ -1159,17 +1159,14 @@ pub(crate) struct RelocatingCompaction {
     inner: StandardCompaction,
     blob_scanner: Peekable<BlobFileMergeScanner>,
     blob_writer: BlobFileWriter,
-    /// Codec of each file being rewritten, by id, and the lifetime class its
-    /// relocated values go to. Relocation copies frames VERBATIM, so the
-    /// output file must record the codec of the SOURCE those frames came from;
-    /// the current blob policy describes what would be written fresh, which is
-    /// a different question and need not agree.
-    rewriting_blob_file_outputs: crate::HashMap<BlobFileId, (crate::CompressionType, u8)>,
+    /// Codec of each file being rewritten, by id, the lifetime class its
+    /// relocated values go to, and where it lies in `rewriting_blob_files`.
+    /// Relocation copies frames VERBATIM, so the output file must record the
+    /// codec of the SOURCE those frames came from, and hold the dictionary of
+    /// its own the source holds; the current blob policy describes what would
+    /// be written fresh, which is a different question and need not agree.
+    rewriting_blob_file_outputs: crate::HashMap<BlobFileId, (crate::CompressionType, u8, usize)>,
     rewriting_blob_files: Vec<BlobFile>,
-    /// The source whose dictionary the writer was last lent: a writer keeps
-    /// what it is lent for the pass, so values of one source in a row lend it
-    /// once.
-    lent_source: Option<BlobFileId>,
     /// Paces relocated-blob I/O. The merge loop's limiter only sees the
     /// encoded handle in `item.value`; the real payload moved here is
     /// debited at the relocation write site so KV-separated compactions
@@ -1479,15 +1476,15 @@ impl RelocatingCompaction {
             blob_writer,
             rewriting_blob_file_outputs: rewriting_blob_files
                 .iter()
-                .map(|bf| {
+                .enumerate()
+                .map(|(at, bf)| {
                     (
                         bf.id(),
-                        (bf.compression(), groups.relocated(bf.lifetime_class())),
+                        (bf.compression(), groups.relocated(bf.lifetime_class()), at),
                     )
                 })
                 .collect(),
             rewriting_blob_files,
-            lent_source: None,
             rate_limiter,
             stop_signal,
             consumed_through: crate::HashMap::default(),
@@ -1508,22 +1505,6 @@ impl RelocatingCompaction {
             held_bytes: 0,
             abandoned: HashSet::default(),
             carried_garbage: FragmentationMap::default(),
-        }
-    }
-
-    /// Lends the writer the own dictionary of the rewritten file `source`, so
-    /// the frames and blocks copied from it land in a file that holds it.
-    fn lend_source_dictionary(&mut self, source: BlobFileId) {
-        if self.lent_source == Some(source) {
-            return;
-        }
-        self.lent_source = Some(source);
-        if let Some(file) = self
-            .rewriting_blob_files
-            .iter()
-            .find(|file| file.id() == source)
-        {
-            self.blob_writer.lend_dictionary(file);
         }
     }
 
@@ -1687,13 +1668,11 @@ impl RelocatingCompaction {
 
         // A file's own dictionary goes with its frames into the file that
         // copies them, which holds it as its own.
-        self.blob_writer.lend_dictionary(blob_file);
-        self.blob_writer.select_output(
-            blob_file.compression(),
-            self.blob_writer
-                .lifetime_groups()
-                .relocated(blob_file.lifetime_class()),
-        )?;
+        let class = self
+            .blob_writer
+            .lifetime_groups()
+            .relocated(blob_file.lifetime_class());
+        self.blob_writer.select_copy_output(blob_file, class)?;
         let copy = match &source {
             crate::vlog::blob_file::reader::CopySource::Frames { frames, value_len } => {
                 // A row's objects may have been written at older sequence
@@ -1866,14 +1845,14 @@ impl RelocatingCompaction {
             clippy::expect_used,
             reason = "the id came from `rewriting_blob_file_outputs`'s own key set"
         )]
-        let (source_codec, class) = *self
+        let (_, class, source_at) = *self
             .rewriting_blob_file_outputs
             .get(&blob_file_id)
             .expect("relocated frame comes from a file being rewritten");
 
         let block_at = (blob_file_id, claimed.frame);
         let whole = if claimed.in_block {
-            self.place_in_block(&item.key.user_key, block_at, (source_codec, class))?
+            self.place_in_block(&item.key.user_key, block_at, (class, source_at))?
         } else {
             None
         };
@@ -1904,8 +1883,10 @@ impl RelocatingCompaction {
                 });
             // A file's own dictionary goes with its frames into the file that
             // copies them, which holds it as its own.
-            self.lend_source_dictionary(blob_file_id);
-            self.blob_writer.select_output(source_codec, class)?;
+            let Some(source) = self.rewriting_blob_files.get(source_at) else {
+                return Err(crate::Error::InvalidHeader("Blob"));
+            };
+            self.blob_writer.select_copy_output(source, class)?;
             match (&claimed.frames, &claimed.value) {
                 (Some(frames), _) => {
                     // A value is listed at the seqno its table gives it. An
@@ -1953,14 +1934,15 @@ impl RelocatingCompaction {
 
     /// Where a value of the block `block_at` goes when the block is copied
     /// whole: the copy, made by the first of its claimed values to arrive,
-    /// under `output`'s codec and class. `None` when its values are written
+    /// into the output of `output`'s class for the source at `output`'s place
+    /// in the rewritten files. `None` when its values are written
     /// anew, or it has no fate. Counts the value placed off the block's fate,
     /// which goes with the last.
     fn place_in_block(
         &mut self,
         key: &[u8],
         block_at: (BlobFileId, u32),
-        output: (crate::CompressionType, u8),
+        output: (u8, usize),
     ) -> crate::Result<Option<(BlobFileId, u32)>> {
         let (placed, done) = match self.fates.get_mut(&block_at) {
             None => return Ok(None),
@@ -1984,7 +1966,7 @@ impl RelocatingCompaction {
                 {
                     return Ok(None);
                 }
-                let at = self.copy_whole(key, block_at.0, output, &block)?;
+                let at = self.copy_whole(key, output, &block)?;
                 // The stored bytes go here: the values after this one need
                 // only where the copy lies.
                 if pending > 1 {
@@ -2005,14 +1987,13 @@ impl RelocatingCompaction {
         Ok(Some(placed))
     }
 
-    /// Copies `stored`, the block `block_at` names, whole into the output of
-    /// its source under `output`'s codec and class, and counts its `dead`
-    /// values as the new file's garbage.
+    /// Copies `block` whole into the output of its source, the rewritten file
+    /// at `output`'s place, under that file's codec and own dictionary and
+    /// `output`'s class, and counts its dead values as the new file's garbage.
     fn copy_whole(
         &mut self,
         key: &[u8],
-        source: BlobFileId,
-        output: (crate::CompressionType, u8),
+        output: (u8, usize),
         block: &WholeBlock,
     ) -> crate::Result<(BlobFileId, u32)> {
         let stored = &block.stored;
@@ -2030,10 +2011,12 @@ impl RelocatingCompaction {
         };
         // A file's own dictionary goes with its blocks into the file that
         // copies them, as it does with its values in `place`.
-        self.lend_source_dictionary(source);
+        let Some(source) = self.rewriting_blob_files.get(output.1) else {
+            return Err(crate::Error::InvalidHeader("Blob"));
+        };
         let at = self
             .blob_writer
-            .copy_block(key, source, output.0, output.1, &copied)?;
+            .copy_block(key, source, output.0, &copied)?;
         self.blob_carried += stored.len() as u64;
         // The block's dead values arrive dead in the new file.
         let dead = block.dead;

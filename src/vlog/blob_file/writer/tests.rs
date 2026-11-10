@@ -425,6 +425,52 @@ fn a_block_copied_whole_must_be_the_block_it_names() -> crate::Result<()> {
     Ok(())
 }
 
+/// A file's own dictionary is the first values it wrote, as they are: values
+/// beginning with the magic of a trained zstd dictionary still make a raw one,
+/// so the values after it compress, the file finishes, and every value reads
+/// back under the dictionary the file stores.
+#[cfg(zstd_any)]
+#[test]
+fn values_beginning_like_a_trained_dictionary_still_build_a_raw_one() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let path = folder.path().join("blob");
+    let mut w = Writer::new(&path, 0, 0, &StdFs)?
+        .use_compression(CompressionType::Zstd(3))
+        .use_file_dictionary(4 * 1024);
+    let mut first = vec![0_u8; 4 * 1024];
+    first[..4].copy_from_slice(&[0x37, 0xA4, 0x30, 0xEC]);
+    let values: Vec<Vec<u8>> = core::iter::once(first)
+        .chain((0..20_u8).map(|i| vec![i; 1_000]))
+        .collect();
+    for (i, value) in values.iter().enumerate() {
+        w.write(format!("k{i:03}").as_bytes(), 0, value)?;
+    }
+    let (meta, _, frames) = w.finish()?;
+    assert!(
+        matches!(meta.compression, CompressionType::ZstdDict { .. }),
+        "{:?}",
+        meta.compression
+    );
+
+    let mut file = crate::fs::Fs::open(&StdFs, &path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let dict = crate::vlog::read_file_dictionary(&mut file, &meta)?;
+    let decoded = decode_all(
+        &std::fs::read(&path)?,
+        &frames,
+        meta.compression,
+        dict.as_deref(),
+    )?;
+    let mut got = Vec::new();
+    for frame in &decoded {
+        got.extend((0..).map_while(|at| frame.value(at)));
+    }
+    assert_eq!(got.len(), values.len());
+    for (got, value) in got.iter().zip(&values) {
+        assert_eq!(&got[..], &value[..]);
+    }
+    Ok(())
+}
+
 /// A file set to build a dictionary of its own gives it up for frames copied
 /// in as they are, which name the codec they were written in: before it holds
 /// a value it records their codec, and once it has written values toward the

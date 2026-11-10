@@ -3372,7 +3372,11 @@ fn run_subcompaction(
                     opts.tree_id,
                 )
                 .with_drain_below(drain_below)
-                .with_block_copy_share(Some(blob_opts.block_copy_share()))
+                // Every slice, the last one included, reserves room for the
+                // live values it moves; a block copied whole also writes its
+                // dead ones, which that room does not count, so a slice writes
+                // every value anew.
+                .with_block_copy_share(None)
                 .with_fresh_values(FreshValues {
                     options: blob_opts.clone(),
                     compression: rc.blob_compression,

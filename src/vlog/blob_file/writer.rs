@@ -746,6 +746,15 @@ impl Writer {
         if self.dictionary_samples.len() < want {
             return;
         }
+        // Bytes that open with a trained dictionary's magic are read as one,
+        // and these are raw content: the first byte goes, and with it the
+        // magic, here once and so in the dictionary the file stores.
+        if self
+            .dictionary_samples
+            .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC)
+        {
+            self.dictionary_samples.remove(0);
+        }
         let dict = crate::compression::ZstdDictionary::new(&self.dictionary_samples);
         self.compression = CompressionType::ZstdDict {
             level,

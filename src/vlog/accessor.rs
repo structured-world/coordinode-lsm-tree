@@ -685,8 +685,20 @@ impl<'a> Accessor<'a> {
         check_key(&first, vhandle.index, key)?;
         let total = first.list.first().map_or(0, |e| u64::from(e.value_len));
         // A whole value its read does not cache is built in place, its chunks
-        // read into it, and none decoded on its own.
-        if range.is_none() && !self.fill.fills() {
+        // read into it, and none decoded on its own. Chunks the cache holds
+        // (filled before the fill policy changed) are taken from it instead.
+        if range.is_none()
+            && !self.fill.fills()
+            && vhandle.frame.checked_add(1).is_none_or(|chunk| {
+                !cache.contains_blob_frame(
+                    tree_id,
+                    crate::cache::BlobFrameAt {
+                        blob_file_id: vhandle.blob_file_id,
+                        frame: chunk,
+                    },
+                )
+            })
+        {
             return self
                 .read_chunks_whole(tree_id, blob_file, &first, vhandle.frame)
                 .map(Some);

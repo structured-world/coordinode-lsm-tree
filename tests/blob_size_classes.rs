@@ -166,6 +166,33 @@ fn a_large_value_read_through_the_cache_is_served_from_it_again() -> lsm_tree::R
     Ok(())
 }
 
+/// A large value cached while the fill was `Always` is still served from the
+/// cache after the fill is set to `Never` on the live tree: the setting stops
+/// new fills, not lookups of what the cache holds.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_cached_large_value_is_served_from_the_cache_after_fills_stop() -> lsm_tree::Result<()> {
+    for compression in std::iter::once(CompressionType::None).chain(codecs()) {
+        let folder = get_tmp_folder();
+        let tree = open(folder.path(), compression, BlobCacheFill::Always)?;
+        let value = random(13, 1 << 20);
+        tree.insert("large", &value, 0);
+        tree.flush_active_memtable(0)?;
+        assert_eq!(tree.get("large", SeqNo::MAX)?.as_deref(), Some(&*value));
+
+        tree.update_runtime_config(|c| c.blob_cache_fill = BlobCacheFill::Never)?;
+        let m = tree.metrics();
+        let requests = m.blob_read_count();
+        assert_eq!(tree.get("large", SeqNo::MAX)?.as_deref(), Some(&*value));
+        assert_eq!(
+            m.blob_read_count(),
+            requests,
+            "{compression:?}: the cached value was read from the filesystem again"
+        );
+    }
+    Ok(())
+}
+
 /// A large value read whole without the cache comes back as written under
 /// every codec, compressible chunks decompressed into place and incompressible
 /// ones read straight in, each byte decoded.

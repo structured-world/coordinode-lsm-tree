@@ -39,9 +39,16 @@ pub(crate) struct MultiWriter {
     /// were stored, if it is such a file (see [`Self::copy_block`]).
     active_source: Option<crate::vlog::BlobFileId>,
 
+    /// The dictionary of its own that the source of the active writer's
+    /// copied frames holds, which the active writer's file holds as its own.
+    active_own: Option<OwnDictionary>,
+
     /// Writers for the other outputs a write has met, each still filling its
     /// own file while the active one takes frames of its codec and class, by
-    /// codec, class and the source of the blocks it copies.
+    /// codec, class, the source of the blocks it copies and the dictionary of
+    /// its own it holds. That dictionary goes by its full fingerprint: the
+    /// codec names it by a 32-bit id, and two sources' dictionaries can share
+    /// one, being hashes of content the user writes.
     ///
     /// A relocation merges its sources by key, so two compression generations
     /// over the same keys alternate on nearly every frame, and values of
@@ -51,7 +58,7 @@ pub(crate) struct MultiWriter {
     /// as full as the size target allows. At most one entry per codec the
     /// sources carry times [`Self::lifetime_groups`], and one per source a
     /// relocation copies blocks of.
-    parked: Vec<(CompressionType, u8, Option<crate::vlog::BlobFileId>, Writer)>,
+    parked: Vec<Parked>,
 
     /// How many lifetime classes the files are split into.
     lifetime_groups: crate::config::LifetimeGroups,
@@ -100,12 +107,6 @@ pub(crate) struct MultiWriter {
     #[cfg(zstd_any)]
     file_dictionary: u32,
 
-    /// The dictionaries of their own the files whose frames this writer
-    /// copies hold: a file copying such frames holds the dictionary that
-    /// decodes them as its own.
-    #[cfg(zstd_any)]
-    lent: Vec<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
-
     /// The tree's dictionary set, used to PIN the dictionary each finished file
     /// records on its handle (see `blob_file::Inner::zstd_dictionary`).
     ///
@@ -147,6 +148,57 @@ pub(crate) struct MultiWriter {
 /// this many, a relocation over many stale files writes the blocks of the
 /// rest value by value instead of opening a file per source.
 const MAX_COPY_SOURCES: usize = 16;
+
+/// A dictionary a copied file holds of its own.
+#[cfg(zstd_any)]
+type OwnDictionary = alloc::sync::Arc<crate::compression::ZstdDictionary>;
+
+/// Without zstd no file holds a dictionary of its own.
+#[cfg(not(zstd_any))]
+#[derive(Clone)]
+enum OwnDictionary {}
+
+/// A parked output: its codec, class, the source of the blocks it copies,
+/// the dictionary of its own it holds, and its writer.
+type Parked = (
+    CompressionType,
+    u8,
+    Option<crate::vlog::BlobFileId>,
+    Option<OwnDictionary>,
+    Writer,
+);
+
+/// The identity `own` keeps an output apart by: the dictionary's full
+/// fingerprint, which its 32-bit codec id is a truncation of.
+fn own_key(own: Option<&OwnDictionary>) -> Option<u64> {
+    #[cfg(zstd_any)]
+    {
+        own.map(|dict| dict.id64())
+    }
+    #[cfg(not(zstd_any))]
+    {
+        let _ = own;
+        None
+    }
+}
+
+/// The dictionary of its own `source` holds, which the file its frames are
+/// copied into holds as its own.
+fn own_dictionary(source: &BlobFile) -> Option<&OwnDictionary> {
+    #[cfg(zstd_any)]
+    {
+        source
+            .0
+            .zstd_dictionary
+            .as_ref()
+            .filter(|_| source.has_own_dictionary())
+    }
+    #[cfg(not(zstd_any))]
+    {
+        let _ = source;
+        None
+    }
+}
 
 impl MultiWriter {
     /// A blob file writer whose files carry no origin.
@@ -211,6 +263,7 @@ impl MultiWriter {
             origin,
             active_class: 0,
             active_source: None,
+            active_own: None,
             parked: Vec::new(),
             lifetime_groups: crate::config::LifetimeGroups::ONE,
 
@@ -232,8 +285,6 @@ impl MultiWriter {
             zstd_two_pass_seed: true,
             #[cfg(zstd_any)]
             file_dictionary: 0,
-            #[cfg(zstd_any)]
-            lent: Vec::new(),
             #[cfg(zstd_any)]
             zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
 
@@ -271,7 +322,7 @@ impl MultiWriter {
         let crossed = domain.crosses(key, comparator.as_ref()).is_some();
         domain.enter(key, crossed);
         if crossed {
-            for (codec, _, _, writer) in core::mem::take(&mut self.parked) {
+            for (codec, _, _, _, writer) in core::mem::take(&mut self.parked) {
                 self.land(writer, codec)?;
             }
             if self.active_writer.item_count > 0 {
@@ -363,7 +414,7 @@ impl MultiWriter {
     pub(crate) fn use_passthrough_compression(mut self, compression: CompressionType) -> Self {
         assert_eq!(self.compression, CompressionType::None);
         self.passthrough_compression = compression;
-        self.restamp_active(compression);
+        self.restamp_active(compression, None);
         self
     }
 
@@ -377,69 +428,39 @@ impl MultiWriter {
         }
     }
 
-    /// The dictionary `codec` compresses with: the one this writer was given
-    /// for its own codec, else the one the tree's set holds for it.
+    /// The dictionary `codec` compresses with: `own`, the one a copied file
+    /// holds of its own, when given; else the one this writer was given for
+    /// its own codec, else the one the tree's set holds for it.
     #[cfg(zstd_any)]
     fn dictionary_for(
         &self,
         codec: CompressionType,
+        own: Option<&OwnDictionary>,
     ) -> Option<alloc::sync::Arc<crate::compression::ZstdDictionary>> {
+        if let Some(own) = own {
+            return Some(alloc::sync::Arc::clone(own));
+        }
         if codec == self.compression {
             return self.zstd_dictionary.clone();
-        }
-        if let Some(lent) = self.lent_for(codec) {
-            return Some(lent);
         }
         self.zstd_dictionaries.for_compression(codec).ok().flatten()
     }
 
-    /// The dictionary of its own a copied file holds for `codec`, if one was
-    /// lent.
-    #[cfg(zstd_any)]
-    fn lent_for(
-        &self,
-        codec: CompressionType,
-    ) -> Option<alloc::sync::Arc<crate::compression::ZstdDictionary>> {
-        let CompressionType::ZstdDict { dict_id, .. } = codec else {
-            return None;
-        };
-        self.lent.iter().find(|dict| dict.id() == dict_id).cloned()
-    }
-
-    /// Takes the dictionary of its own `source` holds, if any, for the file
-    /// its frames are copied into.
-    #[cfg_attr(
-        not(zstd_any),
-        expect(
-            clippy::unused_self,
-            clippy::needless_pass_by_ref_mut,
-            reason = "without zstd no file holds a dictionary to lend"
-        )
-    )]
-    pub(crate) fn lend_dictionary(&mut self, source: &BlobFile) {
-        #[cfg(zstd_any)]
-        if source.has_own_dictionary()
-            && let Some(dict) = &source.0.zstd_dictionary
-            && !self.lent.iter().any(|held| held.id64() == dict.id64())
-        {
-            self.lent.push(alloc::sync::Arc::clone(dict));
-        }
-        #[cfg(not(zstd_any))]
-        let _ = source;
-    }
-
     /// Makes the active writer, which holds nothing yet, compress with and
-    /// record output `passthrough`'s codec.
-    fn restamp_active(&mut self, passthrough: CompressionType) {
+    /// record output `passthrough`'s codec, and hold `own` as its own
+    /// dictionary.
+    fn restamp_active(&mut self, passthrough: CompressionType, own: Option<&OwnDictionary>) {
         let codec = self.codec_for(passthrough);
         self.active_writer.compression = codec;
         #[cfg(zstd_any)]
         {
-            self.active_writer.zstd_dictionary = self.dictionary_for(codec);
-            self.active_writer.dictionary_in_file = self.lent_for(codec).is_some();
+            self.active_writer.zstd_dictionary = self.dictionary_for(codec, own);
+            self.active_writer.dictionary_in_file = own.is_some();
             self.active_writer
                 .set_file_dictionary(self.file_dictionary_for(passthrough));
         }
+        #[cfg(not(zstd_any))]
+        let _ = own;
     }
 
     /// The dictionary a file of output `passthrough` builds of its own: one
@@ -531,51 +552,71 @@ impl MultiWriter {
         compression: CompressionType,
         class: u8,
     ) -> crate::Result<()> {
-        self.select(compression, class, None)
+        self.select(compression, class, None, None)
     }
 
-    /// Directs the next frames to the output of `compression`, `class` and
-    /// `source`, the file whose blocks it copies, if any.
+    /// Directs the next frames, copied as they are out of `source`, to a file
+    /// of lifetime `class` that records `source`'s codec and holds the
+    /// dictionary of its own `source` holds, if any: the one that decodes
+    /// them, whatever other dictionary shares its id.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the creation of the first file for an output not met
+    /// before.
+    pub(crate) fn select_copy_output(&mut self, source: &BlobFile, class: u8) -> crate::Result<()> {
+        self.select(source.compression(), class, None, own_dictionary(source))
+    }
+
+    /// Directs the next frames to the output of `compression`, `class`,
+    /// `source`, the file whose blocks it copies, if any, and `own`, the
+    /// dictionary of its own its file holds, if any.
     fn select(
         &mut self,
         compression: CompressionType,
         class: u8,
         source: Option<crate::vlog::BlobFileId>,
+        own: Option<&OwnDictionary>,
     ) -> crate::Result<()> {
         let class = self.lifetime_groups.cap(class);
+        let own_id = own_key(own);
         if self.passthrough_compression == compression
             && self.active_class == class
             && self.active_source == source
+            && own_key(self.active_own.as_ref()) == own_id
         {
             return Ok(());
         }
-        let next = if let Some(at) = self
-            .parked
-            .iter()
-            .position(|(c, k, s, _)| *c == compression && *k == class && *s == source)
-        {
-            self.parked.swap_remove(at).3
+        let next = if let Some(at) = self.parked.iter().position(|(c, k, s, o, _)| {
+            *c == compression && *k == class && *s == source && own_key(o.as_ref()) == own_id
+        }) {
+            self.parked.swap_remove(at).4
         } else if self.active_writer.item_count == 0 && self.active_writer.len_written() == 0 {
             // Nothing written constrains an untouched writer: restamp it.
-            // Only a codec switch restamps the codec: a class switch keeps what
-            // the writer records, which for a compressing writer is its own.
-            if compression != self.passthrough_compression {
-                self.restamp_active(compression);
+            // Only a codec or dictionary switch restamps the codec: a class
+            // switch keeps what the writer records, which for a compressing
+            // writer is its own.
+            if compression != self.passthrough_compression
+                || own_key(self.active_own.as_ref()) != own_id
+            {
+                self.restamp_active(compression, own);
             }
             self.active_writer
                 .set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
             self.passthrough_compression = compression;
             self.active_class = class;
             self.active_source = source;
+            self.active_own = own.cloned();
             return Ok(());
         } else {
-            self.fresh_writer(compression, class)?
+            self.fresh_writer(compression, class, own)?
         };
         let previous = core::mem::replace(&mut self.active_writer, next);
         self.parked.push((
             self.passthrough_compression,
             self.active_class,
             self.active_source,
+            core::mem::replace(&mut self.active_own, own.cloned()),
             previous,
         ));
         self.passthrough_compression = compression;
@@ -603,10 +644,11 @@ impl MultiWriter {
                 .is_none_or(|(domain, comparator)| domain.holds(first, last, comparator.as_ref()))
     }
 
-    /// Writes `block`, a block frame of `source` under `compression` a scan
-    /// checked, as it is into a file of lifetime `class` that holds blocks of
-    /// `source` alone, and returns that file and the block's frame in it: each
-    /// value keeps its place in the block. `key` is one of the block's keys.
+    /// Writes `block`, a block frame of `source` a scan checked, as it is into
+    /// a file of lifetime `class` that records `source`'s codec, holds blocks
+    /// of `source` alone and holds the dictionary of its own `source` holds,
+    /// if any, and returns that file and the block's frame in it: each value
+    /// keeps its place in the block. `key` is one of the block's keys.
     ///
     /// A source's blocks reach this in the source's order, which is key order,
     /// while the other values of the pass interleave with them: a file of its
@@ -618,15 +660,20 @@ impl MultiWriter {
     pub(crate) fn copy_block(
         &mut self,
         key: &[u8],
-        source: crate::vlog::BlobFileId,
-        compression: CompressionType,
+        source: &BlobFile,
         class: u8,
         block: &super::writer::CopiedBlock<'_>,
     ) -> crate::Result<(crate::vlog::BlobFileId, u32)> {
         self.enter_key(key)?;
-        self.select(compression, class, Some(source))?;
-        if !self.copy_sources.contains(&source) {
-            self.copy_sources.push(source);
+        let id = source.id();
+        self.select(
+            source.compression(),
+            class,
+            Some(id),
+            own_dictionary(source),
+        )?;
+        if !self.copy_sources.contains(&id) {
+            self.copy_sources.push(id);
         }
         let frame = self.active_writer.write_block_verbatim(block)?;
         let file = self.active_writer.blob_file_id();
@@ -638,7 +685,12 @@ impl MultiWriter {
 
     /// A new writer for the next blob file of lifetime `class`, under output
     /// `passthrough`'s codec (see [`Self::codec_for`]).
-    fn fresh_writer(&self, passthrough: CompressionType, class: u8) -> crate::Result<Writer> {
+    fn fresh_writer(
+        &self,
+        passthrough: CompressionType,
+        class: u8,
+        own: Option<&OwnDictionary>,
+    ) -> crate::Result<Writer> {
         let id = self.id_generator.next();
         let path = self.folder.join(id.to_string());
         let w = Writer::open(path, id, self.tree_id, &*self.fs, self.origin)?;
@@ -660,13 +712,15 @@ impl MultiWriter {
         w.set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
         #[cfg(zstd_any)]
         let mut w = w
-            .use_zstd_dictionary(self.dictionary_for(codec))
+            .use_zstd_dictionary(self.dictionary_for(codec, own))
             .use_zstd_two_pass_seed(self.zstd_two_pass_seed)
             .use_file_dictionary(self.file_dictionary_for(passthrough));
         #[cfg(zstd_any)]
         {
-            w.dictionary_in_file = self.lent_for(codec).is_some();
+            w.dictionary_in_file = own.is_some();
         }
+        #[cfg(not(zstd_any))]
+        let _ = own;
         Ok(w)
     }
 
@@ -727,7 +781,11 @@ impl MultiWriter {
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating blob file writer");
 
-        let new_writer = self.fresh_writer(self.passthrough_compression, self.active_class)?;
+        let new_writer = self.fresh_writer(
+            self.passthrough_compression,
+            self.active_class,
+            self.active_own.as_ref(),
+        )?;
 
         let old_writer = core::mem::replace(&mut self.active_writer, new_writer);
         self.land(old_writer, self.passthrough_compression)
@@ -1059,7 +1117,7 @@ impl MultiWriter {
             .chain(
                 self.parked
                     .into_iter()
-                    .map(|(codec, _, _, writer)| (codec, writer)),
+                    .map(|(codec, _, _, _, writer)| (codec, writer)),
             );
         while let Some((passthrough, writer)) = writers.next() {
             match Self::consume_writer(
