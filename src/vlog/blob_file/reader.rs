@@ -200,6 +200,37 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The value `frames` of `blob_file` hold, the frames of its own a copy source
+/// holds (a single frame, or a head and its chunks), decoded: for a value
+/// written anew rather than copied as stored.
+///
+/// # Errors
+///
+/// The frames are no value's own, or one does not check or decode.
+pub(crate) fn decode_copied(blob_file: &BlobFile, frames: &[Slice]) -> crate::Result<UserValue> {
+    let malformed = || crate::Error::InvalidHeader("Blob");
+    let (first, chunks) = frames.split_first().ok_or_else(malformed)?;
+    let mut decoded = 0;
+    let frame = Reader::decode(blob_file, first, &mut decoded)?;
+    match frame.header.kind {
+        FrameKind::Single if chunks.is_empty() => frame.value(0).ok_or_else(malformed),
+        FrameKind::Head => {
+            let mut parts = Vec::with_capacity(chunks.len());
+            for (at, stored) in (0_u32..).zip(chunks) {
+                parts.push(Reader::decode_chunk(
+                    blob_file,
+                    &frame,
+                    at,
+                    stored,
+                    &mut decoded,
+                )?);
+            }
+            assemble(&frame, &parts, None)
+        }
+        _ => Err(malformed()),
+    }
+}
+
 /// What a copy of one value into another file writes.
 pub(crate) enum CopySource {
     /// The frames of a value that has frames of its own, as stored: written

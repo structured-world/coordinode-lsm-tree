@@ -1323,6 +1323,12 @@ enum Held {
     },
 }
 
+/// Blocks a relocation gave up because the rows held for them passed the
+/// bound, counted for the tests that reach that branch.
+#[cfg(test)]
+pub(crate) static BLOCKS_GIVEN_UP: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// The bytes `held` keeps in memory: its row's key and value, and for a
 /// pointer the value it claimed.
 fn held_len(held: &Held) -> usize {
@@ -1672,8 +1678,12 @@ impl RelocatingCompaction {
             .blob_writer
             .lifetime_groups()
             .relocated(blob_file.lifetime_class());
-        self.blob_writer.select_copy_output(blob_file, class)?;
+        let verbatim = self.blob_writer.select_copy_output(blob_file, class)?;
         let copy = match &source {
+            crate::vlog::blob_file::reader::CopySource::Frames { frames, .. } if !verbatim => {
+                let value = crate::vlog::blob_file::reader::decode_copied(blob_file, frames)?;
+                self.blob_writer.write(key, seqno, &value)?
+            }
             crate::vlog::blob_file::reader::CopySource::Frames { frames, value_len } => {
                 // A row's objects may have been written at older sequence
                 // numbers than the row (one it borrows), and its copies follow
@@ -1886,8 +1896,15 @@ impl RelocatingCompaction {
             let Some(source) = self.rewriting_blob_files.get(source_at) else {
                 return Err(crate::Error::InvalidHeader("Blob"));
             };
-            self.blob_writer.select_copy_output(source, class)?;
+            let verbatim = self.blob_writer.select_copy_output(source, class)?;
             match (&claimed.frames, &claimed.value) {
+                // Past the outputs holding a source's dictionary: decoded and
+                // written anew.
+                (Some(frames), _) if !verbatim => {
+                    let value = crate::vlog::blob_file::reader::decode_copied(source, frames)?;
+                    self.blob_writer
+                        .write(&item.key.user_key, item.key.seqno, &value)?
+                }
                 (Some(frames), _) => {
                     // A value is listed at the seqno its table gives it. An
                     // ingestion writes its blob entries before it is given
@@ -2103,6 +2120,8 @@ impl RelocatingCompaction {
         self.held_bytes += held_len(&held);
         self.held.push_back(held);
         if self.held_bytes > HELD_BYTES_MAX {
+            #[cfg(test)]
+            BLOCKS_GIVEN_UP.fetch_add(self.blocks.len(), core::sync::atomic::Ordering::Relaxed);
             self.abandoned.extend(self.blocks.drain().map(|(at, _)| at));
         }
         self.release_ready()

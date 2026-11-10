@@ -340,8 +340,15 @@ pub fn measure(
             LARGE_CACHE,
             BlobCacheFill::Always,
         )?;
-        for (key, _) in &corpus.values {
-            let _ = tree.get(key, SeqNo::MAX)?;
+        // The warming pass is not timed, so it also checks every value reads
+        // back as written.
+        for (key, source) in &corpus.values {
+            let got = tree.get(key, SeqNo::MAX)?;
+            assert_eq!(
+                got.as_deref(),
+                Some(read(source)?.as_slice()),
+                "a value reads back as written"
+            );
         }
         let start = Instant::now();
         for &i in &order {

@@ -350,6 +350,12 @@ Documents are 20,049 values (64 MiB), chain 70,258 values (142 MiB), files
 25 values (472 MiB). A point read is the mean per key with the engine's cache
 smaller than the data, the OS page cache warm.
 
+The sweep runs each layout once, in the fixed order of the tables. The ratios
+do not depend on that order; the times are one run each and can carry what an
+earlier layout left in the caches or the clock. A time difference close to the
+run-to-run spread is no reason to choose a default until runs in alternating
+order repeat it.
+
 | Corpus | Layout | Ratio lz4 | Ratio zstd 3 | Point read lz4 | Point read zstd 3 | Collection WA lz4 |
 |---|---|---|---|---|---|---|
 | documents | per-value | 0.371 | 0.278 | 7.3 µs | 13.6 µs | 0.50 |

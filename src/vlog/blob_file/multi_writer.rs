@@ -558,14 +558,54 @@ impl MultiWriter {
     /// Directs the next frames, copied as they are out of `source`, to a file
     /// of lifetime `class` that records `source`'s codec and holds the
     /// dictionary of its own `source` holds, if any: the one that decodes
-    /// them, whatever other dictionary shares its id.
+    /// them, whatever other dictionary shares its id. Returns whether the
+    /// frames go as they are.
+    ///
+    /// Each output holding a source's dictionary is a file held open until
+    /// the pass ends, so at most [`MAX_COPY_SOURCES`] are: past them, a
+    /// source's values are written anew, decoded, into an output of its
+    /// codec without the dictionary, and this returns `false`.
     ///
     /// # Errors
     ///
     /// Propagates the creation of the first file for an output not met
     /// before.
-    pub(crate) fn select_copy_output(&mut self, source: &BlobFile, class: u8) -> crate::Result<()> {
-        self.select(source.compression(), class, None, own_dictionary(source))
+    pub(crate) fn select_copy_output(
+        &mut self,
+        source: &BlobFile,
+        class: u8,
+    ) -> crate::Result<bool> {
+        let own = own_dictionary(source);
+        if own.is_some() && !self.holds_own_output(own) && self.own_outputs() >= MAX_COPY_SOURCES {
+            let codec = match source.compression() {
+                CompressionType::ZstdDict { level, .. } => CompressionType::Zstd(level),
+                codec => codec,
+            };
+            self.select(codec, class, None, None)?;
+            return Ok(false);
+        }
+        self.select(source.compression(), class, None, own)?;
+        Ok(true)
+    }
+
+    /// Whether an output, active or parked, holds `own`.
+    fn holds_own_output(&self, own: Option<&OwnDictionary>) -> bool {
+        let key = own_key(own);
+        own_key(self.active_own.as_ref()) == key
+            || self
+                .parked
+                .iter()
+                .any(|(_, _, _, o, _)| own_key(o.as_ref()) == key)
+    }
+
+    /// How many outputs, active or parked, hold a source's dictionary.
+    fn own_outputs(&self) -> usize {
+        usize::from(self.active_own.is_some())
+            + self
+                .parked
+                .iter()
+                .filter(|(_, _, _, o, _)| o.is_some())
+                .count()
     }
 
     /// Directs the next frames to the output of `compression`, `class`,

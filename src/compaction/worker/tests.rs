@@ -4359,6 +4359,11 @@ fn relocation_keeps_apart_own_dictionaries_that_share_an_id() -> crate::Result<(
     assert!(!relocated.is_empty(), "the fixture needs a relocation");
     for file in relocated {
         let Some(dict) = &file.0.zstd_dictionary else {
+            assert!(
+                !matches!(file.compression(), crate::CompressionType::ZstdDict { .. }),
+                "file {} records a dictionary codec but holds no dictionary",
+                file.id()
+            );
             continue;
         };
         let min = file.0.meta.key_range.min().first().copied();
@@ -4384,6 +4389,92 @@ fn relocation_keeps_apart_own_dictionaries_that_share_an_id() -> crate::Result<(
                     .as_deref(),
                 Some(&expected[..]),
                 "{prefix}{i:04} reads back"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A relocation over more files with their own dictionaries than it holds
+/// copies open writes the values of the rest anew: an output that copies a
+/// file's frames holds that file's dictionary, so one per source would hold a
+/// file open per source, however many there are.
+#[cfg(zstd_any)]
+#[test]
+fn relocation_holds_no_more_dictionary_outputs_than_copy_sources() -> crate::Result<()> {
+    const FILES: u64 = 20;
+    const KEYS: u64 = 12;
+
+    /// 8000 bytes of `word` repeated: twelve fill a file's dictionary samples.
+    fn value(word: u64) -> Vec<u8> {
+        word.to_le_bytes().repeat(1_000)
+    }
+
+    let folder = crate::get_tmp_folder();
+    let tree = match crate::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Zstd(3))
+    .with_kv_separation(Some(blob_reloc_kv_options()))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for file in 0..FILES {
+        for i in 0..KEYS {
+            tree.insert(format!("{file:02}-{i:04}"), value(1_000 + file), 0);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    assert!(
+        tree.index
+            .current_version()
+            .blob_files
+            .iter()
+            .all(|file| file.has_own_dictionary()),
+        "the fixture needs files with their own dictionaries"
+    );
+    // Half of each file shadowed: all turn stale and relocate together.
+    for file in 0..FILES {
+        for i in 0..KEYS / 2 {
+            tree.insert(format!("{file:02}-{i:04}"), value(7), 1);
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    let written: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+
+    let relocated = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .filter(|file| !written.contains(&file.id()))
+        .count();
+    // At most 16 outputs hold a source's dictionary, as many as the writer
+    // copies blocks of; the rest share an output of their own codec.
+    assert!(
+        relocated > 0 && relocated <= 16 + 2,
+        "{relocated} relocated files for {FILES} sources"
+    );
+    for file in 0..FILES {
+        for i in 0..KEYS {
+            let expected = value(if i < KEYS / 2 { 7 } else { 1_000 + file });
+            assert_eq!(
+                tree.get(format!("{file:02}-{i:04}"), crate::SeqNo::MAX)?
+                    .as_deref(),
+                Some(&expected[..]),
+                "{file:02}-{i:04} reads back"
             );
         }
     }
@@ -4434,8 +4525,12 @@ fn relocation_gives_up_a_block_whose_values_lie_past_the_held_bound() -> crate::
         tree.insert(blob_reloc_key(i), blob_reloc_value(i, 2), 1);
     }
     tree.flush_active_memtable(0)?;
+    let given_up =
+        || crate::compaction::flavour::BLOCKS_GIVEN_UP.load(core::sync::atomic::Ordering::Relaxed);
+    let before = given_up();
     tree.major_compact(64 * 1024 * 1024, 2)?;
     tree.major_compact(64 * 1024 * 1024, 2)?;
+    assert!(given_up() > before, "the pass gives up a block");
 
     assert!(
         tree.index
