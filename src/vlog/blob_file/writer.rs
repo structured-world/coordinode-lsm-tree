@@ -1242,10 +1242,13 @@ impl Writer {
     ) -> crate::Result<FrameRef> {
         use super::packed::{PACKED_REACH, encode_record};
 
+        // A record can be far smaller than its value, so the block is bounded
+        // by what its values decode to as well as by its records' bytes.
         if !self.packed.is_empty()
             && (self.packed.len() as u64 >= u64::from(self.sizes.block_target)
                 || self.packed.len() > PACKED_REACH
-                || self.packed_count == u16::MAX)
+                || self.packed_count == u16::MAX
+                || self.packed_raw + value.len() as u64 > MAX_DECOMPRESSION_SIZE as u64)
         {
             self.close_packed()?;
         }
@@ -1295,7 +1298,7 @@ impl Writer {
         }
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "a packed block holds less than one record past u16::MAX bytes of values"
+            reason = "a packed block closes before its values decode past MAX_DECOMPRESSION_SIZE"
         )]
         let raw_len = self.packed_raw as u32;
         #[expect(

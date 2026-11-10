@@ -515,6 +515,39 @@ fn a_head_whose_chunk_run_meets_another_frame_is_refused() -> crate::Result<()> 
     Ok(())
 }
 
+/// A packed block of values that compress far below their size closes before
+/// its values together decode past the cap: its records stay small while what
+/// they decode to grows, and a block whose declared size passes the cap is one
+/// no reader takes.
+#[cfg(zstd_any)]
+#[test]
+fn packed_blocks_close_before_their_values_decode_past_the_cap() -> crate::Result<()> {
+    const VALUES: usize = 320;
+    let dir = tempdir()?;
+    let path = dir.path().join("0");
+    let value = vec![0_u8; 900 * 1024];
+    let mut writer = BlobFileWriter::new(&path, 0, 0, &StdFs)?
+        .use_compression(crate::CompressionType::Zstd(3))
+        .use_frame_sizes(FrameSizes {
+            block_target: 1 << 20,
+            chunk_size: 1 << 20,
+        })
+        .use_file_dictionary(64 * 1024);
+    for i in 0..VALUES {
+        writer.write(format!("k{i:04}").as_bytes(), 7, &value)?;
+    }
+    writer.finish()?;
+    let bytes = std::fs::read(&path)?;
+    let index = index_of(&path)?;
+    let mut values = 0;
+    for frame in index.windows(2) {
+        let header = crate::vlog::blob_file::frame::parse_header(&bytes[frame[0]..frame[1]])?;
+        values += usize::from(header.count);
+    }
+    assert_eq!(values, VALUES, "every value lies in a frame a reader takes");
+    Ok(())
+}
+
 /// A head that checks but names far more chunks than the file holds, a cap's
 /// worth of one-byte chunks, is damage refused before room is reserved for
 /// them, by the index or along the chain, and the walk goes on after it.

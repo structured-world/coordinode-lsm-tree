@@ -2013,6 +2013,15 @@ impl RelocatingCompaction {
             value_bytes: block.value_bytes,
             entry_bytes: block.entry_bytes,
         };
+        // A file's own dictionary goes with its blocks into the file that
+        // copies them, as it does with its values in `place`.
+        if let Some(file) = self
+            .rewriting_blob_files
+            .iter()
+            .find(|file| file.id() == source)
+        {
+            self.blob_writer.lend_dictionary(file);
+        }
         let at = self
             .blob_writer
             .copy_block(key, source, output.0, output.1, &copied)?;

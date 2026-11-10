@@ -4102,6 +4102,83 @@ fn relocation_rewrites_a_block_a_key_domain_splits() -> crate::Result<()> {
     Ok(())
 }
 
+/// A zstd blob file compresses its blocks with a dictionary of its own. A
+/// relocation that copies such a block whole lands it in a file recording the
+/// source's codec, which must then hold that dictionary: copied without it,
+/// the output file names a dictionary the tree does not have, and the pass
+/// fails before it installs.
+#[cfg(zstd_any)]
+#[test]
+fn relocation_copies_whole_blocks_of_a_file_with_its_own_dictionary() -> crate::Result<()> {
+    const KEYS: u64 = 2_000;
+
+    /// Text-like values, so the file's dictionary trains on them and the
+    /// blocks after it compress under it.
+    fn value(i: u64, generation: u8) -> Vec<u8> {
+        format!("generation {generation} record {i:08} status=ok region=eu-west payload ")
+            .repeat(3)
+            .into_bytes()
+    }
+
+    let folder = crate::get_tmp_folder();
+    let tree = match crate::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Zstd(3))
+    .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in 0..KEYS {
+        tree.insert(blob_reloc_key(i), value(i, 1), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    // Runs of keys shadowed: each file turns stale, the blocks the runs fall
+    // in are written anew, and the blocks between them stay whole and live,
+    // copied as they were stored.
+    let shadowed = |i: u64| i % 64 < 10;
+    for i in (0..KEYS).filter(|i| shadowed(*i)) {
+        tree.insert(blob_reloc_key(i), value(i, 2), 1);
+    }
+    tree.flush_active_memtable(0)?;
+    let first: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .filter(|file| matches!(file.compression(), crate::CompressionType::ZstdDict { .. }))
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    assert!(
+        !first.is_empty(),
+        "the fixture needs files with their own dictionary"
+    );
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    assert!(
+        tree.index
+            .current_version()
+            .blob_files
+            .iter()
+            .all(|file| !first.contains(&file.id())),
+        "the files with their own dictionary are relocated"
+    );
+
+    for i in 0..KEYS {
+        let expected = value(i, if shadowed(i) { 2 } else { 1 });
+        assert_eq!(
+            tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+            Some(&expected[..]),
+            "key {i} reads back"
+        );
+    }
+    Ok(())
+}
+
 /// [`relocating_ingested_frames_lists_them_at_their_table_seqno`] for values
 /// that share blocks: a block of ingested values, whole and live, would be
 /// copied as stored, its entries listed at the zero the ingestion wrote them
