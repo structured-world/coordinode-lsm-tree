@@ -291,12 +291,13 @@ pub(crate) fn check_packed(header: &FrameHeader, records: &[u8]) -> crate::Resul
     let malformed = || crate::Error::InvalidHeader("BlobFrame");
     let count = usize::from(header.count);
     let mut list = Vec::with_capacity(count);
-    let mut sums = Vec::with_capacity(count * 8);
+    // The records' checksums, hashed as they are checked.
+    let mut sums = xxhash_rust::xxh3::Xxh3::with_seed(u64::from(header.header_crc));
     let mut at = 0;
     let mut decoded = 0_usize;
     while at < records.len() {
         let record = parse_record(records.get(at..).unwrap_or_default())?;
-        sums.extend_from_slice(&record.checksum.to_le_bytes());
+        sums.update(&record.checksum.to_le_bytes());
         let value_len = record.value_len as usize;
         list.push(FrameEntry {
             seqno: record.seqno,
@@ -311,7 +312,7 @@ pub(crate) fn check_packed(header: &FrameHeader, records: &[u8]) -> crate::Resul
     if list.len() != count || decoded != header.raw_len as usize {
         return Err(malformed());
     }
-    let checksum = super::frame::frame_checksum(&sums, header.header_crc);
+    let checksum = sums.digest128();
     if checksum != header.checksum {
         return Err(crate::Error::ChecksumMismatch {
             got: crate::Checksum::from_raw(checksum),
