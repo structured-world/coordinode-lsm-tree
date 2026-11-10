@@ -921,6 +921,15 @@ fn is_environmental(e: &crate::Error) -> bool {
     e.is_environmental()
 }
 
+/// Whether resolving a blob file's dictionary failed for its environment
+/// while reading the file: a retry may read it. A dictionary the tree does not
+/// hold is no such failure: for a file nothing references, it goes to the
+/// sweep.
+#[cfg(all(feature = "std", zstd_any))]
+fn reading_failed(e: &crate::Error) -> bool {
+    is_environmental(e) && !matches!(e, crate::Error::ZstdDictMismatch { .. })
+}
+
 /// Whether manifest repair must fail closed on a table because its bulk-ingest
 /// sequence offset cannot be reconstructed from the SST alone (the rebuilt
 /// manifest would install it with offset 0 and silently mis-order / mis-expose
@@ -3126,7 +3135,7 @@ fn recover_blob_files(
         #[cfg(zstd_any)]
         let dict = match blob_file_dictionary(config, blob_path, handle.meta()) {
             Ok(dict) => dict,
-            Err(e) if is_environmental(&e) || referenced.contains(&blob_id) => return Err(e),
+            Err(e) if referenced.contains(&blob_id) || reading_failed(&e) => return Err(e),
             Err(_) => {
                 return Err(crate::Error::InvalidHeader(
                     "blob file names a dictionary the tree does not hold",
@@ -3411,7 +3420,7 @@ fn recover_blob_files(
         #[cfg(zstd_any)]
         let dict = match blob_file_dictionary(config, &blob_path, &meta) {
             Ok(dict) => dict,
-            Err(e) if is_environmental(&e) || referenced.contains(&blob_id) => return Err(e),
+            Err(e) if referenced.contains(&blob_id) || reading_failed(&e) => return Err(e),
             Err(e) => {
                 log::debug!(
                     "blob file {blob_id} names a dictionary the tree does not hold \
