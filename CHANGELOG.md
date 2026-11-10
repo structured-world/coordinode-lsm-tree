@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.6.0...v8.0.0) - 2026-11-10
+
+### Added
+
+- *(bench)* race the blob tree against RocksDB blob files ([#1049](https://github.com/structured-world/coordinode-lsm-tree/pull/1049))
+- opt-in mimalloc global allocator ([#1047](https://github.com/structured-world/coordinode-lsm-tree/pull/1047))
+
+### Fixed
+
+- *(fs)* [**breaking**] read into ReadBuf memory without a byte slice ([#1051](https://github.com/structured-world/coordinode-lsm-tree/pull/1051))
+
+### Performance
+
+- *(blob)* [**breaking**] store values in frames by size class ([#1063](https://github.com/structured-world/coordinode-lsm-tree/pull/1063))
+- *(memtable)* leave a value segment's memory as it comes ([#1059](https://github.com/structured-world/coordinode-lsm-tree/pull/1059))
+- *(fs)* [**breaking**] fill batched reads in place and keep values cached ([#1044](https://github.com/structured-world/coordinode-lsm-tree/pull/1044))
+- *(table)* split blocks no cache shard can keep ([#1040](https://github.com/structured-world/coordinode-lsm-tree/pull/1040))
+
+### Bench
+
+- *(compare)* take blob trees against RocksDB blob files ([#1055](https://github.com/structured-world/coordinode-lsm-tree/pull/1055))
+
 ## [7.6.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.5.0...v7.6.0) - 2026-11-01
 
 ### Added
