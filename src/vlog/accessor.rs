@@ -55,6 +55,9 @@ impl core::borrow::Borrow<DecodedFrame> for HeldFrame {
 #[derive(Default)]
 pub(crate) struct Prefetched {
     frames: crate::HashMap<BlobFrameAt, DecodedFrame>,
+    /// An empty map whose table a refill moves the kept frames into, so no
+    /// window allocates the table again.
+    spare: crate::HashMap<BlobFrameAt, DecodedFrame>,
     /// Payloads of frames the store let go while a value taken out of one
     /// still shared its bytes. A value is a view into its frame's payload, so
     /// the payload's own reference count says whether a caller still keeps
@@ -113,8 +116,9 @@ impl Prefetched {
             return;
         }
         // Moved over by lookup, one per item: matching each held frame against
-        // every item cost a scan's refill the product of the two.
-        let mut held = core::mem::take(&mut self.frames);
+        // every item cost a scan's refill the product of the two. The two maps
+        // trade places, each keeping its table.
+        let mut held = core::mem::replace(&mut self.frames, core::mem::take(&mut self.spare));
         for (_, vhandle, _) in items {
             let at = vhandle.frame_at();
             if let Some(frame) = held.remove(&at) {
@@ -124,9 +128,10 @@ impl Prefetched {
                 break;
             }
         }
-        for (_, frame) in held {
+        for (_, frame) in held.drain() {
             self.release(frame);
         }
+        self.spare = held;
     }
 
     /// Holds `frame` as read ahead at `at`.
