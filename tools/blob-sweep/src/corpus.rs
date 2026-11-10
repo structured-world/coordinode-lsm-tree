@@ -132,8 +132,10 @@ pub fn load(data: &Path) -> std::io::Result<Vec<Corpus>> {
             &["blocks.jsonl", "transactions.jsonl"],
         )?);
     }
+    // The Silesia tar is the part's mark of completion, written last: a fetch
+    // that stopped before it leaves a partial tree, which is not a corpus.
     let files = data.join("files");
-    if files.try_exists()? {
+    if files.join("silesia.tar").try_exists()? {
         corpora.push(tree_of_files("files", &files)?);
     }
     Ok(corpora)

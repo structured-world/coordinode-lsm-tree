@@ -6,7 +6,8 @@ use blob_sweep::corpus;
 use blob_sweep::run::{Codec, Layout, measure, train};
 
 /// A data directory with a JSON lines corpus of documents and a corpus of
-/// files, one of them 3 MiB so range reads run.
+/// files, one of them 3 MiB so range reads run, and the tar that marks the
+/// files complete.
 fn data() -> std::io::Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     let documents = dir.path().join("documents");
@@ -20,7 +21,22 @@ fn data() -> std::io::Result<tempfile::TempDir> {
     std::fs::write(files.join("small.txt"), b"a small file\n".repeat(100))?;
     let large: Vec<u8> = (0..3_u32 << 20).map(|i| (i % 251) as u8).collect();
     std::fs::write(files.join("large.bin"), large)?;
+    std::fs::write(files.join("silesia.tar"), b"a tar\n".repeat(10))?;
     Ok(dir)
+}
+
+/// A files part whose fetch stopped before its tar is not loaded: a partial
+/// tree would be swept as if it were the corpus.
+#[test]
+fn a_files_part_without_its_tar_is_left_out() -> Result<(), blob_sweep::Error> {
+    let data = data()?;
+    std::fs::remove_file(data.path().join("files").join("silesia.tar"))?;
+    let corpora = corpus::load(data.path())?;
+    assert_eq!(
+        corpora.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        ["documents"]
+    );
+    Ok(())
 }
 
 #[test]

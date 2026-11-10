@@ -337,9 +337,11 @@ each overwriting a third of the keys, flushed and compacted, as relocated blob
 bytes over removed blob bytes. Every value is separated (threshold 64 bytes),
 so the runs measure the blob files alone. The trees go to `--work`. The sweep
 does not drop the OS page cache between its passes, so a point read with the
-small cache misses the engine's cache but finds its bytes in the page cache:
-the figures are the cost of locating, decoding and copying a value, not of a
-device read.
+small cache finds its bytes in the page cache when the engine's cache does not
+hold them: the figures are the cost of locating, decoding and copying a value,
+not of a device read. The small cache still takes the blocks of small values a
+read decodes while it has room for them, so a later read in the same block can
+be a hit: these are figures for a cache smaller than the data, not for a miss.
 
 ### What the defaults rest on
 
@@ -374,7 +376,11 @@ With the cache holding the data, every layout reads a key in 1.4 to 2.1 µs.
 A dictionary trained on the corpus, zstd 3 with 16 KiB blocks. It is trained
 on the first values of the corpus and the ratio counts those values too, so the
 gain is in-sample: a dictionary trained on past values sees less of what it
-later compresses.
+later compresses. The sweep turns off the dictionary each blob file builds of
+its own and uses this one dictionary, trained from up to 8 MiB of the corpus,
+for every file: the table is not the default zstd configuration, in which each
+file takes its first 64 KiB of small values as its dictionary and stores them
+as packed records.
 
 | Dictionary on | Ratio documents | Ratio chain | Ratio files |
 |---|---|---|---|
