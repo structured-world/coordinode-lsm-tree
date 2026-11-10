@@ -4434,7 +4434,7 @@ fn relocation_holds_no_more_dictionary_outputs_than_copy_sources() -> crate::Res
             .current_version()
             .blob_files
             .iter()
-            .all(|file| file.has_own_dictionary()),
+            .all(crate::vlog::BlobFile::has_own_dictionary),
         "the fixture needs files with their own dictionaries"
     );
     // Half of each file shadowed: all turn stale and relocate together.
