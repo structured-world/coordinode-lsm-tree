@@ -3292,8 +3292,13 @@ pub(crate) fn salvage_blob_file_on(
     #[cfg(zstd_any)]
     {
         // The re-emit re-compresses under the source's descriptor; a
-        // dictionary descriptor needs the dictionary on the write side too.
-        writer = writer.use_zstd_dictionary(zstd_dictionary.cloned());
+        // dictionary descriptor needs the dictionary on the write side too,
+        // stored in the file when the source stored it, as no tree's set holds
+        // a file's own.
+        let own = crate::vlog::read_blob_file_dictionary(source, &**fs, &source_meta)?.is_some();
+        writer = writer
+            .use_zstd_dictionary(zstd_dictionary.cloned())
+            .keep_dictionary_in_file(own);
     }
 
     let mut records_total = 0usize;

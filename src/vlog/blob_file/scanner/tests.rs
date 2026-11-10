@@ -439,6 +439,42 @@ fn a_damaged_chunk_costs_its_value_alone() -> crate::Result<()> {
     Ok(())
 }
 
+/// A chunk whose stored bytes check but do not decode is refused by a scan
+/// that decodes, as a read of the value would refuse it: the checksum proves
+/// the bytes are the ones written, not that they decode.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_decoding_scan_refuses_a_chunk_that_checks_but_does_not_decode() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("0");
+    let mut writer = BlobFileWriter::new(&path, 0, 0, &StdFs)?
+        .use_frame_sizes(SIZES)
+        .use_compression(crate::CompressionType::Lz4);
+    writer.write(b"big", 7, &[9; 700])?;
+    writer.write(b"next", 7, &[1; 120])?;
+    writer.finish()?;
+    let index = index_of(&path)?;
+    edit(&path, |bytes| {
+        // The first chunk's stored bytes, frame 1, turned to bytes no LZ4
+        // block decodes, then named in its row by their checksum.
+        let chunk = &mut bytes[index[1]..index[2]];
+        chunk.fill(0xFF);
+        let checksum = crate::vlog::blob_file::frame::chunk_checksum(chunk);
+        let head = &mut bytes[index[0]..index[1]];
+        let entries_len = parse_header(head).expect("a head").entries_len as usize;
+        // The first row's checksum, after the chunk size, the count, the
+        // row's stored length and its flags.
+        let row = FRAME_HEADER_LEN + entries_len + 8;
+        head[row + 5..row + 21].copy_from_slice(&checksum.to_le_bytes());
+        crate::vlog::blob_file::frame::reseal(head);
+    })?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(scanner.next().expect("the big value").is_err());
+    let next = scanner.next().expect("the value after it")?;
+    assert_eq!(next.key, Slice::from(&b"next"[..]));
+    Ok(())
+}
+
 /// Along the chain, where only the head's table placed its chunks, a value
 /// whose chunks do not read is refused and the walk searches on from the
 /// head for the next frame: a damaged chunk, and a row naming a stored length

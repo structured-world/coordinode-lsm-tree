@@ -557,6 +557,22 @@ pub(crate) fn read_blob_meta(path: &Path, fs: &dyn Fs, id: BlobFileId) -> crate:
     read_meta_and_index_at(&mut file, id).map(|(meta, ..)| meta)
 }
 
+/// [`read_file_dictionary`] of the blob file at `path`, whose metadata is
+/// `meta`.
+///
+/// # Errors
+///
+/// As [`read_file_dictionary`], and any error opening the file.
+#[cfg(all(feature = "std", zstd_any))]
+pub(crate) fn read_blob_file_dictionary(
+    path: &Path,
+    fs: &dyn Fs,
+    meta: &Metadata,
+) -> crate::Result<Option<Arc<crate::compression::ZstdDictionary>>> {
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    read_file_dictionary(&mut file, meta)
+}
+
 /// Where a section lies: its position and length.
 type SectionAt = (u64, u64);
 

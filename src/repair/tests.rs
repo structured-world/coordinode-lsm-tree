@@ -7876,7 +7876,7 @@ fn validate_frames(
         &config.current_zstd_dictionaries(),
     )?;
     #[cfg(zstd_any)]
-    let dict = super::blob_file_dictionary(config, handle.compression())?;
+    let dict = super::blob_file_dictionary(config, path, handle.meta())?;
     super::validate_blob_frames(
         config,
         path,

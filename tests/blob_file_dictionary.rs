@@ -104,6 +104,103 @@ fn values_under_a_file_dictionary_read_back_and_take_less() -> lsm_tree::Result<
     Ok(())
 }
 
+/// Removes the manifest snapshots and their logs, so the next open has to
+/// rebuild from the files on disk; asserts something was removed.
+fn lose_the_manifest(dir: &std::path::Path) -> lsm_tree::Result<()> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_manifest = name
+            .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_manifest {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    assert!(removed > 0, "no manifest file matched");
+    Ok(())
+}
+
+#[test]
+fn a_repair_reads_a_blob_file_through_its_own_dictionary() -> lsm_tree::Result<()> {
+    // The dictionary lives only in the blob file, not in the tree's set: a
+    // repair that looks only in the set finds a referenced, intact file
+    // naming a dictionary it does not hold and refuses to rebuild.
+    let folder = get_tmp_folder();
+    {
+        let tree = open(folder.path(), 16 * 1_024)?;
+        fill(&tree)?;
+    }
+    lose_the_manifest(folder.path())?;
+    let report = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(CompressionType::Zstd(3))
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(1)
+            .block_size(8 * 1_024)
+            .file_dictionary(16 * 1_024),
+    ))
+    .repair()?;
+    assert_eq!(report.unreadable, 0, "no file should be unreadable");
+    let tree = open(folder.path(), 16 * 1_024)?;
+    assert_all(&tree)
+}
+
+#[test]
+fn a_salvaged_blob_file_keeps_the_dictionary_of_its_own() -> lsm_tree::Result<()> {
+    // A salvage copies the intact frames as they are, under the source's
+    // codec: the replacement must store the dictionary that codec names, as
+    // no tree's set holds it.
+    let folder = get_tmp_folder();
+    {
+        let tree = open(folder.path(), 16 * 1_024)?;
+        fill(&tree)?;
+    }
+    let blob = std::fs::read_dir(folder.path().join(lsm_tree::file::BLOBS_FOLDER))?
+        .find_map(|entry| entry.ok().map(|entry| entry.path()))
+        .expect("a blob file");
+    let mut bytes = std::fs::read(&blob)?;
+    let at = bytes.len() / 3;
+    bytes[at] ^= 0x40;
+    std::fs::write(&blob, &bytes)?;
+
+    Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(CompressionType::Zstd(3))
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(1)
+            .block_size(8 * 1_024)
+            .file_dictionary(16 * 1_024),
+    ))
+    .repair()?;
+
+    let tree = open(folder.path(), 16 * 1_024)?;
+    let mut present = 0;
+    for i in 0..KEYS {
+        if let Some(value) = tree.get(key(i), SeqNo::MAX)? {
+            assert_eq!(value.as_ref(), document(i).as_slice(), "key {i}");
+            present += 1;
+        }
+    }
+    assert!(
+        present > KEYS / 2,
+        "only the damaged frame's values may be lost, {present}/{KEYS} read back"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_file_dictionary_goes_with_the_frames_a_collection_copies() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();

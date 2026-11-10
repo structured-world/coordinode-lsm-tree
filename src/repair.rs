@@ -708,8 +708,9 @@ fn trustworthy_restriction_bound(
     }
 }
 
-/// The dictionary a blob file's own compression descriptor names, resolved
-/// against the tree's set; `None` for a file that uses no dictionary.
+/// The dictionary a blob file's own compression descriptor names: the one the
+/// file at `path` stores, or else the tree's; `None` for a file that uses no
+/// dictionary.
 ///
 /// A blob file records ONE descriptor, so this answers with one dictionary; the
 /// set is what turns the recorded id back into bytes. Resolving here rather than
@@ -726,11 +727,17 @@ fn trustworthy_restriction_bound(
 #[cfg(all(feature = "std", zstd_any))]
 fn blob_file_dictionary(
     config: &Config,
-    compression: crate::CompressionType,
+    path: &std::path::Path,
+    meta: &crate::vlog::blob_file::meta::Metadata,
 ) -> crate::Result<Option<Arc<crate::compression::ZstdDictionary>>> {
+    // A dictionary the file stores of its own is in no tree's set: it is read
+    // from the file first, as an open does.
+    if let Some(own) = crate::vlog::read_blob_file_dictionary(path, &*config.fs, meta)? {
+        return Ok(Some(own));
+    }
     config
         .current_zstd_dictionaries()
-        .for_compression(compression)
+        .for_compression(meta.compression)
 }
 
 /// What only the manifest knows of a table's place in the tree: its bulk-ingest
@@ -3117,9 +3124,9 @@ fn recover_blob_files(
         // references no copy survives either way: it simply does not verify,
         // and every copy takes the unreferenced path to the sweep.
         #[cfg(zstd_any)]
-        let dict = match blob_file_dictionary(config, handle.compression()) {
+        let dict = match blob_file_dictionary(config, blob_path, handle.meta()) {
             Ok(dict) => dict,
-            Err(e) if referenced.contains(&blob_id) => return Err(e),
+            Err(e) if is_environmental(&e) || referenced.contains(&blob_id) => return Err(e),
             Err(_) => {
                 return Err(crate::Error::InvalidHeader(
                     "blob file names a dictionary the tree does not hold",
@@ -3402,9 +3409,9 @@ fn recover_blob_files(
         // supplies the dictionary and re-runs. One nothing references holds no
         // value anyone can reach, and goes to the sweep like any other.
         #[cfg(zstd_any)]
-        let dict = match blob_file_dictionary(config, meta.compression) {
+        let dict = match blob_file_dictionary(config, &blob_path, &meta) {
             Ok(dict) => dict,
-            Err(e) if referenced.contains(&blob_id) => return Err(e),
+            Err(e) if is_environmental(&e) || referenced.contains(&blob_id) => return Err(e),
             Err(e) => {
                 log::debug!(
                     "blob file {blob_id} names a dictionary the tree does not hold \

@@ -561,11 +561,14 @@ impl Scanner {
                 let (Some(entry), Some(key)) = (decoded.list.first(), decoded.key(0)) else {
                     return failed(self, crate::Error::InvalidHeader("BlobFrame"));
                 };
-                // Proven whole without being decoded, each chunk checked
-                // against its row as it lies: every consumer copies the value
-                // as its stored frames.
+                // Each chunk checked against its row as it lies: every consumer
+                // copies the value as its stored frames. A scan that decodes
+                // (repair, salvage) decodes each chunk too, as a read of the
+                // value would: a checksum proves the bytes are the ones
+                // written, not that they decode.
                 let mut stored = Vec::with_capacity(specs.len() + 1);
                 stored.push(bytes);
+                let mut decoded_chunk = Vec::new();
                 let mut from = 0;
                 for spec in &specs {
                     let to = from + spec.stored_len as usize;
@@ -573,7 +576,21 @@ impl Scanner {
                     if !spec.fits(self.codec.compression) {
                         return failed(self, crate::Error::InvalidHeader("BlobFrame"));
                     }
-                    if let Err(e) = super::frame::check_chunk(spec, &chunk) {
+                    let checked = if self.decode == Decode::All {
+                        decoded_chunk.resize(spec.raw_len as usize, 0);
+                        super::frame::decode_chunk_into(
+                            spec,
+                            &chunk,
+                            self.codec.compression,
+                            #[cfg(zstd_any)]
+                            self.codec.dictionary.as_deref(),
+                            &mut decoded_chunk,
+                            &mut 0,
+                        )
+                    } else {
+                        super::frame::check_chunk(spec, &chunk)
+                    };
+                    if let Err(e) = checked {
                         return failed(self, e);
                     }
                     stored.push(chunk);

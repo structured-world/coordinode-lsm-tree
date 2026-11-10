@@ -683,6 +683,16 @@ impl Writer {
         self
     }
 
+    /// Stores the dictionary [`Self::use_zstd_dictionary`] gave in the file, as
+    /// one of its own, when `own`: frames copied from a file that held it need
+    /// it next to them, as no tree's set holds it.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub(crate) fn keep_dictionary_in_file(mut self, own: bool) -> Self {
+        self.dictionary_in_file = own;
+        self
+    }
+
     /// Builds a dictionary of `bytes` from this file's own first values when
     /// it compresses with zstd and no dictionary: every value up to the chunk
     /// size then gets a frame of its own, none shares a block, and a value is
