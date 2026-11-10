@@ -374,6 +374,65 @@ fn reads_waiting_on_one_frame_share_it() {
     );
 }
 
+/// Reads of one packed record behind another read of it take the record that
+/// read hands over; a thread leading a batched load does not wait for it, and
+/// reads the record alone.
+#[test]
+fn reads_waiting_on_one_record_share_it_unless_they_lead_a_batch() {
+    use super::{LoadIdentity, RecordClaim};
+    use std::sync::Arc;
+
+    let cache = Arc::new(
+        Cache::with_capacity_bytes(1024 * 1024)
+            .with_load_coalescing_after(core::time::Duration::ZERO),
+    );
+    let at = super::BlobFrameAt {
+        blob_file_id: 3,
+        frame: 0,
+    };
+    let RecordClaim::Lead(lead) = cache.claim_blob_record(0, at, 5) else {
+        panic!("the first read leads");
+    };
+
+    let alone = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || {
+            let id = crate::table::GlobalTableId::from((0, 1));
+            let identity = LoadIdentity::Block {
+                block_type: crate::table::block::BlockType::Data,
+                size: 100,
+                compression: crate::CompressionType::None,
+                encrypted: false,
+            };
+            let Some(batched) =
+                cache.claim_batched_block(id, crate::table::BlockOffset(1), identity, true)
+            else {
+                panic!("the batched read leads its block");
+            };
+            let claim = cache.claim_blob_record(0, at, 5);
+            drop(batched);
+            matches!(claim, RecordClaim::Alone)
+        }
+    })
+    .join()
+    .expect("the batched reader returns instead of waiting");
+    assert!(alone, "told to read the record alone");
+
+    let waiter = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || match cache.claim_blob_record(0, at, 5) {
+            RecordClaim::Shared(record) => Some(record),
+            _ => None,
+        }
+    });
+    while cache.load_waiters() < 1 {
+        std::thread::yield_now();
+    }
+    lead.hand_over(crate::Slice::from(&b"record"[..]));
+    let shared = waiter.join().expect("reader").expect("shared");
+    assert_eq!(&*shared, b"record");
+}
+
 /// A read that caches what it reads publishes its frame into the cache as it
 /// hands it to its waiters, so a miss after it finds the frame there.
 #[test]

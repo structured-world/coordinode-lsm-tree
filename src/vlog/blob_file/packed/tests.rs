@@ -148,6 +148,54 @@ fn a_cached_record_refuses_another_key() {
     ));
 }
 
+/// A packed block whose header names another count of records, or another
+/// decoded length, than its records add up to is malformed, though every
+/// checksum holds.
+#[test]
+fn a_header_its_records_do_not_add_up_to_is_refused() {
+    let (bytes, starts) = records(&[b"one value", b"another value"]);
+    assert!(check_frame(&frame(&bytes, &starts, 22)).is_ok());
+    assert!(matches!(
+        check_frame(&frame(&bytes, &starts, 21)),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    assert!(matches!(
+        check_frame(&frame(&bytes, &starts[..1], 22)),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+}
+
+/// In a file that compresses nothing, a record stored in another length than
+/// its value's is refused as it is read, not handed out short.
+#[test]
+fn an_uncompressed_record_of_another_length_is_refused() {
+    let mut bytes = Vec::new();
+    encode_record(
+        &mut bytes,
+        b"k0",
+        0,
+        b"the value",
+        UNCOMPRESSED,
+        Some(b"short"),
+    )
+    .unwrap();
+    let bytes = Slice::from(bytes);
+    let record = parse_record(&bytes).unwrap();
+    let mut decoded = 0;
+    assert!(matches!(
+        record_value(
+            &record,
+            &bytes,
+            CompressionType::None,
+            #[cfg(zstd_any)]
+            None,
+            &mut decoded,
+        ),
+        Err(crate::Error::InvalidHeader("BlobRecord"))
+    ));
+    assert_eq!(decoded, 5, "the stored bytes were inspected");
+}
+
 /// Two records of the same length swapped each still check by their own
 /// checksums; the frame's checksum over their checksums in order catches it.
 #[test]

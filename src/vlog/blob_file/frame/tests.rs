@@ -652,6 +652,230 @@ fn a_chunk_decodes_by_its_heads_row() {
     assert!(check_chunk(&spec, b"chunk").is_err(), "another length");
 }
 
+/// `stored` decoded under `spec` into a buffer of `out_len` bytes, as a whole
+/// read of a chunked value decodes each chunk into its place.
+fn chunk_into(
+    spec: &ChunkSpec,
+    stored: &[u8],
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    out_len: usize,
+) -> crate::Result<Vec<u8>> {
+    let mut out = vec![0; out_len];
+    decode_chunk_into(
+        spec,
+        stored,
+        compression,
+        #[cfg(zstd_any)]
+        dictionary,
+        &mut out,
+        &mut 0,
+    )?;
+    Ok(out)
+}
+
+/// `spec` over other stored bytes: a chunk damaged in a way its checksum
+/// does not catch, so the decoder behind it is what refuses it.
+fn resealed(spec: ChunkSpec, stored: &[u8]) -> ChunkSpec {
+    ChunkSpec {
+        stored_len: stored.len() as u32,
+        checksum: chunk_checksum(stored),
+        ..spec
+    }
+}
+
+/// A chunk decoded into its place in a whole value takes exactly the place
+/// its row gives it, and one stored as it is under no codec must be that
+/// long too, though its row names another stored length.
+#[test]
+fn a_chunk_decoded_into_place_takes_exactly_its_row() {
+    let (_, spec) = encode_chunk(b"chunk bytes", plain()).unwrap();
+    let decode = |spec: &ChunkSpec, stored: &[u8], out_len| {
+        chunk_into(
+            spec,
+            stored,
+            CompressionType::None,
+            #[cfg(zstd_any)]
+            None,
+            out_len,
+        )
+    };
+    assert_eq!(decode(&spec, b"chunk bytes", 11).unwrap(), b"chunk bytes");
+    assert!(matches!(
+        decode(&spec, b"chunk bytes", 12),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    // A row of a raw length its stored bytes do not have, the checksum
+    // resealed over them.
+    let short = ChunkSpec {
+        raw_len: 12,
+        ..resealed(spec, b"chunk bytes")
+    };
+    assert!(matches!(
+        decode(&short, b"chunk bytes", 12),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    let mut decoded = 0;
+    assert!(matches!(
+        decode_chunk(
+            &short,
+            &Slice::from(&b"chunk bytes"[..]),
+            CompressionType::None,
+            #[cfg(zstd_any)]
+            None,
+            &mut decoded,
+        ),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+    assert_eq!(decoded, 11, "the stored bytes were inspected");
+}
+
+/// An lz4 chunk decodes into its place; one that does not decompress, or
+/// decompresses short of its row, is refused, though its checksum holds.
+#[cfg(feature = "lz4")]
+#[test]
+fn an_lz4_chunk_decodes_into_place_and_refuses_damage() {
+    let chunk = vec![b'q'; 4_096];
+    let (stored, spec) = encode_chunk(&chunk, codec(CompressionType::Lz4)).unwrap();
+    // A run of one byte compresses.
+    let stored = stored.unwrap();
+    let decode = |spec: &ChunkSpec, stored: &[u8]| {
+        chunk_into(
+            spec,
+            stored,
+            CompressionType::Lz4,
+            #[cfg(zstd_any)]
+            None,
+            spec.raw_len as usize,
+        )
+    };
+    assert_eq!(decode(&spec, &stored).unwrap(), chunk);
+
+    let garbage = [0xF0_u8; 8];
+    assert!(matches!(
+        decode(&resealed(spec, &garbage), &garbage),
+        Err(crate::Error::Decompress(CompressionType::Lz4))
+    ));
+    let long = ChunkSpec {
+        raw_len: spec.raw_len + 1,
+        ..spec
+    };
+    assert!(matches!(
+        decode(&long, &stored),
+        Err(crate::Error::Decompress(CompressionType::Lz4))
+    ));
+}
+
+/// A zstd chunk decodes into its place, with and without a dictionary; one
+/// that does not decompress is refused, and a dictionary chunk read without
+/// its dictionary names the dictionary it needs.
+#[cfg(zstd_any)]
+#[test]
+fn a_zstd_chunk_decodes_into_place_and_refuses_damage() {
+    use crate::compression::ZstdDictionary;
+
+    let chunk = b"the chunk of a value, said over and over. ".repeat(100);
+    let decode = |spec: &ChunkSpec, stored: &[u8], compression, dictionary| {
+        chunk_into(spec, stored, compression, dictionary, spec.raw_len as usize)
+    };
+    let garbage = b"not a zstd frame at all";
+
+    let zstd = CompressionType::Zstd(3);
+    // Repeated text compresses, with and without the dictionary.
+    let (stored, spec) = encode_chunk(&chunk, codec(zstd)).unwrap();
+    let stored = stored.unwrap();
+    assert_eq!(decode(&spec, &stored, zstd, None).unwrap(), chunk);
+    assert!(matches!(
+        decode(&resealed(spec, garbage), garbage, zstd, None),
+        Err(crate::Error::Decompress(_))
+    ));
+
+    let dict = ZstdDictionary::new(&b"the chunk of a value, said over and over. ".repeat(8));
+    let with_dict = CompressionType::ZstdDict {
+        level: 3,
+        dict_id: dict.id(),
+    };
+    let dict_codec = Codec {
+        compression: with_dict,
+        dictionary: Some(&dict),
+        two_pass_seed: true,
+        plain: false,
+    };
+    let (stored, spec) = encode_chunk(&chunk, dict_codec).unwrap();
+    let stored = stored.unwrap();
+    assert_eq!(
+        decode(&spec, &stored, with_dict, Some(&dict)).unwrap(),
+        chunk
+    );
+    assert!(matches!(
+        decode(&spec, &stored, with_dict, None),
+        Err(crate::Error::ZstdDictMismatch { got: None, .. })
+    ));
+    assert!(matches!(
+        decode(&resealed(spec, garbage), garbage, with_dict, Some(&dict)),
+        Err(crate::Error::Decompress(_))
+    ));
+}
+
+/// A plain chunk is zstd without the dictionary, which only a zstd file
+/// writes: under another codec its row is refused.
+#[cfg(all(feature = "lz4", zstd_any))]
+#[test]
+fn a_plain_chunk_under_a_codec_without_zstd_is_refused() {
+    let (_, spec) = encode_chunk(b"chunk bytes", plain()).unwrap();
+    let spec = ChunkSpec {
+        flags: FLAG_PLAIN,
+        ..spec
+    };
+    assert!(matches!(
+        chunk_into(&spec, b"chunk bytes", CompressionType::Lz4, None, 11),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+}
+
+/// A head's table is refused row by row: a chunk stored two ways at once,
+/// and a chunk stored as it is that names another length than its own.
+#[test]
+fn a_heads_table_refuses_a_row_it_cannot_hold() {
+    let entry = EntrySpec {
+        key: b"big",
+        seqno: 7,
+        value_len: 8,
+    };
+    let row = |flags, stored_len| ChunkSpec {
+        raw_len: 8,
+        stored_len,
+        flags,
+        checksum: 0,
+    };
+    for spec in [row(FLAG_RAW | FLAG_PLAIN, 8), row(FLAG_RAW, 7)] {
+        let mut out = Vec::new();
+        encode_frame(
+            FrameKind::Head,
+            &[entry],
+            &head_payload(8, &[spec]),
+            plain(),
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                head_chunks(&out),
+                Err(crate::Error::InvalidHeader("BlobFrame"))
+            ),
+            "{spec:?}"
+        );
+    }
+
+    // A frame of one value has no table at all.
+    let mut out = Vec::new();
+    encode_frame(FrameKind::Single, &[entry], b"8 bytes!", plain(), &mut out).unwrap();
+    assert!(matches!(
+        head_chunks(&out),
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    ));
+}
+
 fn sample_block() -> Vec<u8> {
     let entries = [
         EntrySpec {

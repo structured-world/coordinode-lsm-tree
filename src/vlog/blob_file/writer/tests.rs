@@ -374,6 +374,102 @@ fn verbatim_frames_are_written_as_they_are() -> crate::Result<()> {
     Ok(())
 }
 
+/// A file that compresses nothing hands no value to be compressed ahead, of
+/// any class.
+#[cfg(feature = "std")]
+#[test]
+fn an_uncompressed_file_compresses_no_value_ahead() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let w = Writer::new(folder.path().join("plain"), 0, 0, &StdFs)?.use_frame_sizes(SIZES);
+    for len in [10, 150, 700] {
+        assert!(w.value_codec(len).is_none(), "{len} bytes");
+    }
+    Ok(())
+}
+
+/// A block copied whole is taken only as the block it says it is: a frame of
+/// another kind, or a block of another count of values, is refused before a
+/// byte of it is written.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_block_copied_whole_must_be_the_block_it_names() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let mut source = block_writer(&folder, SIZES)?;
+    source.write(b"a", 0, b"value")?;
+    source.write(b"b", 0, b"v")?;
+    source.write(b"one", 0, &[7; 150])?;
+    let source_path = source.path.clone();
+    let (_, _, frames) = source.finish()?;
+    let bytes = std::fs::read(&source_path)?;
+    let frame = |at: usize| &bytes[frames[at] as usize..frames[at + 1] as usize];
+    let copied = |stored, values| CopiedBlock {
+        stored,
+        first_key: b"a",
+        last_key: b"b",
+        values,
+        value_bytes: 6,
+        entry_bytes: 0,
+    };
+
+    let target = tempfile::tempdir()?;
+    let mut w = writer(&target)?;
+    let before = w.len_written();
+    for (stored, values) in [(frame(1), 1), (frame(0), 3)] {
+        assert!(matches!(
+            w.write_block_verbatim(&copied(stored, values)),
+            Err(crate::Error::InvalidHeader("verbatim blob block"))
+        ));
+    }
+    assert_eq!(w.len_written(), before, "nothing was written");
+    assert_eq!(w.write_block_verbatim(&copied(frame(0), 2))?, 0);
+    Ok(())
+}
+
+/// A file set to build a dictionary of its own gives it up for frames copied
+/// in as they are, which name the codec they were written in: before it holds
+/// a value it records their codec, and once it has written values toward the
+/// dictionary it refuses them.
+#[cfg(zstd_any)]
+#[test]
+fn verbatim_frames_end_a_dictionary_only_before_any_value() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let zstd = CompressionType::Zstd(3);
+    let mut source = Writer::new(folder.path().join("source"), 0, 0, &StdFs)?
+        .use_compression(zstd)
+        .use_frame_sizes(SIZES);
+    source.write(b"big", 3, &[9; 700])?;
+    let source_path = source.path.clone();
+    let (_, _, source_frames) = source.finish()?;
+    let bytes = std::fs::read(&source_path)?;
+    let stored: Vec<crate::Slice> = source_frames
+        .windows(2)
+        .map(|pair| crate::Slice::from(&bytes[pair[0] as usize..pair[1] as usize]))
+        .collect();
+    let target = |name: &str| -> crate::Result<Writer> {
+        Ok(Writer::new(folder.path().join(name), 1, 0, &StdFs)?
+            .use_compression(zstd)
+            .use_frame_sizes(SIZES)
+            .use_file_dictionary(64 * 1024))
+    };
+
+    let mut fresh = target("fresh")?;
+    fresh.write_verbatim(b"big", &stored, 700)?;
+    fresh.write(b"next", 4, &[5; 50])?;
+    let path = fresh.path.clone();
+    let (meta, _, frames) = fresh.finish()?;
+    assert_eq!(meta.compression, zstd, "the copied frames' codec");
+    let decoded = decode_all(&std::fs::read(&path)?, &frames, zstd, None)?;
+    assert_eq!(decoded[0].key(0), Some(&b"big"[..]));
+
+    let mut started = target("started")?;
+    started.write(b"a", 0, &[5; 50])?;
+    assert!(matches!(
+        started.write_verbatim(b"big", &stored, 700),
+        Err(crate::Error::InvalidHeader(_))
+    ));
+    Ok(())
+}
+
 /// Frames written as they are but listed at another seqno take the bytes the
 /// source's do, list the value at that seqno, and check; the chunks after the
 /// head are the source's bytes.

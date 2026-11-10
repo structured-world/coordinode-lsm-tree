@@ -4190,6 +4190,79 @@ fn relocation_copies_whole_blocks_of_a_file_with_its_own_dictionary() -> crate::
     Ok(())
 }
 
+/// A relocation holds the rows after a pointer into a block until the block's
+/// values are all seen, and no more than a bound of them: past it the blocks
+/// still waiting are given up, their values written anew, and the rows go
+/// out. Here more than the bound of inline rows lies between two values of
+/// one block, and every row and value still reads back after the pass.
+#[test]
+fn relocation_gives_up_a_block_whose_values_lie_past_the_held_bound() -> crate::Result<()> {
+    const KEYS: u64 = 40;
+    const ROWS: u64 = 140_000;
+
+    let folder = crate::get_tmp_folder();
+    let tree = match crate::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in 0..KEYS {
+        tree.insert(blob_reloc_key(i), blob_reloc_value(i, 1), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    let first: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    // Inline rows sorting between the first block's first two values, more
+    // bytes of them than a relocation holds back.
+    let row = |j: u64| format!("{}/{j:08}", blob_reloc_key(0));
+    for j in 0..ROWS {
+        tree.insert(row(j), [b'r'; 40], 1);
+    }
+    // The second half shadowed: the file turns stale and is relocated.
+    for i in KEYS / 2..KEYS {
+        tree.insert(blob_reloc_key(i), blob_reloc_value(i, 2), 1);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+
+    assert!(
+        tree.index
+            .current_version()
+            .blob_files
+            .iter()
+            .all(|file| !first.contains(&file.id())),
+        "the first generation is relocated"
+    );
+    for i in 0..KEYS {
+        let expected = blob_reloc_value(i, if i < KEYS / 2 { 1 } else { 2 });
+        assert_eq!(
+            tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+            Some(&expected[..]),
+            "key {i} reads back"
+        );
+    }
+    for j in [0, ROWS / 2, ROWS - 1] {
+        assert_eq!(
+            tree.get(row(j), crate::SeqNo::MAX)?.as_deref(),
+            Some(&[b'r'; 40][..]),
+            "row {j} reads back"
+        );
+    }
+    Ok(())
+}
+
 /// [`relocating_ingested_frames_lists_them_at_their_table_seqno`] for values
 /// that share blocks: a block of ingested values, whole and live, would be
 /// copied as stored, its entries listed at the zero the ingestion wrote them

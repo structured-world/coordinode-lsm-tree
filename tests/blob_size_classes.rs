@@ -379,6 +379,34 @@ fn a_packed_value_is_read_as_its_record_alone() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Under `Always` a packed value a batch read is cached as its record, and a
+/// batch again takes it from the cache: no request of the filesystem.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_cached_packed_value_serves_a_batch_again() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), CompressionType::None, BlobCacheFill::Always)?;
+    for i in 0..20 {
+        tree.insert(format!("k{i:02}"), random(i, 2_000), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    let keys: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
+    let m = tree.metrics();
+
+    for _ in 0..2 {
+        let got = tree.multi_get(&keys, SeqNo::MAX)?;
+        for (i, value) in got.iter().enumerate() {
+            assert_eq!(value.as_deref(), Some(&*random(i as u64, 2_000)));
+        }
+    }
+    assert_eq!(
+        m.blob_read_count(),
+        20,
+        "the second batch is served from the cached records"
+    );
+    Ok(())
+}
+
 /// A batch whose values share blocks reads each block once, even when none
 /// is cached yet.
 #[cfg(feature = "metrics")]

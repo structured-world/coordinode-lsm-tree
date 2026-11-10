@@ -168,6 +168,42 @@ fn a_file_dictionary_running_past_the_file_is_unrecoverable() -> crate::Result<(
     Ok(())
 }
 
+/// A file holding its own dictionary is opened alone with it, whatever
+/// dictionaries the caller has; read under metadata whose codec names no such
+/// dictionary, the stored one is refused as damage.
+#[cfg(zstd_any)]
+#[test]
+fn a_file_dictionary_is_taken_only_as_its_codec_names_it() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?
+        .use_compression(crate::CompressionType::Zstd(3))
+        .use_file_dictionary(4 * 1024);
+    for i in 0..2_000u32 {
+        let value = format!("record {i:08} status=ok region=eu-west ").repeat(4);
+        writer.write(format!("k{i:06}").as_bytes(), 0, value.as_bytes())?;
+    }
+    let (_, checksum, _) = writer.finish()?;
+
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let file = recover_blob_file(path.as_path(), 7, checksum, 0, &fs, &no_dicts())?;
+    assert!(file.0.dictionary_in_file);
+    let dict = file.0.zstd_dictionary.as_ref().unwrap();
+    assert!(matches!(
+        file.0.meta.compression,
+        crate::CompressionType::ZstdDict { dict_id, .. } if dict_id == dict.id()
+    ));
+
+    let mut handle = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let (mut meta, _) = read_meta_and_frames(&mut handle, 7)?;
+    meta.compression = crate::CompressionType::Zstd(3);
+    assert!(matches!(
+        read_file_dictionary(&mut handle, &meta),
+        Err(crate::Error::Unrecoverable)
+    ));
+    Ok(())
+}
+
 /// A frame index the table of contents says runs past the file is damage the
 /// open reports, before anything is sized from the length it names.
 #[test]

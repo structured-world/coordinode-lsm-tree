@@ -439,6 +439,51 @@ fn a_damaged_chunk_costs_its_value_alone() -> crate::Result<()> {
     Ok(())
 }
 
+/// Along the chain, where only the head's table placed its chunks, a value
+/// whose chunks do not read is refused and the walk searches on from the
+/// head for the next frame: a damaged chunk, and a row naming a stored length
+/// a chunk of an uncompressed file cannot have, each cost the value alone,
+/// and what the search finds is tainted.
+#[test]
+fn along_the_chain_a_value_whose_chunks_do_not_read_is_searched_past() -> crate::Result<()> {
+    let damaged_chunk = |path: &std::path::Path| -> crate::Result<()> {
+        let index = index_of(path)?;
+        edit(path, |bytes| bytes[index[2] - 1] ^= 0x40)
+    };
+    let short_row = |path: &std::path::Path| -> crate::Result<()> {
+        let index = index_of(path)?;
+        edit(path, |bytes| {
+            let head = &mut bytes[index[0]..index[1]];
+            let entries_len = parse_header(head).expect("a head").entries_len as usize;
+            // The first row's stored length, after the chunk size and count.
+            let row = FRAME_HEADER_LEN + entries_len + 8;
+            head[row..row + 4].copy_from_slice(&299_u32.to_le_bytes());
+            crate::vlog::blob_file::frame::reseal(head);
+        })
+    };
+    type Damage<'a> = &'a dyn Fn(&std::path::Path) -> crate::Result<()>;
+    let cases: [(&str, Damage<'_>); 2] = [
+        ("a damaged chunk", &damaged_chunk),
+        ("a row it cannot hold", &short_row),
+    ];
+    for (case, damage) in cases {
+        let dir = tempdir()?;
+        let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
+        damage(&path)?;
+        break_index(&path)?;
+        let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+        assert!(results[0].is_err(), "{case}: {:?}", results[0]);
+        let next = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .next_back()
+            .unwrap_or_else(|| panic!("{case}: the value after it"));
+        assert_eq!(next.key, Slice::from(&b"next"[..]), "{case}");
+        assert!(next.resynced, "{case}: found by search");
+    }
+    Ok(())
+}
+
 /// A head lost to damage leaves its chunks behind it: by the index, each is
 /// reached and refused as a chunk without its head, and the walk goes on to
 /// the value after them.
