@@ -8653,6 +8653,56 @@ fn an_environmental_read_failure_never_becomes_a_lossy_blob_salvage() -> crate::
     Ok(())
 }
 
+/// A salvage that fails to open its source leaves no destination behind,
+/// whichever open of the source fails: a retry into the same destination
+/// would otherwise refuse to create it.
+#[test]
+fn a_failed_source_open_leaves_no_salvage_destination() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let mut failed = 0;
+    for skip in 0..16u64 {
+        let dir = tempdir()?;
+        let source = dir.path().join("src_blob");
+        let dest = dir.path().join("dst_blob");
+        let plain: Arc<dyn Fs> = Arc::new(StdFs);
+        build_blob(
+            &source,
+            &plain,
+            &[(b"aaaa", b"AAAAAAAA"), (b"bbbb", b"BBBBBBBB")],
+        )?;
+
+        let fault = FaultFs::new(StdFs);
+        fault.injector().arm(
+            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path("src_blob")
+                .skip(skip)
+                .times(1),
+        );
+        let fs: Arc<dyn Fs> = Arc::new(fault);
+        let result = salvage_blob_file(
+            &source,
+            dest.clone(),
+            &fs,
+            0,
+            &default_comparator(),
+            0,
+            #[cfg(zstd_any)]
+            None,
+        );
+        if result.is_err() {
+            failed += 1;
+            assert!(
+                !dest.exists(),
+                "a failed open of the source left the destination behind (skip {skip})",
+            );
+        }
+    }
+    assert!(failed > 0, "no skip count failed an open of the source");
+    Ok(())
+}
+
 /// Scans a blob file, which compresses nothing, into its `(key, value)`
 /// records (Ok records only).
 fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {

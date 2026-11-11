@@ -3263,6 +3263,11 @@ pub(crate) fn salvage_blob_file_on(
         },
         (live_data_start > 0).then_some(live_data_start),
     )?;
+    // Whether the source stores its dictionary, read before the destination
+    // exists: a failed read must leave nothing behind for a retry to trip on.
+    #[cfg(zstd_any)]
+    let own_dictionary =
+        crate::vlog::read_blob_file_dictionary(source, &**fs, &source_meta)?.is_some();
     // Destination ownership is decided by the writer's `create_new` open, and
     // the CONSTRUCTOR owns cleanup of any partial file it created: on a
     // constructor error this call created nothing (or the constructor already
@@ -3295,10 +3300,9 @@ pub(crate) fn salvage_blob_file_on(
         // dictionary descriptor needs the dictionary on the write side too,
         // stored in the file when the source stored it, as no tree's set holds
         // a file's own.
-        let own = crate::vlog::read_blob_file_dictionary(source, &**fs, &source_meta)?.is_some();
         writer = writer
             .use_zstd_dictionary(zstd_dictionary.cloned())
-            .keep_dictionary_in_file(own);
+            .keep_dictionary_in_file(own_dictionary);
     }
 
     let mut records_total = 0usize;
