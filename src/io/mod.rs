@@ -1485,20 +1485,43 @@ impl<R: Read + Seek> Seek for BufReader<R> {
     }
 }
 
+/// The result the [`BufWriter`] trait impls return: std's under `std`,
+/// this module's otherwise.
 #[cfg(feature = "std")]
-pub use std::io::BufWriter;
-
-/// Buffering writer, mirroring the subset of [`std::io::BufWriter`] the
-/// storage layer uses, for `no_std` builds. Coalesces small writes into one
-/// `capacity`-sized buffer and flushes it to the inner writer on overflow,
-/// explicit [`flush`](Write::flush), [`seek`](Seek::seek), or drop.
+type BufResult<T> = std::io::Result<T>;
 #[cfg(not(feature = "std"))]
+type BufResult<T> = Result<T>;
+
+/// Buffering writer that hands its inner writer whole buffers.
+///
+/// It covers the subset of [`std::io::BufWriter`] the storage layer uses.
+/// Unlike std's, a write that overflows the buffer first fills it: a stream
+/// of frames a
+/// little over a fraction of the buffer would otherwise go down cut where
+/// the next frame stopped fitting, one inner write per few frames. The
+/// buffer reaches the inner writer on overflow, an explicit flush, a seek,
+/// or drop.
 pub struct BufWriter<W: Write> {
     inner: W,
     buf: alloc::vec::Vec<u8>,
+    /// Whether an inner write is under way: one that panicked leaves it
+    /// set, and the drop then calls that writer no more.
+    panicked: bool,
 }
 
-#[cfg(not(feature = "std"))]
+/// What a flush has written of `buf`, which leaves it whether the flush
+/// returns or unwinds.
+struct Written<'a> {
+    buf: &'a mut alloc::vec::Vec<u8>,
+    written: usize,
+}
+
+impl Drop for Written<'_> {
+    fn drop(&mut self) {
+        self.buf.drain(..self.written);
+    }
+}
+
 impl<W: Write> BufWriter<W> {
     /// Wraps `inner` with the default 8 KiB buffer.
     pub fn new(inner: W) -> Self {
@@ -1510,6 +1533,7 @@ impl<W: Write> BufWriter<W> {
         Self {
             inner,
             buf: alloc::vec::Vec::with_capacity(capacity),
+            panicked: false,
         }
     }
 
@@ -1524,35 +1548,132 @@ impl<W: Write> BufWriter<W> {
         &self.inner
     }
 
-    fn flush_buf(&mut self) -> Result<()> {
-        if !self.buf.is_empty() {
-            self.inner.write_all(&self.buf)?;
-            self.buf.clear();
+    /// Hands the buffer down. What the inner writer took leaves the buffer
+    /// even when a later write of the flush fails or panics, so a retry does
+    /// not put it down again.
+    fn flush_buf(&mut self) -> BufResult<()> {
+        let mut done = Written {
+            buf: &mut self.buf,
+            written: 0,
+        };
+        loop {
+            let Some(rest) = done.buf.get(done.written..).filter(|rest| !rest.is_empty()) else {
+                return Ok(());
+            };
+            self.panicked = true;
+            let result = self.inner.write(rest);
+            self.panicked = false;
+            match result {
+                Ok(0) => return Err(write_zero()),
+                Ok(n) => done.written += n,
+                Err(e) if interrupted(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
-        Ok(())
+    }
+
+    /// Hands `data` to the inner writer, marking the write under way.
+    fn write_through(&mut self, data: &[u8]) -> BufResult<usize> {
+        self.panicked = true;
+        let result = self.inner.write(data);
+        self.panicked = false;
+        result
+    }
+
+    /// Takes a prefix of `data`, all of it unless it overflows the buffer.
+    fn put(&mut self, data: &[u8]) -> BufResult<usize> {
+        // A buffer left exactly full by the last write has no room to take
+        // a byte of this one.
+        if self.buf.len() == self.buf.capacity() && !data.is_empty() {
+            self.flush_buf()?;
+        }
+        let room = self.buf.capacity() - self.buf.len();
+        if data.len() <= room {
+            self.buf.extend_from_slice(data);
+            return Ok(data.len());
+        }
+        // A write at least as large as the whole buffer goes down as it is,
+        // after what is buffered: passing it through the buffer would add a
+        // copy and save no inner write.
+        if data.len() >= self.buf.capacity() {
+            self.flush_buf()?;
+            return self.write_through(data);
+        }
+        // Otherwise the buffer goes down full and the caller retries the rest.
+        self.buf
+            .extend_from_slice(data.get(..room).unwrap_or_default());
+        if let Err(e) = self.flush_buf() {
+            // The flush took a prefix of the buffer. Short of the bytes held
+            // before, nothing of `data` went down and it leaves the buffer;
+            // past them, all of `room` is taken, written or still buffered,
+            // and the error comes back on the next flush.
+            let left = self.buf.len();
+            if left >= room {
+                self.buf.truncate(left - room);
+                return Err(e);
+            }
+        }
+        Ok(room)
+    }
+}
+
+/// The error a write that takes nothing ends a flush with.
+#[cfg(feature = "std")]
+fn write_zero() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "failed to write whole buffer",
+    )
+}
+
+/// [`write_zero`] without `std`.
+#[cfg(not(feature = "std"))]
+fn write_zero() -> Error {
+    Error::new(ErrorKind::WriteZero, "failed to write whole buffer")
+}
+
+/// Whether `e` asks for the write to be tried again.
+#[cfg(feature = "std")]
+fn interrupted(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Interrupted
+}
+
+/// [`interrupted`] without `std`.
+#[cfg(not(feature = "std"))]
+fn interrupted(e: &Error) -> bool {
+    e.kind() == ErrorKind::Interrupted
+}
+
+#[cfg(feature = "std")]
+impl<W: Write> std::io::Write for BufWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.put(data)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_buf()?;
+        self.inner.flush()
     }
 }
 
 #[cfg(not(feature = "std"))]
 impl<W: Write> Write for BufWriter<W> {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
-        // Flush first if this write wouldn't fit alongside what's buffered.
-        if self.buf.len() + data.len() > self.buf.capacity() {
-            self.flush_buf()?;
-        }
-        // A write at least as large as the whole buffer bypasses it entirely
-        // (buffering it would just add a copy), matching std::io::BufWriter.
-        if data.len() >= self.buf.capacity() {
-            self.inner.write(data)
-        } else {
-            self.buf.extend_from_slice(data);
-            Ok(data.len())
-        }
+        self.put(data)
     }
 
     fn flush(&mut self) -> Result<()> {
         self.flush_buf()?;
         self.inner.flush()
+    }
+}
+
+#[cfg(feature = "std")]
+impl<W: Write + Seek> std::io::Seek for BufWriter<W> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        // Buffered bytes belong before the seek target.
+        self.flush_buf()?;
+        self.inner.seek(pos)
     }
 }
 
@@ -1566,12 +1687,14 @@ impl<W: Write + Seek> Seek for BufWriter<W> {
     }
 }
 
-#[cfg(not(feature = "std"))]
 impl<W: Write> Drop for BufWriter<W> {
     fn drop(&mut self) {
         // Best-effort flush, like std: a drop can't surface an error, and the
-        // storage writer always flushes explicitly before teardown anyway.
-        let _ = self.flush_buf();
+        // storage writer always flushes explicitly before teardown anyway. A
+        // writer whose write panicked is not called again.
+        if !self.panicked {
+            let _ = self.flush_buf();
+        }
     }
 }
 

@@ -23,13 +23,15 @@ use core::iter::Peekable;
 /// `record_consumed` is invoked with `(blob_file_id, frame_end)` for every
 /// drained entry so the tight-space relocation loop can advance its per-file
 /// punch / resume frontier past the bytes this drain reclaimed. The non-tight
-/// path passes a no-op.
+/// path passes a no-op. `seen` is told of every drained entry, the
+/// resynchronized ones included.
 fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
     scanner: &mut Peekable<I>,
     key: &[u8],
     vptr: &BlobIndirection,
     comparator: &dyn crate::comparator::UserComparator,
     record_consumed: &mut dyn FnMut(BlobFileId, u64),
+    seen: &mut dyn FnMut(BlobFileId, &ScanEntry),
 ) -> crate::Result<()> {
     loop {
         let Some(blob) = scanner.next_if(|x| match x {
@@ -59,6 +61,7 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
         if !entry.resynced {
             record_consumed(blob_file_id, entry.frame_end);
         }
+        seen(blob_file_id, &entry);
     }
 
     Ok(())
@@ -68,12 +71,14 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
 /// through `record_consumed` as `drain_blobs` does; a resynchronized frame is
 /// consumed without moving the frontier. `is_stopped` is polled before every
 /// frame: the drain can cover a whole dead prefix after the merge loop's last
-/// cancellation check, so a stop must not wait for it.
+/// cancellation check, so a stop must not wait for it. `seen` is told of every
+/// drained entry.
 fn drain_unclaimed_below<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
     scanner: &mut Peekable<I>,
     bound: &[u8],
     comparator: &dyn crate::comparator::UserComparator,
     record_consumed: &mut dyn FnMut(BlobFileId, u64),
+    seen: &mut dyn FnMut(BlobFileId, &ScanEntry),
     is_stopped: &dyn Fn() -> bool,
 ) -> crate::Result<()> {
     loop {
@@ -90,6 +95,7 @@ fn drain_unclaimed_below<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId
         if !entry.resynced {
             record_consumed(blob_file_id, entry.frame_end);
         }
+        seen(blob_file_id, &entry);
     }
 }
 
@@ -1006,13 +1012,11 @@ pub(super) fn install_merge(
             // count, and a file is dead only when its entry reaches every
             // total, so an entry is made for them too.
             if len > 0 || bytes > 0 || on_disk > 0 || block > 0 {
-                let mut fill = FragmentationMap::default();
-                fill.insert(
+                blob_frag_map.add(
                     id,
                     crate::blob_tree::FragmentationEntry::new(len, bytes, on_disk)
                         .with_block_bytes(block),
                 );
-                fill.merge_into(&mut blob_frag_map);
             }
         }
     }
@@ -1153,12 +1157,13 @@ pub(crate) struct RelocatingCompaction {
     inner: StandardCompaction,
     blob_scanner: Peekable<BlobFileMergeScanner>,
     blob_writer: BlobFileWriter,
-    /// Codec of each file being rewritten, by id, and the lifetime class its
-    /// relocated values go to. Relocation copies frames VERBATIM, so the
-    /// output file must record the codec of the SOURCE those frames came from;
-    /// the current blob policy describes what would be written fresh, which is
-    /// a different question and need not agree.
-    rewriting_blob_file_outputs: crate::HashMap<BlobFileId, (crate::CompressionType, u8)>,
+    /// Codec of each file being rewritten, by id, the lifetime class its
+    /// relocated values go to, and where it lies in `rewriting_blob_files`.
+    /// Relocation copies frames VERBATIM, so the output file must record the
+    /// codec of the SOURCE those frames came from, and hold the dictionary of
+    /// its own the source holds; the current blob policy describes what would
+    /// be written fresh, which is a different question and need not agree.
+    rewriting_blob_file_outputs: crate::HashMap<BlobFileId, (crate::CompressionType, u8, usize)>,
     rewriting_blob_files: Vec<BlobFile>,
     /// Paces relocated-blob I/O. The merge loop's limiter only sees the
     /// encoded handle in `item.value`; the real payload moved here is
@@ -1209,6 +1214,241 @@ pub(crate) struct RelocatingCompaction {
     fresh: Option<FreshValues>,
     /// Holds a pointer while it is encoded, so a pass allocates this once.
     encoded: Vec<u8>,
+    /// The live share of a block, by its entries' bytes, at or above which
+    /// the block is copied whole as it was stored, its dead values with it;
+    /// below it, its live values are written into new blocks. `None` copies
+    /// no block whole.
+    block_copy_share: Option<f64>,
+    /// The blocks of the rewritten files met so far whose values are not all
+    /// seen yet, by file and frame.
+    blocks: crate::HashMap<(BlobFileId, u32), BlockTally>,
+    /// How each block a pointer of this pass names is relocated, once its
+    /// values are all seen.
+    fates: crate::HashMap<(BlobFileId, u32), BlockFate>,
+    /// The rows from the first pointer into a block not tallied yet on, in
+    /// stream order: the table takes rows in key order, so a row waits for
+    /// every row before it.
+    held: alloc::collections::VecDeque<Held>,
+    /// The bytes `held` holds, bounded by [`HELD_BYTES_MAX`].
+    held_bytes: usize,
+    /// The blocks given up at that bound: their values are written anew, and
+    /// the rest of them is not tallied again.
+    abandoned: HashSet<(BlobFileId, u32)>,
+    /// The dead values the blocks copied whole carry into the new files.
+    carried_garbage: FragmentationMap,
+}
+
+/// What a relocation has seen of one block of a rewritten file.
+struct BlockTally {
+    /// The block as stored, for a copy.
+    stored: crate::Slice,
+    /// The key of its first value, which the scan reaches first.
+    first_key: crate::UserKey,
+    /// How many values the block holds, how many were seen, and their
+    /// decoded bytes so far.
+    values: u16,
+    seen: u16,
+    value_bytes: u64,
+    /// The entry bytes of the values a pointer claimed, and how many.
+    live: u64,
+    claimed: u16,
+    /// The values no pointer claimed: how many, their bytes and their entry
+    /// bytes.
+    dead: (usize, u64, u64),
+    /// A value was reached by a resynchronized scan.
+    resynced: bool,
+    /// A claimed value is listed at another seqno than its table row's (an
+    /// ingested one): a copy as stored would keep the wrong listing.
+    relisted: bool,
+}
+
+/// How a value the scan reached counts in its block's tally.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// No pointer claimed it.
+    Dead,
+    /// A pointer claimed it, listed at the seqno its frame lists.
+    Live,
+    /// A pointer claimed it, listed at another seqno than its frame lists.
+    Relisted,
+}
+
+/// How a relocation moves the values of a block it copies whole; a block
+/// with no fate has its live values written into new blocks. Each kind counts
+/// the claimed values still to place, and the fate is dropped with the last
+/// of them, so a pass holds the blocks of its scan window, not of all it
+/// copied.
+enum BlockFate {
+    /// The block is to be copied as it was stored, once; its dead values go
+    /// with it.
+    Whole { block: WholeBlock, pending: u16 },
+    /// The block was copied whole into the frame `at` names: the values
+    /// still to place point there, and the stored bytes are let go.
+    Copied { at: (BlobFileId, u32), pending: u16 },
+}
+
+/// At most the bytes of the rows a relocation holds back while the blocks
+/// they wait for are tallied. A block's last value arrives within a few rows
+/// of its first unless the block spans keys a denser input fills, such as a
+/// block of a sparse flush merged into a full level: past this much, the
+/// blocks still tallied are given up and their values written anew, which
+/// costs only the copy as stored, not the rows' memory.
+const HELD_BYTES_MAX: usize = 8 * 1024 * 1024;
+
+/// A block a relocation copies whole, and what the scan counted of it: what
+/// the copy adds to the new file, so the block is not read again for it.
+struct WholeBlock {
+    stored: crate::Slice,
+    first_key: crate::UserKey,
+    last_key: crate::UserKey,
+    values: u16,
+    value_bytes: u64,
+    entry_bytes: u64,
+    /// Its values no pointer claimed: how many, their bytes and their entry
+    /// bytes.
+    dead: (usize, u64, u64),
+}
+
+/// A row a relocation holds back.
+enum Held {
+    /// A row this pass writes as it came.
+    Row(InternalValue),
+    /// A pointer into a rewritten file, its value claimed from the scan.
+    Pointer {
+        item: InternalValue,
+        indirection: BlobIndirection,
+        claimed: Claimed,
+    },
+}
+
+/// Blocks a relocation gave up because the rows held for them passed the
+/// bound, counted for the tests that reach that branch.
+#[cfg(test)]
+pub(crate) static BLOCKS_GIVEN_UP: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// The bytes `held` keeps in memory: its row's key and value, and for a
+/// pointer the value it claimed.
+fn held_len(held: &Held) -> usize {
+    match held {
+        Held::Row(item) => item.key.user_key.len() + item.value.len(),
+        Held::Pointer { item, claimed, .. } => {
+            item.key.user_key.len() + item.value.len() + claimed.uncompressed_len as usize
+        }
+    }
+}
+
+/// What a relocation keeps of a value it claimed from the scan to place it.
+struct Claimed {
+    blob_file_id: BlobFileId,
+    frame: u32,
+    index: u16,
+    /// The seqno its frame lists the value at.
+    seqno: crate::SeqNo,
+    /// The value decoded, for a value written anew; `None` for a value with
+    /// frames of its own, copied as stored.
+    value: Option<crate::UserValue>,
+    uncompressed_len: u32,
+    /// The value's frames as stored, for a value with frames of its own.
+    frames: Option<Vec<crate::Slice>>,
+    /// The value shares a block.
+    in_block: bool,
+}
+
+impl Claimed {
+    fn of(entry: ScanEntry, blob_file_id: BlobFileId) -> Self {
+        Self {
+            blob_file_id,
+            frame: entry.frame,
+            index: entry.index,
+            seqno: entry.seqno,
+            value: entry.value,
+            uncompressed_len: entry.uncompressed_len,
+            frames: entry.frames,
+            in_block: entry.block.is_some(),
+        }
+    }
+}
+
+/// Counts `entry`, a value of `blob_file_id` the scan reached, claimed by a
+/// pointer or not, into its block's tally, and settles the block's fate in
+/// `fates` once its last value is counted. A value outside a block, or a pass
+/// that copies no block whole, counts nothing.
+fn tally_block(
+    blocks: &mut crate::HashMap<(BlobFileId, u32), BlockTally>,
+    fates: &mut crate::HashMap<(BlobFileId, u32), BlockFate>,
+    abandoned: &HashSet<(BlobFileId, u32)>,
+    share: Option<f64>,
+    blob_file_id: BlobFileId,
+    entry: &ScanEntry,
+    claim: Claim,
+) {
+    let (Some(share), Some(block)) = (share, &entry.block) else {
+        return;
+    };
+    let at = (blob_file_id, entry.frame);
+    if abandoned.contains(&at) {
+        return;
+    }
+    let tally = blocks.entry(at).or_insert_with(|| BlockTally {
+        stored: block.stored.clone(),
+        first_key: entry.key.clone(),
+        values: block.values,
+        seen: 0,
+        value_bytes: 0,
+        live: 0,
+        claimed: 0,
+        dead: (0, 0, 0),
+        resynced: false,
+        relisted: false,
+    });
+    let bytes = block.entry_bytes;
+    tally.seen += 1;
+    tally.value_bytes += u64::from(entry.uncompressed_len);
+    tally.resynced |= entry.resynced;
+    tally.relisted |= claim == Claim::Relisted;
+    if claim == Claim::Dead {
+        tally.dead.0 += 1;
+        tally.dead.1 += u64::from(entry.uncompressed_len);
+        tally.dead.2 += bytes;
+    } else {
+        tally.live += bytes;
+        tally.claimed += 1;
+    }
+    if tally.seen < tally.values {
+        return;
+    }
+    let Some(tally) = blocks.remove(&at) else {
+        return;
+    };
+    // A block no pointer claimed has nothing to move.
+    if tally.live == 0 {
+        return;
+    }
+    // Entry bytes stay far below 2^53, where an f64 holds every integer.
+    #[expect(clippy::cast_precision_loss, reason = "exact below 2^53")]
+    let whole = !tally.resynced
+        && !tally.relisted
+        && tally.live as f64 >= share * (tally.live + tally.dead.2) as f64;
+    // A block below the share gets no fate: its values are written anew.
+    if whole {
+        fates.insert(
+            at,
+            BlockFate::Whole {
+                block: WholeBlock {
+                    stored: tally.stored,
+                    first_key: tally.first_key,
+                    // The value counted last is the block's last.
+                    last_key: entry.key.clone(),
+                    values: tally.values,
+                    value_bytes: tally.value_bytes,
+                    entry_bytes: tally.live + tally.dead.2,
+                    dead: tally.dead,
+                },
+                pending: tally.claimed,
+            },
+        );
+    }
 }
 
 /// What a relocating pass separates new values under: the tree's separation
@@ -1240,10 +1480,11 @@ impl RelocatingCompaction {
             blob_writer,
             rewriting_blob_file_outputs: rewriting_blob_files
                 .iter()
-                .map(|bf| {
+                .enumerate()
+                .map(|(at, bf)| {
                     (
                         bf.id(),
-                        (bf.compression(), groups.relocated(bf.lifetime_class())),
+                        (bf.compression(), groups.relocated(bf.lifetime_class()), at),
                     )
                 })
                 .collect(),
@@ -1261,7 +1502,23 @@ impl RelocatingCompaction {
             frames_read: 0,
             fresh: None,
             encoded: Vec::new(),
+            block_copy_share: None,
+            blocks: crate::HashMap::default(),
+            fates: crate::HashMap::default(),
+            held: alloc::collections::VecDeque::new(),
+            held_bytes: 0,
+            abandoned: HashSet::default(),
+            carried_garbage: FragmentationMap::default(),
         }
+    }
+
+    /// Copies a block whole, its dead values with it, while the live share of
+    /// its entry bytes is at least `share`; below it, or with no share, writes
+    /// its live values into new blocks.
+    #[must_use]
+    pub(crate) fn with_block_copy_share(mut self, share: Option<f32>) -> Self {
+        self.block_copy_share = share.map(f64::from);
+        self
     }
 
     /// Writes the table row of `key` at `seqno` pointing at `indirection`.
@@ -1413,13 +1670,18 @@ impl RelocatingCompaction {
             .rate_limiter
             .request_interruptible(read, || self.stop_signal.is_stopped());
 
-        self.blob_writer.select_output(
-            blob_file.compression(),
-            self.blob_writer
-                .lifetime_groups()
-                .relocated(blob_file.lifetime_class()),
-        )?;
+        // A file's own dictionary goes with its frames into the file that
+        // copies them, which holds it as its own.
+        let class = self
+            .blob_writer
+            .lifetime_groups()
+            .relocated(blob_file.lifetime_class());
+        let verbatim = self.blob_writer.select_copy_output(blob_file, class)?;
         let copy = match &source {
+            crate::vlog::blob_file::reader::CopySource::Frames { frames, .. } if !verbatim => {
+                let value = crate::vlog::blob_file::reader::decode_copied(blob_file, frames)?;
+                self.blob_writer.write(key, seqno, &value)?
+            }
             crate::vlog::blob_file::reader::CopySource::Frames { frames, value_len } => {
                 // A row's objects may have been written at older sequence
                 // numbers than the row (one it borrows), and its copies follow
@@ -1465,6 +1727,10 @@ impl RelocatingCompaction {
             consumed_through,
             comparator,
             stop_signal,
+            blocks,
+            fates,
+            abandoned,
+            block_copy_share,
             ..
         } = self;
         drain_unclaimed_below(
@@ -1475,8 +1741,394 @@ impl RelocatingCompaction {
                 let slot = consumed_through.entry(id).or_insert(0);
                 *slot = (*slot).max(frame_end);
             },
+            &mut |id, entry| {
+                tally_block(
+                    blocks,
+                    fates,
+                    abandoned,
+                    *block_copy_share,
+                    id,
+                    entry,
+                    Claim::Dead,
+                );
+            },
             &|| stop_signal.is_stopped(),
         )
+    }
+
+    /// Claims the value `indirection` names for the pointer of `key` at
+    /// `seqno` from the scan of the rewritten files, the values before it
+    /// drained as no pointer's, and advances the frontier past it.
+    fn claim(
+        &mut self,
+        key: &crate::UserKey,
+        seqno: crate::SeqNo,
+        indirection: &BlobIndirection,
+    ) -> crate::Result<Claimed> {
+        self.drain_blobs(key, indirection)?;
+
+        #[expect(clippy::expect_used, reason = "vptr is expected to match with blob")]
+        let (blob_entry, blob_file_id) = self
+            .blob_scanner
+            .next()
+            .expect("vptr was not matched with blob (scanner is unexpectedly exhausted)")?;
+
+        assert_eq!(
+            blob_file_id, indirection.vhandle.blob_file_id,
+            "matched blob has different blob file ID than vptr",
+        );
+        assert_eq!(
+            blob_entry.key, *key,
+            "matched blob has different key than vptr",
+        );
+        assert_eq!(
+            (blob_entry.frame, blob_entry.index),
+            (indirection.vhandle.frame, indirection.vhandle.index),
+            "matched blob lies elsewhere than vptr names",
+        );
+
+        // A RESYNCHRONIZED frame was reached by a byte-wise scan after
+        // damage: its boundary is unproven (the magic may sit inside a
+        // damaged record's user-controlled bytes, and every frame chained
+        // past it inherits that unanchored start). Relocating it would
+        // rewrite fabricated bytes as a genuine record. `salvage_blob_file`
+        // drops such frames; relocation must fail closed the same way.
+        if blob_entry.resynced {
+            return Err(crate::Error::InvalidHeader(
+                "resynchronized blob frame reached after damage; refusing to \
+                 relocate a record whose boundary cannot be proven original",
+            ));
+        }
+
+        // Advance the consumed frontier past this relocated frame so the
+        // tight-space loop can punch / resume here once the slice installs.
+        self.record_consumed(blob_file_id, blob_entry.frame_end);
+        // An ingestion lists its values before its table is given a seqno: a
+        // block holding one is relisted value by value, never copied whole.
+        let claim = if blob_entry.seqno == seqno {
+            Claim::Live
+        } else {
+            Claim::Relisted
+        };
+        tally_block(
+            &mut self.blocks,
+            &mut self.fates,
+            &self.abandoned,
+            self.block_copy_share,
+            blob_file_id,
+            &blob_entry,
+            claim,
+        );
+        Ok(Claimed::of(blob_entry, blob_file_id))
+    }
+
+    /// Writes the pointer of `item`, whose value `claimed` this pass claimed,
+    /// at the value's new place: its frames copied as they lay, its block
+    /// copied whole when the block's fate says so, or the value written anew
+    /// into a block.
+    fn place(
+        &mut self,
+        item: InternalValue,
+        indirection: &BlobIndirection,
+        claimed: &Claimed,
+    ) -> crate::Result<()> {
+        let blob_file_id = claimed.blob_file_id;
+        log::trace!(
+            "=> use blob: {:?}:{} frame: {} index: {} from BF {}",
+            item.key.user_key,
+            item.key.seqno,
+            claimed.frame,
+            claimed.index,
+            blob_file_id,
+        );
+
+        // These bytes are the SOURCE's, still encoded as it left them. They go
+        // to the output file that records that codec, one per codec for the
+        // whole pass: a blob file describes one codec, and a relocation can
+        // draw from sources that do not share one (the blob policy may have
+        // changed since they were written). Stamping the current policy
+        // instead would label these frames with a codec they are not in, and
+        // the next read of them would fail to decode.
+        #[expect(
+            clippy::expect_used,
+            reason = "the id came from `rewriting_blob_file_outputs`'s own key set"
+        )]
+        let (_, class, source_at) = *self
+            .rewriting_blob_file_outputs
+            .get(&blob_file_id)
+            .expect("relocated frame comes from a file being rewritten");
+
+        let block_at = (blob_file_id, claimed.frame);
+        let whole = if claimed.in_block {
+            self.place_in_block(&item.key.user_key, block_at, (class, source_at))?
+        } else {
+            None
+        };
+        let new_indirection = if let Some((file, frame)) = whole {
+            // The value keeps its place in the block, and its entry the bytes
+            // it is charged.
+            BlobIndirection {
+                vhandle: crate::vlog::ValueHandle {
+                    blob_file_id: file,
+                    frame,
+                    index: claimed.index,
+                },
+                size: indirection.size,
+                stored: indirection.stored,
+            }
+        } else {
+            // Throttle the relocated blob payload — this is the heavy
+            // KV-separation I/O the merge-loop limiter cannot see (it only has
+            // the encoded handle). Interruptible so a low limit can't stall
+            // shutdown; the return is ignored because the blob is already read
+            // and must be written to keep the new vptr valid — only the *wait*
+            // is shortened on stop, and the debit stays spent for the write
+            // that follows.
+            let _ = self
+                .rate_limiter
+                .request_interruptible(u64::from(claimed.uncompressed_len), || {
+                    self.stop_signal.is_stopped()
+                });
+            // A file's own dictionary goes with its frames into the file that
+            // copies them, which holds it as its own.
+            let Some(source) = self.rewriting_blob_files.get(source_at) else {
+                return Err(crate::Error::InvalidHeader("Blob"));
+            };
+            let verbatim = self.blob_writer.select_copy_output(source, class)?;
+            match (&claimed.frames, &claimed.value) {
+                // Past the outputs holding a source's dictionary: decoded and
+                // written anew.
+                (Some(frames), _) if !verbatim => {
+                    let value = crate::vlog::blob_file::reader::decode_copied(source, frames)?;
+                    self.blob_writer
+                        .write(&item.key.user_key, item.key.seqno, &value)?
+                }
+                (Some(frames), _) => {
+                    // A value is listed at the seqno its table gives it. An
+                    // ingestion writes its blob entries before it is given
+                    // one, so its frames are relisted as they are copied; any
+                    // other frame lists its table's already.
+                    let copy = if claimed.seqno == item.key.seqno {
+                        self.blob_writer.write_verbatim(
+                            &item.key.user_key,
+                            frames,
+                            claimed.uncompressed_len,
+                        )?
+                    } else {
+                        self.blob_writer.write_verbatim_at(
+                            &item.key.user_key,
+                            frames,
+                            claimed.uncompressed_len,
+                            item.key.seqno,
+                        )?
+                    };
+                    // A verbatim copy is frames of its own, its bytes exact.
+                    self.blob_carried += u64::from(copy.stored.bytes());
+                    copy
+                }
+                (None, Some(value)) => {
+                    self.blob_writer
+                        .write(&item.key.user_key, item.key.seqno, value)?
+                }
+                // A scan yields a value either in a block, decoded, or with
+                // frames of its own.
+                (None, None) => return Err(crate::Error::InvalidHeader("Blob")),
+            }
+        };
+        debug_assert_eq!(
+            new_indirection.size, indirection.size,
+            "relocating a value does not change it",
+        );
+        log::trace!("RELOCATE to {new_indirection:?}");
+        self.relocated_bytes += u64::from(new_indirection.stored.bytes());
+
+        self.write_pointer(item.key.user_key, item.key.seqno, &new_indirection)?;
+        self.inner.table_writer.register_blob(new_indirection);
+        Ok(())
+    }
+
+    /// Where a value of the block `block_at` goes when the block is copied
+    /// whole: the copy, made by the first of its claimed values to arrive,
+    /// into the output of `output`'s class for the source at `output`'s place
+    /// in the rewritten files. `None` when its values are written
+    /// anew, or it has no fate. Counts the value placed off the block's fate,
+    /// which goes with the last.
+    fn place_in_block(
+        &mut self,
+        key: &[u8],
+        block_at: (BlobFileId, u32),
+        output: (u8, usize),
+    ) -> crate::Result<Option<(BlobFileId, u32)>> {
+        let (placed, done) = match self.fates.get_mut(&block_at) {
+            None => return Ok(None),
+            Some(BlockFate::Copied { at, pending }) => {
+                debug_assert!(*pending > 0, "a fate counts the values still to place");
+                *pending -= 1;
+                (*at, *pending == 0)
+            }
+            Some(BlockFate::Whole { .. }) => {
+                let Some(BlockFate::Whole { block, pending }) = self.fates.remove(&block_at) else {
+                    return Ok(None);
+                };
+                // A block a key domain splits (the policy set after it was
+                // written), or of a source past the ones the writer copies
+                // blocks of, keeps no fate and has its values written anew:
+                // copied whole, its file would span two domains, or one more
+                // file would be held open for its source.
+                if !self
+                    .blob_writer
+                    .can_copy_block(block_at.0, &block.first_key, &block.last_key)
+                {
+                    return Ok(None);
+                }
+                let at = self.copy_whole(key, output, &block)?;
+                // The stored bytes go here: the values after this one need
+                // only where the copy lies.
+                if pending > 1 {
+                    self.fates.insert(
+                        block_at,
+                        BlockFate::Copied {
+                            at,
+                            pending: pending - 1,
+                        },
+                    );
+                }
+                return Ok(Some(at));
+            }
+        };
+        if done {
+            self.fates.remove(&block_at);
+        }
+        Ok(Some(placed))
+    }
+
+    /// Copies `block` whole into the output of its source, the rewritten file
+    /// at `output`'s place, under that file's codec and own dictionary and
+    /// `output`'s class, and counts its dead values as the new file's garbage.
+    fn copy_whole(
+        &mut self,
+        key: &[u8],
+        output: (u8, usize),
+        block: &WholeBlock,
+    ) -> crate::Result<(BlobFileId, u32)> {
+        let stored = &block.stored;
+        // Paced once for the block, as a whole-value copy is.
+        let _ = self
+            .rate_limiter
+            .request_interruptible(stored.len() as u64, || self.stop_signal.is_stopped());
+        let copied = crate::vlog::blob_file::writer::CopiedBlock {
+            stored,
+            first_key: &block.first_key,
+            last_key: &block.last_key,
+            values: block.values,
+            value_bytes: block.value_bytes,
+            entry_bytes: block.entry_bytes,
+        };
+        // A file's own dictionary goes with its blocks into the file that
+        // copies them, as it does with its values in `place`.
+        let Some(source) = self.rewriting_blob_files.get(output.1) else {
+            return Err(crate::Error::InvalidHeader("Blob"));
+        };
+        let at = self
+            .blob_writer
+            .copy_block(key, source, output.0, &copied)?;
+        self.blob_carried += stored.len() as u64;
+        // The block's dead values arrive dead in the new file.
+        let dead = block.dead;
+        if dead.0 > 0 {
+            self.carried_garbage.add(
+                at.0,
+                crate::blob_tree::FragmentationEntry::new(dead.0, dead.1, 0)
+                    .with_block_bytes(dead.2),
+            );
+        }
+        Ok(at)
+    }
+
+    /// Writes `item`, a row whose value this pass does not relocate.
+    fn write_row(&mut self, item: InternalValue) -> crate::Result<()> {
+        if item.key.value_type.is_cell_row() {
+            return self.write_cell_row(item);
+        }
+        if item.key.value_type.is_indirection() {
+            let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
+            // This blob is not part of the rewritten blob files, so just pass it
+            // through.
+            log::trace!("Pass through {indirection:?} because it is not being relocated");
+            self.inner.table_writer.write(item)?;
+            self.inner.table_writer.register_blob(indirection);
+        } else if let Some(fresh) = &self.fresh
+            && item.key.value_type == crate::ValueType::Value
+            && item.value.len() >= fresh.options.separation_threshold as usize
+        {
+            // A value new to the value log: the filter's or the merge
+            // operator's, or one written inline before the threshold came
+            // down to it. It goes beside the frames this pass relocates.
+            let class = fresh
+                .options
+                .lifetime_classifier()
+                .class_of(&item.key.user_key, false);
+            let compression = fresh.compression;
+            self.write_fresh(compression, class, item)?;
+        } else {
+            self.inner.table_writer.write(item)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a pointer into `frame` of `blob_file_id` waits: the frame is a
+    /// block whose values are not all seen yet.
+    fn waits_for(&self, blob_file_id: BlobFileId, frame: u32) -> bool {
+        self.blocks.contains_key(&(blob_file_id, frame))
+    }
+
+    /// Whether `held` can be written now.
+    fn is_ready(&self, held: &Held) -> bool {
+        match held {
+            Held::Row(_) => true,
+            Held::Pointer { claimed, .. } => !self.waits_for(claimed.blob_file_id, claimed.frame),
+        }
+    }
+
+    /// Writes the held rows from the front as long as they are ready.
+    fn release_ready(&mut self) -> crate::Result<()> {
+        while self.held.front().is_some_and(|held| self.is_ready(held)) {
+            let Some(held) = self.held.pop_front() else {
+                break;
+            };
+            self.held_bytes -= held_len(&held);
+            match held {
+                Held::Row(item) => self.write_row(item)?,
+                Held::Pointer {
+                    item,
+                    indirection,
+                    claimed,
+                } => self.place(item, &indirection, &claimed)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Holds `held` back behind the rows before it, and writes what is ready.
+    /// Past [`HELD_BYTES_MAX`], the blocks still tallied are given up so the
+    /// rows waiting for them go out.
+    fn hold(&mut self, held: Held) -> crate::Result<()> {
+        self.held_bytes += held_len(&held);
+        self.held.push_back(held);
+        if self.held_bytes > HELD_BYTES_MAX {
+            #[cfg(test)]
+            BLOCKS_GIVEN_UP.fetch_add(self.blocks.len(), core::sync::atomic::Ordering::Relaxed);
+            self.abandoned.extend(self.blocks.drain().map(|(at, _)| at));
+        }
+        self.release_ready()
+    }
+
+    /// Writes every held row: a block whose values were not all seen, its last
+    /// ones lying past where this pass reads, keeps no fate and has its live
+    /// values written anew, its live share unknown.
+    fn release_all(&mut self) -> crate::Result<()> {
+        self.blocks.clear();
+        self.release_ready()
     }
 
     /// Advances the per-file frontier for `blob_file_id` to the max of its
@@ -1494,6 +2146,10 @@ impl RelocatingCompaction {
             blob_scanner,
             consumed_through,
             comparator,
+            blocks,
+            fates,
+            abandoned,
+            block_copy_share,
             ..
         } = self;
         drain_blobs(
@@ -1504,6 +2160,17 @@ impl RelocatingCompaction {
             &mut |id, frame_end| {
                 let slot = consumed_through.entry(id).or_insert(0);
                 *slot = (*slot).max(frame_end);
+            },
+            &mut |id, entry| {
+                tally_block(
+                    blocks,
+                    fates,
+                    abandoned,
+                    *block_copy_share,
+                    id,
+                    entry,
+                    Claim::Dead,
+                );
             },
         )
     }
@@ -1524,185 +2191,51 @@ impl CompactionFlavour for RelocatingCompaction {
         None
     }
 
+    /// A pointer into a rewritten file claims its value from the scan as it
+    /// arrives, in stream order. A pointer into a block waits, with every row
+    /// after it, until the block's values are all seen and its fate is known:
+    /// copied whole or written value by value.
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
-        if item.key.value_type.is_cell_row() {
-            return self.write_cell_row(item);
-        }
         if item.key.value_type.is_indirection() {
-            let mut reader = &item.value[..];
-
-            let indirection = BlobIndirection::decode_from(&mut reader).inspect_err(|e| {
-                log::error!("Failed to deserialize blob indirection {item:?}: {e:?}");
-            })?;
-
+            let indirection =
+                BlobIndirection::decode_from(&mut &item.value[..]).inspect_err(|e| {
+                    log::error!("Failed to deserialize blob indirection {item:?}: {e:?}");
+                })?;
             log::trace!(
                 "{:?}:{} => encountered indirection: {indirection:?}",
                 item.key.user_key,
                 item.key.seqno,
             );
-
-            let indirection = if self
+            if self
                 .rewriting_blob_file_outputs
                 .contains_key(&indirection.vhandle.blob_file_id)
             {
-                self.drain_blobs(&item.key.user_key, &indirection)?;
-
-                #[expect(clippy::expect_used, reason = "vptr is expected to match with blob")]
-                let (blob_entry, blob_file_id) = self
-                    .blob_scanner
-                    .next()
-                    .expect("vptr was not matched with blob (scanner is unexpectedly exhausted)")?;
-
-                assert_eq!(
-                    blob_file_id, indirection.vhandle.blob_file_id,
-                    "matched blob has different blob file ID than vptr",
-                );
-                assert_eq!(
-                    blob_entry.key, item.key.user_key,
-                    "matched blob has different key than vptr",
-                );
-                assert_eq!(
-                    (blob_entry.frame, blob_entry.index),
-                    (indirection.vhandle.frame, indirection.vhandle.index),
-                    "matched blob lies elsewhere than vptr names",
-                );
-
-                // A RESYNCHRONIZED frame was reached by a byte-wise scan after
-                // damage: its boundary is unproven (the magic may sit inside a
-                // damaged record's user-controlled bytes, and every frame chained
-                // past it inherits that unanchored start). Relocating it would
-                // rewrite fabricated bytes as a genuine record. `salvage_blob_file`
-                // drops such frames; relocation must fail closed the same way.
-                if blob_entry.resynced {
-                    return Err(crate::Error::InvalidHeader(
-                        "resynchronized blob frame reached after damage; refusing to \
-                         relocate a record whose boundary cannot be proven original",
-                    ));
+                let claimed = self.claim(&item.key.user_key, item.key.seqno, &indirection)?;
+                if self.held.is_empty() && !self.waits_for(claimed.blob_file_id, claimed.frame) {
+                    return self.place(item, &indirection, &claimed);
                 }
-
-                // Advance the consumed frontier past this relocated frame so the
-                // tight-space loop can punch / resume here once the slice installs.
-                self.record_consumed(blob_file_id, blob_entry.frame_end);
-
-                log::trace!(
-                    "=> use blob: {:?}:{} frame: {} index: {} from BF {}",
-                    blob_entry.key,
-                    blob_entry.seqno,
-                    blob_entry.frame,
-                    blob_entry.index,
-                    blob_file_id,
-                );
-
-                log::trace!("RELOCATE to {indirection:?}");
-
-                // Throttle the relocated blob payload — this is the heavy
-                // KV-separation I/O the merge-loop limiter cannot see (it
-                // only has the encoded handle). Interruptible so a low
-                // limit can't stall shutdown; the return is ignored because
-                // the blob is already read and must be written to keep the
-                // new vptr valid — only the *wait* is shortened on stop, and
-                // the debit stays spent for the write that follows.
-                let _ = self
-                    .rate_limiter
-                    .request_interruptible(u64::from(blob_entry.uncompressed_len), || {
-                        self.stop_signal.is_stopped()
-                    });
-
-                // These bytes are the SOURCE's, still encoded as it left them.
-                // They go to the output file that records that codec, one per
-                // codec for the whole pass: a blob file describes one codec, and
-                // a relocation can draw from sources that do not share one (the
-                // blob policy may have changed since they were written).
-                // Stamping the current policy instead would label these frames
-                // with a codec they are not in, and the next read of them would
-                // fail to decode.
-                #[expect(
-                    clippy::expect_used,
-                    reason = "the id came from `rewriting_blob_file_outputs`'s own key set"
-                )]
-                let (source_codec, class) = *self
-                    .rewriting_blob_file_outputs
-                    .get(&blob_file_id)
-                    .expect("relocated frame comes from a file being rewritten");
-                self.blob_writer.select_output(source_codec, class)?;
-
-                let new_indirection = match (&blob_entry.frames, &blob_entry.value) {
-                    (Some(frames), _) => {
-                        // A value is listed at the seqno its table gives it.
-                        // An ingestion writes its blob entries before it is
-                        // given one, so its frames are relisted as they are
-                        // copied; any other frame lists its table's already.
-                        let copy = if blob_entry.seqno == item.key.seqno {
-                            self.blob_writer.write_verbatim(
-                                &item.key.user_key,
-                                frames,
-                                blob_entry.uncompressed_len,
-                            )?
-                        } else {
-                            self.blob_writer.write_verbatim_at(
-                                &item.key.user_key,
-                                frames,
-                                blob_entry.uncompressed_len,
-                                item.key.seqno,
-                            )?
-                        };
-                        // A verbatim copy is frames of its own, its bytes
-                        // exact.
-                        self.blob_carried += u64::from(copy.stored.bytes());
-                        copy
-                    }
-                    (None, Some(value)) => {
-                        self.blob_writer
-                            .write(&item.key.user_key, item.key.seqno, value)?
-                    }
-                    // A scan yields a value either in a block, decoded, or
-                    // with frames of its own.
-                    (None, None) => return Err(crate::Error::InvalidHeader("Blob")),
-                };
-                debug_assert_eq!(
-                    new_indirection.size, indirection.size,
-                    "relocating a value does not change it",
-                );
-                self.relocated_bytes += u64::from(new_indirection.stored.bytes());
-
-                self.write_pointer(item.key.user_key, item.key.seqno, &new_indirection)?;
-
-                new_indirection
-            } else {
-                // This blob is not part of the rewritten blob files
-                // So just pass it through
-                log::trace!("Pass through {indirection:?} because it is not being relocated");
-                self.inner.table_writer.write(item)?;
-
-                indirection
-            };
-
-            self.inner.table_writer.register_blob(indirection);
-        } else if let Some(fresh) = &self.fresh
-            && item.key.value_type == crate::ValueType::Value
-            && item.value.len() >= fresh.options.separation_threshold as usize
-        {
-            // A value new to the value log: the filter's or the merge
-            // operator's, or one written inline before the threshold came
-            // down to it. It goes beside the frames this pass relocates.
-            let class = fresh
-                .options
-                .lifetime_classifier()
-                .class_of(&item.key.user_key, false);
-            let compression = fresh.compression;
-            self.write_fresh(compression, class, item)?;
-        } else {
-            self.inner.table_writer.write(item)?;
+                return self.hold(Held::Pointer {
+                    item,
+                    indirection,
+                    claimed,
+                });
+            }
         }
-
-        Ok(())
+        if self.held.is_empty() {
+            return self.write_row(item);
+        }
+        // The stream is past every key below this one, so the values of those
+        // keys no pointer claimed never will be: drained, they complete the
+        // tallies of the blocks a held pointer waits for.
+        self.drain_unclaimed_below(&item.key.user_key)?;
+        self.hold(Held::Row(item))
     }
 
     fn produce(
         mut self: Box<Self>,
         opts: &Options,
         dst_lvl: usize,
-        blob_frag_map: FragmentationMap,
+        mut blob_frag_map: FragmentationMap,
         extra_blob_files: Vec<BlobFile>,
     ) -> crate::Result<ProducedOutput> {
         log::debug!(
@@ -1713,6 +2246,8 @@ impl CompactionFlavour for RelocatingCompaction {
         if let Some(bound) = self.drain_below.take() {
             self.drain_unclaimed_below(&bound)?;
         }
+        self.release_all()?;
+        core::mem::take(&mut self.carried_garbage).merge_into(&mut blob_frag_map);
 
         let tables_to_delete = core::mem::take(&mut self.inner.tables_to_rewrite);
 

@@ -100,6 +100,114 @@ fn misses_share_loads_only_once_loads_are_measured_slow() {
     assert_eq!(sharing.loads_in_flight(), 0);
 }
 
+/// Packed values read alone stay out of a cache that has not filled: caching
+/// them there would grow it on the reads' path. 2,000 values of 100 bytes
+/// read into 64 MiB leave the cache holding the table's blocks alone.
+#[cfg(feature = "std")]
+#[test]
+fn packed_values_read_alone_stay_out_of_a_cache_still_filling() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .use_cache(Arc::clone(&cache))
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(1),
+    ))
+    .blob_compression(crate::CompressionType::None)
+    .open()?;
+    for i in 0..2_000u32 {
+        tree.insert(i.to_be_bytes(), [7u8; 100], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let pass = || -> crate::Result<u64> {
+        for i in 0..2_000u32 {
+            assert!(tree.get(i.to_be_bytes(), crate::SeqNo::MAX)?.is_some());
+        }
+        Ok(cache.size())
+    };
+    // The first pass loads the table's blocks; neither caches a value, which
+    // a second miss into a filled shard would.
+    let first = pass()?;
+    assert!(
+        first < 2_000 * 100,
+        "{first} bytes cached by the first pass"
+    );
+    assert_eq!(pass()?, first, "the second pass cached its values");
+    Ok(())
+}
+
+/// Packed values read alone go into a cache that has filled, as its
+/// admission takes them: into a shard's room on a first miss, past it on a
+/// second, so within three passes every value is read from the cache. The
+/// cache is filled first with blocks of another table, which evict as they
+/// go in.
+#[cfg(all(feature = "std", feature = "metrics"))]
+#[test]
+fn packed_values_read_again_come_from_a_cache_that_has_filled() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::table::block::{BlockType, Header};
+    use std::sync::Arc;
+
+    let cache = Arc::new(Cache::with_capacity_bytes(1 << 20).with_row_cache(false));
+    let filler = crate::GlobalTableId::from((u64::MAX, 0));
+    for offset in 0..4_096u64 {
+        cache.insert_block(
+            filler,
+            crate::table::BlockOffset(offset * 2_048),
+            crate::table::Block {
+                header: Header {
+                    uncompressed_length: 1_024,
+                    ..Header::test_dummy(BlockType::Data)
+                },
+                data: crate::Slice::from(&[0u8; 1_024][..]),
+            },
+        );
+    }
+
+    let folder = tempfile::tempdir()?;
+    let tree = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .use_cache(Arc::clone(&cache))
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(1),
+    ))
+    .blob_compression(crate::CompressionType::None)
+    .open()?;
+    for i in 0..200u32 {
+        tree.insert(i.to_be_bytes(), [7u8; 100], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let m = tree.metrics();
+    let pass = || -> crate::Result<u64> {
+        let before = m.blob_bytes_read();
+        for i in 0..200u32 {
+            assert_eq!(
+                tree.get(i.to_be_bytes(), crate::SeqNo::MAX)?.as_deref(),
+                Some(&[7u8; 100][..])
+            );
+        }
+        Ok(m.blob_bytes_read() - before)
+    };
+    assert!(pass()? > 0, "the first pass reads the blob file");
+    pass()?;
+    assert_eq!(
+        pass()?,
+        0,
+        "the third pass reads every value from the cache"
+    );
+    Ok(())
+}
+
 #[test]
 fn metadata_priority_defaults_on_and_toggles() {
     // On by default.
@@ -264,6 +372,65 @@ fn reads_waiting_on_one_frame_share_it() {
         cache.get_blob_frame(0, at).is_none(),
         "a read that does not cache what it reads leaves the cache empty"
     );
+}
+
+/// Reads of one packed record behind another read of it take the record that
+/// read hands over; a thread leading a batched load does not wait for it, and
+/// reads the record alone.
+#[test]
+fn reads_waiting_on_one_record_share_it_unless_they_lead_a_batch() {
+    use super::{LoadIdentity, RecordClaim};
+    use std::sync::Arc;
+
+    let cache = Arc::new(
+        Cache::with_capacity_bytes(1024 * 1024)
+            .with_load_coalescing_after(core::time::Duration::ZERO),
+    );
+    let at = super::BlobFrameAt {
+        blob_file_id: 3,
+        frame: 0,
+    };
+    let RecordClaim::Lead(lead) = cache.claim_blob_record(0, at, 5) else {
+        panic!("the first read leads");
+    };
+
+    let alone = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || {
+            let id = crate::table::GlobalTableId::from((0, 1));
+            let identity = LoadIdentity::Block {
+                block_type: crate::table::block::BlockType::Data,
+                size: 100,
+                compression: crate::CompressionType::None,
+                encrypted: false,
+            };
+            let Some(batched) =
+                cache.claim_batched_block(id, crate::table::BlockOffset(1), identity, true)
+            else {
+                panic!("the batched read leads its block");
+            };
+            let claim = cache.claim_blob_record(0, at, 5);
+            drop(batched);
+            matches!(claim, RecordClaim::Alone)
+        }
+    })
+    .join()
+    .expect("the batched reader returns instead of waiting");
+    assert!(alone, "told to read the record alone");
+
+    let waiter = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || match cache.claim_blob_record(0, at, 5) {
+            RecordClaim::Shared(record) => Some(record),
+            _ => None,
+        }
+    });
+    while cache.load_waiters() < 1 {
+        std::thread::yield_now();
+    }
+    lead.hand_over(crate::Slice::from(&b"record"[..]));
+    let shared = waiter.join().expect("reader").expect("shared");
+    assert_eq!(&*shared, b"record");
 }
 
 /// A read that caches what it reads publishes its frame into the cache as it

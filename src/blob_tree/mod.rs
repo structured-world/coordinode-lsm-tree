@@ -2,6 +2,8 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+#[cfg(feature = "std")]
+mod ahead;
 pub mod field_row;
 mod gc;
 pub mod handle;
@@ -42,25 +44,30 @@ pub struct Guard {
     fill: crate::config::BlobCacheFill,
     /// The values of this item the scan read ahead for it, when it does not
     /// cache them: resolved from here, not read again.
-    prefetched: Vec<(crate::vlog::ValueHandle, UserValue)>,
+    prefetched: AheadValues,
     kv: crate::Result<InternalValue>,
     /// Present when this guard came from a scan that can read ahead; resolving
     /// a value through it is what arms that read-ahead.
     prefetch: Option<Arc<ScanPrefetch>>,
-    /// Counts the frames `prefetched` lies in against its scan's read-ahead
-    /// bound until this guard is resolved or dropped: held for its drop alone.
-    _held: HeldFrames,
 }
 
-/// The charges for the frames read ahead that a guard's values keep: what
-/// lets a scan see that the guards it handed out still hold a read's worth.
-#[expect(dead_code, reason = "the charges are held for their drop alone")]
-enum HeldFrames {
+/// The values a scan read ahead for one item.
+enum AheadValues {
     None,
-    /// An indirection's value, in one frame: no allocation per guard.
-    One(Arc<crate::vlog::FrameCharge>),
-    /// A cell row's objects, one charge per object.
-    Many(Vec<Arc<crate::vlog::FrameCharge>>),
+    /// An indirection's value: no allocation per guard.
+    One([(crate::vlog::ValueHandle, UserValue); 1]),
+    /// A cell row's objects.
+    Many(Vec<(crate::vlog::ValueHandle, UserValue)>),
+}
+
+impl AheadValues {
+    fn as_slice(&self) -> &[(crate::vlog::ValueHandle, UserValue)] {
+        match self {
+            Self::None => &[],
+            Self::One(value) => value,
+            Self::Many(values) => values,
+        }
+    }
 }
 
 impl IterGuard for Guard {
@@ -83,7 +90,7 @@ impl IterGuard for Guard {
                 self.tree.id(),
                 &self.tree.index.config.cache,
                 self.fill,
-                &self.prefetched,
+                self.prefetched.as_slice(),
                 &self.version,
                 #[cfg(feature = "metrics")]
                 self.tree.metrics(),
@@ -121,13 +128,58 @@ impl IterGuard for Guard {
             self.tree.id(),
             &self.tree.index.config.cache,
             self.fill,
-            &self.prefetched,
+            self.prefetched.as_slice(),
             &self.version,
             #[cfg(feature = "metrics")]
             self.tree.metrics(),
             self.kv?,
         )
     }
+}
+
+/// Writes `value` under `key` to the blob file, compressed ahead as `pre` when
+/// it was, and its indirection to the table.
+fn write_separated(
+    blob_writer: &mut BlobFileWriter,
+    table_writer: &mut crate::table::multi_writer::MultiWriter,
+    encoded: &mut Vec<u8>,
+    mut key: crate::key::InternalKey,
+    value: &[u8],
+    pre: Option<crate::vlog::blob_file::writer::PreCompressed>,
+) -> crate::Result<()> {
+    use crate::coding::Encode;
+
+    let indirection = blob_writer.write_pre(&key.user_key, key.seqno, value, pre)?;
+    encoded.clear();
+    indirection.encode_into(encoded)?;
+    key.value_type = crate::ValueType::Indirection;
+    table_writer.write(InternalValue::new(key, UserValue::new(encoded)))?;
+    table_writer.register_blob(indirection);
+    Ok(())
+}
+
+/// Writes the oldest value `ahead` holds, `false` when it holds none.
+#[cfg(feature = "std")]
+fn write_ahead(
+    ahead: &mut ahead::ValuesAhead,
+    blob_writer: &mut BlobFileWriter,
+    table_writer: &mut crate::table::multi_writer::MultiWriter,
+    encoded: &mut Vec<u8>,
+) -> crate::Result<bool> {
+    let Some(next) = ahead.take() else {
+        return Ok(false);
+    };
+    let (separated, pre) = next?;
+    blob_writer.select_lifetime_class(separated.class)?;
+    write_separated(
+        blob_writer,
+        table_writer,
+        encoded,
+        separated.key,
+        &separated.value,
+        Some(pre),
+    )?;
+    Ok(true)
 }
 
 /// Finishes a flush's blob and table outputs. Nothing orders the syncs of the
@@ -194,7 +246,13 @@ pub(crate) fn resolve_value_handle(
             // A reference to an object the version no longer holds is damage,
             // reported as such rather than read as an empty field.
             accessor
-                .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
+                .get_stored(
+                    tree_id,
+                    &item.key.user_key,
+                    &vptr.vhandle,
+                    vptr.stored,
+                    cache,
+                )?
                 .ok_or(crate::Error::InvalidHeader(
                     "field row: a reference names a blob file the version does not hold",
                 ))
@@ -221,7 +279,13 @@ pub(crate) fn resolve_value_handle(
         // An indirection naming a blob file the version does not hold is
         // damage, reported as such, the way a cell row's dangling reference is.
         let value = accessor
-            .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
+            .get_stored(
+                tree_id,
+                &item.key.user_key,
+                &vptr.vhandle,
+                vptr.stored,
+                cache,
+            )?
             .ok_or(crate::Error::InvalidHeader(
                 "blob tree: an indirection names a blob file the version does not hold",
             ))?;
@@ -243,13 +307,30 @@ pub(crate) enum ValuePlan<'v> {
     Alone,
 }
 
-/// One blob frame a batched read reads: the `len` bytes of `blob_file` at
-/// `offset` that hold the frame the handle names.
+/// What a batched read reads for one value: the `len` bytes of `blob_file`
+/// at `offset` that hold the frame the handle names, or the value's record
+/// alone when `record` says it is packed.
 pub(crate) struct ValueRead<'v> {
     pub(crate) blob_file: &'v BlobFile,
     pub(crate) vhandle: crate::vlog::ValueHandle,
     pub(crate) offset: u64,
     pub(crate) len: usize,
+    pub(crate) record: bool,
+}
+
+/// What one batched read reads: a frame of a blob file, or one record of
+/// its packed block, which no other value of the block shares.
+pub(crate) type ReadOf = (crate::vlog::BlobFileId, u32, Option<u16>);
+
+impl ValueRead<'_> {
+    /// What this read reads, for values of the same frame to share it.
+    pub(crate) fn reads(&self) -> ReadOf {
+        (
+            self.vhandle.blob_file_id,
+            self.vhandle.frame,
+            self.record.then_some(self.vhandle.index),
+        )
+    }
 }
 
 /// Where a blob tree's values kept in the value log are read from: the tree
@@ -357,6 +438,32 @@ impl BlobSource {
         let Some(blob_file) = version.blob_files.get(vhandle.blob_file_id) else {
             return ValuePlan::Alone;
         };
+        // A packed value is its record alone, as a single read reads it: its
+        // block is read only by a scan or a fill.
+        if let crate::blob_tree::handle::Stored::Packed(len) = indirection.stored {
+            if let Some(record) =
+                self.cache
+                    .get_blob_record(self.tree_id, vhandle.frame_at(), vhandle.index)
+            {
+                return match crate::vlog::blob_file::packed::cached_value(
+                    &record,
+                    &item.key.user_key,
+                ) {
+                    Ok(value) => ValuePlan::Ready(value),
+                    Err(_) => ValuePlan::Alone,
+                };
+            }
+            let Ok(offset) = crate::vlog::accessor::record_offset(blob_file, &vhandle, len) else {
+                return ValuePlan::Alone;
+            };
+            return ValuePlan::Read(ValueRead {
+                blob_file,
+                vhandle,
+                offset,
+                len: len as usize,
+                record: true,
+            });
+        }
         // A cached head holds none of its value. Its chunks all cached, the
         // value's own path assembles it from them with no read; one missing
         // any is read whole, head and chunks, in the one queued read below,
@@ -395,6 +502,7 @@ impl BlobSource {
             vhandle,
             offset,
             len,
+            record: false,
         })
     }
 
@@ -416,7 +524,8 @@ impl BlobSource {
     /// caches what it reads. A chunked value read whole, head and chunks, is
     /// assembled out of them; `None` for one read only as far as its head,
     /// whose chunks are read on the value's own path, which finds the head
-    /// cached.
+    /// cached. The frame comes back beside the value when it holds values of
+    /// its own (a block or a single), for the other values of the batch in it.
     ///
     /// # Errors
     ///
@@ -429,8 +538,11 @@ impl BlobSource {
         key: &[u8],
         read: &ValueRead<'_>,
         bytes: &crate::Slice,
-    ) -> crate::Result<Option<UserValue>> {
-        use crate::vlog::blob_file::{frame::FrameKind, reader};
+    ) -> crate::Result<(Option<UserValue>, Option<crate::vlog::accessor::HeldFrame>)> {
+        use crate::vlog::{
+            accessor::HeldFrame,
+            blob_file::{frame::FrameKind, reader},
+        };
 
         let accessor = Accessor::new(
             &version.blob_files,
@@ -438,6 +550,17 @@ impl BlobSource {
             #[cfg(feature = "metrics")]
             Some(&self.metrics),
         );
+        if read.record {
+            let value = accessor.record_read(
+                self.tree_id,
+                read.blob_file,
+                key,
+                &read.vhandle,
+                bytes,
+                &self.cache,
+            )?;
+            return Ok((Some(value), None));
+        }
         let malformed = || crate::Error::InvalidHeader("Blob");
         let (start, end) = read
             .blob_file
@@ -455,49 +578,73 @@ impl BlobSource {
         let parsed =
             reader::Reader::decode(read.blob_file, &frame_bytes(start, end)?, &mut decoded);
         accessor.count_decoded(decoded);
-        let frame = Arc::new(parsed?);
-        if self.fill.fills() {
-            // Read with the chunks after it, a head decoded as a view would
-            // keep the whole value's read alive in the cache, which charges
-            // it only its own bytes: it is cached detached. A frame read alone
-            // is the whole read and is cached as it is.
-            let cached = if bytes.len() as u64 == end - start {
-                Arc::clone(&frame)
+        let frame = parsed?;
+        // Shared only with the cache: the batch's other values in the frame
+        // are taken out of it here, by reference.
+        let at = read.vhandle.frame_at();
+        let frame =
+            if crate::vlog::accessor::caches(self.fill, &self.cache, self.tree_id, at, &frame) {
+                // Read with the chunks after it, a head decoded as a view
+                // would keep the whole value's read alive in the cache, which
+                // charges it only its own bytes: it is cached detached. A
+                // frame read alone is the whole read and is cached as it is.
+                let frame = if bytes.len() as u64 == end - start {
+                    frame
+                } else {
+                    let (owned, copied) = crate::vlog::accessor::own_frame(frame, bytes, true);
+                    accessor.count_gather(copied);
+                    owned
+                };
+                let frame = Arc::new(frame);
+                self.cache
+                    .insert_blob_frame(self.tree_id, at, Arc::clone(&frame));
+                HeldFrame::Shared(frame)
             } else {
-                let (owned, copied) = crate::vlog::accessor::own_frame(
-                    (*frame).clone(),
-                    read.blob_file.compression(),
-                );
-                accessor.count_gather(copied);
-                Arc::new(owned)
+                HeldFrame::Own(frame)
             };
-            self.cache
-                .insert_blob_frame(self.tree_id, read.vhandle.frame_at(), cached);
-        }
         if frame.header.kind != FrameKind::Head {
-            return reader::value_in(&frame, read.vhandle.index, key).map(Some);
+            let value = reader::value_in(&frame, read.vhandle.index, key)?;
+            return Ok((Some(value), Some(frame)));
         }
         reader::check_key(&frame, read.vhandle.index, key)?;
         if bytes.len() as u64 == end - start {
-            return Ok(None);
+            return Ok((None, None));
         }
-        let all = reader::chunk_frames(&frame, read.vhandle.frame, read.blob_file.frame_count())?;
-        let mut chunks = Vec::with_capacity((all.end - all.start) as usize);
-        for chunk in all {
-            let (chunk_start, chunk_end) =
-                read.blob_file.frame_span(chunk).ok_or_else(malformed)?;
-            let mut decoded = 0;
-            let parsed = reader::Reader::decode(
-                read.blob_file,
-                &frame_bytes(chunk_start, chunk_end)?,
-                &mut decoded,
-            );
-            accessor.count_decoded(decoded);
-            chunks.push(parsed?);
+        // The chunks follow the head back to back: a value stored as it is
+        // is handed out of the read as it lies, any other decoded into place.
+        let area = frame_bytes(end, start + bytes.len() as u64)?;
+        let mut decoded = 0;
+        let value = reader::assemble_stored(
+            &frame,
+            &area,
+            read.blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            read.blob_file.0.zstd_dictionary.as_deref(),
+            &mut decoded,
+        );
+        accessor.count_decoded(decoded);
+        Ok((Some(value?), None))
+    }
+
+    /// The value `item` stands for, out of `frame`, the frame `at` names,
+    /// which a batch read for another of its values: `None` when `item` names
+    /// another frame or its entry there is not its key's, and then it is read
+    /// on its own path.
+    pub(crate) fn value_in_frame(
+        frame: &crate::vlog::blob_file::frame::DecodedFrame,
+        at: crate::cache::BlobFrameAt,
+        item: &InternalValue,
+    ) -> Option<UserValue> {
+        let indirection = BlobIndirection::decode_from(&mut &item.value[..]).ok()?;
+        if indirection.vhandle.frame_at() != at {
+            return None;
         }
-        let value = reader::assemble(&frame, &chunks, None)?;
-        accessor.count_gather(value.len());
-        Ok(Some(value))
+        crate::vlog::blob_file::reader::value_in(
+            frame,
+            indirection.vhandle.index,
+            &item.key.user_key,
+        )
+        .ok()
     }
 
     /// Counts the read of `read`'s record as issued.
@@ -531,7 +678,13 @@ impl BlobSource {
             #[cfg(feature = "metrics")]
             Some(&self.metrics),
         )
-        .get(self.tree_id, key, &indirection.vhandle, &self.cache)?
+        .get_stored(
+            self.tree_id,
+            key,
+            &indirection.vhandle,
+            indirection.stored,
+            &self.cache,
+        )?
         .ok_or(crate::Error::InvalidHeader(
             "field row: a reference names a blob file the version does not hold",
         ))
@@ -1355,7 +1508,6 @@ impl BlobTree {
 
         Arc::new(ScanPrefetch {
             resolving: core::sync::atomic::AtomicBool::new(false),
-            held: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
             fill,
             window,
             max_gap: PREFETCH_MAX_GAP,
@@ -1365,39 +1517,34 @@ impl BlobTree {
 }
 
 /// The values `kv` reads from blob files that a scan read ahead into `local`,
-/// for `kv`'s guard: its own value, or its cells' objects, with the charges,
-/// counted on `held`, for the frames they keep.
-fn take_prefetched(
-    local: &crate::vlog::Prefetched,
-    held: &Arc<core::sync::atomic::AtomicUsize>,
-    kv: &InternalValue,
-) -> (Vec<(crate::vlog::ValueHandle, UserValue)>, HeldFrames) {
+/// for `kv`'s guard: its own value, or its cells' objects. Each is a view into
+/// its frame's payload, which is how the scan sees what kept guards still hold.
+fn take_prefetched(local: &crate::vlog::Prefetched, kv: &InternalValue) -> AheadValues {
     let key = &kv.key.user_key;
-    let charge = |bytes| crate::vlog::FrameCharge::new(held, bytes);
     if kv.key.value_type.is_cell_row() {
         let Ok(refs) = field_row::row_refs(&kv.value) else {
-            return (Vec::new(), HeldFrames::None);
+            return AheadValues::None;
         };
-        let (values, charges): (Vec<_>, Vec<_>) = refs
+        let values: Vec<_> = refs
             .into_iter()
             .filter_map(|(vptr, _)| {
                 local
-                    .get_charged(key, &vptr.vhandle, charge)
-                    .map(|(value, charge)| ((vptr.vhandle, value), charge))
+                    .get(key, &vptr.vhandle)
+                    .map(|value| (vptr.vhandle, value))
             })
-            .unzip();
-        return (values, HeldFrames::Many(charges));
+            .collect();
+        return AheadValues::Many(values);
     }
     if !kv.key.value_type.is_indirection() {
-        return (Vec::new(), HeldFrames::None);
+        return AheadValues::None;
     }
     let mut cursor = crate::io::Cursor::new(&kv.value[..]);
     let Ok(vptr) = BlobIndirection::decode_from(&mut cursor) else {
-        return (Vec::new(), HeldFrames::None);
+        return AheadValues::None;
     };
-    match local.get_charged(key, &vptr.vhandle, charge) {
-        Some((value, charge)) => (alloc::vec![(vptr.vhandle, value)], HeldFrames::One(charge)),
-        None => (Vec::new(), HeldFrames::None),
+    match local.get(key, &vptr.vhandle) {
+        Some(value) => AheadValues::One([(vptr.vhandle, value)]),
+        None => AheadValues::None,
     }
 }
 
@@ -1413,10 +1560,9 @@ fn blob_guard(
         tree: tree.clone(),
         version: version.clone(),
         fill,
-        prefetched: Vec::new(),
+        prefetched: AheadValues::None,
         kv: item,
         prefetch: None,
-        _held: HeldFrames::None,
     })
 }
 
@@ -1432,11 +1578,6 @@ fn blob_guard(
 /// for the first.
 pub(crate) struct ScanPrefetch {
     resolving: core::sync::atomic::AtomicBool,
-    /// Bytes of the frames read ahead into the scan's own store that a value
-    /// was taken out of, while the store or a guard it handed out, unresolved,
-    /// keeps them. Within two reads, so a `usize` holds it on every target,
-    /// 32-bit ones without 64-bit atomics too.
-    held: Arc<core::sync::atomic::AtomicUsize>,
     /// Whether the scan caches the values it reads, as the tree said when the
     /// scan began; when it does not, it keeps what it reads ahead itself.
     fill: crate::config::BlobCacheFill,
@@ -1558,8 +1699,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
         // that follow read their values when resolved.
         let into = if self.state.fill.fills() {
             crate::vlog::PrefetchInto::Cache
-        } else if self.state.held.load(core::sync::atomic::Ordering::Relaxed) >= self.state.max_read
-        {
+        } else if self.local.held_bytes() >= self.state.max_read {
             return;
         } else {
             crate::vlog::PrefetchInto::Local(&mut self.local)
@@ -1575,16 +1715,15 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
     }
 
     fn guard(&self, item: crate::Result<InternalValue>) -> IterGuardImpl {
-        let (prefetched, held) = match &item {
-            Ok(kv) if !self.local.is_empty() => take_prefetched(&self.local, &self.state.held, kv),
-            _ => (Vec::new(), HeldFrames::None),
+        let prefetched = match &item {
+            Ok(kv) if !self.local.is_empty() => take_prefetched(&self.local, kv),
+            _ => AheadValues::None,
         };
         IterGuardImpl::Blob(Guard {
             tree: self.tree.clone(),
             version: self.version.clone(),
             fill: self.state.fill,
             prefetched,
-            _held: held,
             kv: item,
             // Only until the read-ahead is armed, and never with the window
             // disabled. The guards exist to report the FIRST resolution; once
@@ -2221,7 +2360,7 @@ impl AbstractTree for BlobTree {
             crate::runtime_config::WritePin,
         )>,
     > {
-        use crate::{coding::Encode, file::BLOBS_FOLDER, table::multi_writer::MultiWriter};
+        use crate::{file::BLOBS_FOLDER, table::multi_writer::MultiWriter};
 
         let start = crate::time::Instant::now();
 
@@ -2394,6 +2533,7 @@ impl AbstractTree for BlobTree {
             .use_writeback_bytes(self.index.config.writeback_bytes)
             .use_lifetime_groups(kv_opts.lifetime_groups)
             .use_frame_sizes(kv_opts.frame_sizes())
+            .use_dictionary_classes(kv_opts.dictionary_classes)
             .use_clock(self.index.config.clock.clone())
             .use_key_domains(
                 self.index.config.key_domains.clone(),
@@ -2403,7 +2543,10 @@ impl AbstractTree for BlobTree {
             let w = w
                 .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
                 .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
-                .use_zstd_dictionaries(dicts);
+                .use_zstd_dictionaries(dicts)
+                .use_file_dictionary(kv_opts.file_dictionary);
+            #[cfg(feature = "std")]
+            let w = w.use_parallel_compression(self.index.config.parallel_compression());
             w
         };
 
@@ -2419,6 +2562,17 @@ impl AbstractTree for BlobTree {
         // One buffer for every indirection of the flush.
         let mut encoded = Vec::new();
 
+        // A key domain picks the file, and so the dictionary, of the values
+        // under it as the writer enters it: those stay on the writer's thread.
+        #[cfg(feature = "std")]
+        let mut ahead = if self.index.config.key_domains.is_none()
+            && rc.blob_compression != crate::CompressionType::None
+        {
+            ahead::ValuesAhead::for_flush(self.index.config.parallel_compression())
+        } else {
+            None
+        };
+
         for item in stream {
             let item = item?;
 
@@ -2426,6 +2580,31 @@ impl AbstractTree for BlobTree {
             // key once the flush has passed it.
             let overwritten = overwritten
                 .is_some_and(|keys| keys.take_before_and_check(&item.key.user_key, comparator));
+
+            #[cfg(feature = "std")]
+            if let Some(ahead) = &mut ahead {
+                #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
+                let size = item.value.len() as u32;
+                let class = lifetime.class_of(&item.key.user_key, overwritten);
+                let codec = (item.key.value_type == crate::ValueType::Value
+                    && size >= separation_threshold)
+                    .then(|| blob_writer.value_codec(class, size))
+                    .flatten();
+                if let Some(codec) = codec {
+                    if ahead.is_full() {
+                        write_ahead(ahead, &mut blob_writer, &mut table_writer, &mut encoded)?;
+                    }
+                    let separated = ahead::Separated {
+                        key: item.key,
+                        value: item.value,
+                        class,
+                    };
+                    ahead.submit(separated, codec);
+                    continue;
+                }
+                // Anything else follows the values before it into the files.
+                while write_ahead(ahead, &mut blob_writer, &mut table_writer, &mut encoded)? {}
+            }
 
             if item.is_tombstone() {
                 // NOTE: Still need to add tombstone to index tree
@@ -2463,20 +2642,22 @@ impl AbstractTree for BlobTree {
             {
                 blob_writer
                     .select_lifetime_class(lifetime.class_of(&item.key.user_key, overwritten))?;
-                let indirection = blob_writer.write(&item.key.user_key, item.key.seqno, &value)?;
-
-                encoded.clear();
-                indirection.encode_into(&mut encoded)?;
-                table_writer.write({
-                    let mut vptr = InternalValue::new(item.key, UserValue::new(&encoded));
-                    vptr.key.value_type = crate::ValueType::Indirection;
-                    vptr
-                })?;
-
-                table_writer.register_blob(indirection);
+                write_separated(
+                    &mut blob_writer,
+                    &mut table_writer,
+                    &mut encoded,
+                    item.key,
+                    &value,
+                    None,
+                )?;
             } else {
                 table_writer.write(InternalValue::new(item.key, value))?;
             }
+        }
+
+        #[cfg(feature = "std")]
+        if let Some(ahead) = &mut ahead {
+            while write_ahead(ahead, &mut blob_writer, &mut table_writer, &mut encoded)? {}
         }
 
         let (blob_files, written) = finish_flush(

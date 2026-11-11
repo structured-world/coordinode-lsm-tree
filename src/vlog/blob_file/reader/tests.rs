@@ -174,13 +174,26 @@ fn a_range_covers_only_its_chunks() -> crate::Result<()> {
     assert_eq!(covering_chunks(&head, &(600..700))?, (2..3, 0));
 
     let chunks = chunk_frames(&head, handles[0].frame, blob_file.frame_count())?;
-    let second = reader.read_frame(chunks.start + 1, &mut 0)?;
+    let second = read_chunk(&reader, &blob_file, &head, chunks.start, 1)?;
     let part = assemble(&head, &[Box::new(second)], Some(&(310..320)))?;
     assert_eq!(&*part, &value[310..320]);
     // Chunks past the file's last frame: a damaged head, refused before any
     // caller reserves room for them.
     assert!(chunk_frames(&head, handles[0].frame, chunks.end as usize - 1).is_err());
     Ok(())
+}
+
+/// Chunk `at` of the value `head`, whose chunks start at frame `first`,
+/// read and decoded by its row in the head's table.
+fn read_chunk(
+    reader: &Reader<'_>,
+    blob_file: &BlobFile,
+    head: &DecodedFrame,
+    first: u32,
+    at: u32,
+) -> crate::Result<DecodedFrame> {
+    let stored = reader.read_frame_bytes(first + at)?;
+    Reader::decode_chunk(blob_file, head, at, &stored, &mut 0)
 }
 
 /// Chunks that are not the head's are refused: of another size than its
@@ -197,10 +210,13 @@ fn chunks_must_be_the_heads() -> crate::Result<()> {
     let file = File::open(&blob_file.0.path)?;
     let reader = Reader::new(&blob_file, &file);
     let head = reader.read_frame(handles[0].frame, &mut 0)?;
-    let first = reader.read_frame(handles[0].frame + 1, &mut 0)?;
-    let last = reader.read_frame(handles[0].frame + 3, &mut 0)?;
+    let first = read_chunk(&reader, &blob_file, &head, handles[0].frame + 1, 0)?;
+    let last = read_chunk(&reader, &blob_file, &head, handles[0].frame + 1, 2)?;
     let tail = reader.read_frame(handles[1].frame, &mut 0)?;
 
+    // A chunk's bytes read as another chunk do not match its row.
+    let stored = reader.read_frame_bytes(handles[0].frame + 3)?;
+    assert!(Reader::decode_chunk(&blob_file, &head, 0, &stored, &mut 0).is_err());
     // The last chunk (100 bytes) where the first (300) belongs.
     assert!(assemble(&head, &[Box::new(last)], Some(&(0..10))).is_err());
     // A block where a chunk belongs.
@@ -210,36 +226,39 @@ fn chunks_must_be_the_heads() -> crate::Result<()> {
     Ok(())
 }
 
-/// A head's chunks are proven whole without gathering the value: each in its
-/// place the size its table gives it, and a chunk out of its place or a frame
-/// that is no chunk refused.
+/// A head's chunks are proven whole without gathering or decoding the value:
+/// each in its place matches its row's length and checksum, and a chunk out
+/// of its place, or a row past the table, is refused.
 #[test]
 fn chunks_are_checked_without_gathering_the_value() -> crate::Result<()> {
+    use super::super::frame::check_chunk;
+
     let folder = tempfile::tempdir()?;
-    let value = vec![9_u8; 700];
+    let value: Vec<u8> = (0..700_u32).map(|i| (i % 251) as u8).collect();
     let (blob_file, handles) = write(&folder, CompressionType::None, &[(b"big", &value)])?;
     let file = File::open(&blob_file.0.path)?;
     let reader = Reader::new(&blob_file, &file);
     let at = handles[0].frame;
     let head = reader.read_frame(at, &mut 0)?;
     let chunks = (at + 1..at + 4)
-        .map(|frame| reader.read_frame(frame, &mut 0))
+        .map(|frame| reader.read_frame_bytes(frame))
         .collect::<crate::Result<Vec<_>>>()?;
-    let table = ChunkTable::of(&head)?;
 
     for (nth, chunk) in (0..).zip(&chunks) {
-        assert!(table.check(nth, chunk).is_ok(), "chunk {nth} in its place");
+        assert!(
+            check_chunk(&head.chunk(nth)?, chunk).is_ok(),
+            "chunk {nth} in its place"
+        );
     }
     assert!(
-        table.check(0, &chunks[2]).is_err(),
+        check_chunk(&head.chunk(0)?, &chunks[2]).is_err(),
         "the short last chunk first"
     );
-    assert!(table.check(2, &chunks[0]).is_err(), "a full chunk last");
     assert!(
-        table.check(0, &head).is_err(),
-        "a head where a chunk belongs"
+        check_chunk(&head.chunk(1)?, &chunks[0]).is_err(),
+        "a full chunk of other bytes"
     );
-    assert!(ChunkTable::of(&chunks[0]).is_err(), "a chunk has no table");
+    assert!(head.chunk(3).is_err(), "a row past the table");
     Ok(())
 }
 
@@ -256,8 +275,8 @@ fn a_head_holds_no_value_and_a_range_past_the_value_is_refused() -> crate::Resul
     let head = reader.read_frame(at, &mut 0)?;
     assert!(value_in(&head, 0, b"big").is_err(), "a head holds no value");
 
-    let chunks = (at + 1..at + 4)
-        .map(|frame| reader.read_frame(frame, &mut 0).map(Box::new))
+    let chunks = (0..3)
+        .map(|nth| read_chunk(&reader, &blob_file, &head, at + 1, nth).map(Box::new))
         .collect::<crate::Result<Vec<_>>>()?;
     assert!(
         assemble(&head, &chunks, Some(&(0..701))).is_err(),
@@ -267,11 +286,13 @@ fn a_head_holds_no_value_and_a_range_past_the_value_is_refused() -> crate::Resul
     Ok(())
 }
 
-/// A copy of a chunked value checks each frame it takes is a chunk: a head
-/// naming one chunk more than were written finds the next value's frame in
-/// its place, and the copy is refused rather than carrying that frame along.
+/// A copy of a chunked value checks each chunk it takes against its row in
+/// the head's table: bytes the row's checksum does not match, though of the
+/// row's length, are refused rather than carried along.
 #[test]
-fn a_copy_refuses_a_frame_that_is_not_its_value_s_chunk() -> crate::Result<()> {
+fn a_copy_refuses_a_chunk_its_row_does_not_check() -> crate::Result<()> {
+    use crate::vlog::blob_file::frame::{FRAME_HEADER_LEN, parse_header, reseal};
+
     let folder = tempfile::tempdir()?;
     let (blob_file, handles) = write(
         &folder,
@@ -284,12 +305,12 @@ fn a_copy_refuses_a_frame_that_is_not_its_value_s_chunk() -> crate::Result<()> {
     let (start, end) = (start as usize, end as usize);
     let mut bytes = std::fs::read(&blob_file.0.path)?;
     {
-        // A thousand bytes in four chunks of 300: one more than written.
+        // The second row's checksum flipped, the head resealed over it.
         let head = &mut bytes[start..end];
-        head[40 + 10..40 + 14].copy_from_slice(&1000_u32.to_le_bytes());
-        let table = head.len() - 4;
-        head[table..].copy_from_slice(&4_u32.to_le_bytes());
-        crate::vlog::blob_file::frame::reseal(head);
+        let header = parse_header(head)?;
+        let row = FRAME_HEADER_LEN + header.entries_len as usize + 8 + 21;
+        head[row + 5] ^= 0xFF;
+        reseal(head);
     }
     std::fs::write(&blob_file.0.path, &bytes)?;
 
@@ -297,7 +318,7 @@ fn a_copy_refuses_a_frame_that_is_not_its_value_s_chunk() -> crate::Result<()> {
     let reader = Reader::new(&blob_file, &file);
     assert!(matches!(
         reader.copy_source(b"big", &handles[0]),
-        Err(crate::Error::InvalidHeader("Blob"))
+        Err(crate::Error::ChecksumMismatch { .. })
     ));
     Ok(())
 }
@@ -379,7 +400,7 @@ fn a_copy_refuses_chunks_that_do_not_fit_their_head() -> crate::Result<()> {
 #[cfg(feature = "lz4")]
 #[expect(clippy::expect_used, reason = "test code")]
 fn a_copy_hands_over_frames_of_their_own_undecoded() -> crate::Result<()> {
-    use crate::vlog::blob_file::frame::{FRAME_HEADER_LEN, parse_header, reseal};
+    use crate::vlog::blob_file::frame::{FRAME_HEADER_LEN, chunk_checksum, parse_header, reseal};
 
     let folder = tempfile::tempdir()?;
     let chunked: Vec<u8> = (0..700_u32).map(|i| (i % 7) as u8).collect();
@@ -387,15 +408,27 @@ fn a_copy_hands_over_frames_of_their_own_undecoded() -> crate::Result<()> {
     let (blob_file, handles) = write(&folder, CompressionType::Lz4, &refs)?;
 
     let mut bytes = std::fs::read(&blob_file.0.path)?;
-    for frame in [handles[0].frame, handles[1].frame + 1] {
-        let (start, end) = blob_file.frame_span(frame).expect("the frame");
-        let at = &mut bytes[start as usize..end as usize];
-        let header = parse_header(at)?;
-        assert!(!header.is_raw(), "frame {frame} is compressed");
-        let stored = FRAME_HEADER_LEN + header.entries_len as usize;
-        at[stored..].fill(0xFF);
-        reseal(at);
-    }
+    // The single frame's payload, sealed again over the garbage.
+    let (start, end) = blob_file.frame_span(handles[0].frame).expect("the frame");
+    let single = &mut bytes[start as usize..end as usize];
+    let header = parse_header(single)?;
+    assert!(!header.is_raw(), "the single frame is compressed");
+    single[FRAME_HEADER_LEN + header.entries_len as usize..].fill(0xFF);
+    reseal(single);
+    // The first chunk's bytes, its row's checksum set to match them.
+    let (start, end) = blob_file
+        .frame_span(handles[1].frame + 1)
+        .expect("the chunk");
+    let chunk = &mut bytes[start as usize..end as usize];
+    chunk.fill(0xFF);
+    let checksum = chunk_checksum(chunk);
+    let (start, end) = blob_file.frame_span(handles[1].frame).expect("the head");
+    let head = &mut bytes[start as usize..end as usize];
+    let header = parse_header(head)?;
+    let row = FRAME_HEADER_LEN + header.entries_len as usize + 8;
+    assert_eq!(head[row + 4], 0, "the first chunk is compressed");
+    head[row + 5..row + 21].copy_from_slice(&checksum.to_le_bytes());
+    reseal(head);
     std::fs::write(&blob_file.0.path, &bytes)?;
 
     let file = File::open(&blob_file.0.path)?;

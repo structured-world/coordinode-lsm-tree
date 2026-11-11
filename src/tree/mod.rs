@@ -1097,10 +1097,9 @@ impl AbstractTree for Tree {
     }
 
     fn l0_run_count(&self) -> usize {
-        self.current_version()
-            .level(0)
-            .map(|x| x.run_count())
-            .unwrap_or_default()
+        // Every publish writes it: one load, no history lock, no version
+        // clone on the lines the readers share.
+        self.0.l0_runs.load(core::sync::atomic::Ordering::Acquire)
     }
 
     fn size_of<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<u32>> {
@@ -5947,6 +5946,7 @@ impl Tree {
         let latest_super_version = super_versions.latest_handle();
         #[cfg(feature = "std")]
         let insert_gate = super_versions.insert_gate_handle();
+        let l0_runs = super_versions.l0_runs_handle();
         #[cfg(feature = "std")]
         if let Some(budget) = &config.write_buffer_budget {
             budget.register(Arc::downgrade(&latest_super_version));
@@ -5964,6 +5964,7 @@ impl Tree {
             latest_super_version,
             #[cfg(feature = "std")]
             insert_gate,
+            l0_runs,
             stop_signal,
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),

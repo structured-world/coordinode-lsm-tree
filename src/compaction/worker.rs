@@ -1744,13 +1744,70 @@ struct SliceOutputs<'a> {
 /// What a relocating pass moves: the frames its inputs point at in the
 /// `stale` blob files, written into files of `target_size` bytes split into
 /// chunks of `chunk_size`, a file for each of `file_groups` codecs and
-/// lifetime classes at once.
+/// lifetime classes at once. A file of copied frames holds the dictionary of
+/// its own their source holds: `dictionaries` bytes for the first file of
+/// each such source and class, and at most `largest_dictionary` for every
+/// file a target's worth of frames opens past it. The values of the
+/// `rewritten` files may be written anew without their dictionary, as large
+/// as they are raw.
 #[cfg(feature = "std")]
-struct Relocated<'a> {
-    stale: &'a HashSet<BlobFileId>,
+struct Relocated {
+    stale: HashSet<BlobFileId>,
+    rewritten: HashSet<BlobFileId>,
     target_size: u64,
     chunk_size: u32,
     file_groups: u64,
+    dictionaries: u64,
+    largest_dictionary: u64,
+}
+
+#[cfg(feature = "std")]
+impl Relocated {
+    /// What a relocation of the `stale` files writes under `opts`.
+    fn new(stale: &[BlobFile], opts: &crate::KvSeparationOptions) -> Self {
+        let groups = u64::from(opts.lifetime_groups.get());
+        // A file for each codec of the sources.
+        let mut codecs: Vec<crate::CompressionType> = Vec::new();
+        let (mut dictionaries, mut largest_dictionary) = (0, 0);
+        let mut own = HashSet::default();
+        for file in stale {
+            if !codecs.contains(&file.compression()) {
+                codecs.push(file.compression());
+            }
+            let bytes = file.own_dictionary_bytes();
+            dictionaries += bytes;
+            largest_dictionary = largest_dictionary.max(bytes);
+            if file.has_own_dictionary() {
+                own.insert(file.id());
+            }
+        }
+        let mut file_groups = codecs.len() as u64;
+        // Past the sources whose dictionaries a pass keeps with their frames,
+        // a source's values are written anew without it: which sources those
+        // are depends on the order the pass meets them, so every one may be.
+        // They go to a file of one more codec, which may build a dictionary of
+        // its own.
+        let rewritten = if own.len() > crate::vlog::blob_file::multi_writer::MAX_COPY_SOURCES {
+            file_groups += 1;
+            let fresh = u64::from(opts.file_dictionary);
+            dictionaries += fresh;
+            largest_dictionary = largest_dictionary.max(fresh);
+            own
+        } else {
+            HashSet::default()
+        };
+        Self {
+            stale: stale.iter().map(BlobFile::id).collect(),
+            rewritten,
+            target_size: opts.file_target_size,
+            // The output files are written with the sizes the options give
+            // now, which may chunk a value its source file holds in a block.
+            chunk_size: opts.frame_sizes().chunk_size,
+            file_groups: file_groups * groups,
+            dictionaries: dictionaries * groups,
+            largest_dictionary,
+        }
+    }
 }
 
 /// A blob file's metadata past its frames, short of its two keys: the block
@@ -1763,67 +1820,104 @@ const BLOB_META_BYTES: u64 = 1_024;
 /// frames' headers included, for a value with frames of its own; for a value
 /// that shares a block, which is re-encoded, its entry and a frame header the
 /// copy may open, or, when the value is above `chunk_size` (a tree reopened
-/// with a smaller one), a head with its chunk table and a header per chunk.
-/// A block's share is its uncompressed entry, which compression only shrinks.
-/// Each frame the copy writes also takes an entry of the output file's frame
+/// with a smaller one), a head with its chunk table and a row per chunk.
+/// A block's share is its uncompressed entry, which compression only shrinks;
+/// a packed record may hold its value compressed, so its record and the
+/// value it decodes to bound what the copy writes of it. Each frame and
+/// chunk the copy writes also takes an entry of the output file's frame
 /// index: a value with frames of its own is split into chunks of at least
 /// [`MIN_CHUNK_SIZE`](crate::vlog::blob_file::writer::MIN_CHUNK_SIZE), which
 /// bounds how many it has.
 #[cfg(feature = "std")]
 fn frame_bytes(indirection: &crate::blob_tree::handle::BlobIndirection, chunk_size: u32) -> u64 {
     use crate::blob_tree::handle::Stored;
-    use crate::vlog::blob_file::{frame::FRAME_HEADER_LEN, writer::MIN_CHUNK_SIZE};
+    use crate::vlog::blob_file::{
+        frame::{CHUNK_ROW_LEN, FRAME_HEADER_LEN},
+        writer::MIN_CHUNK_SIZE,
+    };
 
-    /// A head's chunk table: the chunk size and the chunk count.
+    /// A head's chunk table, before its rows: the chunk size and the count.
     const CHUNK_TABLE_LEN: u64 = 8;
     /// A frame's entry in the file's frame index: its offset.
     const INDEX_ENTRY_LEN: u64 = 8;
 
-    match indirection.stored {
+    let entry = match indirection.stored {
         // Copied as those frames, under the same codec: at most a head and
         // a chunk per smallest chunk of the value.
         Stored::Frames(bytes) => {
             let frames = 1 + u64::from(indirection.size.div_ceil(MIN_CHUNK_SIZE));
-            u64::from(bytes) + INDEX_ENTRY_LEN * frames
+            return u64::from(bytes) + INDEX_ENTRY_LEN * frames;
         }
-        Stored::InBlock(bytes) if indirection.size > chunk_size => {
-            let frames = 1 + u64::from(indirection.size.div_ceil(chunk_size));
-            u64::from(bytes)
-                + (FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN) * frames
-                + CHUNK_TABLE_LEN
-        }
-        Stored::InBlock(bytes) => u64::from(bytes) + FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN,
+        Stored::InBlock(bytes) => u64::from(bytes),
+        Stored::Packed(record) => u64::from(record) + u64::from(indirection.size),
+    };
+    let head = entry + FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN;
+    if indirection.size > chunk_size {
+        let chunks = u64::from(indirection.size.div_ceil(chunk_size));
+        head + CHUNK_TABLE_LEN + chunks * (CHUNK_ROW_LEN as u64 + INDEX_ENTRY_LEN)
+    } else {
+        head
     }
 }
 
-/// The bytes of the blob frames `item` points at in the `stale` files, which
-/// a relocation into files written with `chunk_size` copies: its own value,
-/// or the references among its cells.
+/// At most the bytes the relocated copy of the value `indirection` names,
+/// under a key of `key_len` bytes, takes as `relocated` writes it: its
+/// frames as [`frame_bytes`] bounds them, or, for a value of a source whose
+/// dictionary the pass may leave behind, the value written anew, which a
+/// codec that saves nothing stores as it is: its entry raw.
 #[cfg(feature = "std")]
-fn stale_frame_bytes(
-    item: &InternalValue,
-    stale: &HashSet<BlobFileId>,
-    chunk_size: u32,
-) -> crate::Result<u64> {
+fn copy_bytes(
+    indirection: &crate::blob_tree::handle::BlobIndirection,
+    key_len: usize,
+    relocated: &Relocated,
+) -> u64 {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::blob_file::{frame::ENTRY_HEADER_LEN, packed::RECORD_HEADER_LEN};
+
+    let copied = frame_bytes(indirection, relocated.chunk_size);
+    if !relocated
+        .rewritten
+        .contains(&indirection.vhandle.blob_file_id)
+    {
+        return copied;
+    }
+    // A record or an entry of a block, whichever header is the larger, as
+    // much as a frame of its own takes. Past `u32` the bound is past any room.
+    let raw = ENTRY_HEADER_LEN.max(RECORD_HEADER_LEN) + key_len + indirection.size as usize;
+    let anew = BlobIndirection {
+        stored: Stored::InBlock(u32::try_from(raw).unwrap_or(u32::MAX)),
+        ..*indirection
+    };
+    copied.max(frame_bytes(&anew, relocated.chunk_size))
+}
+
+/// The bytes of the blob frames `item` points at in the files `relocated`
+/// moves, as it writes them: its own value, or the references among its
+/// cells, which are kept under its key.
+#[cfg(feature = "std")]
+fn stale_frame_bytes(item: &InternalValue, relocated: &Relocated) -> crate::Result<u64> {
     use crate::blob_tree::field_row::{RowCell, decode_row};
     use crate::blob_tree::handle::BlobIndirection;
     use crate::coding::Decode;
 
+    let key_len = item.key.user_key.len();
     if item.key.value_type.is_indirection() {
         let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
-        return Ok(if stale.contains(&indirection.vhandle.blob_file_id) {
-            frame_bytes(&indirection, chunk_size)
-        } else {
-            0
-        });
+        return Ok(
+            if relocated.stale.contains(&indirection.vhandle.blob_file_id) {
+                copy_bytes(&indirection, key_len, relocated)
+            } else {
+                0
+            },
+        );
     }
     if item.key.value_type.is_cell_row() {
         let mut bytes = 0;
         for field in decode_row(&item.value)? {
             if let RowCell::Ref { indirection, .. } = field.cell
-                && stale.contains(&indirection.vhandle.blob_file_id)
+                && relocated.stale.contains(&indirection.vhandle.blob_file_id)
             {
-                bytes += frame_bytes(&indirection, chunk_size);
+                bytes += copy_bytes(&indirection, key_len, relocated);
             }
         }
         return Ok(bytes);
@@ -1852,7 +1946,7 @@ fn tight_slices(
     inputs: &[Table],
     caps: SliceCaps,
     outputs: &SliceOutputs<'_>,
-    relocated: Option<&Relocated<'_>>,
+    relocated: Option<&Relocated>,
     comparator: &crate::comparator::SharedComparator,
     pace: &crate::table::util::Pacer,
 ) -> crate::Result<Vec<TightSlice>> {
@@ -1914,7 +2008,7 @@ fn tight_slices(
                 block.try_for_each_entry(comparator.clone(), |item| {
                     longest_key = longest_key.max(item.key.user_key.len() as u64);
                     // Bounded by the stale files' bytes.
-                    blobs += stale_frame_bytes(&item, relocated.stale, relocated.chunk_size)?;
+                    blobs += stale_frame_bytes(&item, relocated)?;
                     Ok(())
                 })?;
             }
@@ -1971,11 +2065,16 @@ fn tight_slices(
     };
     // Each output blob file closes with its metadata, its first and last keys
     // among it: a file per target's worth of frames, and one more for each
-    // codec and lifetime class the slice's frames may go to.
+    // codec and lifetime class the slice's frames may go to. A file of frames
+    // copied out of a source with a dictionary of its own holds it as well.
     let with_blobs = |blobs: u64| match relocated {
         Some(relocated) if blobs > 0 => {
-            let files = blobs.div_ceil(relocated.target_size.max(1)) + relocated.file_groups;
-            blobs + files * (BLOB_META_BYTES + 2 * longest_key)
+            let split = blobs.div_ceil(relocated.target_size.max(1));
+            let files = split + relocated.file_groups;
+            blobs
+                + files * (BLOB_META_BYTES + 2 * longest_key)
+                + relocated.dictionaries
+                + split * relocated.largest_dictionary
         }
         _ => blobs,
     };
@@ -2003,7 +2102,7 @@ fn tight_slices(
                     u64::try_from(u128::from(raw) * u128::from(file_len) / u128::from(data_bytes))
                         .unwrap_or(u64::MAX);
                 if let Some(relocated) = relocated {
-                    weight.1 += stale_frame_bytes(&item, relocated.stale, relocated.chunk_size)?;
+                    weight.1 += stale_frame_bytes(&item, relocated)?;
                 }
                 Ok(())
             })?;
@@ -2130,14 +2229,12 @@ fn run_tight_space_compaction(
     // the pass is sure to run, below.
     let estimate = merge_estimate(opts, &latest.version, payload, &inputs, &stale_files, None);
     let stale_ids: Vec<BlobFileId> = stale_files.iter().map(BlobFile::id).collect();
-    // A relocation writes a file for each codec of its sources.
-    let mut codecs: Vec<crate::CompressionType> = Vec::new();
-    for bf in &stale_files {
-        if !codecs.contains(&bf.compression()) {
-            codecs.push(bf.compression());
-        }
-    }
-    let stale_codecs = codecs.len() as u64;
+    // What relocating them writes, read off the files before their handles go.
+    let relocation = opts
+        .config
+        .kv_separation_opts
+        .as_ref()
+        .map(|blob_opts| Relocated::new(&stale_files, blob_opts));
     drop(stale_files);
     let relocating = !stale_ids.is_empty();
 
@@ -2266,28 +2363,7 @@ fn run_tight_space_compaction(
             total: dest_free.min(blob_free).min(quota_headroom).max(1),
         }
     };
-    let stale_set: HashSet<BlobFileId> = stale_ids.iter().copied().collect();
-    let relocated = relocating_blobs.then(|| Relocated {
-        stale: &stale_set,
-        target_size: opts
-            .config
-            .kv_separation_opts
-            .as_ref()
-            .map_or(u64::MAX, |blob_opts| blob_opts.file_target_size),
-        // The output files are written with the sizes the options give now,
-        // which may chunk a value its source file holds in a block.
-        chunk_size: opts
-            .config
-            .kv_separation_opts
-            .as_ref()
-            .map_or(u32::MAX, |blob_opts| blob_opts.frame_sizes().chunk_size),
-        file_groups: stale_codecs
-            * opts
-                .config
-                .kv_separation_opts
-                .as_ref()
-                .map_or(1, |blob_opts| u64::from(blob_opts.lifetime_groups.get())),
-    });
+    let relocated = relocation.filter(|_| relocating_blobs);
     let outputs = SliceOutputs {
         target_size: payload.target_size,
         cut_keys: &cut_keys,
@@ -3336,6 +3412,7 @@ fn run_subcompaction(
             .use_writeback_bytes(opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
             .use_frame_sizes(blob_opts.frame_sizes())
+            .use_dictionary_classes(blob_opts.dictionary_classes)
             .use_clock(opts.config.clock.clone())
             .use_key_domains(
                 opts.config.key_domains.clone(),
@@ -3364,6 +3441,11 @@ fn run_subcompaction(
                     opts.tree_id,
                 )
                 .with_drain_below(drain_below)
+                // Every slice, the last one included, reserves room for the
+                // live values it moves; a block copied whole also writes its
+                // dead ones, which that room does not count, so a slice writes
+                // every value anew.
+                .with_block_copy_share(None)
                 .with_fresh_values(FreshValues {
                     options: blob_opts.clone(),
                     compression: rc.blob_compression,
@@ -3663,10 +3745,6 @@ pub(crate) fn pick_blob_files_to_rewrite(
 struct BlobRewrite {
     files: Vec<BlobFile>,
     /// Some of `files` are relocated for locality rather than for staleness.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(dead_code, reason = "read only by the std merge-on-read fast path")
-    )]
     for_locality: bool,
 }
 
@@ -3702,10 +3780,10 @@ fn pick_blob_files_for_merge(
 /// the dictionary each output file records, and the dictionary of the
 /// snapshot's blob policy, with its two-pass setting, encodes the new values.
 #[cfg_attr(
-    not(zstd_any),
+    not(any(zstd_any, feature = "std")),
     expect(
         clippy::missing_const_for_fn,
-        reason = "the zstd build reads the dictionaries"
+        reason = "the zstd build reads the dictionaries, the std build the parallel workers"
     )
 )]
 fn with_fresh_encoding(
@@ -3713,6 +3791,10 @@ fn with_fresh_encoding(
     opts: &Options,
     rc: &crate::runtime_config::RuntimeConfig,
 ) -> BlobFileWriter {
+    // New values and the block values rewritten out of their blocks are
+    // compressed here; copied frames are not.
+    #[cfg(feature = "std")]
+    let writer = writer.use_parallel_compression(opts.config.parallel_compression());
     #[cfg(zstd_any)]
     {
         let dicts = opts.config.current_zstd_dictionaries();
@@ -4284,6 +4366,7 @@ fn merge_tables(
             &pace,
         );
     }
+    let for_locality = blob_rewrite.for_locality;
     let blob_files_to_rewrite = blob_rewrite.files;
 
     // ---- Parallel sub-compaction (std only) ----
@@ -4706,6 +4789,7 @@ fn merge_tables(
                 .use_writeback_bytes(opts.config.writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
                 .use_frame_sizes(blob_opts.frame_sizes())
+                .use_dictionary_classes(blob_opts.dictionary_classes)
                 .use_clock(opts.config.clock.clone())
                 .use_key_domains(
                     opts.config.key_domains.clone(),
@@ -4730,6 +4814,10 @@ fn merge_tables(
                         opts.config.comparator.clone(),
                         opts.tree_id,
                     )
+                    // A pass that relocates for locality rewrites every value
+                    // in key order: a block copied whole would keep its
+                    // source's place among the files it interleaves with.
+                    .with_block_copy_share((!for_locality).then(|| blob_opts.block_copy_share()))
                     .with_fresh_values(FreshValues {
                         options: blob_opts.clone(),
                         compression: rc.blob_compression,

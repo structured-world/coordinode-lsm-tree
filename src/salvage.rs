@@ -3152,8 +3152,10 @@ pub(crate) fn blob_key_regresses(
 /// # Errors
 ///
 /// Returns an error when `source` cannot be opened at all (its metadata / SFA
-/// trailer is unreadable), when it is dictionary-compressed and no matching
-/// dictionary was supplied, or when writing `dest` fails. Per-record
+/// trailer is unreadable), when it is dictionary-compressed, stores no
+/// dictionary of its own and no matching one was supplied, or when writing
+/// `dest` fails. A dictionary the source stores is the one it decodes with,
+/// whatever is supplied. Per-record
 /// corruption is not an error: such records are dropped and listed in the
 /// returned [`BlobSalvageReport`].
 ///
@@ -3208,9 +3210,10 @@ pub(crate) fn salvage_blob_file_on(
     // the scanner yields on-disk bytes, so a compressed record is DECOMPRESSED
     // here (proving it round-trips) and re-emitted through a writer stamped
     // with the same compression — never copied through verbatim under a
-    // mismatched descriptor. A DICTIONARY-compressed source decodes only when
-    // the caller supplies the matching dictionary (manifest repair passes the
-    // one the source's descriptor names); without it this entry fails closed, the same
+    // mismatched descriptor. A DICTIONARY-compressed source decodes with the
+    // dictionary it stores, or, storing none, only when the caller supplies
+    // the matching one (manifest repair passes the one the source's
+    // descriptor names); without either this entry fails closed, the same
     // way SST salvage fails closed on range tombstones.
     //
     // The metadata alone, not a handle: a handle needs the frame index, and a
@@ -3223,6 +3226,14 @@ pub(crate) fn salvage_blob_file_on(
     let compression = source_meta.compression;
     // The salvaged file holds the source's values, so it keeps their class.
     let lifetime_class = source_meta.lifetime_class;
+    // The dictionary the source stores, read before the destination exists:
+    // a failed read must leave nothing behind for a retry to trip on. Its
+    // frames were written with that one, whatever the caller holds under the
+    // same 32-bit id; the caller's serves a file that stores none.
+    #[cfg(zstd_any)]
+    let own_dictionary = crate::vlog::read_blob_file_dictionary(source, &**fs, &source_meta)?;
+    #[cfg(zstd_any)]
+    let zstd_dictionary = own_dictionary.as_ref().or(zstd_dictionary);
     #[cfg(zstd_any)]
     if let crate::CompressionType::ZstdDict { dict_id, .. } = compression {
         let Some(dict) = zstd_dictionary else {
@@ -3292,8 +3303,12 @@ pub(crate) fn salvage_blob_file_on(
     #[cfg(zstd_any)]
     {
         // The re-emit re-compresses under the source's descriptor; a
-        // dictionary descriptor needs the dictionary on the write side too.
-        writer = writer.use_zstd_dictionary(zstd_dictionary.cloned());
+        // dictionary descriptor needs the dictionary on the write side too,
+        // stored in the file when the source stored it, as no tree's set holds
+        // a file's own.
+        writer = writer
+            .use_zstd_dictionary(zstd_dictionary.cloned())
+            .keep_dictionary_in_file(own_dictionary.is_some());
     }
 
     let mut records_total = 0usize;

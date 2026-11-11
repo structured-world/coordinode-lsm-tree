@@ -330,12 +330,10 @@ fn blob_tree_major_compact_relocation_interleaved() -> lsm_tree::Result<()> {
             assert_eq!(
                 &{
                     let mut map = lsm_tree::HashMap::default();
+                    // Above the 8 KiB block size: a frame of its own.
                     let size = big_value.len() as u64;
-                    let block = common::block_entry_len(b"d", size);
-                    map.insert(
-                        0,
-                        FragmentationEntry::new(1, size, 0).with_block_bytes(block),
-                    );
+                    let stored = common::stored_len(b"d", size);
+                    map.insert(0, FragmentationEntry::new(1, size, stored));
                     map
                 },
                 &*gc_stats,

@@ -257,6 +257,11 @@ impl ByteView {
         self.len() <= INLINE_SIZE
     }
 
+    /// Whether no other view shares its bytes: an inline view owns its own.
+    pub(crate) fn is_unique(&self) -> bool {
+        self.is_inline() || self.get_heap_region().ref_count.load(Ordering::Acquire) == 1
+    }
+
     pub(crate) fn update_prefix(&mut self) {
         if !self.is_inline() {
             unsafe {

@@ -5,7 +5,10 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-use super::frame::{Codec, EntrySpec, FrameKind, encode_frame, head_payload};
+use super::frame::{
+    ChunkSpec, Codec, EntrySpec, FrameKind, encode_chunk, encode_frame_parts,
+    encode_frame_parts_compressed, head_payload,
+};
 use super::meta::{META_VERSION, Metadata};
 use crate::io::BufWriter;
 #[cfg(not(feature = "std"))]
@@ -65,10 +68,32 @@ pub(crate) struct FrameSizes {
     pub(crate) chunk_size: u32,
 }
 
+/// A block copied as it was stored, with what it adds to the file that
+/// copies it, as the scan that read and checked it counted it.
+pub(crate) struct CopiedBlock<'a> {
+    /// The block's frame as stored.
+    pub(crate) stored: &'a [u8],
+    /// The keys of its first and last values.
+    pub(crate) first_key: &'a [u8],
+    pub(crate) last_key: &'a [u8],
+    /// How many values it holds, and their decoded bytes.
+    pub(crate) values: u16,
+    pub(crate) value_bytes: u64,
+    /// The block entry bytes its values are charged, as its writer counted
+    /// them.
+    pub(crate) entry_bytes: u64,
+}
+
 impl FrameSizes {
-    /// A block of 16 KiB, chunks of 256 KiB.
+    /// A block of 8 KiB, chunks of 256 KiB, chosen from the blob file sweep in
+    /// `docs/BENCHMARKING.md`. Against a frame per value an 8 KiB block takes
+    /// a fifth to two fifths less room, and a cold point read of documents
+    /// costs about what it did; 16 KiB saves 4 to 8% more for a third more per
+    /// read.
+    /// A 256 KiB chunk reads a 4 KiB range of a large value in under 0.5 ms
+    /// where a frame of the whole value took 60 to 120 ms.
     pub(crate) const DEFAULT: Self = Self {
-        block_target: 16 * 1024,
+        block_target: 8 * 1024,
         chunk_size: 256 * 1024,
     };
 }
@@ -226,6 +251,21 @@ pub(crate) struct Writer {
     #[cfg(zstd_any)]
     pub(crate) zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 
+    /// The bytes of the dictionary a zstd file builds from its own first
+    /// values, `0` for none: see [`Self::use_file_dictionary`].
+    #[cfg(zstd_any)]
+    file_dictionary: u32,
+
+    /// The values collected toward the file's dictionary while it does not
+    /// exist yet, back to back.
+    #[cfg(zstd_any)]
+    dictionary_samples: Vec<u8>,
+
+    /// Whether [`Self::zstd_dictionary`] is the file's own, built from its
+    /// values and written into it.
+    #[cfg(zstd_any)]
+    pub(crate) dictionary_in_file: bool,
+
     /// Whether zstd levels 19-22 run the `btultra2` two-pass seed. Defaults to
     /// `true`, the codec's own behaviour; set from the live runtime config via
     /// [`Self::use_zstd_two_pass_seed`].
@@ -235,14 +275,150 @@ pub(crate) struct Writer {
     /// How this file sizes its frames.
     pub(crate) sizes: FrameSizes,
 
+    /// The frame classes a dictionary codec compresses with its dictionary.
+    pub(crate) dictionary_classes: crate::config::DictionaryClasses,
+
     /// Where each frame written so far starts.
     frames: Vec<u64>,
 
     /// The block the next small value joins.
     block: PendingBlock,
 
+    /// The records of the packed block the next small value joins (see
+    /// [`Self::packs`]), back to back, their checksums in order, how many,
+    /// and their values' bytes.
+    packed: Vec<u8>,
+    packed_sums: Vec<u8>,
+    packed_count: u16,
+    packed_raw: u64,
+
     /// A frame being encoded, kept so a writer allocates it once.
     scratch: Vec<u8>,
+
+    /// Where the chunks of a large value are compressed, when not on the
+    /// writer's thread one after another.
+    #[cfg(feature = "std")]
+    parallel: Option<crate::table::writer::ParallelCompression>,
+}
+
+/// One chunk of a large value to encode on a worker. The chunk is the job's
+/// own copy: a worker outlives the borrow of the value written.
+#[cfg(feature = "std")]
+struct ChunkJob(Vec<u8>);
+
+/// A chunk encoded: compressed bytes when compression shrank it, `None` when
+/// it is stored as it is, and its row in the head's table.
+type EncodedChunk = (Option<Vec<u8>>, ChunkSpec);
+
+/// A writer's codec as a worker holds it, its dictionary shared rather than
+/// borrowed: a worker outlives the borrow of the writer.
+#[cfg(feature = "std")]
+pub(crate) struct OwnedCodec {
+    compression: CompressionType,
+    #[cfg(zstd_any)]
+    dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
+    #[cfg(zstd_any)]
+    two_pass_seed: bool,
+    plain: bool,
+}
+
+#[cfg(feature = "std")]
+impl OwnedCodec {
+    fn as_codec(&self) -> Codec<'_> {
+        Codec {
+            compression: self.compression,
+            #[cfg(zstd_any)]
+            dictionary: self.dictionary.as_deref(),
+            #[cfg(zstd_any)]
+            two_pass_seed: self.two_pass_seed,
+            #[cfg(not(zstd_any))]
+            dictionary: core::marker::PhantomData,
+            plain: self.plain,
+        }
+    }
+
+    /// `value` compressed under this codec off the writer's thread, for the
+    /// writer to take when it writes the value under the same codec.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the compression.
+    pub(crate) fn precompress(&self, value: &[u8]) -> crate::Result<PreCompressed> {
+        let codec = self.as_codec();
+        Ok(PreCompressed {
+            stamp: CodecStamp::of(&codec),
+            compressed: super::frame::compress_payload(value, codec)?,
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl crate::table::writer::ordered_pipeline::OrderedJob for ChunkJob {
+    type Context = OwnedCodec;
+    type Output = crate::Result<EncodedChunk>;
+
+    fn run(self, codec: &OwnedCodec) -> Self::Output {
+        // The chunk is stored as it is from the value written, not from
+        // this copy: only what compression made is handed back.
+        encode_chunk(&self.0, codec.as_codec())
+    }
+}
+
+/// What a codec compresses with, down to the dictionary itself: two codecs
+/// with one stamp produce the same bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CodecStamp {
+    compression: CompressionType,
+    plain: bool,
+    /// The full fingerprint of the dictionary: a dictionary id is 32 bits,
+    /// and two files' dictionaries sharing it would decode each other's
+    /// values into garbage.
+    #[cfg(zstd_any)]
+    dictionary: Option<u64>,
+}
+
+impl CodecStamp {
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::trivially_copy_pass_by_ref,
+            reason = "without zstd a codec carries no dictionary and fits a byte"
+        )
+    )]
+    fn of(codec: &Codec<'_>) -> Self {
+        Self {
+            compression: codec.compression,
+            plain: codec.plain,
+            #[cfg(zstd_any)]
+            dictionary: codec
+                .dictionary
+                .map(crate::compression::ZstdDictionary::id64),
+        }
+    }
+}
+
+/// A value compressed ahead of its write, under the codec its stamp names:
+/// taken by the write only when that is still the codec the value is written
+/// under, and compressed again by the write otherwise.
+pub(crate) struct PreCompressed {
+    stamp: CodecStamp,
+    /// What compression made, `None` when it saved nothing.
+    compressed: Option<Vec<u8>>,
+}
+
+impl PreCompressed {
+    /// What compressing `value` under `codec` makes: this, when it was made
+    /// under `codec`, else made now.
+    fn compressed_for(
+        pre: Option<Self>,
+        value: &[u8],
+        codec: Codec<'_>,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        match pre {
+            Some(pre) if pre.stamp == CodecStamp::of(&codec) => Ok(pre.compressed),
+            _ => super::frame::compress_payload(value, codec),
+        }
+    }
 }
 
 impl Writer {
@@ -357,13 +533,38 @@ impl Writer {
             #[cfg(zstd_any)]
             zstd_dictionary: None,
             #[cfg(zstd_any)]
+            file_dictionary: 0,
+            #[cfg(zstd_any)]
+            dictionary_samples: Vec::new(),
+            #[cfg(zstd_any)]
+            dictionary_in_file: false,
+            #[cfg(zstd_any)]
             zstd_two_pass_seed: true,
 
             sizes: FrameSizes::DEFAULT,
+            dictionary_classes: crate::config::DictionaryClasses::DEFAULT,
             frames: Vec::new(),
             block: PendingBlock::default(),
+            packed: Vec::new(),
+            packed_sums: Vec::new(),
+            packed_count: 0,
+            packed_raw: 0,
             scratch: Vec::new(),
+            #[cfg(feature = "std")]
+            parallel: None,
         })
+    }
+
+    /// Compresses the chunks of a large value on `parallel`'s workers, or one
+    /// after another on the writer's thread without it.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn use_parallel_compression(
+        mut self,
+        parallel: Option<crate::table::writer::ParallelCompression>,
+    ) -> Self {
+        self.parallel = parallel;
+        self
     }
 
     pub(crate) fn use_compression(mut self, compressor: CompressionType) -> Self {
@@ -375,6 +576,17 @@ impl Writer {
     #[must_use]
     pub(crate) fn use_frame_sizes(mut self, sizes: FrameSizes) -> Self {
         self.sizes = sizes;
+        self
+    }
+
+    /// Compresses only the frames of `classes` with a dictionary codec's
+    /// dictionary, the others at its level without one.
+    #[must_use]
+    pub(crate) fn use_dictionary_classes(
+        mut self,
+        classes: crate::config::DictionaryClasses,
+    ) -> Self {
+        self.dictionary_classes = classes;
         self
     }
 
@@ -424,7 +636,9 @@ impl Writer {
     }
 
     /// Starts writing back what the file wrote since the last writeback, once
-    /// at least `writeback_bytes` of it gathered.
+    /// at least `writeback_bytes` of it gathered. Checked once per value
+    /// written, not per frame: a range hint per chunk of a large value cost its
+    /// write a fifth of its time.
     fn writeback_if_due(&mut self) -> crate::Result<()> {
         // `written_back` only ever takes a value of `offset`, which grows.
         let pending = self.offset - self.written_back;
@@ -469,6 +683,129 @@ impl Writer {
         self
     }
 
+    /// Stores the dictionary [`Self::use_zstd_dictionary`] gave in the file, as
+    /// one of its own, when `own`: frames copied from a file that held it need
+    /// it next to them, as no tree's set holds it.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub(crate) fn keep_dictionary_in_file(mut self, own: bool) -> Self {
+        self.dictionary_in_file = own;
+        self
+    }
+
+    /// Builds a dictionary of `bytes` from this file's own first values when
+    /// it compresses with zstd and no dictionary: every value up to the chunk
+    /// size then gets a frame of its own, none shares a block, and a value is
+    /// compressed with the file's dictionary once the file holds one, so a
+    /// read of a value decodes that value alone. The values written before
+    /// the dictionary exists are compressed without it. `0` builds none.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub(crate) fn use_file_dictionary(mut self, bytes: u32) -> Self {
+        self.set_file_dictionary(bytes);
+        self
+    }
+
+    /// [`Self::use_file_dictionary`] on a writer that holds nothing yet: a
+    /// file that wrote a value keeps the dictionary it began with.
+    #[cfg(zstd_any)]
+    pub(crate) fn set_file_dictionary(&mut self, bytes: u32) {
+        if self.item_count == 0 && !self.dictionary_in_file {
+            self.file_dictionary = bytes;
+        }
+    }
+
+    /// Whether this file is collecting values toward a dictionary of its own.
+    #[cfg(zstd_any)]
+    fn collecting_dictionary(&self) -> bool {
+        self.file_dictionary > 0
+            && !self.dictionary_in_file
+            && matches!(self.compression, CompressionType::Zstd(_))
+    }
+
+    /// Whether small values are packed records rather than block entries:
+    /// under the file's own dictionary, and in a file that compresses
+    /// nothing, where a block gains nothing from sharing.
+    fn packs(&self) -> bool {
+        #[cfg(zstd_any)]
+        let own_dictionary = self.file_dictionary_on();
+        #[cfg(not(zstd_any))]
+        let own_dictionary = false;
+        own_dictionary || self.compression == CompressionType::None
+    }
+
+    /// Whether values are written a frame each under the file's own
+    /// dictionary, built or being built.
+    #[cfg(zstd_any)]
+    fn file_dictionary_on(&self) -> bool {
+        self.dictionary_in_file || self.collecting_dictionary()
+    }
+
+    /// Takes `value` toward the file's dictionary, and builds it once the
+    /// samples fill it: the dictionary is the samples as they are, raw
+    /// content a frame's matches reach back into, the latest last.
+    #[cfg(zstd_any)]
+    fn sample_for_dictionary(&mut self, value: &[u8]) {
+        let CompressionType::Zstd(level) = self.compression else {
+            return;
+        };
+        let want = self.file_dictionary as usize;
+        let room = want - self.dictionary_samples.len();
+        self.dictionary_samples
+            .extend_from_slice(value.get(..room.min(value.len())).unwrap_or_default());
+        if self.dictionary_samples.len() < want {
+            return;
+        }
+        // Bytes that open with a trained dictionary's magic are read as one,
+        // and these are raw content: the first byte goes, and with it the
+        // magic, here once and so in the dictionary the file stores.
+        if self
+            .dictionary_samples
+            .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC)
+        {
+            self.dictionary_samples.remove(0);
+        }
+        let dict = crate::compression::ZstdDictionary::new(&self.dictionary_samples);
+        self.compression = CompressionType::ZstdDict {
+            level,
+            dict_id: dict.id(),
+        };
+        self.zstd_dictionary = Some(alloc::sync::Arc::new(dict));
+        self.dictionary_in_file = true;
+        self.dictionary_samples = Vec::new();
+    }
+
+    /// Stops building a dictionary of the file's own before frames encoded
+    /// elsewhere are copied in as they are: a file records one codec, theirs.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] for a file that already wrote values
+    /// toward its own dictionary.
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            clippy::needless_pass_by_ref_mut,
+            reason = "without zstd no file builds a dictionary of its own"
+        )
+    )]
+    fn leave_file_dictionary(&mut self) -> crate::Result<()> {
+        // A file that holds its dictionary takes frames of that codec, its
+        // own; only one still gathering values toward it cannot.
+        #[cfg(zstd_any)]
+        if self.collecting_dictionary() {
+            if self.item_count > 0 {
+                return Err(crate::Error::InvalidHeader(
+                    "verbatim frames into a file building its own dictionary",
+                ));
+            }
+            self.file_dictionary = 0;
+        }
+        Ok(())
+    }
+
     /// Returns the blob file ID.
     #[must_use]
     pub(crate) fn blob_file_id(&self) -> BlobFileId {
@@ -478,10 +815,36 @@ impl Writer {
     /// Bytes the file holds so far, the values waiting for their block counted.
     #[must_use]
     pub(crate) fn len_written(&self) -> u64 {
-        self.offset + self.block.len()
+        self.offset + self.block.len() + self.packed.len() as u64
     }
 
-    fn codec(&self) -> Codec<'_> {
+    /// The codec a frame of `kind` is compressed under: the file's, without
+    /// its dictionary for a class the dictionary does not apply to.
+    fn codec(&self, kind: FrameKind) -> Codec<'_> {
+        // Before the file's own dictionary exists: its level, no dictionary,
+        // said so by the frame, as the file will record the dictionary codec.
+        #[cfg(zstd_any)]
+        if self.collecting_dictionary() {
+            return Codec {
+                compression: self.compression,
+                dictionary: None,
+                two_pass_seed: self.zstd_two_pass_seed,
+                plain: true,
+            };
+        }
+        #[cfg(zstd_any)]
+        if let CompressionType::ZstdDict { level, .. } = self.compression
+            && !self.dictionary_classes.covers(kind)
+        {
+            return Codec {
+                compression: CompressionType::Zstd(level),
+                dictionary: None,
+                two_pass_seed: self.zstd_two_pass_seed,
+                plain: true,
+            };
+        }
+        #[cfg(not(zstd_any))]
+        let _ = kind;
         Codec {
             compression: self.compression,
             #[cfg(zstd_any)]
@@ -490,7 +853,47 @@ impl Writer {
             two_pass_seed: self.zstd_two_pass_seed,
             #[cfg(not(zstd_any))]
             dictionary: core::marker::PhantomData,
+            plain: false,
         }
+    }
+
+    /// [`Self::codec`] for a worker to hold.
+    #[cfg(feature = "std")]
+    fn owned_codec(&self, kind: FrameKind) -> OwnedCodec {
+        let codec = self.codec(kind);
+        OwnedCodec {
+            compression: codec.compression,
+            #[cfg(zstd_any)]
+            dictionary: codec
+                .dictionary
+                .and(self.zstd_dictionary.as_ref())
+                .map(alloc::sync::Arc::clone),
+            #[cfg(zstd_any)]
+            two_pass_seed: codec.two_pass_seed,
+            plain: codec.plain,
+        }
+    }
+
+    /// The codec a value of `value_len` bytes written next would be
+    /// compressed under as a whole, for a worker to compress it ahead: a
+    /// packed record or a frame of its own. `None` for a value that shares a
+    /// block, whose compression is the block's, one that is chunked, whose
+    /// chunks compress on the workers already, and in a file that compresses
+    /// nothing.
+    #[cfg(feature = "std")]
+    pub(crate) fn value_codec(&self, value_len: u32) -> Option<OwnedCodec> {
+        if self.compression == CompressionType::None {
+            return None;
+        }
+        let FrameSizes {
+            block_target,
+            chunk_size,
+        } = self.sizes;
+        if self.packs() && value_len < block_target {
+            return Some(self.owned_codec(FrameKind::Block));
+        }
+        (value_len >= block_target && value_len <= chunk_size)
+            .then(|| self.owned_codec(FrameKind::Single))
     }
 
     /// The number the next frame written gets.
@@ -504,8 +907,9 @@ impl Writer {
         self.put_frame_parts(bytes, &[])
     }
 
-    /// Writes one encoded frame given as `head` then `tail`, at the current
-    /// offset, so a payload borrowed from elsewhere is not staged first.
+    /// Writes one encoded frame given as `head` followed by `tail`, at the
+    /// current offset, so a payload borrowed from elsewhere is not staged
+    /// first.
     fn put_frame_parts(&mut self, head: &[u8], tail: &[u8]) -> crate::Result<()> {
         self.frames.push(self.offset);
         self.writer.write_all(head)?;
@@ -513,10 +917,11 @@ impl Writer {
         let len = (head.len() + tail.len()) as u64;
         self.offset += len;
         self.written_blob_bytes += len;
-        self.writeback_if_due()
+        Ok(())
     }
 
-    /// Encodes and writes one frame.
+    /// Encodes and writes one frame. A payload stored as it is goes to the
+    /// file from where it lies, not through the frame buffer.
     fn emit<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
         &mut self,
         kind: FrameKind,
@@ -524,14 +929,137 @@ impl Writer {
         payload: &[u8],
     ) -> crate::Result<()> {
         let mut scratch = core::mem::take(&mut self.scratch);
-        let encoded = encode_frame(kind, entries, payload, self.codec(), &mut scratch);
-        let written = encoded.and_then(|()| self.put_frame(&scratch));
+        let encoded = encode_frame_parts(kind, entries, payload, self.codec(kind), &mut scratch);
+        let written = encoded
+            .and_then(|as_is| self.put_frame_parts(&scratch, if as_is { payload } else { &[] }));
         self.scratch = scratch;
         written
     }
 
-    /// Writes the block waiting for its values, if any.
+    /// [`Self::emit`] for a frame of one whole value, compressed ahead as
+    /// `pre` when it was (see [`PreCompressed`]).
+    fn emit_pre(
+        &mut self,
+        kind: FrameKind,
+        entries: &[EntrySpec<'_>],
+        payload: &[u8],
+        pre: Option<PreCompressed>,
+    ) -> crate::Result<()> {
+        if pre.is_none() {
+            return self.emit(kind, entries, payload);
+        }
+        let mut scratch = core::mem::take(&mut self.scratch);
+        let codec = self.codec(kind);
+        let encoded = PreCompressed::compressed_for(pre, payload, codec).and_then(|compressed| {
+            encode_frame_parts_compressed(
+                kind,
+                entries,
+                payload,
+                codec,
+                compressed.as_deref(),
+                &mut scratch,
+            )
+        });
+        let written = encoded
+            .and_then(|as_is| self.put_frame_parts(&scratch, if as_is { payload } else { &[] }));
+        self.scratch = scratch;
+        written
+    }
+
+    /// Encodes `value` as chunks of `chunk_size` bytes, in order: all of them
+    /// before any is written, since the head that precedes them lists how
+    /// each is stored. Compressed chunks are encoded on the parallel workers
+    /// when the writer has them and the value has more than one chunk;
+    /// without a codec an encode is a checksum, which a worker would only add
+    /// a copy to.
+    fn encode_chunks(&self, value: &[u8], chunk_size: usize) -> crate::Result<Vec<EncodedChunk>> {
+        let mut encoded = Vec::with_capacity(value.len().div_ceil(chunk_size));
+        #[cfg(feature = "std")]
+        if let Some(parallel) = &self.parallel
+            && parallel.threads > 1
+            && self.compression != CompressionType::None
+            && value.len() > chunk_size
+        {
+            let codec = self.owned_codec(FrameKind::Chunk);
+            // Two chunks in flight per worker keep every worker fed.
+            let in_flight = parallel.threads * 2;
+            let mut pipeline = crate::table::writer::ordered_pipeline::OrderedPipeline::new(
+                alloc::sync::Arc::clone(&parallel.spawner),
+                codec,
+                parallel.threads,
+                in_flight,
+            );
+            #[expect(
+                clippy::expect_used,
+                reason = "taken only while a chunk is pending, which take_next then returns"
+            )]
+            for chunk in value.chunks(chunk_size) {
+                if pipeline.pending() == in_flight {
+                    encoded.push(pipeline.take_next().expect("a chunk is pending")?);
+                }
+                pipeline.submit(ChunkJob(chunk.to_vec()));
+            }
+            #[expect(
+                clippy::expect_used,
+                reason = "taken only while a chunk is pending, which take_next then returns"
+            )]
+            while pipeline.pending() > 0 {
+                encoded.push(pipeline.take_next().expect("a chunk is pending")?);
+            }
+            return Ok(encoded);
+        }
+        let codec = self.codec(FrameKind::Chunk);
+        for chunk in value.chunks(chunk_size) {
+            encoded.push(encode_chunk(chunk, codec)?);
+        }
+        Ok(encoded)
+    }
+
+    /// Writes `chunks`, the chunks of `value` of `chunk_size` bytes each as
+    /// encoded, back to back, each where the frame index places it. A run of
+    /// chunks stored as they are is one range of the value, written from it
+    /// in one call, as a frame of the whole value would be.
+    fn put_chunks(
+        &mut self,
+        value: &[u8],
+        chunk_size: usize,
+        chunks: &[EncodedChunk],
+    ) -> crate::Result<()> {
+        let mut run_start: Option<usize> = None;
+        for (at, (compressed, _)) in chunks.iter().enumerate() {
+            let from = at * chunk_size;
+            match compressed {
+                None => {
+                    let start = *run_start.get_or_insert(from);
+                    self.frames.push(self.offset + (from - start) as u64);
+                }
+                Some(bytes) => {
+                    if let Some(start) = run_start.take() {
+                        self.put_bytes(value.get(start..from).unwrap_or_default())?;
+                    }
+                    self.frames.push(self.offset);
+                    self.put_bytes(bytes)?;
+                }
+            }
+        }
+        if let Some(start) = run_start {
+            self.put_bytes(value.get(start..).unwrap_or_default())?;
+        }
+        Ok(())
+    }
+
+    /// Writes `bytes` at the current offset, as part of the frames placed so
+    /// far.
+    fn put_bytes(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.writer.write_all(bytes)?;
+        self.offset += bytes.len() as u64;
+        self.written_blob_bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Writes the block waiting for its values, packed or not, if any.
     fn close_block(&mut self) -> crate::Result<()> {
+        self.close_packed()?;
         if self.block.is_empty() {
             return Ok(());
         }
@@ -566,6 +1094,18 @@ impl Writer {
         self.uncompressed_bytes += u64::from(value_len);
     }
 
+    /// [`Self::note_key`] for a run of values written at once: `count` of
+    /// them from `first` to `last`, `value_bytes` decoded.
+    fn note_keys(&mut self, first: &[u8], last: &[u8], count: u64, value_bytes: u64) {
+        if self.first_key.is_none() {
+            self.first_key = Some(first.into());
+        }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(last);
+        self.item_count += count;
+        self.uncompressed_bytes += value_bytes;
+    }
+
     /// Writes an item into the file, into the frame its size calls for, and
     /// returns where it lies.
     ///
@@ -586,6 +1126,27 @@ impl Writer {
         seqno: SeqNo,
         value: &[u8],
     ) -> crate::Result<FrameRef> {
+        self.write_pre(key, seqno, value, None)
+    }
+
+    /// [`Self::write`], the value compressed ahead as `pre` when it was (see
+    /// [`Self::value_codec`]): taken when that is still the codec the value
+    /// is written under, compressed again otherwise.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::write`].
+    pub(crate) fn write_pre(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+        pre: Option<PreCompressed>,
+    ) -> crate::Result<FrameRef> {
         assert_ne!(key.len(), 0, "a blob is written under a non-empty key");
         assert!(u16::try_from(key.len()).is_ok(), "keys are u16 length max");
         let value_len = check_size_cap(value.len())?;
@@ -594,6 +1155,25 @@ impl Writer {
             block_target,
             chunk_size,
         } = self.sizes;
+        // A small value that packs is a record of its own in a packed block,
+        // read without its neighbours, and under the file's own dictionary a
+        // sample until the dictionary exists.
+        if self.packs() && value_len < block_target {
+            #[cfg(zstd_any)]
+            let sample = self.collecting_dictionary();
+            let at = self.write_packed(key, seqno, value, pre)?;
+            self.note_key(key, value_len);
+            #[cfg(zstd_any)]
+            if sample {
+                self.sample_for_dictionary(value);
+            }
+            self.writeback_if_due()?;
+            return Ok(at);
+        }
+        // A value of any frame is a sample of the file's own dictionary until
+        // the dictionary exists, taken after the value is written without it.
+        #[cfg(zstd_any)]
+        let sample = self.collecting_dictionary();
         let at = if value_len < block_target {
             // A block is sized by its entries, keys and values alike: small
             // values under long keys would otherwise fill it with keys.
@@ -637,7 +1217,7 @@ impl Writer {
                 value_len,
             };
             let before = self.offset;
-            self.emit(FrameKind::Single, &[entry], value)?;
+            self.emit_pre(FrameKind::Single, &[entry], value, pre)?;
             FrameRef {
                 frame,
                 index: 0,
@@ -653,10 +1233,13 @@ impl Writer {
                 value_len,
             };
             let before = self.offset;
-            self.emit(FrameKind::Head, &[entry], &head_payload(chunk_size, chunks))?;
-            for chunk in value.chunks(chunk_size as usize) {
-                self.emit(FrameKind::Chunk, &[], chunk)?;
+            let encoded = self.encode_chunks(value, chunk_size as usize)?;
+            if encoded.len() != chunks as usize {
+                return Err(crate::Error::InvalidHeader("blob chunk count"));
             }
+            let specs: Vec<ChunkSpec> = encoded.iter().map(|(_, spec)| *spec).collect();
+            self.emit(FrameKind::Head, &[entry], &head_payload(chunk_size, &specs))?;
+            self.put_chunks(value, chunk_size as usize, &encoded)?;
             FrameRef {
                 frame,
                 index: 0,
@@ -664,13 +1247,118 @@ impl Writer {
             }
         };
         self.note_key(key, value_len);
+        #[cfg(zstd_any)]
+        if sample {
+            self.sample_for_dictionary(value);
+        }
+        self.writeback_if_due()?;
         Ok(at)
+    }
+
+    /// Writes `value` as a record of the packed block being gathered, closing
+    /// it first when it holds the block target or a record starting past it
+    /// would not be named by a handle's index. A read of one value reads its
+    /// record alone whatever the block holds; the block's size is what a
+    /// scan, a collection and the frame index see, as of a block of entries.
+    fn write_packed(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+        pre: Option<PreCompressed>,
+    ) -> crate::Result<FrameRef> {
+        use super::packed::{PACKED_REACH, encode_record};
+
+        // A record can be far smaller than its value, so the block is bounded
+        // by what its values decode to as well as by its records' bytes.
+        if !self.packed.is_empty()
+            && (self.packed.len() as u64 >= u64::from(self.sizes.block_target)
+                || self.packed.len() > PACKED_REACH
+                || self.packed_count == u16::MAX
+                || self.packed_raw + value.len() as u64 > MAX_DECOMPRESSION_SIZE as u64)
+        {
+            self.close_packed()?;
+        }
+        let frame = self.next_frame()?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a packed block closes before a record would start past u16::MAX"
+        )]
+        let index = self.packed.len() as u16;
+        let mut records = core::mem::take(&mut self.packed);
+        let codec = self.codec(FrameKind::Block);
+        let encoded = PreCompressed::compressed_for(pre, value, codec).and_then(|compressed| {
+            encode_record(
+                &mut records,
+                key,
+                seqno,
+                value,
+                codec,
+                compressed.as_deref(),
+            )
+        });
+        self.packed = records;
+        let len = encoded?;
+        // A record starts with its checksum.
+        let start = usize::from(index);
+        self.packed_sums
+            .extend_from_slice(self.packed.get(start..start + 8).unwrap_or_default());
+        self.packed_count += 1;
+        self.packed_raw += value.len() as u64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a record holds a value below the block target and a u16 key"
+        )]
+        let len = len as u32;
+        self.block_entry_bytes += u64::from(len);
+        Ok(FrameRef {
+            frame,
+            index,
+            stored: crate::blob_tree::handle::Stored::Packed(len),
+        })
+    }
+
+    /// Writes the packed block being gathered, if any.
+    fn close_packed(&mut self) -> crate::Result<()> {
+        if self.packed.is_empty() {
+            return Ok(());
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a packed block closes before its values decode past MAX_DECOMPRESSION_SIZE"
+        )]
+        let raw_len = self.packed_raw as u32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a packed block holds less than one record past u16::MAX bytes"
+        )]
+        let records_len = self.packed.len() as u32;
+        let header = super::packed::packed_header(
+            self.packed_count,
+            raw_len,
+            records_len,
+            &self.packed_sums,
+        );
+        let records = core::mem::take(&mut self.packed);
+        let before = self.offset;
+        let written = self.put_frame_parts(&header, &records);
+        self.block_frame_bytes += self.offset - before;
+        self.packed = records;
+        self.packed.clear();
+        self.packed_sums.clear();
+        self.packed_count = 0;
+        self.packed_raw = 0;
+        written
     }
 
     /// Writes `frames`, the encoded frames of one whole value (a single frame,
     /// or a head and its chunks) under the codec this file records, without
     /// encoding them again, and returns where the value lies. `value_len` is
     /// the value's decoded length.
+    ///
+    /// The scan that read the frames checked each against its checksum, so
+    /// only their shape is checked here: one value under `key`, a head's
+    /// chunks where its table puts them.
     ///
     /// # Errors
     ///
@@ -710,6 +1398,7 @@ impl Writer {
         relist: Option<crate::SeqNo>,
     ) -> crate::Result<FrameRef> {
         let malformed = || crate::Error::InvalidHeader("verbatim blob frames");
+        self.leave_file_dictionary()?;
         let first = frames.first().ok_or_else(malformed)?;
         let header = super::frame::parse_header(first)?;
         let chunks = frames.len() - 1;
@@ -746,13 +1435,18 @@ impl Writer {
         {
             return Err(malformed());
         }
-        for chunk in frames.get(1..).unwrap_or_default() {
-            let chunk_header = super::frame::parse_header(chunk)?;
-            if chunk_header.kind != FrameKind::Chunk
-                || chunk.len() as u64 != chunk_header.frame_len()
-            {
-                return Err(malformed());
-            }
+        // Each chunk takes what the head's table says it takes, so the frames
+        // the copy places are where the head's readers look.
+        if header.kind == FrameKind::Head
+            && !super::frame::chunks_fit_head(
+                first,
+                entries_end,
+                u64::from(value_len),
+                frames.get(1..).unwrap_or_default(),
+                self.compression,
+            )?
+        {
+            return Err(malformed());
         }
         // Relisted before anything is written, so a refusal leaves the file
         // as it was.
@@ -779,11 +1473,49 @@ impl Writer {
         self.scratch = prefix;
         let (frame, before) = written?;
         self.note_key(key, value_len);
+        self.writeback_if_due()?;
         Ok(FrameRef {
             frame,
             index: 0,
             stored: self.stored_since(before),
         })
+    }
+
+    /// Writes `block.stored`, a block frame as stored under the codec this
+    /// file records, without encoding it again, and returns its frame number:
+    /// each of its values keeps its place in it.
+    ///
+    /// The scan that read the block checked it whole and counted what it
+    /// holds into `block`, so it is neither checked nor parsed again here:
+    /// only its header is read, to refuse a frame that is no such block.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when `block.stored` is not one whole
+    /// block of `block.values` values, and any IO error.
+    pub(crate) fn write_block_verbatim(&mut self, block: &CopiedBlock<'_>) -> crate::Result<u32> {
+        self.leave_file_dictionary()?;
+        let header = super::frame::parse_header(block.stored)?;
+        if header.kind != FrameKind::Block
+            || header.count != block.values
+            || header.frame_len() != block.stored.len() as u64
+        {
+            return Err(crate::Error::InvalidHeader("verbatim blob block"));
+        }
+        self.close_block()?;
+        let frame = self.next_frame()?;
+        let before = self.offset;
+        self.put_frame(block.stored)?;
+        self.block_frame_bytes += self.offset - before;
+        self.block_entry_bytes += block.entry_bytes;
+        self.note_keys(
+            block.first_key,
+            block.last_key,
+            u64::from(block.values),
+            block.value_bytes,
+        );
+        self.writeback_if_due()?;
+        Ok(frame)
     }
 
     /// The bytes written since the offset was `before`: what the frames of
@@ -807,6 +1539,16 @@ impl Writer {
     /// Any IO error.
     pub(crate) fn finish(mut self) -> crate::Result<(Metadata, Checksum, alloc::sync::Arc<[u64]>)> {
         self.close_block()?;
+
+        // The file's own dictionary, which its reader decodes with: what the
+        // codec it records names, since a dictionary's id is its content's.
+        #[cfg(zstd_any)]
+        if self.dictionary_in_file
+            && let Some(dict) = &self.zstd_dictionary
+        {
+            self.writer.start("dict")?;
+            self.writer.write_all(dict.raw())?;
+        }
 
         self.writer.start("frames")?;
         let index = encode_frame_index(&self.frames, self.offset);

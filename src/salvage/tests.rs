@@ -8653,11 +8653,131 @@ fn an_environmental_read_failure_never_becomes_a_lossy_blob_salvage() -> crate::
     Ok(())
 }
 
-/// Scans a blob file into its `(key, value)` records (Ok records only).
+/// A salvage that fails to open its source leaves no destination behind,
+/// whichever open of the source fails: a retry into the same destination
+/// would otherwise refuse to create it.
+#[test]
+fn a_failed_source_open_leaves_no_salvage_destination() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let mut failed = 0;
+    for skip in 0..16u64 {
+        let dir = tempdir()?;
+        let source = dir.path().join("src_blob");
+        let dest = dir.path().join("dst_blob");
+        let plain: Arc<dyn Fs> = Arc::new(StdFs);
+        build_blob(
+            &source,
+            &plain,
+            &[(b"aaaa", b"AAAAAAAA"), (b"bbbb", b"BBBBBBBB")],
+        )?;
+
+        let fault = FaultFs::new(StdFs);
+        fault.injector().arm(
+            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path("src_blob")
+                .skip(skip)
+                .times(1),
+        );
+        let fs: Arc<dyn Fs> = Arc::new(fault);
+        let result = salvage_blob_file(
+            &source,
+            dest.clone(),
+            &fs,
+            0,
+            &default_comparator(),
+            0,
+            #[cfg(zstd_any)]
+            None,
+        );
+        if result.is_err() {
+            failed += 1;
+            assert!(
+                !dest.exists(),
+                "a failed open of the source left the destination behind (skip {skip})",
+            );
+        }
+    }
+    assert!(failed > 0, "no skip count failed an open of the source");
+    Ok(())
+}
+
+/// A blob file that stores a dictionary of its own decodes with that one,
+/// which no caller holds: a salvage given none recovers every record, and
+/// the recovered file decodes with the dictionary it stores in turn.
+#[cfg(zstd_any)]
+#[test]
+fn salvage_blob_file_decodes_with_the_dictionary_the_source_stores() -> crate::Result<()> {
+    use crate::vlog::blob_file::{
+        scanner::{ScanCodec, Scanner},
+        writer::Writer as BlobWriter,
+    };
+
+    let dir = tempdir()?;
+    let source = dir.path().join("src_blob");
+    let dest = dir.path().join("dst_blob");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let values: Vec<Vec<u8>> = (0..40_u8)
+        .map(|i| (0..200_u8).map(|at| (at % 7) ^ i).collect())
+        .collect();
+    let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?
+        .use_compression(crate::CompressionType::Zstd(3))
+        .use_file_dictionary(1_024);
+    for (i, value) in values.iter().enumerate() {
+        writer.write(format!("k{i:03}").as_bytes(), 0, value)?;
+    }
+    let (meta, _, _) = writer.finish()?;
+    assert!(
+        matches!(meta.compression, crate::CompressionType::ZstdDict { .. }),
+        "the fixture needs a file with a dictionary of its own"
+    );
+
+    let report = salvage_blob_file(
+        &source,
+        dest.clone(),
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        None,
+    )?;
+    assert_eq!(report.records_salvaged, values.len());
+    assert!(report.is_complete(), "{:?}", report.dropped);
+
+    let dest_meta = crate::vlog::read_blob_meta(&dest, &*fs, 0)?;
+    let dictionary = crate::vlog::read_blob_file_dictionary(&dest, &*fs, &dest_meta)?;
+    assert!(
+        dictionary.is_some(),
+        "the recovered file stores its dictionary"
+    );
+    let entries = Scanner::open(
+        &dest,
+        &*fs,
+        0,
+        ScanCodec {
+            compression: dest_meta.compression,
+            dictionary,
+        },
+        None,
+    )?
+    .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), values.len());
+    for (entry, value) in entries.iter().zip(&values) {
+        assert_eq!(entry.value.as_deref(), Some(&value[..]));
+    }
+    Ok(())
+}
+
+/// Scans a blob file, which compresses nothing, into its `(key, value)`
+/// records (Ok records only).
 fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     BlobScanner::new(path, &**fs, 0)?
         .filter_map(Result::ok)
-        .map(|e| Ok((e.key.to_vec(), e.whole_value()?.to_vec())))
+        .map(|e| {
+            let value = e.whole_value(crate::CompressionType::None)?;
+            Ok((e.key.to_vec(), value.to_vec()))
+        })
         .collect()
 }
 
@@ -9612,7 +9732,9 @@ fn salvage_blob_file_reports_a_remap_for_every_salvaged_record() -> crate::Resul
 
 /// Values that shared a block in the source are salvaged out of it into a
 /// block of the recovered file, each to its own place; a damaged block loses
-/// the values it held, and only those.
+/// the values it held, and only those. The source compresses, so its small
+/// values share blocks rather than being packed.
+#[cfg(feature = "lz4")]
 #[test]
 #[expect(clippy::indexing_slicing, reason = "test code")]
 fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::Result<()> {
@@ -9623,10 +9745,12 @@ fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::
     let dest = dir.path().join("blob_salvaged");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
     {
-        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?.use_frame_sizes(FrameSizes {
-            block_target: 100,
-            chunk_size: 256,
-        });
+        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?
+            .use_compression(crate::CompressionType::Lz4)
+            .use_frame_sizes(FrameSizes {
+                block_target: 100,
+                chunk_size: 256,
+            });
         // Two blocks of three values (an entry of 36 bytes each), a single
         // value, a chunked one.
         for i in 0..6_u8 {
@@ -9668,12 +9792,17 @@ fn salvage_blob_file_carries_block_values_and_drops_a_damaged_block() -> crate::
     let keys: Vec<&[u8]> = salvaged.iter().map(|e| &*e.key).collect();
     assert_eq!(keys, [&b"a\x03"[..], b"a\x04", b"a\x05", b"b", b"c"]);
     assert_eq!(
-        &*salvaged[4].whole_value()?,
+        &*salvaged[4].whole_value(crate::CompressionType::Lz4)?,
         &[8_u8; 600][..],
         "the chunked value whole"
     );
     for (src, dst) in entries[3..].iter().zip(&salvaged) {
-        assert_eq!(src.whole_value()?, dst.whole_value()?, "{:?}", src.key);
+        assert_eq!(
+            src.whole_value(crate::CompressionType::Lz4)?,
+            dst.whole_value(crate::CompressionType::Lz4)?,
+            "{:?}",
+            src.key
+        );
         let mapped = report
             .remap
             .iter()

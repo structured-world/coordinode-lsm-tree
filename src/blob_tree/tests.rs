@@ -3,8 +3,10 @@ use crate::coding::Encode;
 use crate::vlog::ValueHandle;
 use test_log::test;
 
-/// A blob tree of `keys` keys with 4 KiB values, every one in a blob file,
-/// over a cache of its own, and reading with `fill`.
+/// A blob tree of `keys` keys with 4 KiB values, every one in a frame of its
+/// own in a blob file, over a cache of its own, and reading with `fill`. Frames
+/// of their own are what the fill governs: a block a point read decodes is
+/// cached whatever it says.
 fn blob_tree_with_cache(
     folder: &tempfile::TempDir,
     keys: u32,
@@ -19,7 +21,7 @@ fn blob_tree_with_cache(
         crate::SequenceNumberCounter::default(),
     )
     .use_cache(Arc::clone(&cache))
-    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .with_kv_separation(Some(crate::KvSeparationOptions::default().block_size(0)))
     .blob_cache_fill(fill)
     .open()?
     else {
@@ -269,17 +271,14 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
     let mut store = crate::vlog::Prefetched::default();
     store.hold(
         vhandle.frame_at(),
-        Arc::new(crate::vlog::blob_file::frame::decoded_frame(&[(
-            b"k", b"value",
-        )])),
+        crate::vlog::blob_file::frame::decoded_frame(&[(b"k", b"value")]),
     );
 
-    let held = Arc::new(core::sync::atomic::AtomicUsize::new(0));
     let damaged = |value_type| InternalValue::from_components("k", vec![0xff_u8; 3], 0, value_type);
     for value_type in [crate::ValueType::Indirection, crate::ValueType::CellRow] {
         assert!(
-            take_prefetched(&store, &held, &damaged(value_type))
-                .0
+            take_prefetched(&store, &damaged(value_type))
+                .as_slice()
                 .is_empty(),
             "{value_type:?} that does not decode takes nothing"
         );
@@ -292,18 +291,12 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
         0,
         crate::ValueType::Indirection,
     );
-    let (taken, charge) = take_prefetched(&store, &held, &row);
+    let taken = take_prefetched(&store, &row);
     let [(handle, value)] = taken.as_slice() else {
-        panic!("one value taken, got {}", taken.len());
+        panic!("one value taken, got {}", taken.as_slice().len());
     };
     assert_eq!(*handle, vhandle);
     assert_eq!(&**value, b"value");
-    assert_eq!(
-        held.load(core::sync::atomic::Ordering::Relaxed),
-        b"value".len(),
-        "the value's frame is charged"
-    );
-    drop(charge);
 
     // The frame lists its key: a row of another key naming the same place
     // takes nothing out of it.
@@ -313,7 +306,41 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
         0,
         crate::ValueType::Indirection,
     );
-    assert_eq!(take_prefetched(&store, &held, &other).0, Vec::new());
+    assert!(matches!(take_prefetched(&store, &other), AheadValues::None));
+}
+
+/// A frame the scan's store lets go still counts against the read-ahead bound
+/// while a value taken out of it keeps its bytes, and stops counting once the
+/// last such value is dropped: what a kept guard pins is its frame's payload.
+#[test]
+fn a_released_frame_counts_while_a_taken_value_keeps_it() {
+    let vhandle = ValueHandle {
+        blob_file_id: 3,
+        frame: 12,
+        index: 0,
+    };
+    // Longer than a slice holds inline, so the value is a view, not a copy.
+    let payload = vec![7_u8; 64];
+    let mut store = crate::vlog::Prefetched::default();
+    store.hold(
+        vhandle.frame_at(),
+        crate::vlog::blob_file::frame::decoded_frame(&[(b"k", &payload)]),
+    );
+    assert_eq!(store.held_bytes(), payload.len(), "the held frame counts");
+
+    let Some(value) = store.get(b"k", &vhandle) else {
+        panic!("the value is held");
+    };
+    store.retain_for(&[]);
+    assert!(store.is_empty(), "the frame is let go");
+    assert_eq!(
+        store.held_bytes(),
+        payload.len(),
+        "the value taken out of it still keeps its payload"
+    );
+
+    drop(value);
+    assert_eq!(store.held_bytes(), 0, "nothing keeps the payload any more");
 }
 
 /// A scan that does not cache hands each guard the values read ahead for it.
@@ -539,9 +566,9 @@ fn a_batched_read_of_a_chunked_value_falls_back_to_its_own_path() -> crate::Resu
     let file = std::fs::read(&read.blob_file.0.path)?;
     let at = usize::try_from(read.offset).expect("fits");
     let head = crate::Slice::from(&file[at..at + read.len]);
-    assert_eq!(
-        source.finish_value(&version, b"k", &read, &head)?,
-        None,
+    let (value, frame) = source.finish_value(&version, b"k", &read, &head)?;
+    assert!(
+        value.is_none() && frame.is_none(),
         "the chunks are read on the value's own path"
     );
     let short = crate::Slice::from(&file[at..at + read.len - 1]);

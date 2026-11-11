@@ -481,8 +481,16 @@ fn a_row_of_a_range_read_keeps_its_read() -> lsm_tree::Result<()> {
 /// Builds a blob file holding `doc`'s body and a garbage value, so a major
 /// compaction relocates the body. The body is separated: a non-empty one by
 /// the default threshold, an empty one only where the caller set it to zero.
+/// The filler [`stale_file_with_a_body`] writes beside the body: below the
+/// default 8 KiB block size, so it shares the body's packed block.
+const FILLER_LEN: usize = 4_096;
+
+/// The fixed part of a packed record: its checksum and seqno, the lengths of
+/// its key, its value and its value as stored, and its flags.
+const RECORD_HEADER_LEN: u64 = 8 + 8 + 2 + 4 + 4 + 1;
+
 fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> {
-    let filler = vec![b'f'; 8_192];
+    let filler = vec![b'f'; FILLER_LEN];
     tree.insert_cells("doc", &bytes(&[b"draft", body]), 0)?;
     tree.insert("filler", &filler, 0);
     tree.flush_active_memtable(0)?;
@@ -491,10 +499,11 @@ fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> 
     // The compaction that drops the old filler charges it; files are picked
     // for relocation by what is charged before a compaction starts.
     tree.major_compact(64_000_000, SeqNo::MAX)?;
-    // The filler shares a block with the body: it is charged its entry,
-    // uncompressed, as block bytes. The body is live, so it is not charged,
-    // an empty one too: its file holds a live object of zero bytes.
-    let filler_entry = 14 + b"filler".len() as u64 + filler.len() as u64;
+    // The filler shares a packed block with the body: it is charged its
+    // record, as it lies uncompressed, as block bytes. The body is live, so
+    // it is not charged, an empty one too: its file holds a live object of
+    // zero bytes.
+    let filler_entry = RECORD_HEADER_LEN + b"filler".len() as u64 + filler.len() as u64;
     let gc_stats = tree.current_version().gc_stats().clone();
     assert_eq!(
         gc_stats.values().copied().collect::<Vec<_>>(),
@@ -851,8 +860,10 @@ fn a_memtable_reference_keeps_its_file_through_relocation() -> lsm_tree::Result<
     );
     // The relocated file stays for that row, all of it garbage: the body was
     // copied out and the filler was dead, and the stale bytes say so. Both
-    // shared one block, so both are charged their entries as block bytes.
-    let entries = (14 + b"doc".len() + body.len()) + (14 + b"filler".len() + 8_192);
+    // shared one packed block, so both are charged their records as block
+    // bytes.
+    let header = RECORD_HEADER_LEN as usize;
+    let entries = (header + b"doc".len() + body.len()) + (header + b"filler".len() + FILLER_LEN);
     assert_eq!(
         tree.current_version()
             .gc_stats()
@@ -860,7 +871,7 @@ fn a_memtable_reference_keeps_its_file_through_relocation() -> lsm_tree::Result<
             .copied()
             .collect::<Vec<_>>(),
         [
-            lsm_tree::blob_tree::FragmentationEntry::new(2, (body.len() + 8_192) as u64, 0)
+            lsm_tree::blob_tree::FragmentationEntry::new(2, (body.len() + FILLER_LEN) as u64, 0)
                 .with_block_bytes(entries as u64)
         ],
         "the whole relocated file is stale"

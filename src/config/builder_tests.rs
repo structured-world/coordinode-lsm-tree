@@ -35,20 +35,20 @@ fn blob_frame_sizes_keep_every_frame_within_the_cap() {
     let sizes = KvSeparationOptions::default().frame_sizes();
     assert_eq!(
         (sizes.block_target, sizes.chunk_size),
-        (16 * 1024, 256 * 1024),
+        (8 * 1024, 256 * 1024),
         "the defaults are within every bound"
     );
 }
 
 /// The bytes one value's frames take are recorded in a u32: a chunk size of a
-/// byte splits a value at the cap into 2^28 chunks, each with a frame header,
-/// past what the record holds, and garbage accounting and the space a
-/// relocation reserves would undercount by gigabytes. The chunk size is held
-/// to a floor under which every value's frames fit.
+/// byte splits a value at the cap into 2^28 chunks, each with a row in its
+/// head's table, past what the record holds, and garbage accounting and the
+/// space a relocation reserves would undercount by gigabytes. The chunk size
+/// is held to a floor under which every value's frames fit.
 #[test]
 fn blob_chunk_size_keeps_a_value_s_frames_within_their_record() {
     use crate::vlog::blob_file::{
-        frame::{ENTRY_HEADER_LEN, FRAME_HEADER_LEN},
+        frame::{CHUNK_ROW_LEN, ENTRY_HEADER_LEN, FRAME_HEADER_LEN},
         writer::MAX_DECOMPRESSION_SIZE,
     };
 
@@ -57,9 +57,9 @@ fn blob_chunk_size_keeps_a_value_s_frames_within_their_record() {
     };
     let sizes = KvSeparationOptions::default().chunk_size(one).frame_sizes();
     let chunks = (MAX_DECOMPRESSION_SIZE as u64).div_ceil(u64::from(sizes.chunk_size));
-    // Every chunk's header, the value stored raw at most, and a head with
-    // the longest key and its table.
-    let most = chunks * FRAME_HEADER_LEN as u64
+    // Every chunk's row, the value stored raw at most, and a head with the
+    // longest key and its table's fixed part.
+    let most = chunks * CHUNK_ROW_LEN as u64
         + MAX_DECOMPRESSION_SIZE as u64
         + (FRAME_HEADER_LEN + ENTRY_HEADER_LEN + usize::from(u16::MAX) + 8) as u64;
     assert!(

@@ -23,6 +23,7 @@ fn entry(
             frame_end: u64::from(frame) + 1,
             resynced: false,
             frames: None,
+            block: None,
         },
         blob_file_id,
     ))
@@ -60,6 +61,7 @@ fn drain_blobs_stops_at_the_index_within_a_block() -> crate::Result<()> {
         &naming(0, 3, 2),
         crate::comparator::default_comparator().as_ref(),
         &mut |_, _| {},
+        &mut |_, _| {},
     )?;
 
     assert_eq!(in_block(2)?, iter.next().unwrap()?);
@@ -83,6 +85,7 @@ fn drain_blobs_simple() -> crate::Result<()> {
         b"a",
         &naming(0, 4, 0),
         crate::comparator::default_comparator().as_ref(),
+        &mut |_, _| {},
         &mut |_, _| {},
     )?;
 
@@ -109,6 +112,7 @@ fn drain_blobs_multiple_keys() -> crate::Result<()> {
         &naming(0, 0, 0),
         crate::comparator::default_comparator().as_ref(),
         &mut |_, _| {},
+        &mut |_, _| {},
     )?;
 
     assert_eq!(entry(0, b"e", 0)?, iter.next().unwrap()?);
@@ -134,7 +138,14 @@ fn drain_blobs_follows_the_tree_comparator() -> crate::Result<()> {
     let mut iter = [entry(0, b"e", 0), entry(0, b"c", 1), entry(0, b"a", 2)]
         .into_iter()
         .peekable();
-    drain_blobs(&mut iter, b"a", &naming(0, 2, 0), &Reverse, &mut |_, _| {})?;
+    drain_blobs(
+        &mut iter,
+        b"a",
+        &naming(0, 2, 0),
+        &Reverse,
+        &mut |_, _| {},
+        &mut |_, _| {},
+    )?;
 
     assert_eq!(entry(0, b"a", 2)?, iter.next().unwrap()?);
     Ok(())
@@ -162,6 +173,7 @@ fn drain_unclaimed_below_takes_the_frames_below_the_bound() -> crate::Result<()>
         b"d",
         crate::comparator::default_comparator().as_ref(),
         &mut |id, frame_end| recorded.push((id, frame_end)),
+        &mut |_, _| {},
         &|| false,
     )?;
 
@@ -194,6 +206,7 @@ fn drain_unclaimed_below_returns_a_scan_error() {
         b"z",
         crate::comparator::default_comparator().as_ref(),
         &mut |id, frame_end| recorded.push((id, frame_end)),
+        &mut |_, _| {},
         &|| false,
     );
 
@@ -218,6 +231,7 @@ fn drain_unclaimed_below_stops_on_request() {
         b"z",
         crate::comparator::default_comparator().as_ref(),
         &mut |_, _| recorded += 1,
+        &mut |_, _| {},
         &|| true,
     );
 
@@ -245,6 +259,7 @@ fn drain_blobs_does_not_advance_the_frontier_past_a_resynced_frame() -> crate::R
         &naming(0, 9, 0),
         crate::comparator::default_comparator().as_ref(),
         &mut |_, frame_end| max_recorded = max_recorded.max(frame_end),
+        &mut |_, _| {},
     )?;
 
     // The last PROVEN frame (offset 1) ends at ordinal 2; the resynced frame

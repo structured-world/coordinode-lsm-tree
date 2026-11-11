@@ -141,6 +141,69 @@ fn a_blob_file_missing_a_section_is_unrecoverable() -> crate::Result<()> {
     Ok(())
 }
 
+/// A stored dictionary whose section runs past the file is damage, refused
+/// before a buffer is sized from its length, as the frame index is.
+#[cfg(zstd_any)]
+#[test]
+fn a_file_dictionary_running_past_the_file_is_unrecoverable() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?
+        .use_compression(crate::CompressionType::Zstd(3))
+        .use_file_dictionary(4 * 1024);
+    for i in 0..2_000u32 {
+        let value = format!("record {i:08} status=ok region=eu-west ").repeat(4);
+        writer.write(format!("k{i:06}").as_bytes(), 0, value.as_bytes())?;
+    }
+    writer.finish()?;
+    let file_len = std::fs::metadata(&path)?.len();
+    crate::test_forge::forge_section_len(&path, b"dict", file_len + 4096)?;
+
+    let mut file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let (meta, _) = read_meta_and_frames(&mut file, 7)?;
+    assert!(matches!(
+        read_file_dictionary(&mut file, &meta),
+        Err(crate::Error::Unrecoverable)
+    ));
+    Ok(())
+}
+
+/// A file holding its own dictionary is opened alone with it, whatever
+/// dictionaries the caller has; read under metadata whose codec names no such
+/// dictionary, the stored one is refused as damage.
+#[cfg(zstd_any)]
+#[test]
+fn a_file_dictionary_is_taken_only_as_its_codec_names_it() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::new(&path, 7, 0, &crate::fs::StdFs)?
+        .use_compression(crate::CompressionType::Zstd(3))
+        .use_file_dictionary(4 * 1024);
+    for i in 0..2_000u32 {
+        let value = format!("record {i:08} status=ok region=eu-west ").repeat(4);
+        writer.write(format!("k{i:06}").as_bytes(), 0, value.as_bytes())?;
+    }
+    let (_, checksum, _) = writer.finish()?;
+
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let file = recover_blob_file(path.as_path(), 7, checksum, 0, &fs, &no_dicts())?;
+    assert!(file.0.dictionary_in_file);
+    let dict = file.0.zstd_dictionary.as_ref().unwrap();
+    assert!(matches!(
+        file.0.meta.compression,
+        crate::CompressionType::ZstdDict { dict_id, .. } if dict_id == dict.id()
+    ));
+
+    let mut handle = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let (mut meta, _) = read_meta_and_frames(&mut handle, 7)?;
+    meta.compression = crate::CompressionType::Zstd(3);
+    assert!(matches!(
+        read_file_dictionary(&mut handle, &meta),
+        Err(crate::Error::Unrecoverable)
+    ));
+    Ok(())
+}
+
 /// A frame index the table of contents says runs past the file is damage the
 /// open reports, before anything is sized from the length it names.
 #[test]
@@ -762,7 +825,8 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        // Blocks of sixteen values, so the file holds four.
+        // Blocks of sixteen values when the file compresses, packed blocks
+        // of about a hundred when it does not: more than one either way.
         .with_kv_separation(Some(
             KvSeparationOptions::default()
                 .separation_threshold(64)
@@ -773,7 +837,7 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
         let AnyTree::Blob(tree) = config().open()? else {
             panic!("expected Blob tree");
         };
-        for i in 0..64u64 {
+        for i in 0..256u64 {
             tree.insert(format!("k{i:05}").as_bytes(), alloc::vec![b'v'; 256], i);
         }
         tree.flush_active_memtable(0)?;
@@ -857,7 +921,7 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
          (allocated {allocated_before} before, {allocated_after} after)",
     );
     assert!(
-        tree.get(b"k00063", crate::MAX_SEQNO)?.is_some(),
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
         "the live suffix must still be served",
     );
     Ok(())
