@@ -57,6 +57,47 @@ fn a_held_row_counts_its_place_in_the_queue() {
     assert!(held_len(&Held::Row(tombstone)) > core::mem::size_of::<Held>());
 }
 
+/// A held pointer's value decoded out of a block is copied out of it: as a
+/// view of the decoded block it would keep the whole block alive past what
+/// the bound on held bytes counts, one live value pinning a block of dead
+/// ones.
+#[test]
+fn a_held_block_value_lets_its_block_go() {
+    let block = UserValue::from(alloc::vec![b'x'; 8 * 1024]);
+    let value = block.slice(100..164);
+    let mut held = Held::Pointer {
+        item: InternalValue::from_components(
+            UserKey::from(b"k".as_slice()),
+            UserValue::empty(),
+            1,
+            crate::ValueType::Indirection,
+        ),
+        indirection: naming(7, 0, 100),
+        claimed: Claimed {
+            blob_file_id: 7,
+            frame: 0,
+            index: 100,
+            seqno: 1,
+            value: Some(value.clone()),
+            uncompressed_len: 64,
+            frames: None,
+            in_block: true,
+        },
+    };
+    detach(&mut held);
+    let Held::Pointer { claimed, .. } = &held else {
+        panic!("a pointer");
+    };
+    let Some(kept) = &claimed.value else {
+        panic!("the value is kept");
+    };
+    assert_eq!(&**kept, &*value);
+    assert!(
+        !block.as_ptr_range().contains(&kept.as_ptr()),
+        "the held value no longer lies in its block"
+    );
+}
+
 /// Values of one block share its frame: a drain toward one of them passes
 /// the block's earlier values and stops at its own index.
 #[test]

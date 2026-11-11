@@ -1329,6 +1329,21 @@ pub(crate) static BLOCKS_GIVEN_UP: core::sync::atomic::AtomicUsize =
 
 /// The bytes `held` keeps in memory: its place in the queue, its row's key
 /// and value, and for a pointer the value it claimed.
+/// Copies a held pointer's value decoded out of a block into a buffer of its
+/// own: as a view it keeps the whole decoded block alive, which the bound on
+/// what `held` holds does not count, and a block whose other values are dead
+/// would then keep its every byte for one live value. A held row's key and
+/// value stay views: rows arrive in key order from the tables' blocks one
+/// after the other, so the rows held share the blocks they come from.
+fn detach(held: &mut Held) {
+    if let Held::Pointer { claimed, .. } = held
+        && claimed.in_block
+        && let Some(value) = &mut claimed.value
+    {
+        *value = crate::UserValue::from(&**value);
+    }
+}
+
 fn held_len(held: &Held) -> usize {
     core::mem::size_of::<Held>()
         + match held {
@@ -2113,7 +2128,8 @@ impl RelocatingCompaction {
     /// Holds `held` back behind the rows before it, and writes what is ready.
     /// Past [`HELD_BYTES_MAX`], the blocks still tallied are given up so the
     /// rows waiting for them go out.
-    fn hold(&mut self, held: Held) -> crate::Result<()> {
+    fn hold(&mut self, mut held: Held) -> crate::Result<()> {
+        detach(&mut held);
         self.held_bytes += held_len(&held);
         self.held.push_back(held);
         if self.held_bytes > HELD_BYTES_MAX {
