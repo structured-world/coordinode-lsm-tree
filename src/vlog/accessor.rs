@@ -207,6 +207,19 @@ pub(crate) fn record_offset(
     Ok(at)
 }
 
+/// The record `bytes` holds, checked to be all of `bytes` and `key`'s.
+///
+/// # Errors
+///
+/// A record that does not check, is not `bytes` whole or is not `key`'s.
+fn checked_record(key: &[u8], bytes: &[u8]) -> crate::Result<packed::Record> {
+    let record = packed::parse_record(bytes)?;
+    if record.len != bytes.len() || bytes.get(record.key.clone()) != Some(key) {
+        return Err(crate::Error::InvalidHeader("BlobRecord"));
+    }
+    Ok(record)
+}
+
 impl<'a> Accessor<'a> {
     pub(crate) fn new(
         blob_files: &'a BlobFileList,
@@ -490,19 +503,27 @@ impl<'a> Accessor<'a> {
             .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
         self.count_request(len as usize);
         let bytes = crate::file::read_exact(file.as_ref(), offset, len as usize)?;
-        let (record, value) = self.record_value(blob_file, key, &bytes)?;
-        cache.record_blob_record_load(tree_id, at, vhandle.index, timer);
-        // The record the waiters take is the one the cache keeps: built once.
-        let built = if let Some(lead) = lead
-            && lead.has_waiters()
-        {
-            let cached = packed::cached_record(&record, &bytes, &value);
-            lead.hand_over(cached.clone());
-            Some(cached)
+        let record = checked_record(key, &bytes)?;
+        let waiters = lead.filter(crate::cache::BlobLead::has_waiters);
+        let keep = self.keeps_record(tree_id, vhandle, &record, cache);
+        // The record the waiters take is the one the cache keeps, built once,
+        // and the value this read hands out is a view of it.
+        let value = if waiters.is_some() || keep {
+            let (cached, value) = self.cached_record(blob_file, &record, &bytes)?;
+            cache.record_blob_record_load(tree_id, at, vhandle.index, timer);
+            if let Some(lead) = waiters {
+                lead.hand_over(cached.clone());
+            }
+            let value = cached.slice(value);
+            if keep {
+                cache.fill_blob_record(tree_id, at, vhandle.index, cached);
+            }
+            value
         } else {
-            None
+            let value = self.record_value(blob_file, &record, &bytes)?;
+            cache.record_blob_record_load(tree_id, at, vhandle.index, timer);
+            value
         };
-        self.keep_record(tree_id, vhandle, &record, &bytes, &value, built, cache);
         Ok(Some(value))
     }
 
@@ -586,31 +607,32 @@ impl<'a> Accessor<'a> {
         bytes: &crate::Slice,
         cache: &Cache,
     ) -> crate::Result<UserValue> {
-        let (record, value) = self.record_value(blob_file, key, bytes)?;
-        self.keep_record(tree_id, vhandle, &record, bytes, &value, None, cache);
+        let record = checked_record(key, bytes)?;
+        if !self.keeps_record(tree_id, vhandle, &record, cache) {
+            return self.record_value(blob_file, &record, bytes);
+        }
+        let (cached, value) = self.cached_record(blob_file, &record, bytes)?;
+        let value = cached.slice(value);
+        cache.fill_blob_record(tree_id, vhandle.frame_at(), vhandle.index, cached);
         Ok(value)
     }
 
-    /// The record `bytes` holds, checked to be all of `bytes` and `key`'s,
-    /// and its value decoded under `blob_file`'s codec.
+    /// The value of `record`, parsed out of `bytes`, decoded under
+    /// `blob_file`'s codec into a buffer of its own, or a view of `bytes` for
+    /// a value stored as it is.
     ///
     /// # Errors
     ///
-    /// A record that does not check, is not `bytes` whole or is not `key`'s,
-    /// and a value that does not decode.
+    /// A value that does not decode.
     fn record_value(
         &self,
         blob_file: &BlobFile,
-        key: &[u8],
+        record: &packed::Record,
         bytes: &crate::Slice,
-    ) -> crate::Result<(packed::Record, UserValue)> {
-        let record = packed::parse_record(bytes)?;
-        if record.len != bytes.len() || bytes.get(record.key.clone()) != Some(key) {
-            return Err(crate::Error::InvalidHeader("BlobRecord"));
-        }
+    ) -> crate::Result<UserValue> {
         let mut decoded = 0;
         let value = packed::record_value(
-            &record,
+            record,
             bytes,
             blob_file.0.meta.compression,
             #[cfg(zstd_any)]
@@ -618,13 +640,40 @@ impl<'a> Accessor<'a> {
             &mut decoded,
         );
         self.count_decoded(decoded);
-        Ok((record, value?))
+        value
     }
 
-    /// Caches a packed value read alone, on the read's path: under
-    /// [`BlobCacheFill::Always`] as every value read is, and otherwise only
-    /// into a shard of the cache that has filled once, there as its admission
-    /// takes it.
+    /// `record`, parsed out of `bytes`, as the cache holds it, its value
+    /// decoded under `blob_file`'s codec straight into it, and where that
+    /// value lies in it (see [`packed::cached_record`]).
+    ///
+    /// # Errors
+    ///
+    /// A value that does not decode.
+    fn cached_record(
+        &self,
+        blob_file: &BlobFile,
+        record: &packed::Record,
+        bytes: &crate::Slice,
+    ) -> crate::Result<(crate::Slice, core::ops::Range<usize>)> {
+        let mut decoded = 0;
+        let cached = packed::cached_record(
+            record,
+            bytes,
+            blob_file.0.meta.compression,
+            #[cfg(zstd_any)]
+            blob_file.0.zstd_dictionary.as_deref(),
+            &mut decoded,
+        );
+        self.count_decoded(decoded);
+        cached
+    }
+
+    /// Whether a packed value read alone is cached, decided from its record
+    /// before its value is decoded, so a value cached is decoded straight into
+    /// the record the cache keeps: under [`BlobCacheFill::Always`] as every
+    /// value read is, and otherwise only into a shard of the cache that has
+    /// filled once, there as its admission takes it.
     ///
     /// A shard still filling would grow for it: every insert there touches
     /// fresh memory and the shard's table copies itself as it doubles, on the
@@ -633,32 +682,19 @@ impl<'a> Accessor<'a> {
     /// insert takes the place of what it evicts, and the allocator hands that
     /// memory to the next one. Into its room a value goes on its first miss,
     /// past it only on a miss that repeats a recent one, so a value read once
-    /// is not cached to be evicted unread. `built` is the record as cached,
-    /// when the read built it already for others.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the record as read, decoded and as cached, with where it goes"
-    )]
-    fn keep_record(
+    /// is not cached to be evicted unread.
+    fn keeps_record(
         &self,
         tree_id: TreeId,
         vhandle: &ValueHandle,
         record: &packed::Record,
-        bytes: &crate::Slice,
-        value: &UserValue,
-        built: Option<crate::Slice>,
         cache: &Cache,
-    ) {
+    ) -> bool {
         let at = vhandle.frame_at();
-        let weight = packed::cached_record_len(record, value) as u64;
-        if !self.fill.fills()
-            && (!cache.filled_for_blob_record(tree_id, at, vhandle.index)
-                || !cache.admit_blob_record(tree_id, at, vhandle.index, weight))
-        {
-            return;
-        }
-        let cached = built.unwrap_or_else(|| packed::cached_record(record, bytes, value));
-        cache.fill_blob_record(tree_id, at, vhandle.index, cached);
+        let weight = packed::cached_record_len(record) as u64;
+        self.fill.fills()
+            || (cache.filled_for_blob_record(tree_id, at, vhandle.index)
+                && cache.admit_blob_record(tree_id, at, vhandle.index, weight))
     }
 
     /// Reads bytes `range` of one separated value: of a chunked value, only

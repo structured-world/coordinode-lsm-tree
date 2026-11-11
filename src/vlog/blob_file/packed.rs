@@ -273,29 +273,47 @@ fn record_value_into(
     Ok(out.set_filled(out.capacity())?)
 }
 
-/// The length of the record [`cached_record`] makes of `record` and its
-/// decoded `value`, which is what it weighs in the cache: known before it is
-/// made, so a value the cache would refuse is not copied.
+/// The length of the record [`cached_record`] makes of `record`, which is
+/// what it weighs in the cache: known from the record's header before its
+/// value is decoded, so a value the cache would refuse is decoded into a
+/// buffer of its own and one it takes straight into the cached record.
 #[must_use]
-pub(crate) fn cached_record_len(record: &Record, value: &Slice) -> usize {
-    RECORD_HEADER_LEN + record.key.len() + value.len()
+pub(crate) fn cached_record_len(record: &Record) -> usize {
+    RECORD_HEADER_LEN + record.key.len() + record.value_len as usize
 }
 
-/// `record`, parsed out of `bytes`, as the cache holds it: a record whose
-/// value is stored decoded, so a hit hands out a view of it with nothing to
-/// decode and nothing else to allocate. A value stored as it is already is
-/// that record, `bytes` itself; a decompressed one is copied into a record of
-/// its own beside its key, one allocation that frees `bytes`.
-#[must_use]
-pub(crate) fn cached_record(record: &Record, bytes: &Slice, value: &Slice) -> Slice {
-    let stored = bytes.get(record.stored.clone()).unwrap_or_default();
-    if record.len == bytes.len() && core::ptr::eq(stored.as_ptr(), value.as_ptr()) {
-        return bytes.clone();
+/// `record`, parsed out of `bytes`, as the cache holds it, and where its value
+/// lies in it: a record whose value is stored decoded, so a hit hands out a
+/// view of it with nothing to decode and nothing else to allocate. A value
+/// stored as it is already is that record, `bytes` itself; a compressed one
+/// is decoded under the file's `compression` straight into a record of its
+/// own beside its key, one allocation, which frees `bytes` and which the
+/// read's value is a view of as well.
+///
+/// # Errors
+///
+/// As [`record_value`].
+pub(crate) fn cached_record(
+    record: &Record,
+    bytes: &Slice,
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    decoded: &mut usize,
+) -> crate::Result<(Slice, Range<usize>)> {
+    #[cfg(zstd_any)]
+    let (codec, _) = super::frame::frame_codec(record.flags, compression, dictionary)?;
+    #[cfg(not(zstd_any))]
+    let codec = compression;
+    if record.len == bytes.len() && (record.flags & FLAG_RAW != 0 || codec == CompressionType::None)
+    {
+        *decoded = record.stored.len();
+        if record.stored.len() != record.value_len as usize {
+            return Err(crate::Error::InvalidHeader("BlobRecord"));
+        }
+        return Ok((bytes.clone(), record.stored.clone()));
     }
     let key = bytes.get(record.key.clone()).unwrap_or_default();
-    // Written straight into the record's own allocation: a `Vec` turned into
-    // a `Slice` is copied once more.
-    let len = cached_record_len(record, value);
+    let len = cached_record_len(record);
     let mut cached = crate::slice::UnfilledSlice::new(len);
     let mut out = cached.target();
     // The checksum is the record's as read: a cached record is not checked
@@ -311,18 +329,28 @@ pub(crate) fn cached_record(record: &Record, bytes: &Slice, value: &Slice) -> Sl
     out.append(&record.value_len.to_le_bytes());
     out.append(&[FLAG_RAW]);
     out.append(key);
-    out.append(value);
-    debug_assert_eq!(
-        out.filled(),
-        len,
-        "a cached record is its header, key and value"
-    );
-    // SAFETY: the appends above write the header, key and value back to back
-    // from the start, `cached_record_len` bytes in all, the slice's length.
-    #[expect(unsafe_code, reason = "see safety")]
-    unsafe {
-        cached.assume_filled()
+    let at = out.filled();
+    let mut value = out.portion(at, record.value_len as usize);
+    record_value_into(
+        record,
+        bytes,
+        compression,
+        #[cfg(zstd_any)]
+        dictionary,
+        &mut value,
+        decoded,
+    )?;
+    let filled = value.filled();
+    out.extend_from_portion(filled);
+    if out.filled() != len {
+        return Err(crate::Error::InvalidHeader("BlobRecord"));
     }
+    // SAFETY: the header and key were appended from the start and the value
+    // decoded right after them, `len` bytes in all as checked above, the
+    // slice's length.
+    #[expect(unsafe_code, reason = "see safety")]
+    let cached = unsafe { cached.assume_filled() };
+    Ok((cached, at..len))
 }
 
 /// The value of `cached`, a record [`cached_record`] made, under `key`.

@@ -94,7 +94,7 @@ fn a_record_stored_as_is_caches_as_its_bytes() {
     let bytes = Slice::from(bytes);
     let record = parse_record(&bytes).unwrap();
     let mut decoded = 0;
-    let value = record_value(
+    let (cached, value) = cached_record(
         &record,
         &bytes,
         CompressionType::None,
@@ -103,31 +103,57 @@ fn a_record_stored_as_is_caches_as_its_bytes() {
         &mut decoded,
     )
     .unwrap();
-    let cached = cached_record(&record, &bytes, &value);
     assert_eq!(cached.as_ptr(), bytes.as_ptr(), "the bytes read are kept");
-    assert_eq!(cached.len(), cached_record_len(&record, &value));
+    assert_eq!(cached.len(), cached_record_len(&record));
+    assert_eq!(&*cached.slice(value), b"a value stored as it is");
     assert_eq!(
         &*cached_value(&cached, b"k0").unwrap(),
         b"a value stored as it is"
     );
 }
 
-/// A value decoded into a buffer of its own is copied beside its key into one
-/// record of the length announced, which no longer holds the bytes read, and
-/// a hit hands back the decoded value.
+/// A compressed value is decoded straight into a record of its own beside its
+/// key, of the length announced before the decode, which no longer holds the
+/// bytes read: the value the read hands out is a view of that record, not a
+/// second buffer copied into it, and a hit hands back the decoded value.
 #[test]
-fn a_decoded_record_caches_as_a_record_of_its_own() {
-    let (bytes, _) = records(&[b"the decoded value"]);
+#[cfg(feature = "lz4")]
+fn a_compressed_record_decodes_into_the_record_it_caches() {
+    let value: Vec<u8> = b"the decoded value, ".repeat(16);
+    let compressed = lz4_flex::block::compress(&value);
+    assert!(compressed.len() < value.len(), "the fixture compresses");
+    let mut bytes = Vec::new();
+    encode_record(
+        &mut bytes,
+        b"k0",
+        1,
+        &value,
+        (CompressionType::Lz4, false),
+        Some(&compressed),
+    )
+    .unwrap();
     let bytes = Slice::from(bytes);
     let record = parse_record(&bytes).unwrap();
-    let value = Slice::from(b"the decoded value".to_vec());
-    let cached = cached_record(&record, &bytes, &value);
+    let mut decoded = 0;
+    let (cached, at) = cached_record(
+        &record,
+        &bytes,
+        CompressionType::Lz4,
+        #[cfg(zstd_any)]
+        None,
+        &mut decoded,
+    )
+    .unwrap();
     assert_ne!(cached.as_ptr(), bytes.as_ptr(), "a record of its own");
-    assert_eq!(cached.len(), cached_record_len(&record, &value));
-    assert_eq!(
-        &*cached_value(&cached, b"k0").unwrap(),
-        b"the decoded value"
+    assert_eq!(cached.len(), cached_record_len(&record));
+    assert_eq!(decoded, value.len());
+    let handed_out = cached.slice(at);
+    assert_eq!(&*handed_out, value.as_slice());
+    assert!(
+        cached.as_ptr_range().contains(&handed_out.as_ptr()),
+        "the value handed out lies in the cached record"
     );
+    assert_eq!(&*cached_value(&cached, b"k0").unwrap(), value.as_slice());
 }
 
 /// A cached record answers only for its own key: a hash collision on the cache
@@ -137,7 +163,15 @@ fn a_cached_record_refuses_another_key() {
     let (bytes, _) = records(&[b"value"]);
     let bytes = Slice::from(bytes);
     let record = parse_record(&bytes).unwrap();
-    let cached = cached_record(&record, &bytes, &bytes.slice(record.stored.clone()));
+    let (cached, _) = cached_record(
+        &record,
+        &bytes,
+        CompressionType::None,
+        #[cfg(zstd_any)]
+        None,
+        &mut 0,
+    )
+    .unwrap();
     assert!(matches!(
         cached_value(&cached, b"k1"),
         Err(crate::Error::InvalidHeader("BlobRecord"))
