@@ -291,22 +291,36 @@ pub(crate) fn cached_record(record: &Record, bytes: &Slice, value: &Slice) -> Sl
         return bytes.clone();
     }
     let key = bytes.get(record.key.clone()).unwrap_or_default();
-    let mut out = Vec::with_capacity(cached_record_len(record, value));
+    // Written straight into the record's own allocation: a `Vec` turned into
+    // a `Slice` is copied once more.
+    let len = cached_record_len(record, value);
+    let mut cached = crate::slice::UnfilledSlice::new(len);
+    let mut out = cached.target();
     // The checksum is the record's as read: a cached record is not checked
     // again, its bytes never left memory.
-    out.extend_from_slice(&record.checksum.to_le_bytes());
-    out.extend_from_slice(&record.seqno.to_le_bytes());
+    out.append(&record.checksum.to_le_bytes());
+    out.append(&record.seqno.to_le_bytes());
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the key was read through a u16 length"
     )]
-    out.extend_from_slice(&(key.len() as u16).to_le_bytes());
-    out.extend_from_slice(&record.value_len.to_le_bytes());
-    out.extend_from_slice(&record.value_len.to_le_bytes());
-    out.push(FLAG_RAW);
-    out.extend_from_slice(key);
-    out.extend_from_slice(value);
-    Slice::from(out)
+    out.append(&(key.len() as u16).to_le_bytes());
+    out.append(&record.value_len.to_le_bytes());
+    out.append(&record.value_len.to_le_bytes());
+    out.append(&[FLAG_RAW]);
+    out.append(key);
+    out.append(value);
+    debug_assert_eq!(
+        out.filled(),
+        len,
+        "a cached record is its header, key and value"
+    );
+    // SAFETY: the appends above write the header, key and value back to back
+    // from the start, `cached_record_len` bytes in all, the slice's length.
+    #[expect(unsafe_code, reason = "see safety")]
+    unsafe {
+        cached.assume_filled()
+    }
 }
 
 /// The value of `cached`, a record [`cached_record`] made, under `key`.
