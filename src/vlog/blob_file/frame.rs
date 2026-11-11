@@ -814,7 +814,14 @@ pub(crate) fn undecoded_frame(
 
 /// [`verify_frame`]'s checks, the entries parsed kept.
 pub(crate) fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, FrameEntries)> {
-    let header = parse_header(bytes)?;
+    check_frame_with(parse_header(bytes)?, bytes)
+}
+
+/// [`check_frame`] of `bytes` whose header, `header`, is parsed already.
+fn check_frame_with(
+    header: FrameHeader,
+    bytes: &[u8],
+) -> crate::Result<(FrameHeader, FrameEntries)> {
     if header.frame_len() != bytes.len() as u64 {
         return Err(crate::Error::InvalidHeader("BlobFrame"));
     }
@@ -872,7 +879,7 @@ pub(crate) fn decode_frame(
             decoded,
         );
     }
-    let (header, list) = check_frame(bytes)?;
+    let (header, list) = check_frame_with(header, bytes)?;
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
     let entries = bytes.slice(FRAME_HEADER_LEN..entries_end);
     let stored = bytes.slice(entries_end..bytes.len());

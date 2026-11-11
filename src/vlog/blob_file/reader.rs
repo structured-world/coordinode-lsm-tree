@@ -371,20 +371,32 @@ pub(crate) fn assemble_stored(
     let mut from = 0;
     for spec in &specs {
         let to = from + spec.stored_len as usize;
+        let stored = area.get(from..to).ok_or_else(malformed)?;
         let mut part = target.portion(target.filled(), spec.raw_len as usize);
-        let mut produced = 0;
-        let checked = decode_chunk_into(
-            spec,
-            area.get(from..to).ok_or_else(malformed)?,
-            compression,
-            #[cfg(zstd_any)]
-            dictionary,
-            part.init_mut(),
-            &mut produced,
-        );
-        *decoded += produced;
-        checked?;
-        part.set_filled(spec.raw_len as usize)?;
+        if spec.is_stored_as_is(compression) {
+            // Copied into the unwritten memory as it is: only a
+            // decompression's target is zeroed first.
+            check_chunk(spec, stored)?;
+            if stored.len() != part.capacity() {
+                return Err(malformed());
+            }
+            part.append(stored);
+            *decoded += stored.len();
+        } else {
+            let mut produced = 0;
+            let checked = decode_chunk_into(
+                spec,
+                stored,
+                compression,
+                #[cfg(zstd_any)]
+                dictionary,
+                part.init_mut(),
+                &mut produced,
+            );
+            *decoded += produced;
+            checked?;
+            part.set_filled(spec.raw_len as usize)?;
+        }
         target.extend_from_portion(spec.raw_len as usize);
         from = to;
     }

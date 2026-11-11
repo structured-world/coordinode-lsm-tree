@@ -72,6 +72,36 @@ fn every_class_round_trips_under_lz4() -> crate::Result<()> {
     round_trip(CompressionType::Lz4)
 }
 
+/// A chunked value whose chunks are compressed and stored as they are in
+/// turn reads back whole: each chunk where it belongs, whichever way it lies.
+#[test]
+#[cfg(feature = "lz4")]
+fn a_value_of_compressed_and_raw_chunks_reads_back() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    };
+    // Chunks of 300: compressible, incompressible, compressible, a short
+    // incompressible tail.
+    let mut value = vec![b'a'; 300];
+    value.extend(noise(300));
+    value.extend(vec![b'b'; 300]);
+    value.extend(noise(100));
+    let (blob_file, handles) = write(&folder, CompressionType::Lz4, &[(b"k", &value)])?;
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(&blob_file, &file);
+    assert_eq!(&*reader.get(b"k", &handles[0])?, value.as_slice());
+    Ok(())
+}
+
 /// Every class reads back through its handle under zstd.
 #[test]
 #[cfg(zstd_any)]
