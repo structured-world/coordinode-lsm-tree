@@ -427,6 +427,91 @@ impl MultiWriter {
         )
     }
 
+    /// A `MultiWriter` whose files are in memory, to be given a writer's
+    /// settings and asked what tables of them take (see
+    /// [`Self::rewrite_bound`]) rather than to write any.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the in-memory file's creation.
+    pub(crate) fn probe(target_size: u64, initial_level: u8) -> crate::Result<Self> {
+        let fs: Arc<dyn Fs> = Arc::new(crate::fs::MemFs::new());
+        let folder = PathBuf::from("/probe");
+        fs.create_dir_all(&folder)?;
+        let pools = super::file_pool::TableFilePools::new(
+            crate::SequenceNumberCounter::default(),
+            0,
+            SyncMode::Normal,
+        );
+        Self::from_pool(
+            folder,
+            Arc::new(pools),
+            None,
+            target_size,
+            initial_level,
+            fs,
+            WriteOrigin::CompactionTable,
+        )
+    }
+
+    /// Hashes one entry of `key` registers in an output's filter, at the most.
+    pub(crate) fn filter_hashes_bound(&self, key: &[u8]) -> u64 {
+        self.writer.filter_hashes_bound(key)
+    }
+
+    /// Whether the outputs split cell rows into the columns of their fields,
+    /// which a rewrite's bound then counts (see [`super::writer::CellShapes`]).
+    pub(crate) fn splits_cells(&self) -> bool {
+        self.cell_rows
+    }
+
+    /// Bytes the tables this writer's settings write take together when they
+    /// hold `load`, bounded from above: the tables its target size cuts, one
+    /// more for each of `forced` cuts (keys it ends an output on, key domains
+    /// it closes one at), and the outputs of range tombstones alone it writes
+    /// beside them.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the encoding of the meta block a table ends with.
+    pub(crate) fn rewrite_bound(
+        &self,
+        load: &super::writer::RewriteLoad,
+        forced: u64,
+    ) -> crate::Result<u64> {
+        // A table closes once what it holds, by the estimate it rotates on,
+        // reaches the target, so the tables the target cuts are at most the
+        // bytes over the target and one. The bound grows with the tables, so
+        // the count is taken again over the bound it gives until it stands.
+        let target = self.target_size.max(1);
+        let mut tables = forced + 1;
+        let mut bound = self.writer.rewrite_bound(load, tables)?;
+        loop {
+            let enough = forced + 1 + bound / target;
+            if enough <= tables {
+                break;
+            }
+            tables = enough;
+            bound = self.writer.rewrite_bound(load, tables)?;
+        }
+        // Pieces of tombstones below the first output and past the last one
+        // that a table outside the rewrite needs go to outputs of their own,
+        // one per run of overlapping pieces: at most a run per tombstone on
+        // each side, each holding at most every tombstone.
+        if self.clip_range_tombstones && load.range_tombstones > 0 {
+            let (alone, _) = self.writer.tombstone_only_overhead(load.longest_key, 0)?;
+            let pieces = crate::table::block::framed_len_bound(
+                8 + load.range_tombstone_bytes + load.range_tombstones * (10 + 3 + 3),
+                crate::table::block::BlockType::RangeTombstone,
+                CompressionType::None,
+                self.encryption.as_deref(),
+                self.ecc,
+            );
+            bound += 2 * load.range_tombstones * (alone + pieces);
+        }
+        Ok(bound)
+    }
+
     /// Sets up a `MultiWriter` at the given tables folder, its outputs written
     /// into files claimed from `pools` as `origin`'s, each output's id above
     /// `above` when given.

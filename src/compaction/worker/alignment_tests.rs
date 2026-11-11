@@ -475,6 +475,177 @@ fn without_alignment_outputs_end_off_the_level_below() -> crate::Result<()> {
     Ok(())
 }
 
+/// A merge whose input carries a range tombstone past its keys, over a table
+/// outside the merge, writes the tombstone's piece past its outputs into an
+/// output of its own, holding no key. What a tight-space slice of the merge
+/// charges for its tables covers that output as well as the one holding the
+/// keys, or a slice sized to its room outgrows it as the output lands.
+#[cfg(feature = "std")]
+#[test]
+fn a_tight_slice_covers_the_tombstone_only_outputs_of_its_merge() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(in_memory(&folder).compaction_threads(1))?;
+    let mut seqno = 1;
+    // Outside the merge, below it: keys the tombstone reaches past the
+    // merge's own keys.
+    flush_into(&tree, 5_000..5_100, 100, 3, &mut seqno)?;
+    // The merge's input: a hundred keys and a tombstone reaching far past
+    // them, newer than the keys below.
+    for i in 1_000..1_100 {
+        tree.insert(key(i), noise(seqno, 100), seqno);
+        seqno += 1;
+    }
+    tree.remove_range(key(0), key(9_999), seqno);
+    tree.flush_active_memtable(0)?;
+    let ids: Vec<TableId> = tables(&tree, 0).iter().map(Table::id).collect();
+    tree.compact(Arc::new(Place(ids.clone(), 1)), 0)?;
+    let inputs = tables(&tree, 1);
+
+    let merge = Merge(ids.clone(), 2);
+    let payload = merge.input();
+    let opts = super::Options::from_tree(&tree, Arc::new(Merge(ids, 2)));
+    let version = tree.current_version();
+    let probe = crate::compaction::flavour::output_bound_probe(
+        &version,
+        &opts,
+        &payload,
+        &opts.runtime_config.load_full(),
+    )?;
+    let cut_keys = crate::compaction::flavour::output_cut_keys(&version, &opts, &payload);
+    drop(version);
+    let mut tombstones = crate::table::writer::RewriteLoad::default();
+    for rt in inputs.iter().flat_map(Table::range_tombstones) {
+        tombstones.range_tombstones += 1;
+        tombstones.range_tombstone_bytes += (rt.start.len() + rt.end.len()) as u64;
+        tombstones.longest_key = tombstones
+            .longest_key
+            .max(rt.start.len() as u64)
+            .max(rt.end.len() as u64);
+    }
+    let slices = super::tight_slices(
+        &inputs,
+        super::SliceCaps {
+            tables: u64::MAX,
+            blobs: u64::MAX,
+            total: u64::MAX,
+        },
+        &super::SliceOutputs {
+            probe: &probe,
+            tombstones,
+            cut_keys: &cut_keys,
+            domains: None,
+        },
+        None,
+        &tree.config.comparator,
+        &super::input_pacer(&opts),
+    )?;
+    let [only] = slices.as_slice() else {
+        panic!("unbounded caps cut one slice: {slices:?}");
+    };
+    drop(inputs);
+
+    tree.compact(Arc::new(merge), 0)?;
+    let outputs = tables(&tree, 2);
+    assert!(
+        outputs.len() > 1,
+        "the fixture needs a tombstone-only output beside the keys' one: {} outputs",
+        outputs.len()
+    );
+    let written: u64 = outputs.iter().map(Table::file_len).sum();
+    assert!(
+        only.tables >= written,
+        "the slice charges {} bytes for outputs that take {written}",
+        only.tables
+    );
+    for i in 5_000..5_100 {
+        assert!(
+            tree.get(key(i), crate::SeqNo::MAX)?.is_none(),
+            "key {i} stays deleted"
+        );
+    }
+    Ok(())
+}
+
+/// Inputs a level stored compressed are written by a destination that stores
+/// its blocks without a codec at their full size. What a tight-space slice
+/// charges for its tables covers that, not the inputs' compressed bytes.
+#[cfg(all(feature = "std", feature = "lz4"))]
+#[test]
+fn a_tight_slice_covers_outputs_stored_without_the_inputs_codec() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(
+        in_memory(&folder)
+            .compaction_threads(1)
+            .data_block_compression_policy(crate::config::CompressionPolicy::new([
+                crate::CompressionType::Lz4,
+                crate::CompressionType::Lz4,
+                crate::CompressionType::None,
+            ])),
+    )?;
+    // Values that compress well: what the inputs keep is a fraction of what
+    // the destination writes.
+    for (seqno, i) in (1..).zip(0..2_000) {
+        tree.insert(key(i), vec![b'v'; 200], seqno);
+    }
+    tree.flush_active_memtable(0)?;
+    let ids: Vec<TableId> = tables(&tree, 0).iter().map(Table::id).collect();
+    tree.compact(Arc::new(Place(ids.clone(), 1)), 0)?;
+    let inputs = tables(&tree, 1);
+    let read: u64 = inputs.iter().map(Table::file_len).sum();
+
+    let merge = Merge(ids.clone(), 2);
+    let payload = merge.input();
+    let opts = super::Options::from_tree(&tree, Arc::new(Merge(ids, 2)));
+    let version = tree.current_version();
+    let probe = crate::compaction::flavour::output_bound_probe(
+        &version,
+        &opts,
+        &payload,
+        &opts.runtime_config.load_full(),
+    )?;
+    drop(version);
+    let slices = super::tight_slices(
+        &inputs,
+        super::SliceCaps {
+            tables: u64::MAX,
+            blobs: u64::MAX,
+            total: u64::MAX,
+        },
+        &super::SliceOutputs {
+            probe: &probe,
+            tombstones: crate::table::writer::RewriteLoad::default(),
+            cut_keys: &[],
+            domains: None,
+        },
+        None,
+        &tree.config.comparator,
+        &super::input_pacer(&opts),
+    )?;
+    let [only] = slices.as_slice() else {
+        panic!("unbounded caps cut one slice: {slices:?}");
+    };
+    drop(inputs);
+
+    tree.compact(Arc::new(merge), 0)?;
+    let written: u64 = tables(&tree, 2).iter().map(Table::file_len).sum();
+    assert!(
+        written > 2 * read,
+        "the fixture needs outputs far past the inputs: {written} written from {read}"
+    );
+    assert!(
+        only.tables >= written,
+        "the slice charges {} bytes for outputs that take {written}",
+        only.tables
+    );
+    // A bound far above what is written refuses work that fits.
+    assert!(
+        only.tables <= 2 * written,
+        "a charge of {} for {written} bytes written is too loose",
+        only.tables
+    );
+    Ok(())
+}
+
 /// The slices of a tight-space pass end their outputs on the boundaries of the
 /// level below as one stream does. An output ends off one only where no
 /// boundary is left before its slice ends: at the slice's end, or at the
@@ -528,8 +699,15 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
         blobs: u64::MAX,
         total: HEADROOM,
     };
+    let probe = crate::compaction::flavour::output_bound_probe(
+        &tree.current_version(),
+        &opts,
+        &payload,
+        &opts.runtime_config.load_full(),
+    )?;
     let outputs = super::SliceOutputs {
-        target_size: OUTPUT_TARGET,
+        probe: &probe,
+        tombstones: crate::table::writer::RewriteLoad::default(),
         cut_keys: &cut_keys,
         domains: None,
     };

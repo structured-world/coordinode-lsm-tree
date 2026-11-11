@@ -205,8 +205,7 @@ pub struct TableFilePools {
 }
 
 impl TableFilePools {
-    /// Pools that refill on the claiming thread.
-    #[cfg(test)]
+    /// Pools that refill on the claiming thread, with no tree to keep open.
     pub fn new(ids: SequenceNumberCounter, batch: usize, sync_mode: SyncMode) -> Self {
         Self::with(ids, batch, sync_mode, false, None)
     }

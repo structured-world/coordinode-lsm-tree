@@ -381,7 +381,101 @@ pub(super) fn prepare_table_writer(
     rc: &crate::runtime_config::RuntimeConfig,
 ) -> crate::Result<MultiWriter> {
     let (table_base_folder, level_fs) = opts.config.tables_folder_for_level(payload.dest_level);
+    // Every output's id is above its inputs': an output takes the age of its
+    // newest input, and the id is what tells the two apart, the higher one
+    // the output that supersedes it.
+    let above = payload.table_ids.iter().copied().max();
+    let table_writer = MultiWriter::from_pool(
+        table_base_folder,
+        alloc::sync::Arc::clone(&opts.table_files),
+        above,
+        payload.target_size,
+        payload.dest_level,
+        level_fs,
+        crate::fs::WriteOrigin::CompactionTable,
+    )?
+    .use_output_ledger(opts.outputs.clone());
+    let mut table_writer = configure_table_writer(
+        table_writer,
+        version,
+        opts,
+        payload,
+        filter_sizing,
+        whole_run,
+        rc,
+    )?;
 
+    if let Some(marker) = transform_marker {
+        table_writer = table_writer.use_transform_marker(marker);
+    }
+
+    // Parallel block compression: hand the (per-tree or caller-shared) pool to
+    // the writer so its CPU-bound transform work runs on worker threads while
+    // writes stay ordered. None / single-thread leaves the serial path.
+    // Skipped for sub-compaction writers (block_parallel = false), which
+    // already occupy the pool's workers — see the `block_parallel` parameter
+    // note on `prepare_table_writer`. Also skipped (like the flush writers)
+    // when the per-block transform does no real CPU work: with the identity
+    // transform the pipeline's owned buffer + queue hop per block only adds
+    // lock traffic and pool churn over the serial reusable-buffer path.
+    #[cfg(feature = "std")]
+    let transform_does_work = rc
+        .data_block_compression_policy
+        .get(payload.canonical_level.into())
+        != crate::CompressionType::None
+        || opts.config.encryption.is_some()
+        || opts.config.page_ecc;
+    #[cfg(feature = "std")]
+    let table_writer = if block_parallel && transform_does_work {
+        table_writer.use_parallel_compression(opts.config.parallel_compression())
+    } else {
+        table_writer
+    };
+    #[cfg(not(feature = "std"))]
+    let _ = block_parallel;
+
+    Ok(table_writer)
+}
+
+/// A writer with every setting a compaction of `payload` writes its outputs
+/// with, its file in memory: what bounds the bytes those outputs take before
+/// any is written (see [`MultiWriter::rewrite_bound`]). The plan the
+/// compaction draws its filter widths from may build wider filters than the
+/// level's policy, so its widest choice is taken.
+///
+/// # Errors
+///
+/// As [`prepare_table_writer`].
+pub(super) fn output_bound_probe(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+    rc: &crate::runtime_config::RuntimeConfig,
+) -> crate::Result<MultiWriter> {
+    let probe = MultiWriter::probe(payload.target_size, payload.dest_level)?;
+    let probe = configure_table_writer(probe, version, opts, payload, None, false, rc)?;
+    Ok(match opts.config.filter_advisor.as_ref() {
+        Some(advisor) => probe.use_bloom_policy(crate::filter_budget::widest_policy(
+            advisor.bits_per_key(),
+            output_bloom_policy(version, opts, payload),
+        )),
+        None => probe,
+    })
+}
+
+/// Gives `table_writer` every setting a compaction of `payload` writes its
+/// outputs with: what they hold, how they are encoded and laid out, and where
+/// they are cut. One place for both the writer that writes them and the one
+/// that bounds what they take.
+fn configure_table_writer(
+    table_writer: MultiWriter,
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
+    whole_run: bool,
+    rc: &crate::runtime_config::RuntimeConfig,
+) -> crate::Result<MultiWriter> {
     let dst_lvl = payload.canonical_level.into();
 
     let data_block_size = opts.config.data_block_size_policy.get(dst_lvl);
@@ -442,37 +536,20 @@ pub(super) fn prepare_table_writer(
         payload.dest_level,
         boundaries.len(),
     );
-    // Every output's id is above its inputs': an output takes the age of its
-    // newest input, and the id is what tells the two apart, the higher one
-    // the output that supersedes it.
-    let above = payload.table_ids.iter().copied().max();
-    let mut table_writer = MultiWriter::from_pool(
-        table_base_folder,
-        alloc::sync::Arc::clone(&opts.table_files),
-        above,
-        payload.target_size,
-        payload.dest_level,
-        level_fs,
-        crate::fs::WriteOrigin::CompactionTable,
-    )?
-    .use_output_ledger(opts.outputs.clone())
-    .set_comparator(opts.config.comparator.clone())
-    .use_inherited_age(input_ages)
-    .use_recency(recency)
-    // The outputs' compaction lineage: the input ids this run merges. Lets a
-    // manifest-loss rebuild recognize the output as DERIVED and exclude it
-    // when every input survived a crash-before-commit, instead of publishing
-    // both histories and double-applying the merge operands on read. An
-    // output a filter TRANSFORMS is marked so (see `transform_marker`).
-    .use_lineage(Some(payload.table_ids.iter().copied().collect()))
-    .use_lineage_whole_run(whole_run)
-    // Compaction consumes input tables, so clip RTs to each output table's key range.
-    .use_clip_range_tombstones()
-    .use_cut_alignment(boundaries, span.map(|(_, upper)| upper.clone()));
-
-    if let Some(marker) = transform_marker {
-        table_writer = table_writer.use_transform_marker(marker);
-    }
+    let mut table_writer = table_writer
+        .set_comparator(opts.config.comparator.clone())
+        .use_inherited_age(input_ages)
+        .use_recency(recency)
+        // The outputs' compaction lineage: the input ids this run merges. Lets a
+        // manifest-loss rebuild recognize the output as DERIVED and exclude it
+        // when every input survived a crash-before-commit, instead of publishing
+        // both histories and double-applying the merge operands on read. An
+        // output a filter TRANSFORMS is marked so (see `transform_marker`).
+        .use_lineage(Some(payload.table_ids.iter().copied().collect()))
+        .use_lineage_whole_run(whole_run)
+        // Compaction consumes input tables, so clip RTs to each output table's key range.
+        .use_clip_range_tombstones()
+        .use_cut_alignment(boundaries, span.map(|(_, upper)| upper.clone()));
 
     if index_partitioning {
         // Size-adaptive index: single-level for small SSTs, spill to a
@@ -569,28 +646,6 @@ pub(super) fn prepare_table_writer(
         // writes its outputs under the new strategy, which is how existing
         // SSTs migrate to it.
         .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
-
-    // Parallel block compression: hand the (per-tree or caller-shared) pool to
-    // the writer so its CPU-bound transform work runs on worker threads while
-    // writes stay ordered. None / single-thread leaves the serial path.
-    // Skipped for sub-compaction writers (block_parallel = false), which
-    // already occupy the pool's workers — see the `block_parallel` parameter
-    // note on `prepare_table_writer`. Also skipped (like the flush writers)
-    // when the per-block transform does no real CPU work: with the identity
-    // transform the pipeline's owned buffer + queue hop per block only adds
-    // lock traffic and pool churn over the serial reusable-buffer path.
-    #[cfg(feature = "std")]
-    let transform_does_work = data_block_compression != crate::CompressionType::None
-        || opts.config.encryption.is_some()
-        || opts.config.page_ecc;
-    #[cfg(feature = "std")]
-    let table_writer = if block_parallel && transform_does_work {
-        table_writer.use_parallel_compression(opts.config.parallel_compression())
-    } else {
-        table_writer
-    };
-    #[cfg(not(feature = "std"))]
-    let _ = block_parallel;
 
     Ok(table_writer)
 }

@@ -2,6 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+mod bound;
 mod filter;
 mod index;
 mod meta;
@@ -10,6 +11,7 @@ pub(crate) mod ordered_pipeline;
 #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
 pub(crate) mod parallel_compressor;
 
+pub(crate) use bound::{CellShapes, RewriteLoad};
 pub(crate) use index::DEFAULT_SPILL_THRESHOLD;
 #[cfg(feature = "std")]
 pub use parallel_compressor::CompactionSpawner;

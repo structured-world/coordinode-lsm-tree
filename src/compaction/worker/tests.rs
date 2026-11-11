@@ -3864,6 +3864,10 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
     let free = mem.available_space(dir.path())?;
     let relocated = super::Relocated::new(&stale_files, &blob_reloc_kv_options());
     drop(stale_files);
+    let opts = super::Options::from_tree(
+        &tree.index,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
     let slices = super::tight_slices(
         &inputs,
         super::SliceCaps {
@@ -3872,17 +3876,16 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
             total: free,
         },
         &super::SliceOutputs {
-            target_size: 64 * 1024 * 1024,
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
             cut_keys: &[],
             domains: None,
         },
         Some(&relocated),
         &tree.index.config.comparator,
-        &super::input_pacer(&super::Options::from_tree(
-            &tree.index,
-            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
-        )),
+        &super::input_pacer(&opts),
     )?;
+    drop(opts);
     drop(version);
     let Some(first) = slices.first() else {
         panic!("a pass cuts at least one slice");
@@ -6110,9 +6113,10 @@ fn open_standard(
 
 /// A row written as cells relocates the frames of the cells it references in
 /// a stale file, and only those: a cell kept inline and a reference into a
-/// live file move nothing, and a plain value moves nothing either.
+/// live file move nothing, and a plain value moves nothing either. Its table
+/// links every file it references and lists every object it owns.
 #[test]
-fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crate::Result<()> {
+fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
     use crate::blob_tree::handle::BlobIndirection;
     use crate::vlog::ValueHandle;
@@ -6157,8 +6161,16 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
 
     let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
     let mut dictionaries = Vec::new();
+    let mut load = super::SliceLoad::default();
     assert_eq!(
-        super::stale_frame_bytes(&item, &relocated, &mut dictionaries)?,
+        super::take_entry(
+            &mut load,
+            &item,
+            1,
+            false,
+            Some(&relocated),
+            &mut dictionaries
+        )?,
         super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
     );
     assert_eq!(
@@ -6166,9 +6178,26 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
         vec![7, 7],
         "each reference into the stale file names the dictionary its copy may hold",
     );
+    assert_eq!(
+        load.links.len(),
+        2,
+        "the row links both files it references"
+    );
+    assert_eq!(
+        load.rows.owned_blob_objects, 3,
+        "the row owns its three objects"
+    );
+    assert_eq!(load.rows.entries, 1);
     let plain = InternalValue::from_components(*key, b"v".to_vec(), 2, crate::ValueType::Value);
     assert_eq!(
-        super::stale_frame_bytes(&plain, &relocated, &mut Vec::new())?,
+        super::take_entry(
+            &mut load,
+            &plain,
+            1,
+            false,
+            Some(&relocated),
+            &mut Vec::new()
+        )?,
         0
     );
     Ok(())
@@ -6313,6 +6342,34 @@ fn tight_slices_cover_the_files_each_key_domain_opens() -> crate::Result<()> {
     assert_tight_slice_covers_relocation(dir.path(), &tree, &kv, 1)
 }
 
+/// The writer settings a merge of `inputs` into the last level of `opts`'s
+/// tree at `target_size` writes its outputs with, to bound a slice's tables.
+pub(super) fn slice_probe(
+    opts: &super::Options,
+    inputs: &[Table],
+    target_size: u64,
+) -> crate::Result<crate::table::multi_writer::MultiWriter> {
+    let version = opts.version_history.read().latest_version().version;
+    let Some(last) = version.level_count().checked_sub(1) else {
+        panic!("a tree has levels");
+    };
+    let Ok(last) = u8::try_from(last) else {
+        panic!("a level index fits u8");
+    };
+    let payload = crate::compaction::Input {
+        table_ids: inputs.iter().map(Table::id).collect(),
+        dest_level: last,
+        canonical_level: last,
+        target_size,
+    };
+    crate::compaction::flavour::output_bound_probe(
+        &version,
+        opts,
+        &payload,
+        &opts.runtime_config.load_full(),
+    )
+}
+
 /// A domain per this many keys of the form `k{n:06}`.
 struct PerKeys(u32);
 
@@ -6358,7 +6415,8 @@ fn tight_slices_cover_the_tables_each_key_domain_opens() -> crate::Result<()> {
             total: u64::MAX,
         },
         &super::SliceOutputs {
-            target_size: 64 * 1024 * 1024,
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
             cut_keys: &[],
             domains: tree.config.key_domains.as_deref(),
         },
@@ -6464,6 +6522,10 @@ fn assert_tight_slice_covers_relocation(
     );
     let relocated = super::Relocated::new(&stale_files, kv);
     drop(stale_files);
+    let opts = super::Options::from_tree(
+        &tree.index,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
     let slices = super::tight_slices(
         &inputs,
         super::SliceCaps {
@@ -6472,16 +6534,14 @@ fn assert_tight_slice_covers_relocation(
             total: u64::MAX,
         },
         &super::SliceOutputs {
-            target_size: 64 * 1024 * 1024,
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
             cut_keys: &[],
             domains: tree.index.config.key_domains.as_deref(),
         },
         Some(&relocated),
         &tree.index.config.comparator,
-        &super::input_pacer(&super::Options::from_tree(
-            &tree.index,
-            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
-        )),
+        &super::input_pacer(&opts),
     )?;
     drop(version);
     let [only] = slices.as_slice() else {
@@ -6552,20 +6612,22 @@ fn a_tight_slice_charges_only_the_dictionaries_it_relocates_out_of() -> crate::R
         blobs: every_dictionary,
         total: u64::MAX,
     };
+    let opts = super::Options::from_tree(
+        &tree.index,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
     let slices = super::tight_slices(
         &inputs,
         caps,
         &super::SliceOutputs {
-            target_size: 64 * 1024 * 1024,
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
             cut_keys: &[],
             domains: None,
         },
         Some(&relocated),
         &tree.index.config.comparator,
-        &super::input_pacer(&super::Options::from_tree(
-            &tree.index,
-            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
-        )),
+        &super::input_pacer(&opts),
     )?;
     let Some(first) = slices.first() else {
         panic!("a pass cuts at least one slice");
@@ -6675,7 +6737,8 @@ fn tight_slices_count_the_blocks_they_read_in_the_runs_work() -> crate::Result<(
             total: total / 4,
         },
         &super::SliceOutputs {
-            target_size: 64 * 1024 * 1024,
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
             cut_keys: &[],
             domains: None,
         },

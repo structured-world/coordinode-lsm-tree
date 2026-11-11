@@ -1733,13 +1733,15 @@ struct SliceCaps {
     total: u64,
 }
 
-/// The tables a slice writes: one is opened for every `target_size` bytes,
-/// and one more on every key of `cut_keys` (in key order) the slice passes.
-/// No table or blob file spans two of `domains`, so each domain past the
-/// first a slice's keys lie in opens its outputs again.
+/// The tables a slice writes: as `probe`, which holds the settings of the
+/// writer that writes them, bounds them, one more on every key of `cut_keys`
+/// (in key order) the slice passes, each holding the range tombstones of
+/// `tombstones`. No table or blob file spans two of `domains`, so each domain
+/// past the first a slice's keys lie in opens its outputs again.
 #[cfg(feature = "std")]
 struct SliceOutputs<'a> {
-    target_size: u64,
+    probe: &'a crate::table::multi_writer::MultiWriter,
+    tombstones: crate::table::writer::RewriteLoad,
     cut_keys: &'a [UserKey],
     domains: Option<&'a dyn crate::KeyDomains>,
 }
@@ -1899,56 +1901,20 @@ fn copy_bytes(
     copied.max(frame_bytes(&anew, relocated.chunk_size))
 }
 
-/// The bytes of the blob frames `item` points at in the files `relocated`
-/// moves, as it writes them: its own value, or the references among its
-/// cells, which are kept under its key. Each of those files holding a
-/// dictionary of its own goes into `dictionaries`, the sources whose
-/// dictionary the copy may hold.
-#[cfg(feature = "std")]
-fn stale_frame_bytes(
-    item: &InternalValue,
-    relocated: &Relocated,
-    dictionaries: &mut Vec<BlobFileId>,
-) -> crate::Result<u64> {
-    use crate::blob_tree::field_row::{RowCell, decode_row};
-    use crate::blob_tree::handle::BlobIndirection;
-    use crate::coding::Decode;
-
-    let key_len = item.key.user_key.len();
-    let mut copy = |indirection: &BlobIndirection| {
-        let source = indirection.vhandle.blob_file_id;
-        if !relocated.stale.contains(&source) {
-            return 0;
-        }
-        if relocated.own_dictionaries.contains_key(&source) {
-            dictionaries.push(source);
-        }
-        copy_bytes(indirection, key_len, relocated)
-    };
-    if item.key.value_type.is_indirection() {
-        return Ok(copy(&BlobIndirection::decode_from(&mut &item.value[..])?));
-    }
-    if item.key.value_type.is_cell_row() {
-        let mut bytes = 0;
-        for field in decode_row(&item.value)? {
-            if let RowCell::Ref { indirection, .. } = field.cell {
-                bytes += copy(&indirection);
-            }
-        }
-        return Ok(bytes);
-    }
-    Ok(0)
-}
-
-/// What a slice, or the blocks ending on one key, writes: its bytes to the
-/// tables and to the blob files, the stale sources holding a dictionary of
-/// their own it relocates values out of and those dictionaries' bytes, and
-/// the key domains its keys lie in and those its relocated values lie in,
-/// each by the first key past it (`None` for the last domain).
+/// What a slice, or the blocks ending on one key, writes: the entries its
+/// tables hold, the field columns its cell rows open, the blob files its rows
+/// point into and the keys it passes that end an output, its bytes to the
+/// blob files, the stale sources holding a dictionary of their own it
+/// relocates values out of and those dictionaries' bytes, and the key domains
+/// its keys lie in and those its relocated values lie in, each by the first
+/// key past it (`None` for the last domain).
 #[cfg(feature = "std")]
 #[derive(Default)]
 struct SliceLoad {
-    tables: u64,
+    rows: crate::table::writer::RewriteLoad,
+    cells: crate::table::writer::CellShapes,
+    links: HashSet<BlobFileId>,
+    cut_keys: u64,
     blobs: u64,
     dictionaries: HashSet<BlobFileId>,
     dictionary_bytes: u64,
@@ -1956,15 +1922,73 @@ struct SliceLoad {
     blob_domains: HashSet<Option<UserKey>>,
 }
 
-/// A [`SliceLoad`] counted: its bytes, its dictionaries' bytes and how many
-/// key domains its keys and its relocated values lie in.
+/// A [`SliceLoad`] counted: what its tables hold, the field columns and the
+/// blob files of it included, the keys it passes that end an output, its
+/// bytes to the blob files, its dictionaries' bytes and how many key domains
+/// its keys and its relocated values lie in.
 #[cfg(feature = "std")]
 struct SliceMeasure {
-    tables: u64,
+    rows: crate::table::writer::RewriteLoad,
+    cut_keys: u64,
     blobs: u64,
     dictionary_bytes: u64,
     table_domains: u64,
     blob_domains: u64,
+}
+
+/// What an entry `item` read off an input puts into the slice `load` takes it
+/// into: an entry of its tables, registering `filter_hashes` hashes, the field
+/// columns of a cell row when the outputs split those (`split_cells`), the blob
+/// files its value or references point into and the objects it owns; and, in
+/// a relocating pass, the bytes the frames it points at in the files
+/// `relocated` moves take as it writes them, which it returns. Each of those
+/// files holding a dictionary of its own goes into `dictionaries`, the sources
+/// whose dictionary the copy may hold.
+#[cfg(feature = "std")]
+fn take_entry(
+    load: &mut SliceLoad,
+    item: &InternalValue,
+    filter_hashes: u64,
+    split_cells: bool,
+    relocated: Option<&Relocated>,
+    dictionaries: &mut Vec<BlobFileId>,
+) -> crate::Result<u64> {
+    use crate::blob_tree::field_row::{RowCell, decode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Decode;
+
+    let key_len = item.key.user_key.len();
+    load.rows
+        .take_entry(key_len as u64, item.value.len() as u64, filter_hashes);
+    let mut reference = |links: &mut HashSet<BlobFileId>, indirection: &BlobIndirection| {
+        let source = indirection.vhandle.blob_file_id;
+        links.insert(source);
+        let Some(relocated) = relocated.filter(|r| r.stale.contains(&source)) else {
+            return 0;
+        };
+        if relocated.own_dictionaries.contains_key(&source) {
+            dictionaries.push(source);
+        }
+        copy_bytes(indirection, key_len, relocated)
+    };
+    if item.key.value_type.is_indirection() {
+        let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
+        return Ok(reference(&mut load.links, &indirection));
+    }
+    if item.key.value_type.is_cell_row() {
+        if split_cells {
+            load.cells.take_row(&item.value);
+        }
+        let mut bytes = 0;
+        for field in decode_row(&item.value)? {
+            if let RowCell::Ref { indirection, owner } = field.cell {
+                bytes += reference(&mut load.links, &indirection);
+                load.rows.owned_blob_objects += u64::from(owner);
+            }
+        }
+        return Ok(bytes);
+    }
+    Ok(0)
 }
 
 #[cfg(feature = "std")]
@@ -1981,7 +2005,10 @@ impl SliceLoad {
 
     /// Takes `other` in.
     fn absorb(&mut self, other: &Self, relocated: Option<&Relocated>) {
-        self.tables += other.tables;
+        self.rows.absorb(&other.rows);
+        self.cells.absorb(&other.cells);
+        self.links.extend(other.links.iter().copied());
+        self.cut_keys += other.cut_keys;
         self.blobs += other.blobs;
         for &source in &other.dictionaries {
             self.add_dictionary(source, relocated);
@@ -2002,8 +2029,18 @@ impl SliceLoad {
         let new = |mine: &HashSet<Option<UserKey>>, theirs: &HashSet<Option<UserKey>>| {
             (mine.len() + theirs.iter().filter(|d| !mine.contains(*d)).count()) as u64
         };
+        let mut rows = self.rows;
+        rows.absorb(&other.rows);
+        rows.cell_columns = self.cells.columns_with(&other.cells);
+        rows.linked_blob_files = (self.links.len()
+            + other
+                .links
+                .iter()
+                .filter(|l| !self.links.contains(*l))
+                .count()) as u64;
         SliceMeasure {
-            tables: self.tables + other.tables,
+            rows,
+            cut_keys: self.cut_keys + other.cut_keys,
             blobs: self.blobs + other.blobs,
             dictionary_bytes: self.dictionary_bytes + new_dictionaries,
             table_domains: new(&self.table_domains, &other.table_domains),
@@ -2051,16 +2088,18 @@ fn enter_domain(
 /// The slices a tight-space pass of `inputs` runs in, each within `caps`
 /// as far as its blocks allow, and what each writes.
 ///
-/// A block weighs its share of its table's file, index and filter included,
-/// and, in a relocating pass, the frames its entries point at in the stale
-/// blob files, which the slice relocates: values are not spread evenly over
-/// the keys, so a share of the table's bytes says nothing of a share of
-/// theirs. A slice's tables weigh their blocks and the bytes each table it
-/// opens holds past them, as `outputs` counts them. A slice ends before the
-/// block that would take it past a cap, on the last key of the block
-/// before. The key it ends on goes to the next slice, so that one counts the
-/// entries of that key again, read from the blocks ending on it. A block of
-/// a restricted input below its restriction is punched and writes nothing.
+/// A block weighs the entries it holds as the destination writes them, the
+/// bound the output writer gives from their uncompressed bytes, whatever codec the input stored them
+/// under, and, in a relocating pass, the frames its entries point at in the
+/// stale blob files, which the slice relocates: values are not spread evenly
+/// over the keys, so the table bytes of a block say nothing of theirs. A
+/// slice's tables are bounded over all of its entries, with a table more for
+/// every output its keys end on or open in another key domain, as `outputs`
+/// counts them. A slice ends before the block that would take it past a cap,
+/// on the last key of the block before. The key it ends on goes to the next
+/// slice, so that one counts the entries of that key again, read from the
+/// blocks ending on it. A block of a restricted input below its restriction is
+/// punched and writes nothing.
 ///
 /// The index and block reads go through `pace`, the run's input pacer: they
 /// are the run's reads as much as the merge's are.
@@ -2074,44 +2113,23 @@ fn tight_slices(
     pace: &crate::table::util::Pacer,
 ) -> crate::Result<Vec<TightSlice>> {
     /// The blocks ending on one key: what they write, and where they lie as
-    /// the input, the block and the input's bytes per data byte.
+    /// the input and the block.
     struct Block<'a> {
         end_key: UserKey,
         load: SliceLoad,
-        sources: Vec<(&'a Table, crate::table::BlockHandle, (u64, u64))>,
+        sources: Vec<(&'a Table, crate::table::BlockHandle)>,
     }
 
-    /// The bytes a table writes for an entry, at the most: its key and value
-    /// and what frames them in a block.
-    const ENTRY_FRAMING: u64 = 32;
-
     let cmp = comparator.as_ref();
+    let probe = outputs.probe;
+    let split_cells = probe.splits_cells();
     let mut blocks: Vec<Block> = Vec::new();
     let mut longest_key = 0u64;
-    // What a table holds past its blocks and the sections that grow with
-    // them, at the least the inputs show, and those sections for one block,
-    // the most an input holds per block: the bytes every table takes however
-    // few blocks it holds. The rest of a table's bytes go with its blocks, in
-    // each block's share of the file.
-    let mut fixed: Option<u64> = None;
-    let mut one_block_sections = 0u64;
     for input in inputs {
         let handles = input
             .maintenance_index_walk()
             .with_pace(Arc::clone(pace))
             .collect::<crate::Result<Vec<_>>>()?;
-        // Bounded by the file's length.
-        let data_bytes: u64 = handles.iter().map(|h| u64::from(h.size())).sum();
-        let scaled = input.data_scaled_section_bytes();
-        // A file shorter than its sections says nothing of the rest.
-        if let Some(past_blocks) = input
-            .file_len()
-            .checked_sub(data_bytes)
-            .and_then(|past| past.checked_sub(scaled))
-        {
-            fixed = Some(fixed.map_or(past_blocks, |least| least.min(past_blocks)));
-        }
-        one_block_sections = one_block_sections.max(scaled.div_ceil((handles.len() as u64).max(1)));
         for handle in handles {
             let end_key = handle.end_key().clone();
             if input
@@ -2120,31 +2138,23 @@ fn tight_slices(
             {
                 continue;
             }
-            // The block's share of the file: at most the file's length.
-            let tables = u64::try_from(
-                u128::from(handle.size()) * u128::from(input.file_len())
-                    / u128::from(data_bytes.max(1)),
-            )
-            .unwrap_or(u64::MAX);
-            let mut load = SliceLoad {
-                tables,
-                ..SliceLoad::default()
-            };
-            // The entries are read for what they relocate, and for the
-            // domains their keys lie in.
-            if (relocated.is_some() || outputs.domains.is_some())
-                && let Some(block) =
-                    input.load_data_block_for_maintenance(handle.as_ref(), &**pace)?
-            {
+            let mut load = SliceLoad::default();
+            // A block whose every row a delete mask removes writes nothing.
+            if let Some(block) = input.load_data_block_for_maintenance(handle.as_ref(), &**pace)? {
                 let mut dictionaries = Vec::new();
                 let (mut table_end, mut blob_end) = (DomainEdge::Unseen, DomainEdge::Unseen);
                 block.try_for_each_entry(comparator.clone(), |item| {
                     longest_key = longest_key.max(item.key.user_key.len() as u64);
+                    let hashes = probe.filter_hashes_bound(&item.key.user_key);
                     // Bounded by the stale files' bytes.
-                    let blobs = match relocated {
-                        Some(relocated) => stale_frame_bytes(&item, relocated, &mut dictionaries)?,
-                        None => 0,
-                    };
+                    let blobs = take_entry(
+                        &mut load,
+                        &item,
+                        hashes,
+                        split_cells,
+                        relocated,
+                        &mut dictionaries,
+                    )?;
                     load.blobs += blobs;
                     if let Some(domains) = outputs.domains {
                         let key = &item.key.user_key;
@@ -2162,11 +2172,7 @@ fn tight_slices(
             blocks.push(Block {
                 end_key,
                 load,
-                sources: alloc::vec![(
-                    input,
-                    *handle.as_ref(),
-                    (input.file_len(), data_bytes.max(1)),
-                )],
+                sources: alloc::vec![(input, *handle.as_ref(),)],
             });
         }
     }
@@ -2186,35 +2192,24 @@ fn tight_slices(
         }
     }
     let mut blocks = grouped;
-    let fixed = fixed.unwrap_or(0) + one_block_sections;
-    // A table opened on a cut key weighs on the block that passes it.
+    // An output closed on a cut key goes with the block that passes it.
     let mut cut_keys = outputs.cut_keys.iter().peekable();
     for block in &mut blocks {
         while cut_keys
             .next_if(|key| cmp.compare(key, &block.end_key) != core::cmp::Ordering::Greater)
             .is_some()
         {
-            block.load.tables += fixed;
+            block.load.cut_keys += 1;
         }
     }
 
-    // Every sum is bounded by the inputs' and the stale files' bytes. The
-    // first table of a slice, every one past a target's worth of blocks and
-    // every one a key domain past the first opens weigh their fixed bytes
-    // too. The destination level encodes the blocks its own way (codec,
-    // filter, where blocks end), which an input's share of its file does not
-    // bound: a sixteenth more is kept for it. The blob frames go across as
-    // they lie and need none.
-    let with_tables = |m: &SliceMeasure| {
-        let tables = m.tables + m.tables / 16;
-        tables + fixed * (m.table_domains.max(1) + tables / outputs.target_size.max(1))
-    };
     // Each output blob file closes with its metadata, its first and last keys
     // among it: a file per target's worth of frames, and in each key domain
     // the slice's frames lie in, one more for each codec and lifetime class
     // they may go to. A file of frames copied out of a source with a
     // dictionary of its own holds it as well: each such source the slice
-    // relocates values out of, in each class and domain.
+    // relocates values out of, in each class and domain. Every sum is
+    // bounded by the stale files' bytes. Returns the bytes and the files.
     let with_blobs = |m: &SliceMeasure| match relocated {
         Some(relocated) if m.blobs > 0 => {
             let domains = m.blob_domains.max(1);
@@ -2225,25 +2220,35 @@ fn tight_slices(
             } else {
                 0
             };
-            m.blobs
+            let bytes = m.blobs
                 + files * (BLOB_META_BYTES + 2 * longest_key)
                 + (m.dictionary_bytes + fresh) * relocated.groups * domains
-                + split * relocated.largest_dictionary
+                + split * relocated.largest_dictionary;
+            (bytes, files)
         }
-        _ => m.blobs,
+        _ => (m.blobs, 0),
     };
-    let slice = |end: Option<UserKey>, load: &SliceLoad| {
-        let m = load.measure_with(&SliceLoad::default(), relocated);
-        TightSlice {
-            end,
-            tables: with_tables(&m),
-            blobs: with_blobs(&m),
-        }
+    // The tables hold the slice's entries, the input tombstones each slice is
+    // given, and link the blob files its rows point into and those the
+    // relocation writes. An output closes on each cut key the slice passes
+    // and at each key domain past the first its keys lie in.
+    let with_tables = |m: &SliceMeasure, blob_files: u64| {
+        let mut rows = m.rows;
+        rows.absorb(&outputs.tombstones);
+        rows.linked_blob_files += blob_files;
+        probe.rewrite_bound(&rows, m.cut_keys + m.table_domains.max(1) - 1)
     };
-    let past = |acc: &SliceLoad, block: &Block| {
-        let m = acc.measure_with(&block.load, relocated);
-        let (tables, blobs) = (with_tables(&m), with_blobs(&m));
-        tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total
+    let measure = |m: &SliceMeasure| -> crate::Result<(u64, u64)> {
+        let (blobs, files) = with_blobs(m);
+        Ok((with_tables(m, files)?, blobs))
+    };
+    let slice = |end: Option<UserKey>, load: &SliceLoad| -> crate::Result<TightSlice> {
+        let (tables, blobs) = measure(&load.measure_with(&SliceLoad::default(), relocated))?;
+        Ok(TightSlice { end, tables, blobs })
+    };
+    let past = |acc: &SliceLoad, block: &Block| -> crate::Result<bool> {
+        let (tables, blobs) = measure(&acc.measure_with(&block.load, relocated))?;
+        Ok(tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total)
     };
     // What the entries of the key the blocks of `group` end on write: the
     // next slice's, once a slice ends on that key.
@@ -2251,7 +2256,7 @@ fn tight_slices(
         let mut weight = SliceLoad::default();
         let mut dictionaries = Vec::new();
         let domain = outputs.domains.map(|d| d.domain_end(&group.end_key));
-        for &(input, handle, (file_len, data_bytes)) in &group.sources {
+        for &(input, handle) in &group.sources {
             let Some(block) = input.load_data_block_for_maintenance(&handle, &**pace)? else {
                 continue;
             };
@@ -2259,16 +2264,15 @@ fn tight_slices(
                 if cmp.compare(&item.key.user_key, &group.end_key) != core::cmp::Ordering::Equal {
                     return Ok(());
                 }
-                let raw = item.key.user_key.len() as u64 + item.value.len() as u64 + ENTRY_FRAMING;
-                // The entry's share of the file, as a block's is: bounded by
-                // the file's length.
-                weight.tables +=
-                    u64::try_from(u128::from(raw) * u128::from(file_len) / u128::from(data_bytes))
-                        .unwrap_or(u64::MAX);
-                let blobs = match relocated {
-                    Some(relocated) => stale_frame_bytes(&item, relocated, &mut dictionaries)?,
-                    None => 0,
-                };
+                let hashes = probe.filter_hashes_bound(&item.key.user_key);
+                let blobs = take_entry(
+                    &mut weight,
+                    &item,
+                    hashes,
+                    split_cells,
+                    relocated,
+                    &mut dictionaries,
+                )?;
                 weight.blobs += blobs;
                 if let Some(domain) = &domain {
                     weight.table_domains.insert(domain.clone());
@@ -2290,15 +2294,15 @@ fn tight_slices(
     let mut last: Option<&Block> = None;
     for block in &blocks {
         if let Some(previous) = last
-            && past(&acc, block)
+            && past(&acc, block)?
         {
-            slices.push(slice(Some(previous.end_key.clone()), &acc));
+            slices.push(slice(Some(previous.end_key.clone()), &acc)?);
             acc = key_weight(previous)?;
         }
         acc.absorb(&block.load, relocated);
         last = Some(block);
     }
-    slices.push(slice(None, &acc));
+    slices.push(slice(None, &acc)?);
     Ok(slices)
 }
 
@@ -2482,6 +2486,25 @@ fn run_tight_space_compaction(
     let others_at_start =
         crate::storage_stats::compute_used_bytes_but(&latest.version, &own_tables, &own_blobs)?;
     let cut_keys = super::flavour::output_cut_keys(&latest.version, opts, payload);
+    // What the outputs take is bounded by a writer of their settings, and
+    // each slice is given every input tombstone.
+    let probe = super::flavour::output_bound_probe(
+        &latest.version,
+        opts,
+        payload,
+        &opts.runtime_config.load_full(),
+    )?;
+    let mut input_tombstones: Vec<&crate::range_tombstone::RangeTombstone> =
+        inputs.iter().flat_map(Table::range_tombstones).collect();
+    input_tombstones.sort();
+    input_tombstones.dedup();
+    let mut tombstones = crate::table::writer::RewriteLoad::default();
+    for rt in input_tombstones {
+        let (start, end) = (rt.start.len() as u64, rt.end.len() as u64);
+        tombstones.range_tombstones += 1;
+        tombstones.range_tombstone_bytes += start + end;
+        tombstones.longest_key = tombstones.longest_key.max(start).max(end);
+    }
 
     drop(latest);
     drop(version_history_lock);
@@ -2532,7 +2555,8 @@ fn run_tight_space_compaction(
     };
     let relocated = relocation.filter(|_| relocating_blobs);
     let outputs = SliceOutputs {
-        target_size: payload.target_size,
+        probe: &probe,
+        tombstones,
         cut_keys: &cut_keys,
         domains: opts.config.key_domains.as_deref(),
     };
