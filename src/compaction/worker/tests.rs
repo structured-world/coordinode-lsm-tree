@@ -3874,6 +3874,9 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
         target_size: 48 * 1024,
         chunk_size: blob_reloc_kv_options().frame_sizes().chunk_size,
         file_groups: codecs.len() as u64 * u64::from(blob_reloc_kv_options().lifetime_groups.get()),
+        dictionaries: super::copied_dictionaries(&stale_files).0
+            * u64::from(blob_reloc_kv_options().lifetime_groups.get()),
+        largest_dictionary: super::copied_dictionaries(&stale_files).1,
     };
     let slices = super::tight_slices(
         &inputs,
@@ -6249,6 +6252,129 @@ fn frame_bytes_cover_a_block_value_the_copy_splits_into_chunks() -> crate::Resul
     assert!(
         bound >= u64::from(written),
         "bound {bound} under the {written} bytes the copy writes"
+    );
+    Ok(())
+}
+
+/// A relocated value of a file that holds a dictionary of its own is copied
+/// into a file that holds that dictionary too. The room a tight-space pass
+/// charges for the relocation covers it, or a slice of a few surviving values
+/// is admitted to a room the dictionary alone outgrows.
+#[test]
+#[cfg(feature = "zstd")]
+fn tight_slices_cover_the_dictionary_a_relocated_file_holds() -> crate::Result<()> {
+    use std::collections::HashSet;
+
+    let dir = tempfile::tempdir()?;
+    let kv = KvSeparationOptions::default()
+        .separation_threshold(1)
+        .block_size(0)
+        .age_cutoff(1.0)
+        .staleness_threshold(0.1);
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Zstd(3))
+    .with_kv_separation(Some(kv.clone()))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    let keys = 4_000u32;
+    for i in 0..keys {
+        let value = format!(
+            "{{\"id\":{i},\"tenant\":\"acme\",\"kind\":\"order\",\"region\":\"eu-west-{}\",\
+             \"sku\":\"SKU-{}\",\"note\":\"customer asked for delivery before noon\"}}",
+            i % 3,
+            i % 97
+        );
+        tree.insert(format!("k{i:06}"), value, u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    // A few survivors: the stale file is worth relocating, and what it
+    // relocates is small beside its dictionary.
+    for i in 0..keys {
+        if i % 500 != 0 {
+            tree.remove(format!("k{i:06}"), u64::from(keys + i));
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    // Drops the removed values and records how much of the file they were.
+    tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
+
+    let version = tree.index.current_version();
+    let inputs: Vec<Table> = version.iter_tables().cloned().collect();
+    let ids: crate::HashSet<TableId> = inputs.iter().map(Table::id).collect();
+    let stale_files = super::pick_blob_files_to_rewrite(&ids, &version, &kv)?;
+    assert!(
+        stale_files
+            .iter()
+            .any(crate::vlog::BlobFile::has_own_dictionary),
+        "the fixture needs a stale file holding a dictionary of its own: {:?}",
+        stale_files
+            .iter()
+            .map(|f| (f.id(), f.compression(), f.has_own_dictionary()))
+            .collect::<Vec<_>>()
+    );
+    let stale: crate::HashSet<_> = stale_files.iter().map(crate::vlog::BlobFile::id).collect();
+    let mut codecs = Vec::new();
+    for file in &stale_files {
+        if !codecs.contains(&file.compression()) {
+            codecs.push(file.compression());
+        }
+    }
+    let relocated = super::Relocated {
+        stale: &stale,
+        target_size: kv.file_target_size,
+        chunk_size: kv.frame_sizes().chunk_size,
+        file_groups: codecs.len() as u64 * u64::from(kv.lifetime_groups.get()),
+        dictionaries: super::copied_dictionaries(&stale_files).0
+            * u64::from(kv.lifetime_groups.get()),
+        largest_dictionary: super::copied_dictionaries(&stale_files).1,
+    };
+    let slices = super::tight_slices(
+        &inputs,
+        super::SliceCaps {
+            tables: u64::MAX,
+            blobs: u64::MAX,
+            total: u64::MAX,
+        },
+        &super::SliceOutputs {
+            target_size: 64 * 1024 * 1024,
+            cut_keys: &[],
+        },
+        Some(&relocated),
+        &tree.index.config.comparator,
+        &super::input_pacer(&super::Options::from_tree(
+            &tree.index,
+            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+        )),
+    )?;
+    drop(version);
+    let [only] = slices.as_slice() else {
+        panic!("unbounded caps cut one slice: {slices:?}");
+    };
+
+    let blobs = dir.path().join(crate::file::BLOBS_FOLDER);
+    let names = |dir: &std::path::Path| -> crate::Result<HashSet<std::ffi::OsString>> {
+        Ok(std::fs::read_dir(dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<_>>()?)
+    };
+    let before = names(&blobs)?;
+    tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
+    let mut written = 0;
+    for name in names(&blobs)?.difference(&before) {
+        written += std::fs::metadata(blobs.join(name))?.len();
+    }
+    assert!(written > 0, "the relocation writes a blob file");
+    assert!(
+        only.blobs >= written,
+        "the pass charges {} bytes for a relocation that writes {written}",
+        only.blobs
     );
     Ok(())
 }

@@ -1744,13 +1744,28 @@ struct SliceOutputs<'a> {
 /// What a relocating pass moves: the frames its inputs point at in the
 /// `stale` blob files, written into files of `target_size` bytes split into
 /// chunks of `chunk_size`, a file for each of `file_groups` codecs and
-/// lifetime classes at once.
+/// lifetime classes at once. A file of copied frames holds the dictionary of
+/// its own their source holds: `dictionaries` bytes for the first file of
+/// each such source and class, and at most `largest_dictionary` for every
+/// file a target's worth of frames opens past it.
 #[cfg(feature = "std")]
 struct Relocated<'a> {
     stale: &'a HashSet<BlobFileId>,
     target_size: u64,
     chunk_size: u32,
     file_groups: u64,
+    dictionaries: u64,
+    largest_dictionary: u64,
+}
+
+/// The bytes of the dictionaries of their own `stale` files hold, together
+/// and the largest: what the files their frames are copied into hold too.
+#[cfg(feature = "std")]
+fn copied_dictionaries(stale: &[crate::vlog::BlobFile]) -> (u64, u64) {
+    stale.iter().fold((0, 0), |(sum, largest), file| {
+        let bytes = file.own_dictionary_bytes();
+        (sum + bytes, largest.max(bytes))
+    })
 }
 
 /// A blob file's metadata past its frames, short of its two keys: the block
@@ -1978,11 +1993,16 @@ fn tight_slices(
     };
     // Each output blob file closes with its metadata, its first and last keys
     // among it: a file per target's worth of frames, and one more for each
-    // codec and lifetime class the slice's frames may go to.
+    // codec and lifetime class the slice's frames may go to. A file of frames
+    // copied out of a source with a dictionary of its own holds it as well.
     let with_blobs = |blobs: u64| match relocated {
         Some(relocated) if blobs > 0 => {
-            let files = blobs.div_ceil(relocated.target_size.max(1)) + relocated.file_groups;
-            blobs + files * (BLOB_META_BYTES + 2 * longest_key)
+            let split = blobs.div_ceil(relocated.target_size.max(1));
+            let files = split + relocated.file_groups;
+            blobs
+                + files * (BLOB_META_BYTES + 2 * longest_key)
+                + relocated.dictionaries
+                + split * relocated.largest_dictionary
         }
         _ => blobs,
     };
@@ -2145,6 +2165,7 @@ fn run_tight_space_compaction(
         }
     }
     let stale_codecs = codecs.len() as u64;
+    let (dictionaries, largest_dictionary) = copied_dictionaries(&stale_files);
     drop(stale_files);
     let relocating = !stale_ids.is_empty();
 
@@ -2294,6 +2315,13 @@ fn run_tight_space_compaction(
                 .kv_separation_opts
                 .as_ref()
                 .map_or(1, |blob_opts| u64::from(blob_opts.lifetime_groups.get())),
+        dictionaries: dictionaries
+            * opts
+                .config
+                .kv_separation_opts
+                .as_ref()
+                .map_or(1, |blob_opts| u64::from(blob_opts.lifetime_groups.get())),
+        largest_dictionary,
     });
     let outputs = SliceOutputs {
         target_size: payload.target_size,

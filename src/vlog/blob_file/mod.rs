@@ -691,6 +691,28 @@ impl BlobFile {
         false
     }
 
+    /// The bytes of the dictionary of its own this file holds, which a file
+    /// its frames are copied into holds too; `0` for none.
+    #[must_use]
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::unused_self,
+            reason = "without zstd no file holds a dictionary of its own"
+        )
+    )]
+    pub(crate) fn own_dictionary_bytes(&self) -> u64 {
+        #[cfg(zstd_any)]
+        return self
+            .0
+            .zstd_dictionary
+            .as_ref()
+            .filter(|_| self.has_own_dictionary())
+            .map_or(0, |dict| dict.raw().len() as u64);
+        #[cfg(not(zstd_any))]
+        0
+    }
+
     /// The lifetime class this file's values were written under; `0` is the
     /// shortest-lived. See
     /// [`KvSeparationOptions::lifetime_groups`](crate::KvSeparationOptions::lifetime_groups).
