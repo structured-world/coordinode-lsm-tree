@@ -332,9 +332,7 @@ and the most heap the write took; a full scan; point reads of every key in a
 shuffled order, once with a 16 MiB cache the data does not fit in and once
 with one it fits in; 4 KiB range reads of the values above 1 MiB with the
 bytes each decodes, and the most heap a whole read and a range read of the
-largest value take; and the write amplification of collection, three rounds
-each overwriting a third of the keys, flushed and compacted, as relocated blob
-bytes over removed blob bytes. Every value is separated (threshold 64 bytes),
+largest value take. Every value is separated (threshold 64 bytes),
 so the runs measure the blob files alone. The trees go to `--work`. The sweep
 does not drop the OS page cache between its passes, so a point read with the
 small cache finds its bytes in the page cache when the engine's cache does not
@@ -360,18 +358,18 @@ carry what an earlier layout left in the caches or the clock. A time difference 
 run-to-run spread is no reason to choose a default until runs in alternating
 order repeat it.
 
-| Corpus | Layout | Ratio lz4 | Ratio zstd 3 | Point read lz4 | Point read zstd 3 | Collection WA lz4 |
-|---|---|---|---|---|---|---|
-| documents | per-value | 0.371 | 0.278 | 7.3 µs | 13.6 µs | 0.50 |
-| documents | block 4K | 0.311 | 0.225 | 6.6 µs | 11.0 µs | 0.59 |
-| documents | block 8K | 0.297 | 0.213 | 7.6 µs | 12.6 µs | 0.63 |
-| documents | block 16K | 0.286 | 0.203 | 9.8 µs | 16.7 µs | 0.66 |
-| documents | block 32K | 0.262 | 0.182 | 20.7 µs | 38.5 µs | 0.79 |
-| chain | per-value | 0.599 | 0.405 | 7.1 µs | 11.6 µs | 0.50 |
-| chain | block 4K | 0.442 | 0.270 | 10.1 µs | 16.3 µs | 0.61 |
-| chain | block 8K | 0.409 | 0.242 | 11.9 µs | 19.2 µs | 0.63 |
-| chain | block 16K | 0.384 | 0.221 | 15.3 µs | 26.2 µs | 0.64 |
-| chain | block 32K | 0.368 | 0.209 | 23.2 µs | 39.1 µs | 0.65 |
+| Corpus | Layout | Ratio lz4 | Ratio zstd 3 | Point read lz4 | Point read zstd 3 |
+|---|---|---|---|---|---|
+| documents | per-value | 0.371 | 0.278 | 7.3 µs | 13.6 µs |
+| documents | block 4K | 0.311 | 0.225 | 6.6 µs | 11.0 µs |
+| documents | block 8K | 0.297 | 0.213 | 7.6 µs | 12.6 µs |
+| documents | block 16K | 0.286 | 0.203 | 9.8 µs | 16.7 µs |
+| documents | block 32K | 0.262 | 0.182 | 20.7 µs | 38.5 µs |
+| chain | per-value | 0.599 | 0.405 | 7.1 µs | 11.6 µs |
+| chain | block 4K | 0.442 | 0.270 | 10.1 µs | 16.3 µs |
+| chain | block 8K | 0.409 | 0.242 | 11.9 µs | 19.2 µs |
+| chain | block 16K | 0.384 | 0.221 | 15.3 µs | 26.2 µs |
+| chain | block 32K | 0.368 | 0.209 | 23.2 µs | 39.1 µs |
 
 With the cache holding the data, every layout reads a key in 1.4 to 2.1 µs.
 
@@ -407,8 +405,7 @@ The defaults that follow:
   zstd) for a fifth less on disk; 16 KiB saves another 4% and costs about a
   third more per read, 32 KiB nearly triples it. Chain values are small enough
   that every block size costs reads; 8 KiB adds two thirds to a read for a
-  third less on disk. A block also costs collection: a block is relocated with its live
-  neighbours, which takes the write amplification from 0.50 to 0.63 at 8 KiB.
+  third less on disk.
 - **Chunks of 256 KiB.** 64 KiB loses 4% of ratio, 1 MiB and above make a
   4 KiB range read four to nineteen times slower for at most 3% of ratio.
 - **A dictionary for blocks and single values, none for chunks.** Small values
