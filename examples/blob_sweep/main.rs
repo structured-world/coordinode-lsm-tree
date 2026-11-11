@@ -85,6 +85,24 @@ unsafe impl GlobalAlloc for Counting {
         self.in_use
             .fetch_sub(layout.size() as u64, Ordering::Relaxed);
     }
+
+    // Passed on rather than left to the default, which allocates, copies and
+    // frees: the probe must not change how the program it measures grows its
+    // buffers.
+    unsafe fn realloc(&self, ptr: *mut u8, layout: AllocLayout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller's contract for `realloc`, passed on.
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new.is_null() {
+            let (old, size) = (layout.size() as u64, new_size as u64);
+            if size >= old {
+                let now = self.in_use.fetch_add(size - old, Ordering::Relaxed) + (size - old);
+                self.peak.fetch_max(now, Ordering::Relaxed);
+            } else {
+                self.in_use.fetch_sub(old - size, Ordering::Relaxed);
+            }
+        }
+        new
+    }
 }
 
 // A program links one global allocator: with the crate's `mimalloc` feature

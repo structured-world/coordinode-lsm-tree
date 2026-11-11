@@ -380,12 +380,18 @@ where
                 self.main_bytes += w;
                 self.main.push_back(key);
             } else {
-                // Cold: evict, remember the fingerprint in the ghost queue.
-                if let Ok(entry) = self.map.find_entry(hash, |(k, _)| *k == key) {
-                    evicted.push(entry.remove().0.1.value);
-                }
+                // Cold: evict, remember the fingerprint in the ghost queue. The
+                // shard's accounting is whole before the value is handed on.
+                let removed = self
+                    .map
+                    .find_entry(hash, |(k, _)| *k == key)
+                    .ok()
+                    .map(|entry| entry.remove().0.1.value);
                 self.small_bytes -= w;
                 self.push_ghost(hash);
+                if let Some(value) = removed {
+                    evicted.push(value);
+                }
             }
             return true;
         }
@@ -408,10 +414,15 @@ where
                 self.main.push_back(key);
             } else {
                 let w = slot.weight;
-                if let Ok(entry) = self.map.find_entry(hash, |(k, _)| *k == key) {
-                    evicted.push(entry.remove().0.1.value);
-                }
+                let removed = self
+                    .map
+                    .find_entry(hash, |(k, _)| *k == key)
+                    .ok()
+                    .map(|entry| entry.remove().0.1.value);
                 self.main_bytes -= w;
+                if let Some(value) = removed {
+                    evicted.push(value);
+                }
             }
             return true;
         }

@@ -15536,14 +15536,15 @@ fn the_frontier_walk_steps_over_a_chunked_value_between_holes() -> crate::Result
             KvSeparationOptions::default()
                 .separation_threshold(16)
                 .block_size(0)
-                .chunk_size(core::num::NonZeroU32::new(100).expect("non-zero")),
+                // The smallest chunk size a tree takes.
+                .chunk_size(core::num::NonZeroU32::new(4 * 1024).expect("non-zero")),
         ))
         .open()?;
         // Three chunks each.
         for i in 0..6u32 {
             tree.insert(
                 format!("k{i:04}").as_bytes(),
-                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 300],
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 12 * 1024],
                 u64::from(i),
             );
         }
@@ -15554,6 +15555,11 @@ fn the_frontier_walk_steps_over_a_chunked_value_between_holes() -> crate::Result
     let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs, 0)?
         .collect::<crate::Result<Vec<_>>>()?;
     assert_eq!(entries.len(), 6, "six separated values");
+    let third = entries.get(2).expect("a third value");
+    assert!(
+        third.frames.as_ref().is_some_and(|frames| frames.len() > 1),
+        "the value between the holes lies in a head and its chunks"
+    );
     let data_start = entries.first().expect("a value").offset;
     let second = entries.get(1).expect("a second value");
     let fourth = entries.get(3).expect("a fourth value");

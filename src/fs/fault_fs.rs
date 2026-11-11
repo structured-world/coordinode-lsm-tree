@@ -1472,6 +1472,17 @@ struct FaultFile {
     injector: Arc<FaultInjector>,
 }
 
+impl FaultFile {
+    /// Records `bytes` written to this file's backend, a shortened write as
+    /// well as a whole one.
+    fn log_write(&self, bytes: usize) {
+        self.injector
+            .write_log
+            .lock()
+            .push((self.path.clone(), bytes));
+    }
+}
+
 impl Drop for FaultFile {
     fn drop(&mut self) {
         self.injector.note_closed(self.handle);
@@ -1506,14 +1517,12 @@ impl std::io::Write for FaultFile {
                 }
                 let (head, _) = buf.split_at(take);
                 self.inner.write_all(head)?;
+                self.log_write(take);
                 Ok(take)
             }
             None => {
                 let written = self.inner.write(buf)?;
-                self.injector
-                    .write_log
-                    .lock()
-                    .push((self.path.clone(), written));
+                self.log_write(written);
                 Ok(written)
             }
         }

@@ -158,7 +158,9 @@ async function chain(blocks: string, transactions: string, limit: number): Promi
   const txSink = createWriteStream(transactions);
   const headers: Record<string, string> = { "content-type": "application/json" };
   const key = process.env.TRONGRID_API_KEY;
-  if (key !== undefined && key !== "") {
+  // An empty key is no key: sent without it, and paced as a keyless client.
+  const keyless = key === undefined || key === "";
+  if (!keyless) {
     headers["TRON-PRO-API-KEY"] = key;
   }
   let written = 0;
@@ -170,6 +172,11 @@ async function chain(blocks: string, transactions: string, limit: number): Promi
       body: JSON.stringify({ startNum: start, endNum: start + TRON_BATCH }),
     });
     const batch = (await response.json()) as TronBatch;
+    // A batch past the chain's head holds no block: asking on would never
+    // reach the limit.
+    if ((batch.block ?? []).length === 0) {
+      throw new Error(`TronGrid returned no block from height ${start}`);
+    }
     for (const block of batch.block ?? []) {
       const line = `${JSON.stringify(block)}\n`;
       blockSink.write(line);
@@ -182,7 +189,7 @@ async function chain(blocks: string, transactions: string, limit: number): Promi
       }
     }
     // Keyless clients are held to a few requests a second.
-    await new Promise((resolve) => setTimeout(resolve, key === undefined ? 1_000 : 100));
+    await new Promise((resolve) => setTimeout(resolve, keyless ? 1_000 : 100));
   }
   await new Promise<void>((resolve) => blockSink.end(resolve));
   await new Promise<void>((resolve) => txSink.end(resolve));

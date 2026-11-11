@@ -804,6 +804,115 @@ fn recovery_refuses_when_no_blob_duplicate_matches_the_manifest() {
     );
 }
 
+/// Writes blob file 0 at `path` and returns the manifest digest of it: zstd
+/// with a dictionary of its own when the build has zstd, so the file carries a
+/// `dict` section to damage.
+fn write_blob_zero(path: &std::path::Path) -> crate::Result<Checksum> {
+    let writer = blob_file::writer::Writer::new(path, 0, 0, &crate::fs::StdFs)?;
+    #[cfg(zstd_any)]
+    let writer = writer
+        .use_compression(crate::CompressionType::Zstd(3))
+        .use_file_dictionary(4 * 1024);
+    let mut writer = writer;
+    for i in 0..2_000u32 {
+        let value = format!("record {i:08} status=ok region=eu-west ").repeat(4);
+        writer.write(format!("k{i:06}").as_bytes(), 0, value.as_bytes())?;
+    }
+    let (_, checksum, _) = writer.finish()?;
+    Ok(checksum)
+}
+
+/// A second directory entry of the same id whose metadata or stored dictionary
+/// is damaged is not the copy the manifest digested, so it must not stop the
+/// open: the intact copy the digest names is recovered, and the damaged one is
+/// an orphan.
+#[test]
+#[expect(clippy::indexing_slicing, reason = "test code")]
+fn a_damaged_duplicate_blob_copy_does_not_stop_the_open() -> crate::Result<()> {
+    let damages: Vec<&[u8]> = if cfg!(zstd_any) {
+        vec![b"meta", b"dict"]
+    } else {
+        vec![b"meta"]
+    };
+    for section in damages {
+        let dir = tempfile::tempdir()?;
+        let authoritative = dir.path().join("0");
+        let checksum = write_blob_zero(&authoritative)?;
+        let twin = dir.path().join("00");
+        std::fs::copy(&authoritative, &twin)?;
+        if section == b"meta" {
+            crate::test_forge::forge_section_omitted(&twin, b"meta")?;
+        } else {
+            let pos = crate::sfa::Reader::new(&twin)?
+                .toc()
+                .section(b"dict")
+                .map(crate::sfa::TocEntry::pos)
+                .unwrap_or_default();
+            let mut bytes = std::fs::read(&twin)?;
+            let at = usize::try_from(pos).unwrap_or_default() + 16;
+            bytes[at] ^= 0xFF;
+            std::fs::write(&twin, &bytes)?;
+        }
+
+        let (recovered, orphans) = recover_blob_files(
+            dir.path(),
+            &[(0, checksum, 0)],
+            0,
+            None,
+            &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+            #[cfg(zstd_any)]
+            &no_dicts(),
+        )?;
+        assert_eq!(recovered.len(), 1, "one copy per id survives");
+        assert_eq!(
+            &*recovered[0].0.path,
+            &*authoritative,
+            "the intact copy is kept beside a twin with a damaged {}",
+            String::from_utf8_lossy(section),
+        );
+        assert_eq!(orphans, vec![twin], "the damaged twin is an orphan");
+    }
+    Ok(())
+}
+
+/// A damaged twin vouches for nothing: when the copy left beside it does not
+/// reproduce the manifest's digest either, the open refuses as it does for two
+/// readable copies that both mismatch, rather than taking the survivor.
+#[test]
+fn a_damaged_duplicate_blob_copy_does_not_vouch_for_a_mismatched_one() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let canonical = dir.path().join("0");
+    let checksum = write_blob_zero(&canonical)?;
+    let twin = dir.path().join("00");
+    std::fs::copy(&canonical, &twin)?;
+    crate::test_forge::forge_section_omitted(&twin, b"meta")?;
+    // Rot a data byte of the readable copy: its metadata still parses, its
+    // digest no longer matches.
+    let data = crate::sfa::Reader::new(&canonical)?
+        .toc()
+        .section(b"data")
+        .map(crate::sfa::TocEntry::pos)
+        .unwrap_or_default();
+    let mut bytes = std::fs::read(&canonical)?;
+    let at = usize::try_from(data).unwrap_or_default() + 8;
+    if let Some(byte) = bytes.get_mut(at) {
+        *byte ^= 0xFF;
+    }
+    std::fs::write(&canonical, &bytes)?;
+
+    let result = recover_blob_files(
+        dir.path(),
+        &[(0, checksum, 0)],
+        0,
+        None,
+        &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+        #[cfg(zstd_any)]
+        &no_dicts(),
+    );
+    assert!(matches!(result, Err(crate::Error::Unrecoverable)));
+    Ok(())
+}
+
 /// A blob file's tight-space punch can be deferred by a checkpoint's hard link
 /// exactly as a table's. That intent lives only in the running tree's queue, so
 /// after a restart the manifest still recovers the blob with a positive

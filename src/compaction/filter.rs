@@ -352,6 +352,9 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
                     .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
                     .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                     .use_zstd_dictionaries(dicts)
+                    // A zstd file of its new values builds a dictionary of its
+                    // own, as a flush's does.
+                    .use_file_dictionary(blob_opts.file_dictionary)
             };
             #[cfg(feature = "std")]
             let writer =

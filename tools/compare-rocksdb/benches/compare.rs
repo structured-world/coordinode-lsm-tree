@@ -913,14 +913,21 @@ fn ours_config(
 fn separate_values(config: Config, blobs: Option<BlobCodec>) -> Config {
     match blobs {
         Some(codec) => {
+            // A byte count from `name`, `None` without it. A value that is
+            // not one stops the run, as `COMPARE_SIZES` does: a typo would
+            // otherwise measure the default under the name of the setting.
+            let byte_count = |name: &str| {
+                std::env::var(name).ok().map(|v| {
+                    v.trim()
+                        .parse::<u32>()
+                        .unwrap_or_else(|_| panic!("{name}: not a byte count: {v}"))
+                })
+            };
             let mut opts =
                 KvSeparationOptions::default().separation_threshold(BLOB_SEPARATION_THRESHOLD);
             // Blob block size under study: `COMPARE_BLOB_BLOCK` bytes, the
             // library default without it.
-            if let Some(bytes) = std::env::var("COMPARE_BLOB_BLOCK")
-                .ok()
-                .and_then(|v| v.parse().ok())
-            {
+            if let Some(bytes) = byte_count("COMPARE_BLOB_BLOCK") {
                 opts = opts.block_size(bytes);
             }
             // A dictionary of each zstd blob file's own: `COMPARE_BLOB_DICT`
@@ -928,10 +935,7 @@ fn separate_values(config: Config, blobs: Option<BlobCodec>) -> Config {
             // The zstd blob arms therefore run our default layout, a file's
             // own dictionary included, against RocksDB's blob files, which
             // have none: the comparison is of the two engines' defaults.
-            if let Some(bytes) = std::env::var("COMPARE_BLOB_DICT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-            {
+            if let Some(bytes) = byte_count("COMPARE_BLOB_DICT") {
                 opts = opts.file_dictionary(bytes);
             }
             config
@@ -1346,9 +1350,11 @@ fn drop_page_cache(dir: &Path) {
     if !cfg!(target_os = "linux") {
         return;
     }
-    for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+    // An entry that cannot be read would stay warm and pass for a cold read.
+    for entry in std::fs::read_dir(dir).expect("read dir") {
+        let entry = entry.expect("read dir entry");
         let path = entry.path();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        if entry.file_type().expect("entry file type").is_dir() {
             drop_page_cache(&path);
             continue;
         }

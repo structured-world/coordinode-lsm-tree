@@ -88,6 +88,8 @@ impl<'a> BlobIngestion<'a> {
             blob.use_zstd_dictionary(dicts.for_compression(blob_compression)?)
                 .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                 .use_zstd_dictionaries(dicts)
+                // A zstd file builds a dictionary of its own, as a flush's does.
+                .use_file_dictionary(kv.file_dictionary)
         };
         #[cfg(feature = "std")]
         let blob = blob.use_parallel_compression(tree.index.config.parallel_compression());

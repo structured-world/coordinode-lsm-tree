@@ -531,6 +531,7 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
     let outputs = super::SliceOutputs {
         target_size: OUTPUT_TARGET,
         cut_keys: &cut_keys,
+        domains: None,
     };
     let slice_ends: Vec<u32> = super::tight_slices(
         &inputs,

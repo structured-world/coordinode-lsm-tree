@@ -42,6 +42,21 @@ fn naming(blob_file_id: BlobFileId, frame: u32, index: u16) -> BlobIndirection {
     }
 }
 
+/// A held row costs its place in the queue as well as its bytes: a run of
+/// tombstones, whose keys and values are short, still counts toward the
+/// bound on what a relocation holds.
+#[test]
+fn a_held_row_counts_its_place_in_the_queue() {
+    let tombstone = InternalValue::from_components(
+        UserKey::from(b"k".as_slice()),
+        UserValue::empty(),
+        1,
+        crate::ValueType::Tombstone,
+    );
+    // Its place, plus the one byte of its key.
+    assert!(held_len(&Held::Row(tombstone)) > core::mem::size_of::<Held>());
+}
+
 /// Values of one block share its frame: a drain toward one of them passes
 /// the block's earlier values and stops at its own index.
 #[test]

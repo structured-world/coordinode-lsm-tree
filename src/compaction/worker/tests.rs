@@ -3874,6 +3874,7 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
         &super::SliceOutputs {
             target_size: 64 * 1024 * 1024,
             cut_keys: &[],
+            domains: None,
         },
         Some(&relocated),
         &tree.index.config.comparator,
@@ -6147,18 +6148,29 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
         target_size: u64::MAX,
         chunk_size: u32::MAX,
         file_groups: 1,
-        dictionaries: 0,
-        largest_dictionary: 0,
+        groups: 1,
+        own_dictionaries: core::iter::once::<(BlobFileId, u64)>((7, 4_096)).collect(),
+        fresh_dictionary: 0,
+        largest_dictionary: 4_096,
     };
     let key = b"row-key";
 
     let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
+    let mut dictionaries = Vec::new();
     assert_eq!(
-        super::stale_frame_bytes(&item, &relocated)?,
+        super::stale_frame_bytes(&item, &relocated, &mut dictionaries)?,
         super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
     );
+    assert_eq!(
+        dictionaries,
+        vec![7, 7],
+        "each reference into the stale file names the dictionary its copy may hold",
+    );
     let plain = InternalValue::from_components(*key, b"v".to_vec(), 2, crate::ValueType::Value);
-    assert_eq!(super::stale_frame_bytes(&plain, &relocated)?, 0);
+    assert_eq!(
+        super::stale_frame_bytes(&plain, &relocated, &mut Vec::new())?,
+        0
+    );
     Ok(())
 }
 
@@ -6284,23 +6296,120 @@ fn frame_bytes_cover_a_block_value_the_copy_splits_into_chunks() -> crate::Resul
 #[cfg(feature = "zstd")]
 fn tight_slices_cover_the_dictionary_a_relocated_file_holds() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
+    let (tree, kv) = few_survivors_of_a_dictionary_file(dir.path(), None)?;
+    assert_tight_slice_covers_relocation(dir.path(), &tree, &kv, 1)
+}
+
+/// A source written before the tree took a key-domain policy holds values of
+/// several domains, and a relocation closes its outputs at each boundary: a
+/// file per domain, each holding the source's dictionary again. The room a
+/// tight-space pass charges covers every one of them.
+#[test]
+#[cfg(feature = "zstd")]
+fn tight_slices_cover_the_files_each_key_domain_opens() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Each surviving value its own domain.
+    let (tree, kv) = few_survivors_of_a_dictionary_file(dir.path(), Some(Arc::new(PerKeys(500))))?;
+    assert_tight_slice_covers_relocation(dir.path(), &tree, &kv, 1)
+}
+
+/// A domain per this many keys of the form `k{n:06}`.
+struct PerKeys(u32);
+
+impl crate::KeyDomains for PerKeys {
+    fn domain_end(&self, key: &[u8]) -> Option<crate::UserKey> {
+        let n: u32 = core::str::from_utf8(key.get(1..)?).ok()?.parse().ok()?;
+        Some(
+            format!("k{:06}", (n / self.0 + 1) * self.0)
+                .as_bytes()
+                .into(),
+        )
+    }
+}
+
+/// A table written before the tree took a key-domain policy holds keys of
+/// several domains, and a merge of it ends a table at each boundary, each
+/// with the bytes every table takes. The room a tight-space pass charges for
+/// its tables covers every one of them.
+#[test]
+fn tight_slices_cover_the_tables_each_key_domain_opens() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempfile::tempdir()?;
+    {
+        let tree = open_standard(dir.path(), |c| c)?;
+        for i in 0..2_000u32 {
+            tree.insert(format!("k{i:06}"), vec![b'v'; 16], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = open_standard(dir.path(), |c| c.key_domains(Arc::new(PerKeys(50))))?;
+    let version = tree.current_version();
+    let inputs: Vec<Table> = version.iter_tables().cloned().collect();
+    let opts = super::Options::from_tree(
+        &tree,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
+    let slices = super::tight_slices(
+        &inputs,
+        super::SliceCaps {
+            tables: u64::MAX,
+            blobs: u64::MAX,
+            total: u64::MAX,
+        },
+        &super::SliceOutputs {
+            target_size: 64 * 1024 * 1024,
+            cut_keys: &[],
+            domains: tree.config.key_domains.as_deref(),
+        },
+        None,
+        &tree.config.comparator,
+        &super::input_pacer(&opts),
+    )?;
+    drop(version);
+    let [only] = slices.as_slice() else {
+        panic!("unbounded caps cut one slice: {slices:?}");
+    };
+
+    tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
+    let version = tree.current_version();
+    assert_eq!(version.table_count(), 40, "a table per domain");
+    let written: u64 = version.iter_tables().map(Table::file_len).sum();
+    assert!(
+        only.tables >= written,
+        "the pass charges {} bytes for tables that take {written}",
+        only.tables
+    );
+    Ok(())
+}
+
+/// A tree holding one zstd blob file with a dictionary of its own, of which
+/// every 500th of 4000 values survives, reopened under `domains` when given.
+#[cfg(feature = "zstd")]
+fn few_survivors_of_a_dictionary_file(
+    dir: &std::path::Path,
+    domains: Option<Arc<dyn crate::KeyDomains>>,
+) -> crate::Result<(crate::BlobTree, KvSeparationOptions)> {
     let kv = KvSeparationOptions::default()
         .separation_threshold(1)
         .block_size(0)
         .age_cutoff(1.0)
         .staleness_threshold(0.1);
-    let tree = match Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .blob_compression(crate::CompressionType::Zstd(3))
-    .with_kv_separation(Some(kv.clone()))
-    .open()?
-    {
-        crate::AnyTree::Blob(t) => t,
-        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    let config = || {
+        Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .blob_compression(crate::CompressionType::Zstd(3))
+        .with_kv_separation(Some(kv.clone()))
     };
+    let open = |config: Config| match config.open() {
+        Ok(crate::AnyTree::Blob(t)) => Ok(t),
+        Ok(crate::AnyTree::Standard(_)) => panic!("expected Blob tree"),
+        Err(e) => Err(e),
+    };
+    let tree = open(config())?;
     let keys = 4_000u32;
     for i in 0..keys {
         let value = format!(
@@ -6322,7 +6431,11 @@ fn tight_slices_cover_the_dictionary_a_relocated_file_holds() -> crate::Result<(
     tree.flush_active_memtable(0)?;
     // Drops the removed values and records how much of the file they were.
     tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
-    assert_tight_slice_covers_relocation(dir.path(), &tree, &kv, 1)
+    let Some(domains) = domains else {
+        return Ok((tree, kv));
+    };
+    drop(tree);
+    Ok((open(config().key_domains(domains))?, kv))
 }
 
 /// Asserts the room a tight-space pass over all of `tree`'s tables charges
@@ -6361,6 +6474,7 @@ fn assert_tight_slice_covers_relocation(
         &super::SliceOutputs {
             target_size: 64 * 1024 * 1024,
             cut_keys: &[],
+            domains: tree.index.config.key_domains.as_deref(),
         },
         Some(&relocated),
         &tree.index.config.comparator,
@@ -6403,6 +6517,75 @@ fn assert_tight_slice_covers_relocation(
 #[cfg(feature = "zstd")]
 fn tight_slices_cover_values_written_anew_without_their_dictionary() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
+    let (tree, kv) = many_dictionary_files(dir.path())?;
+    assert_tight_slice_covers_relocation(
+        dir.path(),
+        &tree,
+        &kv,
+        crate::vlog::blob_file::multi_writer::MAX_COPY_SOURCES + 1,
+    )
+}
+
+/// A slice charges the dictionaries of the sources it relocates values out
+/// of, not those of every stale file: in a room that holds a few of them, a
+/// pass over many files with dictionaries of their own, each slice reaching
+/// a few, cuts slices that fit rather than none.
+#[test]
+#[cfg(feature = "zstd")]
+fn a_tight_slice_charges_only_the_dictionaries_it_relocates_out_of() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (tree, kv) = many_dictionary_files(dir.path())?;
+    let version = tree.index.current_version();
+    let inputs: Vec<Table> = version.iter_tables().cloned().collect();
+    let ids: crate::HashSet<TableId> = inputs.iter().map(Table::id).collect();
+    let stale_files = super::pick_blob_files_to_rewrite(&ids, &version, &kv)?;
+    let relocated = super::Relocated::new(&stale_files, &kv);
+    drop(stale_files);
+    // The room for every stale file's dictionary at once, and no more.
+    let every_dictionary: u64 = relocated.own_dictionaries.values().sum::<u64>() * relocated.groups;
+    assert!(
+        relocated.own_dictionaries.len() > 4,
+        "the fixture needs many files with dictionaries of their own"
+    );
+    let caps = super::SliceCaps {
+        tables: u64::MAX,
+        blobs: every_dictionary,
+        total: u64::MAX,
+    };
+    let slices = super::tight_slices(
+        &inputs,
+        caps,
+        &super::SliceOutputs {
+            target_size: 64 * 1024 * 1024,
+            cut_keys: &[],
+            domains: None,
+        },
+        Some(&relocated),
+        &tree.index.config.comparator,
+        &super::input_pacer(&super::Options::from_tree(
+            &tree.index,
+            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+        )),
+    )?;
+    let Some(first) = slices.first() else {
+        panic!("a pass cuts at least one slice");
+    };
+    assert!(
+        first.blobs > 0 && first.blobs <= caps.blobs,
+        "the first slice fits its room: {slices:?} against {}",
+        caps.blobs
+    );
+    assert!(slices.len() > 1, "the pass runs in slices: {slices:?}");
+    Ok(())
+}
+
+/// A tree holding more zstd blob files with a dictionary of their own than a
+/// relocation keeps the dictionaries of, half of every file's values
+/// surviving.
+#[cfg(feature = "zstd")]
+fn many_dictionary_files(
+    dir: &std::path::Path,
+) -> crate::Result<(crate::BlobTree, KvSeparationOptions)> {
     let kv = KvSeparationOptions::default()
         .separation_threshold(1)
         // Every value a frame of its own.
@@ -6414,12 +6597,14 @@ fn tight_slices_cover_values_written_anew_without_their_dictionary() -> crate::R
         .age_cutoff(1.0)
         .staleness_threshold(0.1);
     let tree = match Config::new(
-        dir.path(),
+        dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .blob_compression(crate::CompressionType::Zstd(3))
     .with_kv_separation(Some(kv.clone()))
+    // Table blocks of a few keys: a slice can end every few values.
+    .data_block_size_policy(BlockSizePolicy::all(512))
     .open()?
     {
         crate::AnyTree::Blob(t) => t,
@@ -6455,12 +6640,7 @@ fn tight_slices_cover_values_written_anew_without_their_dictionary() -> crate::R
     }
     tree.flush_active_memtable(0)?;
     tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
-    assert_tight_slice_covers_relocation(
-        dir.path(),
-        &tree,
-        &kv,
-        crate::vlog::blob_file::multi_writer::MAX_COPY_SOURCES + 1,
-    )
+    Ok((tree, kv))
 }
 
 /// The blocks a tight-space pass reads to cut its slices are the run's reads:
@@ -6497,6 +6677,7 @@ fn tight_slices_count_the_blocks_they_read_in_the_runs_work() -> crate::Result<(
         &super::SliceOutputs {
             target_size: 64 * 1024 * 1024,
             cut_keys: &[],
+            domains: None,
         },
         None,
         &tree.config.comparator,

@@ -38,7 +38,13 @@ use core::sync::atomic::AtomicBool;
 /// one, but it beats letting directory order decide, and the surviving copy's
 /// damage still surfaces on the read that meets it.
 ///
+/// A copy whose metadata or stored dictionary did not parse (`damaged`) is
+/// never the one the manifest digested, but it still counts as a duplicate:
+/// the readable copy of its id must reproduce the digest to be kept.
+///
 /// # Errors
+///
+/// A damaged copy's own error when its id has no readable copy.
 ///
 /// Propagates an ENVIRONMENTAL failure while reading a copy's digest. The rank
 /// below would otherwise read "could not be determined" as "does not match" and
@@ -49,6 +55,7 @@ use core::sync::atomic::AtomicBool;
 fn dedupe_blob_sightings(
     fs: &Arc<dyn Fs>,
     blob_files: &mut Vec<BlobFile>,
+    damaged: Vec<(BlobFileId, PathBuf, crate::Error)>,
     orphaned: &mut Vec<PathBuf>,
 ) -> crate::Result<()> {
     let mut seen: crate::HashMap<BlobFileId, usize> = crate::HashMap::default();
@@ -57,6 +64,18 @@ fn dedupe_blob_sightings(
         if seen.insert(bf.id(), idx).is_some() {
             duplicate_ids.insert(bf.id());
         }
+    }
+    for (id, path, e) in damaged {
+        if !seen.contains_key(&id) {
+            return Err(e);
+        }
+        log::warn!(
+            "blob file {} of id {id} does not parse ({e:?}); the id's other copy decides, \
+             and this one is an orphan",
+            path.display(),
+        );
+        duplicate_ids.insert(id);
+        orphaned.push(path);
     }
     if duplicate_ids.is_empty() {
         return Ok(());
@@ -173,6 +192,7 @@ pub(crate) fn recover_blob_files(
 
     let mut blob_files = Vec::with_capacity(ids.len());
     let mut orphaned_blob_files = vec![];
+    let mut damaged_sightings = vec![];
 
     for (idx, dirent) in entries.into_iter().enumerate() {
         let file_name = &dirent.file_name;
@@ -211,9 +231,28 @@ pub(crate) fn recover_blob_files(
 
             let mut file = fs.open(blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
 
-            let (meta, frames) = read_meta_and_frames(&mut file, blob_file_id)?;
+            let parsed = read_meta_and_frames(&mut file, blob_file_id);
             #[cfg(zstd_any)]
-            let own_dictionary = read_file_dictionary(&mut file, &meta)?;
+            let parsed = parsed.and_then(|(meta, frames)| {
+                read_file_dictionary(&mut file, &meta).map(|dict| (meta, frames, dict))
+            });
+            #[cfg(not(zstd_any))]
+            let parsed = parsed.map(|(meta, frames)| (meta, frames, ()));
+            // Damaged bytes are not the copy the manifest digested, but another
+            // directory entry of the same id may be: deduplication below decides,
+            // and only an id left with no copy at all fails on this error.
+            #[cfg_attr(
+                not(zstd_any),
+                expect(unused_variables, reason = "no dictionary without zstd")
+            )]
+            let (meta, frames, own_dictionary) = match parsed {
+                Ok(parsed) => parsed,
+                Err(e) if e.is_environmental() => return Err(e),
+                Err(e) => {
+                    damaged_sightings.push((blob_file_id, blob_file_path.clone(), e));
+                    continue;
+                }
+            };
 
             // With a descriptor cache the file is closed once its metadata is
             // read, and reopened through the cache by its first read: holding
@@ -279,7 +318,12 @@ pub(crate) fn recover_blob_files(
     // authoritative blob and make reads fail. The manifest's checksum covers
     // the live suffix of the copy it named, so it decides; the losers are
     // orphans, which the caller sweeps.
-    dedupe_blob_sightings(fs, &mut blob_files, &mut orphaned_blob_files)?;
+    dedupe_blob_sightings(
+        fs,
+        &mut blob_files,
+        damaged_sightings,
+        &mut orphaned_blob_files,
+    )?;
 
     if blob_files.len() < ids.len() {
         return Err(crate::Error::Unrecoverable);

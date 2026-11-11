@@ -1327,15 +1327,16 @@ enum Held {
 pub(crate) static BLOCKS_GIVEN_UP: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// The bytes `held` keeps in memory: its row's key and value, and for a
-/// pointer the value it claimed.
+/// The bytes `held` keeps in memory: its place in the queue, its row's key
+/// and value, and for a pointer the value it claimed.
 fn held_len(held: &Held) -> usize {
-    match held {
-        Held::Row(item) => item.key.user_key.len() + item.value.len(),
-        Held::Pointer { item, claimed, .. } => {
-            item.key.user_key.len() + item.value.len() + claimed.uncompressed_len as usize
+    core::mem::size_of::<Held>()
+        + match held {
+            Held::Row(item) => item.key.user_key.len() + item.value.len(),
+            Held::Pointer { item, claimed, .. } => {
+                item.key.user_key.len() + item.value.len() + claimed.uncompressed_len as usize
+            }
         }
-    }
 }
 
 /// What a relocation keeps of a value it claimed from the scan to place it.
