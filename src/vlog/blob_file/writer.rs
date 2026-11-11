@@ -1170,6 +1170,10 @@ impl Writer {
             self.writeback_if_due()?;
             return Ok(at);
         }
+        // A value of any frame is a sample of the file's own dictionary until
+        // the dictionary exists, taken after the value is written without it.
+        #[cfg(zstd_any)]
+        let sample = self.collecting_dictionary();
         let at = if value_len < block_target {
             // A block is sized by its entries, keys and values alike: small
             // values under long keys would otherwise fill it with keys.
@@ -1243,6 +1247,10 @@ impl Writer {
             }
         };
         self.note_key(key, value_len);
+        #[cfg(zstd_any)]
+        if sample {
+            self.sample_for_dictionary(value);
+        }
         self.writeback_if_due()?;
         Ok(at)
     }

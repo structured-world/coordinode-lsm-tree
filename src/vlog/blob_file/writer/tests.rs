@@ -471,6 +471,63 @@ fn values_beginning_like_a_trained_dictionary_still_build_a_raw_one() -> crate::
     Ok(())
 }
 
+/// A file's own dictionary is built from its first values whatever frame they
+/// take: a file of single-frame values, or of chunked ones, comes to hold a
+/// dictionary, and every value reads back.
+#[cfg(zstd_any)]
+#[test]
+fn single_and_chunked_values_build_a_file_dictionary() -> crate::Result<()> {
+    // 200-byte values are single frames under SIZES, 1 000-byte ones chunked.
+    for value_len in [200_usize, 1_000] {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("blob");
+        let mut w = Writer::new(&path, 0, 0, &StdFs)?
+            .use_compression(CompressionType::Zstd(3))
+            .use_frame_sizes(SIZES)
+            .use_file_dictionary(1_024);
+        let values: Vec<Vec<u8>> = (0..40_u8)
+            .map(|i| (0..value_len).map(|at| (at % 7) as u8 ^ i).collect())
+            .collect();
+        for (i, value) in values.iter().enumerate() {
+            w.write(format!("k{i:03}").as_bytes(), 0, value)?;
+        }
+        let (meta, _, _) = w.finish()?;
+        assert!(
+            matches!(meta.compression, CompressionType::ZstdDict { .. }),
+            "{value_len}-byte values: {:?}",
+            meta.compression
+        );
+
+        let mut file =
+            crate::fs::Fs::open(&StdFs, &path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let dict = crate::vlog::read_file_dictionary(&mut file, &meta)?;
+        assert!(
+            dict.is_some(),
+            "{value_len}-byte values: the file stores no dictionary"
+        );
+        // The scan checks and decodes every frame and chunk under the file's
+        // codec, the values written before the dictionary and after it alike.
+        let scanner = crate::vlog::blob_file::scanner::Scanner::open(
+            &path,
+            &StdFs,
+            0,
+            crate::vlog::blob_file::scanner::ScanCodec {
+                compression: meta.compression,
+                dictionary: dict,
+            },
+            None,
+        )?;
+        let entries = scanner.collect::<crate::Result<Vec<_>>>()?;
+        assert_eq!(entries.len(), values.len(), "{value_len}-byte values");
+        for (entry, value) in entries.iter().zip(&values) {
+            if let Some(got) = &entry.value {
+                assert_eq!(&got[..], &value[..], "{value_len}-byte values");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A file set to build a dictionary of its own gives it up for frames copied
 /// in as they are, which name the codec they were written in: before it holds
 /// a value it records their codec, and once it has written values toward the
