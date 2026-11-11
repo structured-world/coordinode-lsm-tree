@@ -2581,16 +2581,22 @@ impl AbstractTree for BlobTree {
             let overwritten = overwritten
                 .is_some_and(|keys| keys.take_before_and_check(&item.key.user_key, comparator));
 
+            #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
+            let value_size = item.value.len() as u32;
+            // Only a value is separated: an indirection reads as a put, so an
+            // operand stored as one would stop merging onto its base. Its
+            // lifetime class is asked once, and only for it.
+            let class = (item.key.value_type == crate::ValueType::Value
+                && value_size >= separation_threshold)
+                .then(|| lifetime.class_of(&item.key.user_key, overwritten));
+
             #[cfg(feature = "std")]
             if let Some(ahead) = &mut ahead {
-                #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
-                let size = item.value.len() as u32;
-                let class = lifetime.class_of(&item.key.user_key, overwritten);
-                let codec = (item.key.value_type == crate::ValueType::Value
-                    && size >= separation_threshold)
-                    .then(|| blob_writer.value_codec(class, size))
-                    .flatten();
-                if let Some(codec) = codec {
+                if let Some((class, codec)) = class.and_then(|class| {
+                    blob_writer
+                        .value_codec(class, value_size)
+                        .map(|codec| (class, codec))
+                }) {
                     if ahead.is_full() {
                         write_ahead(ahead, &mut blob_writer, &mut table_writer, &mut encoded)?;
                     }
@@ -2633,15 +2639,8 @@ impl AbstractTree for BlobTree {
                 continue;
             }
 
-            #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
-            let value_size = value.len() as u32;
-
-            // Only a value is separated: an indirection reads as a put, so an
-            // operand stored as one would stop merging onto its base.
-            if item.key.value_type == crate::ValueType::Value && value_size >= separation_threshold
-            {
-                blob_writer
-                    .select_lifetime_class(lifetime.class_of(&item.key.user_key, overwritten))?;
+            if let Some(class) = class {
+                blob_writer.select_lifetime_class(class)?;
                 write_separated(
                     &mut blob_writer,
                     &mut table_writer,
