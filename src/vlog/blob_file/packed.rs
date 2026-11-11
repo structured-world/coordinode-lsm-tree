@@ -406,6 +406,9 @@ pub(crate) fn decode_packed(
     decoded: &mut usize,
 ) -> crate::Result<DecodedFrame> {
     let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    if compression == CompressionType::None {
+        return view_packed(header, records, list, decoded);
+    }
     let raw_len = header.raw_len as usize;
     let mut payload = crate::slice::UnfilledSlice::new(raw_len);
     let mut target = payload.target();
@@ -444,6 +447,41 @@ pub(crate) fn decode_packed(
         entries: records.clone(),
         list,
         payload,
+    })
+}
+
+/// [`decode_packed`] of a block of a file that compresses nothing: every value
+/// lies in its record as it is, so the payload is `records` itself and each
+/// value a view where it lies, nothing gathered.
+///
+/// # Errors
+///
+/// A record stored otherwise than as it is.
+fn view_packed(
+    header: FrameHeader,
+    records: &Slice,
+    list: FrameEntries,
+    decoded: &mut usize,
+) -> crate::Result<DecodedFrame> {
+    let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    let FrameEntries::Many(mut list) = list else {
+        return Err(malformed());
+    };
+    *decoded = 0;
+    for entry in &mut list {
+        let at = entry.at as usize;
+        let record = record_fields(records.get(at..).unwrap_or_default())?;
+        if record.flags & FLAG_PLAIN != 0 || record.stored.len() != record.value_len as usize {
+            return Err(crate::Error::InvalidHeader("BlobRecord"));
+        }
+        entry.value = at + record.stored.start..at + record.stored.end;
+        *decoded += record.stored.len();
+    }
+    Ok(DecodedFrame {
+        header,
+        entries: records.clone(),
+        list: FrameEntries::Many(list),
+        payload: records.clone(),
     })
 }
 

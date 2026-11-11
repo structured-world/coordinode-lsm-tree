@@ -1292,8 +1292,22 @@ pub(crate) fn own_frame(frame: DecodedFrame, read: &[u8], entries: bool) -> (Dec
     // Only what lies in `read` is copied: a payload the decode built for
     // itself (decompressed, or gathered out of a packed block's records)
     // already holds no part of the read.
-    let copy_entries = entries && views(&frame.entries, read);
     let copy_payload = views(&frame.payload, read);
+    // A packed block stored as it is keeps its values where they lie in its
+    // records: one copy serves as both.
+    if copy_payload && frame.payload.as_ptr_range() == frame.entries.as_ptr_range() {
+        let copied = frame.payload.len();
+        let own = crate::Slice::new(&frame.payload);
+        return (
+            DecodedFrame {
+                entries: own.clone(),
+                payload: own,
+                ..frame
+            },
+            copied,
+        );
+    }
+    let copy_entries = entries && views(&frame.entries, read);
     let copied = if copy_entries { frame.entries.len() } else { 0 }
         + if copy_payload { frame.payload.len() } else { 0 };
     let frame = DecodedFrame {

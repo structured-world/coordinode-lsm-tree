@@ -1012,13 +1012,11 @@ pub(super) fn install_merge(
             // count, and a file is dead only when its entry reaches every
             // total, so an entry is made for them too.
             if len > 0 || bytes > 0 || on_disk > 0 || block > 0 {
-                let mut fill = FragmentationMap::default();
-                fill.insert(
+                blob_frag_map.add(
                     id,
                     crate::blob_tree::FragmentationEntry::new(len, bytes, on_disk)
                         .with_block_bytes(block),
                 );
-                fill.merge_into(&mut blob_frag_map);
             }
         }
     }
@@ -2038,13 +2036,11 @@ impl RelocatingCompaction {
         // The block's dead values arrive dead in the new file.
         let dead = block.dead;
         if dead.0 > 0 {
-            let mut carried = FragmentationMap::default();
-            carried.insert(
+            self.carried_garbage.add(
                 at.0,
                 crate::blob_tree::FragmentationEntry::new(dead.0, dead.1, 0)
                     .with_block_bytes(dead.2),
             );
-            carried.merge_into(&mut self.carried_garbage);
         }
         Ok(at)
     }

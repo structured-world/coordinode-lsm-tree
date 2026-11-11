@@ -475,7 +475,13 @@ impl DecodedFrame {
     /// their list.
     #[must_use]
     pub(crate) fn weight(&self) -> u64 {
-        (self.entries.len() + self.payload.len() + self.list.len() * size_of::<FrameEntry>()) as u64
+        // A packed block stored as it is: its payload is its records.
+        let payload = if self.payload.as_ptr_range() == self.entries.as_ptr_range() {
+            0
+        } else {
+            self.payload.len()
+        };
+        (self.entries.len() + payload + self.list.len() * size_of::<FrameEntry>()) as u64
     }
 }
 
@@ -598,6 +604,36 @@ pub(crate) fn head_chunks(head: &[u8]) -> crate::Result<Vec<ChunkSpec>> {
     (0..chunks)
         .map(|at| chunk_row(table, size, chunks, total, at))
         .collect()
+}
+
+/// Whether `chunks` are, in order, the chunks the table of `head` lists for a
+/// value of `total` bytes, each one whole frame in its listed length and
+/// stored as `compression` can hold. `head` is a head frame a scan already
+/// checked, whose entries end at `entries_end`: its table is read as it lies,
+/// its checksum not taken again, nothing gathered.
+///
+/// # Errors
+///
+/// A table that does not hold.
+pub(crate) fn chunks_fit_head(
+    head: &[u8],
+    entries_end: usize,
+    total: u64,
+    chunks: &[Slice],
+    compression: CompressionType,
+) -> crate::Result<bool> {
+    let table = head.get(entries_end..).unwrap_or_default();
+    let (size, count) = head_table(table, total)?;
+    if count as usize != chunks.len() {
+        return Ok(false);
+    }
+    for (at, chunk) in (0..count).zip(chunks) {
+        let spec = chunk_row(table, size, count, total, at)?;
+        if chunk.len() != spec.stored_len as usize || !spec.fits(compression) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The table a head of a value split into `chunks` writes.

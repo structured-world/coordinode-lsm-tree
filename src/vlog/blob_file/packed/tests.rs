@@ -68,6 +68,10 @@ fn a_packed_block_decodes_every_value_in_order() {
     )
     .unwrap();
     assert_eq!(frame.list.len(), 3);
+    assert_eq!(decoded, raw);
+    // Stored as they are, the values stay where they lie in the frame read:
+    // nothing is gathered into a payload of its own.
+    assert_eq!(frame.payload.as_ptr_range(), frame.entries.as_ptr_range());
     for (place, (value, at)) in values.iter().zip(&starts).enumerate() {
         assert_eq!(frame.place_of(u16::try_from(*at).unwrap()), Some(place));
         assert_eq!(&*frame.value(place).unwrap(), *value);

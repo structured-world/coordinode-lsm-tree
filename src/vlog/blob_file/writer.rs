@@ -1356,6 +1356,10 @@ impl Writer {
     /// encoding them again, and returns where the value lies. `value_len` is
     /// the value's decoded length.
     ///
+    /// The scan that read the frames checked each against its checksum, so
+    /// only their shape is checked here: one value under `key`, a head's
+    /// chunks where its table puts them.
+    ///
     /// # Errors
     ///
     /// [`crate::Error::InvalidHeader`] when the frames are not one whole value
@@ -1431,20 +1435,18 @@ impl Writer {
         {
             return Err(malformed());
         }
-        if header.kind == FrameKind::Head {
-            // Each chunk takes what the head's table says it takes, so the
-            // frames the copy places are where the head's readers look.
-            let table = super::frame::head_chunks(first)?;
-            let fits = table.len() == chunks
-                && table
-                    .iter()
-                    .zip(frames.get(1..).unwrap_or_default())
-                    .all(|(spec, chunk)| {
-                        chunk.len() == spec.stored_len as usize && spec.fits(self.compression)
-                    });
-            if !fits {
-                return Err(malformed());
-            }
+        // Each chunk takes what the head's table says it takes, so the frames
+        // the copy places are where the head's readers look.
+        if header.kind == FrameKind::Head
+            && !super::frame::chunks_fit_head(
+                first,
+                entries_end,
+                u64::from(value_len),
+                frames.get(1..).unwrap_or_default(),
+                self.compression,
+            )?
+        {
+            return Err(malformed());
         }
         // Relisted before anything is written, so a refusal leaves the file
         // as it was.
