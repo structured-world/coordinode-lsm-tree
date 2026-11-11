@@ -857,21 +857,25 @@ pub(crate) fn decode_frame(
     #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
     decoded: &mut usize,
 ) -> crate::Result<DecodedFrame> {
-    let (header, list) = check_frame(bytes)?;
-    let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
-    let entries = bytes.slice(FRAME_HEADER_LEN..entries_end);
-    let stored = bytes.slice(entries_end..bytes.len());
+    // A packed block is checked as it is decoded, each record parsed once.
+    let header = parse_header(bytes)?;
     if header.flags & super::packed::FLAG_PACKED != 0 {
+        if header.frame_len() != bytes.len() as u64 {
+            return Err(crate::Error::InvalidHeader("BlobFrame"));
+        }
         return super::packed::decode_packed(
             header,
-            &stored,
-            list,
+            &bytes.slice(FRAME_HEADER_LEN..bytes.len()),
             compression,
             #[cfg(zstd_any)]
             dictionary,
             decoded,
         );
     }
+    let (header, list) = check_frame(bytes)?;
+    let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
+    let entries = bytes.slice(FRAME_HEADER_LEN..entries_end);
+    let stored = bytes.slice(entries_end..bytes.len());
     let raw_len = header.raw_len as usize;
     #[cfg(zstd_any)]
     let (compression, dictionary) = frame_codec(header.flags, compression, dictionary)?;

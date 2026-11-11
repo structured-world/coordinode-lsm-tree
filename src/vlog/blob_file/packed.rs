@@ -22,8 +22,8 @@
 //! the frame whole checks every record and that they are the frame's.
 
 use super::frame::{
-    Codec, DecodedFrame, FLAG_PLAIN, FLAG_RAW, FRAME_HEADER_LEN, FrameEntries, FrameEntry,
-    FrameHeader, FrameKind,
+    DecodedFrame, FLAG_PLAIN, FLAG_RAW, FRAME_HEADER_LEN, FrameEntries, FrameEntry, FrameHeader,
+    FrameKind,
 };
 use crate::{CompressionType, SeqNo, Slice};
 #[cfg(not(feature = "std"))]
@@ -62,8 +62,10 @@ pub(crate) struct Record {
 }
 
 /// Appends the record of `value` under `key` and `seqno` to `out`, stored as
-/// `compressed`, what compressing it under `codec` made (`None` when that
-/// saved nothing), and returns the record's length.
+/// `compressed`, what compressing it under a codec of `compression`, `plain`
+/// when that is a dictionary codec's level without its dictionary, made
+/// (`None` when that saved nothing), and returns the record's length. `out`
+/// is left as it was on an error.
 ///
 /// # Errors
 ///
@@ -77,13 +79,13 @@ pub(crate) fn encode_record(
     key: &[u8],
     seqno: SeqNo,
     value: &[u8],
-    codec: Codec<'_>,
+    (compression, plain): (CompressionType, bool),
     compressed: Option<&[u8]>,
 ) -> crate::Result<usize> {
     let value_len = super::writer::check_size_cap(value.len())?;
-    let flags = if compressed.is_none() && codec.compression != CompressionType::None {
+    let flags = if compressed.is_none() && compression != CompressionType::None {
         FLAG_RAW
-    } else if compressed.is_some() && codec.plain {
+    } else if compressed.is_some() && plain {
         FLAG_PLAIN
     } else {
         0
@@ -385,103 +387,115 @@ pub(crate) fn check_packed(header: &FrameHeader, records: &[u8]) -> crate::Resul
     Ok(FrameEntries::Many(list))
 }
 
-/// The packed block whose header is `header`, whose payload, its records, is
-/// `records` and whose values `list` lists ([`check_packed`] checked them),
-/// decoded whole: every value, for a read of the frame whole (a scan, a
-/// collection, a cache fill).
+/// The packed block whose header is `header` and whose payload, its records,
+/// is `records`, checked as [`check_packed`] checks it and decoded whole in
+/// the same pass, each record parsed once: every value, for a read of the
+/// frame whole (a scan, a collection, a cache fill).
 ///
 /// Each value is decoded straight into its place in the payload, one
-/// allocation for the block.
+/// allocation for the block. In a file that compresses nothing every value
+/// lies in its record as it is: the payload is `records` itself and each
+/// value a view where it lies, nothing gathered.
+///
+/// `decoded` receives what the decoding produced, as soon as it produced it:
+/// a block refused afterwards was still decoded.
 ///
 /// # Errors
 ///
-/// A record that does not decode to the length it declares, or values that
-/// do not add up to the header's decoded length.
+/// A record that does not check or does not decode to the length it
+/// declares, records that are not the header's, or a frame checksum that
+/// does not match.
 pub(crate) fn decode_packed(
     header: FrameHeader,
     records: &Slice,
-    list: FrameEntries,
     compression: CompressionType,
     #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
     decoded: &mut usize,
 ) -> crate::Result<DecodedFrame> {
     let malformed = || crate::Error::InvalidHeader("BlobFrame");
-    if compression == CompressionType::None {
-        return view_packed(header, records, list, decoded);
-    }
+    let count = usize::from(header.count);
     let raw_len = header.raw_len as usize;
-    let mut payload = crate::slice::UnfilledSlice::new(raw_len);
+    // The header's CRC held, but its decoded length is taken before the
+    // records add up to it: a block closes before its values decode past
+    // what a frame may declare, so no more is allocated for it.
+    if raw_len > super::writer::MAX_DECOMPRESSION_SIZE {
+        return Err(malformed());
+    }
+    let in_place = compression == CompressionType::None;
+    let mut payload = crate::slice::UnfilledSlice::new(if in_place { 0 } else { raw_len });
     let mut target = payload.target();
+    let mut list = Vec::with_capacity(count);
+    // Gathered and hashed in one pass, as [`check_packed`] does.
+    let mut sums = Vec::with_capacity(count * 8);
+    let mut at = 0;
+    let mut placed = 0_usize;
     *decoded = 0;
-    for entry in list.iter() {
-        let rest = records.get(entry.at as usize..).unwrap_or_default();
-        let record = record_fields(rest)?;
+    while at < records.len() {
+        let rest = records.get(at..).unwrap_or_default();
+        let record = parse_record(rest)?;
+        sums.extend_from_slice(&record.checksum.to_le_bytes());
         let len = record.value_len as usize;
-        if target.filled() + len > raw_len {
+        if placed + len > raw_len {
             return Err(malformed());
         }
-        let mut part = target.portion(target.filled(), len);
-        let mut produced = 0;
-        let written = record_value_into(
-            &record,
-            rest,
-            compression,
-            #[cfg(zstd_any)]
-            dictionary,
-            &mut part,
-            &mut produced,
-        );
-        *decoded += produced;
-        written?;
-        target.extend_from_portion(len);
+        let value = if in_place {
+            if record.flags & FLAG_PLAIN != 0 || record.stored.len() != len {
+                return Err(crate::Error::InvalidHeader("BlobRecord"));
+            }
+            *decoded += len;
+            at + record.stored.start..at + record.stored.end
+        } else {
+            let mut part = target.portion(target.filled(), len);
+            let mut produced = 0;
+            let written = record_value_into(
+                &record,
+                rest,
+                compression,
+                #[cfg(zstd_any)]
+                dictionary,
+                &mut part,
+                &mut produced,
+            );
+            *decoded += produced;
+            written?;
+            target.extend_from_portion(len);
+            placed..placed + len
+        };
+        list.push(FrameEntry {
+            seqno: record.seqno,
+            key: at + record.key.start..at + record.key.end,
+            value_len: record.value_len,
+            value,
+            at: u32::try_from(at).map_err(|_| malformed())?,
+        });
+        placed += len;
+        at += record.len;
     }
-    if target.filled() != raw_len {
+    if list.len() != count || placed != raw_len {
         return Err(malformed());
     }
-    // SAFETY: every byte of the payload was written above, value by value,
-    // as `target` counted them, and they add up to its length.
-    #[expect(unsafe_code, reason = "see safety")]
-    let payload = unsafe { payload.assume_filled() };
-    Ok(DecodedFrame {
-        header,
-        entries: records.clone(),
-        list,
-        payload,
-    })
-}
-
-/// [`decode_packed`] of a block of a file that compresses nothing: every value
-/// lies in its record as it is, so the payload is `records` itself and each
-/// value a view where it lies, nothing gathered.
-///
-/// # Errors
-///
-/// A record stored otherwise than as it is.
-fn view_packed(
-    header: FrameHeader,
-    records: &Slice,
-    list: FrameEntries,
-    decoded: &mut usize,
-) -> crate::Result<DecodedFrame> {
-    let malformed = || crate::Error::InvalidHeader("BlobFrame");
-    let FrameEntries::Many(mut list) = list else {
-        return Err(malformed());
-    };
-    *decoded = 0;
-    for entry in &mut list {
-        let at = entry.at as usize;
-        let record = record_fields(records.get(at..).unwrap_or_default())?;
-        if record.flags & FLAG_PLAIN != 0 || record.stored.len() != record.value_len as usize {
-            return Err(crate::Error::InvalidHeader("BlobRecord"));
+    let checksum = super::frame::frame_checksum(&sums, header.header_crc);
+    if checksum != header.checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: crate::Checksum::from_raw(checksum),
+            expected: crate::Checksum::from_raw(header.checksum),
+        });
+    }
+    let payload = if in_place {
+        records.clone()
+    } else {
+        // SAFETY: every byte of the payload was written above, value by
+        // value, as `target` counted them, and they add up to its length.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            payload.assume_filled()
         }
-        entry.value = at + record.stored.start..at + record.stored.end;
-        *decoded += record.stored.len();
-    }
+    };
     Ok(DecodedFrame {
         header,
         entries: records.clone(),
         list: FrameEntries::Many(list),
-        payload: records.clone(),
+        payload,
     })
 }
 

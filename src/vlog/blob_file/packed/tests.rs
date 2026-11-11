@@ -2,18 +2,10 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use super::*;
-use crate::vlog::blob_file::frame::{Codec, check_frame, decode_frame};
+use crate::vlog::blob_file::frame::{check_frame, decode_frame};
 
-const UNCOMPRESSED: Codec<'static> = Codec {
-    compression: CompressionType::None,
-    #[cfg(zstd_any)]
-    dictionary: None,
-    #[cfg(zstd_any)]
-    two_pass_seed: false,
-    #[cfg(not(zstd_any))]
-    dictionary: core::marker::PhantomData,
-    plain: false,
-};
+/// A file that compresses nothing.
+const UNCOMPRESSED: (CompressionType, bool) = (CompressionType::None, false);
 
 /// The records of `values` under keys `k0`, `k1`, ... and where each starts.
 fn records(values: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {

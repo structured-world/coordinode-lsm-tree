@@ -1285,20 +1285,20 @@ impl Writer {
             reason = "a packed block closes before a record would start past u16::MAX"
         )]
         let index = self.packed.len() as u16;
-        let mut records = core::mem::take(&mut self.packed);
+        // Compressed before the record goes into the block, which nothing
+        // takes out of the writer meanwhile: a compression that fails, or
+        // unwinds, leaves the block's records as they were.
         let codec = self.codec(FrameKind::Block);
-        let encoded = PreCompressed::compressed_for(pre, value, codec).and_then(|compressed| {
-            encode_record(
-                &mut records,
-                key,
-                seqno,
-                value,
-                codec,
-                compressed.as_deref(),
-            )
-        });
-        self.packed = records;
-        let len = encoded?;
+        let (compression, plain) = (codec.compression, codec.plain);
+        let compressed = PreCompressed::compressed_for(pre, value, codec)?;
+        let len = encode_record(
+            &mut self.packed,
+            key,
+            seqno,
+            value,
+            (compression, plain),
+            compressed.as_deref(),
+        )?;
         // A record starts with its checksum.
         let start = usize::from(index);
         self.packed_sums
