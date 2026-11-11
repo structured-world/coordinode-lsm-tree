@@ -136,8 +136,18 @@ async function documents(out: string, limit: number): Promise<number> {
   }
   await reader.cancel().catch(() => undefined);
   gunzip.end();
-  await done.catch(() => undefined);
+  // A stream cut short on purpose, at the limit, may fail its gzip check;
+  // one that fails before it is a broken download, never a finished corpus.
+  let failure: unknown = undefined;
+  await done.catch((error: unknown) => {
+    if (written < limit) {
+      failure = error;
+    }
+  });
   await new Promise<void>((resolve) => sink.end(resolve));
+  if (failure !== undefined) {
+    throw failure;
+  }
   return lines;
 }
 

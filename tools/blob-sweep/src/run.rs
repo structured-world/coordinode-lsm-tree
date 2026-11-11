@@ -426,7 +426,6 @@ fn collect(
     measured: &mut Measured,
 ) -> Result<(), Error> {
     let tree = open(dir, layout, codec, SMALL_CACHE, BlobCacheFill::Never)?;
-    let metrics = tree.metrics();
     let n = corpus.values.len();
     let mut seqno = n as SeqNo;
     for round in 0..3 {
@@ -439,15 +438,38 @@ fn collect(
             }
         }
         tree.flush_active_memtable(seqno)?;
-        let (before, moved) = (blob_bytes(&tree), metrics.blob_bytes_relocated());
+        let before = blob_files(&tree);
         // The first counts the dead values, the second collects the files
         // they made stale.
         tree.major_compact(64 << 20, seqno)?;
         tree.major_compact(64 << 20, seqno)?;
-        let relocated = metrics.blob_bytes_relocated() - moved;
+        let after = blob_files(&tree);
+        // What the relocation wrote, as the files it made take on disk: the
+        // relocation counter charges a value in a block its entry uncompressed,
+        // which the file lengths below cannot be set against.
+        let relocated: u64 = after
+            .iter()
+            .filter(|(id, _)| !before.iter().any(|(old, _)| old == id))
+            .map(|(_, bytes)| bytes)
+            .sum();
+        let total = |files: &[(u64, u64)]| files.iter().map(|(_, bytes)| bytes).sum::<u64>();
         measured.relocated += relocated;
         measured.reclaimed +=
-            i128::from(before) + i128::from(relocated) - i128::from(blob_bytes(&tree));
+            i128::from(total(&before)) + i128::from(relocated) - i128::from(total(&after));
     }
     Ok(())
+}
+
+/// Every blob file of `tree`'s current version, by id, with its length on disk.
+fn blob_files(tree: &AnyTree) -> Vec<(u64, u64)> {
+    tree.current_version()
+        .blob_files
+        .iter()
+        .map(|file| {
+            (
+                file.id(),
+                std::fs::metadata(file.path()).map_or(0, |m| m.len()),
+            )
+        })
+        .collect()
 }
