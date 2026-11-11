@@ -1211,7 +1211,6 @@ impl DataBlock {
     ///
     /// Propagates a block-decode failure from [`try_iter`](Self::try_iter)
     /// and the first error `f` returns.
-    #[cfg(feature = "std")]
     pub(crate) fn try_for_each_entry(
         &self,
         comparator: crate::comparator::SharedComparator,

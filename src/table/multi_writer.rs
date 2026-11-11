@@ -459,6 +459,12 @@ impl MultiWriter {
         self.writer.filter_hashes_bound(key)
     }
 
+    /// Hashes the entries of a table recording `meta` register in an
+    /// output's filter, at the most.
+    pub(crate) fn filter_hashes_of(&self, meta: &super::meta::ParsedMeta) -> u64 {
+        self.writer.filter_hashes_of(meta)
+    }
+
     /// Whether the outputs split cell rows into the columns of their fields,
     /// which a rewrite's bound then counts (see [`super::writer::CellShapes`]).
     pub(crate) fn splits_cells(&self) -> bool {
@@ -483,11 +489,14 @@ impl MultiWriter {
         // reaches the target, so the tables the target cuts are at most the
         // bytes over the target and one. The bound grows with the tables, so
         // the count is taken again over the bound it gives until it stands.
+        // A table closes after an entry at the least, so a target below one
+        // entry's bytes cuts no more tables than there are entries.
         let target = self.target_size.max(1);
+        let most = load.entries + forced + 1;
         let mut tables = forced + 1;
         let mut bound = self.writer.rewrite_bound(load, tables)?;
         loop {
-            let enough = forced + 1 + bound / target;
+            let enough = (forced + 1 + bound / target).min(most);
             if enough <= tables {
                 break;
             }

@@ -232,9 +232,7 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Returns an error if a live file's size cannot be stat-ed, or a table's
     /// blob-link section cannot be read or parsed.
-    fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
-        crate::storage_stats::compute_storage_stats(&self.current_version(), false, true)
-    }
+    fn storage_stats(&self) -> crate::Result<crate::StorageStats>;
 
     /// Per-LSM-level and per-segment size + entry-count stats, for tiering and
     /// erasure-coding placement decisions (which level / segment is large enough

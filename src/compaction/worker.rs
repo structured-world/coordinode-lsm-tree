@@ -713,6 +713,257 @@ pub(crate) fn merge_would_fit(
     })
 }
 
+/// The bytes the tables a merge of `payload` writes take, bounded from what
+/// its inputs record before any of them is read: their entries' uncompressed
+/// bytes as `probe`, a writer of the merge's output settings, bounds them,
+/// whatever codec the inputs stored them under; an output more for each key
+/// of the level below the merge ends one on and each key domain past the
+/// first its inputs hold; and the files relocating `stale` writes, linked
+/// from the outputs.
+///
+/// A table of rows written as cells records the field columns its groups
+/// hold; one written before it did has its rows read for them.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for an input that records no key and value
+/// byte sums, which every table of this format does; and a read of a cell
+/// table's rows.
+fn recorded_table_demand(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+    probe: &crate::table::multi_writer::MultiWriter,
+    stale: &[BlobFile],
+) -> crate::Result<u64> {
+    use crate::table::writer::{CellShapes, RewriteLoad, varint_len};
+
+    let cmp = opts.config.comparator.as_ref();
+    let mut load = RewriteLoad::default();
+    let mut cells = CellShapes::default();
+    let mut tombstones: Vec<&crate::range_tombstone::RangeTombstone> = Vec::new();
+    // The key domains the inputs' keys may lie in: those a table's key range
+    // meets, or as many as its entries for one whose range meets more.
+    let mut domains: HashSet<Option<UserKey>> = HashSet::default();
+    let mut more_domains = 0u64;
+    let tables: Vec<&Table> = payload
+        .table_ids
+        .iter()
+        .filter_map(|&id| version.get_table(id))
+        .collect();
+    for table in &tables {
+        let meta = &table.metadata;
+        let cell_table =
+            probe.splits_cells() && meta.value_layout == crate::table::meta::ValueLayout::Cells;
+        // A restricted table records the file it was cut from, of which the
+        // merge rewrites the rows past the restriction; a cell table written
+        // before tables recorded their field columns holds them only in its
+        // rows. Both are read.
+        let mut table_load = if table.is_restricted() || (cell_table && meta.cell_columns.is_none())
+        {
+            read_table_load(table, opts, probe, &mut cells)?
+        } else {
+            let (Some(keys), Some(values)) = (meta.sum_user_key_bytes, meta.sum_value_bytes) else {
+                return Err(crate::Error::InvalidHeader("TableMeta"));
+            };
+            if let (true, Some(shapes)) = (cell_table, &meta.cell_columns) {
+                cells.absorb(shapes);
+            }
+            // A table that does not record its longest key or value: no key
+            // is past the most a key takes, nor longer than all of them.
+            let longest_key = meta
+                .longest_user_key
+                .unwrap_or_else(|| keys.min(u64::from(u16::MAX)));
+            let longest_value = meta.longest_value.unwrap_or(values);
+            RewriteLoad {
+                entries: meta.item_count,
+                key_bytes: keys,
+                value_bytes: values,
+                filter_hashes: probe.filter_hashes_of(meta),
+                longest_key,
+                longest_value: Some(longest_value),
+                highest_seqno: table.get_highest_seqno(),
+                entry_lengths: Some(
+                    meta.item_count * (2 * varint_len(longest_key) + varint_len(longest_value)),
+                ),
+                ..RewriteLoad::default()
+            }
+        };
+        (table_load.linked_blob_files, table_load.owned_blob_objects) =
+            table.blob_reference_bound();
+        load.absorb(&table_load);
+        tombstones.extend(table.range_tombstones());
+        if let Some(policy) = opts.config.key_domains.as_deref() {
+            more_domains += key_range_domains(policy, cmp, table, &mut domains);
+        }
+    }
+    tombstones.sort();
+    tombstones.dedup();
+    for rt in tombstones {
+        let (start, end) = (rt.start.len() as u64, rt.end.len() as u64);
+        load.range_tombstones += 1;
+        load.range_tombstone_bytes += start + end;
+        load.longest_key = load.longest_key.max(start).max(end);
+    }
+    let domain_count = (domains.len() as u64 + more_domains).max(1);
+    if let (Some(blob_opts), false) = (&opts.config.kv_separation_opts, stale.is_empty()) {
+        load.linked_blob_files += relocation_output_files(stale, blob_opts, domain_count)?;
+    }
+    load.cell_columns = cells.columns_with(&CellShapes::default());
+    let cut_keys = super::flavour::output_cut_keys(version, opts, payload).len() as u64;
+    probe.rewrite_bound(&load, cut_keys + domain_count - 1)
+}
+
+/// The bytes a full compaction of `tree` at `version` writes, bounded as the
+/// space gate bounds a merge: the largest level's tables (by the bytes they
+/// serve) merged into the last level, as its tables and the stale blob files
+/// it relocates. `(0, 0)` for an empty tree.
+///
+/// # Errors
+///
+/// As [`recorded_table_demand`], and a stale blob file's size.
+pub(crate) fn full_compaction_demand(
+    tree: &crate::Tree,
+    version: &Version,
+) -> crate::Result<(u64, u64)> {
+    let mut largest: Option<(u64, HashSet<TableId>)> = None;
+    for level in version.iter_levels() {
+        let mut size = 0u64;
+        let mut ids = HashSet::default();
+        for table in level.iter().flat_map(|run| run.iter()) {
+            // Bounded by the filesystem's capacity.
+            size += table.live_file_size()?;
+            ids.insert(table.id());
+        }
+        if !ids.is_empty() && largest.as_ref().is_none_or(|(most, _)| size > *most) {
+            largest = Some((size, ids));
+        }
+    }
+    let Some((_, table_ids)) = largest else {
+        return Ok((0, 0));
+    };
+    // A tree has a level at the least, and a full compaction lands in its
+    // last.
+    let last = tree.config.level_count - 1;
+    let payload = CompactionPayload {
+        table_ids,
+        dest_level: last,
+        canonical_level: last,
+        target_size: tree.config.table_target_size,
+    };
+    let opts = Options::from_tree(
+        tree,
+        Arc::new(super::major::Strategy::new(tree.config.table_target_size)),
+    );
+    let probe =
+        super::flavour::output_bound_probe(version, &opts, &payload, &opts.runtime_config.load())?;
+    let stale = match &opts.config.kv_separation_opts {
+        Some(blob_opts) => pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?,
+        None => Vec::new(),
+    };
+    let blobs = stale
+        .iter()
+        .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?;
+    Ok((
+        recorded_table_demand(version, &opts, &payload, &probe, &stale)?,
+        blobs,
+    ))
+}
+
+/// The blob files relocating `stale` under `blob_opts` writes, at the most:
+/// a file per target's worth of their bytes, and in each of `domains` key
+/// domains one more for each codec they are written with, a file of values
+/// written anew without their dictionary included, in each lifetime class.
+fn relocation_output_files(
+    stale: &[BlobFile],
+    blob_opts: &crate::KvSeparationOptions,
+    domains: u64,
+) -> crate::Result<u64> {
+    let mut bytes = 0u64;
+    let mut codecs: Vec<crate::CompressionType> = Vec::new();
+    for file in stale {
+        // Bounded by the filesystem's capacity.
+        bytes += file.physical_size()?;
+        if !codecs.contains(&file.compression()) {
+            codecs.push(file.compression());
+        }
+    }
+    let groups = u64::from(blob_opts.lifetime_groups.get());
+    Ok(bytes.div_ceil(blob_opts.file_target_size.max(1))
+        + (codecs.len() as u64 + 1) * groups * domains)
+}
+
+/// Takes into `domains` the key domains of `policy` the key range of `table`
+/// meets, each by the first key past it, and returns how many more its keys
+/// may lie in: a range meeting more domains than the table has entries counts
+/// one per entry, apart from the ones taken.
+fn key_range_domains(
+    policy: &dyn crate::KeyDomains,
+    cmp: &dyn crate::comparator::UserComparator,
+    table: &Table,
+    domains: &mut HashSet<Option<UserKey>>,
+) -> u64 {
+    let range = &table.metadata.key_range;
+    let entries = table.metadata.item_count.max(1);
+    let mut met: Vec<Option<UserKey>> = Vec::new();
+    let mut end = policy.domain_end(range.min());
+    loop {
+        met.push(end.clone());
+        match end {
+            Some(next) if cmp.compare(&next, range.max()) != core::cmp::Ordering::Greater => {
+                if met.len() as u64 >= entries {
+                    // Its keys lie in no more domains than it has entries.
+                    return entries;
+                }
+                end = policy.domain_end(&next);
+            }
+            _ => break,
+        }
+    }
+    domains.extend(met);
+    0
+}
+
+/// What the rows of `table` a merge rewrites put through the output writer
+/// `probe`, read from them: those of its blocks past a restriction, which the
+/// merge reads, and the field columns its cell rows hold, taken into `cells`
+/// when the outputs split them.
+fn read_table_load(
+    table: &Table,
+    opts: &Options,
+    probe: &crate::table::multi_writer::MultiWriter,
+    cells: &mut crate::table::writer::CellShapes,
+) -> crate::Result<crate::table::writer::RewriteLoad> {
+    let cmp = opts.config.comparator.as_ref();
+    let split_cells = probe.splits_cells();
+    let pace = input_pacer(opts);
+    let mut load = crate::table::writer::RewriteLoad::default();
+    for handle in table.maintenance_index_walk().with_pace(Arc::clone(&pace)) {
+        let handle = handle?;
+        if table
+            .restrict_lower_bound()
+            .is_some_and(|bound| cmp.compare(handle.end_key(), bound) == core::cmp::Ordering::Less)
+        {
+            continue;
+        }
+        if let Some(block) = table.load_data_block_for_maintenance(handle.as_ref(), &*pace)? {
+            block.try_for_each_entry(opts.config.comparator.clone(), |item| {
+                load.take_entry(
+                    item.key.user_key.len() as u64,
+                    item.value.len() as u64,
+                    item.key.seqno,
+                    probe.filter_hashes_bound(&item.key.user_key),
+                );
+                if split_cells && item.key.value_type.is_cell_row() {
+                    cells.take_row(&item.value);
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(load)
+}
+
 /// Reserves the room the merge of `payload` takes, narrowing it to a minimal
 /// reclaiming subset when it does not fit.
 ///
@@ -724,10 +975,9 @@ pub(crate) fn merge_would_fit(
 /// write, consuming the flush floor if it must, which breaks the deadlock of
 /// a merge that frees space and has none to start in.
 ///
-/// The tables are bounded by the bytes of the inputs' files (a tight-space
-/// restricted input by its live suffix: the punched prefix is superseded and
-/// never rewritten), the blob files by the physical size of the stale ones
-/// selected for relocation. A compaction filter or merge operator may write
+/// The tables are bounded from the inputs' entries as the output writer
+/// writes them (see [`recorded_table_demand`]), the blob files by the
+/// physical size of the stale ones selected for relocation. A compaction filter or merge operator may write
 /// more: the merge takes the excess on as its outputs land, or stops (see
 /// [`super::capacity::Reservation::landed`]).
 ///
@@ -765,19 +1015,21 @@ fn space_gate_for_merge(
     // payload) the stale blob relocation set, so a narrowed merge can fit where
     // the full one did not. Stat failures propagate (a silent 0 would undercount
     // and admit the very rewrite this gate must block).
+    // What the outputs take is bounded by a writer of their settings, which a
+    // narrowed merge shares with the one it narrows.
+    let probe = super::flavour::output_bound_probe(version, opts, payload, &rc)?;
     let demand = |p: &CompactionPayload| -> crate::Result<(u64, u64)> {
-        let sst_sigma: u64 = p
-            .table_ids
-            .iter()
-            .filter_map(|&id| version.get_table(id))
-            .try_fold(0u64, |acc, t| t.live_file_size().map(|size| acc + size))?;
-        let blob_sigma: u64 = match &opts.config.kv_separation_opts {
-            Some(blob_opts) => pick_blob_files_to_rewrite(&p.table_ids, version, blob_opts)?
-                .iter()
-                .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?,
-            None => 0,
+        let stale = match &opts.config.kv_separation_opts {
+            Some(blob_opts) => pick_blob_files_to_rewrite(&p.table_ids, version, blob_opts)?,
+            None => Vec::new(),
         };
-        Ok((sst_sigma, blob_sigma))
+        let blob_sigma = stale
+            .iter()
+            .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?;
+        Ok((
+            recorded_table_demand(version, opts, p, &probe, &stale)?,
+            blob_sigma,
+        ))
     };
     let reserve = |bytes: (u64, u64), dest_level: u8| {
         with_merge_demands(&opts.config, dest_level, bytes, |demands| {
@@ -1958,8 +2210,12 @@ fn take_entry(
     use crate::coding::Decode;
 
     let key_len = item.key.user_key.len();
-    load.rows
-        .take_entry(key_len as u64, item.value.len() as u64, filter_hashes);
+    load.rows.take_entry(
+        key_len as u64,
+        item.value.len() as u64,
+        item.key.seqno,
+        filter_hashes,
+    );
     let mut reference = |links: &mut HashSet<BlobFileId>, indirection: &BlobIndirection| {
         let source = indirection.vhandle.blob_file_id;
         links.insert(source);

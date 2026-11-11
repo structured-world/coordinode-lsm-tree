@@ -4,7 +4,7 @@
 
 use crate::{SeqNo, UserKey, table::BlockOffset};
 
-pub struct Metadata {
+pub(crate) struct Metadata {
     /// Written data block count
     pub data_block_count: usize,
 
@@ -38,6 +38,12 @@ pub struct Metadata {
     /// Sum of value byte lengths across all written entries (every version,
     /// pairs with `item_count`).
     pub sum_value_bytes: u64,
+
+    /// Length of the longest user key among the written entries.
+    pub longest_user_key: u64,
+
+    /// Length of the longest value among the written entries.
+    pub longest_value: u64,
 
     /// Current file position of writer
     pub file_pos: BlockOffset,
@@ -79,6 +85,8 @@ impl Default for Metadata {
             filter_partition_hashes: 0,
             sum_user_key_bytes: 0,
             sum_value_bytes: 0,
+            longest_user_key: 0,
+            longest_value: 0,
             file_pos: BlockOffset(0),
             uncompressed_size: 0,
 

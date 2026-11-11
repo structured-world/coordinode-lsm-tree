@@ -478,8 +478,9 @@ fn without_alignment_outputs_end_off_the_level_below() -> crate::Result<()> {
 /// A merge whose input carries a range tombstone past its keys, over a table
 /// outside the merge, writes the tombstone's piece past its outputs into an
 /// output of its own, holding no key. What a tight-space slice of the merge
-/// charges for its tables covers that output as well as the one holding the
-/// keys, or a slice sized to its room outgrows it as the output lands.
+/// and the space gate charge for its tables cover that output as well as the
+/// one holding the keys, or a merge sized to its room outgrows it as the
+/// output lands.
 #[cfg(feature = "std")]
 #[test]
 fn a_tight_slice_covers_the_tombstone_only_outputs_of_its_merge() -> crate::Result<()> {
@@ -512,6 +513,7 @@ fn a_tight_slice_covers_the_tombstone_only_outputs_of_its_merge() -> crate::Resu
         &opts.runtime_config.load_full(),
     )?;
     let cut_keys = crate::compaction::flavour::output_cut_keys(&version, &opts, &payload);
+    let gated = super::recorded_table_demand(&version, &opts, &payload, &probe, &[])?;
     drop(version);
     let mut tombstones = crate::table::writer::RewriteLoad::default();
     for rt in inputs.iter().flat_map(Table::range_tombstones) {
@@ -557,6 +559,10 @@ fn a_tight_slice_covers_the_tombstone_only_outputs_of_its_merge() -> crate::Resu
         "the slice charges {} bytes for outputs that take {written}",
         only.tables
     );
+    assert!(
+        gated >= written,
+        "the gate charges {gated} bytes for outputs that take {written}"
+    );
     for i in 5_000..5_100 {
         assert!(
             tree.get(key(i), crate::SeqNo::MAX)?.is_none(),
@@ -568,7 +574,8 @@ fn a_tight_slice_covers_the_tombstone_only_outputs_of_its_merge() -> crate::Resu
 
 /// Inputs a level stored compressed are written by a destination that stores
 /// its blocks without a codec at their full size. What a tight-space slice
-/// charges for its tables covers that, not the inputs' compressed bytes.
+/// and the space gate charge for its tables cover that, not the inputs'
+/// compressed bytes.
 #[cfg(all(feature = "std", feature = "lz4"))]
 #[test]
 fn a_tight_slice_covers_outputs_stored_without_the_inputs_codec() -> crate::Result<()> {
@@ -603,6 +610,7 @@ fn a_tight_slice_covers_outputs_stored_without_the_inputs_codec() -> crate::Resu
         &payload,
         &opts.runtime_config.load_full(),
     )?;
+    let gated = super::recorded_table_demand(&version, &opts, &payload, &probe, &[])?;
     drop(version);
     let slices = super::tight_slices(
         &inputs,
@@ -642,6 +650,10 @@ fn a_tight_slice_covers_outputs_stored_without_the_inputs_codec() -> crate::Resu
         only.tables <= 2 * written,
         "a charge of {} for {written} bytes written is too loose",
         only.tables
+    );
+    assert!(
+        (written..=2 * written).contains(&gated),
+        "the gate charges {gated} bytes for outputs that take {written}"
     );
     Ok(())
 }

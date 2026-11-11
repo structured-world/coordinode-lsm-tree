@@ -1934,10 +1934,15 @@ impl AbstractTree for BlobTree {
         // footprint and the blob-headroom sum below: a second `current_version()`
         // could race a concurrent flush / compaction and mix two snapshots.
         let version = self.current_version();
+        // What a full compaction writes to its tables, as the space gate
+        // bounds it; its blob relocation is counted below.
+        let (sst_need, _) =
+            crate::compaction::worker::full_compaction_demand(&self.index, &version)?;
         let mut stats = crate::storage_stats::compute_storage_stats(
             &version,
             self.index.is_compacting(),
             false,
+            sst_need,
         )?;
         // Capacity is disk-aware and driven by the index tree's runtime config;
         // its footprint basis (`compute_used_bytes`) already stats blob files, so
@@ -1965,12 +1970,10 @@ impl AbstractTree for BlobTree {
         {
             // SST output lands in the LAST configured level's volume
             // (`level_count - 1`), stale blob relocation in the primary blobs
-            // volume; the demand is bounded by the largest level's size. The
-            // per-volume gate (not `available >= full_compaction_bytes` against
-            // the min-volume free) keeps the status from reporting tight when the
-            // SST and blob outputs each fit their own volume — see the gate's
-            // two-layer model.
-            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version)?;
+            // volume. The per-volume gate (not `available >=
+            // full_compaction_bytes` against the min-volume free) keeps the
+            // status from reporting tight when the SST and blob outputs each fit
+            // their own volume — see the gate's two-layer model.
             // `saturating_sub`: `level_count >= 1` always (the clamp only guards a
             // degenerate zero-level config) → the last level index.
             let sst_dest_level = self.index.config.level_count.saturating_sub(1);

@@ -195,7 +195,6 @@ pub(super) fn plan_filters(
 /// either reaches both.
 /// The keys a merge of `payload` ends its outputs on, past the target size:
 /// the boundaries of the level below it meets, in key order.
-#[cfg(feature = "std")]
 pub(super) fn output_cut_keys(
     version: &Version,
     opts: &Options,
@@ -467,6 +466,13 @@ pub(super) fn output_bound_probe(
 /// outputs with: what they hold, how they are encoded and laid out, and where
 /// they are cut. One place for both the writer that writes them and the one
 /// that bounds what they take.
+#[cfg_attr(
+    not(zstd_any),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only the zstd dictionary a level names can fail to resolve"
+    )
+)]
 fn configure_table_writer(
     table_writer: MultiWriter,
     version: &Version,

@@ -11,7 +11,7 @@ pub(crate) mod ordered_pipeline;
 #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
 pub(crate) mod parallel_compressor;
 
-pub(crate) use bound::{CellShapes, RewriteLoad};
+pub(crate) use bound::{CellShapes, RewriteLoad, varint_len};
 pub(crate) use index::DEFAULT_SPILL_THRESHOLD;
 #[cfg(feature = "std")]
 pub use parallel_compressor::CompactionSpawner;
@@ -829,6 +829,11 @@ pub struct Writer {
     /// holds one layout, since its descriptor records one.
     value_layout: Option<crate::table::meta::ValueLayout>,
 
+    /// The field columns the table's groups of rows written as cells hold,
+    /// recorded with the table so a rewrite of it is bounded before it reads
+    /// a row (see [`CellShapes`]).
+    cell_shapes: CellShapes,
+
     /// Whether this SST is written by the bulk-ingest path, which stores every
     /// entry at LOCAL seqno 0 and relies on a manifest-only `global_seqno` for
     /// its effective MVCC ordering. Persisted as `descriptor#bulk_ingested` so
@@ -1388,6 +1393,7 @@ impl Writer {
             use_zone_map: false,
             use_columnar: false,
             value_layout: None,
+            cell_shapes: CellShapes::default(),
             bulk_ingested: Some(false),
             recency: table_id,
             lineage: None,
@@ -1659,6 +1665,8 @@ impl Writer {
             prefix_extractor: None,
             sum_user_key_bytes: self.meta.sum_user_key_bytes,
             sum_value_bytes: self.meta.sum_value_bytes,
+            longest_user_key: self.meta.longest_user_key,
+            longest_value: self.meta.longest_value,
             uncompressed_size: self.meta.uncompressed_size,
             first_key,
             last_key,
@@ -1692,6 +1700,8 @@ impl Writer {
             value_layout: self
                 .value_layout
                 .unwrap_or(crate::table::meta::ValueLayout::Whole),
+            cell_columns: (self.value_layout == Some(crate::table::meta::ValueLayout::Cells))
+                .then(|| self.cell_shapes.encode()),
             group_shape: crate::table::meta::GroupShape {
                 encoding: self.column_encoding,
                 row_group_size: self.row_group_size,
@@ -2968,6 +2978,8 @@ impl Writer {
         // version). usize -> u64 is a widening cast on every supported target.
         self.meta.sum_user_key_bytes += user_key_len as u64;
         self.meta.sum_value_bytes += value_len as u64;
+        self.meta.longest_user_key = self.meta.longest_user_key.max(user_key_len as u64);
+        self.meta.longest_value = self.meta.longest_value.max(value_len as u64);
 
         if item.is_tombstone() {
             self.meta.tombstone_count += 1;
@@ -3415,6 +3427,22 @@ impl Writer {
         // out where the pages are. Both are encrypted and ECC-protected exactly
         // like data.
         check_group_column_count(batch)?;
+        // A group of rows written as cells: its field columns go into what
+        // the table records of them.
+        if batch
+            .columns
+            .iter()
+            .any(|c| c.column_id == crate::blob_tree::field_row::WHOLE_VALUE_COLUMN)
+        {
+            for column in &batch.columns {
+                if column.column_id == crate::blob_tree::field_row::CELL_REFS_COLUMN {
+                    self.cell_shapes.take_refs();
+                } else if crate::blob_tree::field_row::is_field_column(column.column_id) {
+                    self.cell_shapes
+                        .take_column(column.column_id, column.type_tag.to_wire().1);
+                }
+            }
+        }
         // A group copying another's pages keeps that group's tag, which every
         // copied page's stamp names.
         let group_tag = match carry {
@@ -4168,6 +4196,8 @@ impl Writer {
             let user_key = &e.key.user_key;
             self.meta.sum_user_key_bytes += user_key.len() as u64;
             self.meta.sum_value_bytes += e.value.len() as u64;
+            self.meta.longest_user_key = self.meta.longest_user_key.max(user_key.len() as u64);
+            self.meta.longest_value = self.meta.longest_value.max(e.value.len() as u64);
             if e.is_tombstone() {
                 self.meta.tombstone_count += 1;
             }
@@ -4360,6 +4390,14 @@ impl Writer {
         }
         // The group opens with its directory, whose header gives its length.
         let directory_len = carried_header(raw)?.on_disk_size_with(self.ecc);
+        // The columns a group of rows written as cells holds come from its
+        // rows, which the copy does not decode into columns: read off their
+        // headers. A table of whole values records none of them.
+        for row in entries {
+            if row.key.value_type.is_cell_row() {
+                self.cell_shapes.take_row(&row.value);
+            }
+        }
         let first_key = self.append_verbatim_extent(
             (raw, source),
             uncompressed_length,
@@ -5652,6 +5690,10 @@ struct MetaSectionParams<'a> {
     prefix_extractor: Option<&'a str>,
     sum_user_key_bytes: u64,
     sum_value_bytes: u64,
+    /// The longest user key and value: what a rewrite of the table's entries
+    /// is bounded by before it is written.
+    longest_user_key: u64,
+    longest_value: u64,
     uncompressed_size: u64,
     first_key: &'a [u8],
     last_key: &'a [u8],
@@ -5674,6 +5716,9 @@ struct MetaSectionParams<'a> {
     /// How the columnar blocks store each row's value; written only for a
     /// columnar table.
     value_layout: crate::table::meta::ValueLayout,
+    /// The field columns a table of rows written as cells holds, in the
+    /// wire form [`CellShapes::encode`] gives, written only for one.
+    cell_columns: Option<Vec<u8>>,
     /// How the row groups were cut and encoded; written only for a columnar
     /// table.
     group_shape: crate::table::meta::GroupShape,
@@ -5925,6 +5970,7 @@ fn encode_meta_payload(
         meta("item_count", &p.item_count.to_le_bytes()),
         meta("key#max", p.last_key),
         meta("key#min", p.first_key),
+        meta("key_bytes#max", &p.longest_user_key.to_le_bytes()),
         meta("key_bytes#sum", &p.sum_user_key_bytes.to_le_bytes()),
         meta("key_count", &p.key_count.to_le_bytes()),
         meta("prefix_truncation#data", &[1]),
@@ -5948,6 +5994,7 @@ fn encode_meta_payload(
         meta("table_version", &[3u8]),
         meta("tombstone_count", &p.tombstone_count.to_le_bytes()),
         meta("user_data_size", &p.uncompressed_size.to_le_bytes()),
+        meta("value_bytes#max", &p.longest_value.to_le_bytes()),
         meta("value_bytes#sum", &p.sum_value_bytes.to_le_bytes()),
         meta(
             "weak_tombstone_count",
@@ -5979,6 +6026,12 @@ fn encode_meta_payload(
         // another table keeps all of it, so a copy goes only into a table
         // that would write it the same way.
         meta_items.push(meta("descriptor#group_shape", &p.group_shape.to_bytes()));
+        // The field columns its groups of rows written as cells hold, which
+        // its pages alone record otherwise: what a rewrite of the table is
+        // bounded by before it reads a row.
+        if let Some(shapes) = &p.cell_columns {
+            meta_items.push(meta("descriptor#cell_columns", shapes));
+        }
     }
 
     // L0 recency key, on every table: the reader requires it.

@@ -35,11 +35,11 @@ use parking_lot::Mutex;
 use spin::Mutex;
 
 /// Files a refill creates when the tree's configuration does not say.
-pub const DEFAULT_TABLE_FILE_POOL: usize = 16;
+pub(crate) const DEFAULT_TABLE_FILE_POOL: usize = 16;
 
 /// An empty table file, open for writing, under the name of the table about to
 /// be written into it.
-pub struct ClaimedFile {
+pub(crate) struct ClaimedFile {
     pub id: TableId,
     pub path: PathBuf,
     pub file: Box<dyn FsFile>,
@@ -55,7 +55,7 @@ pub struct ClaimedFile {
 /// held no table yet: the lowest ones. One it leaves out reads to a repair as
 /// written, which can only report a loss that is none, and the bound keeps
 /// the table's metadata a size known in advance.
-pub const WRITING_BELOW_CAP: usize = 16;
+pub(crate) const WRITING_BELOW_CAP: usize = 16;
 
 /// The ids of a folder's files that hold no table yet: pooled, being made by a
 /// refill, or being written into.
@@ -69,7 +69,7 @@ type Unwritten = Arc<Mutex<Vec<TableId>>>;
 /// empty file under such an id is no table that lost its bytes, as one
 /// finished before that table was, but a pooled file or an output the power
 /// loss cut short.
-pub struct Writing {
+pub(crate) struct Writing {
     folder: Unwritten,
     id: TableId,
 }
@@ -92,13 +92,13 @@ impl Writing {
     /// A file of a folder that writes nothing else: for a claim a test makes
     /// up.
     #[cfg(test)]
-    pub fn alone(id: TableId) -> Self {
+    pub(crate) fn alone(id: TableId) -> Self {
         Self::new(&Arc::new(Mutex::new(Vec::new())), id)
     }
 
     /// The ids below this file's of the files its folder holds no table in,
     /// ascending, at most [`WRITING_BELOW_CAP`] of the lowest.
-    pub fn below(&self) -> Vec<TableId> {
+    pub(crate) fn below(&self) -> Vec<TableId> {
         let mut ids: Vec<TableId> = self
             .folder
             .lock()
@@ -173,7 +173,7 @@ struct Pools {
 
 /// Where a table file pool is refilled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RefillOn {
+pub(crate) enum RefillOn {
     /// Off the thread of the write that claims from it: no write waits on a
     /// batch.
     #[default]
@@ -193,7 +193,7 @@ struct Refill {
 }
 
 /// The pools of a tree's tables folders, and the ids their files take.
-pub struct TableFilePools {
+pub(crate) struct TableFilePools {
     pools: Arc<Pools>,
     /// The refills running off the claiming thread, joined before the pools
     /// go: none makes a file in a folder after its tree is closed.
@@ -206,13 +206,13 @@ pub struct TableFilePools {
 
 impl TableFilePools {
     /// Pools that refill on the claiming thread, with no tree to keep open.
-    pub fn new(ids: SequenceNumberCounter, batch: usize, sync_mode: SyncMode) -> Self {
+    pub(crate) fn new(ids: SequenceNumberCounter, batch: usize, sync_mode: SyncMode) -> Self {
         Self::with(ids, batch, sync_mode, false, None)
     }
 
     /// Pools that refill off the claiming thread: no claim waits on a batch.
     #[cfg(all(test, feature = "std"))]
-    pub fn refilling_in_background(
+    pub(crate) fn refilling_in_background(
         ids: SequenceNumberCounter,
         batch: usize,
         sync_mode: SyncMode,
@@ -222,7 +222,7 @@ impl TableFilePools {
 
     /// A tree's pools: refilling where `refill` says, and on the claiming
     /// thread without `std`, keeping the tree open until dropped.
-    pub fn for_tree(
+    pub(crate) fn for_tree(
         ids: SequenceNumberCounter,
         batch: usize,
         sync_mode: SyncMode,
@@ -264,7 +264,7 @@ impl TableFilePools {
     /// folder without the backend telling so see its files twice, and two
     /// pools handing out one file would let one remove or overwrite the table
     /// the other wrote into it.
-    pub fn adopt(&self, folder: &Path, fs: &Arc<dyn Fs>, mut ids: Vec<TableId>) {
+    pub(crate) fn adopt(&self, folder: &Path, fs: &Arc<dyn Fs>, mut ids: Vec<TableId>) {
         if self.pools.batch == 0 {
             return;
         }
@@ -308,7 +308,7 @@ impl TableFilePools {
     /// # Errors
     ///
     /// An I/O error creating or opening a file, or syncing the folder.
-    pub fn claim_as(
+    pub(crate) fn claim_as(
         &self,
         folder: &Path,
         fs: &Arc<dyn Fs>,
@@ -362,7 +362,7 @@ impl TableFilePools {
 
     /// [`Self::claim_as`] for a flush's table.
     #[cfg(test)]
-    pub fn claim(
+    pub(crate) fn claim(
         &self,
         folder: &Path,
         fs: &Arc<dyn Fs>,
@@ -410,7 +410,7 @@ impl TableFilePools {
     }
 
     /// Waits for the refills running off the claiming thread to finish.
-    pub fn wait_for_refills(&self) {
+    pub(crate) fn wait_for_refills(&self) {
         #[cfg(feature = "std")]
         {
             let refills = core::mem::take(&mut *self.refills.lock());

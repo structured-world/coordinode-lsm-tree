@@ -14,6 +14,7 @@
 use super::Writer;
 use crate::CompressionType;
 use crate::table::block::{BlockType, TRAILER_LEN, framed_len_bound};
+use alloc::vec::Vec;
 
 /// What a rewrite puts through the table writers, as the bound counts it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,6 +34,13 @@ pub(crate) struct RewriteLoad {
     /// statistics a columnar group keeps of its values. Without it they are
     /// bounded by the values' bytes.
     pub(crate) longest_value: Option<u64>,
+    /// The highest seqno among them, which bounds the varint a block entry
+    /// stores its seqno, or its delta from its restart head's, in.
+    pub(crate) highest_seqno: u64,
+    /// The bytes the varints of their key lengths (twice: a shared prefix
+    /// and the rest of the key are each no longer) and value lengths take,
+    /// when they are known; at the widest without.
+    pub(crate) entry_lengths: Option<u64>,
     /// Range tombstones the tables carry.
     pub(crate) range_tombstones: u64,
     /// Bytes of their start and end keys.
@@ -66,33 +74,58 @@ pub(crate) struct CellColumns {
 /// fields do not fit the group's columns is kept whole instead and opens none,
 /// so every field the rows hold, at the widest type it comes with, bounds the
 /// columns of any group of them.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CellShapes {
-    widths: alloc::collections::BTreeMap<u16, u64>,
+    widths: alloc::collections::BTreeMap<u16, u8>,
     refs: bool,
 }
 
 /// What a bytes column, and the whole-value and references columns, add to
 /// each row of a group: an offset.
-const BYTES_OFFSET: u64 = 4;
+const BYTES_OFFSET: u8 = 4;
 
 impl CellShapes {
-    /// Takes in the fields of the cell row `value`; a value that does not
-    /// decode as one is kept whole and opens no column.
+    /// Takes in the fields the cell row `value` names, read off its header
+    /// (its field count, its reference and owner bitmaps and one descriptor
+    /// per field) without its cells; a value whose header does not parse is
+    /// kept whole and opens no column.
     pub(crate) fn take_row(&mut self, value: &[u8]) {
-        let Ok(fields) = crate::blob_tree::field_row::decode_row(value) else {
+        let Some((count, rest)) = value.split_first_chunk::<2>() else {
             return;
         };
-        for field in fields {
-            match field.cell {
-                crate::blob_tree::field_row::RowCell::Value(_) => {
-                    let width = field.tag.fixed_width().map_or(BYTES_OFFSET, u64::from);
-                    let slot = self.widths.entry(field.column).or_insert(width);
-                    *slot = (*slot).max(width);
-                }
-                crate::blob_tree::field_row::RowCell::Ref { .. } => self.refs = true,
+        let count = usize::from(u16::from_le_bytes(*count));
+        let bitmap = count.div_ceil(8);
+        let Some((refs, rest)) = rest.split_at_checked(bitmap) else {
+            return;
+        };
+        let Some(descriptors) = rest.get(bitmap..).and_then(|rest| rest.get(..count * 4)) else {
+            return;
+        };
+        for (field, descriptor) in descriptors.as_chunks::<4>().0.iter().enumerate() {
+            let [c0, c1, _, width] = *descriptor;
+            if refs
+                .get(field / 8)
+                .is_some_and(|byte| byte & (1 << (field % 8)) != 0)
+            {
+                self.refs = true;
+            } else {
+                self.take_column(u16::from_le_bytes([c0, c1]), width);
             }
         }
+    }
+
+    /// Takes in the field column `column` of a type of `width` bytes, `0`
+    /// for one of variable width, as a column's wire form names it.
+    pub(crate) fn take_column(&mut self, column: u16, width: u8) {
+        let width = if width == 0 { BYTES_OFFSET } else { width };
+        let slot = self.widths.entry(column).or_insert(width);
+        *slot = (*slot).max(width);
+    }
+
+    /// Takes in the references column.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn take_refs(&mut self) {
+        self.refs = true;
     }
 
     /// Takes `other` in.
@@ -104,19 +137,51 @@ impl CellShapes {
         self.refs |= other.refs;
     }
 
+    /// The wire form a table records: whether a references column is opened,
+    /// then each field column as its little-endian id and the bytes it adds
+    /// to a row.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 3 * self.widths.len());
+        out.push(u8::from(self.refs));
+        for (&column, &width) in &self.widths {
+            out.extend_from_slice(&column.to_le_bytes());
+            out.push(width);
+        }
+        out
+    }
+
+    /// Reads the wire form [`Self::encode`] writes; `None` when it is not one.
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&refs, columns) = bytes.split_first()?;
+        let (columns, []) = columns.as_chunks::<3>() else {
+            return None;
+        };
+        Some(Self {
+            refs: match refs {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+            widths: columns
+                .iter()
+                .map(|&[c0, c1, width]| (u16::from_le_bytes([c0, c1]), width))
+                .collect(),
+        })
+    }
+
     /// The columns of a group holding the rows of this and of `other`, without
     /// taking `other` in; `None` when none of them opens a field column or a
     /// references column, which leaves the four intrinsic ones.
     pub(crate) fn columns_with(&self, other: &Self) -> Option<CellColumns> {
         let mut fields = self.widths.len() as u64;
-        let mut field_bytes: u64 = self.widths.values().sum();
+        let mut field_bytes: u64 = self.widths.values().copied().map(u64::from).sum();
         for (column, &width) in &other.widths {
             if let Some(&mine) = self.widths.get(column) {
                 // The column takes the wider of the two.
-                field_bytes += width.max(mine) - mine;
+                field_bytes += u64::from(width.max(mine) - mine);
             } else {
                 fields += 1;
-                field_bytes += width;
+                field_bytes += u64::from(width);
             }
         }
         let refs = self.refs || other.refs;
@@ -129,37 +194,69 @@ impl CellShapes {
         let refs = u64::from(refs);
         Some(CellColumns {
             count: INTRINSIC_COLUMNS + fields + refs,
-            row_bytes: INTRINSIC_ROW_BYTES + refs * BYTES_OFFSET + field_bytes,
+            row_bytes: INTRINSIC_ROW_BYTES + refs * u64::from(BYTES_OFFSET) + field_bytes,
         })
     }
 }
 
+/// The bytes `value` takes as a varint.
+pub(crate) const fn varint_len(value: u64) -> u64 {
+    let bits = 64 - value.leading_zeros() as u64;
+    if bits == 0 { 1 } else { bits.div_ceil(7) }
+}
+
 impl RewriteLoad {
-    /// Takes in one entry of `key_len` and `value_len` bytes registering
-    /// `filter_hashes` hashes in its table's filter.
-    pub(crate) fn take_entry(&mut self, key_len: u64, value_len: u64, filter_hashes: u64) {
+    /// Takes in one entry of `key_len` and `value_len` bytes at `seqno`,
+    /// registering `filter_hashes` hashes in its table's filter.
+    pub(crate) fn take_entry(
+        &mut self,
+        key_len: u64,
+        value_len: u64,
+        seqno: crate::SeqNo,
+        filter_hashes: u64,
+    ) {
+        let lengths = 2 * varint_len(key_len) + varint_len(value_len);
+        self.entry_lengths = Some(match (self.entry_lengths, self.entries) {
+            (Some(known), _) => known + lengths,
+            (None, 0) => lengths,
+            (None, entries) => entries * WIDEST_ENTRY_LENGTHS + lengths,
+        });
         self.entries += 1;
         self.key_bytes += key_len;
         self.value_bytes += value_len;
         self.filter_hashes += filter_hashes;
         self.longest_key = self.longest_key.max(key_len);
         self.longest_value = Some(self.longest_value.unwrap_or(0).max(value_len));
+        self.highest_seqno = self.highest_seqno.max(seqno);
+    }
+
+    /// The bytes the varints of the entries' key and value lengths take.
+    fn entry_length_bytes(&self) -> u64 {
+        self.entry_lengths
+            .unwrap_or(self.entries * WIDEST_ENTRY_LENGTHS)
     }
 
     /// Takes `other` in.
     pub(crate) fn absorb(&mut self, other: &Self) {
-        self.entries += other.entries;
-        self.key_bytes += other.key_bytes;
-        self.value_bytes += other.value_bytes;
-        self.filter_hashes += other.filter_hashes;
-        self.longest_key = self.longest_key.max(other.longest_key);
-        // An empty load knows nothing of values it does not hold.
+        // An empty load knows nothing of the entries it does not hold.
+        self.entry_lengths = match (self.entry_lengths, other.entry_lengths) {
+            (Some(a), Some(b)) => Some(a + b),
+            (mine, _) if other.entries == 0 => mine,
+            (_, theirs) if self.entries == 0 => theirs,
+            _ => Some(self.entry_length_bytes() + other.entry_length_bytes()),
+        };
         self.longest_value = match (self.longest_value, other.longest_value) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (mine, _) if other.entries == 0 => mine,
             (_, theirs) if self.entries == 0 => theirs,
             _ => None,
         };
+        self.entries += other.entries;
+        self.key_bytes += other.key_bytes;
+        self.value_bytes += other.value_bytes;
+        self.filter_hashes += other.filter_hashes;
+        self.longest_key = self.longest_key.max(other.longest_key);
+        self.highest_seqno = self.highest_seqno.max(other.highest_seqno);
         self.range_tombstones += other.range_tombstones;
         self.range_tombstone_bytes += other.range_tombstone_bytes;
         self.linked_blob_files += other.linked_blob_files;
@@ -174,10 +271,9 @@ impl RewriteLoad {
     }
 }
 
-/// The most bytes a data block entry takes besides its key and value: its
-/// value type, its seqno, its shared prefix and key lengths and its value
-/// length, each varint at its widest (see the data block's `Encodable`).
-const ROW_ENTRY_HEADER: u64 = 1 + 10 + 3 + 3 + 5;
+/// A data block entry's shared prefix and key lengths and its value length,
+/// each varint at its widest (see the data block's `Encodable`).
+const WIDEST_ENTRY_LENGTHS: u64 = 3 + 3 + 5;
 
 /// A restart pointer in a block's binary index, at its widest.
 const RESTART_POINTER: u64 = 4;
@@ -208,26 +304,32 @@ const INTRINSIC_COLUMNS: u64 = 4;
 /// encoding tag, the bytes column's extra offset and a validity bitmap's
 /// partial byte. A chosen encoding never stores more than the plain one,
 /// whose cost it is measured against.
+#[cfg(feature = "columnar")]
 const PAGE_OVERHEAD: u64 =
     crate::table::column_page::PageStamp::LEN as u64 + (2 + 1 + 1 + 1 + 5) + 1 + 4 + 1;
 
 /// A row group directory besides its per-page and per-zone-block entries:
 /// version, tag, counts, head zone length and column.
+#[cfg(feature = "columnar")]
 const DIRECTORY_FIXED: u64 = 1 + 8 + 3 + 3 + 3 + 5 + 2;
 
 /// One statistics zone at its widest: null count, flags and two bounds of at
 /// most `ZONE_BOUND_LEN` bytes, each with its shared and suffix lengths.
+#[cfg(feature = "columnar")]
 const ZONE_LEN: u64 = 5 + 1 + 2 * (2 + ZONE_BOUND_LEN);
 
 /// The most bytes a zone's bound keeps.
+#[cfg(feature = "columnar")]
 const ZONE_BOUND_LEN: u64 = crate::table::column_page::ZONE_BOUND_LEN as u64;
 
 /// A zone block besides its zones: the group tag, the column count and one
 /// column id.
+#[cfg(feature = "columnar")]
 const ZONE_BLOCK_FIXED: u64 = 8 + 3 + 2;
 
 /// The inner zstd frame a data block is split into, whose ends the block
 /// layout section records.
+#[cfg(zstd_any)]
 const ZSTD_INNER_BLOCK: u64 = 128 * 1024;
 
 impl Writer {
@@ -249,27 +351,33 @@ impl Writer {
         let framed = |payload: u64, block_type, compression| {
             framed_len_bound(payload, block_type, compression, encryption, self.ecc)
         };
+        // Every count of blocks passed is at least the tables', so one.
         let frames = |payload: u64, blocks: u64, block_type, compression| {
+            debug_assert!(blocks > 0, "a count of blocks is at least one");
             framed(payload, block_type, compression)
-                + blocks.saturating_sub(1) * framed(1, block_type, compression)
+                + (blocks - 1) * framed(1, block_type, compression)
         };
 
-        let entry_bytes = load.key_bytes + load.value_bytes;
         let longest = load.longest_key;
 
         // Data blocks, or columnar row groups, and their index entries.
+        #[cfg(feature = "columnar")]
         let (data, index_entries) = if self.use_columnar {
             self.columnar_bound(load, tables, &frames)
         } else {
             self.row_bound(load, tables, &frames)
         };
+        #[cfg(not(feature = "columnar"))]
+        let (data, index_entries) = self.row_bound(load, tables, &frames);
 
         // The block index: one block per table, written twice (at the head
         // and as the tail mirror), or partitions and a top-level index written
         // twice. An adaptive index takes either, so both are bounded.
         let index_codec = self.index_block_compression;
-        let entry = INDEX_ENTRY_HEADER + longest;
-        let index_payload = index_entries * entry;
+        // Each entry holds one key whole, a different entry's for each, so
+        // the keys of any set of entries take no more than all keys do.
+        let keys_of = |entries: u64| (entries * longest).min(load.key_bytes);
+        let index_payload = index_entries * INDEX_ENTRY_HEADER + keys_of(index_entries);
         let full_index = 2 * frames(
             index_payload + tables * TRAILER_LEN as u64,
             tables,
@@ -283,7 +391,7 @@ impl Writer {
             BlockType::Index,
             index_codec,
         ) + 2 * frames(
-            partitions * entry + tables * TRAILER_LEN as u64,
+            partitions * INDEX_ENTRY_HEADER + keys_of(partitions) + tables * TRAILER_LEN as u64,
             tables,
             BlockType::Index,
             index_codec,
@@ -317,7 +425,9 @@ impl Writer {
                     + tables;
                 let partitioned = filters(filter_partitions)
                     + frames(
-                        filter_partitions * entry + tables * TRAILER_LEN as u64,
+                        filter_partitions * INDEX_ENTRY_HEADER
+                            + keys_of(filter_partitions)
+                            + tables * TRAILER_LEN as u64,
                         tables,
                         BlockType::Index,
                         index_codec,
@@ -352,19 +462,28 @@ impl Writer {
                 // A field column's bounds are pieces of its rows' values.
                 let cells = self.cell_columns(load);
                 let columns = cells.map_or(INTRINSIC_COLUMNS, |cells| cells.count);
-                let values = match (cells, load.longest_value) {
-                    (None, Some(longest)) => (data_blocks * 2 * longest).min(2 * load.value_bytes),
-                    _ => 2 * load.value_bytes,
+                // Each value column's bounds are a cell of it at the most,
+                // which is no longer than the value it came from: the value
+                // column, or each column past the key, seqno and value type
+                // of a group of cells.
+                let value_columns = cells.map_or(1, |cells| cells.count - 3);
+                let values = match load.longest_value {
+                    Some(longest) => {
+                        (data_blocks * value_columns * 2 * longest).min(2 * load.value_bytes)
+                    }
+                    None => 2 * load.value_bytes,
                 };
-                data_blocks * (slot + columns * stats + 2 * longest) + values
+                data_blocks * (slot + columns * stats) + 2 * keys_of(data_blocks) + values
             } else {
-                data_blocks * (slot + stats + 2 * longest)
+                data_blocks * (slot + stats) + 2 * keys_of(data_blocks)
             };
         }
+        #[cfg(zstd_any)]
         if matches!(self.data_block_compression, CompressionType::Zstd(_)) {
             // An entry per data block cut into several inner frames, and an
             // end per frame.
             let slot = core::mem::size_of::<(super::BlockOffset, Vec<u32>)>() as u64;
+            let entry_bytes = load.key_bytes + load.value_bytes;
             sections += data_blocks * (slot + 4) + 4 * (entry_bytes / ZSTD_INNER_BLOCK);
         }
         if self.delete_strategy != crate::config::DeleteStrategy::CopyOnWrite {
@@ -440,6 +559,29 @@ impl Writer {
             .map_or(0, |extractor| extractor.prefixes(key).count() as u64)
     }
 
+    /// Hashes the entries of a table recording `meta` register in this
+    /// writer's filter, at the most, read off what the table records: its
+    /// distinct keys without a prefix extractor; the hashes its own filter
+    /// holds when that filter indexes this writer's extractor; otherwise a
+    /// hash per entry and one per key byte, a prefix being at least a byte
+    /// longer than the one before it.
+    pub(crate) fn filter_hashes_of(&self, meta: &crate::table::meta::ParsedMeta) -> u64 {
+        let entries = meta.item_count;
+        let Some(extractor) = &self.prefix_extractor else {
+            return meta.key_count.unwrap_or(entries);
+        };
+        let per_byte = || {
+            entries
+                + meta
+                    .sum_user_key_bytes
+                    .unwrap_or_else(|| entries * u64::from(u16::MAX))
+        };
+        match (meta.prefix_extractor.as_deref(), meta.filter_hashes) {
+            (Some(name), Some(hashes)) if name == extractor.name().as_bytes() => hashes,
+            _ => per_byte(),
+        }
+    }
+
     /// The row-major data blocks `load` takes in `tables` tables, and how
     /// many there are, which is the count of index entries.
     fn row_bound(
@@ -455,16 +597,17 @@ impl Writer {
         let blocks = (entry_bytes / u64::from(self.data_block_size.max(1))).min(entries) + tables;
         let restarts = entries / u64::from(self.data_block_restart_interval.max(1)) + blocks;
         let hash = if self.hash_indexed {
-            // A block's buckets: its entries at the ratio, at least one.
+            // A block's buckets: its entries at the ratio, rounded up, at
+            // least one: the product truncated and one more per block.
             let ratio = f64::from(self.data_block_hash_ratio);
             #[expect(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                reason = "an entry count times a small ratio, rounded up"
+                reason = "an entry count times a small ratio, truncated"
             )]
-            let buckets = (entries as f64 * ratio).ceil() as u64;
-            buckets + blocks
+            let buckets = (entries as f64 * ratio) as u64;
+            buckets + 2 * blocks
         } else {
             0
         };
@@ -473,8 +616,16 @@ impl Writer {
         } else {
             0
         };
+        // An entry's value type, its seqno or its zigzagged delta from its
+        // restart head's (no more than twice the highest seqno), and the
+        // varints of its lengths.
+        let seqno = load
+            .highest_seqno
+            .checked_mul(2)
+            .map_or(10, |delta| varint_len(delta + 1));
         let payload = entry_bytes
-            + entries * ROW_ENTRY_HEADER
+            + entries * (1 + seqno)
+            + load.entry_length_bytes()
             + restarts * RESTART_POINTER
             + hash
             + kv
@@ -492,6 +643,7 @@ impl Writer {
 
     /// The columnar row groups `load` takes in `tables` tables, and how many
     /// there are, which is the count of index entries.
+    #[cfg(feature = "columnar")]
     fn columnar_bound(
         &self,
         load: &RewriteLoad,

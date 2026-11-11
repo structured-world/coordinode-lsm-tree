@@ -26,19 +26,16 @@ fn entries(count: usize, key_len: usize, value_len: usize) -> Vec<InternalValue>
 
 /// What writing `entries` puts through a writer, as the bound counts it.
 fn load_of(entries: &[InternalValue]) -> RewriteLoad {
-    RewriteLoad {
-        entries: entries.len() as u64,
-        key_bytes: entries.iter().map(|e| e.key.user_key.len() as u64).sum(),
-        value_bytes: entries.iter().map(|e| e.value.len() as u64).sum(),
-        filter_hashes: entries.len() as u64,
-        longest_key: entries
-            .iter()
-            .map(|e| e.key.user_key.len() as u64)
-            .max()
-            .unwrap_or(0),
-        longest_value: entries.iter().map(|e| e.value.len() as u64).max(),
-        ..RewriteLoad::default()
+    let mut load = RewriteLoad::default();
+    for e in entries {
+        load.take_entry(
+            e.key.user_key.len() as u64,
+            e.value.len() as u64,
+            e.key.seqno,
+            1,
+        );
     }
+    load
 }
 
 /// Writes `entries` as one table with the writer `configure` sets up and
@@ -50,21 +47,30 @@ fn assert_bound_holds(
     configure: impl Fn(Writer) -> Writer,
 ) -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    let probe = configure(Writer::new(
-        dir.path().join("probe"),
-        1,
-        0,
-        Arc::new(StdFs),
-    )?);
-    let bound = probe.rewrite_bound(&load_of(entries), 1)?;
+    assert_bound_holds_for(name, entries, &load_of(entries), configure, dir.path()).map(drop)
+}
+
+/// [`assert_bound_holds`] for a bound taken over `load`, the table written
+/// into `dir`; returns its path and checksum.
+fn assert_bound_holds_for(
+    name: &str,
+    entries: &[InternalValue],
+    load: &RewriteLoad,
+    configure: impl Fn(Writer) -> Writer,
+    dir: &std::path::Path,
+) -> crate::Result<(std::path::PathBuf, crate::Checksum)> {
+    let probe = configure(Writer::new(dir.join("probe"), 1, 0, Arc::new(StdFs))?);
+    let bound = probe.rewrite_bound(load, 1)?;
     drop(probe);
 
-    let path = dir.path().join("table");
+    let path = dir.join("table");
     let mut writer = configure(Writer::new(path.clone(), 2, 0, Arc::new(StdFs))?);
     for entry in entries {
         writer.write(entry.clone())?;
     }
-    writer.finish()?;
+    let Some((_, checksum)) = writer.finish()? else {
+        panic!("{name}: the table is written");
+    };
     let written = std::fs::metadata(&path)?.len();
     assert!(
         written <= bound,
@@ -76,6 +82,104 @@ fn assert_bound_holds(
         bound <= 2 * written,
         "{name}: a bound of {bound} for a table of {written} bytes is too loose to use"
     );
+    Ok((path, checksum))
+}
+
+/// Opens the table written to `path` under `checksum`, and checks it records
+/// the longest key and value of `load`: what a later rewrite of it is
+/// bounded by.
+fn recover_recording(
+    path: std::path::PathBuf,
+    checksum: crate::Checksum,
+    load: &RewriteLoad,
+) -> crate::Result<crate::table::Table> {
+    let table = crate::table::Table::recover(crate::table::RecoverParams::new(
+        path,
+        checksum,
+        2,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+    ))?;
+    assert_eq!(table.metadata.longest_user_key, Some(load.longest_key));
+    assert_eq!(table.metadata.longest_value, load.longest_value);
+    Ok(table)
+}
+
+/// A table records its longest key and value, which bound a rewrite of it
+/// before it is read.
+#[test]
+fn a_table_records_its_longest_key_and_value() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let rows = entries(500, 24, 300);
+    let load = load_of(&rows);
+    let (path, checksum) = assert_bound_holds_for("plain", &rows, &load, |w| w, dir.path())?;
+    let table = recover_recording(path, checksum, &load)?;
+    assert_eq!(table.metadata.cell_columns, None, "a table of whole values");
+    Ok(())
+}
+
+/// Rows written as cells of several shapes, each opening other field columns:
+/// a group of them holds every column any of its rows opens, a fixed-width
+/// one padded with zeros in the rows without it, and the bound counts them
+/// from the field columns the rows name. The table records those columns, so
+/// a rewrite of it is bounded without reading a row.
+#[cfg(feature = "columnar")]
+#[test]
+fn the_rewrite_bound_holds_for_rows_written_as_cells() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, TypeTag, encode_row};
+
+    let mut rows = Vec::new();
+    for i in 0..2_000u32 {
+        let wide = [7u8; 64];
+        let id = i.to_le_bytes();
+        let note = format!("note {i}");
+        let mut fields = vec![RowField::bytes(3, RowCell::Value(note.as_bytes()))];
+        if i % 3 == 0 {
+            fields.push(RowField {
+                column: 4,
+                tag: TypeTag::Fixed(64),
+                cell: RowCell::Value(&wide),
+            });
+        }
+        if i % 5 == 0 {
+            fields.push(RowField {
+                column: 9,
+                tag: TypeTag::Fixed(4),
+                cell: RowCell::Value(&id),
+            });
+        }
+        rows.push(InternalValue::from_components(
+            format!("k{i:08}").into_bytes(),
+            encode_row(&fields)?,
+            u64::from(i),
+            ValueType::CellRow,
+        ));
+    }
+    let mut shapes = CellShapes::default();
+    for row in &rows {
+        shapes.take_row(&row.value);
+    }
+    let load = RewriteLoad {
+        cell_columns: shapes.columns_with(&CellShapes::default()),
+        ..load_of(&rows)
+    };
+    let dir = tempfile::tempdir()?;
+    let (path, checksum) = assert_bound_holds_for(
+        "cells",
+        &rows,
+        &load,
+        |w| {
+            w.use_columnar(true)
+                .use_cell_rows(true)
+                .use_row_group_size(16 * 1_024)
+                .use_columnar_page_size(4_096)
+                .use_zone_map(true)
+        },
+        dir.path(),
+    )?;
+    let table = recover_recording(path, checksum, &load)?;
+    assert_eq!(table.metadata.cell_columns, Some(shapes));
     Ok(())
 }
 

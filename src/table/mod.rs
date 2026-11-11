@@ -902,6 +902,27 @@ impl Table {
         crate::table::writer::parse_owned_blob_objects(&block.data)
     }
 
+    /// The most blob files this table links and blob objects its rows own, as
+    /// the lengths of the sections listing them bound them: each link or
+    /// object takes at least the fixed bytes of its record. Read off the
+    /// table's layout, not its file.
+    pub(crate) fn blob_reference_bound(&self) -> (u64, u64) {
+        let records = |section: Option<BlockHandle>, record: u64| {
+            section.map_or(0, |handle| u64::from(handle.size()) / record.max(1))
+        };
+        (
+            records(
+                self.regions.linked_blob_files,
+                crate::table::writer::LINKED_BLOB_FILE_FIXED_LEN as u64,
+            ),
+            records(
+                self.regions.owned_blob_objects,
+                crate::table::writer::owned_blob_objects_len(1)
+                    - crate::table::writer::owned_blob_objects_len(0),
+            ),
+        )
+    }
+
     /// Reads and parses the `linked_blob_files` section through the descriptor
     /// `open` yields, opened only when the section exists.
     fn read_blob_file_references(
@@ -1522,7 +1543,6 @@ impl Table {
     /// [`Self::load_data_block`] for maintenance that sizes a rewrite of the
     /// table: not counted as a read, and told to `pace`, the rewrite's own,
     /// as the rewrite's reads are.
-    #[cfg(feature = "std")]
     pub(crate) fn load_data_block_for_maintenance(
         &self,
         handle: &BlockHandle,

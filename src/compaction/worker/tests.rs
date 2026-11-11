@@ -3128,33 +3128,51 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
         .flat_map(|level| level.iter())
         .find(|run| run.len() >= 3)
         .expect("a bottom-level run with >= 3 tables");
-    let run_sigma: u64 = run.iter().map(Table::file_len).sum();
-    let payload = Input {
-        table_ids: run.iter().map(Table::id).collect(),
+    let tables: Vec<&Table> = run.iter().collect();
+    let input = |ids: crate::HashSet<TableId>| Input {
+        table_ids: ids,
         dest_level: 6,
         canonical_level: 6,
         target_size: 64 * 1024 * 1024,
     };
-
-    // Free space below the full run's Σ but above a single pair: the run does
-    // not fit, a run-adjacent pair does. Calibrate against the SIMULATED
-    // disk's real stored bytes (manifest / WAL count too, not just live SSTs),
-    // since the gate probes `available_space`, not the version footprint.
-    // `run_sigma >= 1` (real SST files), so `- 1` cannot underflow.
-    let probe_capacity = 1u64 << 40;
-    mem.set_capacity(probe_capacity);
-    let stored =
-        probe_capacity - crate::fs::Fs::available_space(&mem, dir.path()).unwrap_or(probe_capacity);
-    mem.set_capacity(stored + run_sigma - 1);
-    tree.update_runtime_config(|c| {
-        c.storage_admission_check = true;
-        c.storage_limit_bytes = None;
-    })?;
-
+    let payload = input(tables.iter().map(|t| t.id()).collect());
     let opts = super::Options::from_tree(
         &tree,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
+    // What the gate charges the whole run and an adjacent pair of it.
+    let probe = crate::compaction::flavour::output_bound_probe(
+        &version,
+        &opts,
+        &payload,
+        &opts.runtime_config.load(),
+    )?;
+    let full = super::recorded_table_demand(&version, &opts, &payload, &probe, &[])?;
+    let pair = super::recorded_table_demand(
+        &version,
+        &opts,
+        &input(tables.iter().take(2).map(|t| t.id()).collect()),
+        &probe,
+        &[],
+    )?;
+    assert!(
+        pair < full,
+        "a pair takes less than the run: {pair} against {full}"
+    );
+
+    // Free space below what the full run takes but above a pair: the run does
+    // not fit, a run-adjacent pair does. Calibrate against the SIMULATED
+    // disk's real stored bytes (manifest / WAL count too, not just live SSTs),
+    // since the gate probes `available_space`, not the version footprint.
+    let probe_capacity = 1u64 << 40;
+    mem.set_capacity(probe_capacity);
+    let stored =
+        probe_capacity - crate::fs::Fs::available_space(&mem, dir.path()).unwrap_or(probe_capacity);
+    mem.set_capacity(stored + full - 1);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
     match super::space_gate_for_merge(&version, &opts, &payload)? {
         super::SpaceGate::Narrowed(narrowed, ..) => {
             assert_eq!(narrowed.table_ids.len(), 2, "narrowed to an adjacent pair");
@@ -3408,18 +3426,44 @@ fn space_gate_sizes_a_restricted_input_by_its_live_suffix() -> crate::Result<()>
         canonical_level: 6,
         target_size: 64 * 1024 * 1024,
     };
-    // Headroom that fits the live suffix EXACTLY and not the original size.
-    let used = crate::storage_stats::compute_used_bytes(&version)?;
-    tree.update_runtime_config(|c| {
-        c.storage_admission_check = true;
-        c.tight_space_compaction = false;
-        c.storage_limit_bytes = Some(used + live);
-    })?;
-
     let opts = super::Options::from_tree(
         &tree,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
+    // What the gate charges the live suffix, and what the whole original's
+    // entries, as its metadata records them, would take.
+    let probe = crate::compaction::flavour::output_bound_probe(
+        &version,
+        &opts,
+        &payload,
+        &opts.runtime_config.load(),
+    )?;
+    let suffix = super::recorded_table_demand(&version, &opts, &payload, &probe, &[])?;
+    let meta = &restricted.metadata;
+    let whole = probe.rewrite_bound(
+        &crate::table::writer::RewriteLoad {
+            entries: meta.item_count,
+            key_bytes: meta.sum_user_key_bytes.unwrap_or_default(),
+            value_bytes: meta.sum_value_bytes.unwrap_or_default(),
+            filter_hashes: meta.item_count,
+            longest_key: meta.longest_user_key.unwrap_or_default(),
+            longest_value: meta.longest_value,
+            ..crate::table::writer::RewriteLoad::default()
+        },
+        0,
+    )?;
+    assert!(
+        suffix < whole,
+        "the suffix is charged less than the whole original: {suffix} against {whole}"
+    );
+    // Headroom that fits the live suffix EXACTLY and not the original.
+    let used = crate::storage_stats::compute_used_bytes(&version)?;
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = false;
+        c.storage_limit_bytes = Some(used + suffix);
+    })?;
+
     match super::space_gate_for_merge(&version, &opts, &payload)? {
         super::SpaceGate::Run(..) => Ok(()),
         super::SpaceGate::Narrowed(..) => {
@@ -7240,7 +7284,31 @@ mod budget_gate {
             panic!("a bottom-level run with >= 3 tables");
         };
         let ids: Vec<_> = run.iter().map(Table::id).collect();
-        let run_sigma: u64 = run.iter().map(Table::file_len).sum();
+        // What the gate charges the whole run.
+        let payload = crate::compaction::Input {
+            table_ids: ids.iter().copied().collect(),
+            dest_level: 6,
+            canonical_level: 6,
+            target_size: 64 * 1024 * 1024,
+        };
+        let opts = crate::compaction::worker::Options::from_tree(
+            &tree,
+            Arc::new(MergeRun(ids.clone(), 6)),
+        );
+        let probe = crate::compaction::flavour::output_bound_probe(
+            &version,
+            &opts,
+            &payload,
+            &opts.runtime_config.load(),
+        )?;
+        let run_bound = crate::compaction::worker::recorded_table_demand(
+            &version,
+            &opts,
+            &payload,
+            &probe,
+            &[],
+        )?;
+        drop(opts);
         drop(version);
 
         // Room enough for the merge as chosen: the empty budget holds it.
@@ -7259,7 +7327,7 @@ mod budget_gate {
         mem.set_capacity(probe_capacity);
         let stored = probe_capacity
             - crate::fs::Fs::available_space(&mem, dir.path()).unwrap_or(probe_capacity);
-        mem.set_capacity(stored + run_sigma - 1);
+        mem.set_capacity(stored + run_bound - 1);
         tree.update_runtime_config(|_| {})?;
         let tables = tree.table_count();
 

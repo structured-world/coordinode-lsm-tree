@@ -838,9 +838,16 @@ impl AbstractTree for Tree {
         // estimate below: a second `current_version()` could race a concurrent
         // flush / compaction and mix two snapshots.
         let version = self.current_version();
+        // What a full compaction writes, as the space gate bounds it. A
+        // standard tree relocates no blob file.
+        let (sst_need, _) = crate::compaction::worker::full_compaction_demand(self, &version)?;
         // Standard tree: SST values ARE user values (no KV separation).
-        let mut stats =
-            crate::storage_stats::compute_storage_stats(&version, self.is_compacting(), true)?;
+        let mut stats = crate::storage_stats::compute_storage_stats(
+            &version,
+            self.is_compacting(),
+            true,
+            sst_need,
+        )?;
         // Fill the disk-aware capacity figures (quota + free-space probe) the
         // version-only computation can't know.
         let (capacity, available, compaction_possible) = self.admission_capacity(stats.used_bytes);
@@ -858,14 +865,12 @@ impl AbstractTree for Tree {
             && capacity.is_some()
             && stats.status == crate::StorageStatus::Healthy
         {
-            // A full compaction's transient output is bounded by the largest
-            // level's on-disk size, but it LANDS in the last configured level's
+            // A full compaction's output LANDS in the last configured level's
             // volume (`level_count - 1`), which under tiered routing can be a
             // different filesystem than the largest level. A standard tree has no
             // blob relocation. Using the per-volume gate (not `available >=
             // full_compaction_bytes` against the min-volume free) keeps the status
             // from reporting tight when a routed merge would actually be admitted.
-            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version)?;
             // `saturating_sub`: `level_count >= 1` always, so this is the last
             // level index; the clamp only guards a degenerate zero-level config.
             let sst_dest_level = self.0.config.level_count.saturating_sub(1);
