@@ -947,15 +947,21 @@ fn read_table_load(
             continue;
         }
         if let Some(block) = table.load_data_block_for_maintenance(handle.as_ref(), &*pace)? {
-            block.try_for_each_entry(opts.config.comparator.clone(), |item| {
+            let wants_key = probe.hashes_read_keys();
+            block.try_for_each_shape(opts.config.comparator.clone(), |entry| {
+                let hashes = if wants_key {
+                    probe.filter_hashes_bound(&entry.key())
+                } else {
+                    1
+                };
                 load.take_entry(
-                    item.key.user_key.len() as u64,
-                    item.value.len() as u64,
-                    item.key.seqno,
-                    probe.filter_hashes_bound(&item.key.user_key),
+                    entry.key_len as u64,
+                    entry.value.len() as u64,
+                    entry.seqno,
+                    hashes,
                 );
-                if split_cells && item.key.value_type.is_cell_row() {
-                    cells.take_row(&item.value);
+                if split_cells && entry.value_type.is_cell_row() {
+                    cells.take_row(entry.value);
                 }
                 Ok(())
             })?;
@@ -2188,7 +2194,8 @@ struct SliceMeasure {
     blob_domains: u64,
 }
 
-/// What an entry `item` read off an input puts into the slice `load` takes it
+/// What an entry read off an input, of `value_type` at `seqno` with a user
+/// key of `key_len` bytes and `value`, puts into the slice `load` takes it
 /// into: an entry of its tables, registering `filter_hashes` hashes, the field
 /// columns of a cell row when the outputs split those (`split_cells`), the blob
 /// files its value or references point into and the objects it owns; and, in
@@ -2199,7 +2206,7 @@ struct SliceMeasure {
 #[cfg(feature = "std")]
 fn take_entry(
     load: &mut SliceLoad,
-    item: &InternalValue,
+    (value_type, seqno, key_len, value): (crate::ValueType, crate::SeqNo, usize, &[u8]),
     filter_hashes: u64,
     split_cells: bool,
     relocated: Option<&Relocated>,
@@ -2209,13 +2216,8 @@ fn take_entry(
     use crate::blob_tree::handle::BlobIndirection;
     use crate::coding::Decode;
 
-    let key_len = item.key.user_key.len();
-    load.rows.take_entry(
-        key_len as u64,
-        item.value.len() as u64,
-        item.key.seqno,
-        filter_hashes,
-    );
+    load.rows
+        .take_entry(key_len as u64, value.len() as u64, seqno, filter_hashes);
     let mut reference = |links: &mut HashSet<BlobFileId>, indirection: &BlobIndirection| {
         let source = indirection.vhandle.blob_file_id;
         links.insert(source);
@@ -2227,16 +2229,16 @@ fn take_entry(
         }
         copy_bytes(indirection, key_len, relocated)
     };
-    if item.key.value_type.is_indirection() {
-        let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
+    if value_type.is_indirection() {
+        let indirection = BlobIndirection::decode_from(&mut &value[..])?;
         return Ok(reference(&mut load.links, &indirection));
     }
-    if item.key.value_type.is_cell_row() {
+    if value_type.is_cell_row() {
         if split_cells {
-            load.cells.take_row(&item.value);
+            load.cells.take_row(value);
         }
         let mut bytes = 0;
-        for field in decode_row(&item.value)? {
+        for field in decode_row(value)? {
             if let RowCell::Ref { indirection, owner } = field.cell {
                 bytes += reference(&mut load.links, &indirection);
                 load.rows.owned_blob_objects += u64::from(owner);
@@ -2399,21 +2401,24 @@ fn tight_slices(
             if let Some(block) = input.load_data_block_for_maintenance(handle.as_ref(), &**pace)? {
                 let mut dictionaries = Vec::new();
                 let (mut table_end, mut blob_end) = (DomainEdge::Unseen, DomainEdge::Unseen);
-                block.try_for_each_entry(comparator.clone(), |item| {
-                    longest_key = longest_key.max(item.key.user_key.len() as u64);
-                    let hashes = probe.filter_hashes_bound(&item.key.user_key);
+                // The key itself is built only for what reads it: the
+                // prefixes a filter takes of it and the domain it lies in.
+                let wants_key = probe.hashes_read_keys() || outputs.domains.is_some();
+                block.try_for_each_shape(comparator.clone(), |entry| {
+                    longest_key = longest_key.max(entry.key_len as u64);
+                    let key = wants_key.then(|| entry.key());
+                    let hashes = key.as_ref().map_or(1, |key| probe.filter_hashes_bound(key));
                     // Bounded by the stale files' bytes.
                     let blobs = take_entry(
                         &mut load,
-                        &item,
+                        (entry.value_type, entry.seqno, entry.key_len, entry.value),
                         hashes,
                         split_cells,
                         relocated,
                         &mut dictionaries,
                     )?;
                     load.blobs += blobs;
-                    if let Some(domains) = outputs.domains {
-                        let key = &item.key.user_key;
+                    if let (Some(domains), Some(key)) = (outputs.domains, &key) {
                         enter_domain(domains, cmp, &mut table_end, &mut load.table_domains, key);
                         if blobs > 0 {
                             enter_domain(domains, cmp, &mut blob_end, &mut load.blob_domains, key);
@@ -2523,7 +2528,12 @@ fn tight_slices(
                 let hashes = probe.filter_hashes_bound(&item.key.user_key);
                 let blobs = take_entry(
                     &mut weight,
-                    &item,
+                    (
+                        item.key.value_type,
+                        item.key.seqno,
+                        item.key.user_key.len(),
+                        &item.value,
+                    ),
                     hashes,
                     split_cells,
                     relocated,

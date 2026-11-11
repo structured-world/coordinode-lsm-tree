@@ -6209,7 +6209,12 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     assert_eq!(
         super::take_entry(
             &mut load,
-            &item,
+            (
+                item.key.value_type,
+                item.key.seqno,
+                item.key.user_key.len(),
+                &item.value
+            ),
             1,
             false,
             Some(&relocated),
@@ -6236,7 +6241,12 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     assert_eq!(
         super::take_entry(
             &mut load,
-            &plain,
+            (
+                plain.key.value_type,
+                plain.key.seqno,
+                plain.key.user_key.len(),
+                &plain.value
+            ),
             1,
             false,
             Some(&relocated),

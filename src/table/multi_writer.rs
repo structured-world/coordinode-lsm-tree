@@ -2849,6 +2849,13 @@ impl BoundProbe {
         self.writer.writer.filter_hashes_bound(key)
     }
 
+    /// Whether [`Self::filter_hashes_bound`] reads the key: with a prefix
+    /// extractor it counts the key's prefixes; without one every entry
+    /// registers a single hash.
+    pub(crate) fn hashes_read_keys(&self) -> bool {
+        self.writer.writer.has_prefix_extractor()
+    }
+
     /// Hashes the entries of a table recording `meta` register in an
     /// output's filter, at the most.
     pub(crate) fn filter_hashes_of(&self, meta: &super::meta::ParsedMeta) -> u64 {

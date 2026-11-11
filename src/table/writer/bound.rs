@@ -553,6 +553,11 @@ impl Writer {
             .filter(|_| self.value_layout == Some(crate::table::meta::ValueLayout::Cells))
     }
 
+    /// Whether this writer's filter takes prefixes of the keys.
+    pub(crate) fn has_prefix_extractor(&self) -> bool {
+        self.prefix_extractor.is_some()
+    }
+
     /// Hashes one entry of `key` registers in this writer's filter, at the
     /// most: the key, and each prefix its extractor yields of it.
     pub(crate) fn filter_hashes_bound(&self, key: &[u8]) -> u64 {
