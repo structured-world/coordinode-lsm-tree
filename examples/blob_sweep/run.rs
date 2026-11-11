@@ -14,18 +14,18 @@ use std::time::{Duration, Instant};
 
 /// How a run's blob files hold their values.
 #[derive(Clone, Debug)]
-pub struct Layout {
-    pub name: String,
-    pub block_size: u32,
-    pub chunk_size: NonZeroU32,
+pub(crate) struct Layout {
+    pub(crate) name: String,
+    pub(crate) block_size: u32,
+    pub(crate) chunk_size: NonZeroU32,
     /// The classes the dictionary compresses, for a dictionary codec.
-    pub dictionary: DictionaryClasses,
+    pub(crate) dictionary: DictionaryClasses,
 }
 
 impl Layout {
     /// Every value a frame of its own, none split: how a blob file held its
     /// values before size classes.
-    pub fn per_value() -> Self {
+    pub(crate) fn per_value() -> Self {
         Self {
             name: "per-value".to_owned(),
             block_size: 0,
@@ -35,7 +35,7 @@ impl Layout {
     }
 
     /// Blocks of `block_size` and chunks of `chunk_size`.
-    pub fn sized(block_size: u32, chunk_size: u32) -> Self {
+    pub(crate) fn sized(block_size: u32, chunk_size: u32) -> Self {
         Self {
             name: format!("block {} chunk {}", kib(block_size), kib(chunk_size)),
             block_size,
@@ -55,7 +55,7 @@ fn kib(bytes: u32) -> String {
 
 /// What a run compresses with.
 #[derive(Clone)]
-pub enum Codec {
+pub(crate) enum Codec {
     Lz4,
     Zstd(i32),
     /// zstd at the level with this dictionary, trained on the corpus.
@@ -63,7 +63,7 @@ pub enum Codec {
 }
 
 impl Codec {
-    pub fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         match self {
             Self::Lz4 => "lz4".to_owned(),
             Self::Zstd(level) => format!("zstd {level}"),
@@ -89,7 +89,11 @@ impl Codec {
 /// # Errors
 ///
 /// A value cannot be read, or the trainer refuses the samples.
-pub fn train(corpus: &Corpus, sample: usize, size: usize) -> Result<Arc<ZstdDictionary>, Error> {
+pub(crate) fn train(
+    corpus: &Corpus,
+    sample: usize,
+    size: usize,
+) -> Result<Arc<ZstdDictionary>, Error> {
     use structured_zstd::dictionary::{FastCoverOptions, FinalizeOptions, optimize_fastcover_dict};
     let mut samples = Vec::new();
     let mut sizes = Vec::new();
@@ -117,34 +121,39 @@ pub fn train(corpus: &Corpus, sample: usize, size: usize) -> Result<Arc<ZstdDict
 
 /// What one run measured.
 #[derive(Debug, Default)]
-pub struct Measured {
-    pub value_bytes: u64,
-    pub blob_bytes: u64,
-    pub write: Duration,
-    pub write_peak: Option<u64>,
-    pub scan: Duration,
+pub(crate) struct Measured {
+    pub(crate) value_bytes: u64,
+    pub(crate) blob_bytes: u64,
+    pub(crate) write: Duration,
+    pub(crate) write_peak: Option<u64>,
+    pub(crate) scan: Duration,
     /// Point reads with a cache smaller than the data, then with one it fits.
-    pub get_small_cache: Duration,
-    pub get_large_cache: Duration,
-    pub get_bytes_read: u64,
-    pub get_bytes_decoded: u64,
-    pub gets: u64,
-    pub range_reads: u64,
-    pub range_time: Duration,
-    pub range_bytes_decoded: u64,
-    pub large_value: u64,
-    pub large_read_peak: Option<u64>,
-    pub range_read_peak: Option<u64>,
-    pub relocated: u64,
-    pub reclaimed: i128,
+    pub(crate) get_small_cache: Duration,
+    pub(crate) get_large_cache: Duration,
+    pub(crate) get_bytes_read: u64,
+    pub(crate) get_bytes_decoded: u64,
+    pub(crate) gets: u64,
+    pub(crate) range_reads: u64,
+    pub(crate) range_time: Duration,
+    pub(crate) range_bytes_decoded: u64,
+    pub(crate) large_value: u64,
+    pub(crate) large_read_peak: Option<u64>,
+    pub(crate) range_read_peak: Option<u64>,
+    pub(crate) relocated: u64,
+    pub(crate) reclaimed: i128,
 }
 
 impl Measured {
-    pub fn ratio(&self) -> f64 {
+    pub(crate) fn ratio(&self) -> f64 {
         self.blob_bytes as f64 / self.value_bytes.max(1) as f64
     }
 
-    pub fn to_json(&self, corpus: &str, layout: &Layout, codec: &Codec) -> serde_json::Value {
+    pub(crate) fn to_json(
+        &self,
+        corpus: &str,
+        layout: &Layout,
+        codec: &Codec,
+    ) -> serde_json::Value {
         let per = |d: Duration, n: u64| d.as_nanos() as f64 / n.max(1) as f64;
         serde_json::json!({
             "corpus": corpus,
@@ -254,7 +263,7 @@ fn shuffled(n: usize) -> Vec<usize> {
 /// # Errors
 ///
 /// A value cannot be read, or the tree fails.
-pub fn measure(
+pub(crate) fn measure(
     corpus: &Corpus,
     layout: &Layout,
     codec: &Codec,

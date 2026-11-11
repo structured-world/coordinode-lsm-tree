@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 
 /// One value of a corpus: read from a line of a JSON lines file, or a file of
 /// its own.
-pub enum Source {
+pub(crate) enum Source {
     Line { file: PathBuf, at: u64, len: u32 },
     File(PathBuf),
 }
 
 /// A corpus: its name and its values, in key order.
-pub struct Corpus {
-    pub name: String,
-    pub values: Vec<(Vec<u8>, Source)>,
+pub(crate) struct Corpus {
+    pub(crate) name: String,
+    pub(crate) values: Vec<(Vec<u8>, Source)>,
 }
 
 impl Corpus {
@@ -21,7 +21,7 @@ impl Corpus {
     /// # Errors
     ///
     /// A file of the corpus cannot be inspected.
-    pub fn bytes(&self) -> std::io::Result<u64> {
+    pub(crate) fn bytes(&self) -> std::io::Result<u64> {
         self.values
             .iter()
             .map(|(_, source)| match source {
@@ -37,7 +37,7 @@ impl Corpus {
 /// # Errors
 ///
 /// The file cannot be read.
-pub fn read(source: &Source) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read(source: &Source) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     match source {
         Source::Line { file, at, len } => {
@@ -118,7 +118,7 @@ fn tree_of_files(name: &str, dir: &Path) -> std::io::Result<Corpus> {
 ///
 /// A corpus that is present cannot be read; only a corpus that is not there
 /// is left out.
-pub fn load(data: &Path) -> std::io::Result<Vec<Corpus>> {
+pub(crate) fn load(data: &Path) -> std::io::Result<Vec<Corpus>> {
     let mut corpora = Vec::new();
     let documents = data.join("documents");
     if documents.join("records.jsonl").try_exists()? {
