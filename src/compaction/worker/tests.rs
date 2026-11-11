@@ -4110,8 +4110,10 @@ fn relocating_ingested_frames_lists_them_at_their_table_seqno() -> crate::Result
 /// after it was written splits: copied as stored, it would carry keys of two
 /// domains into one file, which expiring either could then not drop. Its
 /// values are written anew, each file held to one domain, as any written
-/// value is.
+/// value is. Only a file that compresses its values writes such blocks: one
+/// that compresses nothing packs them in records.
 #[test]
+#[cfg(feature = "lz4")]
 fn relocation_rewrites_a_block_a_key_domain_splits() -> crate::Result<()> {
     const KEYS: u64 = 400;
     const BOUNDARY: u64 = 202;
@@ -4132,6 +4134,7 @@ fn relocation_rewrites_a_block_a_key_domain_splits() -> crate::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
+        .blob_compression(crate::CompressionType::Lz4)
         .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)));
         if domains {
             config = config.key_domains(alloc::sync::Arc::new(Split));
@@ -4157,12 +4160,27 @@ fn relocation_rewrites_a_block_a_key_domain_splits() -> crate::Result<()> {
         tree.insert(blob_reloc_key(i), blob_reloc_value(i, 2), 1);
     }
     tree.flush_active_memtable(0)?;
+    let before: crate::HashSet<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
     tree.major_compact(64 * 1024 * 1024, 2)?;
     tree.major_compact(64 * 1024 * 1024, 2)?;
 
+    // The files the relocation wrote: the ones written before the domains
+    // hold keys of both by construction.
     let boundary = blob_reloc_key(BOUNDARY);
-    let mut relocated = 0;
-    for file in tree.index.current_version().blob_files.iter() {
+    let (mut relocated, mut lower, mut upper) = (0, false, false);
+    for file in tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .filter(|file| !before.contains(&file.id()))
+    {
         let scanner = crate::vlog::blob_file::scanner::Scanner::new(
             &file.0.path,
             &crate::fs::StdFs,
@@ -4180,9 +4198,14 @@ fn relocation_rewrites_a_block_a_key_domain_splits() -> crate::Result<()> {
             "file {} holds keys of both domains",
             file.id()
         );
+        lower |= below > 0;
+        upper |= below < keys.len();
         relocated += keys.len();
     }
-    assert!(relocated > 0, "the fixture needs the merge to relocate");
+    assert!(
+        relocated > 0 && lower && upper,
+        "the fixture needs the merge to relocate keys of both domains"
+    );
     for i in 0..KEYS {
         let expected = blob_reloc_value(i, if i < KEYS / 4 { 2 } else { 1 });
         assert_eq!(
@@ -4566,8 +4589,10 @@ fn relocation_gives_up_a_block_whose_values_lie_past_the_held_bound() -> crate::
 /// copied as stored, its entries listed at the zero the ingestion wrote them
 /// under. A block whose claimed values are listed at another seqno than their
 /// table's is written anew instead, each value at its table's seqno, as a
-/// block below the copy share is.
+/// block below the copy share is. Only a file that compresses its values
+/// writes such blocks: one that compresses nothing packs them in records.
 #[test]
+#[cfg(feature = "lz4")]
 fn relocating_ingested_blocks_lists_them_at_their_table_seqno() -> crate::Result<()> {
     const KEYS: u64 = 400;
     let folder = crate::get_tmp_folder();
@@ -4576,6 +4601,7 @@ fn relocating_ingested_blocks_lists_them_at_their_table_seqno() -> crate::Result
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .blob_compression(crate::CompressionType::Lz4)
     .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
     .open()?
     {
