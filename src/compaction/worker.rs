@@ -733,7 +733,7 @@ fn recorded_table_demand(
     version: &Version,
     opts: &Options,
     payload: &CompactionPayload,
-    probe: &crate::table::multi_writer::MultiWriter,
+    probe: &crate::table::multi_writer::BoundProbe,
     stale: &[BlobFile],
 ) -> crate::Result<u64> {
     use crate::table::writer::{CellShapes, RewriteLoad, varint_len};
@@ -811,7 +811,7 @@ fn recorded_table_demand(
     }
     load.cell_columns = cells.columns_with(&CellShapes::default());
     let cut_keys = super::flavour::output_cut_keys(version, opts, payload).len() as u64;
-    probe.rewrite_bound(&load, cut_keys + domain_count - 1)
+    Ok(probe.rewrite_bound(&load, cut_keys + domain_count - 1))
 }
 
 /// The bytes a full compaction of `tree` at `version` writes, bounded as the
@@ -931,7 +931,7 @@ fn key_range_domains(
 fn read_table_load(
     table: &Table,
     opts: &Options,
-    probe: &crate::table::multi_writer::MultiWriter,
+    probe: &crate::table::multi_writer::BoundProbe,
     cells: &mut crate::table::writer::CellShapes,
 ) -> crate::Result<crate::table::writer::RewriteLoad> {
     let cmp = opts.config.comparator.as_ref();
@@ -1992,7 +1992,7 @@ struct SliceCaps {
 /// past the first a slice's keys lie in opens its outputs again.
 #[cfg(feature = "std")]
 struct SliceOutputs<'a> {
-    probe: &'a crate::table::multi_writer::MultiWriter,
+    probe: &'a crate::table::multi_writer::BoundProbe,
     tombstones: crate::table::writer::RewriteLoad,
     cut_keys: &'a [UserKey],
     domains: Option<&'a dyn crate::KeyDomains>,
@@ -2494,17 +2494,17 @@ fn tight_slices(
         rows.linked_blob_files += blob_files;
         probe.rewrite_bound(&rows, m.cut_keys + m.table_domains.max(1) - 1)
     };
-    let measure = |m: &SliceMeasure| -> crate::Result<(u64, u64)> {
+    let measure = |m: &SliceMeasure| {
         let (blobs, files) = with_blobs(m);
-        Ok((with_tables(m, files)?, blobs))
+        (with_tables(m, files), blobs)
     };
-    let slice = |end: Option<UserKey>, load: &SliceLoad| -> crate::Result<TightSlice> {
-        let (tables, blobs) = measure(&load.measure_with(&SliceLoad::default(), relocated))?;
-        Ok(TightSlice { end, tables, blobs })
+    let slice = |end: Option<UserKey>, load: &SliceLoad| {
+        let (tables, blobs) = measure(&load.measure_with(&SliceLoad::default(), relocated));
+        TightSlice { end, tables, blobs }
     };
-    let past = |acc: &SliceLoad, block: &Block| -> crate::Result<bool> {
-        let (tables, blobs) = measure(&acc.measure_with(&block.load, relocated))?;
-        Ok(tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total)
+    let past = |acc: &SliceLoad, block: &Block| {
+        let (tables, blobs) = measure(&acc.measure_with(&block.load, relocated));
+        tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total
     };
     // What the entries of the key the blocks of `group` end on write: the
     // next slice's, once a slice ends on that key.
@@ -2550,15 +2550,15 @@ fn tight_slices(
     let mut last: Option<&Block> = None;
     for block in &blocks {
         if let Some(previous) = last
-            && past(&acc, block)?
+            && past(&acc, block)
         {
-            slices.push(slice(Some(previous.end_key.clone()), &acc)?);
+            slices.push(slice(Some(previous.end_key.clone()), &acc));
             acc = key_weight(previous)?;
         }
         acc.absorb(&block.load, relocated);
         last = Some(block);
     }
-    slices.push(slice(None, &acc)?);
+    slices.push(slice(None, &acc));
     Ok(slices)
 }
 

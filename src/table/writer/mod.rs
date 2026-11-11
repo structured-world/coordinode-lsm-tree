@@ -1456,6 +1456,23 @@ impl Writer {
         key_len: u64,
         prefixes: usize,
     ) -> crate::Result<(u64, u64)> {
+        Ok(self.tombstone_only_overhead_with(
+            self.meta_payload_len_without_keys()?,
+            key_len,
+            prefixes,
+        ))
+    }
+
+    /// [`Self::tombstone_only_overhead`] with the meta payload this writer
+    /// writes besides its keys already measured as `meta_without_keys` (see
+    /// [`Self::meta_payload_len`]): what a caller bounding many rewrites
+    /// under unchanged settings measures once.
+    pub(crate) fn tombstone_only_overhead_with(
+        &self,
+        meta_without_keys: u64,
+        key_len: u64,
+        prefixes: usize,
+    ) -> (u64, u64) {
         use crate::table::{
             block::{BlockType, EccParams, framed_len_bound, transform_scratch_bound},
             zone_map::ColumnStats,
@@ -1468,7 +1485,7 @@ impl Writer {
         };
         // An entry holds its key besides a few varints, a seqno and a type.
         let entry = key_len + 32;
-        let meta = self.meta_payload_len_without_keys()? + 2 * key_len + 4;
+        let meta = meta_without_keys + 2 * key_len + 4;
         let index = framed(entry, BlockType::Index, self.index_block_compression);
         let filter = self.bloom_policy.filter_size_bound(1 + prefixes) as u64;
         let seqno_bounds = if self.use_seqno_in_index {
@@ -1522,7 +1539,17 @@ impl Writer {
             + filter
             + transform_scratch_bound(filter, BlockType::Filter, none, encryption, self.ecc)
             + 2 * written;
-        Ok((written, held))
+        (written, held)
+    }
+
+    /// Bytes of the meta block payload with empty key bounds, from above:
+    /// what [`Self::tombstone_only_overhead_with`] takes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the encoding of the meta block.
+    pub(crate) fn meta_payload_len(&self) -> crate::Result<u64> {
+        self.meta_payload_len_without_keys()
     }
 
     /// Bytes of data the table cuts a block at: a row group's for a columnar

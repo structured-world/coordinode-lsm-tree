@@ -334,12 +334,15 @@ const ZSTD_INNER_BLOCK: u64 = 128 * 1024;
 
 impl Writer {
     /// Bytes `tables` tables written with this writer's settings take
-    /// together when they hold `load`, bounded from above.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the encoding of the meta block a table ends with.
-    pub(crate) fn rewrite_bound(&self, load: &RewriteLoad, tables: u64) -> crate::Result<u64> {
+    /// together when they hold `load`, bounded from above; the meta payload
+    /// each table ends with is `meta_without_keys` besides its keys (see
+    /// [`Self::meta_payload_len`]).
+    pub(crate) fn rewrite_bound(
+        &self,
+        load: &RewriteLoad,
+        tables: u64,
+        meta_without_keys: u64,
+    ) -> u64 {
         let tables = tables.max(1);
         let encryption = self.encryption.as_deref();
         let none = CompressionType::None;
@@ -538,9 +541,9 @@ impl Writer {
         // Every table's tail: its version byte, separator, table of contents
         // and two meta copies, and the pieces a table of a single entry holds
         // at the least, which the totals above may leave out of a small one.
-        let (per_table, _) = self.tombstone_only_overhead(longest, 0)?;
+        let (per_table, _) = self.tombstone_only_overhead_with(meta_without_keys, longest, 0);
 
-        Ok(data + index + filter + sections + locator + tables * per_table)
+        data + index + filter + sections + locator + tables * per_table
     }
 
     /// The field columns `load` opens, when this writer splits cell rows into

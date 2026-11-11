@@ -60,7 +60,7 @@ fn assert_bound_holds_for(
     dir: &std::path::Path,
 ) -> crate::Result<(std::path::PathBuf, crate::Checksum)> {
     let probe = configure(Writer::new(dir.join("probe"), 1, 0, Arc::new(StdFs))?);
-    let bound = probe.rewrite_bound(load, 1)?;
+    let bound = probe.rewrite_bound(load, 1, probe.meta_payload_len()?);
     drop(probe);
 
     let path = dir.join("table");

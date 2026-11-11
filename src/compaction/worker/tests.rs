@@ -3451,7 +3451,7 @@ fn space_gate_sizes_a_restricted_input_by_its_live_suffix() -> crate::Result<()>
             ..crate::table::writer::RewriteLoad::default()
         },
         0,
-    )?;
+    );
     assert!(
         suffix < whole,
         "the suffix is charged less than the whole original: {suffix} against {whole}"
@@ -6392,7 +6392,7 @@ pub(super) fn slice_probe(
     opts: &super::Options,
     inputs: &[Table],
     target_size: u64,
-) -> crate::Result<crate::table::multi_writer::MultiWriter> {
+) -> crate::Result<crate::table::multi_writer::BoundProbe> {
     let version = opts.version_history.read().latest_version().version;
     let Some(last) = version.level_count().checked_sub(1) else {
         panic!("a tree has levels");

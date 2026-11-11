@@ -450,10 +450,10 @@ pub(super) fn output_bound_probe(
     opts: &Options,
     payload: &CompactionPayload,
     rc: &crate::runtime_config::RuntimeConfig,
-) -> crate::Result<MultiWriter> {
+) -> crate::Result<crate::table::multi_writer::BoundProbe> {
     let probe = MultiWriter::probe(payload.target_size, payload.dest_level)?;
     let probe = configure_table_writer(probe, version, opts, payload, None, false, rc)?;
-    Ok(match opts.config.filter_advisor.as_ref() {
+    crate::table::multi_writer::BoundProbe::new(match opts.config.filter_advisor.as_ref() {
         Some(advisor) => probe.use_bloom_policy(crate::filter_budget::widest_policy(
             advisor.bits_per_key(),
             output_bloom_policy(version, opts, payload),
