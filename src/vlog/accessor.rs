@@ -492,12 +492,17 @@ impl<'a> Accessor<'a> {
         let bytes = crate::file::read_exact(file.as_ref(), offset, len as usize)?;
         let (record, value) = self.record_value(blob_file, key, &bytes)?;
         cache.record_blob_record_load(tree_id, at, vhandle.index, timer);
-        if let Some(lead) = lead
+        // The record the waiters take is the one the cache keeps: built once.
+        let built = if let Some(lead) = lead
             && lead.has_waiters()
         {
-            lead.hand_over(packed::cached_record(&record, &bytes, &value));
-        }
-        self.keep_record(tree_id, vhandle, &record, &bytes, &value, cache);
+            let cached = packed::cached_record(&record, &bytes, &value);
+            lead.hand_over(cached.clone());
+            Some(cached)
+        } else {
+            None
+        };
+        self.keep_record(tree_id, vhandle, &record, &bytes, &value, built, cache);
         Ok(Some(value))
     }
 
@@ -582,7 +587,7 @@ impl<'a> Accessor<'a> {
         cache: &Cache,
     ) -> crate::Result<UserValue> {
         let (record, value) = self.record_value(blob_file, key, bytes)?;
-        self.keep_record(tree_id, vhandle, &record, bytes, &value, cache);
+        self.keep_record(tree_id, vhandle, &record, bytes, &value, None, cache);
         Ok(value)
     }
 
@@ -628,7 +633,12 @@ impl<'a> Accessor<'a> {
     /// insert takes the place of what it evicts, and the allocator hands that
     /// memory to the next one. Into its room a value goes on its first miss,
     /// past it only on a miss that repeats a recent one, so a value read once
-    /// is not cached to be evicted unread.
+    /// is not cached to be evicted unread. `built` is the record as cached,
+    /// when the read built it already for others.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the record as read, decoded and as cached, with where it goes"
+    )]
     fn keep_record(
         &self,
         tree_id: TreeId,
@@ -636,6 +646,7 @@ impl<'a> Accessor<'a> {
         record: &packed::Record,
         bytes: &crate::Slice,
         value: &UserValue,
+        built: Option<crate::Slice>,
         cache: &Cache,
     ) {
         let at = vhandle.frame_at();
@@ -646,7 +657,7 @@ impl<'a> Accessor<'a> {
         {
             return;
         }
-        let cached = packed::cached_record(record, bytes, value);
+        let cached = built.unwrap_or_else(|| packed::cached_record(record, bytes, value));
         cache.fill_blob_record(tree_id, at, vhandle.index, cached);
     }
 
