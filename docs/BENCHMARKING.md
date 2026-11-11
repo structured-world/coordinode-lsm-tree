@@ -302,16 +302,20 @@ writes the costs and `--github-json-timings <PATH>` the timings.
 
 ## The blob file sweep
 
-`tools/blob-sweep` is what the defaults of a blob file's layout are chosen
-from: the block size below which values share a compressed block, the chunk
-size above which a value is split, and the size classes a zstd dictionary
-compresses. It writes each corpus into a blob tree under each layout and codec
-and measures it:
+The `blob_sweep` example is what the defaults of a blob file's layout are
+chosen from: the block size below which values share a compressed block, the
+chunk size above which a value is split, and the size classes a zstd
+dictionary compresses. It writes each corpus into a blob tree under each
+layout and codec and measures it:
 
 ```sh
-node tools/blob-sweep/fetch-data.ts ~/blob-sweep-data
-cd tools/blob-sweep && cargo run --release -- --data ~/blob-sweep-data --work /var/tmp
+node examples/blob_sweep/fetch-data.ts ~/blob-sweep-data
+cargo run --release --example blob_sweep --features lz4,zstd,metrics -- \
+    --data ~/blob-sweep-data --work /var/tmp
 ```
+
+Built with the `mimalloc` feature, the sweep reports no peak heap: the
+binary's global allocator is then mimalloc, not the counting one.
 
 `fetch-data.ts` builds the corpora from public data, outside the repository,
 once: the products that store values in blob files keep documents of a few

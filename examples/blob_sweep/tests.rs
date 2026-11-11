@@ -1,9 +1,20 @@
 // A run of each kind over a small corpus laid out as `fetch-data.ts` lays the
 // real ones out: what it measures is there, and the values it wrote read back.
 
-use blob_sweep::NoProbe;
-use blob_sweep::corpus;
-use blob_sweep::run::{Codec, Layout, measure, train};
+use super::corpus;
+use super::run::{Codec, Layout, measure, train};
+use super::{Error, HeapProbe};
+
+/// A probe that measures nothing.
+struct NoProbe;
+
+impl HeapProbe for NoProbe {
+    fn reset(&self) {}
+
+    fn peak(&self) -> Option<u64> {
+        None
+    }
+}
 
 /// A data directory with a JSON lines corpus of documents and a corpus of
 /// files, one of them 3 MiB so range reads run, and the tar that marks the
@@ -28,7 +39,7 @@ fn data() -> std::io::Result<tempfile::TempDir> {
 /// A files part whose fetch stopped before its tar is not loaded: a partial
 /// tree would be swept as if it were the corpus.
 #[test]
-fn a_files_part_without_its_tar_is_left_out() -> Result<(), blob_sweep::Error> {
+fn a_files_part_without_its_tar_is_left_out() -> Result<(), Error> {
     let data = data()?;
     std::fs::remove_file(data.path().join("files").join("silesia.tar"))?;
     let corpora = corpus::load(data.path())?;
@@ -40,7 +51,7 @@ fn a_files_part_without_its_tar_is_left_out() -> Result<(), blob_sweep::Error> {
 }
 
 #[test]
-fn every_kind_of_run_measures_what_it_wrote() -> Result<(), blob_sweep::Error> {
+fn every_kind_of_run_measures_what_it_wrote() -> Result<(), Error> {
     let data = data()?;
     let work = tempfile::tempdir()?;
     let corpora = corpus::load(data.path())?;

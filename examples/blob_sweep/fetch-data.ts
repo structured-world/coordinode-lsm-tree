@@ -13,7 +13,7 @@
 // Every source is fetched once; a directory that already holds a part keeps
 // it. `manifest.json` records what each part was built from and its size.
 //
-//   node tools/blob-sweep/fetch-data.ts [DIR]
+//   node examples/blob_sweep/fetch-data.ts [DIR]
 //
 // DIR defaults to $BLOB_SWEEP_DATA, else ~/.cache/lsm-tree-blob-sweep. TronGrid
 // serves keyless clients slowly; $TRONGRID_API_KEY is sent when set.

@@ -1,20 +1,60 @@
-//! Runs the blob file sweep over the corpora in `--data` and writes one JSON
+//! The blob file sweep: each corpus written into a blob tree under each layout
+//! and codec, and what that layout costs measured on it. It writes one JSON
 //! object per run to `--out` (`sweep.json` by default), printing a summary.
 //!
 //! ```text
-//! blob-sweep --data DIR [--work DIR] [--out FILE] [--only SUBSTRING]
+//! node examples/blob_sweep/fetch-data.ts DIR
+//! cargo run --release --example blob_sweep --features lz4,zstd,metrics -- \
+//!     --data DIR [--work DIR] [--out FILE] [--only SUBSTRING]
 //! ```
 //!
-//! `--work` is where the trees are written, the system's temporary directory
-//! by default; it should be the disk the products run on, not a RAM disk.
+//! `fetch-data.ts` builds the corpora once, from public sources, into a
+//! directory outside the repository. `--work` is where the trees are written,
+//! the system's temporary directory by default; it should be the disk the
+//! products run on, not a RAM disk.
+//!
+//! A layout is the block target (values below it share a compressed block),
+//! the chunk size (values above it are split into chunks) and the size classes
+//! a zstd dictionary compresses. The `per-value` layout writes every value as a
+//! frame of its own and splits none, which is what a blob file held before
+//! values were stored by size class: the baseline the others are read against.
+//!
+//! For every run the sweep reports, per corpus:
+//!
+//! - the compression ratio: blob file bytes over value bytes;
+//! - the write time and the peak heap of the write;
+//! - a full scan, and point reads of every key in a shuffled order, once with
+//!   a cache far smaller than the data and once with one it fits in;
+//! - 4 KiB range reads of the values above 1 MiB, with the bytes each decodes,
+//!   and the peak heap of a whole read and of a range read of the largest one;
+//! - the write amplification of collection: three rounds overwriting a third
+//!   of the keys, each flushed and compacted, the blob bytes the compactions
+//!   relocated over the blob bytes they removed.
 
-use blob_sweep::corpus::{self, Corpus};
-use blob_sweep::run::{Codec, Layout, measure, train};
-use blob_sweep::{Error, HeapProbe};
+mod corpus;
+mod run;
+#[cfg(test)]
+mod tests;
+
+use corpus::Corpus;
 use lsm_tree::DictionaryClasses;
+use run::{Codec, Layout, measure, train};
 use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// What a run measures the heap with: the global allocator of the binary, or
+/// nothing in a test.
+trait HeapProbe {
+    /// Starts a window: the peak is measured from the heap in use now.
+    fn reset(&self);
+    /// The most bytes the heap held above the start of the window, `None`
+    /// when nothing measures it.
+    fn peak(&self) -> Option<u64>;
+}
+
+/// An error of the sweep.
+type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// The system allocator, counting the bytes in use and the most since the
 /// last reset.
@@ -47,7 +87,9 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-#[global_allocator]
+// A program links one global allocator: with the crate's `mimalloc` feature
+// that is mimalloc, and the sweep measures no heap.
+#[cfg_attr(not(feature = "mimalloc"), global_allocator)]
 static HEAP: Counting = Counting {
     in_use: AtomicU64::new(0),
     peak: AtomicU64::new(0),
@@ -62,6 +104,9 @@ impl HeapProbe for Counting {
     }
 
     fn peak(&self) -> Option<u64> {
+        if cfg!(feature = "mimalloc") {
+            return None;
+        }
         let (peak, base) = (
             self.peak.load(Ordering::Relaxed),
             self.base.load(Ordering::Relaxed),

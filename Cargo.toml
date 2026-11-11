@@ -10,7 +10,7 @@
 # single-package workspace, so they are excluded — otherwise Cargo would treat
 # them as orphan members of this root and refuse to build.
 [workspace]
-exclude = ["fuzz", "tools/blob-sweep", "tools/compare-rocksdb", "tools/db_bench", "tools/sst-dump", "tools/v5-to-v6"]
+exclude = ["fuzz", "tools/compare-rocksdb", "tools/db_bench", "tools/sst-dump", "tools/v5-to-v6"]
 
 [package]
 name = "coordinode-lsm-tree"
@@ -363,6 +363,13 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 
 [package.metadata.cargo-all-features]
 denylist = []
+
+# The sweep the blob file defaults are chosen from, run by hand on real data
+# (see the example's own docs).
+[[example]]
+name = "blob_sweep"
+path = "examples/blob_sweep/main.rs"
+required-features = ["std", "lz4", "zstd", "metrics"]
 
 [[bench]]
 name = "merge"
