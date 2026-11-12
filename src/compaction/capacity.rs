@@ -284,12 +284,13 @@ impl CapacityPool {
     }
 
     /// Reserves `demands` for a compaction of `tree` when, on the volume of
-    /// each, the reservations sharing it hold no more than its `limit`,
-    /// checked and taken in one step: a pass that sized its work to the room
-    /// it measured, leaving the others that much, stops rather than write over
-    /// room another compaction took since. Its own writes are checked against
-    /// the tree's quota in `check`, not against the volumes' room it measured;
-    /// what it writes past the grant is checked against `check` as it lands.
+    /// each, the reservations sharing it hold no more than its `limit` and the
+    /// volume still has the room, checked and taken in one step: a pass that
+    /// sized its work to the room it measured, leaving the others that much,
+    /// stops rather than write over room another compaction took since, held
+    /// or already written. Its own writes are checked against the tree's quota
+    /// in `check` too; what it writes past the grant is checked against
+    /// `check` as it lands.
     pub(crate) fn reserve_within(
         self: &Arc<Self>,
         tree: TreeId,
@@ -311,15 +312,11 @@ impl CapacityPool {
                 bytes: demand.bytes,
             })
             .collect();
-        let (volumes, total) = gather(&demands, false);
-        // The quota is the tree's own limit, not room another took: what the
-        // slice writes has to fit what it leaves past the tree's holds, as it
-        // stands now.
-        if total
-            > check
-                .quota_headroom
-                .saturating_sub(held_against(&held, Pool::Quota(tree)))
-        {
+        // A compaction that reserved, wrote and gave its room back since the
+        // pass measured leaves the reservations where they were and its bytes
+        // on the volume: only the free space shows them.
+        let (volumes, total) = gather(&demands, true);
+        if !admits(&held, tree, &volumes, total, check) {
             return None;
         }
         let room = self.take(&mut held, tree, volumes, total, Some(check));

@@ -88,6 +88,40 @@ fn reservation_within_its_room_is_refused_past_the_quota() {
     );
 }
 
+/// A slice reserved within the room it measured is refused when the volume no
+/// longer has that room, though no reservation holds more than it measured:
+/// another compaction reserved, wrote and gave back its room since, and the
+/// bytes it wrote stay on the volume.
+#[test]
+fn reservation_within_its_room_is_refused_past_the_free_space() {
+    let fs = MemFs::with_capacity(100 * MIB);
+    let pool = Arc::new(CapacityPool::default());
+    let measured = pool.held_on(&fs, Path::new("/tables"));
+    assert_eq!(pool.available(&fs, Path::new("/tables")), 100 * MIB);
+    // Another compaction's outputs landed and its reservation went: the
+    // volume holds 70 MiB more, the pool holds what it held.
+    fs.set_capacity(30 * MIB);
+    assert_eq!(pool.held_on(&fs, Path::new("/tables")), measured);
+    assert!(
+        pool.reserve_within(
+            1,
+            &[(demand(&fs, "/tables", 60 * MIB), measured)],
+            check(u64::MAX)
+        )
+        .is_none(),
+        "60 MiB does not fit the 30 MiB the volume has left",
+    );
+    assert!(
+        pool.reserve_within(
+            1,
+            &[(demand(&fs, "/tables", 20 * MIB), measured)],
+            check(u64::MAX)
+        )
+        .is_some(),
+        "20 MiB does",
+    );
+}
+
 /// Two compactions on one volume cannot both take the same free bytes: the
 /// second is checked against what the first holds, and the room the first
 /// gives back as it goes is the second's again.
