@@ -1914,9 +1914,9 @@ fn the_meta_estimate_grows_with_the_field_columns_groups_open() -> crate::Result
         .use_row_group_size(4 * 1_024)
         .use_columnar_page_size(1_024);
     // Every ten rows a field column the rows before did not hold.
-    for i in 0..3_000u32 {
+    for i in 0..3_000u16 {
         let note = format!("note {i}");
-        let column = 3 + u16::try_from(i / 10).expect("small");
+        let column = 3 + i / 10;
         writer.write(InternalValue::from_components(
             format!("k{i:08}").into_bytes(),
             encode_row(&[RowField::bytes(column, RowCell::Value(note.as_bytes()))])?,
