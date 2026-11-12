@@ -12,7 +12,6 @@ use crate::io::BufReader;
 use crate::io::{Read, Seek, SeekFrom};
 use crate::path::Path;
 use crate::{CompressionType, SeqNo, Slice, UserKey, UserValue, vlog::BlobFileId};
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -83,8 +82,9 @@ pub(crate) struct Scanner {
 
     decode: Decode,
 
-    /// Values of the block read last that are still to be yielded.
-    pending: VecDeque<ScanEntry>,
+    /// The single frame or block read last, whose values are yielded from
+    /// it one by one.
+    values: Option<FrameValues>,
 
     /// Set when the chain walk resynchronized at a magic found by a byte-wise
     /// search after a damaged frame, and STICKY thereafter: every value read
@@ -272,7 +272,7 @@ impl Scanner {
             next_frame,
             codec,
             decode: Decode::All,
-            pending: VecDeque::new(),
+            values: None,
             resync_tainted: false,
         })
     }
@@ -439,8 +439,10 @@ impl Scanner {
         }
     }
 
-    /// The values of the next frame, queued; `None` at the data end.
-    fn fill(&mut self) -> Option<crate::Result<()>> {
+    /// Reads the next frame: a chunked value is yielded whole, the values of
+    /// a single frame or a block one by one from [`Self::values`]. `None` at
+    /// the data end.
+    fn fill(&mut self) -> Option<crate::Result<Option<ScanEntry>>> {
         let (frame, offset, bytes, decoded) = match self.read_one()? {
             Ok(read) => read,
             Err(e) => return Some(Err(e)),
@@ -449,53 +451,20 @@ impl Scanner {
         let frame_end = offset + bytes.len() as u64;
         match decoded.header.kind {
             FrameKind::Single | FrameKind::Block => {
-                let last = decoded.list.len() - 1;
-                let in_block = decoded.header.kind == FrameKind::Block;
-                let whole = !in_block;
                 // A single frame left undecoded is yielded by its frame alone.
-                let decoded_value = in_block || self.decode == Decode::All;
-                for (at, entry) in decoded.list.iter().enumerate() {
-                    // The index a handle names the value by: in a packed
-                    // block its record's offset.
-                    let (Some(key), Some(index), Some(entry_bytes)) = (
-                        decoded.key(at),
-                        decoded.index_of(at),
-                        decoded.block_entry_bytes(at),
-                    ) else {
-                        return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
-                    };
-                    let value = if decoded_value {
-                        let Some(value) = decoded.value(at) else {
-                            return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
-                        };
-                        Some(value)
-                    } else {
-                        None
-                    };
-                    let block = in_block.then(|| ScanBlock {
-                        stored: bytes.clone(),
-                        values: decoded.header.count,
-                        entry_bytes,
-                    });
-                    self.pending.push_back(ScanEntry {
-                        key: UserKey::from(key),
-                        seqno: entry.seqno,
-                        // A view into the frame: a block's values are taken
-                        // together, as the scan yields them in a row.
-                        value,
-                        frame,
-                        index,
-                        offset,
-                        uncompressed_len: entry.value_len,
-                        // A block is consumed once its last value is: until
-                        // then the frontier stays at its start.
-                        frame_end: if at == last { frame_end } else { offset },
-                        resynced,
-                        frames: whole.then(|| alloc::vec![bytes.clone()]),
-                        block,
-                    });
-                }
-                Some(Ok(()))
+                let decoded_value =
+                    decoded.header.kind == FrameKind::Block || self.decode == Decode::All;
+                self.values = Some(FrameValues {
+                    frame,
+                    offset,
+                    frame_end,
+                    resynced,
+                    decoded_value,
+                    bytes,
+                    decoded,
+                    at: 0,
+                });
+                Some(Ok(None))
             }
             FrameKind::Head => {
                 // The frames the file can hold bound a head's chunks before
@@ -558,7 +527,7 @@ impl Scanner {
                         return Some(Err(e.into()));
                     }
                 };
-                let (Some(entry), Some(key)) = (decoded.list.first(), decoded.key(0)) else {
+                let (Some(entry), Some(_)) = (decoded.list.first(), decoded.key(0)) else {
                     return failed(self, crate::Error::InvalidHeader("BlobFrame"));
                 };
                 // Each chunk checked against its row as it lies: every consumer
@@ -597,8 +566,10 @@ impl Scanner {
                     from = to;
                 }
                 self.next_frame = chunks.end;
-                self.pending.push_back(ScanEntry {
-                    key: UserKey::from(key),
+                // `key` read in range, so the view is too.
+                let key = decoded.entries.slice(entry.key.clone());
+                Some(Ok(Some(ScanEntry {
+                    key,
                     seqno: entry.seqno,
                     value: None,
                     frame,
@@ -609,8 +580,7 @@ impl Scanner {
                     resynced: self.resync_tainted,
                     frames: Some(stored),
                     block: None,
-                });
-                Some(Ok(()))
+                })))
             }
             // A chunk without its head is damage: the head before it was lost.
             FrameKind::Chunk => Some(Err(crate::Error::InvalidHeader("BlobFrame"))),
@@ -774,19 +744,97 @@ impl ScanEntry {
     }
 }
 
+/// The values of a single frame or a block a scan read, yielded one by one.
+struct FrameValues {
+    frame: u32,
+    offset: u64,
+    frame_end: u64,
+    resynced: bool,
+    /// Whether values are yielded decoded: a block's always, a single
+    /// frame's when the scan decodes every frame.
+    decoded_value: bool,
+    /// The frame as stored, and decoded.
+    bytes: Slice,
+    decoded: DecodedFrame,
+    /// The next value to yield.
+    at: usize,
+}
+
+impl FrameValues {
+    /// The next value; `None` past the last one.
+    fn next_value(&mut self) -> Option<crate::Result<ScanEntry>> {
+        let at = self.at;
+        let decoded = &self.decoded;
+        let entry = decoded.list.get(at)?;
+        self.at += 1;
+        let in_block = decoded.header.kind == FrameKind::Block;
+        // The index a handle names the value by: in a packed block its
+        // record's offset.
+        let (Some(_), Some(index), Some(entry_bytes)) = (
+            decoded.key(at),
+            decoded.index_of(at),
+            decoded.block_entry_bytes(at),
+        ) else {
+            return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+        };
+        let value = if self.decoded_value {
+            let Some(value) = decoded.value(at) else {
+                return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+            };
+            Some(value)
+        } else {
+            None
+        };
+        Some(Ok(ScanEntry {
+            // A view into the frame's entries, as the value is into its
+            // payload: `key` read in range, so the view is too.
+            key: decoded.entries.slice(entry.key.clone()),
+            seqno: entry.seqno,
+            value,
+            frame: self.frame,
+            index,
+            offset: self.offset,
+            uncompressed_len: entry.value_len,
+            // A block is consumed once its last value is: until then the
+            // frontier stays at its start.
+            frame_end: if at + 1 == decoded.list.len() {
+                self.frame_end
+            } else {
+                self.offset
+            },
+            resynced: self.resynced,
+            frames: (!in_block).then(|| alloc::vec![self.bytes.clone()]),
+            block: in_block.then(|| ScanBlock {
+                stored: self.bytes.clone(),
+                values: decoded.header.count,
+                entry_bytes,
+            }),
+        }))
+    }
+}
+
 impl Iterator for Scanner {
     type Item = crate::Result<ScanEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(entry) = self.pending.pop_front() {
-                return Some(Ok(entry));
+            if let Some(values) = &mut self.values {
+                match values.next_value() {
+                    Some(Ok(entry)) => return Some(Ok(entry)),
+                    // A value that does not decode ends its frame's values.
+                    Some(Err(e)) => {
+                        self.values = None;
+                        return Some(Err(e));
+                    }
+                    None => self.values = None,
+                }
             }
             if self.is_terminated {
                 return None;
             }
             match self.fill()? {
-                Ok(()) => {}
+                Ok(Some(entry)) => return Some(Ok(entry)),
+                Ok(None) => {}
                 Err(e) => return Some(Err(e)),
             }
         }
