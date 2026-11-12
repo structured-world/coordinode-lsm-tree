@@ -2521,19 +2521,15 @@ fn tight_slices(
             let Some(block) = input.load_data_block_for_maintenance(&handle, &**pace)? else {
                 continue;
             };
-            block.try_for_each_entry(comparator.clone(), |item| {
-                if cmp.compare(&item.key.user_key, &group.end_key) != core::cmp::Ordering::Equal {
+            block.try_for_each_shape(comparator.clone(), |entry| {
+                let key = entry.key();
+                if cmp.compare(&key, &group.end_key) != core::cmp::Ordering::Equal {
                     return Ok(());
                 }
-                let hashes = probe.filter_hashes_bound(&item.key.user_key);
+                let hashes = probe.filter_hashes_bound(&key);
                 let blobs = take_entry(
                     &mut weight,
-                    (
-                        item.key.value_type,
-                        item.key.seqno,
-                        item.key.user_key.len(),
-                        &item.value,
-                    ),
+                    (entry.value_type, entry.seqno, entry.key_len, entry.value),
                     hashes,
                     split_cells,
                     relocated,

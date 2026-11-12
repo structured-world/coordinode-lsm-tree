@@ -1231,30 +1231,14 @@ impl DataBlock {
         )
     }
 
-    /// Hands every entry of the block to `f`, in block order.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a block-decode failure from [`try_iter`](Self::try_iter)
-    /// and the first error `f` returns.
-    pub(crate) fn try_for_each_entry(
-        &self,
-        comparator: crate::comparator::SharedComparator,
-        mut f: impl FnMut(InternalValue) -> crate::Result<()>,
-    ) -> crate::Result<()> {
-        for item in self.try_iter(comparator)? {
-            f(item.materialize(&self.inner.data))?;
-        }
-        Ok(())
-    }
-
     /// Hands every entry of the block to `f`, in block order, as what it is
     /// without building it: its value type, seqno, user key length and value
     /// bytes, its key built only when asked for (see [`EntryShape::key`]).
     ///
     /// # Errors
     ///
-    /// As [`Self::try_for_each_entry`].
+    /// Propagates a block-decode failure from [`try_iter`](Self::try_iter)
+    /// and the first error `f` returns.
     pub(crate) fn try_for_each_shape(
         &self,
         comparator: crate::comparator::SharedComparator,
