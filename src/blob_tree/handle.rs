@@ -75,6 +75,45 @@ impl Encode for BlobIndirection {
     }
 }
 
+impl BlobIndirection {
+    /// Decodes the indirection a table row stores as `value`, straight off the
+    /// slice: what [`Decode`] reads of a well-formed one.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] for a value that does not hold one: a
+    /// varint cut short, longer than its field allows or past its width, or
+    /// an unknown stored kind.
+    #[inline]
+    pub(crate) fn decode_slice(value: &[u8]) -> Result<Self, crate::Error> {
+        let mut bytes = value;
+        Self::take_from(&mut bytes).ok_or(crate::Error::InvalidHeader("BlobIndirection"))
+    }
+
+    /// The indirection off the front of `bytes`; `None` for one that does not
+    /// decode.
+    #[inline]
+    fn take_from(bytes: &mut &[u8]) -> Option<Self> {
+        use crate::coding::take_varint;
+
+        let vhandle = ValueHandle::take_from(bytes)?;
+        let size = u32::try_from(take_varint(bytes, 5)?).ok()?;
+        let word = take_varint(bytes, 10)?;
+        let stored_bytes = u32::try_from(word >> 2).ok()?;
+        let stored = match word & 3 {
+            0 => Stored::Frames(stored_bytes),
+            1 => Stored::InBlock(stored_bytes),
+            2 => Stored::Packed(stored_bytes),
+            _ => return None,
+        };
+        Some(Self {
+            vhandle,
+            size,
+            stored,
+        })
+    }
+}
+
 impl Decode for BlobIndirection {
     fn decode_from<R: Read>(reader: &mut R) -> Result<Self, crate::Error> {
         let vhandle = ValueHandle::decode_from(reader)?;
@@ -95,3 +134,6 @@ impl Decode for BlobIndirection {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

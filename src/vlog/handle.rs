@@ -63,6 +63,24 @@ impl Encode for ValueHandle {
     }
 }
 
+impl ValueHandle {
+    /// Takes the handle off the front of `bytes` as [`Decode`] reads it,
+    /// straight off the slice; `None` where that read would fail.
+    #[inline]
+    pub(crate) fn take_from(bytes: &mut &[u8]) -> Option<Self> {
+        use crate::coding::take_varint;
+
+        let blob_file_id = take_varint(bytes, 10)?;
+        let frame = u32::try_from(take_varint(bytes, 5)?).ok()?;
+        let index = u16::try_from(take_varint(bytes, 3)?).ok()?;
+        Some(Self {
+            blob_file_id,
+            frame,
+            index,
+        })
+    }
+}
+
 impl Decode for ValueHandle {
     fn decode_from<R: Read>(reader: &mut R) -> Result<Self, crate::Error> {
         let blob_file_id = reader.read_u64_varint()?;

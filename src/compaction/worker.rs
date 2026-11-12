@@ -2218,7 +2218,6 @@ fn take_entry(
 ) -> crate::Result<(u64, bool)> {
     use crate::blob_tree::field_row::{RowCell, decode_row};
     use crate::blob_tree::handle::BlobIndirection;
-    use crate::coding::Decode;
 
     rows.take_entry(key_len as u64, value.len() as u64, seqno, filter_hashes);
     // A plain value points into no blob file and opens no column.
@@ -2246,7 +2245,7 @@ fn take_entry(
         copy_bytes(indirection, key_len, relocated)
     };
     if value_type.is_indirection() {
-        let indirection = BlobIndirection::decode_from(&mut &value[..])?;
+        let indirection = BlobIndirection::decode_slice(value)?;
         let bytes = reference(links, &indirection);
         return Ok((bytes, grew));
     }

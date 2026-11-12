@@ -2221,7 +2221,7 @@ impl RelocatingCompaction {
             return self.write_cell_row(item);
         }
         if item.key.value_type.is_indirection() {
-            let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
+            let indirection = BlobIndirection::decode_slice(&item.value)?;
             // This blob is not part of the rewritten blob files, so just pass it
             // through.
             log::trace!("Pass through {indirection:?} because it is not being relocated");
@@ -2376,10 +2376,9 @@ impl CompactionFlavour for RelocatingCompaction {
     /// copied whole or written value by value.
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
         if item.key.value_type.is_indirection() {
-            let indirection =
-                BlobIndirection::decode_from(&mut &item.value[..]).inspect_err(|e| {
-                    log::error!("Failed to deserialize blob indirection {item:?}: {e:?}");
-                })?;
+            let indirection = BlobIndirection::decode_slice(&item.value).inspect_err(|e| {
+                log::error!("Failed to deserialize blob indirection {item:?}: {e:?}");
+            })?;
             log::trace!(
                 "{:?}:{} => encountered indirection: {indirection:?}",
                 item.key.user_key,
