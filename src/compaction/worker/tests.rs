@@ -6496,9 +6496,14 @@ pub(super) fn governed_from(
                 rows.peek(),
                 Some(Ok(next)) if !crate::comparator::same_user_key(&next.key.user_key, &item.key.user_key)
             );
-            match governor.offer(item, false, ends_key, &dropped)? {
-                super::governor::Offered::Pass(..) | super::governor::Offered::Held => {}
-                super::governor::Offered::End => break 'feed,
+            match governor.decide(&item, ends_key, &dropped)? {
+                super::governor::Decided::Pass => {}
+                super::governor::Decided::End => break 'feed,
+                super::governor::Decided::Hold => {
+                    if !governor.hold(item, false, &dropped)? {
+                        break 'feed;
+                    }
+                }
             }
             while governor.pop_ready().is_some() {}
         }

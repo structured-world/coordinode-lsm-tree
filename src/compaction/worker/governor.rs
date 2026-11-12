@@ -99,16 +99,14 @@ impl Event {
     }
 }
 
-/// What becomes of a row offered to a slice's governor.
-pub(super) enum Offered {
-    /// The row, a whole key the slice keeps, to write now, and whether it is
-    /// known to start a key.
-    Pass(InternalValue, bool),
-    /// The row waits for its key to end.
-    Held,
-    /// The slice ends before the row's key, or the key before it: the merge
-    /// stops.
+/// What a slice's governor decides of a row.
+pub(super) enum Decided {
+    /// The row, a whole key the slice keeps, is to be written now.
+    Pass,
+    /// The slice ends before the row's key: the merge stops.
     End,
+    /// The row is to wait for its key to end ([`SliceGovernor::hold`]).
+    Hold,
 }
 
 /// Collects the versions a slice's merge drops, for the governor to place
@@ -301,44 +299,94 @@ impl<'a> SliceGovernor<'a> {
         self.held.pop_front()
     }
 
-    /// Takes `item`, a row the merge keeps, after the versions it dropped
-    /// before it (`dropped`); `ends_key` says the merge knows it is the last
-    /// row of its key.
-    ///
-    /// A row that is a whole key by itself, with nothing held or dropped
-    /// before it, is decided at once and comes back to be written; any other
-    /// is held until its key ends, and what may be written then is
-    /// [`Self::pop_ready`]'s.
+    /// Decides `item`, a row the merge keeps, if it is a whole key by itself
+    /// (`ends_key`: the merge knows it is the last row of its key) with
+    /// nothing held or dropped before it: the slice keeps it, to be written
+    /// now, or ends before it. Any other row is for [`Self::hold`].
     ///
     /// # Errors
     ///
     /// Returns an error when a row's value does not decode.
-    pub(super) fn offer(
+    #[inline]
+    pub(super) fn decide(
         &mut self,
-        item: InternalValue,
-        starts_key: bool,
+        item: &InternalValue,
         ends_key: bool,
         dropped: &RefCell<Vec<InternalValue>>,
-    ) -> crate::Result<Offered> {
-        if ends_key && self.held.is_empty() && dropped.borrow().is_empty() {
-            self.before = KeyStart::of(&self.committed);
-            self.take(&item, true)?;
-            if self.keep_key() {
-                return Ok(Offered::Pass(item, starts_key));
-            }
-            self.end = Some(item.key.user_key);
-            return Ok(Offered::End);
+    ) -> crate::Result<Decided> {
+        if !ends_key || !self.held.is_empty() || !dropped.borrow().is_empty() {
+            return Ok(Decided::Hold);
         }
-        Ok(if self.hold(item, starts_key, dropped)? {
-            Offered::Held
+        if self.take_plain(item) {
+            return Ok(Decided::Pass);
+        }
+        self.before = KeyStart::of(&self.committed);
+        self.take(item, true)?;
+        if self.keep_key() {
+            return Ok(Decided::Pass);
+        }
+        self.end = Some(item.key.user_key.clone());
+        Ok(Decided::End)
+    }
+
+    /// Takes in `item`, a whole key of a plain value, when it fits the quota
+    /// with nothing the quota does not cover: within the widths, past no cut
+    /// key, with no key domains to place it in. `false` takes nothing.
+    #[inline]
+    fn take_plain(&mut self, item: &InternalValue) -> bool {
+        let value_type = item.key.value_type;
+        if value_type.is_indirection()
+            || value_type.is_cell_row()
+            || self.past_quota
+            || self.outputs.domains.is_some()
+        {
+            return false;
+        }
+        let key = &item.key.user_key;
+        let key_len = key.len() as u64;
+        let value_len = item.value.len() as u64;
+        let seqno = item.key.seqno;
+        if key_len > self.widths.key
+            || self.widths.value.is_some_and(|width| value_len > width)
+            || seqno > self.widths.seqno
+        {
+            return false;
+        }
+        if let Some(cut) = self.outputs.cut_keys.get(self.key_cuts)
+            && self.comparator.compare(cut, key) != core::cmp::Ordering::Greater
+        {
+            return false;
+        }
+        let hashes = if self.hashes_read_keys {
+            self.outputs.probe.filter_hashes_bound(key)
         } else {
-            Offered::End
-        })
+            1
+        };
+        // Each sum is bounded by the inputs' entries and bytes.
+        let spent = Cost {
+            entries: self.spent.entries + hashes.max(1),
+            keys: self.spent.keys + key_len,
+            values: self.spent.values + value_len,
+            blobs: self.spent.blobs,
+        };
+        if !spent.within(&self.quota) {
+            return false;
+        }
+        self.spent = spent;
+        self.longest_key = self.longest_key.max(key_len);
+        self.committed
+            .rows
+            .take_entry(key_len, value_len, seqno, hashes);
+        true
     }
 
     /// Holds `item` until its key ends; `false` once the slice ends before
-    /// the key before it.
-    fn hold(
+    /// the key before it, and the merge stops.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a row's value does not decode.
+    pub(super) fn hold(
         &mut self,
         item: InternalValue,
         starts_key: bool,
@@ -484,12 +532,17 @@ impl<'a> SliceGovernor<'a> {
 
     /// Whether the slice keeps the key just taken in, `true`, or ends before
     /// it, `false`, the key then taken back out.
+    #[inline]
     fn keep_key(&mut self) -> bool {
-        if !self.past_quota && self.spent.within(&self.quota) {
-            // Within the quota the key opened no set and passed no cut key:
-            // its rows and relocated bytes are in already.
-            return true;
-        }
+        // Within the quota the key opened no set and passed no cut key: its
+        // rows and relocated bytes are in already.
+        (!self.past_quota && self.spent.within(&self.quota)) || self.keep_key_bounded()
+    }
+
+    /// [`Self::keep_key`] by the bound of the slice with the key.
+    #[cold]
+    #[inline(never)]
+    fn keep_key_bounded(&mut self) -> bool {
         let with = self.committed.measure_with(&self.load, self.relocated);
         if !self.fits(&with) {
             self.before.restore(&mut self.committed);

@@ -2221,6 +2221,10 @@ fn take_entry(
     use crate::coding::Decode;
 
     rows.take_entry(key_len as u64, value.len() as u64, seqno, filter_hashes);
+    // A plain value points into no blob file and opens no column.
+    if !value_type.is_indirection() && !value_type.is_cell_row() {
+        return Ok((0, false));
+    }
     let NewShapes {
         known_links,
         known_cells,
@@ -3795,14 +3799,18 @@ fn run_subcompaction(
             // Whether the row ends its key: the next one is known to start
             // another.
             let ends_key = merge_iter.next_starts_key();
-            match governor.offer(item, starts_key, ends_key, &dropped)? {
-                governor::Offered::Pass(item, starts_key) => {
+            match governor.decide(&item, ends_key, &dropped)? {
+                governor::Decided::Pass => {
                     ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
                 }
-                governor::Offered::Held => hand_on(governor, &ledger, &mut *emit)?,
-                governor::Offered::End => {
+                // Nothing was held before a row decided where it came.
+                governor::Decided::End => break,
+                governor::Decided::Hold => {
+                    let go_on = governor.hold(item, starts_key, &dropped)?;
                     hand_on(governor, &ledger, &mut *emit)?;
-                    break;
+                    if !go_on {
+                        break;
+                    }
                 }
             }
         } else {
