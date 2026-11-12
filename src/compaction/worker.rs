@@ -2507,8 +2507,8 @@ fn tight_slices(
         let (tables, blobs) = measure(&load.measure_with(&SliceLoad::default(), relocated));
         TightSlice { end, tables, blobs }
     };
-    let past = |acc: &SliceLoad, block: &Block| {
-        let (tables, blobs) = measure(&acc.measure_with(&block.load, relocated));
+    let past = |acc: &SliceLoad, more: &SliceLoad| {
+        let (tables, blobs) = measure(&acc.measure_with(more, relocated));
         tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total
     };
     // What the entries of the key the blocks of `group` end on write: the
@@ -2554,19 +2554,46 @@ fn tight_slices(
         }
         Ok(weight)
     };
+    // A slice ends before the first block that takes it past a cap. What a
+    // slice writes only grows with what it holds, so that block is found by
+    // galloping: runs of blocks twice as long while they fit, then halves,
+    // a bound per step rather than per block.
     let mut slices = Vec::new();
+    let Some((first, rest)) = blocks.split_first() else {
+        slices.push(slice(None, &SliceLoad::default()));
+        return Ok(slices);
+    };
     let mut acc = SliceLoad::default();
-    // The blocks ending on the key the slice so far ends on.
-    let mut last: Option<&Block> = None;
-    for block in &blocks {
-        if let Some(previous) = last
-            && past(&acc, block)
-        {
+    acc.absorb(&first.load, relocated);
+    // `previous` is the block the slice so far ends on.
+    let (mut previous, mut rest) = (first, rest);
+    let (mut step, mut shrinking) = (1usize, false);
+    while let Some((next, after_next)) = rest.split_first() {
+        let (run, after) = rest.split_at(step.min(rest.len()));
+        let mut more = SliceLoad::default();
+        for block in run {
+            more.absorb(&block.load, relocated);
+        }
+        if !past(&acc, &more) {
+            acc.absorb(&more, relocated);
+            previous = run.last().unwrap_or(previous);
+            rest = after;
+            if !shrinking {
+                step *= 2;
+            }
+        } else if run.len() > 1 {
+            step = run.len() / 2;
+            shrinking = true;
+        } else {
             slices.push(slice(Some(previous.end_key.clone()), &acc));
             acc = key_weight(previous)?;
+            // The block that passes the cap opens the next slice whatever it
+            // weighs: a slice ends on a key.
+            acc.absorb(&next.load, relocated);
+            previous = next;
+            rest = after_next;
+            (step, shrinking) = (1, false);
         }
-        acc.absorb(&block.load, relocated);
-        last = Some(block);
     }
     slices.push(slice(None, &acc));
     Ok(slices)
