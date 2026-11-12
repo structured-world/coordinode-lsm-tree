@@ -1246,10 +1246,10 @@ impl<'a> Accessor<'a> {
             *admit_budget -= weight;
             // A frame decoded as stored is a view into the coalesced read;
             // copied out so it does not keep the whole read alive, unless the
-            // read is that frame alone. In the read's own store only what it
-            // hands on is: a value stored as it is would pin the read for as
-            // long as its caller holds it, while the entries stay with the
-            // store, which lets the read go with the frame.
+            // read is that frame alone: its payload, which a value taken out
+            // of it shares with the caller, and its entries, which would keep
+            // the read, the gaps between its frames included, for as long as
+            // the store holds any of them, past what its budget counts.
             let whole = from == 0 && to == bytes.len();
             let at = vhandle.frame_at();
             match into {
@@ -1267,7 +1267,7 @@ impl<'a> Accessor<'a> {
                     let frame = if whole {
                         frame
                     } else {
-                        let (frame, copied) = own_frame(frame, bytes, false);
+                        let (frame, copied) = own_frame(frame, bytes, true);
                         self.count_gather(copied);
                         frame
                     };
