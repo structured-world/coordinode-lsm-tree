@@ -388,6 +388,7 @@ impl<'a> SliceGovernor<'a> {
     /// Takes the kept row `item` into the key being merged: one more entry,
     /// and the cut keys and key domains it passes when it starts the key
     /// (`new_key`).
+    #[inline]
     fn take(&mut self, item: &InternalValue, new_key: bool) -> crate::Result<()> {
         let cmp = self.comparator.as_ref();
         let key = &item.key.user_key;
