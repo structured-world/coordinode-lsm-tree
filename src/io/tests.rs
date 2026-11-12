@@ -284,7 +284,7 @@ fn buf_writer_writes_full_buffers_for_frames_that_straddle_it() -> std::io::Resu
     use std::io::Write as _;
     const CAP: usize = 1024;
     let frame: Vec<u8> = (0..=255u8).cycle().take(CAP / 4 + 13).collect();
-    let mut out = BufWriter::with_capacity(CAP, WriteLog::default());
+    let mut out = FillingBufWriter::with_capacity(CAP, WriteLog::default());
     for _ in 0..40 {
         out.write_all(&frame)?;
     }
@@ -307,7 +307,7 @@ fn buf_writer_takes_the_write_after_an_exactly_full_buffer() -> std::io::Result<
     use std::io::Write as _;
     const CAP: usize = 1024;
     let frame = [7u8; CAP / 4];
-    let mut out = BufWriter::with_capacity(CAP, WriteLog::default());
+    let mut out = FillingBufWriter::with_capacity(CAP, WriteLog::default());
     for _ in 0..9 {
         out.write_all(&frame)?;
     }
@@ -326,7 +326,7 @@ fn buf_writer_takes_the_write_after_an_exactly_full_buffer() -> std::io::Result<
 fn buf_writer_passes_a_write_of_a_whole_buffer_straight_down() -> std::io::Result<()> {
     use std::io::Write as _;
     const CAP: usize = 1024;
-    let mut out = BufWriter::with_capacity(CAP, WriteLog::default());
+    let mut out = FillingBufWriter::with_capacity(CAP, WriteLog::default());
     out.write_all(&[1; 100])?;
     out.write_all(&[2; 3 * CAP])?;
     out.write_all(&[3; 10])?;
@@ -376,7 +376,7 @@ impl std::io::Write for FailsOnce {
 #[test]
 fn buf_writer_keeps_only_what_a_failed_flush_did_not_write() -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut out = BufWriter::with_capacity(
+    let mut out = FillingBufWriter::with_capacity(
         8,
         FailsOnce {
             accept: 6,
@@ -401,7 +401,7 @@ fn buf_writer_keeps_only_what_a_failed_flush_did_not_write() -> std::io::Result<
 #[test]
 fn buf_writer_takes_a_write_a_failed_flush_wrote_part_of() -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut out = BufWriter::with_capacity(
+    let mut out = FillingBufWriter::with_capacity(
         8,
         FailsOnce {
             accept: 7,
@@ -450,7 +450,7 @@ impl std::io::Write for PanicsOnce {
 #[test]
 fn buf_writer_keeps_only_what_a_panicking_flush_did_not_write() -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut out = BufWriter::with_capacity(8, PanicsOnce::default());
+    let mut out = FillingBufWriter::with_capacity(8, PanicsOnce::default());
     out.write_all(b"abcdef")?;
     let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.flush())).is_err();
     assert!(caught, "the injected panic surfaces");
@@ -467,7 +467,7 @@ fn buf_writer_dropped_after_a_panicking_write_replays_nothing() -> std::io::Resu
     use std::io::Write as _;
     let mut inner = PanicsOnce::default();
     {
-        let mut out = BufWriter::with_capacity(8, &mut inner);
+        let mut out = FillingBufWriter::with_capacity(8, &mut inner);
         out.write_all(b"abcdef")?;
         let caught =
             std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.flush())).is_err();

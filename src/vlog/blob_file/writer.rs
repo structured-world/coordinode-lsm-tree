@@ -10,7 +10,7 @@ use super::frame::{
     encode_frame_parts_compressed, head_payload,
 };
 use super::meta::{META_VERSION, Metadata};
-use crate::io::BufWriter;
+use crate::io::FillingBufWriter;
 #[cfg(not(feature = "std"))]
 use crate::io::Write;
 use crate::path::{Path, PathBuf};
@@ -203,7 +203,7 @@ pub(crate) struct Writer {
     pub(crate) blob_file_id: BlobFileId,
 
     #[expect(clippy::struct_field_names)]
-    writer: crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    writer: crate::sfa::Writer<ChecksummedWriter<FillingBufWriter<Box<dyn FsFile>>>>,
 
     offset: u64,
 
@@ -488,7 +488,7 @@ impl Writer {
         // cleanup would race a concurrent creator and delete a file it does
         // not own.
         let mut writer = crate::sfa::Writer::from_writer(ChecksummedWriter::new(
-            BufWriter::with_capacity(u16::MAX.into(), file),
+            FillingBufWriter::with_capacity(u16::MAX.into(), file),
         ));
         if let Err(e) = writer.start("data") {
             drop(writer);

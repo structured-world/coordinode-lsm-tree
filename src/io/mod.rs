@@ -1485,8 +1485,16 @@ impl<R: Read + Seek> Seek for BufReader<R> {
     }
 }
 
-/// The result the [`BufWriter`] trait impls return: std's under `std`,
-/// this module's otherwise.
+#[cfg(not(feature = "std"))]
+pub use FillingBufWriter as BufWriter;
+/// Buffering writer for table files: std's under `std`, whose blocks of a
+/// few KiB fill its buffer close to the end anyway; [`FillingBufWriter`]
+/// otherwise.
+#[cfg(feature = "std")]
+pub use std::io::BufWriter;
+
+/// The result the [`FillingBufWriter`] trait impls return: std's under
+/// `std`, this module's otherwise.
 #[cfg(feature = "std")]
 type BufResult<T> = std::io::Result<T>;
 #[cfg(not(feature = "std"))]
@@ -1501,7 +1509,13 @@ type BufResult<T> = Result<T>;
 /// the next frame stopped fitting, one inner write per few frames. The
 /// buffer reaches the inner writer on overflow, an explicit flush, a seek,
 /// or drop.
-pub struct BufWriter<W: Write> {
+///
+/// Blob files write through it, whose frames of tens of KiB went down two or
+/// three to an inner write under std's writer. Table files do not: their
+/// blocks of a few KiB lose nothing to std's flush, and buffers cut at an
+/// exact size made a merge's writes cost it more page faults and allocator
+/// calls than they saved.
+pub struct FillingBufWriter<W: Write> {
     inner: W,
     buf: alloc::vec::Vec<u8>,
     /// Whether an inner write is under way: one that panicked leaves it
@@ -1522,7 +1536,7 @@ impl Drop for Written<'_> {
     }
 }
 
-impl<W: Write> BufWriter<W> {
+impl<W: Write> FillingBufWriter<W> {
     /// Wraps `inner` with the default 8 KiB buffer.
     pub fn new(inner: W) -> Self {
         Self::with_capacity(8 * 1024, inner)
@@ -1645,7 +1659,7 @@ fn interrupted(e: &Error) -> bool {
 }
 
 #[cfg(feature = "std")]
-impl<W: Write> std::io::Write for BufWriter<W> {
+impl<W: Write> std::io::Write for FillingBufWriter<W> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.put(data)
     }
@@ -1657,7 +1671,7 @@ impl<W: Write> std::io::Write for BufWriter<W> {
 }
 
 #[cfg(not(feature = "std"))]
-impl<W: Write> Write for BufWriter<W> {
+impl<W: Write> Write for FillingBufWriter<W> {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
         self.put(data)
     }
@@ -1669,7 +1683,7 @@ impl<W: Write> Write for BufWriter<W> {
 }
 
 #[cfg(feature = "std")]
-impl<W: Write + Seek> std::io::Seek for BufWriter<W> {
+impl<W: Write + Seek> std::io::Seek for FillingBufWriter<W> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         // Buffered bytes belong before the seek target.
         self.flush_buf()?;
@@ -1678,7 +1692,7 @@ impl<W: Write + Seek> std::io::Seek for BufWriter<W> {
 }
 
 #[cfg(not(feature = "std"))]
-impl<W: Write + Seek> Seek for BufWriter<W> {
+impl<W: Write + Seek> Seek for FillingBufWriter<W> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         // Buffered bytes belong before the seek target, so flush them out
         // before moving the inner cursor (matches std::io::BufWriter).
@@ -1687,7 +1701,7 @@ impl<W: Write + Seek> Seek for BufWriter<W> {
     }
 }
 
-impl<W: Write> Drop for BufWriter<W> {
+impl<W: Write> Drop for FillingBufWriter<W> {
     fn drop(&mut self) {
         // Best-effort flush, like std: a drop can't surface an error, and the
         // storage writer always flushes explicitly before teardown anyway. A
