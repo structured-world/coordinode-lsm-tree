@@ -96,8 +96,13 @@ impl Prefetched {
     /// of it shares the bytes.
     fn release(&mut self, frame: DecodedFrame) {
         // The rest of the frame goes first: its entries may share the bytes.
-        let payload = frame.payload.clone();
-        drop(frame);
+        let DecodedFrame {
+            header: _,
+            entries,
+            list,
+            payload,
+        } = frame;
+        drop((entries, list));
         if !payload.is_empty() && !payload.is_unique() {
             self.released.push(payload);
         }
