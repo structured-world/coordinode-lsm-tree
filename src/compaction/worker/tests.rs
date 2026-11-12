@@ -8351,3 +8351,44 @@ fn a_row_table_of_cell_rows_is_bounded_by_the_columns_it_splits_into() -> crate:
     );
     Ok(())
 }
+
+/// A tight-space pass over a table on a disk with a quarter of its size free
+/// rewrites the whole table: each slice is sized to the room the volume has
+/// when it starts, so the pass's outputs taking more than their punched
+/// inputs freed shrink the next slice instead of ending the pass, and no
+/// input is left restricted.
+#[test]
+fn a_tight_space_pass_rewrites_the_whole_table() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let tree = open_standard(dir.path(), |c| c.with_shared_fs(Arc::new(mem.clone())))?;
+    for i in 0..20_000u64 {
+        tree.insert(format!("key{i:08}").as_bytes(), [0xCD; 100], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    let version = tree.current_version();
+    assert!(mem.punched_bytes() > 0, "the pass ran in slices");
+    assert!(
+        version
+            .iter_tables()
+            .all(|t| t.restrict_lower_bound().is_none()),
+        "a table is left restricted: the pass ended before its input did"
+    );
+    let last = tree.config.level_count - 1;
+    assert!(
+        version
+            .iter_levels()
+            .take(usize::from(last))
+            .all(|level| level.is_empty()),
+        "every key reached the last level"
+    );
+    Ok(())
+}
