@@ -747,6 +747,21 @@ impl MultiWriter {
         self.outside = (!outside.tombstones.is_empty()).then_some(outside);
     }
 
+    /// Ends the keys this writer answers for before `end`, known only once
+    /// the rows were written: the pieces of the kept tombstones past the last
+    /// output reach no further.
+    pub(crate) fn answer_below(&mut self, end: UserKey) {
+        let cmp = self.comparator.as_ref();
+        if let Some(outside) = &mut self.outside
+            && outside
+                .upper
+                .as_ref()
+                .is_none_or(|upper| cmp.compare(&end, upper) == core::cmp::Ordering::Less)
+        {
+            outside.upper = Some(end);
+        }
+    }
+
     /// Sets range tombstones to be distributed across output tables.
     pub(crate) fn set_range_tombstones(&mut self, mut tombstones: Vec<RangeTombstone>) {
         let comparator = self.comparator.as_ref();

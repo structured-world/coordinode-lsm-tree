@@ -524,7 +524,7 @@ fn a_tight_slice_covers_the_tombstone_only_outputs_of_its_merge() -> crate::Resu
             .max(rt.start.len() as u64)
             .max(rt.end.len() as u64);
     }
-    let slices = super::tight_slices(
+    let only = super::tests::governed(
         &inputs,
         super::SliceCaps {
             tables: u64::MAX,
@@ -539,11 +539,8 @@ fn a_tight_slice_covers_the_tombstone_only_outputs_of_its_merge() -> crate::Resu
         },
         None,
         &tree.config.comparator,
-        &super::input_pacer(&opts),
     )?;
-    let [only] = slices.as_slice() else {
-        panic!("unbounded caps cut one slice: {slices:?}");
-    };
+    assert!(only.end.is_none(), "unbounded caps take every key");
     drop(inputs);
 
     tree.compact(Arc::new(merge), 0)?;
@@ -612,7 +609,7 @@ fn a_tight_slice_covers_outputs_stored_without_the_inputs_codec() -> crate::Resu
     )?;
     let gated = super::recorded_table_demand(&version, &opts, &payload, &probe, &[])?;
     drop(version);
-    let slices = super::tight_slices(
+    let only = super::tests::governed(
         &inputs,
         super::SliceCaps {
             tables: u64::MAX,
@@ -627,11 +624,8 @@ fn a_tight_slice_covers_outputs_stored_without_the_inputs_codec() -> crate::Resu
         },
         None,
         &tree.config.comparator,
-        &super::input_pacer(&opts),
     )?;
-    let [only] = slices.as_slice() else {
-        panic!("unbounded caps cut one slice: {slices:?}");
-    };
+    assert!(only.end.is_none(), "unbounded caps take every key");
     drop(inputs);
 
     tree.compact(Arc::new(merge), 0)?;
@@ -723,18 +717,22 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
         cut_keys: &cut_keys,
         domains: None,
     };
-    let slice_ends: Vec<u32> = super::tight_slices(
+    let mut slice_ends: Vec<u32> = Vec::new();
+    let mut from: Option<crate::UserKey> = None;
+    while let Some(end) = super::tests::governed_from(
         &inputs,
         caps,
         &outputs,
         None,
         &tree.config.comparator,
-        &super::input_pacer(&opts),
+        from.as_ref(),
     )?
-    .iter()
-    .filter_map(|slice| slice.end.as_ref())
-    .map(|end| index(end))
-    .collect();
+    .end
+    {
+        assert_ne!(from.as_ref(), Some(&end), "every slice takes a key");
+        slice_ends.push(index(&end));
+        from = Some(end);
+    }
     assert!(
         slice_ends.len() > 2,
         "the pass runs in slices: {slice_ends:?}"

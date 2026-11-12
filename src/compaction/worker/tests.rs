@@ -3853,10 +3853,10 @@ fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()>
     assert_relocated_values(&tree)
 }
 
-/// A relocating pass whose tables and blob files share one volume checks a
-/// slice against the room both of its demands take there: another tree that
-/// took less than that room since, but more than it leaves past the two
-/// together, stops the slice before it writes.
+/// A relocating pass whose tables and blob files share one volume holds a
+/// slice to the room both of its writes take there together; another tree
+/// that took all but too little of it for the first key stops the pass before
+/// a slice writes.
 #[test]
 fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crate::Result<()> {
     use crate::fs::Fs;
@@ -3912,7 +3912,7 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
         &tree.index,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
-    let slices = super::tight_slices(
+    let first = governed(
         &inputs,
         super::SliceCaps {
             tables: u64::MAX,
@@ -3927,24 +3927,23 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
         },
         Some(&relocated),
         &tree.index.config.comparator,
-        &super::input_pacer(&opts),
     )?;
     drop(opts);
+    drop(inputs);
     drop(version);
-    let Some(first) = slices.first() else {
-        panic!("a pass cuts at least one slice");
-    };
-    let (tables, blobs) = (first.tables, first.blobs);
     assert!(
-        slices.len() > 1 && tables.min(blobs) >= 2,
-        "the fixture needs a pass in slices writing both: {slices:?}"
+        first.end.is_some() && first.tables.min(first.blobs) >= 2,
+        "the fixture needs a pass in slices writing both"
+    );
+    assert!(
+        first.tables + first.blobs <= free,
+        "both writes of a slice are held to the one room: {} + {} past {free}",
+        first.tables,
+        first.blobs
     );
 
-    // Past the room the two leave together, short of what either leaves.
-    squeeze.store(
-        free - (tables + blobs) + tables.min(blobs) / 2,
-        Ordering::SeqCst,
-    );
+    // All of the room but a byte: not even the first key fits.
+    squeeze.store(free - 1, Ordering::SeqCst);
     let punched = mem.punched_bytes();
     let result = tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
     assert_eq!(
@@ -6424,6 +6423,67 @@ pub(super) fn slice_probe(
     )
 }
 
+/// What a tight-space slice's governor lets a slice over `inputs` write
+/// within `caps`, the rows read in key order as the merge keeps them all: its
+/// tables and its relocated values as the governor bounds them, and the key
+/// it ends before when the caps cut it.
+pub(super) struct Governed {
+    pub tables: u64,
+    pub blobs: u64,
+    pub end: Option<crate::UserKey>,
+}
+
+/// Runs a slice's governor over every row of `inputs`, a level's tables (see
+/// [`Governed`]).
+pub(super) fn governed(
+    inputs: &[Table],
+    caps: super::SliceCaps,
+    outputs: &super::SliceOutputs<'_>,
+    relocated: Option<&super::Relocated>,
+    comparator: &crate::comparator::SharedComparator,
+) -> crate::Result<Governed> {
+    governed_from(inputs, caps, outputs, relocated, comparator, None)
+}
+
+/// [`governed`] over the rows of `inputs` from `from` on: the slice a pass
+/// runs after one that ended before `from`.
+pub(super) fn governed_from(
+    inputs: &[Table],
+    caps: super::SliceCaps,
+    outputs: &super::SliceOutputs<'_>,
+    relocated: Option<&super::Relocated>,
+    comparator: &crate::comparator::SharedComparator,
+    from: Option<&crate::UserKey>,
+) -> crate::Result<Governed> {
+    let mut governor =
+        super::governor::SliceGovernor::new(caps, outputs, relocated, comparator, from);
+    let dropped = core::cell::RefCell::new(Vec::new());
+    let mut ordered: Vec<&Table> = inputs.iter().collect();
+    ordered
+        .sort_by(|a, b| comparator.compare(a.metadata.key_range.min(), b.metadata.key_range.min()));
+    'feed: for table in ordered {
+        for item in table.scan()? {
+            let item = item?;
+            if from.is_some_and(|from| {
+                comparator.compare(&item.key.user_key, from) == core::cmp::Ordering::Less
+            }) {
+                continue;
+            }
+            if !governor.offer(item, false, &dropped)? {
+                break 'feed;
+            }
+            governor.take_ready().for_each(drop);
+        }
+    }
+    governor.finish(&dropped)?;
+    let (tables, blobs) = governor.committed_bound();
+    Ok(Governed {
+        tables,
+        blobs,
+        end: governor.end().cloned(),
+    })
+}
+
 /// A domain per this many keys of the form `k{n:06}`.
 struct PerKeys(u32);
 
@@ -6461,7 +6521,7 @@ fn tight_slices_cover_the_tables_each_key_domain_opens() -> crate::Result<()> {
         &tree,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
-    let slices = super::tight_slices(
+    let only = governed(
         &inputs,
         super::SliceCaps {
             tables: u64::MAX,
@@ -6476,12 +6536,10 @@ fn tight_slices_cover_the_tables_each_key_domain_opens() -> crate::Result<()> {
         },
         None,
         &tree.config.comparator,
-        &super::input_pacer(&opts),
     )?;
+    drop(inputs);
     drop(version);
-    let [only] = slices.as_slice() else {
-        panic!("unbounded caps cut one slice: {slices:?}");
-    };
+    assert!(only.end.is_none(), "unbounded caps take every key");
 
     tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
     let version = tree.current_version();
@@ -6580,7 +6638,7 @@ fn assert_tight_slice_covers_relocation(
         &tree.index,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
-    let slices = super::tight_slices(
+    let only = governed(
         &inputs,
         super::SliceCaps {
             tables: u64::MAX,
@@ -6595,12 +6653,10 @@ fn assert_tight_slice_covers_relocation(
         },
         Some(&relocated),
         &tree.index.config.comparator,
-        &super::input_pacer(&opts),
     )?;
+    drop(inputs);
     drop(version);
-    let [only] = slices.as_slice() else {
-        panic!("unbounded caps cut one slice: {slices:?}");
-    };
+    assert!(only.end.is_none(), "unbounded caps take every key");
 
     let blobs = dir.join(crate::file::BLOBS_FOLDER);
     let names = |dir: &std::path::Path| -> crate::Result<HashSet<std::ffi::OsString>> {
@@ -6670,7 +6726,7 @@ fn a_tight_slice_charges_only_the_dictionaries_it_relocates_out_of() -> crate::R
         &tree.index,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
-    let slices = super::tight_slices(
+    let first = governed(
         &inputs,
         caps,
         &super::SliceOutputs {
@@ -6681,17 +6737,14 @@ fn a_tight_slice_charges_only_the_dictionaries_it_relocates_out_of() -> crate::R
         },
         Some(&relocated),
         &tree.index.config.comparator,
-        &super::input_pacer(&opts),
     )?;
-    let Some(first) = slices.first() else {
-        panic!("a pass cuts at least one slice");
-    };
     assert!(
         first.blobs > 0 && first.blobs <= caps.blobs,
-        "the first slice fits its room: {slices:?} against {}",
+        "the first slice fits its room: {} against {}",
+        first.blobs,
         caps.blobs
     );
-    assert!(slices.len() > 1, "the pass runs in slices: {slices:?}");
+    assert!(first.end.is_some(), "the pass runs in slices");
     Ok(())
 }
 
@@ -6757,55 +6810,6 @@ fn many_dictionary_files(
     tree.flush_active_memtable(0)?;
     tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
     Ok((tree, kv))
-}
-
-/// The blocks a tight-space pass reads to cut its slices are the run's reads:
-/// read from the file, they count in its work as the merge's reads do.
-#[test]
-fn tight_slices_count_the_blocks_they_read_in_the_runs_work() -> crate::Result<()> {
-    use crate::AbstractTree;
-
-    let dir = tempfile::tempdir()?;
-    // No cache: every block the cut reads comes from the file.
-    let tree = open_standard(dir.path(), |c| {
-        c.use_cache(Arc::new(crate::Cache::with_capacity_bytes(0)))
-            .data_block_size_policy(BlockSizePolicy::all(512))
-    })?;
-    for i in 0..2_000u32 {
-        tree.insert(format!("k{i:06}"), vec![b'v'; 64], u64::from(i));
-    }
-    tree.flush_active_memtable(0)?;
-    let version = tree.current_version();
-    let inputs: Vec<Table> = version.iter_tables().cloned().collect();
-    let total: u64 = inputs.iter().map(Table::file_len).sum();
-    let opts = super::Options::from_tree(
-        &tree,
-        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
-    );
-
-    let slices = super::tight_slices(
-        &inputs,
-        super::SliceCaps {
-            tables: u64::MAX,
-            blobs: u64::MAX,
-            total: total / 4,
-        },
-        &super::SliceOutputs {
-            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
-            tombstones: crate::table::writer::RewriteLoad::default(),
-            cut_keys: &[],
-            domains: None,
-        },
-        None,
-        &tree.config.comparator,
-        &super::input_pacer(&opts),
-    )?;
-    assert!(slices.len() > 1, "the fixture needs a pass in slices");
-    assert!(
-        opts.work.report().measured.read > 0,
-        "the blocks read to cut the slices are counted"
-    );
-    Ok(())
 }
 
 /// Two trees handed one limiter are bounded by it together: what one tree's

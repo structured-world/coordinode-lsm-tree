@@ -2,6 +2,8 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+#[cfg(feature = "std")]
+use crate::UserKey;
 use crate::blob_tree::FragmentationMap;
 use crate::blob_tree::handle::BlobIndirection;
 use crate::coding::{Decode, Encode};
@@ -870,6 +872,13 @@ pub(super) trait CompactionFlavour {
     /// Writes range tombstones to the output tables, keeping the pieces of
     /// `outside`'s that fall past them (see [`TombstonesOutside`]).
     fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone], outside: TombstonesOutside);
+
+    /// Ends the keys this merge answers for before `end`, a key it found the
+    /// end of only as it ran (a tight-space slice): no piece of a range
+    /// tombstone written beside its outputs reaches `end`, and a relocation's
+    /// frames below it that no pointer claimed are drained into its frontier.
+    #[cfg(feature = "std")]
+    fn end_before(&mut self, end: UserKey);
 
     /// Finalizes this (sub-)compaction's output files (flushing the table
     /// writer, finishing blob writers) WITHOUT installing a version edit. The
@@ -2344,6 +2353,12 @@ impl CompactionFlavour for RelocatingCompaction {
         self.inner.write_range_tombstones(tombstones, outside);
     }
 
+    #[cfg(feature = "std")]
+    fn end_before(&mut self, end: UserKey) {
+        self.inner.end_before(end.clone());
+        self.drain_below = Some(end);
+    }
+
     /// A relocating compaction moves the blob values its rows point at, so it
     /// writes every row and copies no group.
     fn carrying(&mut self) -> Option<&mut StandardCompaction> {
@@ -2757,6 +2772,11 @@ impl CompactionFlavour for StandardCompaction {
     ) {
         self.table_writer.set_range_tombstones(tombstones.to_vec());
         self.table_writer.keep_tombstones_outside(outside);
+    }
+
+    #[cfg(feature = "std")]
+    fn end_before(&mut self, end: UserKey) {
+        self.table_writer.answer_below(end);
     }
 
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {

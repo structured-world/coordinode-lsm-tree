@@ -1970,17 +1970,6 @@ pub(super) fn cancelled_compaction() -> crate::Error {
     ))
 }
 
-/// One slice of a tight-space pass: the key it ends before (`None` for the
-/// last, which runs to the end of the inputs), and the bytes it writes to
-/// the tables and to the blob files.
-#[cfg(feature = "std")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TightSlice {
-    end: Option<UserKey>,
-    tables: u64,
-    blobs: u64,
-}
-
 /// The most bytes a slice may write: to the tables, to the blob files, and
 /// to both together (a volume they share, and the tree's quota).
 #[cfg(feature = "std")]
@@ -2198,7 +2187,8 @@ struct SliceMeasure {
 /// key of `key_len` bytes and `value`, puts into the slice `load` takes it
 /// into: an entry of its tables, registering `filter_hashes` hashes, the field
 /// columns of a cell row when the outputs split those (`split_cells`), the blob
-/// files its value or references point into and the objects it owns; and, in
+/// files its value or references point into and, as owned, every object its
+/// cells reference; and, in
 /// a relocating pass, the bytes the frames it points at in the files
 /// `relocated` moves take as it writes them, which it returns. Each of those
 /// files holding a dictionary of its own goes into `dictionaries`, the sources
@@ -2239,9 +2229,11 @@ fn take_entry(
         }
         let mut bytes = 0;
         for field in decode_row(value)? {
-            if let RowCell::Ref { indirection, owner } = field.cell {
+            // Every reference counts as owned: the end of its key may pass a
+            // dropped version's object to the row, after it was counted.
+            if let RowCell::Ref { indirection, .. } = field.cell {
                 bytes += reference(&mut load.links, &indirection);
-                load.rows.owned_blob_objects += u64::from(owner);
+                load.rows.owned_blob_objects += 1;
             }
         }
         return Ok(bytes);
@@ -2341,258 +2333,6 @@ fn enter_domain(
         seen.insert(domain.clone());
         *edge = domain.map_or(DomainEdge::Open, DomainEdge::At);
     }
-}
-
-/// The slices a tight-space pass of `inputs` runs in, each within `caps`
-/// as far as its blocks allow, and what each writes.
-///
-/// A block weighs the entries it holds as the destination writes them, the
-/// bound the output writer gives from their uncompressed bytes, whatever codec the input stored them
-/// under, and, in a relocating pass, the frames its entries point at in the
-/// stale blob files, which the slice relocates: values are not spread evenly
-/// over the keys, so the table bytes of a block say nothing of theirs. A
-/// slice's tables are bounded over all of its entries, with a table more for
-/// every output its keys end on or open in another key domain, as `outputs`
-/// counts them. A slice ends before the block that would take it past a cap,
-/// on the last key of the block before. The key it ends on goes to the next
-/// slice, so that one counts the entries of that key again, read from the
-/// blocks ending on it. A block of a restricted input below its restriction is
-/// punched and writes nothing.
-///
-/// The index and block reads go through `pace`, the run's input pacer: they
-/// are the run's reads as much as the merge's are.
-#[cfg(feature = "std")]
-fn tight_slices(
-    inputs: &[Table],
-    caps: SliceCaps,
-    outputs: &SliceOutputs<'_>,
-    relocated: Option<&Relocated>,
-    comparator: &crate::comparator::SharedComparator,
-    pace: &crate::table::util::Pacer,
-) -> crate::Result<Vec<TightSlice>> {
-    /// The blocks ending on one key: what they write, and where they lie as
-    /// the input and the block.
-    struct Block<'a> {
-        end_key: UserKey,
-        load: SliceLoad,
-        sources: Vec<(&'a Table, crate::table::BlockHandle)>,
-    }
-
-    let cmp = comparator.as_ref();
-    let probe = outputs.probe;
-    let split_cells = probe.splits_cells();
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut longest_key = 0u64;
-    for input in inputs {
-        let handles = input
-            .maintenance_index_walk()
-            .with_pace(Arc::clone(pace))
-            .collect::<crate::Result<Vec<_>>>()?;
-        for handle in handles {
-            let end_key = handle.end_key().clone();
-            if input
-                .restrict_lower_bound()
-                .is_some_and(|bound| cmp.compare(&end_key, bound) == core::cmp::Ordering::Less)
-            {
-                continue;
-            }
-            let mut load = SliceLoad::default();
-            // A block whose every row a delete mask removes writes nothing.
-            if let Some(block) = input.load_data_block_for_maintenance(handle.as_ref(), &**pace)? {
-                let mut dictionaries = Vec::new();
-                let (mut table_end, mut blob_end) = (DomainEdge::Unseen, DomainEdge::Unseen);
-                // The key itself is built only for what reads it: the
-                // prefixes a filter takes of it and the domain it lies in.
-                let wants_key = probe.hashes_read_keys() || outputs.domains.is_some();
-                block.try_for_each_shape(comparator.clone(), |entry| {
-                    longest_key = longest_key.max(entry.key_len as u64);
-                    let key = wants_key.then(|| entry.key());
-                    let hashes = key.as_ref().map_or(1, |key| probe.filter_hashes_bound(key));
-                    // Bounded by the stale files' bytes.
-                    let blobs = take_entry(
-                        &mut load,
-                        (entry.value_type, entry.seqno, entry.key_len, entry.value),
-                        hashes,
-                        split_cells,
-                        relocated,
-                        &mut dictionaries,
-                    )?;
-                    load.blobs += blobs;
-                    if let (Some(domains), Some(key)) = (outputs.domains, &key) {
-                        enter_domain(domains, cmp, &mut table_end, &mut load.table_domains, key);
-                        if blobs > 0 {
-                            enter_domain(domains, cmp, &mut blob_end, &mut load.blob_domains, key);
-                        }
-                    }
-                    Ok(())
-                })?;
-                for source in dictionaries {
-                    load.add_dictionary(source, relocated);
-                }
-            }
-            blocks.push(Block {
-                end_key,
-                load,
-                sources: alloc::vec![(input, *handle.as_ref(),)],
-            });
-        }
-    }
-    blocks.sort_by(|a, b| cmp.compare(&a.end_key, &b.end_key));
-    // Blocks ending on one key go into one slice together: a slice ends on a
-    // key, not between the inputs that hold it.
-    let mut grouped: Vec<Block> = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        match grouped.last_mut() {
-            Some(group)
-                if cmp.compare(&group.end_key, &block.end_key) == core::cmp::Ordering::Equal =>
-            {
-                group.load.absorb(&block.load, relocated);
-                group.sources.extend(block.sources);
-            }
-            _ => grouped.push(block),
-        }
-    }
-    let mut blocks = grouped;
-    // An output closed on a cut key goes with the block that passes it.
-    let mut cut_keys = outputs.cut_keys.iter().peekable();
-    for block in &mut blocks {
-        while cut_keys
-            .next_if(|key| cmp.compare(key, &block.end_key) != core::cmp::Ordering::Greater)
-            .is_some()
-        {
-            block.load.cut_keys += 1;
-        }
-    }
-
-    // Each output blob file closes with its metadata, its first and last keys
-    // among it: a file per target's worth of frames, and in each key domain
-    // the slice's frames lie in, one more for each codec and lifetime class
-    // they may go to. A file of frames copied out of a source with a
-    // dictionary of its own holds it as well: each such source the slice
-    // relocates values out of, in each class and domain. Every sum is
-    // bounded by the stale files' bytes. Returns the bytes and the files.
-    let with_blobs = |m: &SliceMeasure| match relocated {
-        Some(relocated) if m.blobs > 0 => {
-            let domains = m.blob_domains.max(1);
-            let split = m.blobs.div_ceil(relocated.target_size.max(1));
-            let files = split + relocated.file_groups * domains;
-            let fresh = if m.dictionary_bytes > 0 {
-                relocated.fresh_dictionary
-            } else {
-                0
-            };
-            let bytes = m.blobs
-                + files * (BLOB_META_BYTES + 2 * longest_key)
-                + (m.dictionary_bytes + fresh) * relocated.groups * domains
-                + split * relocated.largest_dictionary;
-            (bytes, files)
-        }
-        _ => (m.blobs, 0),
-    };
-    // The tables hold the slice's entries, the input tombstones each slice is
-    // given, and link the blob files its rows point into and those the
-    // relocation writes. An output closes on each cut key the slice passes
-    // and at each key domain past the first its keys lie in.
-    let with_tables = |m: &SliceMeasure, blob_files: u64| {
-        let mut rows = m.rows;
-        rows.absorb(&outputs.tombstones);
-        rows.linked_blob_files += blob_files;
-        probe.rewrite_bound(&rows, m.cut_keys + m.table_domains.max(1) - 1)
-    };
-    let measure = |m: &SliceMeasure| {
-        let (blobs, files) = with_blobs(m);
-        (with_tables(m, files), blobs)
-    };
-    let slice = |end: Option<UserKey>, load: &SliceLoad| {
-        let (tables, blobs) = measure(&load.measure_with(&SliceLoad::default(), relocated));
-        TightSlice { end, tables, blobs }
-    };
-    let past = |acc: &SliceLoad, more: &SliceLoad| {
-        let (tables, blobs) = measure(&acc.measure_with(more, relocated));
-        tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total
-    };
-    // What the entries of the key the blocks of `group` end on write: the
-    // next slice's, once a slice ends on that key.
-    let key_weight = |group: &Block| -> crate::Result<SliceLoad> {
-        let mut weight = SliceLoad::default();
-        let mut dictionaries = Vec::new();
-        let domain = outputs.domains.map(|d| d.domain_end(&group.end_key));
-        for &(input, handle) in &group.sources {
-            let Some(block) = input.load_data_block_for_maintenance(&handle, &**pace)? else {
-                continue;
-            };
-            block.try_for_each_shape(comparator.clone(), |entry| {
-                let key = entry.key();
-                if cmp.compare(&key, &group.end_key) != core::cmp::Ordering::Equal {
-                    return Ok(());
-                }
-                let hashes = probe.filter_hashes_bound(&key);
-                let blobs = take_entry(
-                    &mut weight,
-                    (entry.value_type, entry.seqno, entry.key_len, entry.value),
-                    hashes,
-                    split_cells,
-                    relocated,
-                    &mut dictionaries,
-                )?;
-                weight.blobs += blobs;
-                if let Some(domain) = &domain {
-                    weight.table_domains.insert(domain.clone());
-                    if blobs > 0 {
-                        weight.blob_domains.insert(domain.clone());
-                    }
-                }
-                Ok(())
-            })?;
-        }
-        for source in dictionaries {
-            weight.add_dictionary(source, relocated);
-        }
-        Ok(weight)
-    };
-    // A slice ends before the first block that takes it past a cap. What a
-    // slice writes only grows with what it holds, so that block is found by
-    // galloping: runs of blocks twice as long while they fit, then halves,
-    // a bound per step rather than per block.
-    let mut slices = Vec::new();
-    let Some((first, rest)) = blocks.split_first() else {
-        slices.push(slice(None, &SliceLoad::default()));
-        return Ok(slices);
-    };
-    let mut acc = SliceLoad::default();
-    acc.absorb(&first.load, relocated);
-    // `previous` is the block the slice so far ends on.
-    let (mut previous, mut rest) = (first, rest);
-    let (mut step, mut shrinking) = (1usize, false);
-    while let Some((next, after_next)) = rest.split_first() {
-        let (run, after) = rest.split_at(step.min(rest.len()));
-        let mut more = SliceLoad::default();
-        for block in run {
-            more.absorb(&block.load, relocated);
-        }
-        if !past(&acc, &more) {
-            acc.absorb(&more, relocated);
-            previous = run.last().unwrap_or(previous);
-            rest = after;
-            if !shrinking {
-                step *= 2;
-            }
-        } else if run.len() > 1 {
-            step = run.len() / 2;
-            shrinking = true;
-        } else {
-            slices.push(slice(Some(previous.end_key.clone()), &acc));
-            acc = key_weight(previous)?;
-            // The block that passes the cap opens the next slice whatever it
-            // weighs: a slice ends on a key.
-            acc.absorb(&next.load, relocated);
-            previous = next;
-            rest = after_next;
-            (step, shrinking) = (1, false);
-        }
-    }
-    slices.push(slice(None, &acc));
-    Ok(slices)
 }
 
 /// Builds a per-slice compaction payload over the still-surviving input ids,
@@ -2695,7 +2435,6 @@ fn run_tight_space_compaction(
         .kv_separation_opts
         .as_ref()
         .map(|blob_opts| Relocated::new(&stale_files, blob_opts));
-    drop(stale_files);
     let relocating = !stale_ids.is_empty();
 
     // The reclaim runs through each INPUT's own backend, not the destination's:
@@ -2783,6 +2522,10 @@ fn run_tight_space_compaction(
         payload,
         &opts.runtime_config.load_full(),
     )?;
+    // The most the whole merge writes to the tables, as the space gate
+    // charges it: no slice holds more room than that.
+    let merge_tables = recorded_table_demand(&latest.version, opts, payload, &probe, &stale_files)?;
+    drop(stale_files);
     let mut input_tombstones: Vec<&crate::range_tombstone::RangeTombstone> =
         inputs.iter().flat_map(Table::range_tombstones).collect();
     input_tombstones.sort();
@@ -2843,63 +2586,36 @@ fn run_tight_space_compaction(
         }
     };
     let relocated = relocation.filter(|_| relocating_blobs);
-    let outputs = SliceOutputs {
+    let slice_outputs = SliceOutputs {
         probe: &probe,
         tombstones,
         cut_keys: &cut_keys,
         domains: opts.config.key_domains.as_deref(),
     };
-    let slices = tight_slices(
-        &inputs,
-        caps,
-        &outputs,
-        relocated.as_ref(),
-        &comparator,
-        &input_pacer(opts),
-    )?;
-    let Some((tail, slices)) = slices.split_last() else {
-        return Ok(CompactionResult::nothing());
-    };
-    // A slice past the caps (a block, or the blocks of one key, alone past
-    // them) cannot be cut any finer: it would write past the room the pass
-    // found. The pass runs the slices before it, which free room as they go,
-    // and stops there; one that comes first leaves the pass nothing to run.
-    // A single slice within them is the whole merge, in one go.
-    let past_caps = |slice: &TightSlice| {
-        slice.tables > caps.tables
-            || slice.blobs > caps.blobs
-            || slice.tables + slice.blobs > caps.total
-    };
-    if past_caps(slices.first().unwrap_or(tail)) {
-        return Ok(CompactionResult::nothing());
-    }
+    // Recorded once the first slice takes a key: the pass is sure to run then.
+    let mut estimate = Some(estimate);
 
-    opts.work.plan(estimate);
-
-    // Each slice holds the room it takes, so the compactions sharing the pool
-    // count it: the tables its blocks rewrite and the stale frames they
-    // relocate, as the slices were cut.
+    // Each slice holds the room it may take, so the compactions sharing the
+    // pool count it, and its merge writes no further than that room lets it
+    // (see `governor`): the caps less what the others took since the pass
+    // measured them.
     //
-    // Checked as each slice starts, in one step with taking it: the caps were
-    // what was free past what the other compactions sharing the pool held
-    // when the pass measured it, and another may have taken that room since,
-    // or between two slices. Only their holds are checked: the pass's own
-    // slices write ahead of the punches that free their inputs, so its room
-    // between slices is not what it measured and is not the question. A slice
-    // the others left no room for ends the pass there, its installed slices
-    // kept; the next compaction picks up the rest. What a slice writes past
-    // its room it takes on as it lands, under the quota as it stands then and
-    // short of the flush floor, or the pass stops. The quota a slice is
-    // checked against is the one the pass was cut for, less what the files
-    // it neither reads nor writes (`own_tables`, `own_blobs`) have grown by
-    // since: a flush, another compaction.
-    let reserve_slice = |slice: &TightSlice,
-                         own_tables: &HashSet<TableId>,
-                         own_blobs: &HashSet<BlobFileId>|
-     -> crate::Result<bool> {
-        if past_caps(slice) {
-            return Ok(false);
-        }
+    // Taken as each slice starts, in one step with checking the others'
+    // holds: the caps were what was free past what the other compactions
+    // sharing the pool held when the pass measured it, and another may have
+    // taken some of that since, or between two slices. Only their holds count:
+    // the pass's own slices write ahead of the punches that free their
+    // inputs, so its room between slices is not what it measured and is not
+    // the question. A slice the others left no room for ends the pass there,
+    // its installed slices kept; the next compaction picks up the rest. What a
+    // slice writes past its room it takes on as it lands, under the quota as
+    // it stands then and short of the flush floor, or the pass stops. The
+    // quota a slice is held to is the one the pass was cut for, less what the
+    // files it neither reads nor writes (`own_tables`, `own_blobs`) have grown
+    // by since: a flush, another compaction.
+    let slice_room = |own_tables: &HashSet<TableId>,
+                      own_blobs: &HashSet<BlobFileId>|
+     -> crate::Result<Option<SliceCaps>> {
         let quota_headroom = match quota_limit {
             Some(limit) => {
                 let others = crate::storage_stats::compute_used_bytes_but(
@@ -2914,18 +2630,6 @@ fn run_tight_space_compaction(
             }
             None => u64::MAX,
         };
-        let demands = [
-            super::capacity::Demand {
-                fs: &*dest_fs,
-                path: &dest_path,
-                bytes: slice.tables,
-            },
-            super::capacity::Demand {
-                fs: &*opts.config.fs,
-                path: &blob_dir,
-                bytes: slice.blobs,
-            },
-        ];
         #[cfg(all(test, feature = "std"))]
         {
             let squeeze = opts
@@ -2944,36 +2648,83 @@ fn run_tight_space_compaction(
                 ));
             }
         }
-        // What the others may hold on each volume: what they held when the
-        // pass measured it, and what room a slice left past it then, both of
-        // its demands taken from a volume they share. The slack is never
-        // below none.
-        let (tables_room, blobs_room) = if shared_volume {
-            let both = slice.tables + slice.blobs;
-            (both, both)
-        } else {
-            (slice.tables, slice.blobs)
-        };
-        let [tables, blobs] = demands;
-        let within = [
-            (tables, dest_held + dest_free.saturating_sub(tables_room)),
-            (blobs, blob_held + blob_free.saturating_sub(blobs_room)),
-        ];
         // The slice before is installed: what it held is not the others'.
         opts.outputs.release_room();
+        // What the others hold on each volume now, and took since the pass
+        // measured it: room no slice has any more. Neither is ever below
+        // what they held then, short of a release, which gives none back to
+        // the caps (clamped at none).
+        let dest_now = opts.capacity.held_on(&*dest_fs, &dest_path);
+        let blob_now = opts.capacity.held_on(&*opts.config.fs, &blob_dir);
+        let quota_room = quota_headroom.saturating_sub(opts.capacity.quota_held(opts.tree_id));
+        let room = if shared_volume {
+            SliceCaps {
+                tables: caps.tables,
+                blobs: caps.blobs,
+                total: caps
+                    .total
+                    .saturating_sub(dest_now.saturating_sub(dest_held))
+                    .min(quota_room),
+            }
+        } else {
+            SliceCaps {
+                tables: caps
+                    .tables
+                    .saturating_sub(dest_now.saturating_sub(dest_held)),
+                blobs: caps
+                    .blobs
+                    .saturating_sub(blob_now.saturating_sub(blob_held)),
+                total: caps.total.min(quota_room),
+            }
+        };
+        if room.tables == 0 || room.blobs == 0 || room.total == 0 {
+            return Ok(None);
+        }
+        // Held on each volume, together no more than the quota lets nor than
+        // the whole merge writes as the space gate charges it (an unbounded
+        // volume's room is no hold): a slice writes at most its room to each
+        // and the total to both, and what it writes to a volume past its hold
+        // there it takes on as it lands.
+        let blobs_whole = if relocating_blobs {
+            stale_total_bytes
+        } else {
+            0
+        };
+        let (tables_hold, blobs_hold) = if shared_volume {
+            (room.total.min(merge_tables + blobs_whole), 0)
+        } else {
+            let blobs = room.blobs.min(room.total).min(blobs_whole);
+            (room.tables.min(room.total - blobs).min(merge_tables), blobs)
+        };
+        let within = [
+            (
+                super::capacity::Demand {
+                    fs: &*dest_fs,
+                    path: &dest_path,
+                    bytes: tables_hold,
+                },
+                dest_now,
+            ),
+            (
+                super::capacity::Demand {
+                    fs: &*opts.config.fs,
+                    path: &blob_dir,
+                    bytes: blobs_hold,
+                },
+                blob_now,
+            ),
+        ];
         let check = super::capacity::Check {
             quota_headroom,
             floor: super::capacity::Floor::MayConsume,
         };
-        Ok(
-            match opts.capacity.reserve_within(opts.tree_id, &within, check) {
-                Some(room) => {
-                    opts.outputs.reserve(room);
-                    true
-                }
-                None => false,
-            },
-        )
+        Ok(opts
+            .capacity
+            .reserve_within(opts.tree_id, &within, check)
+            .map(|reserved| {
+                opts.outputs.reserve(reserved);
+                room
+            }))
     };
     // Set when a slice no longer fits: the pass ends there.
     let mut stopped = false;
@@ -3024,16 +2775,19 @@ fn run_tight_space_compaction(
     let result = (|| -> crate::Result<usize> {
         let mut tables_out = 0usize;
 
-        // Every slice but the tail ends before a key.
-        for (slice, boundary) in slices
-            .iter()
-            .filter_map(|slice| slice.end.as_ref().map(|end| (slice, end)))
-        {
-            if reclaim_deferred || !reserve_slice(slice, &own_tables, &own_blobs)? {
+        // Every slice but the tail ends before a key, found as it merges.
+        loop {
+            let room = if reclaim_deferred {
+                None
+            } else {
+                slice_room(&own_tables, &own_blobs)?
+            };
+            let Some(room) = room else {
                 stopped = true;
                 return Ok(tables_out);
-            }
-            // Merge [lower, boundary) over the surviving (restricted) input views.
+            };
+            // Merge from `lower` over the surviving (restricted) input views,
+            // as far as the room lets.
             let slice_payload = slice_payload_for(&current_views, payload);
             let version = opts.version_history.read().latest_version();
 
@@ -3057,7 +2811,9 @@ fn run_tight_space_compaction(
                 None
             };
 
-            let span = (lower.clone(), Bound::Excluded(boundary.clone()));
+            // The slice's end is found as it merges: it is planned over what
+            // is left of the inputs.
+            let span = (lower.clone(), Bound::Unbounded);
             // Planned per slice over its current views: a plan holds the views
             // it inherits from, and a view held past its slice would block the
             // punch of its consumed prefix. Held until the slice's install, so
@@ -3070,11 +2826,23 @@ fn run_tight_space_compaction(
                 Some(span.clone()),
                 &rc,
             );
+            let from = match &lower {
+                Bound::Included(key) | Bound::Excluded(key) => Some(key),
+                Bound::Unbounded => None,
+            };
+            let mut governor = governor::SliceGovernor::new(
+                room,
+                &slice_outputs,
+                relocated.as_ref(),
+                &comparator,
+                from,
+            );
             let produced = run_subcompaction(
                 opts,
                 &slice_payload,
                 &version.version,
-                Vec::new(),
+                // Removed when the slice turns out to be the tail.
+                current_views.clone(),
                 &rts,
                 None,
                 span,
@@ -3086,8 +2854,35 @@ fn run_tight_space_compaction(
                 reloc,
                 &rc,
                 filter_sizing.clone(),
+                Some(&mut governor),
             )?;
             drop(version);
+            // A slice whose room holds not even its first key ends the pass;
+            // what it opened is the run's to remove.
+            if governor.took_nothing() && governor.end().is_some() {
+                stopped = true;
+                return Ok(tables_out);
+            }
+            if let Some(estimate) = estimate.take() {
+                opts.work.plan(estimate);
+            }
+            let Some(boundary) = governor.end().cloned() else {
+                // The tail [lower, hi): it removes the inputs, and drops the
+                // now fully consumed stale blob files (install_merge deletes
+                // them outright — the prior slices already punched their
+                // prefixes).
+                drop(filter_sizing);
+                drop(current_stale);
+                let tail_out = produced.created_tables().len();
+                let installed = super::flavour::install_merge(
+                    &mut opts.version_history.write(),
+                    opts,
+                    &slice_payload,
+                    vec![produced],
+                )?;
+                return Ok(tables_out + installed.map_or(0, |_| tail_out));
+            };
+            let boundary = &boundary;
 
             let outputs: Vec<Table> = produced.created_tables().to_vec();
             own_tables.extend(outputs.iter().map(Table::id));
@@ -3504,65 +3299,10 @@ fn run_tight_space_compaction(
             }
 
             if current_views.is_empty() {
-                // Every input was consumed before the last boundary.
+                // Every input was consumed before the slice's end.
                 return Ok(tables_out);
             }
         }
-
-        // Tail [last boundary, hi): merge the remainder, remove the inputs, and
-        // drop the now fully-consumed stale blob files (install_merge deletes
-        // them outright — the prior slices already punched their prefixes).
-        if reclaim_deferred || !reserve_slice(tail, &own_tables, &own_blobs)? {
-            stopped = true;
-            return Ok(tables_out);
-        }
-        let slice_payload = slice_payload_for(&current_views, payload);
-        let version = opts.version_history.read().latest_version();
-        let tail_reloc = if relocating {
-            let current_stale: Vec<BlobFile> = stale_ids
-                .iter()
-                .filter_map(|id| version.version.blob_files.get(*id).cloned())
-                .collect();
-            Some(RelocationSetup {
-                stale_files: current_stale,
-                resume_offsets: resume_offsets.clone(),
-            })
-        } else {
-            None
-        };
-        let produced = run_subcompaction(
-            opts,
-            &slice_payload,
-            &version.version,
-            current_views.clone(),
-            &rts,
-            None,
-            (lower.clone(), Bound::Unbounded),
-            dst_lvl,
-            bottommost_gc,
-            // Slices apply no removal semantics; see the parameter docs.
-            false,
-            &blobs_folder,
-            tail_reloc,
-            &rc,
-            super::flavour::plan_filters(
-                &version.version,
-                opts,
-                &slice_payload,
-                &[],
-                Some((lower.clone(), Bound::Unbounded)),
-                &rc,
-            ),
-        )?;
-        drop(version);
-        let tail_out = produced.created_tables().len();
-        let installed = super::flavour::install_merge(
-            &mut opts.version_history.write(),
-            opts,
-            &slice_payload,
-            vec![produced],
-        )?;
-        Ok(tables_out + installed.map_or(0, |_| tail_out))
     })();
     // Held across every slice's install: the installed outputs name their
     // dictionaries from here on (see `WritePin`).
@@ -3646,6 +3386,9 @@ fn run_subcompaction(
     // The compaction's filter plan, shared by all of its sub-compactions (or
     // slices) so they draw on one reservation of the filter budget.
     filter_sizing: Option<crate::filter_budget::FilterPlan>,
+    // A tight-space slice's governor, which ends the merge where the slice's
+    // room runs out (see `governor`); `None` writes every row in `bounds`.
+    mut governor: Option<&mut governor::SliceGovernor<'_>>,
 ) -> crate::Result<super::flavour::ProducedOutput> {
     use super::flavour::CompactionFlavour;
 
@@ -3675,6 +3418,10 @@ fn run_subcompaction(
         ledger: &ledger,
         error: &ledger_error,
     };
+    // The versions a governed slice's merge drops, until its governor places
+    // them among its rows. Declared before the stream that borrows it.
+    let dropped = core::cell::RefCell::new(Vec::new());
+    let mut drop_queue = governor::DropQueue(&dropped);
 
     // Declared before the stream that borrows it, so it outlives it.
     let completeness = input_completeness_for(version, &payload.table_ids, &opts.config);
@@ -3791,9 +3538,15 @@ fn run_subcompaction(
     }
 
     // KV separation (no relocation on this path): track fragmentation from
-    // dropped/GC'd entries so the merged install updates blob GC stats.
+    // dropped/GC'd entries so the merged install updates blob GC stats. A
+    // governed slice holds them back with its rows: a dropped version past
+    // where it ends is the next slice's to count.
     if opts.config.kv_separation_opts.is_some() {
-        merge_iter = merge_iter.with_drop_callback(&mut ledger_hook);
+        merge_iter = if governor.is_some() {
+            merge_iter.with_drop_callback(&mut drop_queue)
+        } else {
+            merge_iter.with_drop_callback(&mut ledger_hook)
+        };
     }
 
     // Versions that go in and do not come out: read after the stream drops, at
@@ -4017,9 +3770,17 @@ fn run_subcompaction(
             return Err(cancelled_compaction());
         }
 
-        ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
-        if let Some(e) = ledger_error.borrow_mut().take() {
-            return Err(e);
+        if let Some(governor) = governor.as_deref_mut() {
+            let go_on = governor.offer(item, starts_key, &dropped)?;
+            hand_on(governor, &ledger, &mut *emit)?;
+            if !go_on {
+                break;
+            }
+        } else {
+            ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
+            if let Some(e) = ledger_error.borrow_mut().take() {
+                return Err(e);
+            }
         }
 
         if idx.is_multiple_of(1_000_000) && opts.stop_signal.is_stopped() {
@@ -4029,6 +3790,10 @@ fn run_subcompaction(
         starts_key = merge_iter.next_starts_key();
     }
     drop(merge_iter);
+    if let Some(governor) = governor.as_deref_mut() {
+        governor.finish(&dropped)?;
+        hand_on(governor, &ledger, &mut *emit)?;
+    }
 
     if let Some(filter) = compaction_filter {
         filter.finish();
@@ -4050,6 +3815,9 @@ fn run_subcompaction(
         })?,
         _ => super::carry::Carried::default(),
     };
+    if let Some(end) = governor.as_deref().and_then(governor::SliceGovernor::end) {
+        compactor.end_before(end.clone());
+    }
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
     produced.set_released_objects(released_objects);
     produced.set_carried(carried);
@@ -4060,6 +3828,26 @@ fn run_subcompaction(
         produced.mark_collected_below_watermark();
     }
     Ok(produced)
+}
+
+/// Hands what a slice's `governor` lets through to the ownership `ledger`,
+/// in the merge's order: its kept rows on toward `emit`, its dropped
+/// versions into the ledger's accounting.
+#[cfg(feature = "std")]
+fn hand_on(
+    governor: &mut governor::SliceGovernor<'_>,
+    ledger: &core::cell::RefCell<super::ownership::OwnershipLedger>,
+    emit: &mut dyn FnMut(InternalValue, bool) -> crate::Result<()>,
+) -> crate::Result<()> {
+    for event in governor.take_ready() {
+        match event {
+            governor::Event::Kept(item, starts_key) => {
+                ledger.borrow_mut().admit(item, starts_key, emit)?;
+            }
+            governor::Event::Dropped(kv) => ledger.borrow_mut().dropped(&kv)?,
+        }
+    }
+    Ok(())
 }
 
 #[expect(
@@ -4963,6 +4751,7 @@ fn merge_tables(
                                 None,
                                 &rc,
                                 filter_sizing,
+                                None,
                             );
                             // The receiver outlives every send (it drains N
                             // items below), so this cannot fail.
@@ -5011,6 +4800,7 @@ fn merge_tables(
                                 None,
                                 &rc,
                                 filter_sizing.clone(),
+                                None,
                             )
                         })
                         .collect()
@@ -5749,6 +5539,9 @@ fn drop_tables(
         work: super::WorkReport::default(),
     })
 }
+
+#[cfg(feature = "std")]
+mod governor;
 
 #[cfg(test)]
 mod tests;
