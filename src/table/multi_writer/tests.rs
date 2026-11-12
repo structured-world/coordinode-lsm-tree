@@ -2793,3 +2793,47 @@ fn a_partly_carried_group_is_bounded_by_the_rows_it_rebuilds() {
         "bound {bound} under {payload} bytes of rows"
     );
 }
+
+/// The outputs of range tombstones alone take each tombstone's piece once per
+/// side, however many runs the pieces fall into: the bound grows with the
+/// tombstones in step, so twice as many cost twice as much, not four times.
+#[test]
+fn tombstone_only_outputs_are_bounded_in_step_with_their_tombstones() -> crate::Result<()> {
+    use crate::{fs::StdFs, table::writer::RewriteLoad};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let writer = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        64 * 1024 * 1024,
+        1,
+        fs,
+    )?
+    .use_clip_range_tombstones();
+    let probe = super::BoundProbe::new(writer)?;
+    let bound = |tombstones: u64| {
+        probe.rewrite_bound(
+            &RewriteLoad {
+                entries: 1,
+                key_bytes: 16,
+                value_bytes: 100,
+                filter_hashes: 1,
+                longest_key: 16,
+                longest_value: Some(100),
+                range_tombstones: tombstones,
+                range_tombstone_bytes: tombstones * 32,
+                ..RewriteLoad::default()
+            },
+            0,
+        )
+    };
+    let none = bound(0);
+    let (some, twice) = (bound(1_000) - none, bound(2_000) - none);
+    assert!(
+        twice <= 2 * some,
+        "1000 tombstones take {some} bytes past none, 2000 take {twice}"
+    );
+    Ok(())
+}

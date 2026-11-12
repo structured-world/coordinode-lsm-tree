@@ -2916,21 +2916,31 @@ impl BoundProbe {
         // Pieces of tombstones below the first output and past the last one
         // that a table outside the rewrite needs go to outputs of their own,
         // one per run of overlapping pieces: at most a run per tombstone on
-        // each side, each holding at most every tombstone.
+        // each side. A tombstone has one piece on a side, so the runs of a
+        // side hold every tombstone once between them, each in a block of its
+        // own: a run's block takes its framing, count and the parity rounding
+        // of its share past what one block of them all takes.
         if writer.clip_range_tombstones && load.range_tombstones > 0 {
+            use crate::table::block::{BlockType, framed_len_bound};
+
             let (alone, _) = writer.writer.tombstone_only_overhead_with(
                 self.meta_without_keys,
                 load.longest_key,
                 0,
             );
-            let pieces = crate::table::block::framed_len_bound(
-                8 + load.range_tombstone_bytes + load.range_tombstones * (10 + 3 + 3),
-                crate::table::block::BlockType::RangeTombstone,
-                CompressionType::None,
-                writer.encryption.as_deref(),
-                writer.ecc,
-            );
-            bound += 2 * load.range_tombstones * (alone + pieces);
+            let framed = |payload| {
+                framed_len_bound(
+                    payload,
+                    BlockType::RangeTombstone,
+                    CompressionType::None,
+                    writer.encryption.as_deref(),
+                    writer.ecc,
+                )
+            };
+            let pieces =
+                framed(8 + load.range_tombstone_bytes + load.range_tombstones * (10 + 3 + 3));
+            let run = alone + framed(8);
+            bound += 2 * (load.range_tombstones * run + pieces);
         }
         bound
     }
