@@ -721,8 +721,8 @@ pub(crate) fn merge_would_fit(
 /// first its inputs hold; and the files relocating `stale` writes, linked
 /// from the outputs.
 ///
-/// A table of rows written as cells records the field columns its groups
-/// hold; one written before it did has its rows read for them.
+/// When the outputs split cell rows, a table of cells records the field
+/// columns its groups hold; any other table has its rows read for them.
 ///
 /// # Errors
 ///
@@ -753,12 +753,14 @@ fn recorded_table_demand(
         .collect();
     for table in &tables {
         let meta = &table.metadata;
-        let cell_table =
-            probe.splits_cells() && meta.value_layout == crate::table::meta::ValueLayout::Cells;
+        // Outputs that split cell rows split those of any input, a row-major
+        // or whole-value one written before columnar tables were switched on
+        // included, and only a table of cells records the columns they make.
+        let cell_table = probe.splits_cells();
         // A restricted table records the file it was cut from, of which the
-        // merge rewrites the rows past the restriction; a cell table written
-        // before tables recorded their field columns holds them only in its
-        // rows. Both are read.
+        // merge rewrites the rows past the restriction; a table that records
+        // no field columns holds the ones its cell rows make only in its rows.
+        // Both are read.
         let mut table_load = if table.is_restricted() || (cell_table && meta.cell_columns.is_none())
         {
             read_table_load(table, opts, probe, &mut cells)?

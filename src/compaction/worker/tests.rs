@@ -8208,3 +8208,63 @@ fn produced_compaction_outputs_leave_the_version_lock_free() -> crate::Result<()
     );
     Ok(())
 }
+
+/// A row-major table of cell rows, written before columnar tables were
+/// switched on, is split into the columns of its fields when compacted after:
+/// the bound a full compaction is admitted by covers those columns although
+/// the table records none, so the merge writes no more than it was admitted
+/// for.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_row_table_of_cell_rows_is_bounded_by_the_columns_it_splits_into() -> crate::Result<()> {
+    use crate::SeqNo;
+    use crate::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+
+    let folder = tempfile::tempdir()?;
+    let tree = match Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    // No cell is separated: every field stays in the row, as a column.
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(1 << 20),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected a blob tree"),
+    };
+    // Many field columns of small cells, so the columns' own costs outweigh
+    // the bytes of the rows.
+    let fields: Vec<Field<'_>> = (0..200u16)
+        .map(|column| Field::bytes(FIRST_FIELD_COLUMN + column, b"v"))
+        .collect();
+    for row in 0..64u64 {
+        tree.insert_cells(format!("row-{row:04}"), &fields, row)?;
+    }
+    tree.flush_active_memtable(0)?;
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .all(|t| !t.metadata.columnar),
+        "the rows were written row-major"
+    );
+
+    tree.index.update_runtime_config(|rc| rc.columnar = true)?;
+    let (bound, _) = super::full_compaction_demand(&tree.index, &tree.current_version())?;
+    tree.major_compact(u64::MAX, SeqNo::MAX)?;
+    let version = tree.current_version();
+    assert!(
+        version.iter_tables().all(|t| t.metadata.columnar),
+        "the compaction wrote columnar tables"
+    );
+    let written = version
+        .iter_tables()
+        .try_fold(0u64, |sum, t| t.live_file_size().map(|size| sum + size))?;
+    assert!(
+        written <= bound,
+        "the merge wrote {written} bytes past the {bound} it was bounded by"
+    );
+    Ok(())
+}
