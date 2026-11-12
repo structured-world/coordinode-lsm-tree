@@ -6202,25 +6202,38 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     };
     let key = b"row-key";
 
+    // Takes `item` into `load` on top of what `known` holds.
+    let take = |load: &mut super::SliceLoad,
+                known: &super::SliceLoad,
+                item: &InternalValue,
+                dictionaries: &mut Vec<BlobFileId>| {
+        super::take_entry(
+            &mut load.rows,
+            super::NewShapes {
+                known_links: &known.links,
+                known_cells: &known.cells,
+                links: &mut load.links,
+                cells: &mut load.cells,
+            },
+            (
+                item.key.value_type,
+                item.key.seqno,
+                item.key.user_key.len(),
+                &item.value,
+            ),
+            1,
+            false,
+            Some(&relocated),
+            dictionaries,
+        )
+    };
+
     let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
     let mut dictionaries = Vec::new();
     let mut load = super::SliceLoad::default();
     let nothing = super::SliceLoad::default();
     assert_eq!(
-        super::take_entry(
-            &mut load,
-            &nothing,
-            (
-                item.key.value_type,
-                item.key.seqno,
-                item.key.user_key.len(),
-                &item.value
-            ),
-            1,
-            false,
-            Some(&relocated),
-            &mut dictionaries
-        )?,
+        take(&mut load, &nothing, &item, &mut dictionaries)?,
         (
             super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
             true
@@ -6244,20 +6257,7 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     assert_eq!(load.rows.entries, 1);
     let plain = InternalValue::from_components(*key, b"v".to_vec(), 2, crate::ValueType::Value);
     assert_eq!(
-        super::take_entry(
-            &mut load,
-            &nothing,
-            (
-                plain.key.value_type,
-                plain.key.seqno,
-                plain.key.user_key.len(),
-                &plain.value
-            ),
-            1,
-            false,
-            Some(&relocated),
-            &mut Vec::new()
-        )?,
+        take(&mut load, &nothing, &plain, &mut Vec::new())?,
         (0, false)
     );
 
@@ -6265,20 +6265,7 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     // nothing new: the slice's bound counts each file once.
     let mut more = super::SliceLoad::default();
     assert_eq!(
-        super::take_entry(
-            &mut more,
-            &load,
-            (
-                item.key.value_type,
-                item.key.seqno,
-                item.key.user_key.len(),
-                &item.value
-            ),
-            1,
-            false,
-            Some(&relocated),
-            &mut Vec::new()
-        )?,
+        take(&mut more, &load, &item, &mut Vec::new())?,
         (
             super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
             false

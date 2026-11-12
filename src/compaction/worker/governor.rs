@@ -99,8 +99,10 @@ pub(super) struct SliceGovernor<'a> {
     comparator: &'a crate::comparator::SharedComparator,
     split_cells: bool,
     hashes_read_keys: bool,
-    /// What the keys handed on write.
+    /// What the keys handed on write, the rows and relocated bytes of the
+    /// key being merged included; those as they stood before it.
     committed: SliceLoad,
+    before: (RewriteLoad, u64),
     /// The cost the slice may add past the last bound taken and still fit,
     /// what it added since, and the widths the quota holds for.
     quota: Cost,
@@ -108,18 +110,19 @@ pub(super) struct SliceGovernor<'a> {
     widths: Widths,
     /// The longest key seen.
     longest_key: u64,
-    /// The key being merged, what its rows write, the cut keys it passes,
-    /// and whether it brings what the quota does not cover.
-    key: Option<UserKey>,
+    /// What the key being merged adds besides its rows and relocated bytes
+    /// (the blob files, columns, key domains, dictionaries and cut keys it is
+    /// the first to bring), the cut keys passed, and whether it brings what
+    /// the quota does not cover.
     load: SliceLoad,
     key_cuts: usize,
     past_quota: bool,
     edges: (DomainEdge, DomainEdge),
-    /// What the merge handed over of the key being merged, with the versions
-    /// dropped since the key before.
+    /// What the merge handed over: the rows of the key being merged with the
+    /// versions dropped since the key before, after the first `ready` events,
+    /// which may be handed on now.
     held: Vec<Event>,
-    /// What may be handed on now.
-    ready: Vec<Event>,
+    ready: usize,
     /// The key the slice ends before, once it stopped.
     end: Option<UserKey>,
 }
@@ -149,6 +152,7 @@ impl<'a> SliceGovernor<'a> {
             split_cells: outputs.probe.splits_cells(),
             hashes_read_keys: outputs.probe.hashes_read_keys(),
             committed: SliceLoad::default(),
+            before: (RewriteLoad::default(), 0),
             // No bound taken yet: the first key takes one.
             quota: Cost::default(),
             spent: Cost::default(),
@@ -158,13 +162,12 @@ impl<'a> SliceGovernor<'a> {
                 seqno: 0,
             },
             longest_key: 0,
-            key: None,
             load: SliceLoad::default(),
             key_cuts: cuts,
             past_quota: false,
             edges: (DomainEdge::Unseen, DomainEdge::Unseen),
             held: Vec::new(),
-            ready: Vec::new(),
+            ready: 0,
             end: None,
         }
     }
@@ -180,14 +183,28 @@ impl<'a> SliceGovernor<'a> {
         !self.any_committed()
     }
 
-    /// Whether a key was handed on: every key holds a kept entry.
+    /// Whether a key was handed on, once the key being merged is taken back
+    /// out: every key holds a kept entry.
     fn any_committed(&self) -> bool {
         self.committed.rows.entries > 0
     }
 
+    /// The key being merged: that of the last row held past those ready.
+    fn current_key(&self) -> Option<&UserKey> {
+        self.held
+            .get(self.ready..)?
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::Kept(item, _) => Some(&item.key.user_key),
+                Event::Dropped(_) => None,
+            })
+    }
+
     /// What may be handed on, in order.
     pub(super) fn take_ready(&mut self) -> alloc::vec::Drain<'_, Event> {
-        self.ready.drain(..)
+        let ready = core::mem::take(&mut self.ready);
+        self.held.drain(..ready)
     }
 
     /// Takes `item`, a row the merge keeps, after the versions it dropped
@@ -203,15 +220,18 @@ impl<'a> SliceGovernor<'a> {
         dropped: &RefCell<Vec<InternalValue>>,
     ) -> crate::Result<bool> {
         self.hold_dropped(dropped);
-        let new_key = self
-            .key
-            .as_ref()
-            .is_none_or(|key| !crate::comparator::same_user_key(key, &item.key.user_key));
+        let (merging, new_key) = match self.current_key() {
+            Some(key) => (
+                true,
+                !crate::comparator::same_user_key(key, &item.key.user_key),
+            ),
+            None => (false, true),
+        };
         if new_key {
-            if self.key.is_some() && !self.settle(Some(&item.key.user_key)) {
+            if merging && !self.settle(Some(&item.key.user_key)) {
                 return Ok(false);
             }
-            self.key = Some(item.key.user_key.clone());
+            self.before = (self.committed.rows, self.committed.blobs);
         }
         self.take(&item, new_key)?;
         self.held.push(Event::Kept(item, starts_key));
@@ -224,10 +244,10 @@ impl<'a> SliceGovernor<'a> {
             return;
         }
         self.hold_dropped(dropped);
-        if self.key.is_some() {
+        if self.current_key().is_some() {
             self.settle(None);
         } else {
-            self.ready.append(&mut self.held);
+            self.ready = self.held.len();
         }
     }
 
@@ -263,18 +283,23 @@ impl<'a> SliceGovernor<'a> {
         } else {
             1
         };
-        let owned = self.load.rows.owned_blob_objects;
+        let owned = self.committed.rows.owned_blob_objects;
         let mut dictionaries = Vec::new();
         let (blobs, grew) = take_entry(
-            &mut self.load,
-            &self.committed,
+            &mut self.committed.rows,
+            super::NewShapes {
+                known_links: &self.committed.links,
+                known_cells: &self.committed.cells,
+                links: &mut self.load.links,
+                cells: &mut self.load.cells,
+            },
             (item.key.value_type, item.key.seqno, key.len(), &item.value),
             hashes,
             self.split_cells,
             self.relocated,
             &mut dictionaries,
         )?;
-        self.load.blobs += blobs;
+        self.committed.blobs += blobs;
         for source in dictionaries {
             if !self.committed.dictionaries.contains(&source)
                 && !self.load.dictionaries.contains(&source)
@@ -295,7 +320,7 @@ impl<'a> SliceGovernor<'a> {
             }
         }
         // Each sum is bounded by the inputs' bytes and objects.
-        let owned = self.load.rows.owned_blob_objects - owned;
+        let owned = self.committed.rows.owned_blob_objects - owned;
         self.spent.tables += (key_len + value_len)
             .max(ENTRY_COST)
             .max(ENTRY_COST * hashes)
@@ -319,22 +344,20 @@ impl<'a> SliceGovernor<'a> {
             && self.spent.tables <= self.quota.tables
             && self.spent.blobs <= self.quota.blobs
         {
-            // Within the quota the key opened no set and passed no cut key.
-            self.committed.rows.absorb(&self.load.rows);
-            self.committed.blobs += self.load.blobs;
-            self.load.rows = RewriteLoad::default();
-            self.load.blobs = 0;
+            // Within the quota the key opened no set and passed no cut key:
+            // its rows and relocated bytes are in already.
             self.hand_on_below(upto);
             return true;
         }
         let with = self.committed.measure_with(&self.load, self.relocated);
         if !self.fits(&with) {
-            let end = self.key.take();
+            (self.committed.rows, self.committed.blobs) = self.before;
+            let end = self.current_key().cloned();
             if self.any_committed() {
                 // The versions dropped below the key are this slice's.
                 self.hand_on_below(end.as_ref());
             }
-            self.held.clear();
+            self.held.truncate(self.ready);
             self.end = end;
             return false;
         }
@@ -410,17 +433,20 @@ impl<'a> SliceGovernor<'a> {
         self.widths = widths;
     }
 
-    /// Moves the held events below `upto` (all for `None`) to `ready`; they
-    /// lie in key order.
+    /// Makes the held events below `upto` (all for `None`) ready. They lie in
+    /// key order, and only the versions dropped since the key being merged
+    /// can reach `upto`, so the boundary is found from the end.
     fn hand_on_below(&mut self, upto: Option<&UserKey>) {
-        let cmp = self.comparator.as_ref();
-        let at = upto.map_or(self.held.len(), |upto| {
-            self.held
-                .iter()
-                .position(|event| cmp.compare(event.key(), upto) != core::cmp::Ordering::Less)
-                .unwrap_or(self.held.len())
-        });
-        self.ready.extend(self.held.drain(..at));
+        let mut at = self.held.len();
+        if let Some(upto) = upto {
+            let cmp = self.comparator.as_ref();
+            while let Some(event) = at.checked_sub(1).and_then(|last| self.held.get(last))
+                && cmp.compare(event.key(), upto) != core::cmp::Ordering::Less
+            {
+                at -= 1;
+            }
+        }
+        self.ready = at;
     }
 
     /// Whether a slice writing `m` stays within the caps.
