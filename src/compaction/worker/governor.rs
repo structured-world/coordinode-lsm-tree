@@ -36,6 +36,7 @@ use super::{
 };
 use crate::table::writer::{RewriteLoad, varint_len};
 use crate::{InternalValue, UserKey};
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
@@ -196,7 +197,7 @@ pub(super) struct SliceGovernor<'a> {
     /// What the merge handed over: the rows of the key being merged with the
     /// versions dropped since the key before, after the first `ready` events,
     /// which may be handed on now.
-    held: Vec<Event>,
+    held: VecDeque<Event>,
     ready: usize,
     /// The key the slice ends before, once it stopped.
     end: Option<UserKey>,
@@ -241,7 +242,7 @@ impl<'a> SliceGovernor<'a> {
             key_cuts: cuts,
             past_quota: false,
             edges: (DomainEdge::Unseen, DomainEdge::Unseen),
-            held: Vec::new(),
+            held: VecDeque::new(),
             ready: 0,
             end: None,
         }
@@ -267,8 +268,7 @@ impl<'a> SliceGovernor<'a> {
     /// The key being merged: that of the last row held past those ready.
     fn current_key(&self) -> Option<&UserKey> {
         self.held
-            .get(self.ready..)?
-            .iter()
+            .range(self.ready..)
             .rev()
             .find_map(|event| match event {
                 Event::Kept(item, _) => Some(&item.key.user_key),
@@ -276,10 +276,10 @@ impl<'a> SliceGovernor<'a> {
             })
     }
 
-    /// What may be handed on, in order.
-    pub(super) fn take_ready(&mut self) -> alloc::vec::Drain<'_, Event> {
-        let ready = core::mem::take(&mut self.ready);
-        self.held.drain(..ready)
+    /// The next event that may be handed on, in order.
+    pub(super) fn pop_ready(&mut self) -> Option<Event> {
+        self.ready = self.ready.checked_sub(1)?;
+        self.held.pop_front()
     }
 
     /// Takes `item`, a row the merge keeps, after the versions it dropped
@@ -309,7 +309,7 @@ impl<'a> SliceGovernor<'a> {
             self.before = KeyStart::of(&self.committed);
         }
         self.take(&item, new_key)?;
-        self.held.push(Event::Kept(item, starts_key));
+        self.held.push_back(Event::Kept(item, starts_key));
         Ok(true)
     }
 
@@ -447,7 +447,7 @@ impl<'a> SliceGovernor<'a> {
     /// merged (all for `None`), ready. Unless versions were dropped since the
     /// key's last row, every held event lies below `next`.
     fn hand_on_next(&mut self, next: Option<&UserKey>) {
-        if matches!(self.held.last(), Some(Event::Kept(..))) {
+        if matches!(self.held.back(), Some(Event::Kept(..))) {
             self.ready = self.held.len();
         } else {
             self.hand_on_below(next);

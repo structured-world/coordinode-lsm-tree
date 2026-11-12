@@ -3860,12 +3860,11 @@ fn hand_on(
     ledger: &core::cell::RefCell<super::ownership::OwnershipLedger>,
     emit: &mut dyn FnMut(InternalValue, bool) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    for event in governor.take_ready() {
+    let mut ledger = ledger.borrow_mut();
+    while let Some(event) = governor.pop_ready() {
         match event {
-            governor::Event::Kept(item, starts_key) => {
-                ledger.borrow_mut().admit(item, starts_key, emit)?;
-            }
-            governor::Event::Dropped(kv) => ledger.borrow_mut().dropped(&kv)?,
+            governor::Event::Kept(item, starts_key) => ledger.admit(item, starts_key, emit)?,
+            governor::Event::Dropped(kv) => ledger.dropped(&kv)?,
         }
     }
     Ok(())

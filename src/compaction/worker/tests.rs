@@ -6491,7 +6491,7 @@ pub(super) fn governed_from(
             if !governor.offer(item, false, &dropped)? {
                 break 'feed;
             }
-            governor.take_ready().for_each(drop);
+            while governor.pop_ready().is_some() {}
         }
     }
     governor.finish(&dropped);
