@@ -6,9 +6,13 @@
 //!
 //! Computed from the live version's table + blob-file metadata plus one
 //! size-stat per live file (the same accounting `Tree::create_checkpoint`
-//! uses), so it never touches the data blocks. The blob reference figures also
-//! read each table's blob-link section, once: the table keeps it after. See
-//! [`crate::AbstractTree::storage_stats`].
+//! uses). The blob reference figures also read each table's blob-link
+//! section, once: the table keeps it after. The data blocks are read only for
+//! the full-compaction figure, and only those of a restricted table in the
+//! largest level past its restriction (a table a tight-space pass is cutting
+//! up), whose metadata records the whole file it was cut from: the figure is
+//! what the compaction space check admits, which reads them too, and a read
+//! error there is the call's error. See [`crate::AbstractTree::storage_stats`].
 
 use crate::version::Version;
 #[cfg(not(feature = "std"))]
@@ -106,16 +110,20 @@ pub struct StorageStats {
     /// Free space (bytes) a FULL compaction needs for its transient output
     /// while the inputs still exist: what the largest level's entries take
     /// rewritten into the last level, bounded from their uncompressed bytes
-    /// under that level's settings as the compaction space check bounds them,
-    /// and the stale blob files a tree that separates values relocates. A
-    /// full compaction has room when [`Self::available_bytes`] `>=` this. Pair with `used_bytes` /
-    /// `capacity_bytes` to draw a capacity gauge: `used` → `used + tight_compaction_bytes`
-    /// → `used + full_compaction_bytes` → `capacity`.
+    /// under that level's settings as the compaction space check bounds them
+    /// (a restricted table's rows past its restriction read for them), and
+    /// the stale blob files a tree that separates values relocates. Whether
+    /// a full compaction has room is [`Self::status`]: the space check weighs
+    /// each volume it writes to against its own free space, while
+    /// [`Self::available_bytes`] is the least any volume has. Pair with
+    /// `used_bytes` / `capacity_bytes` to draw a capacity gauge: `used` →
+    /// `used + tight_compaction_bytes` → `used + full_compaction_bytes` →
+    /// `capacity`.
     pub full_compaction_bytes: u64,
 
     /// Estimated free space (bytes) a minimal (tight) space-reclaiming
     /// compaction needs to make forward progress: the reserved working floor.
-    /// Tight compaction has room when [`Self::available_bytes`] `>=` this.
+    /// Whether it has room is [`Self::status`], as for a full compaction.
     pub tight_compaction_bytes: u64,
 
     /// Number of live entries (all versions) across all live SSTs.
@@ -838,8 +846,9 @@ pub trait StorageStatistics {
     ///
     /// # Errors
     ///
-    /// Returns an error if a live file's size cannot be stat-ed, or a table's
-    /// blob-link section cannot be read or parsed.
+    /// Returns an error if a live file's size cannot be stat-ed, a table's
+    /// blob-link section cannot be read or parsed, or a block of a restricted
+    /// table in the largest level cannot be read (see the module docs).
     fn storage_stats(&self) -> crate::Result<StorageStats>;
 
     /// Per-LSM-level and per-segment size + entry-count stats, for tiering and
