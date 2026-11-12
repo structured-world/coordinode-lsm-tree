@@ -185,6 +185,9 @@ pub(super) struct SliceGovernor<'a> {
     comparator: &'a crate::comparator::SharedComparator,
     split_cells: bool,
     hashes_read_keys: bool,
+    /// The shortest inline value the relocation writes anew into a blob file
+    /// (`u64::MAX` without one), which the quota does not cover.
+    fresh_threshold: u64,
     /// What the keys handed on write, the rows and relocated bytes of the
     /// key being merged included; those as they stood before it.
     committed: SliceLoad,
@@ -237,6 +240,7 @@ impl<'a> SliceGovernor<'a> {
             comparator,
             split_cells: outputs.probe.splits_cells(),
             hashes_read_keys: outputs.probe.hashes_read_keys(),
+            fresh_threshold: relocated.map_or(u64::MAX, |r| r.fresh_threshold),
             committed: SliceLoad::default(),
             before: KeyStart::default(),
             // No bound taken yet: the first key takes one.
@@ -330,8 +334,9 @@ impl<'a> SliceGovernor<'a> {
     }
 
     /// Takes in `item`, a whole key of a plain value, when it fits the quota
-    /// with nothing the quota does not cover: within the widths, past no cut
-    /// key, with no key domains to place it in. `false` takes nothing.
+    /// with nothing the quota does not cover: within the widths, short of a
+    /// value the relocation writes anew, past no cut key, with no key domains
+    /// to place it in. `false` takes nothing.
     #[inline]
     fn take_plain(&mut self, item: &InternalValue) -> bool {
         let value_type = item.key.value_type;
@@ -348,6 +353,7 @@ impl<'a> SliceGovernor<'a> {
         let seqno = item.key.seqno;
         if key_len > self.widths.key
             || self.widths.value.is_some_and(|width| value_len > width)
+            || value_len >= self.fresh_threshold
             || seqno > self.widths.seqno
         {
             return false;
@@ -467,8 +473,10 @@ impl<'a> SliceGovernor<'a> {
             super::NewShapes {
                 known_links: &self.committed.links,
                 known_cells: &self.committed.cells,
+                known_fresh: self.committed.fresh,
                 links: &mut self.load.links,
                 cells: &mut self.load.cells,
+                fresh: &mut self.load.fresh,
             },
             (item.key.value_type, item.key.seqno, key.len(), &item.value),
             hashes,
@@ -714,18 +722,28 @@ impl<'a> SliceGovernor<'a> {
             Some(relocated) if m.blobs > 0 => {
                 let domains = m.blob_domains.max(1);
                 let split = m.blobs.div_ceil(relocated.target_size.max(1));
-                let files = split + relocated.file_groups * domains;
-                let fresh = if m.dictionary_bytes > 0 {
+                // The file of values written anew: counted among the groups of
+                // a pass that may write a source's values anew, and by a slice
+                // that writes an inline value anew otherwise. It may build a
+                // dictionary in each lifetime class and key domain.
+                let rewrites = !relocated.rewritten.is_empty();
+                let fresh_groups = if m.fresh && !rewrites {
+                    relocated.groups
+                } else {
+                    0
+                };
+                let fresh_dictionary = if m.fresh || (rewrites && m.dictionary_bytes > 0) {
                     relocated.fresh_dictionary
                 } else {
                     0
                 };
+                let files = split + (relocated.file_groups + fresh_groups) * domains;
                 // A quota proven for longer keys bounds them by its width.
                 let longest_key = self.longest_key.max(m.rows.longest_key);
                 let bytes = m.blobs
                     + files * (BLOB_META_BYTES + 2 * longest_key)
-                    + (m.dictionary_bytes + fresh) * relocated.groups * domains
-                    + split * relocated.largest_dictionary;
+                    + (m.dictionary_bytes + fresh_dictionary) * relocated.groups * domains
+                    + split * relocated.largest_dictionary.max(fresh_dictionary);
                 (bytes, files)
             }
             _ => (m.blobs, 0),
@@ -777,6 +795,7 @@ fn past(now: &SliceMeasure, quota: Cost, widths: &Widths) -> SliceMeasure {
         rows,
         cut_keys: now.cut_keys,
         blobs: now.blobs + quota.blobs,
+        fresh: now.fresh,
         dictionary_bytes: now.dictionary_bytes,
         table_domains: now.table_domains,
         blob_domains: now.blob_domains,

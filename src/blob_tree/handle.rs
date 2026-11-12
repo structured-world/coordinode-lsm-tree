@@ -76,6 +76,12 @@ impl Encode for BlobIndirection {
 }
 
 impl BlobIndirection {
+    /// The most bytes an encoded indirection takes: the varints of its file id
+    /// (10), frame (5), index (3), size (5) and stored word (a `u32` shifted by
+    /// two bits, 5).
+    #[cfg(feature = "std")]
+    pub(crate) const MAX_ENCODED_LEN: u64 = 10 + 5 + 3 + 5 + 5;
+
     /// Decodes the indirection a table row stores as `value`, straight off the
     /// slice: what [`Decode`] reads of a well-formed one.
     ///

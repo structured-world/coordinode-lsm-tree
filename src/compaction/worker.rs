@@ -2004,7 +2004,8 @@ struct SliceOutputs<'a> {
 /// of `groups` lifetime classes and key domains, and at most
 /// `largest_dictionary` for every file a target's worth of frames opens past
 /// it. The values of the `rewritten` files may be written anew without their
-/// dictionary, as large as they are raw, into a file that may build a
+/// dictionary, as large as they are raw, and so is every inline value of at
+/// least `fresh_threshold` bytes: into a file of their own, which may build a
 /// dictionary of `fresh_dictionary` bytes.
 #[cfg(feature = "std")]
 struct Relocated {
@@ -2015,6 +2016,7 @@ struct Relocated {
     file_groups: u64,
     groups: u64,
     own_dictionaries: crate::HashMap<BlobFileId, u64>,
+    fresh_threshold: u64,
     fresh_dictionary: u64,
     largest_dictionary: u64,
 }
@@ -2038,20 +2040,25 @@ impl Relocated {
                 own_dictionaries.insert(file.id(), bytes);
             }
         }
+        // The values a pass writes anew go to a file of one more codec, which
+        // may build a dictionary of its own: an inline value the separation
+        // threshold now reaches (written before it came down to it, or by the
+        // filter or the merge operator), and, past the sources whose
+        // dictionaries a pass keeps with their frames, a source's values
+        // without it. Which sources those are depends on the order the pass
+        // meets them, so every one may be.
         let mut file_groups = codecs.len() as u64;
-        // Past the sources whose dictionaries a pass keeps with their frames,
-        // a source's values are written anew without it: which sources those
-        // are depends on the order the pass meets them, so every one may be.
-        // They go to a file of one more codec, which may build a dictionary of
-        // its own.
-        let (rewritten, fresh_dictionary) =
+        let fresh_dictionary = u64::from(opts.file_dictionary);
+        // The file of values written anew is counted once its first value is:
+        // here for a pass that may write a source's values anew, by the
+        // slice for one whose first fresh value comes past it.
+        let rewritten =
             if own_dictionaries.len() > crate::vlog::blob_file::multi_writer::MAX_COPY_SOURCES {
                 file_groups += 1;
-                let fresh = u64::from(opts.file_dictionary);
-                largest_dictionary = largest_dictionary.max(fresh);
-                (own_dictionaries.keys().copied().collect(), fresh)
+                largest_dictionary = largest_dictionary.max(fresh_dictionary);
+                own_dictionaries.keys().copied().collect()
             } else {
-                (HashSet::default(), 0)
+                HashSet::default()
             };
         Self {
             stale: stale.iter().map(BlobFile::id).collect(),
@@ -2063,6 +2070,7 @@ impl Relocated {
             file_groups: file_groups * groups,
             groups,
             own_dictionaries,
+            fresh_threshold: u64::from(opts.separation_threshold),
             fresh_dictionary,
             largest_dictionary,
         }
@@ -2130,9 +2138,6 @@ fn copy_bytes(
     key_len: usize,
     relocated: &Relocated,
 ) -> u64 {
-    use crate::blob_tree::handle::{BlobIndirection, Stored};
-    use crate::vlog::blob_file::{frame::ENTRY_HEADER_LEN, packed::RECORD_HEADER_LEN};
-
     let copied = frame_bytes(indirection, relocated.chunk_size);
     if !relocated
         .rewritten
@@ -2140,21 +2145,41 @@ fn copy_bytes(
     {
         return copied;
     }
-    // A record or an entry of a block, whichever header is the larger, as
-    // much as a frame of its own takes. Past `u32` the bound is past any room.
-    let raw = ENTRY_HEADER_LEN.max(RECORD_HEADER_LEN) + key_len + indirection.size as usize;
-    let anew = BlobIndirection {
-        stored: Stored::InBlock(u32::try_from(raw).unwrap_or(u32::MAX)),
-        ..*indirection
+    copied.max(anew_bytes(indirection.size, key_len, relocated.chunk_size))
+}
+
+/// At most the bytes a value of `size` bytes under a key of `key_len` bytes
+/// takes written anew into a blob file of `chunk_size`: a codec that saves
+/// nothing stores it as it is, a record or an entry of a block, whichever
+/// header is the larger, as much as a frame of its own takes.
+#[cfg(feature = "std")]
+fn anew_bytes(size: u32, key_len: usize, chunk_size: u32) -> u64 {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::{
+        ValueHandle,
+        blob_file::{frame::ENTRY_HEADER_LEN, packed::RECORD_HEADER_LEN},
     };
-    copied.max(frame_bytes(&anew, relocated.chunk_size))
+
+    // Past `u32` the bound is past any room.
+    let raw = ENTRY_HEADER_LEN.max(RECORD_HEADER_LEN) + key_len + size as usize;
+    let anew = BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 0,
+            frame: 0,
+            index: 0,
+        },
+        size,
+        stored: Stored::InBlock(u32::try_from(raw).unwrap_or(u32::MAX)),
+    };
+    frame_bytes(&anew, chunk_size)
 }
 
 /// What a slice, or the blocks ending on one key, writes: the entries its
 /// tables hold, the field columns its cell rows open, the blob files its rows
 /// point into and the keys it passes that end an output, its bytes to the
-/// blob files, the stale sources holding a dictionary of their own it
-/// relocates values out of and those dictionaries' bytes, and the key domains
+/// blob files, whether it writes an inline value anew into one (`fresh`), the
+/// stale sources holding a dictionary of their own it relocates values out of
+/// and those dictionaries' bytes, and the key domains
 /// its keys lie in and those its relocated values lie in, each by the first
 /// key past it (`None` for the last domain).
 #[cfg(feature = "std")]
@@ -2165,6 +2190,7 @@ struct SliceLoad {
     links: HashSet<BlobFileId>,
     cut_keys: u64,
     blobs: u64,
+    fresh: bool,
     dictionaries: HashSet<BlobFileId>,
     dictionary_bytes: u64,
     table_domains: HashSet<Option<UserKey>>,
@@ -2173,27 +2199,31 @@ struct SliceLoad {
 
 /// A [`SliceLoad`] counted: what its tables hold, the field columns and the
 /// blob files of it included, the keys it passes that end an output, its
-/// bytes to the blob files, its dictionaries' bytes and how many key domains
-/// its keys and its relocated values lie in.
+/// bytes to the blob files, whether it writes values anew, its dictionaries'
+/// bytes and how many key domains its keys and its relocated values lie in.
 #[cfg(feature = "std")]
 #[derive(Clone)]
 struct SliceMeasure {
     rows: crate::table::writer::RewriteLoad,
     cut_keys: u64,
     blobs: u64,
+    fresh: bool,
     dictionary_bytes: u64,
     table_domains: u64,
     blob_domains: u64,
 }
 
-/// The field columns and blob files a slice takes, past those it `known`s
-/// already: where an entry's new columns and links go.
+/// The field columns and blob files a slice takes, and whether it writes a
+/// value anew, past what it `known`s already: where an entry's new columns,
+/// links and first fresh value go.
 #[cfg(feature = "std")]
 struct NewShapes<'a> {
     known_links: &'a HashSet<BlobFileId>,
     known_cells: &'a crate::table::writer::CellShapes,
+    known_fresh: bool,
     links: &'a mut HashSet<BlobFileId>,
     cells: &'a mut crate::table::writer::CellShapes,
+    fresh: &'a mut bool,
 }
 
 /// What an entry read off an input, of `value_type` at `seqno` with a user
@@ -2205,9 +2235,11 @@ struct NewShapes<'a> {
 /// the files `relocated` moves take as it writes them. Columns and blob files
 /// the slice holds already are not taken again (`shapes`). Each of those
 /// files holding a dictionary of its own goes into `dictionaries`, the sources
-/// whose dictionary the copy may hold. Returns the bytes to the blob files,
-/// and whether the entry opened a column or linked a blob file the slice did
-/// not hold.
+/// whose dictionary the copy may hold. An inline value of at least the
+/// threshold `relocated` writes anew leaves a pointer in its table, and its
+/// bytes written raw go to the blob files. Returns the bytes to the blob
+/// files, and whether the entry opened a column, linked a blob file or wrote
+/// a value anew where the slice had not.
 #[cfg(feature = "std")]
 fn take_entry(
     rows: &mut crate::table::writer::RewriteLoad,
@@ -2221,16 +2253,38 @@ fn take_entry(
     use crate::blob_tree::field_row::{RowCell, decode_row};
     use crate::blob_tree::handle::BlobIndirection;
 
-    rows.take_entry(key_len as u64, value.len() as u64, seqno, filter_hashes);
-    // A plain value points into no blob file and opens no column.
+    let value_len = value.len() as u64;
     if !value_type.is_indirection() && !value_type.is_cell_row() {
+        // A value the pass writes anew into a blob file leaves its pointer in
+        // the table; any other plain value points into no blob file and opens
+        // no column.
+        if let Some(relocated) = relocated
+            && value_type == crate::ValueType::Value
+            && value_len >= relocated.fresh_threshold
+        {
+            rows.take_entry(
+                key_len as u64,
+                BlobIndirection::MAX_ENCODED_LEN,
+                seqno,
+                filter_hashes,
+            );
+            rows.owned_blob_objects += 1;
+            let first = !shapes.known_fresh && !*shapes.fresh;
+            *shapes.fresh = true;
+            // A value is at most `u32::MAX` bytes, the blob format's limit.
+            let size = u32::try_from(value_len).unwrap_or(u32::MAX);
+            return Ok((anew_bytes(size, key_len, relocated.chunk_size), first));
+        }
+        rows.take_entry(key_len as u64, value_len, seqno, filter_hashes);
         return Ok((0, false));
     }
+    rows.take_entry(key_len as u64, value_len, seqno, filter_hashes);
     let NewShapes {
         known_links,
         known_cells,
         links,
         cells,
+        ..
     } = shapes;
     let mut grew = false;
     let mut reference = |links: &mut HashSet<BlobFileId>, indirection: &BlobIndirection| {
@@ -2286,6 +2340,7 @@ impl SliceLoad {
         self.links.extend(other.links.iter().copied());
         self.cut_keys += other.cut_keys;
         self.blobs += other.blobs;
+        self.fresh |= other.fresh;
         for &source in &other.dictionaries {
             self.add_dictionary(source, relocated);
         }
@@ -2318,6 +2373,7 @@ impl SliceLoad {
             rows,
             cut_keys: self.cut_keys + other.cut_keys,
             blobs: self.blobs + other.blobs,
+            fresh: self.fresh || other.fresh,
             dictionary_bytes: self.dictionary_bytes + new_dictionaries,
             table_domains: new(&self.table_domains, &other.table_domains),
             blob_domains: new(&self.blob_domains, &other.blob_domains),

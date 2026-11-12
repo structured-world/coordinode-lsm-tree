@@ -6197,6 +6197,7 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
         file_groups: 1,
         groups: 1,
         own_dictionaries: core::iter::once::<(BlobFileId, u64)>((7, 4_096)).collect(),
+        fresh_threshold: u64::MAX,
         fresh_dictionary: 0,
         largest_dictionary: 4_096,
     };
@@ -6212,8 +6213,10 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
             super::NewShapes {
                 known_links: &known.links,
                 known_cells: &known.cells,
+                known_fresh: known.fresh,
                 links: &mut load.links,
                 cells: &mut load.cells,
+                fresh: &mut load.fresh,
             },
             (
                 item.key.value_type,
@@ -6272,6 +6275,86 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
         ),
     );
     assert!(more.links.is_empty(), "a known link is not taken again");
+    Ok(())
+}
+
+/// An inline value the separation threshold reaches is written anew into a
+/// blob file by a relocating pass: the slice charges the blob files with it
+/// as written raw, and its table with the pointer left in its place. A value
+/// below the threshold, and any value of a pass that relocates nothing, stays
+/// in the table.
+#[test]
+fn an_inline_value_the_threshold_reaches_is_charged_to_the_blob_files() -> crate::Result<()> {
+    use crate::{InternalValue, vlog::BlobFileId};
+
+    let relocated = super::Relocated {
+        stale: core::iter::once::<BlobFileId>(7).collect(),
+        rewritten: crate::HashSet::default(),
+        target_size: u64::MAX,
+        chunk_size: u32::MAX,
+        file_groups: 1,
+        groups: 1,
+        own_dictionaries: crate::HashMap::default(),
+        fresh_threshold: 1_000,
+        fresh_dictionary: 0,
+        largest_dictionary: 0,
+    };
+    // Takes `item` into a slice that wrote a value anew already or not
+    // (`known_fresh`): the blob bytes, whether the slice grew, its table's
+    // value bytes and whether it now writes a value anew.
+    let take = |item: &InternalValue, relocated: Option<&super::Relocated>, known_fresh: bool| {
+        let mut load = super::SliceLoad::default();
+        let known = super::SliceLoad::default();
+        let blobs = super::take_entry(
+            &mut load.rows,
+            super::NewShapes {
+                known_links: &known.links,
+                known_cells: &known.cells,
+                known_fresh,
+                links: &mut load.links,
+                cells: &mut load.cells,
+                fresh: &mut load.fresh,
+            },
+            (
+                item.key.value_type,
+                item.key.seqno,
+                item.key.user_key.len(),
+                &item.value,
+            ),
+            1,
+            false,
+            relocated,
+            &mut Vec::new(),
+        )?;
+        crate::Result::Ok((blobs, load.rows.value_bytes, load.fresh))
+    };
+
+    let key = b"value-key";
+    let large = InternalValue::from_components(*key, vec![b'v'; 1_000], 1, crate::ValueType::Value);
+    let anew = super::anew_bytes(1_000, key.len(), u32::MAX);
+    assert!(anew > 1_000, "its frame takes at least its bytes");
+    assert_eq!(
+        take(&large, Some(&relocated), false)?,
+        (
+            (anew, true),
+            crate::blob_tree::handle::BlobIndirection::MAX_ENCODED_LEN,
+            true
+        ),
+        "the value goes to a blob file as written raw, its table keeps a \
+         pointer, and the slice's first such value opens the file of them",
+    );
+    assert_eq!(
+        take(&large, Some(&relocated), true)?.0,
+        (anew, false),
+        "past the slice's first, a value written anew opens nothing",
+    );
+
+    let small = InternalValue::from_components(*key, vec![b'v'; 999], 1, crate::ValueType::Value);
+    assert_eq!(
+        take(&small, Some(&relocated), false)?,
+        ((0, false), 999, false)
+    );
+    assert_eq!(take(&large, None, false)?, ((0, false), 1_000, false));
     Ok(())
 }
 
