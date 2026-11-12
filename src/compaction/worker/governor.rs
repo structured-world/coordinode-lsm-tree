@@ -267,6 +267,13 @@ impl<'a> SliceGovernor<'a> {
 
     /// The key being merged: that of the last row held past those ready.
     fn current_key(&self) -> Option<&UserKey> {
+        // The last held event is the key's row unless versions were dropped
+        // since.
+        if self.ready < self.held.len()
+            && let Some(Event::Kept(item, _)) = self.held.back()
+        {
+            return Some(&item.key.user_key);
+        }
         self.held
             .range(self.ready..)
             .rev()
