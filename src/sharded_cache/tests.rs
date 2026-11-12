@@ -412,3 +412,25 @@ fn concurrent_stress_keeps_invariants() {
         "atomic weight diverged from resident entries",
     );
 }
+
+/// A fingerprint spent on an admission and recorded again lives out its new
+/// stay in the ghost queue: the node of its first stay aging out does not
+/// forget the second.
+#[test]
+fn a_ghost_recorded_again_outlives_its_first_stay() {
+    let mut shard: ShardCore<u64, alloc::vec::Vec<u8>, FxBuildHasher> =
+        ShardCore::new(1_000, 4, FxBuildHasher);
+    shard.push_ghost(7);
+    assert!(shard.take_ghost(7), "the admission spends the fingerprint");
+    shard.push_ghost(1);
+    shard.push_ghost(7);
+    // Two more push the first stay of 7 out of the four the queue keeps,
+    // leaving 1, the second stay of 7 and these two.
+    shard.push_ghost(2);
+    shard.push_ghost(3);
+    assert!(
+        shard.in_ghost(7),
+        "the second stay of 7 is still within the queue"
+    );
+    assert!(shard.in_ghost(1));
+}
