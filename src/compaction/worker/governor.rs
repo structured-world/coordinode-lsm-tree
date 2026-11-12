@@ -13,9 +13,13 @@
 //! the input groups whose rows come out as read.
 //!
 //! The bound is not taken at every key. Each bound taken also proves a quota:
-//! a cost the slice may add on top of what it holds and still fit, where an
-//! entry costs at least its key, value, filter hashes, length varints, owned
-//! objects and relocated bytes, each of which grows the bound no faster.
+//! what the slice may add on top of what it holds and still fit, as a cost to
+//! its tables and one to its blob files. An entry costs its tables at least
+//! its key and value bytes, and [`ENTRY_COST`] for itself, for each filter
+//! hash and for each object it owns; it costs the blob files the bytes it
+//! relocates. So a quota of `q` holds at most `q` bytes of keys, `q` of
+//! values and `q / ENTRY_COST` entries, hashes and owned objects, which is
+//! the slice the quota is proven for.
 //! A key that leaves the slice within its quota, with no key, value or seqno
 //! past the widths the quota was proven for and nothing the bound counts once
 //! per kind (a blob file it links, a field column, a key domain, a cut key, a
@@ -36,9 +40,21 @@ use crate::{InternalValue, UserKey};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-/// What an entry costs besides its bytes: the most the entries counted by the
-/// bound grow for a cost of this much.
-const ENTRY_COST: u64 = 16;
+/// What an entry, a filter hash and an owned object each cost a slice's
+/// tables at the least: a quota of `q` holds at most `q / ENTRY_COST` of
+/// each. An entry smaller than this is counted as this large.
+const ENTRY_COST: u64 = 64;
+
+/// The most bytes the varints of an entry's key and value lengths take: a
+/// key of up to `u16::MAX` bytes and a value of up to `u32::MAX`.
+const ENTRY_LENGTHS: u64 = 2 * 3 + 5;
+
+/// A cost to a slice's tables and one to its blob files.
+#[derive(Clone, Copy, Default)]
+struct Cost {
+    tables: u64,
+    blobs: u64,
+}
 
 /// What a slice's merge hands on, in its order.
 pub(super) enum Event {
@@ -87,8 +103,8 @@ pub(super) struct SliceGovernor<'a> {
     committed: SliceLoad,
     /// The cost the slice may add past the last bound taken and still fit,
     /// what it added since, and the widths the quota holds for.
-    quota: u64,
-    spent: u64,
+    quota: Cost,
+    spent: Cost,
     widths: Widths,
     /// The longest key seen.
     longest_key: u64,
@@ -134,8 +150,8 @@ impl<'a> SliceGovernor<'a> {
             hashes_read_keys: outputs.probe.hashes_read_keys(),
             committed: SliceLoad::default(),
             // No bound taken yet: the first key takes one.
-            quota: 0,
-            spent: 0,
+            quota: Cost::default(),
+            spent: Cost::default(),
             widths: Widths {
                 key: 0,
                 value: Some(0),
@@ -279,14 +295,12 @@ impl<'a> SliceGovernor<'a> {
             }
         }
         // Each sum is bounded by the inputs' bytes and objects.
-        self.spent += ENTRY_COST
-            + key_len
-            + value_len
-            + hashes
-            + 2 * varint_len(key_len)
-            + varint_len(value_len)
-            + (self.load.rows.owned_blob_objects - owned)
-            + blobs;
+        let owned = self.load.rows.owned_blob_objects - owned;
+        self.spent.tables += (key_len + value_len)
+            .max(ENTRY_COST)
+            .max(ENTRY_COST * hashes)
+            .max(ENTRY_COST * owned);
+        self.spent.blobs += blobs;
         if grew
             || key_len > self.widths.key
             || self.widths.value.is_some_and(|width| value_len > width)
@@ -301,20 +315,30 @@ impl<'a> SliceGovernor<'a> {
     /// of them for `None`), when the slice with it fits, `true`; otherwise
     /// ends the slice before the key, `false`.
     fn settle(&mut self, upto: Option<&UserKey>) -> bool {
-        if self.past_quota || self.spent > self.quota {
-            let with = self.committed.measure_with(&self.load, self.relocated);
-            if !self.fits(&with) {
-                let end = self.key.take();
-                if self.any_committed() {
-                    // The versions dropped below the key are this slice's.
-                    self.hand_on_below(end.as_ref());
-                }
-                self.held.clear();
-                self.end = end;
-                return false;
-            }
-            self.prove_quota(&with);
+        if !self.past_quota
+            && self.spent.tables <= self.quota.tables
+            && self.spent.blobs <= self.quota.blobs
+        {
+            // Within the quota the key opened no set and passed no cut key.
+            self.committed.rows.absorb(&self.load.rows);
+            self.committed.blobs += self.load.blobs;
+            self.load.rows = RewriteLoad::default();
+            self.load.blobs = 0;
+            self.hand_on_below(upto);
+            return true;
         }
+        let with = self.committed.measure_with(&self.load, self.relocated);
+        if !self.fits(&with) {
+            let end = self.key.take();
+            if self.any_committed() {
+                // The versions dropped below the key are this slice's.
+                self.hand_on_below(end.as_ref());
+            }
+            self.held.clear();
+            self.end = end;
+            return false;
+        }
+        self.prove_quota(&with);
         let load = core::mem::take(&mut self.load);
         self.committed.absorb(&load, self.relocated);
         self.past_quota = false;
@@ -322,12 +346,12 @@ impl<'a> SliceGovernor<'a> {
         true
     }
 
-    /// Takes `now`, a slice that fits, as the last bound: the quota is a cost
-    /// a slice past `now` adds and still fits, the larger of the quota before
-    /// and twice the cost spent since, halved as often as needed. A quota used
-    /// up doubles while the room lasts, so the bounds taken grow as the
-    /// logarithm of the keys, and it stays within twice what the slice spent
-    /// between two bounds.
+    /// Takes `now`, a slice that fits, as the last bound: the quota is what a
+    /// slice past `now` adds and still fits, in each cost the larger of the
+    /// quota before and twice the cost spent since, halved as often as needed
+    /// on the side past its cap. A quota used up doubles while the room
+    /// lasts, so the bounds taken grow as the logarithm of the keys, and it
+    /// stays within twice what the slice spent between two bounds.
     fn prove_quota(&mut self, now: &SliceMeasure) {
         let widths = Widths {
             key: 2 * now.rows.longest_key,
@@ -339,19 +363,50 @@ impl<'a> SliceGovernor<'a> {
             seqno: same_width_seqno(now.rows.highest_seqno),
         };
         // Bounded by twice the cost of the keys taken, far below `u64::MAX`.
-        // No quota past a cap fits: a cost of `q` adds `q` bytes of keys to
-        // the tables and `q` bytes to the blob files.
-        let mut quota = self
-            .quota
-            .max(2 * self.spent)
-            .min(self.caps.tables)
-            .min(self.caps.blobs)
-            .min(self.caps.total / 2);
-        while quota > 0 && !self.fits(&past(now, quota, &widths)) {
-            quota /= 2;
+        // No quota past a cap fits: a cost of `q` adds `q` bytes to the side
+        // it is charged to.
+        let mut quota = Cost {
+            tables: self
+                .quota
+                .tables
+                .max(2 * self.spent.tables)
+                .min(self.caps.tables.min(self.caps.total)),
+            blobs: self
+                .quota
+                .blobs
+                .max(2 * self.spent.blobs)
+                .min(self.caps.blobs.min(self.caps.total)),
+        };
+        loop {
+            let (tables, blobs) = self.bound(&past(now, quota, &widths));
+            let over_tables = tables > self.caps.tables;
+            let over_blobs = blobs > self.caps.blobs;
+            if !over_tables && !over_blobs && tables + blobs <= self.caps.total {
+                break;
+            }
+            // Past the shared cap alone, both sides give way.
+            let both = !over_tables && !over_blobs;
+            let halved = Cost {
+                tables: if over_tables || both {
+                    quota.tables / 2
+                } else {
+                    quota.tables
+                },
+                blobs: if over_blobs || both {
+                    quota.blobs / 2
+                } else {
+                    quota.blobs
+                },
+            };
+            if (halved.tables, halved.blobs) == (quota.tables, quota.blobs) {
+                // Only the widths are past the room: every key takes a bound.
+                quota = Cost::default();
+                break;
+            }
+            quota = halved;
         }
         self.quota = quota;
-        self.spent = 0;
+        self.spent = Cost::default();
         self.widths = widths;
     }
 
@@ -427,19 +482,21 @@ impl<'a> SliceGovernor<'a> {
     }
 }
 
-/// The most a slice writing `now` writes once it adds a cost of `quota`
-/// with keys, values and seqnos within `widths`: each measure an entry's
-/// cost counts grows by the quota at most, the entries by a share of it, and
-/// the rest stays as it is.
-fn past(now: &SliceMeasure, quota: u64, widths: &Widths) -> SliceMeasure {
+/// The most a slice writing `now` writes once it adds `quota` with keys,
+/// values and seqnos within `widths`: the key and value bytes grow by the
+/// table cost at most and the relocated bytes by the blob cost, the entries,
+/// filter hashes and owned objects by the table cost's share of
+/// [`ENTRY_COST`], the length varints by those of as many entries, and the
+/// rest stays as it is.
+fn past(now: &SliceMeasure, quota: Cost, widths: &Widths) -> SliceMeasure {
     let n = &now.rows;
     // Each sum is bounded by the caps, far below `u64::MAX`.
-    let entries = quota / ENTRY_COST;
+    let entries = quota.tables / ENTRY_COST;
     let rows = RewriteLoad {
         entries: n.entries + entries,
-        key_bytes: n.key_bytes + quota,
-        value_bytes: n.value_bytes + quota,
-        filter_hashes: n.filter_hashes + quota,
+        key_bytes: n.key_bytes + quota.tables,
+        value_bytes: n.value_bytes + quota.tables,
+        filter_hashes: n.filter_hashes + entries,
         longest_key: n.longest_key.max(widths.key),
         longest_value: match (n.longest_value, widths.value) {
             (Some(longest), Some(width)) => Some(longest.max(width)),
@@ -448,20 +505,20 @@ fn past(now: &SliceMeasure, quota: u64, widths: &Widths) -> SliceMeasure {
         },
         highest_seqno: n.highest_seqno.max(widths.seqno),
         entry_lengths: match n.entry_lengths {
-            Some(lengths) => Some(lengths + quota),
-            None if n.entries == 0 => Some(quota),
+            Some(lengths) => Some(lengths + entries * ENTRY_LENGTHS),
+            None if n.entries == 0 => Some(entries * ENTRY_LENGTHS),
             None => None,
         },
         range_tombstones: n.range_tombstones,
         range_tombstone_bytes: n.range_tombstone_bytes,
         linked_blob_files: n.linked_blob_files,
-        owned_blob_objects: n.owned_blob_objects + quota,
+        owned_blob_objects: n.owned_blob_objects + entries,
         cell_columns: n.cell_columns,
     };
     SliceMeasure {
         rows,
         cut_keys: now.cut_keys,
-        blobs: now.blobs + quota,
+        blobs: now.blobs + quota.blobs,
         dictionary_bytes: now.dictionary_bytes,
         table_domains: now.table_domains,
         blob_domains: now.blob_domains,
