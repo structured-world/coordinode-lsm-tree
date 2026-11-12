@@ -6475,7 +6475,7 @@ pub(super) fn governed_from(
             governor.take_ready().for_each(drop);
         }
     }
-    governor.finish(&dropped)?;
+    governor.finish(&dropped);
     let (tables, blobs) = governor.committed_bound();
     Ok(Governed {
         tables,

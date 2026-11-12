@@ -4,31 +4,32 @@
 //! Where a tight-space slice ends, found as its merge runs.
 //!
 //! The merge hands the rows it keeps and the versions it drops to a
-//! [`SliceGovernor`], which holds them back and hands them on a run of keys
-//! at a time while what the slice writes stays within its room. What a slice
-//! writes only grows with the keys it takes, so a run past the room is cut at
-//! the last of its keys that fits, the slice ends before the next key, and
-//! the next slice starts there. A key never splits across slices.
+//! [`SliceGovernor`], which holds back the rows of the key they belong to
+//! until the key ends, and then hands the key on when what the slice writes
+//! with it stays within the slice's room. The first key past the room ends
+//! the slice, and the next slice starts with it: a key never splits across
+//! slices. Only the key being merged is held, so the rows reach the ledger
+//! and the writer as the merge emits them, a key late: a carry plan copies
+//! the input groups whose rows come out as read.
 //!
-//! A dropped version is handed on with the keys around it, in the merge's
-//! order: the ownership ledger settles a key's blob objects from its dropped
+//! What a slice writes only grows with the keys it takes, so the bound is
+//! not taken at every key. At each bound taken the governor also checks a
+//! point past the slice so far, grown as much again as it grew since the
+//! bound before; a key that keeps the slice within that point, in every
+//! measure the bound grows with, fits without a bound of its own.
+//!
+//! A dropped version is handed on in the merge's order with the keys around
+//! it: the ownership ledger settles a key's blob objects from its dropped
 //! versions, and those of a key past the end are the next slice's to count.
 
 use super::{
     BLOB_META_BYTES, DomainEdge, Relocated, SliceCaps, SliceLoad, SliceMeasure, SliceOutputs,
     enter_domain, take_entry,
 };
+use crate::table::writer::RewriteLoad;
 use crate::{InternalValue, UserKey};
 use alloc::vec::Vec;
 use core::cell::RefCell;
-
-/// The first run of held keys checked, by the bytes of their keys and
-/// values: a slice of a few keys is decided at once.
-const FIRST_CHECK: usize = 64 * 1_024;
-
-/// The longest run of held keys: past it what is held is checked, so what
-/// the governor holds in memory stays within it whatever the room.
-const LONGEST_CHECK: usize = 1_024 * 1_024;
 
 /// What a slice's merge hands on, in its order.
 pub(super) enum Event {
@@ -68,22 +69,20 @@ pub(super) struct SliceGovernor<'a> {
     committed: SliceLoad,
     /// Whether a key was handed on.
     any_committed: bool,
-    /// The cut keys `committed` passed.
-    committed_cuts: usize,
+    /// The slice as it stood at the last bound taken, and the point past it
+    /// known to fit.
+    checked: SliceMeasure,
+    room: SliceMeasure,
     /// The longest key seen.
     longest_key: u64,
-    /// What the merge handed over since, held back.
-    held: Vec<Event>,
-    /// Each held key, and where its first kept row lies in `held`.
-    keys: Vec<(usize, UserKey)>,
-    /// What the held keys write, and the cut keys they pass.
+    /// The key being merged, what its rows write, and the cut keys it passes.
+    key: Option<UserKey>,
     load: SliceLoad,
-    load_cuts: usize,
-    load_edges: (DomainEdge, DomainEdge),
-    /// The bytes of the held keys and values, and the bytes at which they
-    /// are checked.
-    held_bytes: usize,
-    check_at: usize,
+    key_cuts: usize,
+    edges: (DomainEdge, DomainEdge),
+    /// What the merge handed over of the key being merged, with the versions
+    /// dropped since the key before.
+    held: Vec<Event>,
     /// What may be handed on now.
     ready: Vec<Event>,
     /// The key the slice ends before, once it stopped.
@@ -102,11 +101,12 @@ impl<'a> SliceGovernor<'a> {
         from: Option<&UserKey>,
     ) -> Self {
         let cmp = comparator.as_ref();
-        let passed = from.map_or(0, |from| {
+        let cuts = from.map_or(0, |from| {
             outputs
                 .cut_keys
                 .partition_point(|cut| cmp.compare(cut, from) == core::cmp::Ordering::Less)
         });
+        let empty = SliceLoad::default().measure_with(&SliceLoad::default(), relocated);
         Self {
             caps,
             outputs,
@@ -116,15 +116,14 @@ impl<'a> SliceGovernor<'a> {
             hashes_read_keys: outputs.probe.hashes_read_keys(),
             committed: SliceLoad::default(),
             any_committed: false,
-            committed_cuts: passed,
+            checked: empty.clone(),
+            room: empty,
             longest_key: 0,
-            held: Vec::new(),
-            keys: Vec::new(),
+            key: None,
             load: SliceLoad::default(),
-            load_cuts: passed,
-            load_edges: (DomainEdge::Unseen, DomainEdge::Unseen),
-            held_bytes: 0,
-            check_at: FIRST_CHECK,
+            key_cuts: cuts,
+            edges: (DomainEdge::Unseen, DomainEdge::Unseen),
+            held: Vec::new(),
             ready: Vec::new(),
             end: None,
         }
@@ -160,47 +159,31 @@ impl<'a> SliceGovernor<'a> {
     ) -> crate::Result<bool> {
         self.hold_dropped(dropped);
         let new_key = self
-            .keys
-            .last()
-            .is_none_or(|(_, key)| !crate::comparator::same_user_key(key, &item.key.user_key));
-        if new_key
-            && !self.keys.is_empty()
-            && self.held_bytes >= self.check_at
-            && !self.settle(Some(&item.key.user_key))?
-        {
-            return Ok(false);
-        }
+            .key
+            .as_ref()
+            .is_none_or(|key| !crate::comparator::same_user_key(key, &item.key.user_key));
         if new_key {
-            self.keys.push((self.held.len(), item.key.user_key.clone()));
+            if self.key.is_some() && !self.settle(Some(&item.key.user_key)) {
+                return Ok(false);
+            }
+            self.key = Some(item.key.user_key.clone());
         }
-        self.held_bytes += item.key.user_key.len() + item.value.len();
-        let (mut cuts, mut edges) = (
-            self.load_cuts,
-            core::mem::replace(
-                &mut self.load_edges,
-                (DomainEdge::Unseen, DomainEdge::Unseen),
-            ),
-        );
-        let mut load = core::mem::take(&mut self.load);
-        let taken = self.take(&mut load, &mut cuts, &mut edges, &item, new_key);
-        (self.load, self.load_cuts, self.load_edges) = (load, cuts, edges);
-        taken?;
+        self.take(&item, new_key)?;
         self.held.push(Event::Kept(item, starts_key));
         Ok(true)
     }
 
-    /// Ends the merge: what is held is handed on as far as it fits.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a row's value does not decode.
-    pub(super) fn finish(&mut self, dropped: &RefCell<Vec<InternalValue>>) -> crate::Result<()> {
+    /// Ends the merge: the key being merged is handed on if it fits.
+    pub(super) fn finish(&mut self, dropped: &RefCell<Vec<InternalValue>>) {
         if self.end.is_some() {
-            return Ok(());
+            return;
         }
         self.hold_dropped(dropped);
-        self.settle(None)?;
-        Ok(())
+        if self.key.is_some() {
+            self.settle(None);
+        } else {
+            self.ready.append(&mut self.held);
+        }
     }
 
     /// Places the versions dropped since among the held events.
@@ -209,16 +192,10 @@ impl<'a> SliceGovernor<'a> {
             .extend(dropped.borrow_mut().drain(..).map(Event::Dropped));
     }
 
-    /// Takes the kept row `item` into `load`: one more entry, and the cut
-    /// keys and key domains it passes when it starts a key (`new_key`).
-    fn take(
-        &mut self,
-        load: &mut SliceLoad,
-        cuts: &mut usize,
-        (table_end, blob_end): &mut (DomainEdge, DomainEdge),
-        item: &InternalValue,
-        new_key: bool,
-    ) -> crate::Result<()> {
+    /// Takes the kept row `item` into the key being merged: one more entry,
+    /// and the cut keys and key domains it passes when it starts the key
+    /// (`new_key`).
+    fn take(&mut self, item: &InternalValue, new_key: bool) -> crate::Result<()> {
         let cmp = self.comparator.as_ref();
         let key = &item.key.user_key;
         self.longest_key = self.longest_key.max(key.len() as u64);
@@ -226,11 +203,11 @@ impl<'a> SliceGovernor<'a> {
             while self
                 .outputs
                 .cut_keys
-                .get(*cuts)
+                .get(self.key_cuts)
                 .is_some_and(|cut| cmp.compare(cut, key) != core::cmp::Ordering::Greater)
             {
-                load.cut_keys += 1;
-                *cuts += 1;
+                self.load.cut_keys += 1;
+                self.key_cuts += 1;
             }
         }
         let hashes = if self.hashes_read_keys {
@@ -240,102 +217,76 @@ impl<'a> SliceGovernor<'a> {
         };
         let mut dictionaries = Vec::new();
         let blobs = take_entry(
-            load,
+            &mut self.load,
             (item.key.value_type, item.key.seqno, key.len(), &item.value),
             hashes,
             self.split_cells,
             self.relocated,
             &mut dictionaries,
         )?;
-        load.blobs += blobs;
+        self.load.blobs += blobs;
         for source in dictionaries {
-            load.add_dictionary(source, self.relocated);
+            self.load.add_dictionary(source, self.relocated);
         }
         if let Some(domains) = self.outputs.domains {
-            enter_domain(domains, cmp, table_end, &mut load.table_domains, key);
+            let (table_end, blob_end) = &mut self.edges;
+            enter_domain(domains, cmp, table_end, &mut self.load.table_domains, key);
             if blobs > 0 {
-                enter_domain(domains, cmp, blob_end, &mut load.blob_domains, key);
+                enter_domain(domains, cmp, blob_end, &mut self.load.blob_domains, key);
             }
         }
         Ok(())
     }
 
-    /// Hands on the held keys below `upto` (all of them for `None`) when
-    /// they fit, `true`; otherwise as many as fit, the slice ending before
-    /// the next, `false`.
-    fn settle(&mut self, upto: Option<&UserKey>) -> crate::Result<bool> {
-        if self.fits(&self.committed.measure_with(&self.load, self.relocated)) {
-            let load = core::mem::take(&mut self.load);
-            self.committed.absorb(&load, self.relocated);
-            self.committed_cuts = self.load_cuts;
-            self.any_committed |= !self.keys.is_empty();
-            self.keys.clear();
-            self.load_edges = (DomainEdge::Unseen, DomainEdge::Unseen);
-            self.held_bytes = 0;
-            self.check_at = (self.check_at * 2).min(LONGEST_CHECK);
-            self.hand_on_below(upto);
-            return Ok(true);
-        }
-        // The most held keys that fit: none fits at the least, all do not.
-        let (mut fitting, mut past) = (0, self.keys.len());
-        while past - fitting > 1 {
-            let mid = fitting + (past - fitting) / 2;
-            if self.prefix_fits(mid)? {
-                fitting = mid;
-            } else {
-                past = mid;
+    /// Hands on the key being merged, with the held events below `upto` (all
+    /// of them for `None`), when the slice with it fits, `true`; otherwise
+    /// ends the slice before the key, `false`.
+    fn settle(&mut self, upto: Option<&UserKey>) -> bool {
+        let with = self.committed.measure_with(&self.load, self.relocated);
+        let fits = within(&with, &self.room) || {
+            let fits = self.fits(&with);
+            if fits {
+                self.grow_room(with);
             }
+            fits
+        };
+        if !fits {
+            let end = self.key.take();
+            if self.any_committed {
+                // The versions dropped below the key are this slice's.
+                self.hand_on_below(end.as_ref());
+            }
+            self.held.clear();
+            self.end = end;
+            return false;
         }
-        let end = self.keys.get(fitting).map(|(_, key)| key.clone());
-        if fitting > 0 {
-            let load = self.prefix_load(fitting)?;
-            self.committed.absorb(&load, self.relocated);
-            self.any_committed = true;
-        }
-        if self.any_committed {
-            self.hand_on_below(end.as_ref());
-        }
-        self.held.clear();
-        self.end = end;
-        Ok(false)
+        let load = core::mem::take(&mut self.load);
+        self.committed.absorb(&load, self.relocated);
+        self.any_committed = true;
+        self.hand_on_below(upto);
+        true
     }
 
-    /// Whether the first `count` held keys fit beside what was handed on.
-    fn prefix_fits(&mut self, count: usize) -> crate::Result<bool> {
-        let load = self.prefix_load(count)?;
-        Ok(self.fits(&self.committed.measure_with(&load, self.relocated)))
-    }
-
-    /// What the first `count` held keys write, all of them past the last.
-    fn prefix_load(&mut self, count: usize) -> crate::Result<SliceLoad> {
-        let stop = self
-            .keys
-            .get(count)
-            .map_or(self.held.len(), |&(stop, _)| stop);
-        let mut load = SliceLoad::default();
-        let mut cuts = self.committed_cuts;
-        let mut edges = (DomainEdge::Unseen, DomainEdge::Unseen);
-        let mut previous: Option<UserKey> = None;
-        let held = core::mem::take(&mut self.held);
-        let mut taken = Ok(());
-        for event in held.get(..stop).unwrap_or_default() {
-            let Event::Kept(item, _) = event else {
-                continue;
-            };
-            let new_key = previous
-                .as_ref()
-                .is_none_or(|key| !crate::comparator::same_user_key(key, &item.key.user_key));
-            if new_key {
-                previous = Some(item.key.user_key.clone());
-            }
-            taken = self.take(&mut load, &mut cuts, &mut edges, item, new_key);
-            if taken.is_err() {
+    /// Records `now`, a slice that fits, as the last bound taken, and the
+    /// point past it grown as much again as it grew since the bound before,
+    /// or as much of that as fits, as the room keys take without a bound.
+    fn grow_room(&mut self, now: SliceMeasure) {
+        let mut step = Growth::between(&self.checked, &now);
+        let mut room = step.past(&now);
+        // A few halvings find most of the room left; past them a key takes
+        // a bound of its own, as every key does once the room is nearly used.
+        for _ in 0..8 {
+            if self.fits(&room) {
                 break;
             }
+            step = step.halved();
+            room = step.past(&now);
         }
-        self.held = held;
-        taken?;
-        Ok(load)
+        if !self.fits(&room) {
+            room = now.clone();
+        }
+        self.checked = now;
+        self.room = room;
     }
 
     /// Moves the held events below `upto` (all for `None`) to `ready`; they
@@ -351,15 +302,7 @@ impl<'a> SliceGovernor<'a> {
         self.ready.extend(self.held.drain(..at));
     }
 
-    /// Whether a slice writing `m` stays within the caps: its tables as the
-    /// probe bounds them, holding the input tombstones and linking the blob
-    /// files the relocation writes, one more on each cut key it passes and
-    /// each key domain past the first; and its relocated values, each output
-    /// blob file closing with its metadata and its first and last keys, a
-    /// file per target's worth of frames and, in each key domain the frames
-    /// lie in, one more for each codec and lifetime class they may go to. A
-    /// file of frames copied out of a source with a dictionary of its own
-    /// holds it as well. Every sum is bounded by the inputs' bytes.
+    /// Whether a slice writing `m` stays within the caps.
     fn fits(&self, m: &SliceMeasure) -> bool {
         let (tables, blobs) = self.bound(m);
         tables <= self.caps.tables && blobs <= self.caps.blobs && tables + blobs <= self.caps.total
@@ -377,7 +320,15 @@ impl<'a> SliceGovernor<'a> {
     }
 
     /// The bytes a slice writing `m` writes to its tables and to the blob
-    /// files (see [`Self::fits`]).
+    /// files: its tables as the probe bounds them, holding the input
+    /// tombstones and linking the blob files the relocation writes, one more
+    /// on each cut key it passes and each key domain past the first; and its
+    /// relocated values, each output blob file closing with its metadata and
+    /// its first and last keys, a file per target's worth of frames and, in
+    /// each key domain the frames lie in, one more for each codec and lifetime
+    /// class they may go to. A file of frames copied out of a source with a
+    /// dictionary of its own holds it as well. Every sum is bounded by the
+    /// inputs' bytes.
     fn bound(&self, m: &SliceMeasure) -> (u64, u64) {
         let (blobs, files) = match self.relocated {
             Some(relocated) if m.blobs > 0 => {
@@ -405,5 +356,153 @@ impl<'a> SliceGovernor<'a> {
             .probe
             .rewrite_bound(&rows, m.cut_keys + m.table_domains.max(1) - 1);
         (tables, blobs)
+    }
+}
+
+/// Whether a slice writing `m` writes no more than one writing `room`: every
+/// measure the bound grows with is at or below `room`'s.
+fn within(m: &SliceMeasure, room: &SliceMeasure) -> bool {
+    let (a, b) = (&m.rows, &room.rows);
+    // A missing bound is the widest: it is past any value it stands for.
+    let at_most = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(a), Some(b)) => a <= b,
+    };
+    a.entries <= b.entries
+        && a.key_bytes <= b.key_bytes
+        && a.value_bytes <= b.value_bytes
+        && a.filter_hashes <= b.filter_hashes
+        && a.longest_key <= b.longest_key
+        && at_most(a.longest_value, b.longest_value)
+        && a.highest_seqno <= b.highest_seqno
+        && at_most(a.entry_lengths, b.entry_lengths)
+        && a.range_tombstones <= b.range_tombstones
+        && a.range_tombstone_bytes <= b.range_tombstone_bytes
+        && a.linked_blob_files <= b.linked_blob_files
+        && a.owned_blob_objects <= b.owned_blob_objects
+        && match (a.cell_columns, b.cell_columns) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.count <= b.count && a.row_bytes <= b.row_bytes,
+            _ => false,
+        }
+        && m.cut_keys <= room.cut_keys
+        && m.blobs <= room.blobs
+        && m.dictionary_bytes <= room.dictionary_bytes
+        && m.table_domains <= room.table_domains
+        && m.blob_domains <= room.blob_domains
+}
+
+/// How much a slice grew between two bounds taken, in the measures that add
+/// up: what a point past the slice adds to it.
+#[derive(Clone, Copy)]
+struct Growth {
+    entries: u64,
+    key_bytes: u64,
+    value_bytes: u64,
+    filter_hashes: u64,
+    entry_lengths: u64,
+    linked_blob_files: u64,
+    owned_blob_objects: u64,
+    cut_keys: u64,
+    blobs: u64,
+    dictionary_bytes: u64,
+    table_domains: u64,
+    blob_domains: u64,
+}
+
+impl Growth {
+    /// What the slice grew by from `before` to `now`, which holds it.
+    fn between(before: &SliceMeasure, now: &SliceMeasure) -> Self {
+        let (b, n) = (&before.rows, &now.rows);
+        // Each measure of `now` is at least `before`'s: the slice only grew.
+        Self {
+            entries: n.entries - b.entries,
+            key_bytes: n.key_bytes - b.key_bytes,
+            value_bytes: n.value_bytes - b.value_bytes,
+            filter_hashes: n.filter_hashes - b.filter_hashes,
+            // A missing one is the widest already, and grows no further.
+            entry_lengths: match (b.entry_lengths, n.entry_lengths) {
+                (Some(b), Some(n)) => n - b,
+                _ => 0,
+            },
+            linked_blob_files: n.linked_blob_files - b.linked_blob_files,
+            owned_blob_objects: n.owned_blob_objects - b.owned_blob_objects,
+            cut_keys: now.cut_keys - before.cut_keys,
+            blobs: now.blobs - before.blobs,
+            dictionary_bytes: now.dictionary_bytes - before.dictionary_bytes,
+            table_domains: now.table_domains - before.table_domains,
+            blob_domains: now.blob_domains - before.blob_domains,
+        }
+    }
+
+    /// Half of it.
+    fn halved(self) -> Self {
+        Self {
+            entries: self.entries / 2,
+            key_bytes: self.key_bytes / 2,
+            value_bytes: self.value_bytes / 2,
+            filter_hashes: self.filter_hashes / 2,
+            entry_lengths: self.entry_lengths / 2,
+            linked_blob_files: self.linked_blob_files / 2,
+            owned_blob_objects: self.owned_blob_objects / 2,
+            cut_keys: self.cut_keys / 2,
+            blobs: self.blobs / 2,
+            dictionary_bytes: self.dictionary_bytes / 2,
+            table_domains: self.table_domains / 2,
+            blob_domains: self.blob_domains / 2,
+        }
+    }
+
+    /// The point past `now` it reaches. The longest key and value may
+    /// double, and the seqnos run to the last one whose varint is as long as
+    /// the highest's, which leaves the entries as long.
+    fn past(&self, now: &SliceMeasure) -> SliceMeasure {
+        let n = &now.rows;
+        // Each sum is bounded by the inputs' bytes and seqnos, far below
+        // `u64::MAX`, so doubling one does not overflow.
+        let rows = RewriteLoad {
+            entries: n.entries + self.entries,
+            key_bytes: n.key_bytes + self.key_bytes,
+            value_bytes: n.value_bytes + self.value_bytes,
+            filter_hashes: n.filter_hashes + self.filter_hashes,
+            longest_key: 2 * n.longest_key,
+            longest_value: n.longest_value.map(|longest| 2 * longest),
+            highest_seqno: same_width_seqno(n.highest_seqno),
+            entry_lengths: n.entry_lengths.map(|lengths| lengths + self.entry_lengths),
+            range_tombstones: n.range_tombstones,
+            range_tombstone_bytes: n.range_tombstone_bytes,
+            linked_blob_files: n.linked_blob_files + self.linked_blob_files,
+            owned_blob_objects: n.owned_blob_objects + self.owned_blob_objects,
+            cell_columns: n.cell_columns,
+        };
+        SliceMeasure {
+            rows,
+            cut_keys: now.cut_keys + self.cut_keys,
+            blobs: now.blobs + self.blobs,
+            dictionary_bytes: now.dictionary_bytes + self.dictionary_bytes,
+            table_domains: now.table_domains + self.table_domains,
+            blob_domains: now.blob_domains + self.blob_domains,
+        }
+    }
+}
+
+/// The highest seqno an entry stores in as many varint bytes as `seqno`: an
+/// entry stores `2 * seqno + 1`, seven bits a byte.
+fn same_width_seqno(seqno: u64) -> u64 {
+    let Some(stored) = seqno
+        .checked_mul(2)
+        .and_then(|doubled| doubled.checked_add(1))
+    else {
+        return u64::MAX;
+    };
+    let width = crate::table::writer::varint_len(stored);
+    match u32::try_from(7 * width)
+        .ok()
+        .and_then(|bits| 1u64.checked_shl(bits))
+    {
+        // `2 * s + 1 < 2^(7 * width)`, the largest such `s`.
+        Some(limit) => (limit - 2) / 2,
+        None => u64::MAX,
     }
 }

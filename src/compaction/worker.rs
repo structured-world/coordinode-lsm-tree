@@ -2174,6 +2174,7 @@ struct SliceLoad {
 /// bytes to the blob files, its dictionaries' bytes and how many key domains
 /// its keys and its relocated values lie in.
 #[cfg(feature = "std")]
+#[derive(Clone)]
 struct SliceMeasure {
     rows: crate::table::writer::RewriteLoad,
     cut_keys: u64,
@@ -3791,7 +3792,7 @@ fn run_subcompaction(
     }
     drop(merge_iter);
     if let Some(governor) = governor.as_deref_mut() {
-        governor.finish(&dropped)?;
+        governor.finish(&dropped);
         hand_on(governor, &ledger, &mut *emit)?;
     }
 
