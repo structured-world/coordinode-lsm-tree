@@ -227,6 +227,7 @@ pub(crate) const fn varint_len(value: u64) -> u64 {
 impl RewriteLoad {
     /// Takes in one entry of `key_len` and `value_len` bytes at `seqno`,
     /// registering `filter_hashes` hashes in its table's filter.
+    #[inline]
     pub(crate) fn take_entry(
         &mut self,
         key_len: u64,
