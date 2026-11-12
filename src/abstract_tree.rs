@@ -201,7 +201,9 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Computed from the live version's table + blob metadata plus one
     /// size-stat per live file; it reads data blocks only of a restricted
-    /// table in the largest level, past its restriction, for
+    /// table in the largest level, past its restriction, and, when the
+    /// outputs split cell rows into field columns, of a table there that
+    /// records no field columns, for
     /// [`StorageStats::full_compaction_bytes`](crate::StorageStats::full_compaction_bytes)
     /// to be what the compaction space check admits. The default
     /// implementation reports [`StorageStatus::Healthy`](crate::StorageStatus::Healthy);
@@ -234,8 +236,8 @@ pub trait AbstractTree: sealed::Sealed {
     /// # Errors
     ///
     /// Returns an error if a live file's size cannot be stat-ed, a table's
-    /// blob-link section cannot be read or parsed, or a block of such a
-    /// restricted table cannot be read.
+    /// blob-link section cannot be read or parsed, or a block of such a table
+    /// cannot be read.
     fn storage_stats(&self) -> crate::Result<crate::StorageStats>;
 
     /// Per-LSM-level and per-segment size + entry-count stats, for tiering and

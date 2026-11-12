@@ -8,11 +8,14 @@
 //! size-stat per live file (the same accounting `Tree::create_checkpoint`
 //! uses). The blob reference figures also read each table's blob-link
 //! section, once: the table keeps it after. The data blocks are read only for
-//! the full-compaction figure, and only those of a restricted table in the
-//! largest level past its restriction (a table a tight-space pass is cutting
-//! up), whose metadata records the whole file it was cut from: the figure is
-//! what the compaction space check admits, which reads them too, and a read
-//! error there is the call's error. See [`crate::AbstractTree::storage_stats`].
+//! the full-compaction figure, and only those of two kinds of table in the
+//! largest level: a restricted one past its restriction (a table a tight-space
+//! pass is cutting up), whose metadata records the whole file it was cut
+//! from; and, when the outputs split cell rows into field columns, one that
+//! records no field columns (written before columnar tables were switched on),
+//! whose rows hold them. The figure is what the compaction space check admits,
+//! which reads them too, and a read error there is the call's error. See
+//! [`crate::AbstractTree::storage_stats`].
 
 use crate::version::Version;
 #[cfg(not(feature = "std"))]
@@ -111,7 +114,9 @@ pub struct StorageStats {
     /// while the inputs still exist: what the largest level's entries take
     /// rewritten into the last level, bounded from their uncompressed bytes
     /// under that level's settings as the compaction space check bounds them
-    /// (a restricted table's rows past its restriction read for them), and
+    /// (a restricted table's rows past its restriction, and those of a table
+    /// recording no field columns when the outputs split cell rows, read for
+    /// them; see the module docs), and
     /// the stale blob files a tree that separates values relocates. Whether
     /// a full compaction has room is [`Self::status`]: the space check weighs
     /// each volume it writes to against its own free space, while
@@ -847,8 +852,8 @@ pub trait StorageStatistics {
     /// # Errors
     ///
     /// Returns an error if a live file's size cannot be stat-ed, a table's
-    /// blob-link section cannot be read or parsed, or a block of a restricted
-    /// table in the largest level cannot be read (see the module docs).
+    /// blob-link section cannot be read or parsed, or a block of a table the
+    /// full-compaction figure reads cannot be read (see the module docs).
     fn storage_stats(&self) -> crate::Result<StorageStats>;
 
     /// Per-LSM-level and per-segment size + entry-count stats, for tiering and

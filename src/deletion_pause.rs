@@ -468,7 +468,7 @@ impl DeletionPause {
     }
 
     /// Whether any reclaim is still waiting for its file to stop being shared.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     pub(crate) fn has_pending_reclaims(&self) -> bool {
         !self.pending_reclaims.lock().is_empty()
     }
