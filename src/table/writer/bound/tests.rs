@@ -183,6 +183,57 @@ fn the_rewrite_bound_holds_for_rows_written_as_cells() -> crate::Result<()> {
     Ok(())
 }
 
+/// A row taken past the columns a slice already holds takes only what widens
+/// them: a column the slice holds at least as wide is not taken again, and a
+/// new column, a wider type or the first references column is, and reported.
+/// A slice decides from that report whether a row changes its bound.
+#[test]
+fn a_row_taken_past_known_columns_takes_only_what_widens_them() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, TypeTag, encode_row};
+
+    let narrow = [1u8; 4];
+    let wide = [2u8; 8];
+    fn fixed(column: u16, cell: &[u8]) -> crate::Result<RowField<'_>> {
+        let width = u8::try_from(cell.len()).map_err(|_| crate::Error::Unrecoverable)?;
+        Ok(RowField {
+            column,
+            tag: TypeTag::Fixed(width),
+            cell: RowCell::Value(cell),
+        })
+    }
+    let known_row = encode_row(&[
+        RowField::bytes(3, RowCell::Value(b"note")),
+        fixed(4, &narrow)?,
+    ])?;
+    let mut known = CellShapes::default();
+    known.take_row(&known_row);
+
+    let mut more = CellShapes::default();
+    assert!(
+        !more.take_row_past(&known_row, &known),
+        "a row of the known columns widens nothing",
+    );
+    assert_eq!(more, CellShapes::default(), "and takes nothing in");
+
+    let wider = encode_row(&[fixed(4, &wide)?])?;
+    assert!(more.take_row_past(&wider, &known), "a wider type widens");
+    let other = encode_row(&[fixed(9, &narrow)?])?;
+    assert!(more.take_row_past(&other, &known), "a new column widens");
+    assert!(
+        !more.take_row_past(&other, &known),
+        "a column taken once is not reported again",
+    );
+
+    let mut both = known.clone();
+    both.absorb(&more);
+    let mut all = CellShapes::default();
+    for row in [&known_row, &wider, &other] {
+        all.take_row(row);
+    }
+    assert_eq!(both, all, "what a row past known takes is what it adds");
+    Ok(())
+}
+
 /// The bound holds for each setting that changes what a table takes: the
 /// codecs, encryption, parity, per-KV checksums, hash index, sections and a
 /// partitioned index and filter, alone and together, over values no codec

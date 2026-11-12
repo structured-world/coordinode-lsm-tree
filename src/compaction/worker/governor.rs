@@ -12,11 +12,16 @@
 //! and the writer as the merge emits them, a key late: a carry plan copies
 //! the input groups whose rows come out as read.
 //!
-//! What a slice writes only grows with the keys it takes, so the bound is
-//! not taken at every key. At each bound taken the governor also checks a
-//! point past the slice so far, grown as much again as it grew since the
-//! bound before; a key that keeps the slice within that point, in every
-//! measure the bound grows with, fits without a bound of its own.
+//! The bound is not taken at every key. Each bound taken also proves a quota:
+//! a cost the slice may add on top of what it holds and still fit, where an
+//! entry costs at least its key, value, filter hashes, length varints, owned
+//! objects and relocated bytes, each of which grows the bound no faster.
+//! A key that leaves the slice within its quota, with no key, value or seqno
+//! past the widths the quota was proven for and nothing the bound counts once
+//! per kind (a blob file it links, a field column, a key domain, a cut key, a
+//! source dictionary) new, is handed on with a sum and a comparison. Only a
+//! key past the quota takes a bound of its own, as every key does once the
+//! room is nearly used.
 //!
 //! A dropped version is handed on in the merge's order with the keys around
 //! it: the ownership ledger settles a key's blob objects from its dropped
@@ -26,10 +31,14 @@ use super::{
     BLOB_META_BYTES, DomainEdge, Relocated, SliceCaps, SliceLoad, SliceMeasure, SliceOutputs,
     enter_domain, take_entry,
 };
-use crate::table::writer::RewriteLoad;
+use crate::table::writer::{RewriteLoad, varint_len};
 use crate::{InternalValue, UserKey};
 use alloc::vec::Vec;
 use core::cell::RefCell;
+
+/// What an entry costs besides its bytes: the most the entries counted by the
+/// bound grow for a cost of this much.
+const ENTRY_COST: u64 = 16;
 
 /// What a slice's merge hands on, in its order.
 pub(super) enum Event {
@@ -57,6 +66,15 @@ impl crate::compaction::stream::DroppedKvCallback for DropQueue<'_> {
     }
 }
 
+/// The widths a quota was proven for: the longest key and value (`None`
+/// for a value of any length) and the highest seqno a key may bring and
+/// still be handed on without a bound.
+struct Widths {
+    key: u64,
+    value: Option<u64>,
+    seqno: u64,
+}
+
 /// Decides how far a tight-space slice's merge writes (see the module docs).
 pub(super) struct SliceGovernor<'a> {
     caps: SliceCaps,
@@ -67,18 +85,19 @@ pub(super) struct SliceGovernor<'a> {
     hashes_read_keys: bool,
     /// What the keys handed on write.
     committed: SliceLoad,
-    /// Whether a key was handed on.
-    any_committed: bool,
-    /// The slice as it stood at the last bound taken, and the point past it
-    /// known to fit.
-    checked: SliceMeasure,
-    room: SliceMeasure,
+    /// The cost the slice may add past the last bound taken and still fit,
+    /// what it added since, and the widths the quota holds for.
+    quota: u64,
+    spent: u64,
+    widths: Widths,
     /// The longest key seen.
     longest_key: u64,
-    /// The key being merged, what its rows write, and the cut keys it passes.
+    /// The key being merged, what its rows write, the cut keys it passes,
+    /// and whether it brings what the quota does not cover.
     key: Option<UserKey>,
     load: SliceLoad,
     key_cuts: usize,
+    past_quota: bool,
     edges: (DomainEdge, DomainEdge),
     /// What the merge handed over of the key being merged, with the versions
     /// dropped since the key before.
@@ -106,7 +125,6 @@ impl<'a> SliceGovernor<'a> {
                 .cut_keys
                 .partition_point(|cut| cmp.compare(cut, from) == core::cmp::Ordering::Less)
         });
-        let empty = SliceLoad::default().measure_with(&SliceLoad::default(), relocated);
         Self {
             caps,
             outputs,
@@ -115,13 +133,19 @@ impl<'a> SliceGovernor<'a> {
             split_cells: outputs.probe.splits_cells(),
             hashes_read_keys: outputs.probe.hashes_read_keys(),
             committed: SliceLoad::default(),
-            any_committed: false,
-            checked: empty.clone(),
-            room: empty,
+            // No bound taken yet: the first key takes one.
+            quota: 0,
+            spent: 0,
+            widths: Widths {
+                key: 0,
+                value: Some(0),
+                seqno: 0,
+            },
             longest_key: 0,
             key: None,
             load: SliceLoad::default(),
             key_cuts: cuts,
+            past_quota: false,
             edges: (DomainEdge::Unseen, DomainEdge::Unseen),
             held: Vec::new(),
             ready: Vec::new(),
@@ -137,7 +161,12 @@ impl<'a> SliceGovernor<'a> {
 
     /// Whether the slice took no key: its room holds not even its first.
     pub(super) fn took_nothing(&self) -> bool {
-        !self.any_committed
+        !self.any_committed()
+    }
+
+    /// Whether a key was handed on: every key holds a kept entry.
+    fn any_committed(&self) -> bool {
+        self.committed.rows.entries > 0
     }
 
     /// What may be handed on, in order.
@@ -198,7 +227,9 @@ impl<'a> SliceGovernor<'a> {
     fn take(&mut self, item: &InternalValue, new_key: bool) -> crate::Result<()> {
         let cmp = self.comparator.as_ref();
         let key = &item.key.user_key;
-        self.longest_key = self.longest_key.max(key.len() as u64);
+        let key_len = key.len() as u64;
+        let value_len = item.value.len() as u64;
+        self.longest_key = self.longest_key.max(key_len);
         if new_key {
             while self
                 .outputs
@@ -208,6 +239,7 @@ impl<'a> SliceGovernor<'a> {
             {
                 self.load.cut_keys += 1;
                 self.key_cuts += 1;
+                self.past_quota = true;
             }
         }
         let hashes = if self.hashes_read_keys {
@@ -215,9 +247,11 @@ impl<'a> SliceGovernor<'a> {
         } else {
             1
         };
+        let owned = self.load.rows.owned_blob_objects;
         let mut dictionaries = Vec::new();
-        let blobs = take_entry(
+        let (blobs, grew) = take_entry(
             &mut self.load,
+            &self.committed,
             (item.key.value_type, item.key.seqno, key.len(), &item.value),
             hashes,
             self.split_cells,
@@ -226,14 +260,39 @@ impl<'a> SliceGovernor<'a> {
         )?;
         self.load.blobs += blobs;
         for source in dictionaries {
-            self.load.add_dictionary(source, self.relocated);
+            if !self.committed.dictionaries.contains(&source)
+                && !self.load.dictionaries.contains(&source)
+            {
+                self.load.add_dictionary(source, self.relocated);
+                self.past_quota = true;
+            }
         }
         if let Some(domains) = self.outputs.domains {
             let (table_end, blob_end) = &mut self.edges;
+            let seen = (self.load.table_domains.len(), self.load.blob_domains.len());
             enter_domain(domains, cmp, table_end, &mut self.load.table_domains, key);
             if blobs > 0 {
                 enter_domain(domains, cmp, blob_end, &mut self.load.blob_domains, key);
             }
+            if (self.load.table_domains.len(), self.load.blob_domains.len()) != seen {
+                self.past_quota = true;
+            }
+        }
+        // Each sum is bounded by the inputs' bytes and objects.
+        self.spent += ENTRY_COST
+            + key_len
+            + value_len
+            + hashes
+            + 2 * varint_len(key_len)
+            + varint_len(value_len)
+            + (self.load.rows.owned_blob_objects - owned)
+            + blobs;
+        if grew
+            || key_len > self.widths.key
+            || self.widths.value.is_some_and(|width| value_len > width)
+            || item.key.seqno > self.widths.seqno
+        {
+            self.past_quota = true;
         }
         Ok(())
     }
@@ -242,51 +301,58 @@ impl<'a> SliceGovernor<'a> {
     /// of them for `None`), when the slice with it fits, `true`; otherwise
     /// ends the slice before the key, `false`.
     fn settle(&mut self, upto: Option<&UserKey>) -> bool {
-        let with = self.committed.measure_with(&self.load, self.relocated);
-        let fits = within(&with, &self.room) || {
-            let fits = self.fits(&with);
-            if fits {
-                self.grow_room(with);
+        if self.past_quota || self.spent > self.quota {
+            let with = self.committed.measure_with(&self.load, self.relocated);
+            if !self.fits(&with) {
+                let end = self.key.take();
+                if self.any_committed() {
+                    // The versions dropped below the key are this slice's.
+                    self.hand_on_below(end.as_ref());
+                }
+                self.held.clear();
+                self.end = end;
+                return false;
             }
-            fits
-        };
-        if !fits {
-            let end = self.key.take();
-            if self.any_committed {
-                // The versions dropped below the key are this slice's.
-                self.hand_on_below(end.as_ref());
-            }
-            self.held.clear();
-            self.end = end;
-            return false;
+            self.prove_quota(&with);
         }
         let load = core::mem::take(&mut self.load);
         self.committed.absorb(&load, self.relocated);
-        self.any_committed = true;
+        self.past_quota = false;
         self.hand_on_below(upto);
         true
     }
 
-    /// Records `now`, a slice that fits, as the last bound taken, and the
-    /// point past it grown as much again as it grew since the bound before,
-    /// or as much of that as fits, as the room keys take without a bound.
-    fn grow_room(&mut self, now: SliceMeasure) {
-        let mut step = Growth::between(&self.checked, &now);
-        let mut room = step.past(&now);
-        // A few halvings find most of the room left; past them a key takes
-        // a bound of its own, as every key does once the room is nearly used.
-        for _ in 0..8 {
-            if self.fits(&room) {
-                break;
-            }
-            step = step.halved();
-            room = step.past(&now);
+    /// Takes `now`, a slice that fits, as the last bound: the quota is a cost
+    /// a slice past `now` adds and still fits, the larger of the quota before
+    /// and twice the cost spent since, halved as often as needed. A quota used
+    /// up doubles while the room lasts, so the bounds taken grow as the
+    /// logarithm of the keys, and it stays within twice what the slice spent
+    /// between two bounds.
+    fn prove_quota(&mut self, now: &SliceMeasure) {
+        let widths = Widths {
+            key: 2 * now.rows.longest_key,
+            value: match now.rows.longest_value {
+                Some(longest) => Some(2 * longest),
+                None if now.rows.entries == 0 => Some(0),
+                None => None,
+            },
+            seqno: same_width_seqno(now.rows.highest_seqno),
+        };
+        // Bounded by twice the cost of the keys taken, far below `u64::MAX`.
+        // No quota past a cap fits: a cost of `q` adds `q` bytes of keys to
+        // the tables and `q` bytes to the blob files.
+        let mut quota = self
+            .quota
+            .max(2 * self.spent)
+            .min(self.caps.tables)
+            .min(self.caps.blobs)
+            .min(self.caps.total / 2);
+        while quota > 0 && !self.fits(&past(now, quota, &widths)) {
+            quota /= 2;
         }
-        if !self.fits(&room) {
-            room = now.clone();
-        }
-        self.checked = now;
-        self.room = room;
+        self.quota = quota;
+        self.spent = 0;
+        self.widths = widths;
     }
 
     /// Moves the held events below `upto` (all for `None`) to `ready`; they
@@ -340,8 +406,10 @@ impl<'a> SliceGovernor<'a> {
                 } else {
                     0
                 };
+                // A quota proven for longer keys bounds them by its width.
+                let longest_key = self.longest_key.max(m.rows.longest_key);
                 let bytes = m.blobs
-                    + files * (BLOB_META_BYTES + 2 * self.longest_key)
+                    + files * (BLOB_META_BYTES + 2 * longest_key)
                     + (m.dictionary_bytes + fresh) * relocated.groups * domains
                     + split * relocated.largest_dictionary;
                 (bytes, files)
@@ -359,131 +427,44 @@ impl<'a> SliceGovernor<'a> {
     }
 }
 
-/// Whether a slice writing `m` writes no more than one writing `room`: every
-/// measure the bound grows with is at or below `room`'s.
-fn within(m: &SliceMeasure, room: &SliceMeasure) -> bool {
-    let (a, b) = (&m.rows, &room.rows);
-    // A missing bound is the widest: it is past any value it stands for.
-    let at_most = |a: Option<u64>, b: Option<u64>| match (a, b) {
-        (_, None) => true,
-        (None, Some(_)) => false,
-        (Some(a), Some(b)) => a <= b,
+/// The most a slice writing `now` writes once it adds a cost of `quota`
+/// with keys, values and seqnos within `widths`: each measure an entry's
+/// cost counts grows by the quota at most, the entries by a share of it, and
+/// the rest stays as it is.
+fn past(now: &SliceMeasure, quota: u64, widths: &Widths) -> SliceMeasure {
+    let n = &now.rows;
+    // Each sum is bounded by the caps, far below `u64::MAX`.
+    let entries = quota / ENTRY_COST;
+    let rows = RewriteLoad {
+        entries: n.entries + entries,
+        key_bytes: n.key_bytes + quota,
+        value_bytes: n.value_bytes + quota,
+        filter_hashes: n.filter_hashes + quota,
+        longest_key: n.longest_key.max(widths.key),
+        longest_value: match (n.longest_value, widths.value) {
+            (Some(longest), Some(width)) => Some(longest.max(width)),
+            (None, Some(width)) if n.entries == 0 => Some(width),
+            _ => None,
+        },
+        highest_seqno: n.highest_seqno.max(widths.seqno),
+        entry_lengths: match n.entry_lengths {
+            Some(lengths) => Some(lengths + quota),
+            None if n.entries == 0 => Some(quota),
+            None => None,
+        },
+        range_tombstones: n.range_tombstones,
+        range_tombstone_bytes: n.range_tombstone_bytes,
+        linked_blob_files: n.linked_blob_files,
+        owned_blob_objects: n.owned_blob_objects + quota,
+        cell_columns: n.cell_columns,
     };
-    a.entries <= b.entries
-        && a.key_bytes <= b.key_bytes
-        && a.value_bytes <= b.value_bytes
-        && a.filter_hashes <= b.filter_hashes
-        && a.longest_key <= b.longest_key
-        && at_most(a.longest_value, b.longest_value)
-        && a.highest_seqno <= b.highest_seqno
-        && at_most(a.entry_lengths, b.entry_lengths)
-        && a.range_tombstones <= b.range_tombstones
-        && a.range_tombstone_bytes <= b.range_tombstone_bytes
-        && a.linked_blob_files <= b.linked_blob_files
-        && a.owned_blob_objects <= b.owned_blob_objects
-        && match (a.cell_columns, b.cell_columns) {
-            (None, None) => true,
-            (Some(a), Some(b)) => a.count <= b.count && a.row_bytes <= b.row_bytes,
-            _ => false,
-        }
-        && m.cut_keys <= room.cut_keys
-        && m.blobs <= room.blobs
-        && m.dictionary_bytes <= room.dictionary_bytes
-        && m.table_domains <= room.table_domains
-        && m.blob_domains <= room.blob_domains
-}
-
-/// How much a slice grew between two bounds taken, in the measures that add
-/// up: what a point past the slice adds to it.
-#[derive(Clone, Copy)]
-struct Growth {
-    entries: u64,
-    key_bytes: u64,
-    value_bytes: u64,
-    filter_hashes: u64,
-    entry_lengths: u64,
-    linked_blob_files: u64,
-    owned_blob_objects: u64,
-    cut_keys: u64,
-    blobs: u64,
-    dictionary_bytes: u64,
-    table_domains: u64,
-    blob_domains: u64,
-}
-
-impl Growth {
-    /// What the slice grew by from `before` to `now`, which holds it.
-    fn between(before: &SliceMeasure, now: &SliceMeasure) -> Self {
-        let (b, n) = (&before.rows, &now.rows);
-        // Each measure of `now` is at least `before`'s: the slice only grew.
-        Self {
-            entries: n.entries - b.entries,
-            key_bytes: n.key_bytes - b.key_bytes,
-            value_bytes: n.value_bytes - b.value_bytes,
-            filter_hashes: n.filter_hashes - b.filter_hashes,
-            // A missing one is the widest already, and grows no further.
-            entry_lengths: match (b.entry_lengths, n.entry_lengths) {
-                (Some(b), Some(n)) => n - b,
-                _ => 0,
-            },
-            linked_blob_files: n.linked_blob_files - b.linked_blob_files,
-            owned_blob_objects: n.owned_blob_objects - b.owned_blob_objects,
-            cut_keys: now.cut_keys - before.cut_keys,
-            blobs: now.blobs - before.blobs,
-            dictionary_bytes: now.dictionary_bytes - before.dictionary_bytes,
-            table_domains: now.table_domains - before.table_domains,
-            blob_domains: now.blob_domains - before.blob_domains,
-        }
-    }
-
-    /// Half of it.
-    fn halved(self) -> Self {
-        Self {
-            entries: self.entries / 2,
-            key_bytes: self.key_bytes / 2,
-            value_bytes: self.value_bytes / 2,
-            filter_hashes: self.filter_hashes / 2,
-            entry_lengths: self.entry_lengths / 2,
-            linked_blob_files: self.linked_blob_files / 2,
-            owned_blob_objects: self.owned_blob_objects / 2,
-            cut_keys: self.cut_keys / 2,
-            blobs: self.blobs / 2,
-            dictionary_bytes: self.dictionary_bytes / 2,
-            table_domains: self.table_domains / 2,
-            blob_domains: self.blob_domains / 2,
-        }
-    }
-
-    /// The point past `now` it reaches. The longest key and value may
-    /// double, and the seqnos run to the last one whose varint is as long as
-    /// the highest's, which leaves the entries as long.
-    fn past(&self, now: &SliceMeasure) -> SliceMeasure {
-        let n = &now.rows;
-        // Each sum is bounded by the inputs' bytes and seqnos, far below
-        // `u64::MAX`, so doubling one does not overflow.
-        let rows = RewriteLoad {
-            entries: n.entries + self.entries,
-            key_bytes: n.key_bytes + self.key_bytes,
-            value_bytes: n.value_bytes + self.value_bytes,
-            filter_hashes: n.filter_hashes + self.filter_hashes,
-            longest_key: 2 * n.longest_key,
-            longest_value: n.longest_value.map(|longest| 2 * longest),
-            highest_seqno: same_width_seqno(n.highest_seqno),
-            entry_lengths: n.entry_lengths.map(|lengths| lengths + self.entry_lengths),
-            range_tombstones: n.range_tombstones,
-            range_tombstone_bytes: n.range_tombstone_bytes,
-            linked_blob_files: n.linked_blob_files + self.linked_blob_files,
-            owned_blob_objects: n.owned_blob_objects + self.owned_blob_objects,
-            cell_columns: n.cell_columns,
-        };
-        SliceMeasure {
-            rows,
-            cut_keys: now.cut_keys + self.cut_keys,
-            blobs: now.blobs + self.blobs,
-            dictionary_bytes: now.dictionary_bytes + self.dictionary_bytes,
-            table_domains: now.table_domains + self.table_domains,
-            blob_domains: now.blob_domains + self.blob_domains,
-        }
+    SliceMeasure {
+        rows,
+        cut_keys: now.cut_keys,
+        blobs: now.blobs + quota,
+        dictionary_bytes: now.dictionary_bytes,
+        table_domains: now.table_domains,
+        blob_domains: now.blob_domains,
     }
 }
 
@@ -496,7 +477,7 @@ fn same_width_seqno(seqno: u64) -> u64 {
     else {
         return u64::MAX;
     };
-    let width = crate::table::writer::varint_len(stored);
+    let width = varint_len(stored);
     match u32::try_from(7 * width)
         .ok()
         .and_then(|bits| 1u64.checked_shl(bits))

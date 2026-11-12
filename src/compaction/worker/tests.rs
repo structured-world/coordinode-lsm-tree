@@ -6205,9 +6205,11 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
     let mut dictionaries = Vec::new();
     let mut load = super::SliceLoad::default();
+    let nothing = super::SliceLoad::default();
     assert_eq!(
         super::take_entry(
             &mut load,
+            &nothing,
             (
                 item.key.value_type,
                 item.key.seqno,
@@ -6219,7 +6221,11 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
             Some(&relocated),
             &mut dictionaries
         )?,
-        super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
+        (
+            super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
+            true
+        ),
+        "the row links blob files the slice does not link yet",
     );
     assert_eq!(
         dictionaries,
@@ -6240,6 +6246,7 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     assert_eq!(
         super::take_entry(
             &mut load,
+            &nothing,
             (
                 plain.key.value_type,
                 plain.key.seqno,
@@ -6251,8 +6258,33 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
             Some(&relocated),
             &mut Vec::new()
         )?,
-        0
+        (0, false)
     );
+
+    // On top of a slice that links both files already, the row links
+    // nothing new: the slice's bound counts each file once.
+    let mut more = super::SliceLoad::default();
+    assert_eq!(
+        super::take_entry(
+            &mut more,
+            &load,
+            (
+                item.key.value_type,
+                item.key.seqno,
+                item.key.user_key.len(),
+                &item.value
+            ),
+            1,
+            false,
+            Some(&relocated),
+            &mut Vec::new()
+        )?,
+        (
+            super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
+            false
+        ),
+    );
+    assert!(more.links.is_empty(), "a known link is not taken again");
     Ok(())
 }
 

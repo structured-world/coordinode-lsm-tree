@@ -2186,32 +2186,38 @@ struct SliceMeasure {
 
 /// What an entry read off an input, of `value_type` at `seqno` with a user
 /// key of `key_len` bytes and `value`, puts into the slice `load` takes it
-/// into: an entry of its tables, registering `filter_hashes` hashes, the field
-/// columns of a cell row when the outputs split those (`split_cells`), the blob
-/// files its value or references point into and, as owned, every object its
-/// cells reference; and, in
-/// a relocating pass, the bytes the frames it points at in the files
-/// `relocated` moves take as it writes them, which it returns. Each of those
-/// files holding a dictionary of its own goes into `dictionaries`, the sources
-/// whose dictionary the copy may hold.
+/// into on top of `known`, what the slice holds already: an entry of its
+/// tables, registering `filter_hashes` hashes, the field columns of a cell row
+/// when the outputs split those (`split_cells`), the blob files its value or
+/// references point into and, as owned, every object its cells reference;
+/// and, in a relocating pass, the bytes the frames it points at in the files
+/// `relocated` moves take as it writes them. Columns and blob files `known`
+/// holds are not taken again. Each of those files holding a dictionary of its
+/// own goes into `dictionaries`, the sources whose dictionary the copy may
+/// hold. Returns the bytes to the blob files, and whether the entry opened a
+/// column or linked a blob file `known` does not hold.
 #[cfg(feature = "std")]
 fn take_entry(
     load: &mut SliceLoad,
+    known: &SliceLoad,
     (value_type, seqno, key_len, value): (crate::ValueType, crate::SeqNo, usize, &[u8]),
     filter_hashes: u64,
     split_cells: bool,
     relocated: Option<&Relocated>,
     dictionaries: &mut Vec<BlobFileId>,
-) -> crate::Result<u64> {
+) -> crate::Result<(u64, bool)> {
     use crate::blob_tree::field_row::{RowCell, decode_row};
     use crate::blob_tree::handle::BlobIndirection;
     use crate::coding::Decode;
 
     load.rows
         .take_entry(key_len as u64, value.len() as u64, seqno, filter_hashes);
+    let mut grew = false;
     let mut reference = |links: &mut HashSet<BlobFileId>, indirection: &BlobIndirection| {
         let source = indirection.vhandle.blob_file_id;
-        links.insert(source);
+        if !known.links.contains(&source) && links.insert(source) {
+            grew = true;
+        }
         let Some(relocated) = relocated.filter(|r| r.stale.contains(&source)) else {
             return 0;
         };
@@ -2222,12 +2228,10 @@ fn take_entry(
     };
     if value_type.is_indirection() {
         let indirection = BlobIndirection::decode_from(&mut &value[..])?;
-        return Ok(reference(&mut load.links, &indirection));
+        let bytes = reference(&mut load.links, &indirection);
+        return Ok((bytes, grew));
     }
     if value_type.is_cell_row() {
-        if split_cells {
-            load.cells.take_row(value);
-        }
         let mut bytes = 0;
         for field in decode_row(value)? {
             // Every reference counts as owned: the end of its key may pass a
@@ -2237,9 +2241,10 @@ fn take_entry(
                 load.rows.owned_blob_objects += 1;
             }
         }
-        return Ok(bytes);
+        let opened = split_cells && load.cells.take_row_past(value, &known.cells);
+        return Ok((bytes, grew || opened));
     }
-    Ok(0)
+    Ok((0, false))
 }
 
 #[cfg(feature = "std")]

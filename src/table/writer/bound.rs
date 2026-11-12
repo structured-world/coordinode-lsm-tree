@@ -90,28 +90,47 @@ impl CellShapes {
     /// per field) without its cells; a value whose header does not parse is
     /// kept whole and opens no column.
     pub(crate) fn take_row(&mut self, value: &[u8]) {
+        self.take_row_past(value, &Self::default());
+    }
+
+    /// Takes in what the cell row `value` names that `known` does not hold
+    /// already, as [`Self::take_row`] reads it; `true` when any of it was
+    /// taken, which widens a group holding the rows of both.
+    pub(crate) fn take_row_past(&mut self, value: &[u8], known: &Self) -> bool {
         let Some((count, rest)) = value.split_first_chunk::<2>() else {
-            return;
+            return false;
         };
         let count = usize::from(u16::from_le_bytes(*count));
         let bitmap = count.div_ceil(8);
         let Some((refs, rest)) = rest.split_at_checked(bitmap) else {
-            return;
+            return false;
         };
         let Some(descriptors) = rest.get(bitmap..).and_then(|rest| rest.get(..count * 4)) else {
-            return;
+            return false;
         };
+        let mut grew = false;
         for (field, descriptor) in descriptors.as_chunks::<4>().0.iter().enumerate() {
             let [c0, c1, _, width] = *descriptor;
             if refs
                 .get(field / 8)
                 .is_some_and(|byte| byte & (1 << (field % 8)) != 0)
             {
-                self.refs = true;
+                if !known.refs && !self.refs {
+                    self.refs = true;
+                    grew = true;
+                }
             } else {
-                self.take_column(u16::from_le_bytes([c0, c1]), width);
+                let column = u16::from_le_bytes([c0, c1]);
+                let wide = if width == 0 { BYTES_OFFSET } else { width };
+                if known.widths.get(&column).is_none_or(|&had| had < wide)
+                    && self.widths.get(&column).is_none_or(|&had| had < wide)
+                {
+                    self.take_column(column, width);
+                    grew = true;
+                }
             }
         }
+        grew
     }
 
     /// Takes in the field column `column` of a type of `width` bytes, `0`
