@@ -5268,7 +5268,7 @@ impl crate::MergeOperator for SetMerge {
         base_value: Option<&[u8]>,
         operands: &[&[u8]],
     ) -> crate::Result<crate::UserValue> {
-        let mut set: Vec<u8> = base_value.map(<[u8]>::to_vec).unwrap_or_default();
+        let mut set: Vec<u8> = base_value.map_or_default(<[u8]>::to_vec);
         for operand in operands {
             match operand.split_first() {
                 Some((0x02, rest)) => set.retain(|m| !rest.contains(m)),
@@ -5327,17 +5327,13 @@ impl CompactionStrategy for MoveTables {
 /// Returns the ids of the tables currently on `level`, newest id first.
 fn table_ids_on_level(tree: &crate::Tree, level: usize) -> Vec<TableId> {
     let version = tree.version_history.read().latest_version();
-    let mut ids: Vec<TableId> = version
-        .version
-        .level(level)
-        .map(|level| {
-            level
-                .iter()
-                .flat_map(|run| run.iter())
-                .map(Table::id)
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut ids: Vec<TableId> = version.version.level(level).map_or_default(|level| {
+        level
+            .iter()
+            .flat_map(|run| run.iter())
+            .map(Table::id)
+            .collect()
+    });
     ids.sort_unstable_by(|a, b| b.cmp(a));
     ids
 }

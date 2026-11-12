@@ -26,7 +26,6 @@ rust-version = "1.99"
 readme = "README.md"
 include = ["src/**/*", "build.rs", "LICENSE-APACHE", "README.md", "CHANGELOG.md"]
 repository = "https://github.com/structured-world/coordinode-lsm-tree"
-homepage = "https://github.com/structured-world/coordinode-lsm-tree"
 documentation = "https://docs.rs/coordinode-lsm-tree"
 keywords = ["lsm-tree", "storage", "database", "embedded", "key-value"]
 categories = [
@@ -67,10 +66,12 @@ path = "src/lib.rs"
 default = ["std", "parallel", "io-uring"]
 std = [
     "dep:arc-swap",
+    "dep:libc",
     "dep:parking_lot",
     "dep:parking_lot_core",
     "dep:tempfile",
     "rustc-hash/std",
+    "dep:varint-rs",
     "varint-rs/std",
 ]
 # Parallel block-compression pipeline (default executor: rayon thread pool).
@@ -257,7 +258,9 @@ serde = { version = "1", optional = true, default-features = false, features = [
 # feature so the no-std build does not pull in `fastrand` (which
 # transitively does `extern crate std`).
 tempfile = { version = "3.20.0", optional = true }
-varint-rs = { version = "2.2.1", default-features = false }
+# Only the std build reads varints through it; without std the crate's own
+# `io` varints serve.
+varint-rs = { version = "2.2.1", default-features = false, optional = true }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # CRC32C (Castagnoli) for the optional `Crc32c` checksum algorithm.
 # Hardware-accelerated (SSE4.2 `_mm_crc32` on x86, CRC32 instructions on
@@ -323,8 +326,9 @@ syscalls = { version = "0.8", optional = true, default-features = false }
 #     `ioctl(FS_IOC_SETFLAGS|FS_NOCOW_FL)` CoW disable on Btrfs SSTs, and
 #     `sync_file_range` for incremental writeback.
 # libc provides the arch-correct struct layouts and ioctl constants that are
-# otherwise error-prone to hand-declare per architecture.
-libc = "0.2"
+# otherwise error-prone to hand-declare per architecture. Only the std
+# filesystem calls it.
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # Integration tests assemble their own wire fixtures with byteorder; the

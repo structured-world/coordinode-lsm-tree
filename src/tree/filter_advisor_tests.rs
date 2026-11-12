@@ -120,7 +120,7 @@ impl crate::MergeOperator for Concat {
         base: Option<&[u8]>,
         operands: &[&[u8]],
     ) -> crate::Result<crate::UserValue> {
-        let mut merged = base.map(<[u8]>::to_vec).unwrap_or_default();
+        let mut merged = base.map_or_default(<[u8]>::to_vec);
         for operand in operands {
             merged.extend_from_slice(operand);
         }

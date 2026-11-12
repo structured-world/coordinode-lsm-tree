@@ -5563,7 +5563,7 @@ fn scan_table_folders(
                                         config,
                                         &output_path,
                                         salvaged,
-                                        restrict_bound.clone(),
+                                        restrict_bound,
                                         allow_resurrection,
                                     )?;
                                     keep_salvaged_replacement(

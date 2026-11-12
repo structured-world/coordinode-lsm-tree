@@ -1554,9 +1554,7 @@ impl MultiWriter {
         if self.first_output_key.is_none() {
             self.write_pieces_below_the_first_output()?;
         }
-        let gap = domain_end
-            .map(|end| self.tombstones_up_to_the_next_output(end))
-            .unwrap_or_default();
+        let gap = domain_end.map_or_default(|end| self.tombstones_up_to_the_next_output(end));
         let gap_writer = if gap.is_empty() {
             None
         } else {

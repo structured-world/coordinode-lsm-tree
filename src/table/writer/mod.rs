@@ -1756,8 +1756,7 @@ impl Writer {
             writing_below: self
                 .writing
                 .as_ref()
-                .map(crate::table::file_pool::Writing::below)
-                .unwrap_or_default(),
+                .map_or_default(crate::table::file_pool::Writing::below),
             range_tombstone_count,
             delete_bitmap_len: delete_bitmap.0,
             delete_bitmap_hash: delete_bitmap.1,
@@ -3864,7 +3863,7 @@ impl Writer {
     ///
     /// As [`Self::write_columnar_batch`], except a non-zero per-row seqno is
     /// accepted (it is stored as the row's sequence number).
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn write_columnar_block_verbatim(
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
@@ -4394,7 +4393,7 @@ impl Writer {
     /// before anything is written. Without a prebuilt filter it does nothing.
     /// A column batch is written whole, not entry by entry, so only it needs
     /// the count up front.
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn count_prebuilt_keys(
         &mut self,
         entries: &[InternalValue],

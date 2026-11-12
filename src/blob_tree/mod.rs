@@ -842,8 +842,7 @@ impl BlobTree {
             .blob_files
             .list_ids()
             .max()
-            .map(|x| x + 1)
-            .unwrap_or_default();
+            .map_or_default(|x| x + 1);
 
         index
             .0

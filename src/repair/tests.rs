@@ -13556,7 +13556,7 @@ fn a_failed_salvage_output_never_costs_the_source() -> crate::Result<()> {
 
         // The filesystem is healthy again: whatever the first attempt did, the
         // retry (or the open of what it committed) serves every intact value.
-        let tree = config(memfs.clone()).open_or_repair(crate::repair::RepairPolicy::default());
+        let tree = config(memfs).open_or_repair(crate::repair::RepairPolicy::default());
         let tree = match tree {
             Ok((tree, _)) => tree,
             Err(e) => panic!("skip={skip}: the tree does not open after {first:?}: {e:?}"),
@@ -13673,7 +13673,7 @@ fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Resu
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
             )
-            .with_shared_fs(memfs.clone())
+            .with_shared_fs(memfs)
             .with_kv_separation(Some(
                 KvSeparationOptions::default().separation_threshold(16),
             ))
@@ -14311,7 +14311,7 @@ fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
             )
-            .with_shared_fs(memfs.clone())
+            .with_shared_fs(memfs)
             .with_kv_separation(Some(
                 KvSeparationOptions::default().separation_threshold(16),
             ))
@@ -15442,8 +15442,7 @@ fn a_frame_index_past_the_file_is_refused_by_the_frontier_probe() -> crate::Resu
     let data_start = crate::sfa::Reader::new(&path)?
         .toc()
         .section(b"data")
-        .map(crate::sfa::TocEntry::pos)
-        .unwrap_or_default();
+        .map_or_default(crate::sfa::TocEntry::pos);
     {
         let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
         file.seek(SeekFrom::Start(data_start))?;

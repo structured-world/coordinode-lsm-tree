@@ -153,10 +153,10 @@ pub(crate) const MAX_COPY_SOURCES: usize = 16;
 #[cfg(zstd_any)]
 type OwnDictionary = alloc::sync::Arc<crate::compression::ZstdDictionary>;
 
-/// Without zstd no file holds a dictionary of its own.
+/// Without zstd no file holds a dictionary of its own: a type with no value.
 #[cfg(not(zstd_any))]
 #[derive(Clone)]
-enum OwnDictionary {}
+struct OwnDictionary(core::convert::Infallible);
 
 /// A parked output: its codec, class, the source of the blocks it copies,
 /// the dictionary of its own it holds, and its writer.

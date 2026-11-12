@@ -240,8 +240,7 @@ fn a_frame_index_off_the_data_section_is_unrecoverable() -> crate::Result<()> {
         let (pos, len) = reader
             .toc()
             .section(b"frames")
-            .map(|s| (s.pos(), s.len()))
-            .unwrap_or_default();
+            .map_or_default(|s| (s.pos(), s.len()));
         let bytes = std::fs::read(&path)?;
         let at = usize::try_from(pos).unwrap_or_default();
         let len = usize::try_from(len).unwrap_or_default();
@@ -846,8 +845,7 @@ fn a_damaged_duplicate_blob_copy_does_not_stop_the_open() -> crate::Result<()> {
             let pos = crate::sfa::Reader::new(&twin)?
                 .toc()
                 .section(b"dict")
-                .map(crate::sfa::TocEntry::pos)
-                .unwrap_or_default();
+                .map_or_default(crate::sfa::TocEntry::pos);
             let mut bytes = std::fs::read(&twin)?;
             let at = usize::try_from(pos).unwrap_or_default() + 16;
             bytes[at] ^= 0xFF;
@@ -891,8 +889,7 @@ fn a_damaged_duplicate_blob_copy_does_not_vouch_for_a_mismatched_one() -> crate:
     let data = crate::sfa::Reader::new(&canonical)?
         .toc()
         .section(b"data")
-        .map(crate::sfa::TocEntry::pos)
-        .unwrap_or_default();
+        .map_or_default(crate::sfa::TocEntry::pos);
     let mut bytes = std::fs::read(&canonical)?;
     let at = usize::try_from(data).unwrap_or_default() + 8;
     if let Some(byte) = bytes.get_mut(at) {

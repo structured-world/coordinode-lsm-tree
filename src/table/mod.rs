@@ -959,15 +959,14 @@ impl Table {
 
     #[must_use]
     pub fn filter_size(&self) -> u32 {
-        self.regions.filter.map(|x| x.size()).unwrap_or_default()
+        self.regions.filter.map_or_default(|x| x.size())
     }
 
     #[must_use]
     pub fn pinned_filter_size(&self) -> usize {
         self.pinned_filter_block
             .as_ref()
-            .map(FilterBlock::size)
-            .unwrap_or_default()
+            .map_or_default(FilterBlock::size)
     }
 
     /// Filter bytes held in memory now: the pinned filter, or the filter
@@ -1080,7 +1079,7 @@ impl Table {
     /// before masking. A present section with a missing hash (a table written
     /// before the field) cannot be authenticated → `false` (fail closed). A table
     /// with no delete-bitmap section has nothing to authenticate → `true`.
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn delete_bitmap_authenticated(&self) -> bool {
         if !self.has_delete_bitmap_section() {
             return true;
@@ -1758,7 +1757,7 @@ impl Table {
     ///
     /// `pub(crate)` for the salvage walk ([`crate::salvage`]). Salvage is
     /// maintenance, so nothing here is charged to the gather counter.
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn load_columnar_block_masked(
         &self,
         handle: &BlockHandle,
@@ -1833,7 +1832,7 @@ impl Table {
     /// `allow_delete_resurrection == false` — abort salvage, letting
     /// `repair_with_salvage` rebuild the manifest WITHOUT a table a retry (or
     /// the right key) could have recovered faithfully.
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn delete_positions_verified(&self) -> crate::Result<bool> {
         let Some(starts) = self.delete_block_starts.as_deref() else {
             // No materialized deletes: there is nothing to position.
@@ -2239,8 +2238,7 @@ impl Table {
         {
             self.block_layout
                 .ends_for(offset)
-                .map(<[u32]>::to_vec)
-                .unwrap_or_default()
+                .map_or_default(<[u32]>::to_vec)
         }
         #[cfg(not(feature = "zstd"))]
         {
@@ -8026,14 +8024,11 @@ impl Table {
     /// reconstruction). The chunked `multi_get` resolver reads these via
     /// [`Table::load_data_block`] instead of [`Table::decode_data_block_from_bytes`].
     pub(crate) fn is_chunk_special(&self) -> bool {
-        if self.metadata.ecc_params.is_some() {
-            return true;
-        }
         #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            return true;
-        }
-        false
+        let columnar = self.metadata.columnar;
+        #[cfg(not(feature = "columnar"))]
+        let columnar = false;
+        self.metadata.ecc_params.is_some() || columnar
     }
 
     /// Plans the data blocks [`Table::batch_get`] would read for `sorted_keys`

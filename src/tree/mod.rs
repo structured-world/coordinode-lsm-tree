@@ -1414,7 +1414,7 @@ impl AbstractTree for Tree {
         log::trace!(
             "Registering {} tables, {} blob files",
             tables.len(),
-            blob_files.map(<[BlobFile]>::len).unwrap_or_default(),
+            blob_files.map_or_default(<[BlobFile]>::len),
         );
 
         // Wire the tree-wide deletion pause into every fresh table / blob

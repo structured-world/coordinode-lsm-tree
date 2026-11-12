@@ -731,7 +731,7 @@ fn tail_hint_keeps_internal_key_order_under_mixed_inserts() {
             // Newer version of the tail key: same user key, higher seqno.
             // Sorts BEFORE the version just appended, so it is NOT a tail append.
             map.insert(&make_key(&key, 2), make_value(b"v2"));
-            expected.push((key.clone(), 2));
+            expected.push((key, 2));
         }
         if i % 11 == 5 {
             // A key below the current tail (out of order): full search path.

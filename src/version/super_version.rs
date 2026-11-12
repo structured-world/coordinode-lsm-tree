@@ -424,10 +424,7 @@ pub struct SuperVersions {
 
 /// The runs `version` holds in L0.
 fn l0_run_count(version: &Version) -> usize {
-    version
-        .level(0)
-        .map(|level| level.run_count())
-        .unwrap_or_default()
+    version.level(0).map_or_default(|level| level.run_count())
 }
 
 impl SuperVersions {

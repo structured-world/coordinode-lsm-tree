@@ -377,9 +377,7 @@ impl GroupCarry {
         // The rows go into the buffer of the group before last when no
         // candidate holds it any more, which is the usual case once the merge
         // has moved past it, so a long scan allocates no buffer per group.
-        let mut buffer = Arc::get_mut(&mut self.spare)
-            .map(core::mem::take)
-            .unwrap_or_default();
+        let mut buffer = Arc::get_mut(&mut self.spare).map_or_default(core::mem::take);
         buffer.clear();
         buffer.extend(rows);
         let read = buffer.len();

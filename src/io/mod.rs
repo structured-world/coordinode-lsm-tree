@@ -1051,12 +1051,14 @@ pub trait ByteOrder {
     }
 }
 
-/// Little-endian [`ByteOrder`] (matches `byteorder::LittleEndian`).
+/// Little-endian [`ByteOrder`] (matches `byteorder::LittleEndian`); a marker,
+/// never built.
 #[derive(Clone, Copy, Debug)]
-pub enum LittleEndian {}
-/// Big-endian [`ByteOrder`] (matches `byteorder::BigEndian`).
+pub struct LittleEndian(core::convert::Infallible);
+/// Big-endian [`ByteOrder`] (matches `byteorder::BigEndian`); a marker, never
+/// built.
 #[derive(Clone, Copy, Debug)]
-pub enum BigEndian {}
+pub struct BigEndian(core::convert::Infallible);
 
 /// Short alias for [`LittleEndian`] (matches `byteorder::LE`).
 pub type LE = LittleEndian;
