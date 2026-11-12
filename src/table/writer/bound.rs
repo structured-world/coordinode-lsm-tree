@@ -517,9 +517,14 @@ impl Writer {
         }
         if load.range_tombstones > 0 {
             // A table holds the pieces of the tombstones its keys meet, at
-            // most every tombstone.
+            // most every tombstone. A piece clipped to the table ends where
+            // the tombstone does or at a key of the outputs, at most a byte
+            // past the longest key (an exclusive end past the last one).
+            let clipped_ends = load.range_tombstones * 2 * (load.longest_key + 1);
             sections += tables
-                * (8 + load.range_tombstone_bytes + load.range_tombstones * RANGE_TOMBSTONE_HEADER);
+                * (8 + load.range_tombstone_bytes
+                    + clipped_ends
+                    + load.range_tombstones * RANGE_TOMBSTONE_HEADER);
         }
         if load.linked_blob_files > 0 {
             sections += tables
