@@ -1754,6 +1754,18 @@ impl Writer {
         }
     }
 
+    /// Measures the meta payload the estimates count again once the field
+    /// columns the table records grew past the `recorded` bytes they encoded
+    /// to: a group opening a column the table did not hold adds it to the
+    /// meta block. A column opens a few times per table at most.
+    #[cfg(feature = "columnar")]
+    fn remeasure_meta_if_grown(&mut self, recorded: usize) -> crate::Result<()> {
+        if self.cell_shapes.encoded_len() != recorded && self.meta_base_len.is_some() {
+            self.meta_base_len = Some(self.meta_payload_len_without_keys()?);
+        }
+        Ok(())
+    }
+
     /// Bytes of the meta block payload with empty key bounds, from above.
     ///
     /// Every other value it holds is fixed-width or fixed for the table once
@@ -3461,6 +3473,7 @@ impl Writer {
             .iter()
             .any(|c| c.column_id == crate::blob_tree::field_row::WHOLE_VALUE_COLUMN)
         {
+            let recorded = self.cell_shapes.encoded_len();
             for column in &batch.columns {
                 if column.column_id == crate::blob_tree::field_row::CELL_REFS_COLUMN {
                     self.cell_shapes.take_refs();
@@ -3469,6 +3482,7 @@ impl Writer {
                         .take_column(column.column_id, column.type_tag.to_wire().1);
                 }
             }
+            self.remeasure_meta_if_grown(recorded)?;
         }
         // A group copying another's pages keeps that group's tag, which every
         // copied page's stamp names.
@@ -4420,11 +4434,13 @@ impl Writer {
         // The columns a group of rows written as cells holds come from its
         // rows, which the copy does not decode into columns: read off their
         // headers. A table of whole values records none of them.
+        let recorded = self.cell_shapes.encoded_len();
         for row in entries {
             if row.key.value_type.is_cell_row() {
                 self.cell_shapes.take_row(&row.value);
             }
         }
+        self.remeasure_meta_if_grown(recorded)?;
         let first_key = self.append_verbatim_extent(
             (raw, source),
             uncompressed_length,

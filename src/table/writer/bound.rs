@@ -156,6 +156,13 @@ impl CellShapes {
         self.refs |= other.refs;
     }
 
+    /// The bytes [`Self::encode`] writes: a field column more grows them, a
+    /// wider type or the references column does not.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn encoded_len(&self) -> usize {
+        1 + 3 * self.widths.len()
+    }
+
     /// The wire form a table records: whether a references column is opened,
     /// then each field column as its little-endian id and the bytes it adds
     /// to a row.
