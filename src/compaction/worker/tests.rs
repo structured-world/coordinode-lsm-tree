@@ -6481,15 +6481,24 @@ pub(super) fn governed_from(
     ordered
         .sort_by(|a, b| comparator.compare(a.metadata.key_range.min(), b.metadata.key_range.min()));
     'feed: for table in ordered {
-        for item in table.scan()? {
+        let mut rows = table.scan()?.peekable();
+        while let Some(item) = rows.next() {
             let item = item?;
             if from.is_some_and(|from| {
                 comparator.compare(&item.key.user_key, from) == core::cmp::Ordering::Less
             }) {
                 continue;
             }
-            if !governor.offer(item, false, &dropped)? {
-                break 'feed;
+            // A row known to end its key, as the merge knows it: the next
+            // row of its table carries another. The last row of a table is
+            // not known to, and waits for the next.
+            let ends_key = matches!(
+                rows.peek(),
+                Some(Ok(next)) if !crate::comparator::same_user_key(&next.key.user_key, &item.key.user_key)
+            );
+            match governor.offer(item, false, ends_key, &dropped)? {
+                super::governor::Offered::Pass(..) | super::governor::Offered::Held => {}
+                super::governor::Offered::End => break 'feed,
             }
             while governor.pop_ready().is_some() {}
         }

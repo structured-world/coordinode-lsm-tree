@@ -99,6 +99,18 @@ impl Event {
     }
 }
 
+/// What becomes of a row offered to a slice's governor.
+pub(super) enum Offered {
+    /// The row, a whole key the slice keeps, to write now, and whether it is
+    /// known to start a key.
+    Pass(InternalValue, bool),
+    /// The row waits for its key to end.
+    Held,
+    /// The slice ends before the row's key, or the key before it: the merge
+    /// stops.
+    End,
+}
+
 /// Collects the versions a slice's merge drops, for the governor to place
 /// among its rows.
 pub(super) struct DropQueue<'q>(pub &'q RefCell<Vec<InternalValue>>);
@@ -290,12 +302,43 @@ impl<'a> SliceGovernor<'a> {
     }
 
     /// Takes `item`, a row the merge keeps, after the versions it dropped
-    /// before it (`dropped`). `false` once the slice ends: the merge stops.
+    /// before it (`dropped`); `ends_key` says the merge knows it is the last
+    /// row of its key.
+    ///
+    /// A row that is a whole key by itself, with nothing held or dropped
+    /// before it, is decided at once and comes back to be written; any other
+    /// is held until its key ends, and what may be written then is
+    /// [`Self::pop_ready`]'s.
     ///
     /// # Errors
     ///
     /// Returns an error when a row's value does not decode.
     pub(super) fn offer(
+        &mut self,
+        item: InternalValue,
+        starts_key: bool,
+        ends_key: bool,
+        dropped: &RefCell<Vec<InternalValue>>,
+    ) -> crate::Result<Offered> {
+        if ends_key && self.held.is_empty() && dropped.borrow().is_empty() {
+            self.before = KeyStart::of(&self.committed);
+            self.take(&item, true)?;
+            if self.keep_key() {
+                return Ok(Offered::Pass(item, starts_key));
+            }
+            self.end = Some(item.key.user_key);
+            return Ok(Offered::End);
+        }
+        Ok(if self.hold(item, starts_key, dropped)? {
+            Offered::Held
+        } else {
+            Offered::End
+        })
+    }
+
+    /// Holds `item` until its key ends; `false` once the slice ends before
+    /// the key before it.
+    fn hold(
         &mut self,
         item: InternalValue,
         starts_key: bool,
@@ -424,29 +467,37 @@ impl<'a> SliceGovernor<'a> {
     /// of them for `None`), when the slice with it fits, `true`; otherwise
     /// ends the slice before the key, `false`.
     fn settle(&mut self, upto: Option<&UserKey>) -> bool {
+        if self.keep_key() {
+            self.hand_on_next(upto);
+            return true;
+        }
+        let end = self.current_key().cloned();
+        if self.any_committed() {
+            // The versions dropped below the key are this slice's.
+            self.hand_on_below(end.as_ref());
+        }
+        self.held.truncate(self.ready);
+        self.end = end;
+        false
+    }
+
+    /// Whether the slice keeps the key just taken in, `true`, or ends before
+    /// it, `false`, the key then taken back out.
+    fn keep_key(&mut self) -> bool {
         if !self.past_quota && self.spent.within(&self.quota) {
             // Within the quota the key opened no set and passed no cut key:
             // its rows and relocated bytes are in already.
-            self.hand_on_next(upto);
             return true;
         }
         let with = self.committed.measure_with(&self.load, self.relocated);
         if !self.fits(&with) {
             self.before.restore(&mut self.committed);
-            let end = self.current_key().cloned();
-            if self.any_committed() {
-                // The versions dropped below the key are this slice's.
-                self.hand_on_below(end.as_ref());
-            }
-            self.held.truncate(self.ready);
-            self.end = end;
             return false;
         }
         self.prove_quota(&with);
         let load = core::mem::take(&mut self.load);
         self.committed.absorb(&load, self.relocated);
         self.past_quota = false;
-        self.hand_on_next(upto);
         true
     }
 

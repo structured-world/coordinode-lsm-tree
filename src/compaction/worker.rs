@@ -3792,10 +3792,18 @@ fn run_subcompaction(
         }
 
         if let Some(governor) = governor.as_deref_mut() {
-            let go_on = governor.offer(item, starts_key, &dropped)?;
-            hand_on(governor, &ledger, &mut *emit)?;
-            if !go_on {
-                break;
+            // Whether the row ends its key: the next one is known to start
+            // another.
+            let ends_key = merge_iter.next_starts_key();
+            match governor.offer(item, starts_key, ends_key, &dropped)? {
+                governor::Offered::Pass(item, starts_key) => {
+                    ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
+                }
+                governor::Offered::Held => hand_on(governor, &ledger, &mut *emit)?,
+                governor::Offered::End => {
+                    hand_on(governor, &ledger, &mut *emit)?;
+                    break;
+                }
             }
         } else {
             ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
