@@ -1289,9 +1289,8 @@ pub(crate) struct RelocatingCompaction {
     /// The rows from the first pointer into a block not tallied yet on, in
     /// stream order: the table takes rows in key order, so a row waits for
     /// every row before it.
-    held: alloc::collections::VecDeque<Held>,
-    /// The bytes `held` holds, bounded by [`HELD_BYTES_MAX`].
-    held_bytes: usize,
+    /// Its bytes are bounded by [`HELD_BYTES_MAX`].
+    held: HeldRows,
     /// The blocks given up at that bound: their values are written anew, and
     /// the rest of them is not tallied again.
     abandoned: HashSet<(BlobFileId, u32)>,
@@ -1388,23 +1387,109 @@ enum Held {
 pub(crate) static BLOCKS_GIVEN_UP: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// The bytes `held` keeps in memory: its place in the queue, its row's key
-/// and value, and for a pointer the value it claimed.
-/// Copies a held pointer's value decoded out of a block into a buffer of its
-/// own: as a view it keeps the whole decoded block alive, which the bound on
-/// what `held` holds does not count, and a block whose other values are dead
-/// would then keep its every byte for one live value. A held row's key and
-/// value stay views: rows arrive in key order from the tables' blocks one
-/// after the other, so the rows held share the blocks they come from.
-fn detach(held: &mut Held) {
-    if let Held::Pointer { claimed, .. } = held
-        && claimed.in_block
-        && let Some(value) = &mut claimed.value
-    {
-        *value = crate::UserValue::from(&**value);
+/// A decoded block held values are views of, and the held row that counts it.
+struct HeldBlock {
+    /// Tells the block's allocation apart from every other one alive while
+    /// a held value views it.
+    id: usize,
+    bytes: usize,
+    /// The number of the row that counts it: the last held value of it, so
+    /// it is counted until the last of them is written.
+    counted_by: u64,
+}
+
+/// The rows a relocation holds back, in stream order, and the bytes they keep
+/// in memory.
+#[derive(Default)]
+struct HeldRows {
+    /// Each with the bytes it is counted at.
+    rows: alloc::collections::VecDeque<(Held, usize)>,
+    bytes: usize,
+    /// How many rows were held and let go: a row's place is its number less
+    /// this.
+    released: u64,
+    /// The decoded block the last held value is a view of.
+    block: Option<HeldBlock>,
+}
+
+impl HeldRows {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn front(&self) -> Option<&Held> {
+        self.rows.front().map(|(held, _)| held)
+    }
+
+    /// Holds `held` last. A value viewing a decoded block keeps the block
+    /// alive: the block is counted once, with the last held value of it, so
+    /// it stays counted until every held value of it is let go.
+    fn push(&mut self, mut held: Held) {
+        let mut bytes = held_len(&held);
+        if let Held::Pointer { claimed, .. } = &mut held
+            && claimed.in_block
+            && let Some(value) = &mut claimed.value
+        {
+            match value.allocation() {
+                crate::slice::Allocation::Own => {}
+                crate::slice::Allocation::Shared { id, len } => {
+                    let number = self.released + self.rows.len() as u64;
+                    match &mut self.block {
+                        Some(block) if block.id == id => {
+                            // The row counting the block is still held: it
+                            // stops being `block` as it is let go.
+                            let at = usize::try_from(block.counted_by - self.released).ok();
+                            if let Some((_, counted)) = at.and_then(|at| self.rows.get_mut(at)) {
+                                *counted -= block.bytes;
+                                self.bytes -= block.bytes;
+                            }
+                            block.counted_by = number;
+                        }
+                        // A block held again past another one is counted
+                        // again.
+                        _ => {
+                            self.block = Some(HeldBlock {
+                                id,
+                                bytes: len,
+                                counted_by: number,
+                            });
+                        }
+                    }
+                    bytes += len;
+                }
+                // The block it keeps alive cannot be counted, so the value is
+                // copied into a buffer of its own.
+                crate::slice::Allocation::Unknown => {
+                    *value = crate::UserValue::from(&**value);
+                }
+            }
+        }
+        self.bytes += bytes;
+        self.rows.push_back((held, bytes));
+    }
+
+    /// Lets the first held row go.
+    fn pop_front(&mut self) -> Option<Held> {
+        let (held, bytes) = self.rows.pop_front()?;
+        self.bytes -= bytes;
+        if self
+            .block
+            .as_ref()
+            .is_some_and(|block| block.counted_by == self.released)
+        {
+            self.block = None;
+        }
+        self.released += 1;
+        Some(held)
     }
 }
 
+/// The bytes `held` keeps in memory: its place in the queue, its row's key
+/// and value, and for a pointer the value it claimed. A held value decoded
+/// out of a block keeps the whole block alive besides, counted apart. A held
+/// row's key and value are counted alone: rows arrive in key order from the
+/// tables' blocks one after the other, so the rows held share the blocks they
+/// come from.
 fn held_len(held: &Held) -> usize {
     core::mem::size_of::<Held>()
         + match held {
@@ -1582,8 +1667,7 @@ impl RelocatingCompaction {
             block_copy_share: None,
             blocks: crate::HashMap::default(),
             fates: crate::HashMap::default(),
-            held: alloc::collections::VecDeque::new(),
-            held_bytes: 0,
+            held: HeldRows::default(),
             abandoned: HashSet::default(),
             carried_garbage: FragmentationMap::default(),
         }
@@ -2173,7 +2257,6 @@ impl RelocatingCompaction {
             let Some(held) = self.held.pop_front() else {
                 break;
             };
-            self.held_bytes -= held_len(&held);
             match held {
                 Held::Row(item) => self.write_row(item)?,
                 Held::Pointer {
@@ -2189,11 +2272,9 @@ impl RelocatingCompaction {
     /// Holds `held` back behind the rows before it, and writes what is ready.
     /// Past [`HELD_BYTES_MAX`], the blocks still tallied are given up so the
     /// rows waiting for them go out.
-    fn hold(&mut self, mut held: Held) -> crate::Result<()> {
-        detach(&mut held);
-        self.held_bytes += held_len(&held);
-        self.held.push_back(held);
-        if self.held_bytes > HELD_BYTES_MAX {
+    fn hold(&mut self, held: Held) -> crate::Result<()> {
+        self.held.push(held);
+        if self.held.bytes > HELD_BYTES_MAX {
             #[cfg(test)]
             BLOCKS_GIVEN_UP.fetch_add(self.blocks.len(), core::sync::atomic::Ordering::Relaxed);
             self.abandoned.extend(self.blocks.drain().map(|(at, _)| at));
