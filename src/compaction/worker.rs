@@ -2760,32 +2760,6 @@ fn run_tight_space_compaction(
                 total: caps.total.min(quota_room),
             }
         };
-        // Nor more than each volume has free now, past what every reservation
-        // holds: a compaction that wrote and gave its room back since leaves
-        // the holds as they were and its bytes on the volume, and the pass's
-        // own outputs may have taken more than their punched inputs freed. A
-        // slice shrinks to the room there is rather than being refused it.
-        let dest_free_now = opts.capacity.available(&*dest_fs, &dest_path);
-        let room = if relocating_blobs {
-            let blob_free_now = opts.capacity.available(&*opts.config.fs, &blob_dir);
-            if shared_volume {
-                SliceCaps {
-                    total: room.total.min(dest_free_now.min(blob_free_now)),
-                    ..room
-                }
-            } else {
-                SliceCaps {
-                    tables: room.tables.min(dest_free_now),
-                    blobs: room.blobs.min(blob_free_now),
-                    ..room
-                }
-            }
-        } else {
-            SliceCaps {
-                tables: room.tables.min(dest_free_now),
-                ..room
-            }
-        };
         if room.tables == 0 || room.blobs == 0 || room.total == 0 {
             return Ok(None);
         }
