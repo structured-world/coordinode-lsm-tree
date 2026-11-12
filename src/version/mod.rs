@@ -1332,6 +1332,7 @@ impl Version {
     /// and installing this version persists the refreshed digest to the
     /// manifest via the version diff. Level / run structure is untouched
     /// (same table, same key range — only the digest changes).
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn with_refreshed_table_checksum(
         &self,

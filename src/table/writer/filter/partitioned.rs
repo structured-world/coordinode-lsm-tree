@@ -218,9 +218,12 @@ impl PartitionedFilterWriter {
     /// still on workers and spills the open one, each adding an entry under
     /// its last key.
     fn tli_at_finish(&self) -> usize {
-        let entry = |key: &UserKey| core::mem::size_of::<KeyedBlockHandle>() + key.len();
         #[cfg(feature = "std")]
-        let pending: usize = self.pending.iter().map(|p| entry(&p.key)).sum();
+        let pending: usize = self
+            .pending
+            .iter()
+            .map(|p| core::mem::size_of::<KeyedBlockHandle>() + p.key.len())
+            .sum();
         #[cfg(not(feature = "std"))]
         let pending = 0;
         let open = if self.bloom_hash_buffer.is_empty() {

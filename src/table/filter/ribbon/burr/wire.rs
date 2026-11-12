@@ -120,6 +120,10 @@ pub(crate) fn encoded_len(filter: &BurrFilter) -> usize {
 pub(crate) enum LayerSolution<'a> {
     /// Rows, row-major, each row's result in its low `r` bits, as an imported
     /// solution comes.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std import hands in a solution as rows")
+    )]
     Rows(&'a [u64]),
     /// The bit-sliced payload itself, as a build solves it.
     Packed(&'a [u8]),

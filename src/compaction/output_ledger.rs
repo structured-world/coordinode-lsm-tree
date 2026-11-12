@@ -78,6 +78,7 @@ impl OutputLedger {
     /// Gives the room of a finished slice back before the next one is checked,
     /// so the next is not checked against room its predecessor no longer
     /// needs.
+    #[cfg(feature = "std")]
     pub fn release_room(&self) {
         let released = self.0.room.lock().take();
         drop(released);

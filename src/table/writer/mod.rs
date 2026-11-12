@@ -719,6 +719,10 @@ pub struct Writer {
     carries_filter: bool,
 
     /// The prebuilt partition the table's keys have reached.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std import hands in a prebuilt filter")
+    )]
     prebuilt_partition: usize,
 
     /// A `locator` section built elsewhere, written at `finish` in place of
@@ -1118,6 +1122,10 @@ impl PageOut<'_, '_> {
 }
 
 /// A membership filter built elsewhere, as the wire bytes it is written as.
+#[cfg_attr(
+    not(feature = "std"),
+    expect(dead_code, reason = "only the std import hands in a prebuilt filter")
+)]
 pub(crate) enum PrebuiltFilter {
     /// One filter over the whole table.
     Full(Vec<u8>),
@@ -1136,6 +1144,10 @@ impl PrebuiltFilter {
     ///
     /// Returns [`crate::Error::InvalidHeader`] for a key past the last
     /// partition: no filter would answer for it, so a read would miss it.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std import hands in a prebuilt filter")
+    )]
     fn count_key(
         &mut self,
         key: &[u8],
@@ -1212,6 +1224,7 @@ impl Writer {
     }
 
     /// [`Self::new`], the file written as `origin`'s.
+    #[cfg(feature = "std")]
     pub(crate) fn new_for(
         path: PathBuf,
         table_id: TableId,
@@ -2408,6 +2421,7 @@ impl Writer {
     /// happens to be non-empty — so a source whose section is present but
     /// unreadable still salvages into a copy that carries one (the writer
     /// re-derives the ranges from the re-emitted entries).
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn mirror_from(
         self,
@@ -2748,6 +2762,7 @@ impl Writer {
     /// Sets the transformed marker at build time (see
     /// [`Self::lineage_transformed`]); the rewrite path carries a source
     /// table's marker onto its replacement.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_lineage_transformed(mut self, transformed: bool) -> Self {
         self.assert_not_started("use_lineage_transformed");
@@ -2763,6 +2778,7 @@ impl Writer {
 
     /// Sets the last-output marker at build time (see [`Self::lineage_last`]);
     /// the rewrite path carries a source table's marker onto its replacement.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_lineage_last(mut self, last: bool) -> Self {
         self.assert_not_started("use_lineage_last");
@@ -2773,6 +2789,7 @@ impl Writer {
     /// Sets the age the table records, in nanoseconds since the Unix epoch,
     /// instead of the time it is finished: a table rebuilt from another store
     /// keeps the age of the data it carries.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_created_at(mut self, created_at: u128) -> Self {
         self.assert_not_started("use_created_at");
@@ -2829,6 +2846,7 @@ impl Writer {
     /// Writes `filter`, built elsewhere for exactly the keys this table will
     /// hold, as the table's membership filter instead of building one from
     /// them. Must be set before the first key.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_prebuilt_filter(mut self, filter: PrebuiltFilter) -> Self {
         self.assert_not_started("use_prebuilt_filter");
@@ -2841,6 +2859,7 @@ impl Writer {
     /// Writes `section`, a `locator` section built elsewhere for exactly the
     /// keys and blocks this table will hold, instead of building one from
     /// them. Must be set before the first key.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_prebuilt_locator(mut self, section: Vec<u8>) -> Self {
         self.assert_not_started("use_prebuilt_locator");
@@ -2923,6 +2942,7 @@ impl Writer {
     /// holds: for a table rebuilt from another store, whose range tombstones
     /// reach past its entries. The caller orders the range under the tree's
     /// comparator, and it covers every entry the table receives.
+    #[cfg(feature = "std")]
     pub(crate) fn cover_key_range(&mut self, start: UserKey, end: UserKey) {
         self.key_range_cover = Some((start, end));
     }
@@ -2985,6 +3005,7 @@ impl Writer {
     }
 
     /// As [`Self::write`], plus the refusal of an uncovered key.
+    #[cfg(feature = "std")]
     pub(crate) fn write_counted(
         &mut self,
         item: InternalValue,

@@ -35,6 +35,7 @@ use parking_lot::Mutex;
 use spin::Mutex;
 
 /// Files a refill creates when the tree's configuration does not say.
+#[cfg(feature = "std")]
 pub(crate) const DEFAULT_TABLE_FILE_POOL: usize = 16;
 
 /// An empty table file, open for writing, under the name of the table about to
@@ -187,7 +188,15 @@ pub(crate) enum RefillOn {
 /// makes its files through and the ids reserved for them.
 struct Refill {
     at: usize,
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std refill makes the files")
+    )]
     folder: PathBuf,
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std refill makes the files")
+    )]
     fs: Arc<dyn Fs>,
     ids: Vec<TableId>,
 }

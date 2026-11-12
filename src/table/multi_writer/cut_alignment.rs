@@ -93,6 +93,7 @@ impl CutAlignment {
     }
 
     /// Bounds the writer's keys by `upper`.
+    #[cfg(feature = "std")]
     pub(super) fn limit(&mut self, upper: UserKey) {
         self.upper = Some(upper);
     }

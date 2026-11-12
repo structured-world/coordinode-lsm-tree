@@ -211,6 +211,10 @@ pub struct Inner {
     /// to fail closed unless the caller explicitly opted into that
     /// degradation. Always `false` on a normal (non-salvage) open, which fails
     /// instead of degrading.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std-gated salvage walk reads it")
+    )]
     pub(crate) delete_bitmap_degraded: bool,
 
     /// Whether a SALVAGE-MODE open degraded a REBUILDABLE side section
@@ -223,6 +227,10 @@ pub struct Inner {
     /// the table exposes no deletion metadata. Purely STRUCTURAL (each decode
     /// reads its own section's bytes, independent of the data blocks), so a
     /// corrupt DATA block does not trip it.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std-gated salvage walk reads it")
+    )]
     pub(crate) rebuildable_section_degraded: bool,
 
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
@@ -626,6 +634,9 @@ impl Drop for Inner {
                     {
                         pause.retain_reclaim(Arc::clone(&self.fs), (*self.path).clone(), rest);
                     }
+                    // Without std there is no retry to hand the rest to.
+                    #[cfg(not(feature = "std"))]
+                    let _ = at;
                     break;
                 }
             }

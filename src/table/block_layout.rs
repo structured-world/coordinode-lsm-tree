@@ -141,6 +141,7 @@ impl BlockLayoutMap {
     }
 
     /// Whether the map records no blocks at all.
+    #[cfg(feature = "std")]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

@@ -1875,6 +1875,7 @@ impl RelocatingCompaction {
 
     /// Marks this as a tight-space slice ending (exclusively) at `bound`; see
     /// the `drain_below` field.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn with_drain_below(mut self, bound: Option<crate::UserKey>) -> Self {
         self.drain_below = bound;

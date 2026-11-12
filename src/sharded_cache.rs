@@ -727,6 +727,7 @@ where
 
     /// Removes every entry whose key `doomed` picks. Walks every shard under
     /// its write lock: for a sweep, not the hot path.
+    #[cfg(feature = "std")]
     pub(crate) fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) {
         for shard in &self.shards {
             let mut core = shard.0.write();

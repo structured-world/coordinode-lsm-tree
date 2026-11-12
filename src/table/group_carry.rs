@@ -335,6 +335,7 @@ impl GroupCarry {
     /// Carry state for a scanner of `table` handing out the rows within
     /// `bounds` only: a group the bounds cut is handed out in part and not
     /// recorded, since the rows outside them are another range's to write.
+    #[cfg(feature = "std")]
     pub(crate) fn bounded(table: Table, queue: CarryQueue, bounds: KeyBounds) -> Self {
         Self {
             bounds: Some(bounds),
@@ -474,6 +475,7 @@ impl Table {
     /// # Errors
     ///
     /// Any error reading the index or opening the scan.
+    #[cfg(feature = "std")]
     pub(crate) fn scan_carrying(
         &self,
         bounds: KeyBounds,

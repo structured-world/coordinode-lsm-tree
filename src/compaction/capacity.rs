@@ -223,6 +223,7 @@ impl CapacityPool {
     /// The free space the folder `path` reports, less what the reservations
     /// sharing its volume have still to write; `u64::MAX` when the backend
     /// reports none.
+    #[cfg(feature = "std")]
     pub(crate) fn available(&self, fs: &dyn Fs, path: &Path) -> u64 {
         // Probed with the account locked, as `gather` probes.
         let held = self.held.lock();
@@ -235,6 +236,7 @@ impl CapacityPool {
     }
 
     /// What the compactions of `tree` in progress hold of its quota.
+    #[cfg(feature = "std")]
     pub(crate) fn quota_held(&self, tree: TreeId) -> u64 {
         self.held
             .lock()
@@ -279,6 +281,7 @@ impl CapacityPool {
     }
 
     /// What the reservations sharing the volume of the folder `path` hold.
+    #[cfg(feature = "std")]
     pub(crate) fn held_on(&self, fs: &dyn Fs, path: &Path) -> u64 {
         held_against(&self.held.lock(), Pool::of(fs, path))
     }
@@ -291,6 +294,7 @@ impl CapacityPool {
     /// or already written. Its own writes are checked against the tree's quota
     /// in `check` too; what it writes past the grant is checked against
     /// `check` as it lands.
+    #[cfg(feature = "std")]
     pub(crate) fn reserve_within(
         self: &Arc<Self>,
         tree: TreeId,

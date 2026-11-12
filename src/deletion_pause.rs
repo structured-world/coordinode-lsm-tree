@@ -66,6 +66,7 @@ pub struct DeletionPause {
     /// stay allocated until an unrelated compaction retires the table, under
     /// exactly the low-space condition that chose the tight-space path.
     /// Retried by [`retry_pending_reclaims`](Self::retry_pending_reclaims).
+    #[cfg(feature = "std")]
     pending_reclaims: Mutex<Vec<QueuedDeletion>>,
 
     /// Excludes a checkpoint's hard-link window from in-place file mutation
@@ -218,6 +219,7 @@ impl DeletionPause {
     /// only if the file is still exclusively owned then: a checkpoint that DID
     /// link it during its window shares the inode, and punching would zero the
     /// checkpoint's copy too.
+    #[cfg(feature = "std")]
     pub(crate) fn try_enqueue_punch(
         &self,
         fs: Arc<dyn Fs>,
@@ -345,10 +347,14 @@ impl Drop for Pause {
                         );
                     }
                 }
+                #[cfg(feature = "std")]
                 QueuedAction::Punch(_) => {
                     self.inner
                         .reclaim_or_retain(item, &self.inner.pending_reclaims);
                 }
+                // Only the std reclaim path queues a punch.
+                #[cfg(not(feature = "std"))]
+                QueuedAction::Punch(_) => {}
             }
         }
     }
@@ -372,6 +378,7 @@ impl DeletionPause {
     /// checkpoint starting after the probe read `1` would hard-link the file and
     /// then watch the punch zero the inode its immutable snapshot shares. The
     /// window excludes every checkpoint generation across the whole sequence.
+    #[cfg(feature = "std")]
     fn reclaim_or_retain(&self, item: QueuedDeletion, pending: &Mutex<Vec<QueuedDeletion>>) {
         let QueuedAction::Punch(extents) = &item.action else {
             return;
@@ -452,6 +459,7 @@ impl DeletionPause {
     /// Call it where the reclaimed space is needed — the tight-space compaction
     /// path — and after a checkpoint releases, since that is when its links
     /// usually disappear.
+    #[cfg(feature = "std")]
     pub(crate) fn retry_pending_reclaims(&self) {
         let retained = core::mem::take(&mut *self.pending_reclaims.lock());
         for item in retained {

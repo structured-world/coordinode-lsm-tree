@@ -21,7 +21,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{string::ToString, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::path::PathBuf;
 
@@ -591,6 +591,7 @@ impl MultiWriter {
 
     /// Bounds the keys this writer can be handed by `upper`: a writer of one
     /// key range of a compaction does not wait for a boundary past it.
+    #[cfg(feature = "std")]
     pub(crate) fn limit_cut_alignment(&mut self, upper: UserKey) {
         if let Some(alignment) = &mut self.alignment {
             alignment.limit(upper);
@@ -750,6 +751,7 @@ impl MultiWriter {
     /// Ends the keys this writer answers for before `end`, known only once
     /// the rows were written: the pieces of the kept tombstones past the last
     /// output reach no further.
+    #[cfg(feature = "std")]
     pub(crate) fn answer_below(&mut self, end: UserKey) {
         let cmp = self.comparator.as_ref();
         if let Some(outside) = &mut self.outside

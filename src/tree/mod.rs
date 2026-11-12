@@ -6344,6 +6344,7 @@ impl Tree {
         // then), and only an id no copy delivers surfaces its ambiguity.
         // A LIST, not a per-id map: routing can put a temp for the same id in
         // more than one folder, and each one is a file that has to be settled.
+        #[cfg(feature = "std")]
         let mut deferred_temps: Vec<(
             TableId,
             crate::path::PathBuf,

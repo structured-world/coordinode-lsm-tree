@@ -137,6 +137,13 @@ pub(crate) enum RecoveryMode {
     /// standalone recovery reader, where the source's own stored id IS the
     /// identity to recover under. An ENCRYPTED open always cross-checks the
     /// caller's id — the meta block's AAD binds it regardless.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "only the std-gated salvage and repair open a table this way"
+        )
+    )]
     Salvage {
         /// The durable table id known out-of-band, or `None` when the
         /// source's stored id is authoritative.
@@ -459,6 +466,7 @@ fn apply_global_seqno(local: SeqNo, global: SeqNo) -> SeqNo {
 
 /// Result of [`Table::salvage_load_block`]: the decoded block plus, when it read
 /// back cleanly, its raw on-disk bytes for a verbatim copy.
+#[cfg(feature = "std")]
 pub(crate) struct SalvageBlock {
     /// The decoded (decompressed / decrypted / ECC-healed) block: the source of
     /// the per-row entries the salvage walk accounts and, on the re-encode path,
@@ -505,6 +513,7 @@ pub(crate) struct SalvageRowGroup {
 
 /// Raw on-disk frame captured for a verbatim block copy:
 /// `(raw_on_disk_bytes, header, inner_layout)`. See [`SalvageBlock::verbatim`].
+#[cfg(feature = "std")]
 pub(crate) type VerbatimCopy = (
     alloc::vec::Vec<u8>,
     crate::table::block::Header,
@@ -1916,6 +1925,7 @@ impl Table {
     /// healed payload in [`block`](SalvageBlock::block) instead.
     ///
     /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    #[cfg(feature = "std")]
     pub(crate) fn salvage_load_block(
         &self,
         handle: &BlockHandle,
@@ -2137,6 +2147,7 @@ impl Table {
     /// for a table without a recognized ECC scheme; a build without `page_ecc`
     /// never reaches this for an ECC table (the caller's gate already routes
     /// those to the re-encode path).
+    #[cfg(feature = "std")]
     #[cfg_attr(
         not(feature = "page_ecc"),
         expect(
@@ -2215,6 +2226,7 @@ impl Table {
     /// never split. Salvage's verbatim copy passes this through so a multi-inner
     /// block keeps its layout at its new file offset (the offsets are
     /// decompressed-space and block-relative, so they stay valid after the move).
+    #[cfg(feature = "std")]
     #[cfg_attr(
         not(feature = "zstd"),
         expect(
@@ -10460,6 +10472,7 @@ impl Table {
     /// keeps the checksum stable across the punch, and it is what
     /// [`reopen_restricted`](Self::reopen_restricted) records and what
     /// verification / heal reconciliation must recompute for a restricted view.
+    #[cfg(feature = "std")]
     pub(crate) fn live_region_checksum(&self) -> crate::Result<Checksum> {
         self.suffix_checksum_for(self.restrict_lower_bound())
     }
@@ -10876,6 +10889,7 @@ impl Table {
     /// in-place heal changed the file's bytes, and installing this view into
     /// a new version makes the diff persist the refreshed digest to the
     /// manifest (see [`crate::Version::with_refreshed_table_checksum`]).
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn with_refreshed_checksum(&self, checksum: Checksum) -> Self {
         Self(self.0.clone(), self.1.clone(), Some(checksum))
@@ -11293,6 +11307,7 @@ impl Table {
     /// seqno 0 may itself be a legacy bulk-ingested table.
     ///
     /// [`get_highest_seqno`]: Self::get_highest_seqno
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn max_local_seqno(&self) -> SeqNo {
         self.metadata.seqnos.1

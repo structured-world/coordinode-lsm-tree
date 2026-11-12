@@ -46,6 +46,10 @@ pub(crate) trait ReadPacer: Send + Sync {
 
     /// Told how long the read of a paced portion took, whether it returned
     /// bytes or an error. Only a `std` build times the reads.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only a std build times the reads")
+    )]
     fn read_took(&self, _elapsed: core::time::Duration) {}
 
     /// Told the bytes every read of the walk returned from the file, paced
@@ -82,6 +86,7 @@ impl TimedFile {
     }
 
     /// The file, for reads this wrapper does not time.
+    #[cfg(feature = "std")]
     pub(crate) fn into_inner(self) -> alloc::boxed::Box<dyn crate::fs::FsFile> {
         self.file
     }
