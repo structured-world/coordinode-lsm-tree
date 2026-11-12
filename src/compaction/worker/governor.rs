@@ -55,6 +55,24 @@ struct Cost {
 }
 
 impl Cost {
+    /// Whether it adds nothing.
+    fn is_empty(&self) -> bool {
+        (self.entries, self.keys, self.values, self.blobs) == (0, 0, 0, 0)
+    }
+
+    /// Each measure times `per_mille` thousandths.
+    fn scaled(&self, per_mille: u64) -> Self {
+        let scale = |measure: u64| {
+            u64::try_from(u128::from(measure) * u128::from(per_mille) / 1_000).unwrap_or(u64::MAX)
+        };
+        Self {
+            entries: scale(self.entries),
+            keys: scale(self.keys),
+            values: scale(self.values),
+            blobs: scale(self.blobs),
+        }
+    }
+
     /// Whether every measure is within `quota`'s.
     fn within(&self, quota: &Self) -> bool {
         self.entries <= quota.entries
@@ -436,14 +454,21 @@ impl<'a> SliceGovernor<'a> {
         }
     }
 
-    /// Takes `now`, a slice that fits, as the last bound: the quota is what a
-    /// slice past `now` adds and still fits, in each cost the larger of the
-    /// quota before and twice the cost spent since, halved as often as needed
-    /// on the side past its cap. A quota used up doubles while the room
-    /// lasts, so the bounds taken grow as the logarithm of the keys, and it
-    /// stays within twice what the slice spent between two bounds.
+    /// Takes `now`, a slice that fits, as the last bound, and proves the
+    /// quota a slice past it adds and still fits.
+    ///
+    /// The quota keeps the shares the keys spent in since the bound before
+    /// (or those of the quota before, when larger), sized by the room it
+    /// leaves: the bound of a trial quota against that of `now` gives how
+    /// much the slice grows per quota, and the room left gives how many such
+    /// quotas fit, of which nine tenths is tried next, up to 64 times the
+    /// trial in one step. Then a quota past the room halves until it fits. So
+    /// a slice takes a few bounds where its keys fill the room, not one per
+    /// doubling. Longer keys and values than the slice holds are allowed up
+    /// to twice its longest while that much room is left, and none past them
+    /// near the end, where the keys' own lengths still fit.
     fn prove_quota(&mut self, now: &SliceMeasure) {
-        let widths = Widths {
+        let doubled = Widths {
             key: 2 * now.rows.longest_key,
             value: match now.rows.longest_value {
                 Some(longest) => Some(2 * longest),
@@ -452,51 +477,81 @@ impl<'a> SliceGovernor<'a> {
             },
             seqno: same_width_seqno(now.rows.highest_seqno),
         };
-        // Bounded by twice what the keys taken add, far below `u64::MAX`. No
-        // quota past a cap fits: a byte quota of `q` adds `q` bytes.
-        let table_cap = self.caps.tables.min(self.caps.total);
-        let grown = |quota: u64, spent: u64, cap: u64| quota.max(2 * spent).min(cap);
-        let mut quota = Cost {
-            entries: grown(self.quota.entries, self.spent.entries, table_cap),
-            keys: grown(self.quota.keys, self.spent.keys, table_cap),
-            values: grown(self.quota.values, self.spent.values, table_cap),
-            blobs: grown(
-                self.quota.blobs,
-                self.spent.blobs,
-                self.caps.blobs.min(self.caps.total),
-            ),
+        let widths = if self.fits(&past(now, Cost::default(), &doubled)) {
+            doubled
+        } else {
+            Widths {
+                key: now.rows.longest_key,
+                value: match now.rows.longest_value {
+                    Some(longest) => Some(longest),
+                    None if now.rows.entries == 0 => Some(0),
+                    None => None,
+                },
+                seqno: doubled.seqno,
+            }
         };
-        loop {
-            let (tables, blobs) = self.bound(&past(now, quota, &widths));
-            let over_tables = tables > self.caps.tables;
-            let over_blobs = blobs > self.caps.blobs;
-            if !over_tables && !over_blobs && tables + blobs <= self.caps.total {
+        let base = self.bound(now);
+        // Bounded by twice what the keys taken add, far below `u64::MAX`.
+        let mut quota = Cost {
+            entries: self.quota.entries.max(2 * self.spent.entries),
+            keys: self.quota.keys.max(2 * self.spent.keys),
+            values: self.quota.values.max(2 * self.spent.values),
+            blobs: self.quota.blobs.max(2 * self.spent.blobs),
+        };
+        // A quota grows only once used up: a bound taken for a new blob file,
+        // domain or width leaves it as it was proven, at most.
+        let mut may_grow = !self.spent.within(&self.quota);
+        for _ in 0..4 {
+            let trial = self.bound(&past(now, quota, &widths));
+            let room = self.room_per_mille(base, trial);
+            // A step grows the quota once at most, by 64 times: what the
+            // slice spent bounds it.
+            if room >= 1_000 && (room < 2_000 || !may_grow) {
                 break;
             }
-            // Past the shared cap alone, both sides give way. A side's
-            // measures halve together, keeping the shares the keys spent in.
-            let both = !over_tables && !over_blobs;
-            let table_side = over_tables || both;
-            let blob_side = over_blobs || both;
-            let halve = |q: u64, side: bool| if side { q / 2 } else { q };
-            let halved = Cost {
-                entries: halve(quota.entries, table_side),
-                keys: halve(quota.keys, table_side),
-                values: halve(quota.values, table_side),
-                blobs: halve(quota.blobs, blob_side),
-            };
-            if (halved.entries, halved.keys, halved.values, halved.blobs)
-                == (quota.entries, quota.keys, quota.values, quota.blobs)
-            {
-                // Only the widths are past the room: every key takes a bound.
-                quota = Cost::default();
+            let step = if room >= 1_000 {
+                may_grow = false;
+                room.min(64_000)
+            } else {
+                room
+            } * 9
+                / 10;
+            quota = quota.scaled(step);
+            if quota.is_empty() {
                 break;
             }
-            quota = halved;
+        }
+        while !quota.is_empty() && !self.fits(&past(now, quota, &widths)) {
+            quota = quota.scaled(500);
+        }
+        if !self.fits(&past(now, quota, &widths)) {
+            // Only the widths are past the room: every key takes a bound.
+            quota = Cost::default();
         }
         self.quota = quota;
         self.spent = Cost::default();
         self.widths = widths;
+    }
+
+    /// How many times, in thousandths, the growth from a slice bounded at
+    /// `base` to one bounded at `trial` fits the room left past `base`: the
+    /// least over the tables, the blob files and both together.
+    fn room_per_mille(&self, base: (u64, u64), trial: (u64, u64)) -> u64 {
+        let ratio = |cap: u64, at: u64, to: u64| -> u64 {
+            // `base` fits, so its bound is within every cap.
+            debug_assert!(at <= cap, "the slice bounded at `base` fits");
+            let slack = u128::from(cap - at);
+            match to.checked_sub(at) {
+                Some(grow) if grow > 0 => {
+                    u64::try_from(slack * 1_000 / u128::from(grow)).unwrap_or(u64::MAX)
+                }
+                // The bound did not grow on this side.
+                _ => u64::MAX,
+            }
+        };
+        ratio(self.caps.tables, base.0, trial.0)
+            .min(ratio(self.caps.blobs, base.1, trial.1))
+            .min(ratio(self.caps.total, base.0 + base.1, trial.0 + trial.1))
     }
 
     /// Makes the held events below `upto` (all for `None`) ready. They lie in
