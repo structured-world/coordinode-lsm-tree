@@ -2260,20 +2260,25 @@ impl RelocatingCompaction {
         }
     }
 
+    /// Writes `held`, which is ready.
+    fn write_held(&mut self, held: Held) -> crate::Result<()> {
+        match held {
+            Held::Row(item) => self.write_row(item),
+            Held::Pointer {
+                item,
+                indirection,
+                claimed,
+            } => self.place(item, &indirection, &claimed),
+        }
+    }
+
     /// Writes the held rows from the front as long as they are ready.
     fn release_ready(&mut self) -> crate::Result<()> {
         while self.held.front().is_some_and(|held| self.is_ready(held)) {
             let Some(held) = self.held.pop_front() else {
                 break;
             };
-            match held {
-                Held::Row(item) => self.write_row(item)?,
-                Held::Pointer {
-                    item,
-                    indirection,
-                    claimed,
-                } => self.place(item, &indirection, &claimed)?,
-            }
+            self.write_held(held)?;
         }
         Ok(())
     }
