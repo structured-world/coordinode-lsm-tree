@@ -49,6 +49,48 @@ fn an_indirection_decodes_off_its_slice_as_its_read_does() -> crate::Result<()> 
     Ok(())
 }
 
+/// Each way a pointer can be malformed is refused off the slice: cut short, a
+/// tenth varint byte past bit 63, a varint longer than its field, a value past
+/// its field's width, and an unknown stored kind.
+#[test]
+fn a_malformed_indirection_is_refused_off_its_slice() {
+    let cases: [(&str, &[u8]); 10] = [
+        ("empty", &[]),
+        ("id cut short", &[0x80]),
+        ("stored word missing", &[0, 0, 0, 0]),
+        ("unknown stored kind", &[0, 0, 0, 0, 3]),
+        (
+            "id tenth byte past bit 63",
+            &[
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0,
+            ],
+        ),
+        (
+            "frame past u32",
+            &[0, 0xff, 0xff, 0xff, 0xff, 0x1f, 0, 0, 0],
+        ),
+        (
+            "frame longer than 5 bytes",
+            &[0, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0, 0, 0],
+        ),
+        ("index past u16", &[0, 0, 0xff, 0xff, 0x07, 0, 0]),
+        ("size past u32", &[0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0x1f, 0]),
+        (
+            "stored bytes past u32",
+            &[0, 0, 0, 0, 0xfc, 0xff, 0xff, 0xff, 0x7f],
+        ),
+    ];
+    for (case, bytes) in cases {
+        assert!(
+            BlobIndirection::decode_slice(bytes).is_err(),
+            "{case}: {bytes:02x?} decoded"
+        );
+    }
+    // The same fields with a known kind decode, so each case above is refused
+    // for its own defect.
+    assert!(BlobIndirection::decode_slice(&[0, 0, 0, 0, 2]).is_ok());
+}
+
 /// Any bytes decode off the slice without a panic: an indirection only where
 /// re-encoding it gives back the bytes it was read from, and an error for a
 /// varint cut short, too long for its field or past its width, or an unknown
