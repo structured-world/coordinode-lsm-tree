@@ -412,3 +412,55 @@ fn concurrent_stress_keeps_invariants() {
         "atomic weight diverged from resident entries",
     );
 }
+
+/// A value of some weight that counts its drops.
+struct Counted {
+    weight: u64,
+    drops: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.drops
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CountedWeight;
+impl Weighter<u64, alloc::sync::Arc<Counted>> for CountedWeight {
+    fn weight(&self, _: &u64, v: &alloc::sync::Arc<Counted>) -> u64 {
+        v.weight
+    }
+}
+
+/// An insert that outweighs more residents than it holds in place evicts
+/// every one of them and drops each once: the ones held in place and the
+/// ones past them alike, and none of what stays.
+#[test]
+fn an_insert_evicting_more_than_it_holds_in_place_drops_each_once() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    let drops = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let value = |weight| {
+        alloc::sync::Arc::new(Counted {
+            weight,
+            drops: alloc::sync::Arc::clone(&drops),
+        })
+    };
+    let c = ShardedCache::with_weighter(1_000, 1, 1024, CountedWeight, FxBuildHasher);
+    for key in 0..20 {
+        c.insert(key, value(50));
+    }
+    assert_eq!((c.len(), drops.load(Ordering::Relaxed)), (20, 0));
+
+    // Twelve residents make room for it, more than are held in place.
+    c.insert(100, value(600));
+    let evicted = 20 + 1 - c.len();
+    assert!(evicted > HELD, "{evicted} evicted");
+    assert_eq!(drops.load(Ordering::Relaxed), evicted);
+    assert!(c.weight() <= 1_000);
+
+    drop(c);
+    assert_eq!(drops.load(Ordering::Relaxed), 21, "each value once");
+}
