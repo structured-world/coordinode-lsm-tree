@@ -482,23 +482,44 @@ where
 /// a percent; and places for more would be initialised and dropped by every
 /// insert, the ones that evict nothing included.
 pub(crate) struct Evicted<V> {
-    first: Option<V>,
+    /// The first [`HELD`] of them, the ones before `len` written.
+    held: [core::mem::MaybeUninit<V>; HELD],
+    len: usize,
     rest: Vec<V>,
 }
+
+/// The evicted entries held in place: a blob frame of 64 KiB over blocks of
+/// 8 KiB evicts that many.
+const HELD: usize = 8;
 
 impl<V> Evicted<V> {
     pub(crate) const fn new() -> Self {
         Self {
-            first: None,
+            held: [const { core::mem::MaybeUninit::uninit() }; HELD],
+            len: 0,
             rest: Vec::new(),
         }
     }
 
     fn push(&mut self, value: V) {
-        if self.first.is_none() {
-            self.first = Some(value);
+        if let Some(place) = self.held.get_mut(self.len) {
+            place.write(value);
+            self.len += 1;
         } else {
             self.rest.push(value);
+        }
+    }
+}
+
+impl<V> Drop for Evicted<V> {
+    fn drop(&mut self) {
+        for place in self.held.iter_mut().take(self.len) {
+            // SAFETY: `push` wrote every place before `len`, and nothing takes
+            // one out before this drop.
+            #[expect(unsafe_code, reason = "see safety")]
+            unsafe {
+                place.assume_init_drop();
+            }
         }
     }
 }
