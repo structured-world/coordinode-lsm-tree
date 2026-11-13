@@ -395,8 +395,19 @@ impl DecodedFrame {
         if !self.is_packed() {
             return Some(usize::from(index));
         }
+        let index = u32::from(index);
+        // Records of one length lie at even steps, so the offset's share of
+        // the block is the place: tried first, it spares the search a scan
+        // would otherwise run for every value. The product fits: an offset
+        // and a block's count are both within `u16`.
+        let guess = (index as usize * self.list.len())
+            .checked_div(self.entries.len())
+            .unwrap_or(0);
+        if self.list.get(guess).is_some_and(|entry| entry.at == index) {
+            return Some(guess);
+        }
         self.list
-            .binary_search_by_key(&u32::from(index), |entry| entry.at)
+            .binary_search_by_key(&index, |entry| entry.at)
             .ok()
     }
 

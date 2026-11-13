@@ -72,6 +72,45 @@ fn a_packed_block_decodes_every_value_in_order() {
     }
 }
 
+/// A record is placed by its offset whether its block's records are of one
+/// length, where the offset's share of the block is the place, or of many,
+/// where that share names another record; an offset inside a record, or past
+/// the block, places nothing. A handle damaged to such an offset must not
+/// read a neighbour's value.
+#[test]
+fn a_record_is_placed_by_its_offset_alone() {
+    let even: [&[u8]; 5] = [b"aaaa", b"bbbb", b"cccc", b"dddd", b"eeee"];
+    let uneven: [&[u8]; 5] = [
+        b"a",
+        b"a much longer value than the others",
+        b"cc",
+        b"",
+        b"eeeeeeeeeeee",
+    ];
+    for values in [even, uneven] {
+        let (bytes, starts) = records(&values);
+        let raw = values.iter().map(|v| v.len()).sum::<usize>();
+        let frame = Slice::from(frame(&bytes, &starts, u32::try_from(raw).unwrap()));
+        let mut decoded = 0;
+        let frame = decode_frame(
+            &frame,
+            CompressionType::None,
+            #[cfg(zstd_any)]
+            None,
+            &mut decoded,
+        )
+        .unwrap();
+        for offset in 0..=bytes.len() + 1 {
+            let expected = starts.iter().position(|&at| at == offset);
+            assert_eq!(
+                frame.place_of(u16::try_from(offset).unwrap()),
+                expected,
+                "offset {offset}"
+            );
+        }
+    }
+}
+
 /// A damaged record byte is caught by that record's own checksum on a read of
 /// the frame whole, which no longer hashes the records a second time.
 #[test]

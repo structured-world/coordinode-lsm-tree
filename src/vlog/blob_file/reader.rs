@@ -265,13 +265,16 @@ pub(crate) fn check_key(frame: &DecodedFrame, index: u16, key: &[u8]) -> crate::
 ///
 /// The entry is not `key`'s, or the frame is not a single or block frame.
 pub(crate) fn value_in(frame: &DecodedFrame, index: u16, key: &[u8]) -> crate::Result<UserValue> {
-    check_key(frame, index, key)?;
+    let malformed = || crate::Error::InvalidHeader("Blob");
+    // The entry is placed once for its key and its value: in a packed block
+    // placing it is a search.
+    let at = frame.place_of(index).ok_or_else(malformed)?;
+    if frame.key(at) != Some(key) {
+        return Err(malformed());
+    }
     match frame.header.kind {
-        FrameKind::Single | FrameKind::Block => frame
-            .place_of(index)
-            .and_then(|at| frame.value(at))
-            .ok_or(crate::Error::InvalidHeader("Blob")),
-        FrameKind::Head | FrameKind::Chunk => Err(crate::Error::InvalidHeader("Blob")),
+        FrameKind::Single | FrameKind::Block => frame.value(at).ok_or_else(malformed),
+        FrameKind::Head | FrameKind::Chunk => Err(malformed()),
     }
 }
 
