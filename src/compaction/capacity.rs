@@ -56,7 +56,7 @@ impl Pool {
 
 /// Whether a reservation may take the room the engine keeps free for flushes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Floor {
+pub(crate) enum Floor {
     /// Only room the floor leaves: work that may as well wait.
     Keep,
     /// The floor as well, which breaks the deadlock of a compaction that
@@ -108,7 +108,7 @@ impl core::fmt::Debug for CapacityPool {
 }
 
 /// Bytes a compaction is about to write into the folder `path` of `fs`.
-pub struct Demand<'a> {
+pub(crate) struct Demand<'a> {
     pub fs: &'a dyn Fs,
     pub path: &'a Path,
     pub bytes: u64,
@@ -116,7 +116,7 @@ pub struct Demand<'a> {
 
 /// How a reservation is checked.
 #[derive(Clone, Copy, Debug)]
-pub struct Check {
+pub(crate) struct Check {
     /// The room left under the tree's quota, `u64::MAX` without one.
     pub quota_headroom: u64,
     /// Whether the flush floor may be taken.
@@ -467,7 +467,7 @@ struct Grants {
 
 /// The room one compaction holds: given back as its outputs land on their
 /// volumes, and wholly once it is dropped.
-pub struct Reservation {
+pub(crate) struct Reservation {
     pool: Arc<CapacityPool>,
     check: Option<Check>,
     /// The tree whose quota it holds.
@@ -648,7 +648,7 @@ impl Reservation {
 
 /// Quota bytes a reservation kept held past its end, for outputs it left on
 /// disk ([`Reservation::strand`]).
-pub struct QuotaHold {
+pub(crate) struct QuotaHold {
     pool: Arc<CapacityPool>,
     quota: Pool,
     bytes: u64,

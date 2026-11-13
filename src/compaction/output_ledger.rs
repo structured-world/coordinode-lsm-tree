@@ -43,7 +43,7 @@ struct Output {
 /// removed still takes the room it landed in. Clones share one ledger, so the
 /// sub-compactions of a run record into the same list.
 #[derive(Clone, Default)]
-pub struct OutputLedger(Arc<Ledger>);
+pub(crate) struct OutputLedger(Arc<Ledger>);
 
 #[derive(Default)]
 struct Ledger {
@@ -55,12 +55,17 @@ struct Ledger {
 
 impl OutputLedger {
     /// Records a table file the run created at `path`.
-    pub fn record_table(&self, id: crate::TableId, path: PathBuf, fs: Arc<dyn Fs>) {
+    pub(crate) fn record_table(&self, id: crate::TableId, path: PathBuf, fs: Arc<dyn Fs>) {
         self.record(Kind::Table, id, path, fs);
     }
 
     /// Records a blob file the run created at `path`.
-    pub fn record_blob_file(&self, id: crate::vlog::BlobFileId, path: PathBuf, fs: Arc<dyn Fs>) {
+    pub(crate) fn record_blob_file(
+        &self,
+        id: crate::vlog::BlobFileId,
+        path: PathBuf,
+        fs: Arc<dyn Fs>,
+    ) {
         self.record(Kind::BlobFile, id, path, fs);
     }
 
@@ -69,7 +74,7 @@ impl OutputLedger {
     }
 
     /// Holds `room`, reserved for the run's outputs, until the run returns.
-    pub fn reserve(&self, room: super::capacity::Reservation) {
+    pub(crate) fn reserve(&self, room: super::capacity::Reservation) {
         // The room it replaces, a finished slice's, goes back as it drops.
         let replaced = self.0.room.lock().replace(Arc::new(room));
         drop(replaced);
@@ -79,14 +84,14 @@ impl OutputLedger {
     /// so the next is not checked against room its predecessor no longer
     /// needs.
     #[cfg(feature = "std")]
-    pub fn release_room(&self) {
+    pub(crate) fn release_room(&self) {
         let released = self.0.room.lock().take();
         drop(released);
     }
 
     /// Holds `holds`, the write budget reserved for the run's outputs, until
     /// the run returns, each given back as the outputs on its medium land.
-    pub fn hold_budget(&self, holds: Vec<crate::write_budget::BudgetHold>) {
+    pub(crate) fn hold_budget(&self, holds: Vec<crate::write_budget::BudgetHold>) {
         self.0.budget.lock().extend(holds);
     }
 
@@ -98,7 +103,7 @@ impl OutputLedger {
     /// Adds `demand` to the run's room when it fits under `check`, checked and
     /// taken in one step; a run holding no room only checks it against `pool`
     /// for `tree`.
-    pub fn try_reserve_more(
+    pub(crate) fn try_reserve_more(
         &self,
         pool: &super::capacity::CapacityPool,
         tree: crate::tree::inner::TreeId,
@@ -120,7 +125,7 @@ impl OutputLedger {
     /// Any error reading the file's length, and
     /// [`crate::Error::StorageFull`] when the volume has no room for what the
     /// run wrote past its reservation.
-    pub fn landed(&self, fs: &dyn Fs, path: &crate::path::Path) -> crate::Result<()> {
+    pub(crate) fn landed(&self, fs: &dyn Fs, path: &crate::path::Path) -> crate::Result<()> {
         let room = self.room();
         let budget = fs.write_budget();
         if room.is_none() && budget.is_none() {
@@ -144,13 +149,13 @@ impl OutputLedger {
 
     /// Whether the run's room stopped it: its outputs outgrew the room and
     /// the volume had none left for them.
-    pub fn out_of_room(&self) -> bool {
+    pub(crate) fn out_of_room(&self) -> bool {
         self.room().is_some_and(|room| room.refused())
     }
 
     /// A version now names every recorded file, so they are no longer the
     /// run's to remove.
-    pub fn installed(&self) {
+    pub(crate) fn installed(&self) {
         self.0.files.lock().clear();
     }
 
@@ -158,7 +163,7 @@ impl OutputLedger {
     /// unknown: a power loss may still make it the installed one, naming
     /// them. They and the quota bytes they take are handed back as
     /// [`KeptOutputs`], to go once an install proves no version names them.
-    pub fn keep_uninstalled(&self) -> KeptOutputs {
+    pub(crate) fn keep_uninstalled(&self) -> KeptOutputs {
         let files = core::mem::take(&mut *self.0.files.lock());
         let room = self.0.room.lock().take();
         let hold = room.as_ref().map(|room| {
@@ -179,7 +184,11 @@ impl OutputLedger {
     /// removed its own empty output, a rolled-back handle) is skipped; one
     /// that cannot be removed stays for the orphan sweep of the next open, and
     /// keeps its bytes held in the tree's quota until then.
-    pub fn remove_uninstalled(&self, tree_id: TreeId, descriptor_table: Option<&DescriptorTable>) {
+    pub(crate) fn remove_uninstalled(
+        &self,
+        tree_id: TreeId,
+        descriptor_table: Option<&DescriptorTable>,
+    ) {
         let outputs = core::mem::take(&mut *self.0.files.lock());
         // Given back once the files it covered are gone, below.
         let room = self.0.room.lock().take();
@@ -199,7 +208,7 @@ impl OutputLedger {
 /// The install that failed marks the next one to write a full snapshot, which
 /// supersedes the edit whichever way it went: from then on no version names
 /// these files, on disk or in memory, and [`Self::remove`] takes them.
-pub struct KeptOutputs {
+pub(crate) struct KeptOutputs {
     files: Vec<Output>,
     hold: Option<super::capacity::QuotaHold>,
 }
@@ -207,7 +216,7 @@ pub struct KeptOutputs {
 impl KeptOutputs {
     /// Deletes the files, as [`OutputLedger::remove_uninstalled`] deletes
     /// uninstalled ones, and gives back the quota of each one gone.
-    pub fn remove(self, tree_id: TreeId, descriptor_table: Option<&DescriptorTable>) {
+    pub(crate) fn remove(self, tree_id: TreeId, descriptor_table: Option<&DescriptorTable>) {
         let stranded = remove_files(self.files, tree_id, descriptor_table);
         if let Some(hold) = self.hold {
             hold.release_but(stranded);

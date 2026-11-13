@@ -24,7 +24,7 @@ pub trait HoldsRangeTombstones {
 ///
 /// May point to an interval [min, max] of tables in the next run.
 #[expect(dead_code, reason = "planned for cascading index optimization")]
-pub struct Indexed<T: Ranged> {
+pub(crate) struct Indexed<T: Ranged> {
     inner: T,
     // cascade_indexes: (u32, u32),
 }

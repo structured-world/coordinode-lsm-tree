@@ -650,16 +650,16 @@ impl Drop for Inner {
 /// The edge a punch above an earlier one starts from: a multiple of every
 /// page size a filesystem uses, so the page the earlier punch ended in is
 /// covered whole.
-pub const PUNCH_ALIGN: u64 = 64 * 1_024;
+pub(crate) const PUNCH_ALIGN: u64 = 64 * 1_024;
 
 /// The most one prefix punch call covers, unless a single block is larger: a
 /// call is cut only at block edges, so each one that lands zeroes whole blocks.
-pub const PUNCH_CHUNK: u64 = 4 * 1_024 * 1_024;
+pub(crate) const PUNCH_CHUNK: u64 = 4 * 1_024 * 1_024;
 
 /// The punch calls for `blocks` (ascending, disjoint `[start, end)`), highest
 /// first: runs of adjacent blocks, each call as many whole blocks as fit in
 /// [`PUNCH_CHUNK`] and at least one.
-pub fn punch_extents_top_down(blocks: &[(u64, u64)]) -> alloc::vec::Vec<(u64, u64)> {
+pub(crate) fn punch_extents_top_down(blocks: &[(u64, u64)]) -> alloc::vec::Vec<(u64, u64)> {
     let mut extents = alloc::vec::Vec::new();
     // `[lo, hi)` of the call being built.
     let mut call: Option<(u64, u64)> = None;

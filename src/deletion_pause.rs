@@ -50,7 +50,7 @@ use spin::Mutex;
 /// Cheap to clone: holds an atomic counter plus a `Mutex<Vec<...>>` that is
 /// only contended during checkpoint setup/teardown, never on the read path.
 #[derive(Default)]
-pub struct DeletionPause {
+pub(crate) struct DeletionPause {
     /// Number of active [`Pause`] guards. `0` means deletions happen
     /// immediately; `>0` means they are queued.
     active: AtomicU32,
@@ -127,7 +127,7 @@ struct DeferredRemoval {
 /// since a pin's consumer reads the attestation beside the table.
 #[cfg(feature = "std")]
 #[derive(Clone, Copy)]
-pub enum PinnedKind {
+pub(crate) enum PinnedKind {
     /// A table, with its sidecars.
     Table,
     /// A blob file, which has none.
@@ -180,7 +180,7 @@ impl DeletionPause {
     /// An inactive gate of no tree, for a test that drives one alone.
     #[cfg(test)]
     #[must_use]
-    pub fn new_shared() -> Arc<Self> {
+    pub(crate) fn new_shared() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
@@ -196,7 +196,7 @@ impl DeletionPause {
     /// Returns `true` if there is at least one active [`Pause`] guard and
     /// deletions should therefore be queued.
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire) > 0
     }
 
@@ -204,7 +204,7 @@ impl DeletionPause {
     /// the deletion was queued (caller must NOT call `remove_file`), or
     /// `false` if the pause is currently inactive (caller proceeds with
     /// the deletion as usual).
-    pub fn try_enqueue(&self, fs: Arc<dyn Fs>, path: PathBuf) -> bool {
+    pub(crate) fn try_enqueue(&self, fs: Arc<dyn Fs>, path: PathBuf) -> bool {
         self.try_enqueue_action(fs, path, QueuedAction::Remove)
     }
 
@@ -254,7 +254,7 @@ impl DeletionPause {
             reason = "no_std-capable; only the std-gated checkpoint consumer acquires a pause"
         )
     )]
-    pub fn acquire(self: &Arc<Self>) -> Pause {
+    pub(crate) fn acquire(self: &Arc<Self>) -> Pause {
         self.active.fetch_add(1, Ordering::AcqRel);
         Pause {
             inner: Arc::clone(self),
@@ -287,7 +287,7 @@ impl DeletionPause {
         reason = "no_std-capable RAII guard; only the std-gated checkpoint consumer constructs one"
     )
 )]
-pub struct Pause {
+pub(crate) struct Pause {
     inner: Arc<DeletionPause>,
 }
 
@@ -604,7 +604,7 @@ impl DeletionPause {
 
 /// An in-place mutation under way; see [`DeletionPause::begin_mutation`].
 #[cfg(feature = "std")]
-pub struct MutationGuard<'a> {
+pub(crate) struct MutationGuard<'a> {
     pause: &'a DeletionPause,
 }
 
@@ -621,7 +621,7 @@ impl Drop for MutationGuard<'_> {
 
 /// A pin being taken; see [`DeletionPause::begin_pin`].
 #[cfg(feature = "std")]
-pub struct PinGuard<'a> {
+pub(crate) struct PinGuard<'a> {
     pause: &'a DeletionPause,
 }
 

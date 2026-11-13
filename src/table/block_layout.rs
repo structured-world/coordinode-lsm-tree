@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 /// length >= 2 (single-inner-block blocks are not recorded).
 ///
 /// Writes via `extend_from_slice` (infallible on `Vec`), so no I/O error path.
-pub fn encode_block_layouts(out: &mut Vec<u8>, layouts: &[(BlockOffset, Vec<u32>)]) {
+pub(crate) fn encode_block_layouts(out: &mut Vec<u8>, layouts: &[(BlockOffset, Vec<u32>)]) {
     // entry_count fits u32: a table cannot hold more data blocks than u32 file
     // offsets address, and the writer only pushes split blocks.
     #[expect(
@@ -194,7 +194,7 @@ impl BlockLayoutMap {
         reason = "consumed by range-query partial decode (next slice)"
     )
 )]
-pub fn map_byte_range_to_blocks(ends: &[u32], lower: u32, upper: u32) -> Option<(u32, u32)> {
+pub(crate) fn map_byte_range_to_blocks(ends: &[u32], lower: u32, upper: u32) -> Option<(u32, u32)> {
     let total = *ends.last()?;
     if lower >= total {
         return None;

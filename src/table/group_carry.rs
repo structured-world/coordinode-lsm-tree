@@ -28,10 +28,10 @@ use crate::comparator::SharedComparator;
 use crate::{InternalValue, UserKey};
 
 #[cfg(feature = "columnar")]
-pub use super::index_block::RowGroupRef;
+pub(crate) use super::index_block::RowGroupRef;
 
 /// What a candidate copies.
-pub enum CarryUnit {
+pub(crate) enum CarryUnit {
     /// A columnar row group: the tag and lengths its directory carries, as its
     /// index entry names them. Its bytes are read when it is copied.
     #[cfg(feature = "columnar")]
@@ -44,7 +44,7 @@ pub enum CarryUnit {
 
 /// A row group or data block a scanner read, with the rows it handed out for
 /// it.
-pub struct CarryCandidate {
+pub(crate) struct CarryCandidate {
     /// The table it was read from.
     pub(crate) table: Table,
     /// Where it lies: its index entry for a group, its extent for a block.
@@ -72,7 +72,7 @@ pub struct CarryCandidate {
 /// one, then two, doubling up to [`Self::LONGEST_SKIP`], and records one
 /// between to see whether that still holds; a group copied ends the skipping.
 #[derive(Default)]
-pub struct CarryOdds {
+pub(crate) struct CarryOdds {
     misses: core::sync::atomic::AtomicU32,
     skip: core::sync::atomic::AtomicU32,
 }
@@ -128,7 +128,7 @@ impl Drop for Outcome {
 }
 
 /// The bytes of `row`'s key and value, as a carry counts what it holds.
-pub fn row_bytes(row: &InternalValue) -> u64 {
+pub(crate) fn row_bytes(row: &InternalValue) -> u64 {
     (row.key.user_key.len() + row.value.len()) as u64
 }
 
@@ -161,13 +161,13 @@ impl CarryCandidate {
 
 /// The candidates the scanners of one compaction recorded, in the order each
 /// read them; shared by every input's scanner and the write side.
-pub type CarryQueue = Arc<Candidates>;
+pub(crate) type CarryQueue = Arc<Candidates>;
 
 /// The candidates of a [`CarryQueue`], and how many were ever recorded: the
 /// write side learns from the count, without taking the lock, that none was
 /// added since it last looked.
 #[derive(Default)]
-pub struct Candidates {
+pub(crate) struct Candidates {
     queue: Mutex<VecDeque<CarryCandidate>>,
     recorded: core::sync::atomic::AtomicUsize,
 }
@@ -194,7 +194,7 @@ impl Candidates {
 
 /// How the output lays out its data, which a copy keeps.
 #[derive(Clone, Copy)]
-pub enum CarryShape {
+pub(crate) enum CarryShape {
     /// Columnar row groups, cut and encoded as this says.
     #[cfg(feature = "columnar")]
     Groups(crate::table::meta::GroupShape),
@@ -213,7 +213,7 @@ pub enum CarryShape {
 /// Where the scanners of one compaction record the groups and blocks they
 /// read, and which tables' they record.
 #[derive(Clone)]
-pub struct CarryTarget {
+pub(crate) struct CarryTarget {
     /// Where the candidates are recorded.
     pub(crate) queue: CarryQueue,
     /// The data codec of the output: a copy keeps its codec and dictionary,
@@ -257,7 +257,7 @@ impl CarryTarget {
 }
 
 /// The key range a scanner hands out rows of, under the tree's comparator.
-pub struct KeyBounds {
+pub(crate) struct KeyBounds {
     /// The lower bound.
     pub(crate) lo: Bound<UserKey>,
     /// The upper bound.
@@ -285,7 +285,7 @@ impl KeyBounds {
 
 /// A scanner's carry state: the rows of the group it is handing out, and where
 /// it records the groups it reads.
-pub struct GroupCarry {
+pub(crate) struct GroupCarry {
     table: Table,
     queue: CarryQueue,
     /// The range the scan hands out rows of, `None` for the whole table.
