@@ -100,14 +100,6 @@ struct Slot<V> {
     loc: Location,
 }
 
-/// A fingerprint's place in the ghost queue: its nodes there and whether it is
-/// remembered (see [`ShardCore::ghost_set`]).
-struct Ghost {
-    hash: u64,
-    nodes: u32,
-    live: bool,
-}
-
 /// 64-byte-aligned wrapper so adjacent shard locks land on separate cache lines
 /// (no false sharing between shards under concurrent access).
 #[repr(align(64))]
@@ -132,11 +124,7 @@ struct ShardCore<K, V, S> {
     /// cold or missed into a full shard, oldest first. The hash is already
     /// mixed, so `ghost_set` is keyed by it as is: no key clone, no rehash.
     ghost: VecDeque<u64>,
-    /// Each fingerprint with a node in `ghost`: how many nodes it has there,
-    /// and whether it is remembered. An admission spends the fingerprint and
-    /// leaves its node, so a fingerprint recorded again has a node per stay,
-    /// and only its last node aging out forgets it.
-    ghost_set: hashbrown::HashTable<Ghost>,
+    ghost_set: hashbrown::HashTable<u64>,
     small_bytes: u64,
     main_bytes: u64,
     /// Per-shard byte capacity.
@@ -444,17 +432,23 @@ where
     /// Whether the key hashed to `hash` is remembered in the ghost queue.
     #[inline]
     fn in_ghost(&self, hash: u64) -> bool {
-        self.ghost_set
-            .find(hash, |g| g.hash == hash)
-            .is_some_and(|g| g.live)
+        self.ghost_set.find(hash, |&h| h == hash).is_some()
     }
 
-    /// Forgets `hash`, reporting whether it was remembered. Its queue node
-    /// stays and is counted off when it ages out.
+    /// Forgets `hash` from the ghost set, reporting whether it was there. Its
+    /// queue node stays and ages out whatever `hash` is recorded as then: a
+    /// fingerprint recorded again while its old node is queued is forgotten
+    /// with that node, short of a full stay. Kept so by measurement: holding
+    /// it for the full second stay admitted more blocks straight to the main
+    /// queue, and a scan over a tree a fifth larger than the cache ran 7%
+    /// slower, with no read path faster for it.
     fn take_ghost(&mut self, hash: u64) -> bool {
-        match self.ghost_set.find_mut(hash, |g| g.hash == hash) {
-            Some(ghost) => core::mem::replace(&mut ghost.live, false),
-            None => false,
+        match self.ghost_set.find_entry(hash, |&h| h == hash) {
+            Ok(entry) => {
+                entry.remove();
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -462,40 +456,15 @@ where
         if self.ghost_capacity == 0 {
             return;
         }
-        match self.ghost_set.entry(hash, |g| g.hash == hash, |g| g.hash) {
-            hashbrown::hash_table::Entry::Vacant(slot) => {
-                slot.insert(Ghost {
-                    hash,
-                    nodes: 1,
-                    live: true,
-                });
-                self.ghost.push_back(hash);
-            }
-            // A stay that an admission spent: a new node starts the next one.
-            hashbrown::hash_table::Entry::Occupied(mut entry) if !entry.get().live => {
-                let ghost = entry.get_mut();
-                ghost.live = true;
-                // At most one node per entry of the queue, which is bounded
-                // by `ghost_capacity`.
-                ghost.nodes += 1;
-                self.ghost.push_back(hash);
-            }
-            hashbrown::hash_table::Entry::Occupied(_) => {}
+        if let hashbrown::hash_table::Entry::Vacant(slot) =
+            self.ghost_set.entry(hash, |&h| h == hash, |&h| h)
+        {
+            slot.insert(hash);
+            self.ghost.push_back(hash);
         }
         while self.ghost.len() > self.ghost_capacity {
             if let Some(old) = self.ghost.pop_front() {
-                self.age_out_ghost(old);
-            }
-        }
-    }
-
-    /// Counts off the oldest node of `hash`, forgetting it with its last.
-    fn age_out_ghost(&mut self, hash: u64) {
-        if let Ok(mut entry) = self.ghost_set.find_entry(hash, |g| g.hash == hash) {
-            let ghost = entry.get_mut();
-            ghost.nodes -= 1;
-            if ghost.nodes == 0 {
-                entry.remove();
+                self.take_ghost(old);
             }
         }
     }
