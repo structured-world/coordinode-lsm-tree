@@ -37,8 +37,12 @@ use handle::BlobIndirection;
 
 /// Iterator value guard
 pub struct Guard {
-    tree: crate::BlobTree,
-    version: Version,
+    /// The tree and the version a value still to be read is read through.
+    /// `None` for an item that reads nothing more: one whose value is inline,
+    /// or an indirection whose value the scan read ahead. Such a guard, the
+    /// usual one of a scan, holds no reference to either, so handing it out
+    /// and resolving it bumps no shared count.
+    source: Option<(crate::BlobTree, Version)>,
     /// Whether resolving the value caches it, as the tree said when the scan
     /// began.
     fill: crate::config::BlobCacheFill,
@@ -86,17 +90,7 @@ impl IterGuard for Guard {
         // selective scan into a full read of the value log. A caller that
         // wants every value uses `into_inner`, and that is what arms it.
         if pred(&kv.key.user_key) {
-            resolve_value_handle(
-                self.tree.id(),
-                &self.tree.index.config.cache,
-                self.fill,
-                self.prefetched.as_slice(),
-                &self.version,
-                #[cfg(feature = "metrics")]
-                self.tree.metrics(),
-                kv,
-            )
-            .map(|(k, v)| (k, Some(v)))
+            resolve(self.source, self.fill, self.prefetched, kv).map(|(k, v)| (k, Some(v)))
         } else {
             Ok((kv.key.user_key, None))
         }
@@ -123,17 +117,56 @@ impl IterGuard for Guard {
         if let Some(p) = &self.prefetch {
             p.note_resolved();
         }
-        resolve_value_handle(
-            self.tree.id(),
-            &self.tree.index.config.cache,
-            self.fill,
-            self.prefetched.as_slice(),
-            &self.version,
-            #[cfg(feature = "metrics")]
-            self.tree.metrics(),
-            self.kv?,
-        )
+        resolve(self.source, self.fill, self.prefetched, self.kv?)
     }
+}
+
+/// The key and value of a guard's item `kv`: the value read ahead for an
+/// indirection as it is, with no second decode of its pointer; a value read
+/// through `source`; or, with no source, the inline value the item holds
+/// (see [`Guard::source`]).
+fn resolve(
+    source: Option<(crate::BlobTree, Version)>,
+    fill: crate::config::BlobCacheFill,
+    prefetched: AheadValues,
+    kv: InternalValue,
+) -> RangeItem {
+    match (prefetched, source) {
+        // Taken for this very item, under its key, by its own pointer.
+        (AheadValues::One([(_, value)]), _) => Ok((kv.key.user_key, value)),
+        (prefetched, Some((tree, version))) => resolve_value_handle(
+            tree.id(),
+            &tree.index.config.cache,
+            fill,
+            prefetched.as_slice(),
+            &version,
+            #[cfg(feature = "metrics")]
+            tree.metrics(),
+            kv,
+        ),
+        (_, None) => Ok((kv.key.user_key, kv.value)),
+    }
+}
+
+/// The tree and version a guard of `item` reads its value through, when it
+/// has one to read: a cell row's objects, or an indirection's value the scan
+/// did not read ahead (see [`Guard::source`]).
+fn guard_source(
+    tree: &crate::BlobTree,
+    version: &Version,
+    item: &crate::Result<InternalValue>,
+    prefetched: &AheadValues,
+) -> Option<(crate::BlobTree, Version)> {
+    let kv = item.as_ref().ok()?;
+    let value_type = kv.key.value_type;
+    // The usual item of a scan falls through: an inline value, or an
+    // indirection read ahead.
+    if value_type.is_cell_row()
+        || (value_type.is_indirection() && !matches!(prefetched, AheadValues::One(_)))
+    {
+        return Some((tree.clone(), version.clone()));
+    }
+    None
 }
 
 /// Writes `value` under `key` to the blob file, compressed ahead as `pre` when
@@ -1552,8 +1585,7 @@ fn blob_guard(
     item: crate::Result<InternalValue>,
 ) -> IterGuardImpl {
     IterGuardImpl::Blob(Guard {
-        tree: tree.clone(),
-        version: version.clone(),
+        source: guard_source(tree, version, &item, &AheadValues::None),
         fill,
         prefetched: AheadValues::None,
         kv: item,
@@ -1714,8 +1746,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             _ => AheadValues::None,
         };
         IterGuardImpl::Blob(Guard {
-            tree: self.tree.clone(),
-            version: self.version.clone(),
+            source: guard_source(&self.tree, &self.version, &item, &prefetched),
             fill: self.state.fill,
             prefetched,
             kv: item,
