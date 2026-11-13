@@ -1570,8 +1570,10 @@ fn take_prefetched(local: &crate::vlog::Prefetched, kv: &InternalValue) -> Ahead
     if !kv.key.value_type.is_indirection() {
         return AheadValues::None;
     }
-    let mut cursor = crate::io::Cursor::new(&kv.value[..]);
-    let Ok(vptr) = BlobIndirection::decode_from(&mut cursor) else {
+    // Off the bytes on the scan's two decodes, here and at the window's fill:
+    // measured faster there than the cursor, which a point read keeps, where
+    // it measured faster.
+    let Ok(vptr) = BlobIndirection::decode_slice(&kv.value) else {
         return AheadValues::None;
     };
     match local.get(key, &vptr.vhandle) {
@@ -1701,8 +1703,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             if !kv.key.value_type.is_indirection() {
                 continue;
             }
-            let mut cursor = crate::io::Cursor::new(&kv.value[..]);
-            let Ok(vptr) = BlobIndirection::decode_from(&mut cursor) else {
+            let Ok(vptr) = BlobIndirection::decode_slice(&kv.value) else {
                 continue;
             };
             handles.push((&kv.key.user_key, vptr.vhandle, 0));
