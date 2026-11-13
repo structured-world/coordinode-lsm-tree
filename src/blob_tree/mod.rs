@@ -104,7 +104,8 @@ impl IterGuard for Guard {
         let kv = self.kv?;
 
         if kv.key.value_type.is_indirection() {
-            Ok(BlobIndirection::decode_slice(&kv.value)?.size)
+            let mut cursor = crate::io::Cursor::new(kv.value);
+            Ok(BlobIndirection::decode_from(&mut cursor)?.size)
         } else if kv.key.value_type.is_cell_row() {
             field_row::logical_len(&kv.value)
         } else {
@@ -292,7 +293,8 @@ pub(crate) fn resolve_value_handle(
         return Ok((item.key.user_key, UserValue::from(value)));
     }
     if item.key.value_type.is_indirection() {
-        let vptr = BlobIndirection::decode_slice(&item.value)?;
+        let mut cursor = crate::io::Cursor::new(item.value);
+        let vptr = BlobIndirection::decode_from(&mut cursor)?;
         if let Some(value) = prefetched_value(prefetched, &vptr.vhandle) {
             return Ok((item.key.user_key, value));
         }
@@ -412,7 +414,7 @@ impl BlobSource {
             let value = self.value(version, item)?;
             return crate::vlog::accessor::slice_range(&value, &range);
         }
-        let vptr = BlobIndirection::decode_slice(&item.value)?;
+        let vptr = BlobIndirection::decode_from(&mut crate::io::Cursor::new(&item.value[..]))?;
         Accessor::new(
             &version.blob_files,
             self.fill,
@@ -452,7 +454,8 @@ impl BlobSource {
         if !item.key.value_type.is_indirection() {
             return ValuePlan::Alone;
         }
-        let Ok(indirection) = BlobIndirection::decode_slice(&item.value) else {
+        let mut cursor = crate::io::Cursor::new(&item.value[..]);
+        let Ok(indirection) = BlobIndirection::decode_from(&mut cursor) else {
             return ValuePlan::Alone;
         };
         let vhandle = indirection.vhandle;
@@ -665,7 +668,7 @@ impl BlobSource {
         at: crate::cache::BlobFrameAt,
         item: &InternalValue,
     ) -> Option<UserValue> {
-        let indirection = BlobIndirection::decode_slice(&item.value).ok()?;
+        let indirection = BlobIndirection::decode_from(&mut &item.value[..]).ok()?;
         if indirection.vhandle.frame_at() != at {
             return None;
         }
@@ -1567,7 +1570,8 @@ fn take_prefetched(local: &crate::vlog::Prefetched, kv: &InternalValue) -> Ahead
     if !kv.key.value_type.is_indirection() {
         return AheadValues::None;
     }
-    let Ok(vptr) = BlobIndirection::decode_slice(&kv.value) else {
+    let mut cursor = crate::io::Cursor::new(&kv.value[..]);
+    let Ok(vptr) = BlobIndirection::decode_from(&mut cursor) else {
         return AheadValues::None;
     };
     match local.get(key, &vptr.vhandle) {
@@ -1697,7 +1701,8 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             if !kv.key.value_type.is_indirection() {
                 continue;
             }
-            let Ok(vptr) = BlobIndirection::decode_slice(&kv.value) else {
+            let mut cursor = crate::io::Cursor::new(&kv.value[..]);
+            let Ok(vptr) = BlobIndirection::decode_from(&mut cursor) else {
                 continue;
             };
             handles.push((&kv.key.user_key, vptr.vhandle, 0));
