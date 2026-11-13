@@ -875,11 +875,17 @@ impl Writer {
     /// compressed under as a whole, for a worker to compress it ahead: a
     /// packed record or a frame of its own. `None` for a value that shares a
     /// block, whose compression is the block's, one that is chunked, whose
-    /// chunks compress on the workers already, and in a file that compresses
-    /// nothing.
+    /// chunks compress on the workers already, in a file that compresses
+    /// nothing, and in one still gathering its own dictionary: its codec
+    /// changes when the dictionary is built, and every value compressed ahead
+    /// under the codec before it would be compressed again when written.
     #[cfg(feature = "std")]
     pub(crate) fn value_codec(&self, value_len: u32) -> Option<OwnedCodec> {
         if self.compression == CompressionType::None {
+            return None;
+        }
+        #[cfg(zstd_any)]
+        if self.collecting_dictionary() {
             return None;
         }
         let FrameSizes {
