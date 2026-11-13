@@ -479,11 +479,20 @@ impl CompressionProvider for ZstdProvider {
 
         TLS_COMPRESSOR.with(|cell| {
             let mut state = cell.borrow_mut();
-            if !matches!(
-                &*state,
-                Some((key, l, cached, _))
-                    if *key == dict.id64() && *l == level && *cached == single_pass
-            ) {
+            if let Some((key, l, cached, compressor)) = state.as_mut()
+                && *l == level
+                && *cached == single_pass
+            {
+                // Another dictionary at the same parameters, as each blob
+                // file brings its own: the compressor keeps its tables and
+                // takes the new handle.
+                if *key != dict.id64() {
+                    compressor
+                        .set_encoder_dictionary(dict.prepared_encoder()?)
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                    *key = dict.id64();
+                }
+            } else {
                 let configured = CompressionLevel::from_level(level);
                 let mut compressor = FrameCompressor::new(configured);
                 // Before the dictionary: attaching it builds match-finder state

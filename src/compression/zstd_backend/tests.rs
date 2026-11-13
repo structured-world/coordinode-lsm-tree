@@ -789,6 +789,32 @@ fn the_compressor_cache_key_ignores_the_seed_below_level_19() {
     }
 }
 
+/// A thread's compressor takes another dictionary at the same level without
+/// being rebuilt, as each blob file brings its own: every frame decodes under
+/// the dictionary it was compressed with, going from one to the other and
+/// back.
+#[test]
+fn a_compressor_changing_dictionaries_writes_each_frame_under_its_own() {
+    let content = |seed: u32| -> Vec<u8> {
+        (0..4 * 1024_u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13).to_le_bytes()[0])
+            .collect()
+    };
+    let (first, second) = (content(1), content(2));
+    let dicts = [ZstdDictionary::new(&first), ZstdDictionary::new(&second)];
+    // Each value is a slice of its dictionary, so it compresses to a match
+    // only under that one.
+    let values = [&first[1_000..1_300], &second[2_000..2_300]];
+    for round in [0, 1, 0, 1, 1, 0] {
+        let (dict, value) = (&dicts[round], values[round]);
+        let frame = ZstdProvider::compress_with_dict(value, 3, dict, true).expect("compress");
+        assert!(frame.len() < value.len() / 2, "matched its dictionary");
+        let back =
+            ZstdProvider::decompress_with_dict(&frame, dict, value.len() + 1).expect("decompress");
+        assert_eq!(back, value);
+    }
+}
+
 #[test]
 fn a_single_pass_dictionary_frame_round_trips() {
     // The dictionary path configures its own compressor, so the setting has
