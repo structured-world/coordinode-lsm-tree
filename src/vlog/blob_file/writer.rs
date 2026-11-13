@@ -285,10 +285,8 @@ pub(crate) struct Writer {
     block: PendingBlock,
 
     /// The records of the packed block the next small value joins (see
-    /// [`Self::packs`]), back to back, their checksums in order, how many,
-    /// and their values' bytes.
+    /// [`Self::packs`]), back to back, how many, and their values' bytes.
     packed: Vec<u8>,
-    packed_sums: Vec<u8>,
     packed_count: u16,
     packed_raw: u64,
 
@@ -546,7 +544,6 @@ impl Writer {
             frames: Vec::new(),
             block: PendingBlock::default(),
             packed: Vec::new(),
-            packed_sums: Vec::new(),
             packed_count: 0,
             packed_raw: 0,
             scratch: Vec::new(),
@@ -1299,10 +1296,6 @@ impl Writer {
             (compression, plain),
             compressed.as_deref(),
         )?;
-        // A record starts with its checksum.
-        let start = usize::from(index);
-        self.packed_sums
-            .extend_from_slice(self.packed.get(start..start + 8).unwrap_or_default());
         self.packed_count += 1;
         self.packed_raw += value.len() as u64;
         #[expect(
@@ -1328,24 +1321,13 @@ impl Writer {
             reason = "a packed block closes before its values decode past MAX_DECOMPRESSION_SIZE"
         )]
         let raw_len = self.packed_raw as u32;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a packed block holds less than one record past u16::MAX bytes"
-        )]
-        let records_len = self.packed.len() as u32;
-        let header = super::packed::packed_header(
-            self.packed_count,
-            raw_len,
-            records_len,
-            &self.packed_sums,
-        );
+        let header = super::packed::packed_header(self.packed_count, raw_len, &self.packed);
         let records = core::mem::take(&mut self.packed);
         let before = self.offset;
         let written = self.put_frame_parts(&header, &records);
         self.block_frame_bytes += self.offset - before;
         self.packed = records;
         self.packed.clear();
-        self.packed_sums.clear();
         self.packed_count = 0;
         self.packed_raw = 0;
         written

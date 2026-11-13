@@ -40,8 +40,8 @@
 //! what is left.
 //! `header_crc` covers the fixed fields after the magic; `checksum` is
 //! xxh3-128 over the entries and the payload as stored, which lie back to
-//! back, seeded with `header_crc`; a packed block's is over its records'
-//! checksums instead (see [`super::packed`]).
+//! back, seeded with `header_crc`; a packed block has no entries, and its
+//! payload is its records (see [`super::packed`]).
 
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;

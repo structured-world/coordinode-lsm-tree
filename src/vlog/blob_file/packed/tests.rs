@@ -29,16 +29,7 @@ fn records(values: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
 
 /// The packed block over `records`, whose records start at `starts`.
 fn frame(records: &[u8], starts: &[usize], raw_len: u32) -> Vec<u8> {
-    let mut sums = Vec::new();
-    for &at in starts {
-        sums.extend_from_slice(&records[at..at + 8]);
-    }
-    let header = packed_header(
-        u16::try_from(starts.len()).unwrap(),
-        raw_len,
-        u32::try_from(records.len()).unwrap(),
-        &sums,
-    );
+    let header = packed_header(u16::try_from(starts.len()).unwrap(), raw_len, records);
     [header.as_slice(), records].concat()
 }
 
@@ -111,18 +102,42 @@ fn a_record_is_placed_by_its_offset_alone() {
     }
 }
 
-/// A damaged record byte is caught by that record's own checksum on a read of
-/// the frame whole, which no longer hashes the records a second time.
+/// A damaged byte anywhere in a record, its own checksum included, is caught
+/// by the frame's checksum on a read of the frame whole, which hashes the
+/// records once and no record on its own: damage must not reach a scan
+/// because the record it is in was not hashed.
 #[test]
 fn a_damaged_record_fails_the_frame_check() {
     let (bytes, starts) = records(&[b"one value", b"another value"]);
-    let mut frame = frame(&bytes, &starts, 22);
-    let last = frame.len() - 1;
-    frame[last] ^= 1;
-    assert!(matches!(
-        check_frame(&frame),
-        Err(crate::Error::ChecksumMismatch { .. })
-    ));
+    let whole = frame(&bytes, &starts, 22);
+    let header = crate::vlog::blob_file::frame::FRAME_HEADER_LEN;
+    for at in header..whole.len() {
+        let mut frame = whole.clone();
+        frame[at] ^= 1;
+        assert!(
+            matches!(
+                check_frame(&frame),
+                Err(crate::Error::ChecksumMismatch { .. })
+            ),
+            "byte {at}"
+        );
+    }
+}
+
+/// A record read alone is checked by its own checksum, which the frame's
+/// does not replace: a read of one record sees no other byte of the block.
+#[test]
+fn a_damaged_record_read_alone_fails_its_own_checksum() {
+    let (bytes, starts) = records(&[b"one value", b"another value"]);
+    let record = &bytes[starts[1]..];
+    assert!(parse_record(record).is_ok());
+    for at in 0..record.len() {
+        let mut damaged = record.to_vec();
+        damaged[at] ^= 1;
+        // A flipped length bit makes the record malformed before it is
+        // hashed; any other flip fails the hash.
+        assert!(parse_record(&damaged).is_err(), "byte {at}");
+    }
 }
 
 /// A record whose value is stored as it is caches as the very bytes read, so
@@ -266,7 +281,7 @@ fn an_uncompressed_record_of_another_length_is_refused() {
 }
 
 /// Two records of the same length swapped each still check by their own
-/// checksums; the frame's checksum over their checksums in order catches it.
+/// checksums; the frame's checksum over the records as they lie catches it.
 #[test]
 fn records_swapped_fail_the_frame_checksum() {
     let (bytes, starts) = records(&[b"aaaa", b"bbbb"]);

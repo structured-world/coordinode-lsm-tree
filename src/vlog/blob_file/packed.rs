@@ -16,10 +16,13 @@
 //! and the table its record's length, so a point read reads that record
 //! alone and decodes that value alone: the neighbours a block compresses a
 //! value with are what the file's dictionary gives it here. `checksum` is
-//! xxh3-64 over the rest of the record. The frame's own checksum is xxh3-128
-//! over its records' checksums in order, seeded with its header's CRC: the
-//! records' bytes are each hashed once, by their own checksums, and a read of
-//! the frame whole checks every record and that they are the frame's.
+//! xxh3-64 over the rest of the record, which a read of the record alone
+//! checks. The frame's own checksum is xxh3-128 over its records as they lie,
+//! seeded with its header's CRC, as any frame's is over its payload: a read
+//! of the frame whole checks that one, in one pass over the block, and reads
+//! the records' fields without hashing each again. A hash per record of a few
+//! hundred bytes cost a scan two and a half times what the block hashed whole
+//! does, its setup and finish paid per value.
 
 use super::frame::{
     DecodedFrame, FLAG_PLAIN, FLAG_RAW, FRAME_HEADER_LEN, FrameEntries, FrameEntry, FrameHeader,
@@ -369,28 +372,36 @@ pub(crate) fn cached_value(cached: &Slice, key: &[u8]) -> crate::Result<Slice> {
     Ok(cached.slice(record.stored))
 }
 
-/// Checks the records of the packed block whose header is `header`, each
-/// against its own checksum and all of them against the frame's, and lists
-/// its values: keys as views into `records`, values where they lie once
-/// decoded back to back.
+/// Fails unless `records` are the packed block's whose header is `header`,
+/// by the frame's checksum over them.
+fn check_records(header: &FrameHeader, records: &[u8]) -> crate::Result<()> {
+    let checksum = super::frame::frame_checksum(records, header.header_crc);
+    if checksum != header.checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: crate::Checksum::from_raw(checksum),
+            expected: crate::Checksum::from_raw(header.checksum),
+        });
+    }
+    Ok(())
+}
+
+/// Checks the records of the packed block whose header is `header` against
+/// the frame's checksum, and lists its values: keys as views into `records`,
+/// values where they lie once decoded back to back.
 ///
 /// # Errors
 ///
-/// A record that does not check, records that are not the header's, or a
-/// frame checksum that does not match.
+/// A frame checksum that does not match, or records that are not the
+/// header's.
 pub(crate) fn check_packed(header: &FrameHeader, records: &[u8]) -> crate::Result<FrameEntries> {
     let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    check_records(header, records)?;
     let count = usize::from(header.count);
     let mut list = Vec::with_capacity(count);
-    // Gathered and hashed in one pass: a seeded xxh3 state fed per record
-    // measured 0.6-0.7% more instructions per scan, its secret derived and
-    // its stripe buffer kept per frame costing more than this allocation.
-    let mut sums = Vec::with_capacity(count * 8);
     let mut at = 0;
     let mut decoded = 0_usize;
     while at < records.len() {
-        let record = parse_record(records.get(at..).unwrap_or_default())?;
-        sums.extend_from_slice(&record.checksum.to_le_bytes());
+        let record = record_fields(records.get(at..).unwrap_or_default())?;
         let value_len = record.value_len as usize;
         list.push(FrameEntry {
             seqno: record.seqno,
@@ -405,20 +416,13 @@ pub(crate) fn check_packed(header: &FrameHeader, records: &[u8]) -> crate::Resul
     if list.len() != count || decoded != header.raw_len as usize {
         return Err(malformed());
     }
-    let checksum = super::frame::frame_checksum(&sums, header.header_crc);
-    if checksum != header.checksum {
-        return Err(crate::Error::ChecksumMismatch {
-            got: crate::Checksum::from_raw(checksum),
-            expected: crate::Checksum::from_raw(header.checksum),
-        });
-    }
     Ok(FrameEntries::Many(list))
 }
 
 /// The packed block whose header is `header` and whose payload, its records,
-/// is `records`, checked as [`check_packed`] checks it and decoded whole in
-/// the same pass, each record parsed once: every value, for a read of the
-/// frame whole (a scan, a collection, a cache fill).
+/// is `records`, checked as [`check_packed`] checks it and decoded whole,
+/// each record parsed once: every value, for a read of the frame whole (a
+/// scan, a collection, a cache fill).
 ///
 /// Each value is decoded straight into its place in the payload, one
 /// allocation for the block. In a file that compresses nothing every value
@@ -430,9 +434,8 @@ pub(crate) fn check_packed(header: &FrameHeader, records: &[u8]) -> crate::Resul
 ///
 /// # Errors
 ///
-/// A record that does not check or does not decode to the length it
-/// declares, records that are not the header's, or a frame checksum that
-/// does not match.
+/// A frame checksum that does not match, records that are not the header's,
+/// or a record that does not decode to the length it declares.
 pub(crate) fn decode_packed(
     header: FrameHeader,
     records: &Slice,
@@ -449,19 +452,19 @@ pub(crate) fn decode_packed(
     if raw_len > super::writer::MAX_DECOMPRESSION_SIZE {
         return Err(malformed());
     }
+    *decoded = 0;
+    // Checked before anything is decoded: a block that is not the frame's
+    // decodes nothing.
+    check_records(&header, records)?;
     let in_place = compression == CompressionType::None;
     let mut payload = crate::slice::UnfilledSlice::new(if in_place { 0 } else { raw_len });
     let mut target = payload.target();
     let mut list = Vec::with_capacity(count);
-    // Gathered and hashed in one pass, as [`check_packed`] does.
-    let mut sums = Vec::with_capacity(count * 8);
     let mut at = 0;
     let mut placed = 0_usize;
-    *decoded = 0;
     while at < records.len() {
         let rest = records.get(at..).unwrap_or_default();
-        let record = parse_record(rest)?;
-        sums.extend_from_slice(&record.checksum.to_le_bytes());
+        let record = record_fields(rest)?;
         let len = record.value_len as usize;
         if placed + len > raw_len {
             return Err(malformed());
@@ -502,13 +505,6 @@ pub(crate) fn decode_packed(
     if list.len() != count || placed != raw_len {
         return Err(malformed());
     }
-    let checksum = super::frame::frame_checksum(&sums, header.header_crc);
-    if checksum != header.checksum {
-        return Err(crate::Error::ChecksumMismatch {
-            got: crate::Checksum::from_raw(checksum),
-            expected: crate::Checksum::from_raw(header.checksum),
-        });
-    }
     let payload = if in_place {
         records.clone()
     } else {
@@ -528,14 +524,14 @@ pub(crate) fn decode_packed(
 }
 
 /// The header of a packed block of `count` records, `raw_len` value bytes
-/// decoded, `records_len` bytes long, whose records' checksums are `sums` in
-/// order.
-pub(crate) fn packed_header(
-    count: u16,
-    raw_len: u32,
-    records_len: u32,
-    sums: &[u8],
-) -> [u8; FRAME_HEADER_LEN] {
+/// decoded, whose records are `records`.
+///
+/// # Panics
+///
+/// `records` longer than a frame holds: the writer closes a block first.
+pub(crate) fn packed_header(count: u16, raw_len: u32, records: &[u8]) -> [u8; FRAME_HEADER_LEN] {
+    #[expect(clippy::expect_used, reason = "the writer closes a block first")]
+    let records_len = u32::try_from(records.len()).expect("a packed block fits a frame");
     super::frame::stamp_header(
         FrameKind::Block,
         FLAG_PACKED,
@@ -543,6 +539,6 @@ pub(crate) fn packed_header(
         0,
         raw_len,
         records_len,
-        |crc| super::frame::frame_checksum(sums, crc),
+        |crc| super::frame::frame_checksum(records, crc),
     )
 }
