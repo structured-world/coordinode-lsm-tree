@@ -181,12 +181,13 @@ impl<'a> Reader<'a> {
                 let all = chunk_frames(&frame, vhandle.frame, self.blob_file.frame_count())?;
                 let mut frames = Vec::with_capacity(all.len() + 1);
                 frames.push(first);
-                for (at, chunk) in (0_u32..).zip(all) {
+                // As many rows as chunks: both are counted from the table.
+                for (spec, chunk) in frame.chunks()?.zip(all) {
                     let bytes = self.read_frame_bytes(chunk)?;
                     read += bytes.len() as u64;
                     // Copied as stored: the row's length and checksum prove
                     // it, no decode.
-                    let spec = frame.chunk(at)?;
+                    let spec = spec?;
                     if !spec.fits(compression) {
                         return Err(crate::Error::InvalidHeader("Blob"));
                     }
@@ -344,13 +345,9 @@ pub(crate) fn assemble_stored(
     use super::frame::{check_chunk, decode_chunk_into};
 
     let malformed = || crate::Error::InvalidHeader("Blob");
-    let (_, count) = head.chunk_table()?;
     let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
     let len = usize::try_from(total).map_err(|_| malformed())?;
-    let mut specs = Vec::with_capacity(count as usize);
-    for at in 0..count {
-        specs.push(head.chunk(at)?);
-    }
+    let specs = head.chunks()?.collect::<crate::Result<Vec<_>>>()?;
     let stored_len: u64 = specs.iter().map(|spec| u64::from(spec.stored_len)).sum();
     if stored_len != area.len() as u64 {
         return Err(malformed());

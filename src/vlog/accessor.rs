@@ -811,11 +811,11 @@ impl<'a> Accessor<'a> {
         use crate::vlog::blob_file::frame::{check_chunk, decode_chunk_into};
 
         let malformed = || crate::Error::InvalidHeader("Blob");
-        let (_, count) = head.chunk_table()?;
+        let specs = head.chunks()?;
         let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
         let len = usize::try_from(total).map_err(|_| malformed())?;
         let chunks = chunk_frames(head, head_frame, blob_file.frame_count())?;
-        if chunks.end - chunks.start != count {
+        if (chunks.end - chunks.start) as usize != specs.len() {
             return Err(malformed());
         }
         let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
@@ -826,9 +826,9 @@ impl<'a> Accessor<'a> {
 
         // Each chunk where the frame index places it, of the length its row
         // in the head's table gives.
-        let mut placed = Vec::with_capacity(count as usize);
-        for (at, frame) in (0_u32..).zip(chunks) {
-            let spec = head.chunk(at)?;
+        let mut placed = Vec::with_capacity(specs.len());
+        for (spec, frame) in specs.zip(chunks) {
+            let spec = spec?;
             let (start, end) = blob_file.frame_span(frame).ok_or_else(malformed)?;
             if end - start != u64::from(spec.stored_len) || !spec.fits(compression) {
                 return Err(malformed());

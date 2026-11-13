@@ -67,6 +67,7 @@ default = ["std", "parallel", "io-uring"]
 std = [
     "dep:arc-swap",
     "dep:libc",
+    "libc/std",
     "dep:parking_lot",
     "dep:parking_lot_core",
     "dep:tempfile",
@@ -100,7 +101,10 @@ io-uring = ["dep:io-uring", "std"]
 # Linux-only by nature (io_uring is a Linux kernel API); the backend module is
 # additionally `cfg(target_os = "linux")`, so enabling this on a non-Linux
 # target compiles to nothing.
-io-uring-raw = ["dep:syscalls"]
+#
+# `libc` comes along for its constants alone: the backend checks the flags it
+# spells out against the C library's as it builds, and links nothing of it.
+io-uring-raw = ["dep:syscalls", "dep:libc"]
 lz4 = ["dep:lz4_flex", "std"]
 # The previous `zstd-pure = ["zstd"]` alias was removed. It was
 # documented as deprecated when there were two candidate zstd backends
@@ -327,8 +331,9 @@ syscalls = { version = "0.8", optional = true, default-features = false }
 #     `sync_file_range` for incremental writeback.
 # libc provides the arch-correct struct layouts and ioctl constants that are
 # otherwise error-prone to hand-declare per architecture. Only the std
-# filesystem calls it.
-libc = { version = "0.2", optional = true }
+# filesystem calls it; the no-std io_uring backend reads its constants, so it
+# is taken without its own `std` there.
+libc = { version = "0.2", optional = true, default-features = false }
 
 [dev-dependencies]
 # Integration tests assemble their own wire fixtures with byteorder; the

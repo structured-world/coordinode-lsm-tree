@@ -157,3 +157,11 @@ impl ValuesAhead {
         Some(compressed.map(|compressed| (separated, compressed)))
     }
 }
+
+// The values are compressed ahead only under a codec.
+#[cfg(all(test, any(feature = "lz4", zstd_any)))]
+#[expect(
+    clippy::expect_used,
+    reason = "test code: a fixture that is missing fails the test"
+)]
+mod tests;

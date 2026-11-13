@@ -482,6 +482,20 @@ impl DecodedFrame {
         chunk_row(&self.payload, size, chunks, total, at)
     }
 
+    /// Every chunk of a head in order, the table's bounds checked once for
+    /// all of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::chunk_table`]; each row yields its own error.
+    pub(crate) fn chunks(
+        &self,
+    ) -> crate::Result<impl ExactSizeIterator<Item = crate::Result<ChunkSpec>> + '_> {
+        let (size, chunks) = self.chunk_table()?;
+        let total = self.list.first().map_or(0, |e| u64::from(e.value_len));
+        Ok((0..chunks).map(move |at| chunk_row(&self.payload, size, chunks, total, at)))
+    }
+
     /// Bytes this frame takes in a cache: what it decoded, its entries and
     /// their list.
     #[must_use]
