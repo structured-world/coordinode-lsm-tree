@@ -474,6 +474,13 @@ where
 /// shard's lock is released, so no read of the shard waits behind the frees.
 /// The first is held in place: an insert evicts one entry or none far more
 /// often than more, and then collecting them allocates nothing.
+///
+/// No further ones are held in place. An insert evicts several only when it
+/// outweighs several residents, a blob frame of 64 KiB over 8 KiB blocks at
+/// the least, so it follows a read and a checksum of that frame, tens of
+/// microseconds, beside which the list's two or three allocations are under
+/// a percent; and places for more would be initialised and dropped by every
+/// insert, the ones that evict nothing included.
 pub(crate) struct Evicted<V> {
     first: Option<V>,
     rest: Vec<V>,
