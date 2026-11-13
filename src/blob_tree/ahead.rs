@@ -76,6 +76,8 @@ pub(crate) struct ValuesAhead {
     batches: usize,
     /// The values handed over and not yet taken back, oldest first.
     waiting: VecDeque<Separated>,
+    /// The value bytes of `waiting`.
+    queued_bytes: u64,
     /// The batch being gathered, and the value bytes in it.
     batch: Vec<Value>,
     batch_bytes: usize,
@@ -95,6 +97,7 @@ impl ValuesAhead {
             pipeline: OrderedPipeline::new(parallel.spawner, (), threads, batches),
             batches,
             waiting: VecDeque::new(),
+            queued_bytes: 0,
             batch: Vec::new(),
             batch_bytes: 0,
             ready: VecDeque::new(),
@@ -108,8 +111,14 @@ impl ValuesAhead {
         !self.ready.is_empty()
     }
 
+    /// The bytes of the values handed over and not yet taken back.
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        self.queued_bytes
+    }
+
     /// Hands `separated` over to be compressed under `codec`.
     pub(crate) fn submit(&mut self, separated: Separated, codec: OwnedCodec) {
+        self.queued_bytes += separated.value.len() as u64;
         self.batch_bytes += separated.value.len();
         self.batch.push((separated.value.clone(), codec));
         self.waiting.push_back(separated);
@@ -132,6 +141,7 @@ impl ValuesAhead {
     /// compressed; `None` when nothing is waiting.
     pub(crate) fn take(&mut self) -> Option<crate::Result<(Separated, PreCompressed)>> {
         let separated = self.waiting.pop_front()?;
+        self.queued_bytes -= separated.value.len() as u64;
         if self.ready.is_empty() {
             // The oldest values not yet taken are the oldest batch's; with
             // none out they are the batch being gathered, which the flush

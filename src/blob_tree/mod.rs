@@ -2628,7 +2628,7 @@ impl AbstractTree for BlobTree {
             if let Some(ahead) = &mut ahead {
                 if let Some((class, codec)) = class.and_then(|class| {
                     blob_writer
-                        .value_codec(class, value_size)
+                        .value_codec(class, value_size, ahead.queued_bytes())
                         .map(|codec| (class, codec))
                 }) {
                     if ahead.has_ready() {

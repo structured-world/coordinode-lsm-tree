@@ -875,17 +875,29 @@ impl Writer {
     /// compressed under as a whole, for a worker to compress it ahead: a
     /// packed record or a frame of its own. `None` for a value that shares a
     /// block, whose compression is the block's, one that is chunked, whose
-    /// chunks compress on the workers already, in a file that compresses
-    /// nothing, and in one still gathering its own dictionary: its codec
-    /// changes when the dictionary is built, and every value compressed ahead
-    /// under the codec before it would be compressed again when written.
+    /// chunks compress on the workers already, and in a file that compresses
+    /// nothing.
+    ///
+    /// `queued` is the bytes of the values handed out to be compressed ahead
+    /// and not written yet, which this value follows into the file. A file
+    /// gathering its own dictionary writes its values without it until the
+    /// values written fill it, so the codec of this one is known from what is
+    /// gathered and queued: the codec without the dictionary while they leave
+    /// room in it, and `None` once they fill it, since the dictionary this
+    /// value is written under does not exist yet.
     #[cfg(feature = "std")]
-    pub(crate) fn value_codec(&self, value_len: u32) -> Option<OwnedCodec> {
+    #[cfg_attr(
+        not(zstd_any),
+        expect(unused_variables, reason = "only a zstd file gathers a dictionary")
+    )]
+    pub(crate) fn value_codec(&self, value_len: u32, queued: u64) -> Option<OwnedCodec> {
         if self.compression == CompressionType::None {
             return None;
         }
         #[cfg(zstd_any)]
-        if self.collecting_dictionary() {
+        if self.collecting_dictionary()
+            && self.dictionary_samples.len() as u64 + queued >= u64::from(self.file_dictionary)
+        {
             return None;
         }
         let FrameSizes {

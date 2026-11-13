@@ -1068,12 +1068,13 @@ impl MultiWriter {
         &self,
         class: u8,
         value_len: u32,
+        queued: u64,
     ) -> Option<super::writer::OwnedCodec> {
         let takes_class = self.lifetime_groups.cap(class) == self.active_class
             && self.active_source.is_none()
             && self.domain.is_none();
         takes_class
-            .then(|| self.active_writer.value_codec(value_len))
+            .then(|| self.active_writer.value_codec(value_len, queued))
             .flatten()
     }
 

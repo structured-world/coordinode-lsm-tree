@@ -382,7 +382,7 @@ fn an_uncompressed_file_compresses_no_value_ahead() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
     let w = Writer::new(folder.path().join("plain"), 0, 0, &StdFs)?.use_frame_sizes(SIZES);
     for len in [10, 150, 700] {
-        assert!(w.value_codec(len).is_none(), "{len} bytes");
+        assert!(w.value_codec(len, 0).is_none(), "{len} bytes");
     }
     Ok(())
 }
@@ -422,6 +422,45 @@ fn a_block_copied_whole_must_be_the_block_it_names() -> crate::Result<()> {
     }
     assert_eq!(w.len_written(), before, "nothing was written");
     assert_eq!(w.write_block_verbatim(&copied(frame(0), 2))?, 0);
+    Ok(())
+}
+
+/// A file gathering its own dictionary names the codec of a value to
+/// compress ahead from what it has gathered and what is queued before the
+/// value: without the dictionary while those leave room in it, none once
+/// they fill it, and the dictionary's once it is built.
+#[cfg(all(zstd_any, feature = "std"))]
+#[test]
+fn a_value_ahead_of_a_gathering_file_is_compressed_without_the_dictionary() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let mut w = Writer::new(folder.path().join("blob"), 0, 0, &StdFs)?
+        .use_compression(CompressionType::Zstd(3))
+        .use_file_dictionary(1_024);
+    let value = [7_u8; 100];
+    let stamp = |codec: Option<OwnedCodec>| codec.map(|c| CodecStamp::of(&c.as_codec()));
+
+    let gathering = stamp(w.value_codec(100, 0));
+    assert!(
+        gathering.is_some_and(|s| s.plain && s.dictionary.is_none()),
+        "nothing gathered: written without the dictionary"
+    );
+    assert!(stamp(w.value_codec(100, 1_023)) == gathering, "room left");
+    assert!(w.value_codec(100, 1_024).is_none(), "the queue fills it");
+
+    for i in 0..5_u8 {
+        w.write(&[b'k', i], 0, &value)?;
+    }
+    assert!(stamp(w.value_codec(100, 500)) == gathering, "500 + 500");
+    assert!(w.value_codec(100, 600).is_none(), "500 + 600");
+
+    for i in 5..11_u8 {
+        w.write(&[b'k', i], 0, &value)?;
+    }
+    assert!(w.dictionary_in_file);
+    assert!(
+        stamp(w.value_codec(100, 0)).is_some_and(|s| !s.plain && s.dictionary.is_some()),
+        "built: written under it"
+    );
     Ok(())
 }
 
