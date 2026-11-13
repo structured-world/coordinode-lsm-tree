@@ -17,8 +17,11 @@
 //! and take its result back, so a job per value spent the flush's thread on
 //! the handing over, and kept the pool's threads waking for work the size of
 //! a wake; beside a table codec that needs those threads, it slowed the flush
-//! instead. A batch holds enough bytes that the handing over is a small part
-//! of it.
+//! instead. A batch holds enough values that the handing over is a small
+//! part of it, and few enough that a flush of a thousand values still
+//! spreads over the workers: batches of 64 KiB left such a flush three of
+//! them, most compressed by the flush itself as it drained, and it wrote a
+//! quarter slower than with a job per value.
 
 use crate::{
     UserValue,
@@ -33,12 +36,12 @@ use alloc::collections::VecDeque;
 
 /// The value bytes a batch holds before it goes to a worker: some tens of
 /// microseconds of compression, against the microsecond or two of handing a
-/// job over.
-const BATCH_BYTES: usize = 64 * 1_024;
+/// job over. A value at or past it is a batch by itself.
+const BATCH_BYTES: usize = 4 * 1_024;
 
 /// The most values a batch holds, whatever their bytes: values of a few bytes
 /// do not gather without bound.
-const BATCH_VALUES: usize = 512;
+const BATCH_VALUES: usize = 32;
 
 /// One value to compress and the codec to compress it under.
 type Value = (UserValue, OwnedCodec);
@@ -85,9 +88,9 @@ impl ValuesAhead {
     pub(crate) fn for_flush(parallel: Option<ParallelCompression>) -> Option<Self> {
         let parallel = parallel?;
         let threads = parallel.threads.max(1);
-        // A batch per worker, and one more gathered behind each so no worker
-        // waits for the flush.
-        let batches = threads * 2;
+        // A batch per worker, and three more gathered behind each so no
+        // worker waits for the flush.
+        let batches = threads * 4;
         Some(Self {
             pipeline: OrderedPipeline::new(parallel.spawner, (), threads, batches),
             batches,
@@ -98,11 +101,11 @@ impl ValuesAhead {
         })
     }
 
-    /// Whether a value has to be taken before the next is submitted: every
-    /// batch the workers may hold is out, so the next one to fill would have
-    /// nowhere to go.
-    pub(crate) fn is_full(&self) -> bool {
-        self.pipeline.pending() >= self.batches
+    /// Whether a compressed value is at hand for the flush to write before
+    /// it submits the next: taking one per value submitted keeps what is held
+    /// compressed and unwritten to a batch or two.
+    pub(crate) fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
     }
 
     /// Hands `separated` over to be compressed under `codec`.
@@ -111,6 +114,14 @@ impl ValuesAhead {
         self.batch.push((separated.value.clone(), codec));
         self.waiting.push_back(separated);
         if self.batch_bytes >= BATCH_BYTES || self.batch.len() >= BATCH_VALUES {
+            // Every batch the workers may hold is out: the oldest comes back
+            // first, so the one going in has a place among them. Its values
+            // follow the ones already at hand, in the order they went in.
+            if self.pipeline.pending() >= self.batches
+                && let Some(oldest) = self.pipeline.take_next()
+            {
+                self.ready.extend(oldest);
+            }
             let batch = core::mem::take(&mut self.batch);
             self.batch_bytes = 0;
             self.pipeline.submit(BatchJob(batch));

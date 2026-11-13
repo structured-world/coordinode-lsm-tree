@@ -2631,7 +2631,7 @@ impl AbstractTree for BlobTree {
                         .value_codec(class, value_size)
                         .map(|codec| (class, codec))
                 }) {
-                    if ahead.is_full() {
+                    if ahead.has_ready() {
                         write_ahead(ahead, &mut blob_writer, &mut table_writer, &mut encoded)?;
                     }
                     let separated = ahead::Separated {
