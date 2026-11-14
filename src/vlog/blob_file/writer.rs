@@ -182,9 +182,23 @@ pub(crate) fn encode_frame_index_marked(starts: &[u64], end: u64, chunks: &[u64]
         reason = "a frame number is a u32, so a file holds at most u32::MAX frames"
     )]
     out.extend_from_slice(&(starts.len() as u32).to_le_bytes());
-    for (at, start) in starts.iter().enumerate() {
-        let mark = if is_marked(chunks, at) { CHUNK_MARK } else { 0 };
-        out.extend_from_slice(&(start | mark).to_le_bytes());
+    for start in starts {
+        out.extend_from_slice(&start.to_le_bytes());
+    }
+    // The marks go onto the starts already laid down, a chunk at a time: most
+    // files hold none, and their index costs what it did without the marks.
+    for (word, &bits) in chunks.iter().enumerate() {
+        let mut bits = bits;
+        while bits != 0 {
+            let at = word * 64 + bits.trailing_zeros() as usize;
+            // The top byte of the little-endian start of frame `at`.
+            if at < starts.len()
+                && let Some(top) = out.get_mut(4 + at * 8 + 7)
+            {
+                *top |= 0x80;
+            }
+            bits &= bits - 1;
+        }
     }
     out.extend_from_slice(&end.to_le_bytes());
     let digest = xxhash_rust::xxh3::xxh3_64(&out);

@@ -329,14 +329,6 @@ impl Scanner {
         }
     }
 
-    /// Whether the index marks `frame` as a chunk of the head before it.
-    fn is_chunk(&self, frame: u32) -> bool {
-        match &self.bounds {
-            Bounds::Index(frames) => frames.is_chunk(frame as usize),
-            Bounds::Chain => false,
-        }
-    }
-
     /// Moves to frame `frame` when the index places it, past the frames before
     /// it; in a chain walk, which knows no frame's place ahead, stays where
     /// the walk already is.
@@ -388,12 +380,6 @@ impl Scanner {
             }
             Some(Err(e))
         };
-        // A chunk is read with its head, never as a frame: the walk stands
-        // at one only when the index and the heads disagree.
-        if self.is_chunk(frame) {
-            return damaged(self, crate::Error::InvalidHeader("BlobFrame"));
-        }
-
         // The span to read: the index's, else the header's declared length,
         // bounded by the section either way. An index is taken only when it
         // rises strictly within the data section and ends at its end, and a
