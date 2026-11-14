@@ -214,6 +214,10 @@ pub(super) struct SliceGovernor<'a> {
     ready: usize,
     /// The key the slice ends before, once it stopped.
     end: Option<UserKey>,
+    /// The sources with a dictionary of their own that the row being taken
+    /// points into: emptied after every row and kept, so a row gathers them
+    /// without an allocation of its own.
+    row_dictionaries: Vec<crate::vlog::BlobFileId>,
 }
 
 impl<'a> SliceGovernor<'a> {
@@ -259,6 +263,7 @@ impl<'a> SliceGovernor<'a> {
             held: VecDeque::new(),
             ready: 0,
             end: None,
+            row_dictionaries: Vec::new(),
         }
     }
 
@@ -467,8 +472,8 @@ impl<'a> SliceGovernor<'a> {
             1
         };
         let owned = self.committed.rows.owned_blob_objects;
-        let mut dictionaries = Vec::new();
-        let (blobs, grew) = take_entry(
+        let mut dictionaries = core::mem::take(&mut self.row_dictionaries);
+        let taken = take_entry(
             &mut self.committed.rows,
             super::NewShapes {
                 known_links: &self.committed.links,
@@ -483,9 +488,8 @@ impl<'a> SliceGovernor<'a> {
             self.split_cells,
             self.relocated,
             &mut dictionaries,
-        )?;
-        self.committed.blobs += blobs;
-        for source in dictionaries {
+        );
+        for &source in &dictionaries {
             if !self.committed.dictionaries.contains(&source)
                 && !self.load.dictionaries.contains(&source)
             {
@@ -493,6 +497,10 @@ impl<'a> SliceGovernor<'a> {
                 self.past_quota = true;
             }
         }
+        dictionaries.clear();
+        self.row_dictionaries = dictionaries;
+        let (blobs, grew) = taken?;
+        self.committed.blobs += blobs;
         if let Some(domains) = self.outputs.domains {
             let (table_end, blob_end) = &mut self.edges;
             let seen = (self.load.table_domains.len(), self.load.blob_domains.len());
