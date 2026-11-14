@@ -6,7 +6,7 @@
 use crate::UserKey;
 use crate::blob_tree::FragmentationMap;
 use crate::blob_tree::handle::BlobIndirection;
-use crate::coding::{Decode, Encode};
+use crate::coding::Decode;
 use crate::compaction::Input as CompactionPayload;
 use crate::compaction::worker::Options;
 use crate::range_tombstone::RangeTombstone;
@@ -1282,8 +1282,6 @@ pub(crate) struct RelocatingCompaction {
     /// inline for this pass to write beside the relocated frames. `None`
     /// writes every inline value inline.
     fresh: Option<FreshValues>,
-    /// Holds a pointer while it is encoded, so a pass allocates this once.
-    encoded: Vec<u8>,
     /// The live share of a block, by its entries' bytes, at or above which
     /// the block is copied whole as it was stored, its dead values with it;
     /// below it, its live values are written into new blocks. `None` copies
@@ -1672,7 +1670,6 @@ impl RelocatingCompaction {
             blob_carried: 0,
             frames_read: 0,
             fresh: None,
-            encoded: Vec::new(),
             block_copy_share: None,
             blocks: crate::HashMap::default(),
             fates: crate::HashMap::default(),
@@ -1698,13 +1695,13 @@ impl RelocatingCompaction {
         seqno: crate::SeqNo,
         indirection: &BlobIndirection,
     ) -> crate::Result<()> {
-        self.encoded.clear();
-        indirection.encode_into(&mut self.encoded)?;
+        let mut encoded = [0; BlobIndirection::ENCODED_CAP];
+        let pointer = indirection.encode_in(&mut encoded);
         self.inner
             .table_writer
             .write(InternalValue::from_components(
                 key,
-                self.encoded.as_slice(),
+                pointer,
                 seqno,
                 crate::ValueType::Indirection,
             ))?;

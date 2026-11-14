@@ -80,7 +80,44 @@ impl BlobIndirection {
     /// (10), frame (5), index (3), size (5) and stored word (a `u32` shifted by
     /// two bits, 5).
     #[cfg(feature = "std")]
-    pub(crate) const MAX_ENCODED_LEN: u64 = 10 + 5 + 3 + 5 + 5;
+    pub(crate) const MAX_ENCODED_LEN: u64 = Self::ENCODED_CAP as u64;
+
+    /// Encodes this indirection into `buf` and returns the bytes written:
+    /// what [`Encode`] writes, a varint at a time straight into the caller's
+    /// buffer, for the writers that encode one for every value.
+    #[inline]
+    pub(crate) fn encode_in<'b>(&self, buf: &'b mut [u8; Self::ENCODED_CAP]) -> &'b [u8] {
+        #[inline]
+        fn put(buf: &mut [u8], at: &mut usize, mut value: u64) {
+            loop {
+                let low = value.to_le_bytes()[0] & 0x7f;
+                value >>= 7;
+                // The buffer holds the longest encoding, so every byte lands.
+                if let Some(slot) = buf.get_mut(*at) {
+                    *slot = if value == 0 { low } else { low | 0x80 };
+                }
+                *at += 1;
+                if value == 0 {
+                    return;
+                }
+            }
+        }
+        let stored = match self.stored {
+            Stored::Frames(bytes) => u64::from(bytes) << 2,
+            Stored::InBlock(bytes) => (u64::from(bytes) << 2) | 1,
+            Stored::Packed(bytes) => (u64::from(bytes) << 2) | 2,
+        };
+        let mut at = 0;
+        put(buf, &mut at, self.vhandle.blob_file_id);
+        put(buf, &mut at, u64::from(self.vhandle.frame));
+        put(buf, &mut at, u64::from(self.vhandle.index));
+        put(buf, &mut at, u64::from(self.size));
+        put(buf, &mut at, stored);
+        buf.get(..at).unwrap_or_default()
+    }
+
+    /// Room for the longest encoded indirection.
+    pub(crate) const ENCODED_CAP: usize = 10 + 5 + 3 + 5 + 5;
 
     /// The most bytes the indirection of this value takes once the value is
     /// moved: its length stays, so that field keeps its bytes, and its file,

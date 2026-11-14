@@ -175,18 +175,15 @@ fn guard_source(
 fn write_separated(
     blob_writer: &mut BlobFileWriter,
     table_writer: &mut crate::table::multi_writer::MultiWriter,
-    encoded: &mut Vec<u8>,
     mut key: crate::key::InternalKey,
     value: &[u8],
     pre: Option<crate::vlog::blob_file::writer::PreCompressed>,
 ) -> crate::Result<()> {
-    use crate::coding::Encode;
-
     let indirection = blob_writer.write_pre(&key.user_key, key.seqno, value, pre)?;
-    encoded.clear();
-    indirection.encode_into(encoded)?;
+    let mut encoded = [0; BlobIndirection::ENCODED_CAP];
+    let pointer = indirection.encode_in(&mut encoded);
     key.value_type = crate::ValueType::Indirection;
-    table_writer.write(InternalValue::new(key, UserValue::new(encoded)))?;
+    table_writer.write(InternalValue::new(key, UserValue::new(pointer)))?;
     table_writer.register_blob(indirection);
     Ok(())
 }
@@ -197,7 +194,6 @@ fn write_ahead(
     ahead: &mut ahead::ValuesAhead,
     blob_writer: &mut BlobFileWriter,
     table_writer: &mut crate::table::multi_writer::MultiWriter,
-    encoded: &mut Vec<u8>,
 ) -> crate::Result<bool> {
     let Some(next) = ahead.take() else {
         return Ok(false);
@@ -207,7 +203,6 @@ fn write_ahead(
     write_separated(
         blob_writer,
         table_writer,
-        encoded,
         separated.key,
         &separated.value,
         Some(pre),
@@ -2592,9 +2587,6 @@ impl AbstractTree for BlobTree {
         // carry the RT metadata.
         table_writer.set_range_tombstones(range_tombstones);
 
-        // One buffer for every indirection of the flush.
-        let mut encoded = Vec::new();
-
         // A key domain picks the file, and so the dictionary, of the values
         // under it as the writer enters it: those stay on the writer's thread.
         #[cfg(feature = "std")]
@@ -2631,7 +2623,7 @@ impl AbstractTree for BlobTree {
                         .map(|codec| (class, codec))
                 }) {
                     if ahead.has_ready() {
-                        write_ahead(ahead, &mut blob_writer, &mut table_writer, &mut encoded)?;
+                        write_ahead(ahead, &mut blob_writer, &mut table_writer)?;
                     }
                     let separated = ahead::Separated {
                         key: item.key,
@@ -2642,7 +2634,7 @@ impl AbstractTree for BlobTree {
                     continue;
                 }
                 // Anything else follows the values before it into the files.
-                while write_ahead(ahead, &mut blob_writer, &mut table_writer, &mut encoded)? {}
+                while write_ahead(ahead, &mut blob_writer, &mut table_writer)? {}
             }
 
             if item.is_tombstone() {
@@ -2674,14 +2666,7 @@ impl AbstractTree for BlobTree {
 
             if let Some(class) = class {
                 blob_writer.select_lifetime_class(class)?;
-                write_separated(
-                    &mut blob_writer,
-                    &mut table_writer,
-                    &mut encoded,
-                    item.key,
-                    &value,
-                    None,
-                )?;
+                write_separated(&mut blob_writer, &mut table_writer, item.key, &value, None)?;
             } else {
                 table_writer.write(InternalValue::new(item.key, value))?;
             }
@@ -2689,7 +2674,7 @@ impl AbstractTree for BlobTree {
 
         #[cfg(feature = "std")]
         if let Some(ahead) = &mut ahead {
-            while write_ahead(ahead, &mut blob_writer, &mut table_writer, &mut encoded)? {}
+            while write_ahead(ahead, &mut blob_writer, &mut table_writer)? {}
         }
 
         let (blob_files, written) = finish_flush(

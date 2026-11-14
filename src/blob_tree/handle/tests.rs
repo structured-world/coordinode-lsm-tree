@@ -40,6 +40,11 @@ fn an_indirection_decodes_off_its_slice_as_its_read_does() -> crate::Result<()> 
                             assert_eq!(format!("{sliced:?}"), expected, "off the slice");
                             let read = BlobIndirection::decode_from(&mut &encoded[..])?;
                             assert_eq!(format!("{read:?}"), expected, "through `Read`");
+                            // Encoded into a buffer of the caller's, it is the
+                            // same bytes, of the length it reports.
+                            let mut buf = [0; BlobIndirection::ENCODED_CAP];
+                            assert_eq!(indirection.encode_in(&mut buf), &encoded[..]);
+                            assert_eq!(indirection.encoded_len(), encoded.len() as u64);
                         }
                     }
                 }
