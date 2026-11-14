@@ -116,6 +116,41 @@ fn a_writer_that_does_not_fill_keeps_a_write_whole() -> io::Result<()> {
     Ok(())
 }
 
+/// A file's buffers go to the workers only once it has written its first
+/// megabyte on the caller's thread: a short file is written as a writer
+/// without workers writes it.
+#[test]
+fn a_short_file_is_written_on_the_callers_thread() -> io::Result<()> {
+    let here = std::thread::current().id();
+
+    let mut out = DeferredWriter::with_capacity(64 * 1_024, Sink::default(), true);
+    out.use_spawner(Arc::new(Prompt));
+    let short = pattern(WORKERS_AFTER_BYTES - 1);
+    write_in(&mut out, &short, 1_000)?;
+    let sink = out.finish()?;
+    assert_eq!(sink.bytes, short);
+    assert!(sink.threads.iter().all(|&thread| thread == here));
+
+    let mut out = DeferredWriter::with_capacity(64 * 1_024, Sink::default(), true);
+    out.use_spawner(Arc::new(Prompt));
+    let long = pattern(3 * WORKERS_AFTER_BYTES);
+    write_in(&mut out, &long, 1_000)?;
+    let sink = out.finish()?;
+    assert_eq!(sink.bytes, long);
+    let by_workers: usize = sink
+        .threads
+        .iter()
+        .zip(&sink.writes)
+        .filter(|&(&thread, _)| thread != here)
+        .map(|(_, &len)| len)
+        .sum();
+    assert!(
+        by_workers >= WORKERS_AFTER_BYTES,
+        "the workers wrote {by_workers} bytes of the long file"
+    );
+    Ok(())
+}
+
 /// A buffer the last write left exactly full takes the next write: it goes
 /// down first, where a writer that took nothing of the write would have it
 /// fail as a write of zero bytes.
@@ -124,7 +159,7 @@ fn a_write_after_an_exactly_full_buffer_is_taken() -> io::Result<()> {
     for (fill, workers) in [(true, false), (true, true), (false, false), (false, true)] {
         let mut out = DeferredWriter::with_capacity(1_000, Sink::default(), fill);
         if workers {
-            out.use_spawner(Arc::new(Threads));
+            out.use_spawner_now(Arc::new(Threads));
         }
         out.write_all(&[1; 400])?;
         out.write_all(&[2; 600])?;
@@ -147,7 +182,7 @@ fn writes_of_any_size_reach_the_file_in_order() -> io::Result<()> {
     for (fill, workers) in [(true, false), (true, true), (false, false), (false, true)] {
         let mut out = DeferredWriter::with_capacity(CAPACITY, Sink::default(), fill);
         if workers {
-            out.use_spawner(Arc::new(Threads));
+            out.use_spawner_now(Arc::new(Threads));
         }
         let mut expected = Vec::new();
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
@@ -188,9 +223,9 @@ fn workers_write_the_buffers_in_order() -> io::Result<()> {
     for prompt in [false, true] {
         let mut out = DeferredWriter::with_capacity(4_096, Sink::default(), true);
         if prompt {
-            out.use_spawner(Arc::new(Prompt));
+            out.use_spawner_now(Arc::new(Prompt));
         } else {
-            out.use_spawner(Arc::new(Threads));
+            out.use_spawner_now(Arc::new(Threads));
         }
         write_in(&mut out, &data, 333)?;
         let sink = out.finish()?;
@@ -216,7 +251,7 @@ fn a_write_larger_than_the_buffer_keeps_its_place() -> io::Result<()> {
     for workers in [false, true] {
         let mut out = DeferredWriter::with_capacity(1_024, Sink::default(), true);
         if workers {
-            out.use_spawner(Arc::new(Threads));
+            out.use_spawner_now(Arc::new(Threads));
         }
         out.write_all(&[1; 10])?;
         out.write_all(&[2; 5_000])?;
@@ -236,7 +271,7 @@ fn a_write_larger_than_the_buffer_keeps_its_place() -> io::Result<()> {
 fn a_pool_that_never_comes_does_not_stop_the_writer() -> io::Result<()> {
     let data = pattern(4 * LANE_BYTES_MAX);
     let mut out = DeferredWriter::with_capacity(64 * 1_024, Sink::default(), true);
-    out.use_spawner(Arc::new(Never::default()));
+    out.use_spawner_now(Arc::new(Never::default()));
     write_in(&mut out, &data, 5_000)?;
     let sink = out.finish()?;
     assert_eq!(sink.bytes, data);
@@ -253,7 +288,7 @@ fn a_full_lane_holds_the_writer_back() -> io::Result<()> {
         ..Sink::default()
     };
     let mut out = DeferredWriter::with_capacity(64 * 1_024, sink, true);
-    out.use_spawner(Arc::new(Threads));
+    out.use_spawner_now(Arc::new(Threads));
     let mut most = 0;
     for chunk in data.chunks(64 * 1_024) {
         out.write_all(chunk)?;
@@ -272,7 +307,7 @@ fn a_job_behind_writes_finds_them_written() -> io::Result<()> {
         let seen = Arc::new(AtomicUsize::new(usize::MAX));
         let mut out = DeferredWriter::with_capacity(1_024, Sink::default(), true);
         if workers {
-            out.use_spawner(Arc::new(Threads));
+            out.use_spawner_now(Arc::new(Threads));
         }
         out.write_all(&pattern(5_000))?;
         let at = Arc::clone(&seen);
@@ -296,7 +331,7 @@ fn a_failed_write_is_returned_and_nothing_follows_it() {
         };
         let mut out = DeferredWriter::with_capacity(1_024, sink, true);
         if workers {
-            out.use_spawner(Arc::new(Threads));
+            out.use_spawner_now(Arc::new(Threads));
         }
         // Enough writes for the failure to come back through one of them.
         let mut failed = None;
@@ -367,7 +402,7 @@ fn a_panic_on_a_worker_is_a_failure_of_the_file() {
         dropped: Arc::clone(&dropped),
     };
     let mut out = DeferredWriter::with_capacity(1_024, sink, true);
-    out.use_spawner(Arc::new(Threads));
+    out.use_spawner_now(Arc::new(Threads));
     let mut failed = false;
     for _ in 0..64 {
         if out.write_all(&[7; 1_024]).is_err() {
@@ -412,7 +447,7 @@ fn a_dropped_writer_leaves_no_work_behind() -> io::Result<()> {
     let dropped = Arc::new(AtomicBool::new(false));
     let mut out =
         DeferredWriter::with_capacity(1_024, Noted(Arc::clone(&dropped), Vec::new()), true);
-    out.use_spawner(Arc::new(Threads));
+    out.use_spawner_now(Arc::new(Threads));
     out.write_all(&pattern(64 * 1_024))?;
     drop(out);
     assert!(dropped.load(Ordering::SeqCst));
@@ -462,7 +497,7 @@ fn workers_taken_on_midway_keep_the_order() -> io::Result<()> {
     let mut out = DeferredWriter::with_capacity(1_024, Sink::default(), true);
     let (before, after) = data.split_at(10_500);
     out.write_all(before)?;
-    out.use_spawner(Arc::new(Threads));
+    out.use_spawner_now(Arc::new(Threads));
     out.write_all(after)?;
     assert_eq!(out.finish()?.bytes, data);
     Ok(())
@@ -472,7 +507,7 @@ fn workers_taken_on_midway_keep_the_order() -> io::Result<()> {
 #[test]
 fn the_inner_writer_is_read_with_everything_written() -> io::Result<()> {
     let mut out = DeferredWriter::with_capacity(1_024, Sink::default(), true);
-    out.use_spawner(Arc::new(Threads));
+    out.use_spawner_now(Arc::new(Threads));
     out.write_all(&pattern(50_000))?;
     assert_eq!(out.with_inner(|sink| sink.bytes.len())?, 50_000);
     out.write_all(&pattern(7))?;
