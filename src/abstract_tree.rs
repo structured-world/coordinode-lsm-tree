@@ -1152,7 +1152,8 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
+    /// Will return `Err` if an IO error occurs; the files written up to it are
+    /// removed before it returns.
     fn flush_to_tables(
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
@@ -1199,7 +1200,11 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
+    /// Will return `Err` if an IO error occurs. The files of an install that
+    /// failed go once their handles drop, except on
+    /// [`Error::InstallOutcomeUnknown`](crate::Error::InstallOutcomeUnknown):
+    /// a reopen after a power loss may find them named, so they stay until a
+    /// later install supersedes the unknown one.
     fn register_tables(
         &self,
         tables: &[Table],
