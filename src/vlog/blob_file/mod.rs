@@ -652,18 +652,26 @@ impl BlobFile {
     }
 
     /// Whether a frame of this file starts at `offset`, or its data ends
-    /// there.
+    /// there. A chunk is no frame of its own: where one starts is the middle
+    /// of its value.
     #[must_use]
     pub(crate) fn is_frame_boundary(&self, offset: u64) -> bool {
-        self.0.frames.binary_search(&offset).is_ok()
+        self.0
+            .frames
+            .binary_search(&offset)
+            .is_ok_and(|at| !self.0.frames.is_chunk(at))
     }
 
-    /// The number of the frame that starts at `offset`, if one does.
+    /// The number of the frame that starts at `offset`, if one does: a head,
+    /// a single or a block, never a chunk.
     #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn frame_at_offset(&self, offset: u64) -> Option<u32> {
         let starts = self.0.frames.get(..self.frame_count())?;
         let at = starts.binary_search(&offset).ok()?;
+        if self.0.frames.is_chunk(at) {
+            return None;
+        }
         u32::try_from(at).ok()
     }
 

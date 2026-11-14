@@ -2349,6 +2349,11 @@ fn derive_blob_frontier(
     // frames of the index and check by its table; `None` when it does not.
     let intact = |at: usize| -> crate::Result<Option<usize>> {
         use crate::vlog::blob_file::frame::{FrameKind, check_chunk, head_chunks, verify_frame};
+        // A chunk is its value's bytes with no header: what it checks as is
+        // the writer's payload, never a frame of the file to anchor on.
+        if starts.is_chunk(at) {
+            return Ok(None);
+        }
         let bytes = frame_bytes(at)?;
         let checked = verify_frame(&bytes).and_then(|header| {
             if header.kind != FrameKind::Head {

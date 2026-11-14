@@ -251,6 +251,10 @@ impl Scanner {
                     Err(at) if seek_to == data_end || (start.is_none() && at == 0) => at,
                     Err(_) => return Err(crate::Error::InvalidHeader("BlobFile")),
                 };
+                // A chunk is read with its head: a walk never starts at one.
+                if frames.is_chunk(next) {
+                    return Err(crate::Error::InvalidHeader("BlobFile"));
+                }
                 let next =
                     u32::try_from(next).map_err(|_| crate::Error::InvalidHeader("BlobFile"))?;
                 (Bounds::Index(frames), next)

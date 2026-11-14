@@ -15577,6 +15577,106 @@ fn the_frontier_walk_steps_over_a_chunked_value_between_holes() -> crate::Result
     Ok(())
 }
 
+/// A chunk is its value's bytes with no header, so a value can hold a whole
+/// frame that checks. A reclaimed hole followed by a head lost to zeros ends
+/// the zeroed run at that head's first chunk: the chunk is no anchor for a
+/// frontier, whatever its bytes check as, since the index marks it a chunk.
+/// Anchored there, a repair would start at the writer's payload and take the
+/// frame inside it for a record.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_frame_inside_a_chunk_is_no_anchor_for_the_frontier() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    const CHUNK: usize = 4 * 1024;
+    let options = || {
+        KvSeparationOptions::default()
+            .separation_threshold(16)
+            .block_size(0)
+            // The smallest chunk size a tree takes.
+            .chunk_size(core::num::NonZeroU32::new(4 * 1024).expect("non-zero"))
+    };
+    // The values of a tree on `memfs`, as its one blob file holds them.
+    let written = |memfs: &Arc<MemFs>, values: &[(&[u8], Vec<u8>)]| {
+        let root = std::path::absolute("/db")?;
+        let tree = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .blob_compression(crate::CompressionType::None)
+        .with_kv_separation(Some(options()))
+        .open()?;
+        for (seqno, (key, value)) in (0_u64..).zip(values) {
+            tree.insert(*key, value.clone(), seqno);
+        }
+        tree.flush_active_memtable(0)?;
+        let blob_path = root.join(crate::file::BLOBS_FOLDER).join("0");
+        let fs: Arc<dyn Fs> = memfs.clone();
+        let entries = crate::vlog::BlobFileScanner::new(&blob_path, &*fs, 0)?
+            .collect::<crate::Result<Vec<_>>>()?;
+        crate::Result::Ok((blob_path, entries))
+    };
+
+    // A frame of one value that takes exactly a chunk.
+    let forged = (CHUNK - 200..CHUNK)
+        .find_map(|len| {
+            let (_, entries) = written(
+                &Arc::new(MemFs::new()),
+                &[(b"forged", alloc::vec![b'f'; len])],
+            )
+            .ok()?;
+            let frame = entries.first()?.frames.as_ref()?.first()?.to_vec();
+            (frame.len() == CHUNK).then_some(frame)
+        })
+        .expect("a single frame of a chunk's size");
+
+    let mut second = forged;
+    second.extend_from_slice(&[b'b'; 2 * CHUNK]);
+    let memfs = Arc::new(MemFs::new());
+    let (blob_path, entries) = written(
+        &memfs,
+        &[
+            (b"k0", alloc::vec![b'a'; 3 * CHUNK]),
+            (b"k1", second),
+            (b"k2", alloc::vec![b'c'; 3 * CHUNK]),
+        ],
+    )?;
+    let first = entries.first().expect("a first value");
+    let second = entries.get(1).expect("a second value");
+    let head_len = second
+        .frames
+        .as_ref()
+        .and_then(|frames| frames.first())
+        .expect("the second value's head")
+        .len();
+
+    // The first value reclaimed, the second's head zeroed in place.
+    memfs.punch_hole(&blob_path, first.offset, first.frame_end - first.offset)?;
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(second.offset))?;
+        file.write_all(&alloc::vec![0_u8; head_len])?;
+        file.sync_all()?;
+    }
+
+    let fs: Arc<dyn Fs> = memfs;
+    let derived = super::derive_blob_frontier(&fs, &blob_path)?;
+    assert!(
+        matches!(derived, super::BlobFrontier::Whole),
+        "no frame checks at the end of the zeroed run, only a chunk: {derived:?}",
+    );
+    Ok(())
+}
+
 /// Separation of every value from 16 bytes, each into a frame of its own: a
 /// fixture whose damage to one value's frame is damage to that value alone,
 /// what the frame-level repair tests probe.
