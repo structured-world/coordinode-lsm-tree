@@ -472,7 +472,6 @@ impl<'a> SliceGovernor<'a> {
             1
         };
         let owned = self.committed.rows.owned_blob_objects;
-        let mut dictionaries = core::mem::take(&mut self.row_dictionaries);
         let taken = take_entry(
             &mut self.committed.rows,
             super::NewShapes {
@@ -487,18 +486,21 @@ impl<'a> SliceGovernor<'a> {
             hashes,
             self.split_cells,
             self.relocated,
-            &mut dictionaries,
+            &mut self.row_dictionaries,
         );
-        for &source in &dictionaries {
-            if !self.committed.dictionaries.contains(&source)
-                && !self.load.dictionaries.contains(&source)
-            {
-                self.load.add_dictionary(source, self.relocated);
-                self.past_quota = true;
+        // Most rows point into no file with a dictionary of its own: the
+        // list is looked at, not walked or emptied.
+        if !self.row_dictionaries.is_empty() {
+            for &source in &self.row_dictionaries {
+                if !self.committed.dictionaries.contains(&source)
+                    && !self.load.dictionaries.contains(&source)
+                {
+                    self.load.add_dictionary(source, self.relocated);
+                    self.past_quota = true;
+                }
             }
+            self.row_dictionaries.clear();
         }
-        dictionaries.clear();
-        self.row_dictionaries = dictionaries;
         let (blobs, grew) = taken?;
         self.committed.blobs += blobs;
         if let Some(domains) = self.outputs.domains {
