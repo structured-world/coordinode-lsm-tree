@@ -510,7 +510,7 @@ pub(crate) fn recover_blob_file_cached(
 pub(crate) fn read_meta_and_frames(
     file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
     id: BlobFileId,
-) -> crate::Result<(Metadata, Arc<[u64]>)> {
+) -> crate::Result<(Metadata, blob_file::writer::FrameIndex)> {
     let (meta, frames_at, data) = read_meta_and_index_at(file, id)?;
     let (Some((pos, len)), Some(data)) = (frames_at, data) else {
         log::error!("frames or data section in blob file #{id} is missing (file may be corrupted)");

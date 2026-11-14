@@ -164,7 +164,7 @@ fn mark(marks: &mut Vec<u64>, at: usize) {
 }
 
 /// Whether frame `at` is marked in a bit set of frames.
-pub(crate) fn is_marked(marks: &[u64], at: usize) -> bool {
+fn is_marked(marks: &[u64], at: usize) -> bool {
     marks
         .get(at / 64)
         .is_some_and(|bits| bits & (1 << (at % 64)) != 0)
@@ -198,27 +198,48 @@ pub(crate) fn encode_frame_index(starts: &[u64], end: u64) -> Vec<u8> {
     encode_frame_index_marked(starts, end, &[])
 }
 
-/// Decodes a frame index: each frame's start followed by the data end, one
-/// more entry than there are frames.
-///
-/// # Errors
-///
-/// As [`decode_frame_index_marked`].
-pub(crate) fn decode_frame_index(bytes: &[u8]) -> crate::Result<alloc::sync::Arc<[u64]>> {
-    decode_frame_index_marked(bytes).map(|(starts, _)| starts)
+/// A blob file's frame index as a reader holds it: where each frame starts,
+/// then where the data ends (it reads as that slice), and which frames are
+/// chunks. Cloning it shares both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FrameIndex {
+    starts: alloc::sync::Arc<[u64]>,
+    chunks: alloc::sync::Arc<[u64]>,
 }
 
-/// [`decode_frame_index`], with the bit set of the frames the index marks as
-/// chunks.
+impl FrameIndex {
+    /// The index of frames starting at `starts`, the last of which is the
+    /// data end, `chunks` the bit set of the frames that are chunks.
+    pub(crate) fn new(starts: Vec<u64>, chunks: Vec<u64>) -> Self {
+        Self {
+            starts: starts.into(),
+            chunks: chunks.into(),
+        }
+    }
+
+    /// Whether `frame` is a chunk of the head before it.
+    pub(crate) fn is_chunk(&self, frame: usize) -> bool {
+        is_marked(&self.chunks, frame)
+    }
+}
+
+impl core::ops::Deref for FrameIndex {
+    type Target = [u64];
+
+    fn deref(&self) -> &[u64] {
+        &self.starts
+    }
+}
+
+/// Decodes a frame index: each frame's start followed by the data end, one
+/// more entry than there are frames, and the frames it marks as chunks.
 ///
 /// # Errors
 ///
 /// [`crate::Error::InvalidHeader`] for an index that is short, long, fails its
 /// checksum, lists starts that do not increase within the data, or marks its
 /// first frame or its data end a chunk: a chunk follows a head.
-pub(crate) fn decode_frame_index_marked(
-    bytes: &[u8],
-) -> crate::Result<(alloc::sync::Arc<[u64]>, Vec<u64>)> {
+pub(crate) fn decode_frame_index(bytes: &[u8]) -> crate::Result<FrameIndex> {
     let malformed = || crate::Error::InvalidHeader("BlobFrameIndex");
     let (body, digest) = bytes.split_last_chunk::<8>().ok_or_else(malformed)?;
     if xxhash_rust::xxh3::xxh3_64(body) != u64::from_le_bytes(*digest) {
@@ -251,7 +272,7 @@ pub(crate) fn decode_frame_index_marked(
     {
         return Err(malformed());
     }
-    Ok((offsets.into(), chunks))
+    Ok(FrameIndex::new(offsets, chunks))
 }
 
 /// Blob file writer
@@ -1603,7 +1624,7 @@ impl Writer {
     /// # Errors
     ///
     /// Any IO error.
-    pub(crate) fn finish(mut self) -> crate::Result<(Metadata, Checksum, alloc::sync::Arc<[u64]>)> {
+    pub(crate) fn finish(mut self) -> crate::Result<(Metadata, Checksum, FrameIndex)> {
         self.close_block()?;
 
         // The file's own dictionary, which its reader decodes with: what the
@@ -1620,7 +1641,10 @@ impl Writer {
         let index = encode_frame_index_marked(&self.frames, self.offset, &self.chunk_marks);
         self.writer.write_all(&index)?;
         self.frames.push(self.offset);
-        let frames: alloc::sync::Arc<[u64]> = core::mem::take(&mut self.frames).into();
+        let frames = FrameIndex::new(
+            core::mem::take(&mut self.frames),
+            core::mem::take(&mut self.chunk_marks),
+        );
 
         self.writer.start("meta")?;
 

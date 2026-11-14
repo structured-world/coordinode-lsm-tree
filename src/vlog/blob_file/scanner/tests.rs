@@ -255,11 +255,7 @@ fn an_environmental_index_read_failure_is_returned_not_walked_around() -> crate:
 
     let mut file = Cursor::new(std::fs::read(&path)?);
     let index = read_frame_index(&mut file, at, data.clone())?;
-    assert_eq!(
-        index.map(|(starts, _)| starts.len()),
-        Some(4),
-        "three frames and the end"
-    );
+    assert_eq!(index.map(|i| i.len()), Some(4), "three frames and the end");
 
     assert!(matches!(
         read_frame_index(&mut Failing(std::io::ErrorKind::PermissionDenied), at, data.clone()),
@@ -553,7 +549,7 @@ fn chunks_whose_head_is_damaged_are_passed_with_it() -> crate::Result<()> {
 #[test]
 fn the_frame_index_marks_chunks_alone() -> crate::Result<()> {
     use crate::vlog::blob_file::writer::{
-        CHUNK_MARK, decode_frame_index_marked, encode_frame_index_marked, is_marked,
+        CHUNK_MARK, decode_frame_index, encode_frame_index_marked,
     };
 
     let dir = tempdir()?;
@@ -567,18 +563,15 @@ fn the_frame_index_marks_chunks_alone() -> crate::Result<()> {
     )?;
     let (pos, len) = section(&path, b"frames")?;
     let bytes = std::fs::read(&path)?;
-    let (starts, chunks) = decode_frame_index_marked(&bytes[pos..pos + len])?;
+    let index = decode_frame_index(&bytes[pos..pos + len])?;
     // A single, a head, three chunks, a single, the data end.
-    assert_eq!(starts.len(), 7);
-    let marked: Vec<bool> = (0..starts.len()).map(|at| is_marked(&chunks, at)).collect();
+    assert_eq!(index.len(), 7);
+    let marked: Vec<bool> = (0..index.len()).map(|at| index.is_chunk(at)).collect();
     assert_eq!(marked, [false, false, true, true, true, false, false]);
-    assert!(starts.iter().all(|start| start & CHUNK_MARK == 0));
+    assert!(index.iter().all(|start| start & CHUNK_MARK == 0));
 
     let first = encode_frame_index_marked(&[10, 20], 30, &[0b01]);
-    assert!(
-        decode_frame_index_marked(&first).is_err(),
-        "the first frame"
-    );
+    assert!(decode_frame_index(&first).is_err(), "the first frame");
     // The writer marks starts alone, so the data end is marked by hand, the
     // index sealed again.
     let mut end = encode_frame_index_marked(&[10, 20], 30, &[]);
@@ -586,9 +579,9 @@ fn the_frame_index_marks_chunks_alone() -> crate::Result<()> {
     end[body - 1] |= 0x80;
     let digest = xxhash_rust::xxh3::xxh3_64(&end[..body]);
     end[body..].copy_from_slice(&digest.to_le_bytes());
-    assert!(decode_frame_index_marked(&end).is_err(), "the data end");
+    assert!(decode_frame_index(&end).is_err(), "the data end");
     let second = encode_frame_index_marked(&[10, 20], 30, &[0b10]);
-    assert!(decode_frame_index_marked(&second).is_ok());
+    assert!(decode_frame_index(&second).is_ok_and(|index| index.is_chunk(1)));
     Ok(())
 }
 

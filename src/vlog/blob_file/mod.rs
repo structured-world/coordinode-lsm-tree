@@ -91,7 +91,7 @@ pub(crate) struct Inner {
     /// Where each frame starts, then where the data ends: one more entry than
     /// the file has frames. A handle names a frame by its number, and this is
     /// how a read finds its bytes.
-    pub(crate) frames: Arc<[u64]>,
+    pub(crate) frames: writer::FrameIndex,
 
     pub(crate) file_accessor: FileAccessor,
 
