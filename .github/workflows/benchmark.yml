@@ -178,17 +178,17 @@ jobs:
     runs-on:
       group: Bench
       labels: [self-hosted, bench, Linux]
-    # The whole job, every bench in it, fits in 40 minutes on a warm cache:
-    # the three builds side by side, the db_bench pass, the head-to-head
-    # matrix and the publishing. Each bench step has its own limit below, so
-    # an overrun fails at the bench that caused it.
+    # The whole job, every bench in it, takes about an hour and a half on a
+    # warm cache and an idle host: the three builds side by side, the
+    # db_bench pass, the head-to-head matrix (76 minutes of it) and the
+    # publishing. Each bench step has its own limit below, so an overrun
+    # fails at the bench that caused it.
     #
     # On a cold cache the librocksdb-sys C++ compile (RocksDB built from
-    # source via bindgen) takes 15-25 min by itself, which leaves too little
-    # of the budget for the benches, so that run fails at its limit. The
-    # build is saved to the cache as soon as it finishes, before any bench,
-    # so the next run is warm again whatever happens to this one.
-    timeout-minutes: 40
+    # source via bindgen) takes 15-25 min more. The build is saved to the
+    # cache as soon as it finishes, before any bench, so the next run is warm
+    # again whatever happens to this one.
+    timeout-minutes: 180
     defaults:
       run:
         # Every step below is written in POSIX shell. Windows would otherwise
@@ -421,10 +421,12 @@ jobs:
         # Runs whatever the db_bench pass did, so a host that cannot build
         # RocksDB still reaches the db_bench publishing below.
         if: ${{ !cancelled() }}
-        # ~17 min on an idle host, about half of it the sustained overwrite at
-        # zstd 22 (compaction run to rest every round) and a few minutes the
-        # blob groups; the limit leaves room for a loaded one.
-        timeout-minutes: 35
+        # 76 min on an idle host: 29 of them the two sustained overwrites
+        # (compaction run to rest every round, the blob files at zstd 22 the
+        # slowest arm of each), the rest spread over the other groups, each
+        # of which runs every blob codec on both engines. The limit leaves
+        # room for a loaded host.
+        timeout-minutes: 140
         # Pin the published dashboard to the RocksDbParity preset (the apples-to-
         # apples comparison): every lsm-tree-only on-disk opt-in is OFF so the
         # numbers are not paying for protection RocksDB has no equivalent for.
