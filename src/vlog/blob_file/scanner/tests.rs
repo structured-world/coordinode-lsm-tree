@@ -255,7 +255,11 @@ fn an_environmental_index_read_failure_is_returned_not_walked_around() -> crate:
 
     let mut file = Cursor::new(std::fs::read(&path)?);
     let index = read_frame_index(&mut file, at, data.clone())?;
-    assert_eq!(index.map(|i| i.len()), Some(4), "three frames and the end");
+    assert_eq!(
+        index.map(|(starts, _)| starts.len()),
+        Some(4),
+        "three frames and the end"
+    );
 
     assert!(matches!(
         read_frame_index(&mut Failing(std::io::ErrorKind::PermissionDenied), at, data.clone()),
@@ -520,32 +524,107 @@ fn along_the_chain_a_value_whose_chunks_do_not_read_is_searched_past() -> crate:
     Ok(())
 }
 
-/// A head lost to damage leaves its chunks behind it: by the index, each is
-/// reached and refused as a chunk without its head, and the walk goes on to
-/// the value after them.
+/// A head lost to damage takes its chunks with it: by the index, which marks
+/// them, the walk passes them without reading one as a frame and goes on to
+/// the value after them, untainted, since the index placed it.
 #[test]
-fn chunks_whose_head_is_damaged_are_refused_each() -> crate::Result<()> {
+fn chunks_whose_head_is_damaged_are_passed_with_it() -> crate::Result<()> {
     let dir = tempdir()?;
     let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
     let index = index_of(&path)?;
     // A key byte of the head, frame 0.
     edit(&path, |bytes| bytes[index[0] + 40 + 14] ^= 0x40)?;
     let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
-    assert_eq!(results.len(), 5, "the head, three chunks, the next value");
+    assert_eq!(results.len(), 2, "the head, then the next value");
     assert!(matches!(
         results[0],
         Err(crate::Error::ChecksumMismatch { .. })
     ));
-    for chunk in &results[1..4] {
-        assert!(matches!(
-            chunk,
-            Err(crate::Error::InvalidHeader("BlobFrame"))
-        ));
-    }
-    assert_eq!(
-        results[4].as_ref().expect("the next value").key,
-        Slice::from(&b"next"[..])
+    let next = results[1].as_ref().expect("the next value");
+    assert_eq!(next.key, Slice::from(&b"next"[..]));
+    assert_eq!(next.frame, 4, "after the head and its three chunks");
+    assert!(!next.resynced);
+    Ok(())
+}
+
+/// The index marks the chunks of a chunked value and no other frame, and a
+/// mark on the first frame or on the data end is refused: a chunk follows a
+/// head.
+#[test]
+fn the_frame_index_marks_chunks_alone() -> crate::Result<()> {
+    use crate::vlog::blob_file::writer::{
+        CHUNK_MARK, decode_frame_index_marked, encode_frame_index_marked, is_marked,
+    };
+
+    let dir = tempdir()?;
+    let path = write(
+        dir.path(),
+        &[
+            (b"one", &[1; 120]),
+            (b"big", &[9; 700]),
+            (b"next", &[1; 120]),
+        ],
+    )?;
+    let (pos, len) = section(&path, b"frames")?;
+    let bytes = std::fs::read(&path)?;
+    let (starts, chunks) = decode_frame_index_marked(&bytes[pos..pos + len])?;
+    // A single, a head, three chunks, a single, the data end.
+    assert_eq!(starts.len(), 7);
+    let marked: Vec<bool> = (0..starts.len()).map(|at| is_marked(&chunks, at)).collect();
+    assert_eq!(marked, [false, false, true, true, true, false, false]);
+    assert!(starts.iter().all(|start| start & CHUNK_MARK == 0));
+
+    let first = encode_frame_index_marked(&[10, 20], 30, &[0b01]);
+    assert!(
+        decode_frame_index_marked(&first).is_err(),
+        "the first frame"
     );
+    // The writer marks starts alone, so the data end is marked by hand, the
+    // index sealed again.
+    let mut end = encode_frame_index_marked(&[10, 20], 30, &[]);
+    let body = end.len() - 8;
+    end[body - 1] |= 0x80;
+    let digest = xxhash_rust::xxh3::xxh3_64(&end[..body]);
+    end[body..].copy_from_slice(&digest.to_le_bytes());
+    assert!(decode_frame_index_marked(&end).is_err(), "the data end");
+    let second = encode_frame_index_marked(&[10, 20], 30, &[0b10]);
+    assert!(decode_frame_index_marked(&second).is_ok());
+    Ok(())
+}
+
+/// A chunk is the value's own bytes with no header, so a value can hold a
+/// whole frame that checks. When its head is lost to damage the walk by the
+/// index still knows the frames after it for chunks, and yields none of them
+/// as a value: the frame inside the chunk is the writer's payload, never a
+/// record of the file.
+#[test]
+fn a_frame_inside_a_chunk_whose_head_is_damaged_is_not_a_value() -> crate::Result<()> {
+    // A frame of one value that takes exactly a chunk's 300 bytes.
+    let forged = (100..300_usize)
+        .find_map(|len| {
+            let dir = tempdir().ok()?;
+            let path = write(dir.path(), &[(b"forged", &vec![b'f'; len])]).ok()?;
+            let index = index_of(&path).ok()?;
+            let frame = std::fs::read(&path).ok()?[index[0]..index[1]].to_vec();
+            (frame.len() == 300).then_some(frame)
+        })
+        .expect("a single frame of 300 bytes");
+
+    let mut big = forged;
+    big.extend_from_slice(&[9; 400]);
+    let dir = tempdir()?;
+    let path = write(dir.path(), &[(b"big", &big), (b"next", &[1; 120])])?;
+    let index = index_of(&path)?;
+    // A key byte of the head, frame 0.
+    edit(&path, |bytes| bytes[index[0] + 40 + 14] ^= 0x40)?;
+
+    let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+    let keys: Vec<_> = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|entry| entry.key.clone())
+        .collect();
+    assert_eq!(keys, [Slice::from(&b"next"[..])], "{results:?}");
     Ok(())
 }
 

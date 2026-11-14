@@ -144,19 +144,47 @@ impl PendingBlock {
     }
 }
 
+/// The bit of a frame's start in the index that says the frame is a chunk of
+/// the head before it. A chunk is its value's bytes with no header, so
+/// nothing in it tells it from a frame: a value may hold a whole frame that
+/// checks. The index is what knows, and a walk that lost a head to damage
+/// passes its chunks by this bit instead of reading them as frames. A file
+/// offset never reaches it.
+pub(crate) const CHUNK_MARK: u64 = 1 << 63;
+
+/// Marks frame `at` in a bit set of frames.
+fn mark(marks: &mut Vec<u64>, at: usize) {
+    let word = at / 64;
+    if marks.len() <= word {
+        marks.resize(word + 1, 0);
+    }
+    if let Some(bits) = marks.get_mut(word) {
+        *bits |= 1 << (at % 64);
+    }
+}
+
+/// Whether frame `at` is marked in a bit set of frames.
+pub(crate) fn is_marked(marks: &[u64], at: usize) -> bool {
+    marks
+        .get(at / 64)
+        .is_some_and(|bits| bits & (1 << (at % 64)) != 0)
+}
+
 /// The frame index a blob file ends its data with: where each frame starts,
-/// then where the data ends, then a checksum over both.
+/// then where the data ends, then a checksum over both. A chunk's start
+/// carries [`CHUNK_MARK`]; `chunks` is the bit set of the frames that are.
 ///
 /// `[count; 4][offset; 8] * count [end; 8][xxh3; 8]`
-pub(crate) fn encode_frame_index(starts: &[u64], end: u64) -> Vec<u8> {
+pub(crate) fn encode_frame_index_marked(starts: &[u64], end: u64, chunks: &[u64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + (starts.len() + 2) * 8);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a frame number is a u32, so a file holds at most u32::MAX frames"
     )]
     out.extend_from_slice(&(starts.len() as u32).to_le_bytes());
-    for start in starts {
-        out.extend_from_slice(&start.to_le_bytes());
+    for (at, start) in starts.iter().enumerate() {
+        let mark = if is_marked(chunks, at) { CHUNK_MARK } else { 0 };
+        out.extend_from_slice(&(start | mark).to_le_bytes());
     }
     out.extend_from_slice(&end.to_le_bytes());
     let digest = xxhash_rust::xxh3::xxh3_64(&out);
@@ -164,14 +192,33 @@ pub(crate) fn encode_frame_index(starts: &[u64], end: u64) -> Vec<u8> {
     out
 }
 
+/// [`encode_frame_index_marked`] of a file that holds no chunk.
+#[cfg(test)]
+pub(crate) fn encode_frame_index(starts: &[u64], end: u64) -> Vec<u8> {
+    encode_frame_index_marked(starts, end, &[])
+}
+
 /// Decodes a frame index: each frame's start followed by the data end, one
 /// more entry than there are frames.
 ///
 /// # Errors
 ///
-/// [`crate::Error::InvalidHeader`] for an index that is short, long, fails its
-/// checksum, or lists starts that do not increase within the data.
+/// As [`decode_frame_index_marked`].
 pub(crate) fn decode_frame_index(bytes: &[u8]) -> crate::Result<alloc::sync::Arc<[u64]>> {
+    decode_frame_index_marked(bytes).map(|(starts, _)| starts)
+}
+
+/// [`decode_frame_index`], with the bit set of the frames the index marks as
+/// chunks.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for an index that is short, long, fails its
+/// checksum, lists starts that do not increase within the data, or marks its
+/// first frame or its data end a chunk: a chunk follows a head.
+pub(crate) fn decode_frame_index_marked(
+    bytes: &[u8],
+) -> crate::Result<(alloc::sync::Arc<[u64]>, Vec<u64>)> {
     let malformed = || crate::Error::InvalidHeader("BlobFrameIndex");
     let (body, digest) = bytes.split_last_chunk::<8>().ok_or_else(malformed)?;
     if xxhash_rust::xxh3::xxh3_64(body) != u64::from_le_bytes(*digest) {
@@ -184,16 +231,27 @@ pub(crate) fn decode_frame_index(bytes: &[u8]) -> crate::Result<alloc::sync::Arc
     if words != Some(rest.len()) {
         return Err(malformed());
     }
+    let mut chunks = Vec::new();
     let offsets: Vec<u64> = rest
         .as_chunks::<8>()
         .0
         .iter()
-        .map(|word| u64::from_le_bytes(*word))
+        .enumerate()
+        .map(|(at, word)| {
+            let word = u64::from_le_bytes(*word);
+            if word & CHUNK_MARK != 0 {
+                mark(&mut chunks, at);
+            }
+            word & !CHUNK_MARK
+        })
         .collect();
-    if offsets.windows(2).any(|pair| pair.first() >= pair.get(1)) {
+    if offsets.windows(2).any(|pair| pair.first() >= pair.get(1))
+        || is_marked(&chunks, 0)
+        || is_marked(&chunks, offsets.len() - 1)
+    {
         return Err(malformed());
     }
-    Ok(offsets.into())
+    Ok((offsets.into(), chunks))
 }
 
 /// Blob file writer
@@ -280,6 +338,9 @@ pub(crate) struct Writer {
 
     /// Where each frame written so far starts.
     frames: Vec<u64>,
+
+    /// Which of `frames` are chunks, a bit a frame: see [`CHUNK_MARK`].
+    chunk_marks: Vec<u64>,
 
     /// The block the next small value joins.
     block: PendingBlock,
@@ -542,6 +603,7 @@ impl Writer {
             sizes: FrameSizes::DEFAULT,
             dictionary_classes: crate::config::DictionaryClasses::DEFAULT,
             frames: Vec::new(),
+            chunk_marks: Vec::new(),
             block: PendingBlock::default(),
             packed: Vec::new(),
             packed_count: 0,
@@ -1046,12 +1108,14 @@ impl Writer {
             match compressed {
                 None => {
                     let start = *run_start.get_or_insert(from);
+                    mark(&mut self.chunk_marks, self.frames.len());
                     self.frames.push(self.offset + (from - start) as u64);
                 }
                 Some(bytes) => {
                     if let Some(start) = run_start.take() {
                         self.put_bytes(value.get(start..from).unwrap_or_default())?;
                     }
+                    mark(&mut self.chunk_marks, self.frames.len());
                     self.frames.push(self.offset);
                     self.put_bytes(bytes)?;
                 }
@@ -1465,7 +1529,9 @@ impl Writer {
                 }
                 None => self.put_frame(first)?,
             }
+            // The frames after the first are the chunks of a head.
             for bytes in frames.get(1..).unwrap_or_default() {
+                mark(&mut self.chunk_marks, self.frames.len());
                 self.put_frame(bytes)?;
             }
             Ok((frame, before))
@@ -1551,7 +1617,7 @@ impl Writer {
         }
 
         self.writer.start("frames")?;
-        let index = encode_frame_index(&self.frames, self.offset);
+        let index = encode_frame_index_marked(&self.frames, self.offset, &self.chunk_marks);
         self.writer.write_all(&index)?;
         self.frames.push(self.offset);
         let frames: alloc::sync::Arc<[u64]> = core::mem::take(&mut self.frames).into();

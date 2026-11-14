@@ -38,12 +38,22 @@ impl ScanCodec {
     }
 }
 
+/// A frame index as a file holds it: each frame's start then the data end,
+/// and the bit set of the frames it marks as chunks.
+pub(crate) type MarkedIndex = (Arc<[u64]>, Vec<u64>);
+
 /// How the scanner finds where each frame starts.
 enum Bounds {
     /// From the file's frame index: each frame's start, then the data end.
-    /// A damaged frame costs that frame alone: the next one is where the
-    /// index puts it.
-    Index(Arc<[u64]>),
+    /// A damaged frame costs that frame alone, and a damaged head its chunks
+    /// with it: the next frame is where the index puts it, past the frames
+    /// the index marks as chunks. `chunks` is that bit set, `None` when the
+    /// file's own index could not be read for it; damage then taints what
+    /// follows, as along the chain.
+    Index {
+        frames: Arc<[u64]>,
+        chunks: Option<Vec<u64>>,
+    },
     /// Without a readable index: each frame from the length the one before
     /// declares, and past damage from a byte-wise search for the next magic.
     Chain,
@@ -225,9 +235,20 @@ impl Scanner {
 
         // The index the caller trusts, else the one the file holds if it
         // reads and fits the data, else the chain.
-        let frames = match (frames, index_at) {
-            (Some(frames), _) => Some(frames),
-            (None, Some(at)) => read_frame_index(&mut file, at, data_start..data_end)?,
+        // Which frames are chunks comes from the file's index either way: the
+        // caller's index is the starts alone.
+        let on_file = match index_at {
+            Some(at) => read_frame_index(&mut file, at, data_start..data_end)?,
+            None => None,
+        };
+        let frames = match (frames, on_file) {
+            (Some(frames), on_file) => {
+                let chunks = on_file
+                    .filter(|(starts, _)| *starts == frames)
+                    .map(|(_, chunks)| chunks);
+                Some((frames, chunks))
+            }
+            (None, Some((frames, chunks))) => Some((frames, Some(chunks))),
             (None, None) => None,
         };
 
@@ -239,7 +260,7 @@ impl Scanner {
             return Err(crate::Error::InvalidHeader("BlobFile"));
         }
         let (bounds, next_frame) = match frames {
-            Some(frames) => {
+            Some((frames, chunks)) => {
                 let starts = frames.get(..frames.len() - 1).unwrap_or_default();
                 // At the data end there is nothing left; elsewhere `start` must
                 // be a frame's own start.
@@ -250,7 +271,7 @@ impl Scanner {
                 };
                 let next =
                     u32::try_from(next).map_err(|_| crate::Error::InvalidHeader("BlobFile"))?;
-                (Bounds::Index(frames), next)
+                (Bounds::Index { frames, chunks }, next)
             }
             // Without an index a frame's number is its place from the data
             // start, which a resumed chain walk cannot know.
@@ -258,7 +279,9 @@ impl Scanner {
             None => return Err(crate::Error::InvalidHeader("BlobFile")),
         };
         let seek_to = match &bounds {
-            Bounds::Index(frames) => frames.get(next_frame as usize).copied().unwrap_or(data_end),
+            Bounds::Index { frames, .. } => {
+                frames.get(next_frame as usize).copied().unwrap_or(data_end)
+            }
             Bounds::Chain => seek_to,
         };
 
@@ -321,8 +344,19 @@ impl Scanner {
     /// walk.
     fn indexed_end(&self, frame: u32) -> Option<u64> {
         match &self.bounds {
-            Bounds::Index(frames) => frames.get(frame as usize + 1).copied(),
+            Bounds::Index { frames, .. } => frames.get(frame as usize + 1).copied(),
             Bounds::Chain => None,
+        }
+    }
+
+    /// Whether the index marks `frame` as a chunk of the head before it.
+    fn is_chunk(&self, frame: u32) -> bool {
+        match &self.bounds {
+            Bounds::Index {
+                chunks: Some(chunks),
+                ..
+            } => super::writer::is_marked(chunks, frame as usize),
+            _ => false,
         }
     }
 
@@ -330,7 +364,7 @@ impl Scanner {
     /// it; in a chain walk, which knows no frame's place ahead, stays where
     /// the walk already is.
     fn skip_to_frame(&mut self, frame: u32) -> crate::Result<()> {
-        if let Bounds::Index(frames) = &self.bounds {
+        if let Bounds::Index { frames, .. } = &self.bounds {
             let at = frames.get(frame as usize).copied().unwrap_or(self.data_end);
             self.next_frame = frame;
             self.inner.seek(SeekFrom::Start(at))?;
@@ -340,15 +374,31 @@ impl Scanner {
 
     /// Moves past a frame that did not check: to where the index says the next
     /// one starts, or by a byte-wise search in a chain walk.
+    ///
+    /// By the index, the frames it marks as chunks right after the damaged
+    /// one are passed with it. If that one was their head, they are a value's
+    /// bytes with no header, where a frame that checks may lie as payload;
+    /// read as frames they would yield it as a value of the file. An index
+    /// that does not say which frames are chunks cannot rule that out, so
+    /// what follows the damage is tainted, as what a search finds is.
     fn skip_damaged(&mut self, frame: u32, offset: u64) -> crate::Result<()> {
-        self.next_frame = frame + 1;
-        match self.indexed_end(frame) {
-            Some(end) => {
-                self.inner.seek(SeekFrom::Start(end))?;
-                Ok(())
+        let Bounds::Index { frames, chunks } = &self.bounds else {
+            self.next_frame = frame + 1;
+            return self.resync_to_next_frame(offset);
+        };
+        let mut next = frame as usize + 1;
+        if let Some(chunks) = chunks {
+            while next + 1 < frames.len() && super::writer::is_marked(chunks, next) {
+                next += 1;
             }
-            None => self.resync_to_next_frame(offset),
         }
+        let unmarked = chunks.is_none();
+        let at = frames.get(next).copied().unwrap_or(self.data_end);
+        self.resync_tainted |= unmarked;
+        // A frame number is a u32: the index holds no more.
+        self.next_frame = u32::try_from(next).unwrap_or(u32::MAX);
+        self.inner.seek(SeekFrom::Start(at))?;
+        Ok(())
     }
 
     /// Reads the frame at the current position whole: its bytes as stored and
@@ -367,6 +417,11 @@ impl Scanner {
             }
             Some(Err(e))
         };
+        // A chunk is read with its head, never as a frame: the walk stands
+        // at one only when the index and the heads disagree.
+        if self.is_chunk(frame) {
+            return damaged(self, crate::Error::InvalidHeader("BlobFrame"));
+        }
 
         // The span to read: the index's, else the header's declared length,
         // bounded by the section either way. An index is taken only when it
@@ -473,7 +528,7 @@ impl Scanner {
                 // least one. `frame_end` lies within the section: the frame
                 // was read whole in it.
                 let room = match &self.bounds {
-                    Bounds::Index(frames) => frames.len() - 1,
+                    Bounds::Index { frames, .. } => frames.len() - 1,
                     Bounds::Chain => {
                         let fit = self.data_end - frame_end;
                         // An upper bound: one past `usize::MAX` bounds nothing more.
@@ -490,7 +545,7 @@ impl Scanner {
                 // walk, which only the head's table placed, searches on.
                 let failed = |this: &mut Self, e: crate::Error| {
                     let moved = match this.bounds {
-                        Bounds::Index(_) => this.skip_to_frame(chunks.end),
+                        Bounds::Index { .. } => this.skip_to_frame(chunks.end),
                         Bounds::Chain => this.resync_to_next_frame(offset),
                     };
                     if let Err(seek) = moved {
@@ -602,7 +657,7 @@ pub(crate) fn read_frame_index<F: Read + Seek>(
     file: &mut F,
     (pos, len): (u64, u64),
     data: core::ops::Range<u64>,
-) -> crate::Result<Option<Arc<[u64]>>> {
+) -> crate::Result<Option<MarkedIndex>> {
     // The index lies within the file: a length past it is damage, refused
     // before a buffer is sized from it.
     let file_len = match file.seek(SeekFrom::End(0)) {
@@ -623,12 +678,12 @@ pub(crate) fn read_frame_index<F: Read + Seek>(
     if let Err(e) = read {
         return environmental_or_none(e);
     }
-    let Ok(frames) = super::writer::decode_frame_index(&bytes) else {
+    let Ok((frames, chunks)) = super::writer::decode_frame_index_marked(&bytes) else {
         return Ok(None);
     };
     let fits = frames.first().is_some_and(|&first| first >= data.start)
         && frames.last() == Some(&data.end);
-    Ok(fits.then_some(frames))
+    Ok(fits.then_some((frames, chunks)))
 }
 
 /// A failure reading the frame index: returned when environmental, so the
