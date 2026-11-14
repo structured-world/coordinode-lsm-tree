@@ -102,6 +102,9 @@ pub(crate) fn encode_record(
     )]
     let stored_len = stored.len() as u32;
     let start = out.len();
+    // Room for the whole record at once: the appends below grow nothing, and
+    // a growth that fails leaves `out` without a part of a record.
+    out.reserve(8 + 8 + 2 + 4 + 4 + 1 + key.len() + stored.len());
     out.extend_from_slice(&[0; 8]);
     out.extend_from_slice(&seqno.to_le_bytes());
     out.extend_from_slice(&key_len.to_le_bytes());
