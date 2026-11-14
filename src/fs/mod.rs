@@ -794,16 +794,64 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     }
 }
 
-/// Asks `file` to start writing back `len` bytes at `offset` for a writer that
-/// writes back every `writeback_bytes`. The request is a hint: a refusal turns
-/// writeback off for the file (`*writeback_bytes = 0`) instead of failing the
-/// write, since the file's final sync still writes it and reports a failed
-/// write. On Linux `sync_file_range` without `SYNC_FILE_RANGE_WAIT_AFTER` does
-/// not consume the file's writeback error, so that sync still sees it.
-pub(crate) fn hint_writeback(file: &dyn FsFile, offset: u64, len: u64, writeback_bytes: &mut u64) {
-    if let Err(error) = file.start_writeback(offset, len) {
-        log::warn!("writeback hint refused, the file is written back by its final sync: {error}");
-        *writeback_bytes = 0;
+/// How a file's writer asks for writeback as it writes: every `bytes` it
+/// wrote (`0` for never), until a request is refused.
+pub(crate) struct Writeback {
+    /// The bytes written between two requests, `0` for no requests.
+    pub(crate) bytes: u64,
+    /// Set by a refused request, which may run on a worker.
+    refused: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+}
+
+impl Writeback {
+    /// Requests every `bytes` written, `0` for none.
+    pub(crate) fn every(bytes: u64) -> Self {
+        Self {
+            bytes,
+            refused: alloc::sync::Arc::default(),
+        }
+    }
+
+    /// Asks the file to start writing back the `len` bytes `writer` took at
+    /// `offset`, once they have reached it: on a worker when the writer
+    /// hands its buffers to one, so the request, which a filesystem may
+    /// serve by placing the range's blocks, is not waited for here.
+    ///
+    /// The request is a hint: a refusal turns the requests off from the next
+    /// one on instead of failing the write, since the file's final sync
+    /// still writes it and reports a failed write. On Linux
+    /// `sync_file_range` without `SYNC_FILE_RANGE_WAIT_AFTER` does not
+    /// consume the file's writeback error, so that sync still sees it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of an earlier write of `writer`.
+    pub(crate) fn hint(
+        &mut self,
+        writer: &mut crate::io::FileWriter<alloc::boxed::Box<dyn FsFile>>,
+        offset: u64,
+        len: u64,
+    ) -> crate::Result<()> {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        if self.refused.load(Relaxed) {
+            self.bytes = 0;
+            return Ok(());
+        }
+        let refused = alloc::sync::Arc::clone(&self.refused);
+        writer.after_writes(move |file| {
+            // A request queued before an earlier one was refused is not made.
+            if refused.load(Relaxed) {
+                return;
+            }
+            if let Err(error) = file.start_writeback(offset, len) {
+                log::warn!(
+                    "writeback hint refused, the file is written back by its final sync: {error}"
+                );
+                refused.store(true, Relaxed);
+            }
+        })?;
+        Ok(())
     }
 }
 

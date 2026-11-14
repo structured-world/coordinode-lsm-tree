@@ -123,6 +123,13 @@ impl<W: crate::io::Write> ChecksummedWriter<W> {
         &self.inner
     }
 
+    /// The wrapped writer, to change how it writes or to reach what lies
+    /// under it: never to write or seek through, which would leave the
+    /// counted [`Self::position`] and the checksum behind.
+    pub(crate) fn settings(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
     /// Unwraps the writer.
     pub fn into_inner(self) -> W {
         self.inner
