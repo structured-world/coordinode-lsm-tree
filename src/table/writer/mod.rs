@@ -127,7 +127,12 @@ fn linked_blob_file_record_len(first_key: &[u8], last_key: &[u8]) -> u64 {
 /// register, since a writer asks for that size before every key.
 #[derive(Default)]
 pub(crate) struct LinkedBlobFiles {
+    /// The files linked, but for `current`.
     files: crate::HashMap<BlobFileId, LinkedFile>,
+    /// The file the last entry registered points into, held out of `files`:
+    /// a flush writes value after value into one blob file, and each of them
+    /// finds its link here without hashing its file's id.
+    current: Option<LinkedFile>,
     /// The records' bytes, without the section's four-byte count.
     records_len: u64,
 }
@@ -155,37 +160,47 @@ impl LinkedBlobFiles {
         } else {
             (0, 0, (0, 0))
         };
-        match self.files.entry(blob_file_id) {
-            hashbrown::hash_map::Entry::Occupied(mut entry) => {
-                let link = entry.get_mut();
-                link.bytes += bytes;
-                link.on_disk_bytes += on_disk_bytes;
-                link.block_bytes += block_bytes;
-                link.len += len;
-                // The record grows or shrinks by the change in its last key.
-                self.records_len = self.records_len - link.last_key.len() as u64 + key.len() as u64;
-                link.last_key.clone_from(key);
+        if self
+            .current
+            .as_ref()
+            .is_none_or(|link| link.blob_file_id != blob_file_id)
+        {
+            // Another file: the one held goes back among the rest, and this
+            // one's link comes out of them, or starts here.
+            if let Some(held) = self.current.take() {
+                self.files.insert(held.blob_file_id, held);
             }
-            hashbrown::hash_map::Entry::Vacant(entry) => {
-                self.records_len += linked_blob_file_record_len(key, key);
-                entry.insert(LinkedFile {
+            let link = self.files.remove(&blob_file_id).unwrap_or_else(|| {
+                self.records_len += linked_blob_file_record_len(key, &[]);
+                LinkedFile {
                     blob_file_id,
-                    bytes,
-                    on_disk_bytes,
-                    block_bytes,
-                    len,
+                    bytes: 0,
+                    on_disk_bytes: 0,
+                    block_bytes: 0,
+                    len: 0,
                     first_key: key.clone(),
-                    last_key: key.clone(),
-                });
-            }
+                    last_key: UserKey::empty(),
+                }
+            });
+            self.current = Some(link);
         }
+        let Some(link) = &mut self.current else {
+            return;
+        };
+        link.bytes += bytes;
+        link.on_disk_bytes += on_disk_bytes;
+        link.block_bytes += block_bytes;
+        link.len += len;
+        // The record grows or shrinks by the change in its last key.
+        self.records_len = self.records_len - link.last_key.len() as u64 + key.len() as u64;
+        link.last_key.clone_from(key);
     }
 
     /// Bytes the `linked_blob_files` section takes: nothing without links,
     /// else the count and the records.
     #[must_use]
     pub(crate) fn section_len(&self) -> u64 {
-        if self.files.is_empty() {
+        if self.len() == 0 {
             0
         } else {
             4 + self.records_len
@@ -195,7 +210,7 @@ impl LinkedBlobFiles {
     /// Number of files linked.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
-        self.files.len()
+        self.files.len() + usize::from(self.current.is_some())
     }
 
     /// Entries the map has room for without reallocating.
@@ -208,7 +223,9 @@ impl LinkedBlobFiles {
     /// kept under the next table.
     pub(crate) fn take(&mut self) -> impl Iterator<Item = LinkedFile> {
         self.records_len = 0;
-        core::mem::take(&mut self.files).into_values()
+        core::mem::take(&mut self.files)
+            .into_values()
+            .chain(self.current.take())
     }
 }
 

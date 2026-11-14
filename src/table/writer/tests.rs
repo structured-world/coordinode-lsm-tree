@@ -102,11 +102,44 @@ fn linked_blob_files_track_their_section_len_as_entries_register() {
             &UserKey::from(key.as_bytes()),
             true,
         );
-        let links: Vec<LinkedFile> = linked.files.values().cloned().collect();
+        // The file the last entry points into is held apart from the rest.
+        assert_eq!(
+            linked.current.as_ref().map(|link| link.blob_file_id),
+            Some(file)
+        );
+        assert!(!linked.files.contains_key(&file));
+        let links: Vec<LinkedFile> = linked
+            .files
+            .values()
+            .chain(linked.current.as_ref())
+            .cloned()
+            .collect();
         assert_eq!(linked.section_len(), encode_links(&links).len() as u64);
     }
     assert_eq!(linked.len(), 3);
-    assert_eq!(linked.take().count(), 3);
+    let mut links: Vec<LinkedFile> = linked.take().collect();
+    links.sort_by_key(|link| link.blob_file_id);
+    // A file left and come back to keeps its counts and its first key.
+    let spans: Vec<_> = links
+        .iter()
+        .map(|link| {
+            (
+                link.blob_file_id,
+                link.len,
+                &*link.first_key,
+                &*link.last_key,
+            )
+        })
+        .collect();
+    assert_eq!(
+        spans,
+        [
+            (3, 3, &b"apple"[..], &b"elderberry"[..]),
+            (5, 1, &b"fig"[..], &b"fig"[..]),
+            (9, 2, &b"banana-split"[..], &b"date"[..]),
+        ]
+    );
+    assert_eq!(linked.len(), 0);
     assert_eq!(linked.section_len(), 0);
 }
 
