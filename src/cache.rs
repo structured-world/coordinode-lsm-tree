@@ -1193,9 +1193,11 @@ impl Cache {
     }
 
     /// Whether the value of a packed block at `at` and `index`, just missed
-    /// and `weight` once cached, goes into the cache: while there is room for
-    /// it, and otherwise only on a miss that repeats a recent one, so a value
-    /// read once is not built into an entry only to be evicted unread.
+    /// and `weight` once cached, goes into the cache: only into a shard that
+    /// has ever filled, so caching it there replaces what it evicts instead
+    /// of growing the cache; there while the shard has room for it, and
+    /// otherwise only on a miss that repeats a recent one, so a value read
+    /// once is not built into an entry only to be evicted unread.
     #[must_use]
     pub(crate) fn admit_blob_record(
         &self,
@@ -1205,20 +1207,7 @@ impl Cache {
         weight: u64,
     ) -> bool {
         self.data
-            .admit(&blob_record_key(vlog_id, at, index), weight)
-    }
-
-    /// Whether the shard the value of a packed block at `at` and `index`
-    /// would go to has ever filled, so caching it there replaces what it
-    /// evicts instead of growing the cache.
-    #[must_use]
-    pub(crate) fn filled_for_blob_record(
-        &self,
-        vlog_id: crate::TreeId,
-        at: BlobFrameAt,
-        index: u16,
-    ) -> bool {
-        self.data.has_filled(&blob_record_key(vlog_id, at, index))
+            .admit_once_filled(&blob_record_key(vlog_id, at, index), weight)
     }
 
     /// Whether the blob frame at `at`, just read and `weight` once cached,

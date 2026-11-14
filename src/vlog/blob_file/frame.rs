@@ -496,6 +496,16 @@ impl DecodedFrame {
         Ok((0..chunks).map(move |at| chunk_row(&self.payload, size, chunks, total, at)))
     }
 
+    /// [`Self::chunks`] gathered, on the caller's stack for a value of a few
+    /// chunks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::chunk_table`], and a row that does not parse.
+    pub(crate) fn chunk_specs(&self) -> crate::Result<ChunkSpecs> {
+        self.chunks()?.collect()
+    }
+
     /// Bytes this frame takes in a cache: what it decoded, its entries and
     /// their list.
     #[must_use]
@@ -509,6 +519,11 @@ impl DecodedFrame {
         (self.entries.len() + payload + self.list.len() * size_of::<FrameEntry>()) as u64
     }
 }
+
+/// The rows of a head's table: in place for a value of up to eight chunks
+/// (2 MiB at the default chunk size), which is most chunked values, and on
+/// the heap past that.
+pub(crate) type ChunkSpecs = smallvec::SmallVec<[ChunkSpec; 8]>;
 
 /// One chunk of a chunked value as its head's table lists it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

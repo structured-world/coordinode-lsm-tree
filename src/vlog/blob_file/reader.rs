@@ -347,7 +347,7 @@ pub(crate) fn assemble_stored(
     let malformed = || crate::Error::InvalidHeader("Blob");
     let total = head.list.first().map_or(0, |e| u64::from(e.value_len));
     let len = usize::try_from(total).map_err(|_| malformed())?;
-    let specs = head.chunks()?.collect::<crate::Result<Vec<_>>>()?;
+    let specs = head.chunk_specs()?;
     let stored_len: u64 = specs.iter().map(|spec| u64::from(spec.stored_len)).sum();
     if stored_len != area.len() as u64 {
         return Err(malformed());

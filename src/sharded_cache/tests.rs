@@ -50,6 +50,38 @@ fn a_shard_has_filled_once_it_has_evicted_and_stays_so() {
     assert!(c.has_filled(&1), "a shard that has filled stays filled");
 }
 
+/// A miss is admitted into a shard that has filled as any miss is, and into
+/// one that has not, never: with room for it, and with the key remembered as
+/// a recent miss alike.
+#[test]
+fn a_shard_that_has_not_filled_admits_nothing_once_filled() {
+    let c = ShardedCache::with_weighter(1_000, 1, 1024, LenWeighter, FxBuildHasher);
+    c.insert(1_000, vec![0u8; 100]);
+    assert!(c.admit(&1, 100), "room for it");
+    assert!(
+        !c.admit_once_filled(&1, 100),
+        "room, and nothing evicted yet"
+    );
+
+    let c = full_shard(1024);
+    assert!(
+        !c.admit_once_filled(&1, 100),
+        "full, and nothing evicted yet"
+    );
+    assert!(!c.admit(&1, 100), "a first miss into a full shard");
+    assert!(c.admit(&1, 100), "the miss repeated");
+    assert!(
+        !c.admit_once_filled(&1, 100),
+        "a repeated miss, and still nothing evicted"
+    );
+
+    c.insert(2_000, vec![0u8; 100]);
+    assert!(c.admit_once_filled(&1, 100), "filled, and a repeated miss");
+    assert!(!c.admit_once_filled(&2, 100), "filled, and a first miss");
+    c.remove(&2_000);
+    assert!(c.admit_once_filled(&3, 100), "filled, with room");
+}
+
 /// A first miss is taken while its shard has room: inserting it evicts
 /// nothing, so there is no churn to save, and a working set that fits the
 /// cache is cached on its first read.

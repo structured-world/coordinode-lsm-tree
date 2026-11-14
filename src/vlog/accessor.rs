@@ -697,9 +697,7 @@ impl<'a> Accessor<'a> {
     ) -> bool {
         let at = vhandle.frame_at();
         let weight = packed::cached_record_len(record) as u64;
-        self.fill.fills()
-            || (cache.filled_for_blob_record(tree_id, at, vhandle.index)
-                && cache.admit_blob_record(tree_id, at, vhandle.index, weight))
+        self.fill.fills() || cache.admit_blob_record(tree_id, at, vhandle.index, weight)
     }
 
     /// Reads bytes `range` of one separated value: of a chunked value, only
@@ -826,7 +824,8 @@ impl<'a> Accessor<'a> {
 
         // Each chunk where the frame index places it, of the length its row
         // in the head's table gives.
-        let mut placed = Vec::with_capacity(specs.len());
+        let mut placed =
+            smallvec::SmallVec::<[(crate::vlog::blob_file::frame::ChunkSpec, u64); 8]>::new();
         for (spec, frame) in specs.zip(chunks) {
             let spec = spec?;
             let (start, end) = blob_file.frame_span(frame).ok_or_else(malformed)?;

@@ -647,9 +647,25 @@ where
     /// never comes back costs a fingerprint, not an entry built, inserted and
     /// evicted unread.
     pub(crate) fn admit(&self, key: &K, weight: u64) -> bool {
+        self.admit_where(key, weight, false)
+    }
+
+    /// [`Self::admit`], and never into a shard that has not yet had to evict
+    /// to stay within capacity: an insert there grows the shard into fresh
+    /// memory, where one into a shard that has filled takes the place of
+    /// what it evicts. One look at the shard answers both.
+    pub(crate) fn admit_once_filled(&self, key: &K, weight: u64) -> bool {
+        self.admit_where(key, weight, true)
+    }
+
+    #[inline]
+    fn admit_where(&self, key: &K, weight: u64, filled_only: bool) -> bool {
         let (h, shard) = self.locate(key);
         {
             let core = shard.read();
+            if filled_only && !core.filled {
+                return false;
+            }
             if core.resident_bytes() + weight <= core.capacity || core.in_ghost(h) {
                 return true;
             }
@@ -665,6 +681,7 @@ where
     /// Whether `key`'s shard has ever had to evict to stay within capacity,
     /// so an insert there takes the place of what it evicts instead of
     /// growing the shard into fresh memory.
+    #[cfg(test)]
     pub(crate) fn has_filled(&self, key: &K) -> bool {
         let (_, shard) = self.locate(key);
         shard.read().filled

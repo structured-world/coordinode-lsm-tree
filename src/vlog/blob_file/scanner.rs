@@ -499,13 +499,12 @@ impl Scanner {
                     }
                     Some(Err(e))
                 };
-                let mut specs = Vec::with_capacity((chunks.end - chunks.start) as usize);
-                for at in 0..chunks.end - chunks.start {
-                    match decoded.chunk(at) {
-                        Ok(spec) => specs.push(spec),
-                        Err(e) => return failed(self, e),
-                    }
-                }
+                // One pass over the head's table, as many rows as `chunks`:
+                // both are counted from it.
+                let specs = match decoded.chunk_specs() {
+                    Ok(specs) => specs,
+                    Err(e) => return failed(self, e),
+                };
                 let area_len: u64 = specs.iter().map(|spec| u64::from(spec.stored_len)).sum();
                 let end = frame_end + area_len;
                 let placed = chunks.end > chunks.start

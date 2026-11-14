@@ -254,6 +254,9 @@ self_cell = "1.2.0"
 # written out, so the crate builds no proc-macro (`syn`, `quote`). No `std`
 # either: the impls need `alloc` only, so `ribbon-serde` builds without it.
 serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }
+# Short lists a read builds and drops, held on its stack while they are
+# short: the rows of a chunked value's table. No `std`.
+smallvec = { version = "1", default-features = false }
 # sfa is vendored under src/sfa/ (upstream does not accept PRs; pinning
 # the format to in-tree code lets us evolve it locally without waiting
 # for a release we cannot influence). License files preserved alongside.
