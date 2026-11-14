@@ -404,6 +404,10 @@ struct ChunkJob(Vec<u8>);
 /// it is stored as it is, and its row in the head's table.
 type EncodedChunk = (Option<Vec<u8>>, ChunkSpec);
 
+/// The chunks of one value as encoded: in place for a value of up to eight
+/// chunks, as its rows are when it is read.
+type EncodedChunks = smallvec::SmallVec<[EncodedChunk; 8]>;
+
 /// A writer's codec as a worker holds it, its dictionary shared rather than
 /// borrowed: a worker outlives the borrow of the writer.
 #[cfg(feature = "std")]
@@ -1084,8 +1088,8 @@ impl Writer {
     /// when the writer has them and the value has more than one chunk;
     /// without a codec an encode is a checksum, which a worker would only add
     /// a copy to.
-    fn encode_chunks(&self, value: &[u8], chunk_size: usize) -> crate::Result<Vec<EncodedChunk>> {
-        let mut encoded = Vec::with_capacity(value.len().div_ceil(chunk_size));
+    fn encode_chunks(&self, value: &[u8], chunk_size: usize) -> crate::Result<EncodedChunks> {
+        let mut encoded = EncodedChunks::with_capacity(value.len().div_ceil(chunk_size));
         #[cfg(feature = "std")]
         if let Some(parallel) = &self.parallel
             && parallel.threads > 1
@@ -1351,7 +1355,7 @@ impl Writer {
             if encoded.len() != chunks as usize {
                 return Err(crate::Error::InvalidHeader("blob chunk count"));
             }
-            let specs: Vec<ChunkSpec> = encoded.iter().map(|(_, spec)| *spec).collect();
+            let specs: super::frame::ChunkSpecs = encoded.iter().map(|(_, spec)| *spec).collect();
             self.emit(FrameKind::Head, &[entry], &head_payload(chunk_size, &specs))?;
             self.put_chunks(value, chunk_size as usize, &encoded)?;
             FrameRef {
