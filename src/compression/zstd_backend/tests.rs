@@ -30,6 +30,70 @@ const COMPRESSED: &[u8] = &[
 
 const PLAINTEXT: &[u8] = b"hello world hello world hello world";
 
+/// A frame under a finalized dictionary decodes straight into a buffer of
+/// exactly its length, as the allocating decode returns it.
+#[test]
+fn decompress_with_dict_into_finalized_fills_the_exact_buffer() {
+    let dict = ZstdDictionary::new(DICT);
+    let mut out = vec![0_u8; PLAINTEXT.len()];
+    let written = ZstdProvider::decompress_with_dict_into(COMPRESSED, &dict, &mut out)
+        .expect("decompression should succeed");
+    assert_eq!(written, PLAINTEXT.len());
+    assert_eq!(out, PLAINTEXT);
+}
+
+/// The raw-content path, which blob files use for the dictionary they carry,
+/// decodes into an exact buffer too, and twice in a row on one thread.
+#[test]
+fn decompress_with_dict_into_raw_content_fills_the_exact_buffer() {
+    let dict = ZstdDictionary::new(b"hello world raw content dictionary bytes");
+    let frame = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
+        .expect("compression should succeed");
+    for _ in 0..2 {
+        let mut out = vec![0_u8; PLAINTEXT.len()];
+        let written = ZstdProvider::decompress_with_dict_into(&frame, &dict, &mut out)
+            .expect("decompression should succeed");
+        assert_eq!(&out[..written], PLAINTEXT);
+    }
+}
+
+/// A frame compressed under another raw-content dictionary is refused, not
+/// decoded into silent garbage with the wrong history.
+#[test]
+fn decompress_with_dict_into_refuses_another_raw_content_dictionary() {
+    let used = ZstdDictionary::new(b"the dictionary the frame was compressed under");
+    let other = ZstdDictionary::new(b"a different dictionary of the same blob tree");
+    let frame = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &used, true)
+        .expect("compression should succeed");
+    let mut out = vec![0_u8; PLAINTEXT.len()];
+    assert!(ZstdProvider::decompress_with_dict_into(&frame, &other, &mut out).is_err());
+}
+
+/// A buffer shorter than the frame's content is refused rather than
+/// written past or truncated.
+#[test]
+fn decompress_with_dict_into_refuses_a_short_buffer() {
+    let dict = ZstdDictionary::new(DICT);
+    let mut out = vec![0_u8; PLAINTEXT.len() - 1];
+    assert!(ZstdProvider::decompress_with_dict_into(COMPRESSED, &dict, &mut out).is_err());
+}
+
+/// A plain frame decoded on the same thread after a dictionary frame comes
+/// out plain: the dictionary decoder leaves the plain one untouched.
+#[test]
+fn decompress_into_after_a_dictionary_decode_stays_plain() {
+    let dict = ZstdDictionary::new(b"hello world raw content dictionary bytes");
+    let with_dict = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
+        .expect("compression should succeed");
+    let plain = ZstdProvider::compress(PLAINTEXT, 3, true).expect("compression should succeed");
+    let mut out = vec![0_u8; PLAINTEXT.len()];
+    ZstdProvider::decompress_with_dict_into(&with_dict, &dict, &mut out)
+        .expect("decompression should succeed");
+    let mut out = vec![0_u8; PLAINTEXT.len()];
+    let written = ZstdProvider::decompress_into(&plain, &mut out).expect("plain decode");
+    assert_eq!(&out[..written], PLAINTEXT);
+}
+
 #[test]
 fn decompress_with_dict_returns_correct_plaintext() {
     let dict = ZstdDictionary::new(DICT);
@@ -722,6 +786,32 @@ fn the_compressor_cache_key_ignores_the_seed_below_level_19() {
             !builds_a_single_pass_compressor(level, true),
             "and keeps it when the setting is on",
         );
+    }
+}
+
+/// A thread's compressor takes another dictionary at the same level without
+/// being rebuilt, as each blob file brings its own: every frame decodes under
+/// the dictionary it was compressed with, going from one to the other and
+/// back.
+#[test]
+fn a_compressor_changing_dictionaries_writes_each_frame_under_its_own() {
+    let content = |seed: u32| -> Vec<u8> {
+        (0..4 * 1024_u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13).to_le_bytes()[0])
+            .collect()
+    };
+    let (first, second) = (content(1), content(2));
+    let dicts = [ZstdDictionary::new(&first), ZstdDictionary::new(&second)];
+    // Each value is a slice of its dictionary, so it compresses to a match
+    // only under that one.
+    let values = [&first[1_000..1_300], &second[2_000..2_300]];
+    for round in [0, 1, 0, 1, 1, 0] {
+        let (dict, value) = (&dicts[round], values[round]);
+        let frame = ZstdProvider::compress_with_dict(value, 3, dict, true).expect("compress");
+        assert!(frame.len() < value.len() / 2, "matched its dictionary");
+        let back =
+            ZstdProvider::decompress_with_dict(&frame, dict, value.len() + 1).expect("decompress");
+        assert_eq!(back, value);
     }
 }
 

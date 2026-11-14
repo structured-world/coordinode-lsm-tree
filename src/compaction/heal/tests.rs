@@ -313,8 +313,7 @@ fn a_transient_ecc_correction_queues_no_heal() -> crate::Result<()> {
     let name = table
         .path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().into_owned());
     let at = keyed.offset().0 + Header::MIN_LEN as u64 + 3;
     *flip
         .target

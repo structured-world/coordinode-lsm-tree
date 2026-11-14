@@ -686,12 +686,7 @@ impl FilterSizing {
     /// The widest filter any choice builds: what a writer bounds its output
     /// by before the choice is made.
     pub(crate) fn bound_policy(&self) -> BloomConstructionPolicy {
-        let widest = self.widths.last().copied().unwrap_or(self.fallback_bits);
-        if widest > self.fallback_bits {
-            BloomConstructionPolicy::BitsPerKey(f32::from(widest))
-        } else {
-            self.fallback
-        }
+        widest_policy(&self.widths, self.fallback)
     }
 
     /// The widths to build a filter over `n` hashes of keys in `bounds` at,
@@ -1865,6 +1860,22 @@ pub(crate) fn bits_of(policy: BloomConstructionPolicy) -> u8 {
         BloomConstructionPolicy::FalsePositiveRate(rate) => (1..=64u8)
             .find(|&bits| exp2(-f64::from(bits)) <= f64::from(rate))
             .unwrap_or(64),
+    }
+}
+
+/// The widest filter a plan over `widths` (an advisor's, narrowest first)
+/// builds when its level's policy is `fallback`: what a writer bounds its
+/// output by before the plan chooses.
+pub(crate) fn widest_policy(
+    widths: &[u8],
+    fallback: BloomConstructionPolicy,
+) -> BloomConstructionPolicy {
+    let fallback_bits = bits_of(fallback);
+    let widest = widths.last().copied().unwrap_or(fallback_bits);
+    if widest > fallback_bits {
+        BloomConstructionPolicy::BitsPerKey(f32::from(widest))
+    } else {
+        fallback
     }
 }
 

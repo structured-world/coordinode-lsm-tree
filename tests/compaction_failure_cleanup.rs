@@ -327,7 +327,9 @@ fn a_failed_relocation_leaves_none_of_its_blob_files() -> lsm_tree::Result<()> {
     f.tree.flush_active_memtable(0)?;
     f.tree.major_compact(u64::MAX, PAST_EVERY_VERSION)?;
 
-    assert_fails_cleanly(&f, [io_error(FaultOp::Write, "blobs", 4)], u64::MAX, |i| {
+    // The relocation writes four blob files, so the third write fails it
+    // part-way through, after two of them are finished.
+    assert_fails_cleanly(&f, [io_error(FaultOp::Write, "blobs", 2)], u64::MAX, |i| {
         value(i, u64::from(i % 2 == 0))
     })
 }

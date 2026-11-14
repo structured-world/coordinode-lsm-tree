@@ -310,6 +310,7 @@ pub(crate) struct RowPages {
 
 impl RowPages {
     /// The rows the batches hold between them.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn row_count(&self) -> u32 {
         // The directory proved the row pages sum to the group's `u32` row

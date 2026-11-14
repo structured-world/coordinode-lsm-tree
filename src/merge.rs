@@ -83,6 +83,11 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
     type Item = IterItem;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // One source is already in order: a flush of one memtable would move
+        // every entry through the heap and back for nothing.
+        if let [only] = self.iterators.as_mut_slice() {
+            return only.next();
+        }
         if !self.initialized_lo {
             fail_iter!(self.initialize_lo());
         }
@@ -117,6 +122,10 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
 
 impl<I: DoubleEndedIterator<Item = IterItem>> DoubleEndedIterator for Merger<I> {
     fn next_back(&mut self) -> Option<Self::Item> {
+        // As `next`: the source walks from both ends itself.
+        if let [only] = self.iterators.as_mut_slice() {
+            return only.next_back();
+        }
         if !self.initialized_hi {
             fail_iter!(self.initialize_hi());
         }

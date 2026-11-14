@@ -9,7 +9,7 @@ mod handle;
 pub use blob_file::BlobFile;
 
 pub(crate) use {
-    accessor::{Accessor, FrameCharge, PrefetchInto, Prefetched},
+    accessor::{Accessor, PrefetchInto, Prefetched},
     blob_file::merge::MergeScanner as BlobFileMergeScanner,
     blob_file::multi_writer::MultiWriter as BlobFileWriter,
     blob_file::scanner::Scanner as BlobFileScanner,
@@ -38,7 +38,13 @@ use core::sync::atomic::AtomicBool;
 /// one, but it beats letting directory order decide, and the surviving copy's
 /// damage still surfaces on the read that meets it.
 ///
+/// A copy whose metadata or stored dictionary did not parse (`damaged`) is
+/// never the one the manifest digested, but it still counts as a duplicate:
+/// the readable copy of its id must reproduce the digest to be kept.
+///
 /// # Errors
+///
+/// A damaged copy's own error when its id has no readable copy.
 ///
 /// Propagates an ENVIRONMENTAL failure while reading a copy's digest. The rank
 /// below would otherwise read "could not be determined" as "does not match" and
@@ -49,6 +55,7 @@ use core::sync::atomic::AtomicBool;
 fn dedupe_blob_sightings(
     fs: &Arc<dyn Fs>,
     blob_files: &mut Vec<BlobFile>,
+    damaged: Vec<(BlobFileId, PathBuf, crate::Error)>,
     orphaned: &mut Vec<PathBuf>,
 ) -> crate::Result<()> {
     let mut seen: crate::HashMap<BlobFileId, usize> = crate::HashMap::default();
@@ -57,6 +64,18 @@ fn dedupe_blob_sightings(
         if seen.insert(bf.id(), idx).is_some() {
             duplicate_ids.insert(bf.id());
         }
+    }
+    for (id, path, e) in damaged {
+        if !seen.contains_key(&id) {
+            return Err(e);
+        }
+        log::warn!(
+            "blob file {} of id {id} does not parse ({e:?}); the id's other copy decides, \
+             and this one is an orphan",
+            path.display(),
+        );
+        duplicate_ids.insert(id);
+        orphaned.push(path);
     }
     if duplicate_ids.is_empty() {
         return Ok(());
@@ -173,6 +192,7 @@ pub(crate) fn recover_blob_files(
 
     let mut blob_files = Vec::with_capacity(ids.len());
     let mut orphaned_blob_files = vec![];
+    let mut damaged_sightings = vec![];
 
     for (idx, dirent) in entries.into_iter().enumerate() {
         let file_name = &dirent.file_name;
@@ -211,7 +231,28 @@ pub(crate) fn recover_blob_files(
 
             let mut file = fs.open(blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
 
-            let (meta, frames) = read_meta_and_frames(&mut file, blob_file_id)?;
+            let parsed = read_meta_and_frames(&mut file, blob_file_id);
+            #[cfg(zstd_any)]
+            let parsed = parsed.and_then(|(meta, frames)| {
+                read_file_dictionary(&mut file, &meta).map(|dict| (meta, frames, dict))
+            });
+            #[cfg(not(zstd_any))]
+            let parsed = parsed.map(|(meta, frames)| (meta, frames, ()));
+            // Damaged bytes are not the copy the manifest digested, but another
+            // directory entry of the same id may be: deduplication below decides,
+            // and only an id left with no copy at all fails on this error.
+            #[cfg_attr(
+                not(zstd_any),
+                expect(unused_variables, reason = "no dictionary without zstd")
+            )]
+            let (meta, frames, own_dictionary) = match parsed {
+                Ok(parsed) => parsed,
+                Err(e) if e.is_environmental() => return Err(e),
+                Err(e) => {
+                    damaged_sightings.push((blob_file_id, blob_file_path.clone(), e));
+                    continue;
+                }
+            };
 
             // With a descriptor cache the file is closed once its metadata is
             // read, and reopened through the cache by its first read: holding
@@ -238,7 +279,12 @@ pub(crate) fn recover_blob_files(
                 // still restore it, rather than turning every value in the
                 // file into a failed read far from the cause.
                 #[cfg(zstd_any)]
-                zstd_dictionary: zstd_dictionaries.for_compression(meta.compression)?,
+                dictionary_in_file: own_dictionary.is_some(),
+                #[cfg(zstd_any)]
+                zstd_dictionary: match own_dictionary {
+                    Some(dict) => Some(dict),
+                    None => zstd_dictionaries.for_compression(meta.compression)?,
+                },
                 meta,
                 is_deleted: AtomicBool::new(false),
                 punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
@@ -272,7 +318,12 @@ pub(crate) fn recover_blob_files(
     // authoritative blob and make reads fail. The manifest's checksum covers
     // the live suffix of the copy it named, so it decides; the losers are
     // orphans, which the caller sweeps.
-    dedupe_blob_sightings(fs, &mut blob_files, &mut orphaned_blob_files)?;
+    dedupe_blob_sightings(
+        fs,
+        &mut blob_files,
+        damaged_sightings,
+        &mut orphaned_blob_files,
+    )?;
 
     if blob_files.len() < ids.len() {
         return Err(crate::Error::Unrecoverable);
@@ -394,6 +445,8 @@ pub(crate) fn recover_blob_file_cached(
 
     // Same read as `recover_blob_files`' per-id branch above.
     let (meta, frames) = read_meta_and_frames(&mut file, id)?;
+    #[cfg(zstd_any)]
+    let own_dictionary = read_file_dictionary(&mut file, &meta)?;
 
     let file: Arc<dyn crate::fs::FsFile> = Arc::from(file);
     let file_accessor = match descriptors {
@@ -417,10 +470,15 @@ pub(crate) fn recover_blob_file_cached(
         // supply. Refusing here would collapse both answers into "not a blob
         // file" and throw that context away.
         #[cfg(zstd_any)]
-        zstd_dictionary: zstd_dictionaries
-            .for_compression(meta.compression)
-            .ok()
-            .flatten(),
+        dictionary_in_file: own_dictionary.is_some(),
+        #[cfg(zstd_any)]
+        zstd_dictionary: match own_dictionary {
+            Some(dict) => Some(dict),
+            None => zstd_dictionaries
+                .for_compression(meta.compression)
+                .ok()
+                .flatten(),
+        },
         meta,
         is_deleted: AtomicBool::new(false),
         punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
@@ -452,7 +510,7 @@ pub(crate) fn recover_blob_file_cached(
 pub(crate) fn read_meta_and_frames(
     file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
     id: BlobFileId,
-) -> crate::Result<(Metadata, Arc<[u64]>)> {
+) -> crate::Result<(Metadata, blob_file::writer::FrameIndex)> {
     let (meta, frames_at, data) = read_meta_and_index_at(file, id)?;
     let (Some((pos, len)), Some(data)) = (frames_at, data) else {
         log::error!("frames or data section in blob file #{id} is missing (file may be corrupted)");
@@ -481,6 +539,56 @@ pub(crate) fn read_meta_and_frames(
     Ok((meta, frames))
 }
 
+/// The dictionary a blob file stores of its own, when it does: the one the
+/// codec its metadata records names, since a dictionary's id is its
+/// content's.
+///
+/// # Errors
+///
+/// [`crate::Error::Unrecoverable`] for a stored dictionary another than the
+/// one the metadata names, and any error reading it.
+#[cfg(zstd_any)]
+pub(crate) fn read_file_dictionary(
+    file: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
+    meta: &Metadata,
+) -> crate::Result<Option<Arc<crate::compression::ZstdDictionary>>> {
+    let at = {
+        let reader = crate::sfa::Reader::from_reader(file)?;
+        reader
+            .toc()
+            .section(b"dict")
+            .map(|entry| (entry.pos(), entry.len()))
+    };
+    let Some((pos, len)) = at else {
+        return Ok(None);
+    };
+    // The dictionary lies within the file: a length past it is damage, refused
+    // before a buffer is sized from it.
+    let file_len = file.metadata()?.len;
+    if pos.checked_add(len).is_none_or(|end| end > file_len) {
+        log::error!(
+            "dict section in blob file #{} runs past the file (file may be corrupted)",
+            meta.id
+        );
+        return Err(crate::Error::Unrecoverable);
+    }
+    let len = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
+    let dict =
+        crate::compression::ZstdDictionary::new(&crate::file::read_exact(&**file, pos, len)?);
+    match meta.compression {
+        crate::CompressionType::ZstdDict { dict_id, .. } if dict_id == dict.id() => {
+            Ok(Some(Arc::new(dict)))
+        }
+        _ => {
+            log::error!(
+                "blob file #{} stores a dictionary its codec does not name",
+                meta.id
+            );
+            Err(crate::Error::Unrecoverable)
+        }
+    }
+}
+
 /// The metadata of the blob file at `path`, without its frame index: what a
 /// salvage needs of a file whose index may be what is damaged.
 ///
@@ -491,6 +599,22 @@ pub(crate) fn read_meta_and_frames(
 pub(crate) fn read_blob_meta(path: &Path, fs: &dyn Fs, id: BlobFileId) -> crate::Result<Metadata> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     read_meta_and_index_at(&mut file, id).map(|(meta, ..)| meta)
+}
+
+/// [`read_file_dictionary`] of the blob file at `path`, whose metadata is
+/// `meta`.
+///
+/// # Errors
+///
+/// As [`read_file_dictionary`], and any error opening the file.
+#[cfg(all(feature = "std", zstd_any))]
+pub(crate) fn read_blob_file_dictionary(
+    path: &Path,
+    fs: &dyn Fs,
+    meta: &Metadata,
+) -> crate::Result<Option<Arc<crate::compression::ZstdDictionary>>> {
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    read_file_dictionary(&mut file, meta)
 }
 
 /// Where a section lies: its position and length.

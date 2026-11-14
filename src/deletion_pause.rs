@@ -50,7 +50,7 @@ use spin::Mutex;
 /// Cheap to clone: holds an atomic counter plus a `Mutex<Vec<...>>` that is
 /// only contended during checkpoint setup/teardown, never on the read path.
 #[derive(Default)]
-pub struct DeletionPause {
+pub(crate) struct DeletionPause {
     /// Number of active [`Pause`] guards. `0` means deletions happen
     /// immediately; `>0` means they are queued.
     active: AtomicU32,
@@ -66,6 +66,7 @@ pub struct DeletionPause {
     /// stay allocated until an unrelated compaction retires the table, under
     /// exactly the low-space condition that chose the tight-space path.
     /// Retried by [`retry_pending_reclaims`](Self::retry_pending_reclaims).
+    #[cfg(feature = "std")]
     pending_reclaims: Mutex<Vec<QueuedDeletion>>,
 
     /// Excludes a checkpoint's hard-link window from in-place file mutation
@@ -126,7 +127,7 @@ struct DeferredRemoval {
 /// since a pin's consumer reads the attestation beside the table.
 #[cfg(feature = "std")]
 #[derive(Clone, Copy)]
-pub enum PinnedKind {
+pub(crate) enum PinnedKind {
     /// A table, with its sidecars.
     Table,
     /// A blob file, which has none.
@@ -179,7 +180,7 @@ impl DeletionPause {
     /// An inactive gate of no tree, for a test that drives one alone.
     #[cfg(test)]
     #[must_use]
-    pub fn new_shared() -> Arc<Self> {
+    pub(crate) fn new_shared() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
@@ -195,7 +196,7 @@ impl DeletionPause {
     /// Returns `true` if there is at least one active [`Pause`] guard and
     /// deletions should therefore be queued.
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire) > 0
     }
 
@@ -203,7 +204,7 @@ impl DeletionPause {
     /// the deletion was queued (caller must NOT call `remove_file`), or
     /// `false` if the pause is currently inactive (caller proceeds with
     /// the deletion as usual).
-    pub fn try_enqueue(&self, fs: Arc<dyn Fs>, path: PathBuf) -> bool {
+    pub(crate) fn try_enqueue(&self, fs: Arc<dyn Fs>, path: PathBuf) -> bool {
         self.try_enqueue_action(fs, path, QueuedAction::Remove)
     }
 
@@ -218,6 +219,7 @@ impl DeletionPause {
     /// only if the file is still exclusively owned then: a checkpoint that DID
     /// link it during its window shares the inode, and punching would zero the
     /// checkpoint's copy too.
+    #[cfg(feature = "std")]
     pub(crate) fn try_enqueue_punch(
         &self,
         fs: Arc<dyn Fs>,
@@ -252,7 +254,7 @@ impl DeletionPause {
             reason = "no_std-capable; only the std-gated checkpoint consumer acquires a pause"
         )
     )]
-    pub fn acquire(self: &Arc<Self>) -> Pause {
+    pub(crate) fn acquire(self: &Arc<Self>) -> Pause {
         self.active.fetch_add(1, Ordering::AcqRel);
         Pause {
             inner: Arc::clone(self),
@@ -285,7 +287,7 @@ impl DeletionPause {
         reason = "no_std-capable RAII guard; only the std-gated checkpoint consumer constructs one"
     )
 )]
-pub struct Pause {
+pub(crate) struct Pause {
     inner: Arc<DeletionPause>,
 }
 
@@ -345,10 +347,14 @@ impl Drop for Pause {
                         );
                     }
                 }
+                #[cfg(feature = "std")]
                 QueuedAction::Punch(_) => {
                     self.inner
                         .reclaim_or_retain(item, &self.inner.pending_reclaims);
                 }
+                // Only the std reclaim path queues a punch.
+                #[cfg(not(feature = "std"))]
+                QueuedAction::Punch(_) => {}
             }
         }
     }
@@ -372,6 +378,7 @@ impl DeletionPause {
     /// checkpoint starting after the probe read `1` would hard-link the file and
     /// then watch the punch zero the inode its immutable snapshot shares. The
     /// window excludes every checkpoint generation across the whole sequence.
+    #[cfg(feature = "std")]
     fn reclaim_or_retain(&self, item: QueuedDeletion, pending: &Mutex<Vec<QueuedDeletion>>) {
         let QueuedAction::Punch(extents) = &item.action else {
             return;
@@ -452,6 +459,7 @@ impl DeletionPause {
     /// Call it where the reclaimed space is needed — the tight-space compaction
     /// path — and after a checkpoint releases, since that is when its links
     /// usually disappear.
+    #[cfg(feature = "std")]
     pub(crate) fn retry_pending_reclaims(&self) {
         let retained = core::mem::take(&mut *self.pending_reclaims.lock());
         for item in retained {
@@ -460,7 +468,7 @@ impl DeletionPause {
     }
 
     /// Whether any reclaim is still waiting for its file to stop being shared.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     pub(crate) fn has_pending_reclaims(&self) -> bool {
         !self.pending_reclaims.lock().is_empty()
     }
@@ -596,7 +604,7 @@ impl DeletionPause {
 
 /// An in-place mutation under way; see [`DeletionPause::begin_mutation`].
 #[cfg(feature = "std")]
-pub struct MutationGuard<'a> {
+pub(crate) struct MutationGuard<'a> {
     pause: &'a DeletionPause,
 }
 
@@ -613,7 +621,7 @@ impl Drop for MutationGuard<'_> {
 
 /// A pin being taken; see [`DeletionPause::begin_pin`].
 #[cfg(feature = "std")]
-pub struct PinGuard<'a> {
+pub(crate) struct PinGuard<'a> {
     pause: &'a DeletionPause,
 }
 

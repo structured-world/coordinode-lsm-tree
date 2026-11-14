@@ -1937,6 +1937,95 @@ fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> cr
     Ok(())
 }
 
+/// A tight-space slice reserves room for the live values it relocates, so it
+/// copies no block whole: a whole copy also writes the block's dead values,
+/// which the reservation does not count and the volume may not have room for.
+/// Mostly live blocks a normal pass would copy whole are written value by
+/// value here, and no dead value reaches the new files.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_tight_space_slice_copies_no_block_whole() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    // Values share blocks under a codec; with none they would be packed
+    // records, which are not copied whole.
+    .blob_compression(crate::CompressionType::Lz4)
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(mem.clone()))
+    .with_kv_separation(Some(
+        blob_reloc_kv_options()
+            .block_size(4_096)
+            .file_target_size(64 * 1024 * 1024),
+    ));
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+
+    // One blob file per generation: the first is relocated whole, so the
+    // files left after the pass hold only what it wrote and the second. At
+    // seqno 0, the seqno the merge before the pass leaves its rows at, so its
+    // blocks list their values at their rows' seqno and may be copied whole.
+    for i in 0..BLOB_RELOC_KEYS {
+        tree.insert(blob_reloc_key(i).as_bytes(), blob_reloc_value(i, 1), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    // A run overwritten whole makes the files stale; past it, one value in
+    // sixteen leaves the blocks mostly live, each with a dead value in it.
+    let run = BLOB_RELOC_KEYS * 3 / 10;
+    for i in (0..BLOB_RELOC_KEYS).filter(|i| *i < run || i % 16 == 0) {
+        tree.insert(
+            blob_reloc_key(i).as_bytes(),
+            blob_reloc_value(i, 2),
+            BLOB_RELOC_KEYS + i,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 4);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = true;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+    assert!(
+        mem.punched_bytes() > 0,
+        "the fixture needs the pass to run in slices"
+    );
+
+    let values: u64 = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(|file| file.0.meta.item_count)
+        .sum();
+    assert_eq!(
+        values, BLOB_RELOC_KEYS,
+        "the blob files hold one value per key and no dead one"
+    );
+    for i in 0..BLOB_RELOC_KEYS {
+        let generation = if i < run || i % 16 == 0 { 2 } else { 1 };
+        assert_eq!(
+            tree.get(blob_reloc_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(blob_reloc_value(i, generation).as_slice()),
+            "key {i}"
+        );
+    }
+    Ok(())
+}
+
 /// A tight-space slice whose share of a stale blob file is all dead (the
 /// pointers to those frames were folded away before the pass) still reclaims
 /// it: every version of the slice's keys went through the slice, so a frame
@@ -2774,10 +2863,10 @@ fn blob_file_picking_simple() -> crate::Result<()> {
     assert_eq!(2, tree.table_count());
     assert_eq!(1, tree.blob_file_count());
 
-    // `a` shares a block with the others: it is charged its entry
-    // uncompressed as block bytes, its key and one byte with the entry's
-    // fixed part, nothing of frames of its own.
-    let charged = (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + 2) as u64;
+    // `a` is a record of a packed block shared with the others: it is
+    // charged its record as block bytes, its key and one byte with the
+    // record's fixed part, nothing of frames of its own.
+    let charged = (crate::vlog::blob_file::packed::RECORD_HEADER_LEN + 2) as u64;
     let garbage = crate::blob_tree::FragmentationEntry::new(1, 1, 0).with_block_bytes(charged);
     {
         assert_eq!(
@@ -3039,33 +3128,51 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
         .flat_map(|level| level.iter())
         .find(|run| run.len() >= 3)
         .expect("a bottom-level run with >= 3 tables");
-    let run_sigma: u64 = run.iter().map(Table::file_len).sum();
-    let payload = Input {
-        table_ids: run.iter().map(Table::id).collect(),
+    let tables: Vec<&Table> = run.iter().collect();
+    let input = |ids: crate::HashSet<TableId>| Input {
+        table_ids: ids,
         dest_level: 6,
         canonical_level: 6,
         target_size: 64 * 1024 * 1024,
     };
-
-    // Free space below the full run's Σ but above a single pair: the run does
-    // not fit, a run-adjacent pair does. Calibrate against the SIMULATED
-    // disk's real stored bytes (manifest / WAL count too, not just live SSTs),
-    // since the gate probes `available_space`, not the version footprint.
-    // `run_sigma >= 1` (real SST files), so `- 1` cannot underflow.
-    let probe_capacity = 1u64 << 40;
-    mem.set_capacity(probe_capacity);
-    let stored =
-        probe_capacity - crate::fs::Fs::available_space(&mem, dir.path()).unwrap_or(probe_capacity);
-    mem.set_capacity(stored + run_sigma - 1);
-    tree.update_runtime_config(|c| {
-        c.storage_admission_check = true;
-        c.storage_limit_bytes = None;
-    })?;
-
+    let payload = input(tables.iter().map(|t| t.id()).collect());
     let opts = super::Options::from_tree(
         &tree,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
+    // What the gate charges the whole run and an adjacent pair of it.
+    let probe = crate::compaction::flavour::output_bound_probe(
+        &version,
+        &opts,
+        &payload,
+        &opts.runtime_config.load(),
+    )?;
+    let full = super::recorded_table_demand(&version, &opts, &payload, &probe, &[])?;
+    let pair = super::recorded_table_demand(
+        &version,
+        &opts,
+        &input(tables.iter().take(2).map(|t| t.id()).collect()),
+        &probe,
+        &[],
+    )?;
+    assert!(
+        pair < full,
+        "a pair takes less than the run: {pair} against {full}"
+    );
+
+    // Free space below what the full run takes but above a pair: the run does
+    // not fit, a run-adjacent pair does. Calibrate against the SIMULATED
+    // disk's real stored bytes (manifest / WAL count too, not just live SSTs),
+    // since the gate probes `available_space`, not the version footprint.
+    let probe_capacity = 1u64 << 40;
+    mem.set_capacity(probe_capacity);
+    let stored =
+        probe_capacity - crate::fs::Fs::available_space(&mem, dir.path()).unwrap_or(probe_capacity);
+    mem.set_capacity(stored + full - 1);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
     match super::space_gate_for_merge(&version, &opts, &payload)? {
         super::SpaceGate::Narrowed(narrowed, ..) => {
             assert_eq!(narrowed.table_ids.len(), 2, "narrowed to an adjacent pair");
@@ -3319,18 +3426,44 @@ fn space_gate_sizes_a_restricted_input_by_its_live_suffix() -> crate::Result<()>
         canonical_level: 6,
         target_size: 64 * 1024 * 1024,
     };
-    // Headroom that fits the live suffix EXACTLY and not the original size.
-    let used = crate::storage_stats::compute_used_bytes(&version)?;
-    tree.update_runtime_config(|c| {
-        c.storage_admission_check = true;
-        c.tight_space_compaction = false;
-        c.storage_limit_bytes = Some(used + live);
-    })?;
-
     let opts = super::Options::from_tree(
         &tree,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
+    // What the gate charges the live suffix, and what the whole original's
+    // entries, as its metadata records them, would take.
+    let probe = crate::compaction::flavour::output_bound_probe(
+        &version,
+        &opts,
+        &payload,
+        &opts.runtime_config.load(),
+    )?;
+    let suffix = super::recorded_table_demand(&version, &opts, &payload, &probe, &[])?;
+    let meta = &restricted.metadata;
+    let whole = probe.rewrite_bound(
+        &crate::table::writer::RewriteLoad {
+            entries: meta.item_count,
+            key_bytes: meta.sum_user_key_bytes.unwrap_or_default(),
+            value_bytes: meta.sum_value_bytes.unwrap_or_default(),
+            filter_hashes: meta.item_count,
+            longest_key: meta.longest_user_key.unwrap_or_default(),
+            longest_value: meta.longest_value,
+            ..crate::table::writer::RewriteLoad::default()
+        },
+        0,
+    );
+    assert!(
+        suffix < whole,
+        "the suffix is charged less than the whole original: {suffix} against {whole}"
+    );
+    // Headroom that fits the live suffix EXACTLY and not the original.
+    let used = crate::storage_stats::compute_used_bytes(&version)?;
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = false;
+        c.storage_limit_bytes = Some(used + suffix);
+    })?;
+
     match super::space_gate_for_merge(&version, &opts, &payload)? {
         super::SpaceGate::Run(..) => Ok(()),
         super::SpaceGate::Narrowed(..) => {
@@ -3720,10 +3853,10 @@ fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()>
     assert_relocated_values(&tree)
 }
 
-/// A relocating pass whose tables and blob files share one volume checks a
-/// slice against the room both of its demands take there: another tree that
-/// took less than that room since, but more than it leaves past the two
-/// together, stops the slice before it writes.
+/// A relocating pass whose tables and blob files share one volume holds a
+/// slice to the room both of its writes take there together; another tree
+/// that took all but too little of it for the first key stops the pass before
+/// a slice writes.
 #[test]
 fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crate::Result<()> {
     use crate::fs::Fs;
@@ -3772,21 +3905,14 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
     let inputs: Vec<Table> = version.iter_tables().cloned().collect();
     let ids: crate::HashSet<TableId> = inputs.iter().map(Table::id).collect();
     let stale_files = super::pick_blob_files_to_rewrite(&ids, &version, &blob_reloc_kv_options())?;
-    let stale: crate::HashSet<_> = stale_files.iter().map(crate::vlog::BlobFile::id).collect();
-    let mut codecs = Vec::new();
-    for file in &stale_files {
-        if !codecs.contains(&file.compression()) {
-            codecs.push(file.compression());
-        }
-    }
     let free = mem.available_space(dir.path())?;
-    let relocated = super::Relocated {
-        stale: &stale,
-        target_size: 48 * 1024,
-        chunk_size: blob_reloc_kv_options().frame_sizes().chunk_size,
-        file_groups: codecs.len() as u64 * u64::from(blob_reloc_kv_options().lifetime_groups.get()),
-    };
-    let slices = super::tight_slices(
+    let relocated = super::Relocated::new(&stale_files, &blob_reloc_kv_options());
+    drop(stale_files);
+    let opts = super::Options::from_tree(
+        &tree.index,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
+    let first = governed(
         &inputs,
         super::SliceCaps {
             tables: u64::MAX,
@@ -3794,31 +3920,30 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
             total: free,
         },
         &super::SliceOutputs {
-            target_size: 64 * 1024 * 1024,
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
             cut_keys: &[],
+            domains: None,
         },
         Some(&relocated),
         &tree.index.config.comparator,
-        &super::input_pacer(&super::Options::from_tree(
-            &tree.index,
-            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
-        )),
     )?;
+    drop(opts);
+    drop(inputs);
     drop(version);
-    let Some(first) = slices.first() else {
-        panic!("a pass cuts at least one slice");
-    };
-    let (tables, blobs) = (first.tables, first.blobs);
     assert!(
-        slices.len() > 1 && tables.min(blobs) >= 2,
-        "the fixture needs a pass in slices writing both: {slices:?}"
+        first.end.is_some() && first.tables.min(first.blobs) >= 2,
+        "the fixture needs a pass in slices writing both"
+    );
+    assert!(
+        first.tables + first.blobs <= free,
+        "both writes of a slice are held to the one room: {} + {} past {free}",
+        first.tables,
+        first.blobs
     );
 
-    // Past the room the two leave together, short of what either leaves.
-    squeeze.store(
-        free - (tables + blobs) + tables.min(blobs) / 2,
-        Ordering::SeqCst,
-    );
+    // All of the room but a byte: not even the first key fits.
+    squeeze.store(free - 1, Ordering::SeqCst);
     let punched = mem.punched_bytes();
     let result = tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
     assert_eq!(
@@ -4011,6 +4136,578 @@ fn relocating_ingested_frames_lists_them_at_their_table_seqno() -> crate::Result
         }
     }
     assert!(relocated > 0, "the fixture needs the merge to relocate");
+    Ok(())
+}
+
+/// A relocation never copies whole a block whose values a key domain set
+/// after it was written splits: copied as stored, it would carry keys of two
+/// domains into one file, which expiring either could then not drop. Its
+/// values are written anew, each file held to one domain, as any written
+/// value is. Only a file that compresses its values writes such blocks: one
+/// that compresses nothing packs them in records.
+#[test]
+#[cfg(feature = "lz4")]
+fn relocation_rewrites_a_block_a_key_domain_splits() -> crate::Result<()> {
+    const KEYS: u64 = 400;
+    const BOUNDARY: u64 = 202;
+
+    /// Two domains, split at `BOUNDARY`'s key.
+    struct Split;
+    impl crate::KeyDomains for Split {
+        fn domain_end(&self, key: &[u8]) -> Option<crate::UserKey> {
+            let boundary = blob_reloc_key(BOUNDARY);
+            (key < boundary.as_bytes()).then(|| crate::UserKey::from(boundary.as_bytes()))
+        }
+    }
+
+    let folder = crate::get_tmp_folder();
+    let open = |domains: bool| -> crate::Result<crate::BlobTree> {
+        let mut config = crate::Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .blob_compression(crate::CompressionType::Lz4)
+        .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)));
+        if domains {
+            config = config.key_domains(alloc::sync::Arc::new(Split));
+        }
+        match config.open()? {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+        }
+    };
+    // Values below the block size, several to a block, written before the
+    // domains: a block holds keys on both sides of the boundary.
+    {
+        let tree = open(false)?;
+        for i in 0..KEYS {
+            tree.insert(blob_reloc_key(i), blob_reloc_value(i, 1), 0);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = open(true)?;
+    // The first quarter shadowed in a run: its blocks die whole and the file
+    // turns stale, while the rest stay whole and live.
+    for i in 0..KEYS / 4 {
+        tree.insert(blob_reloc_key(i), blob_reloc_value(i, 2), 1);
+    }
+    tree.flush_active_memtable(0)?;
+    let before: crate::HashSet<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+
+    // The files the relocation wrote: the ones written before the domains
+    // hold keys of both by construction.
+    let boundary = blob_reloc_key(BOUNDARY);
+    let (mut relocated, mut lower, mut upper) = (0, false, false);
+    for file in tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .filter(|file| !before.contains(&file.id()))
+    {
+        let scanner = crate::vlog::blob_file::scanner::Scanner::new(
+            &file.0.path,
+            &crate::fs::StdFs,
+            file.id(),
+        )?;
+        let keys = scanner
+            .map(|entry| entry.map(|entry| entry.key))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let below = keys
+            .iter()
+            .filter(|key| ***key < *boundary.as_bytes())
+            .count();
+        assert!(
+            below == 0 || below == keys.len(),
+            "file {} holds keys of both domains",
+            file.id()
+        );
+        lower |= below > 0;
+        upper |= below < keys.len();
+        relocated += keys.len();
+    }
+    assert!(
+        relocated > 0 && lower && upper,
+        "the fixture needs the merge to relocate keys of both domains"
+    );
+    for i in 0..KEYS {
+        let expected = blob_reloc_value(i, if i < KEYS / 4 { 2 } else { 1 });
+        assert_eq!(
+            tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+            Some(&expected[..]),
+            "key {i} reads back"
+        );
+    }
+    Ok(())
+}
+
+/// A zstd blob file compresses its blocks with a dictionary of its own. A
+/// relocation that copies such a block whole lands it in a file recording the
+/// source's codec, which must then hold that dictionary: copied without it,
+/// the output file names a dictionary the tree does not have, and the pass
+/// fails before it installs.
+#[cfg(zstd_any)]
+#[test]
+fn relocation_copies_whole_blocks_of_a_file_with_its_own_dictionary() -> crate::Result<()> {
+    const KEYS: u64 = 2_000;
+
+    /// Text-like values, so the file's dictionary trains on them and the
+    /// blocks after it compress under it.
+    fn value(i: u64, generation: u8) -> Vec<u8> {
+        format!("generation {generation} record {i:08} status=ok region=eu-west payload ")
+            .repeat(3)
+            .into_bytes()
+    }
+
+    let folder = crate::get_tmp_folder();
+    let open = || -> crate::Result<crate::BlobTree> {
+        match crate::Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .blob_compression(crate::CompressionType::Zstd(3))
+        .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+        }
+    };
+    let tree = open()?;
+    for i in 0..KEYS {
+        tree.insert(blob_reloc_key(i), value(i, 1), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    // Runs of keys shadowed: each file turns stale, the blocks the runs fall
+    // in are written anew, and the blocks between them stay whole and live,
+    // copied as they were stored.
+    let shadowed = |i: u64| i % 64 < 10;
+    for i in (0..KEYS).filter(|i| shadowed(*i)) {
+        tree.insert(blob_reloc_key(i), value(i, 2), 1);
+    }
+    tree.flush_active_memtable(0)?;
+    let first: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .filter(|file| matches!(file.compression(), crate::CompressionType::ZstdDict { .. }))
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    assert!(
+        !first.is_empty(),
+        "the fixture needs files with their own dictionary"
+    );
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    assert!(
+        tree.index
+            .current_version()
+            .blob_files
+            .iter()
+            .all(|file| !first.contains(&file.id())),
+        "the files with their own dictionary are relocated"
+    );
+
+    // Read back as written, and again after a reopen, which loads each
+    // file's dictionary from the file itself.
+    let read_back = |tree: &crate::BlobTree| -> crate::Result<()> {
+        for i in 0..KEYS {
+            let expected = value(i, if shadowed(i) { 2 } else { 1 });
+            assert_eq!(
+                tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+                Some(&expected[..]),
+                "key {i} reads back"
+            );
+        }
+        Ok(())
+    };
+    read_back(&tree)?;
+    drop(tree);
+    read_back(&open()?)?;
+    Ok(())
+}
+
+/// Two blob files whose own dictionaries differ but share a 32-bit id are
+/// relocated in one pass: each source's frames and blocks land in a file that
+/// holds that source's dictionary, never the other's, so every value still
+/// decodes. The id is a truncated hash of content the user writes, so such a
+/// pair is constructible: 64 KiB of one repeated `u64` against another.
+#[cfg(zstd_any)]
+#[test]
+fn relocation_keeps_apart_own_dictionaries_that_share_an_id() -> crate::Result<()> {
+    const KEYS: u64 = 40;
+
+    /// 8000 bytes of `word` repeated: eight and a bit of these fill a file's
+    /// 64 KiB of samples with nothing but `word`.
+    fn value(word: u64) -> Vec<u8> {
+        word.to_le_bytes().repeat(1_000)
+    }
+
+    let folder = crate::get_tmp_folder();
+    let tree = match crate::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Zstd(3))
+    .with_kv_separation(Some(blob_reloc_kv_options()))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    let words = [31_195_u64, 33_067];
+    for (prefix, word) in ["a", "b"].into_iter().zip(words) {
+        for i in 0..KEYS {
+            tree.insert(format!("{prefix}{i:04}"), value(word), 0);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let ids: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::compression)
+        .collect();
+    assert!(
+        matches!(
+            ids.as_slice(),
+            [
+                crate::CompressionType::ZstdDict { dict_id: a, .. },
+                crate::CompressionType::ZstdDict { dict_id: b, .. },
+            ] if a == b
+        ),
+        "the fixture needs two own dictionaries under one id: {ids:?}"
+    );
+    // A run shadowed in each file: both turn stale and are relocated together.
+    for prefix in ["a", "b"] {
+        for i in 0..KEYS / 4 {
+            tree.insert(format!("{prefix}{i:04}"), value(7), 1);
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    let written: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+
+    // Every file holding a source's values holds that source's dictionary.
+    let version = tree.index.current_version();
+    let relocated: Vec<_> = version
+        .blob_files
+        .iter()
+        .filter(|file| !written.contains(&file.id()))
+        .collect();
+    assert!(!relocated.is_empty(), "the fixture needs a relocation");
+    for file in relocated {
+        let Some(dict) = &file.0.zstd_dictionary else {
+            assert!(
+                !matches!(file.compression(), crate::CompressionType::ZstdDict { .. }),
+                "file {} records a dictionary codec but holds no dictionary",
+                file.id()
+            );
+            continue;
+        };
+        let min = file.0.meta.key_range.min().first().copied();
+        let max = file.0.meta.key_range.max().first().copied();
+        for (prefix, word) in b"ab".iter().copied().zip(words) {
+            if min == Some(prefix) || max == Some(prefix) {
+                assert_eq!(
+                    dict.raw().get(..8),
+                    Some(&word.to_le_bytes()[..]),
+                    "file {} holds {} values under another source's dictionary",
+                    file.id(),
+                    char::from(prefix)
+                );
+            }
+        }
+    }
+
+    for (prefix, word) in ["a", "b"].into_iter().zip(words) {
+        for i in 0..KEYS {
+            let expected = value(if i < KEYS / 4 { 7 } else { word });
+            assert_eq!(
+                tree.get(format!("{prefix}{i:04}"), crate::SeqNo::MAX)?
+                    .as_deref(),
+                Some(&expected[..]),
+                "{prefix}{i:04} reads back"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A relocation over more files with their own dictionaries than it holds
+/// copies open writes the values of the rest anew: an output that copies a
+/// file's frames holds that file's dictionary, so one per source would hold a
+/// file open per source, however many there are.
+#[cfg(zstd_any)]
+#[test]
+fn relocation_holds_no_more_dictionary_outputs_than_copy_sources() -> crate::Result<()> {
+    const FILES: u64 = 20;
+    const KEYS: u64 = 12;
+
+    /// 8000 bytes of `word` repeated: twelve fill a file's dictionary samples.
+    fn value(word: u64) -> Vec<u8> {
+        word.to_le_bytes().repeat(1_000)
+    }
+
+    let folder = crate::get_tmp_folder();
+    let tree = match crate::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Zstd(3))
+    .with_kv_separation(Some(blob_reloc_kv_options()))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for file in 0..FILES {
+        for i in 0..KEYS {
+            tree.insert(format!("{file:02}-{i:04}"), value(1_000 + file), 0);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    assert!(
+        tree.index
+            .current_version()
+            .blob_files
+            .iter()
+            .all(crate::vlog::BlobFile::has_own_dictionary),
+        "the fixture needs files with their own dictionaries"
+    );
+    // Half of each file shadowed: all turn stale and relocate together.
+    for file in 0..FILES {
+        for i in 0..KEYS / 2 {
+            tree.insert(format!("{file:02}-{i:04}"), value(7), 1);
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    let written: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+
+    let relocated = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .filter(|file| !written.contains(&file.id()))
+        .count();
+    // At most 16 outputs hold a source's dictionary, as many as the writer
+    // copies blocks of; the rest share an output of their own codec.
+    assert!(
+        relocated > 0 && relocated <= 16 + 2,
+        "{relocated} relocated files for {FILES} sources"
+    );
+    for file in 0..FILES {
+        for i in 0..KEYS {
+            let expected = value(if i < KEYS / 2 { 7 } else { 1_000 + file });
+            assert_eq!(
+                tree.get(format!("{file:02}-{i:04}"), crate::SeqNo::MAX)?
+                    .as_deref(),
+                Some(&expected[..]),
+                "{file:02}-{i:04} reads back"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A relocation holds the rows after a pointer into a block until the block's
+/// values are all seen, and no more than a bound of them: past it the blocks
+/// still waiting are given up, their values written anew, and the rows go
+/// out. Here more than the bound of inline rows lies between two values of
+/// one block, and every row and value still reads back after the pass.
+#[test]
+fn relocation_gives_up_a_block_whose_values_lie_past_the_held_bound() -> crate::Result<()> {
+    const KEYS: u64 = 40;
+    const ROWS: u64 = 140_000;
+
+    let folder = crate::get_tmp_folder();
+    let tree = match crate::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in 0..KEYS {
+        tree.insert(blob_reloc_key(i), blob_reloc_value(i, 1), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    let first: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    // Inline rows sorting between the first block's first two values, more
+    // bytes of them than a relocation holds back.
+    let row = |j: u64| format!("{}/{j:08}", blob_reloc_key(0));
+    for j in 0..ROWS {
+        tree.insert(row(j), [b'r'; 40], 1);
+    }
+    // The second half shadowed: the file turns stale and is relocated.
+    for i in KEYS / 2..KEYS {
+        tree.insert(blob_reloc_key(i), blob_reloc_value(i, 2), 1);
+    }
+    tree.flush_active_memtable(0)?;
+    let given_up =
+        || crate::compaction::flavour::BLOCKS_GIVEN_UP.load(core::sync::atomic::Ordering::Relaxed);
+    let before = given_up();
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    tree.major_compact(64 * 1024 * 1024, 2)?;
+    assert!(given_up() > before, "the pass gives up a block");
+
+    assert!(
+        tree.index
+            .current_version()
+            .blob_files
+            .iter()
+            .all(|file| !first.contains(&file.id())),
+        "the first generation is relocated"
+    );
+    for i in 0..KEYS {
+        let expected = blob_reloc_value(i, if i < KEYS / 2 { 1 } else { 2 });
+        assert_eq!(
+            tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+            Some(&expected[..]),
+            "key {i} reads back"
+        );
+    }
+    for j in [0, ROWS / 2, ROWS - 1] {
+        assert_eq!(
+            tree.get(row(j), crate::SeqNo::MAX)?.as_deref(),
+            Some(&[b'r'; 40][..]),
+            "row {j} reads back"
+        );
+    }
+    Ok(())
+}
+
+/// [`relocating_ingested_frames_lists_them_at_their_table_seqno`] for values
+/// that share blocks: a block of ingested values, whole and live, would be
+/// copied as stored, its entries listed at the zero the ingestion wrote them
+/// under. A block whose claimed values are listed at another seqno than their
+/// table's is written anew instead, each value at its table's seqno, as a
+/// block below the copy share is. Only a file that compresses its values
+/// writes such blocks: one that compresses nothing packs them in records.
+#[test]
+#[cfg(feature = "lz4")]
+fn relocating_ingested_blocks_lists_them_at_their_table_seqno() -> crate::Result<()> {
+    const KEYS: u64 = 400;
+    let folder = crate::get_tmp_folder();
+    let tree = match crate::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Lz4)
+    .with_kv_separation(Some(blob_reloc_kv_options().block_size(1_024)))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    // Values below the block size: several to a block.
+    let value = blob_reloc_value;
+    // As in the frame test: a seqno other than zero for the ingestion, and a
+    // range tombstone that keeps the covered keys at their real seqnos.
+    tree.insert("a", value(0, 0), 0);
+    tree.remove_range("key", "kez", 0);
+    tree.flush_active_memtable(0)?;
+    let mut ingestion = crate::blob_tree::ingest::BlobIngestion::new(&tree)?;
+    for i in 0..KEYS {
+        ingestion.write(blob_reloc_key(i).into_bytes().into(), value(i, 1).into())?;
+    }
+    ingestion.finish()?;
+    let Some(ingested) = tree.get_highest_seqno() else {
+        panic!("the ingestion is given a seqno");
+    };
+    assert!(ingested > 0);
+    // The first half shadowed in a run: its blocks die whole and the file
+    // turns stale, while the second half's blocks stay whole and live, the
+    // share a block is copied whole at.
+    for i in 0..KEYS / 2 {
+        tree.insert(blob_reloc_key(i), value(i, 2), ingested + 1 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let watermark = ingested + 2 * KEYS;
+    // The first merge learns which values died; the second relocates.
+    tree.major_compact(64 * 1024 * 1024, watermark)?;
+    let before: crate::HashSet<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    tree.major_compact(64 * 1024 * 1024, watermark)?;
+
+    let version = tree.index.current_version();
+    let mut relocated = 0;
+    for file in version
+        .blob_files
+        .iter()
+        .filter(|f| !before.contains(&f.id()))
+    {
+        let scanner = crate::vlog::blob_file::scanner::Scanner::new(
+            &file.0.path,
+            &crate::fs::StdFs,
+            file.id(),
+        )?;
+        for entry in scanner {
+            let entry = entry?;
+            assert_eq!(
+                entry.seqno, ingested,
+                "{:?} listed at its table's seqno",
+                entry.key
+            );
+            assert!(entry.block.is_some(), "{:?} shares a block", entry.key);
+            relocated += 1;
+        }
+    }
+    assert!(relocated > 0, "the fixture needs the merge to relocate");
+    for i in 0..KEYS {
+        let expected = value(i, if i < KEYS / 2 { 2 } else { 1 });
+        assert_eq!(
+            tree.get(blob_reloc_key(i), crate::SeqNo::MAX)?.as_deref(),
+            Some(&expected[..]),
+            "key {i} reads back"
+        );
+    }
     Ok(())
 }
 
@@ -4571,7 +5268,7 @@ impl crate::MergeOperator for SetMerge {
         base_value: Option<&[u8]>,
         operands: &[&[u8]],
     ) -> crate::Result<crate::UserValue> {
-        let mut set: Vec<u8> = base_value.map(<[u8]>::to_vec).unwrap_or_default();
+        let mut set: Vec<u8> = base_value.map_or_default(<[u8]>::to_vec);
         for operand in operands {
             match operand.split_first() {
                 Some((0x02, rest)) => set.retain(|m| !rest.contains(m)),
@@ -4630,17 +5327,13 @@ impl CompactionStrategy for MoveTables {
 /// Returns the ids of the tables currently on `level`, newest id first.
 fn table_ids_on_level(tree: &crate::Tree, level: usize) -> Vec<TableId> {
     let version = tree.version_history.read().latest_version();
-    let mut ids: Vec<TableId> = version
-        .version
-        .level(level)
-        .map(|level| {
-            level
-                .iter()
-                .flat_map(|run| run.iter())
-                .map(Table::id)
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut ids: Vec<TableId> = version.version.level(level).map_or_default(|level| {
+        level
+            .iter()
+            .flat_map(|run| run.iter())
+            .map(Table::id)
+            .collect()
+    });
     ids.sort_unstable_by(|a, b| b.cmp(a));
     ids
 }
@@ -5459,9 +6152,10 @@ fn open_standard(
 
 /// A row written as cells relocates the frames of the cells it references in
 /// a stale file, and only those: a cell kept inline and a reference into a
-/// live file move nothing, and a plain value moves nothing either.
+/// live file move nothing, and a plain value moves nothing either. Its table
+/// links every file it references and lists every object it owns.
 #[test]
-fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crate::Result<()> {
+fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
     use crate::blob_tree::handle::BlobIndirection;
     use crate::vlog::ValueHandle;
@@ -5491,16 +6185,276 @@ fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crat
         RowField::bytes(5, reference(other)),
         RowField::bytes(6, reference(second)),
     ])?;
-    let stale: crate::HashSet<BlobFileId> = core::iter::once(7).collect();
+    let relocated = super::Relocated {
+        stale: core::iter::once::<BlobFileId>(7).collect(),
+        rewritten: crate::HashSet::default(),
+        target_size: u64::MAX,
+        chunk_size: u32::MAX,
+        file_groups: 1,
+        groups: 1,
+        own_dictionaries: core::iter::once::<(BlobFileId, u64)>((7, 4_096)).collect(),
+        fresh_threshold: u64::MAX,
+        fresh_dictionary: 0,
+        largest_dictionary: 4_096,
+    };
     let key = b"row-key";
 
+    // Takes `item` into `load` on top of what `known` holds.
+    let take = |load: &mut super::SliceLoad,
+                known: &super::SliceLoad,
+                item: &InternalValue,
+                dictionaries: &mut Vec<BlobFileId>| {
+        super::take_entry(
+            &mut load.rows,
+            super::NewShapes {
+                known_links: &known.links,
+                known_cells: &known.cells,
+                known_fresh: known.fresh,
+                links: &mut load.links,
+                cells: &mut load.cells,
+                fresh: &mut load.fresh,
+            },
+            (
+                item.key.value_type,
+                item.key.seqno,
+                item.key.user_key.len(),
+                &item.value,
+            ),
+            1,
+            false,
+            Some(&relocated),
+            dictionaries,
+        )
+    };
+
     let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
+    let mut dictionaries = Vec::new();
+    let mut load = super::SliceLoad::default();
+    let nothing = super::SliceLoad::default();
     assert_eq!(
-        super::stale_frame_bytes(&item, &stale, u32::MAX)?,
-        super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
+        take(&mut load, &nothing, &item, &mut dictionaries)?,
+        (
+            super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
+            true
+        ),
+        "the row links blob files the slice does not link yet",
     );
+    assert_eq!(
+        dictionaries,
+        vec![7, 7],
+        "each reference into the stale file names the dictionary its copy may hold",
+    );
+    assert_eq!(
+        load.links.len(),
+        2,
+        "the row links both files it references"
+    );
+    assert_eq!(
+        load.rows.owned_blob_objects, 3,
+        "the row owns its three objects"
+    );
+    assert_eq!(load.rows.entries, 1);
     let plain = InternalValue::from_components(*key, b"v".to_vec(), 2, crate::ValueType::Value);
-    assert_eq!(super::stale_frame_bytes(&plain, &stale, u32::MAX)?, 0);
+    assert_eq!(
+        take(&mut load, &nothing, &plain, &mut Vec::new())?,
+        (0, false)
+    );
+
+    // On top of a slice that links both files already, the row links
+    // nothing new: the slice's bound counts each file once.
+    let mut more = super::SliceLoad::default();
+    assert_eq!(
+        take(&mut more, &load, &item, &mut Vec::new())?,
+        (
+            super::frame_bytes(&first, u32::MAX) + super::frame_bytes(&second, u32::MAX),
+            false
+        ),
+    );
+    assert!(more.links.is_empty(), "a known link is not taken again");
+    Ok(())
+}
+
+/// A relocating pass writes a new pointer for a value it moves, and the new
+/// one may be longer than the one read: another file id, another frame,
+/// another stored length. The slice charges its table with the longest a
+/// pointer can be for every reference into a file it relocates, alone or in
+/// a cell row, and with the bytes read for one it leaves where it is.
+#[test]
+fn a_relocated_reference_is_charged_at_the_longest_its_new_pointer_can_be() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, vlog::BlobFileId};
+
+    let indirection = |blob_file_id: BlobFileId| BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id,
+            frame: 0,
+            index: 0,
+        },
+        size: 100,
+        stored: crate::blob_tree::handle::Stored::Frames(100),
+    };
+    let relocated = super::Relocated {
+        stale: core::iter::once::<BlobFileId>(7).collect(),
+        rewritten: crate::HashSet::default(),
+        target_size: u64::MAX,
+        chunk_size: u32::MAX,
+        file_groups: 1,
+        groups: 1,
+        own_dictionaries: crate::HashMap::default(),
+        fresh_threshold: u64::MAX,
+        fresh_dictionary: 0,
+        largest_dictionary: 0,
+    };
+    // The table's value bytes after taking `item` alone.
+    let charged = |item: &InternalValue| {
+        let mut load = super::SliceLoad::default();
+        let known = super::SliceLoad::default();
+        super::take_entry(
+            &mut load.rows,
+            super::NewShapes {
+                known_links: &known.links,
+                known_cells: &known.cells,
+                known_fresh: known.fresh,
+                links: &mut load.links,
+                cells: &mut load.cells,
+                fresh: &mut load.fresh,
+            },
+            (
+                item.key.value_type,
+                item.key.seqno,
+                item.key.user_key.len(),
+                &item.value,
+            ),
+            1,
+            false,
+            Some(&relocated),
+            &mut Vec::new(),
+        )?;
+        crate::Result::Ok(load.rows.value_bytes)
+    };
+    let pointer = |blob_file_id| {
+        let mut bytes = Vec::new();
+        indirection(blob_file_id).encode_into(&mut bytes)?;
+        crate::Result::Ok(bytes)
+    };
+
+    let (moved, kept) = (pointer(7)?, pointer(8)?);
+    let read = moved.len() as u64;
+    // A value of 100 bytes: its length takes one byte, moved or not.
+    let longest = BlobIndirection::MAX_ENCODED_LEN - 4;
+    assert_eq!(indirection(7).longest_moved(), longest);
+    assert!(read < longest);
+    let item =
+        |value: Vec<u8>, value_type| InternalValue::from_components(*b"key", value, 1, value_type);
+    assert_eq!(
+        charged(&item(moved, crate::ValueType::Indirection))?,
+        longest,
+        "a pointer the pass writes anew",
+    );
+    assert_eq!(
+        charged(&item(kept, crate::ValueType::Indirection))?,
+        read,
+        "a pointer the pass copies as it is",
+    );
+
+    let reference = |blob_file_id| RowCell::Ref {
+        indirection: indirection(blob_file_id),
+        owner: true,
+    };
+    let row = encode_row(&[
+        RowField::bytes(3, reference(7)),
+        RowField::bytes(4, reference(8)),
+        RowField::bytes(5, reference(7)),
+    ])?;
+    let row_len = row.len() as u64;
+    assert_eq!(
+        charged(&item(row, crate::ValueType::CellRow))?,
+        row_len + 2 * (longest - read),
+        "each of the two references the pass writes anew may grow to the longest",
+    );
+    Ok(())
+}
+
+/// An inline value the separation threshold reaches is written anew into a
+/// blob file by a relocating pass: the slice charges the blob files with it
+/// as written raw, and its table with the pointer left in its place. A value
+/// below the threshold, and any value of a pass that relocates nothing, stays
+/// in the table.
+#[test]
+fn an_inline_value_the_threshold_reaches_is_charged_to_the_blob_files() -> crate::Result<()> {
+    use crate::{InternalValue, vlog::BlobFileId};
+
+    let relocated = super::Relocated {
+        stale: core::iter::once::<BlobFileId>(7).collect(),
+        rewritten: crate::HashSet::default(),
+        target_size: u64::MAX,
+        chunk_size: u32::MAX,
+        file_groups: 1,
+        groups: 1,
+        own_dictionaries: crate::HashMap::default(),
+        fresh_threshold: 1_000,
+        fresh_dictionary: 0,
+        largest_dictionary: 0,
+    };
+    // Takes `item` into a slice that wrote a value anew already or not
+    // (`known_fresh`): the blob bytes, whether the slice grew, its table's
+    // value bytes and whether it now writes a value anew.
+    let take = |item: &InternalValue, relocated: Option<&super::Relocated>, known_fresh: bool| {
+        let mut load = super::SliceLoad::default();
+        let known = super::SliceLoad::default();
+        let blobs = super::take_entry(
+            &mut load.rows,
+            super::NewShapes {
+                known_links: &known.links,
+                known_cells: &known.cells,
+                known_fresh,
+                links: &mut load.links,
+                cells: &mut load.cells,
+                fresh: &mut load.fresh,
+            },
+            (
+                item.key.value_type,
+                item.key.seqno,
+                item.key.user_key.len(),
+                &item.value,
+            ),
+            1,
+            false,
+            relocated,
+            &mut Vec::new(),
+        )?;
+        crate::Result::Ok((blobs, load.rows.value_bytes, load.fresh))
+    };
+
+    let key = b"value-key";
+    let large = InternalValue::from_components(*key, vec![b'v'; 1_000], 1, crate::ValueType::Value);
+    let anew = super::anew_bytes(1_000, key.len(), u32::MAX);
+    assert!(anew > 1_000, "its frame takes at least its bytes");
+    assert_eq!(
+        take(&large, Some(&relocated), false)?,
+        (
+            (anew, true),
+            crate::blob_tree::handle::BlobIndirection::MAX_ENCODED_LEN,
+            true
+        ),
+        "the value goes to a blob file as written raw, its table keeps a \
+         pointer, and the slice's first such value opens the file of them",
+    );
+    assert_eq!(
+        take(&large, Some(&relocated), true)?.0,
+        (anew, false),
+        "past the slice's first, a value written anew opens nothing",
+    );
+
+    let small = InternalValue::from_components(*key, vec![b'v'; 999], 1, crate::ValueType::Value);
+    assert_eq!(
+        take(&small, Some(&relocated), false)?,
+        ((0, false), 999, false)
+    );
+    assert_eq!(take(&large, None, false)?, ((0, false), 1_000, false));
     Ok(())
 }
 
@@ -5618,51 +6572,460 @@ fn frame_bytes_cover_a_block_value_the_copy_splits_into_chunks() -> crate::Resul
     Ok(())
 }
 
-/// The blocks a tight-space pass reads to cut its slices are the run's reads:
-/// read from the file, they count in its work as the merge's reads do.
+/// A relocated value of a file that holds a dictionary of its own is copied
+/// into a file that holds that dictionary too. The room a tight-space pass
+/// charges for the relocation covers it, or a slice of a few surviving values
+/// is admitted to a room the dictionary alone outgrows.
 #[test]
-fn tight_slices_count_the_blocks_they_read_in_the_runs_work() -> crate::Result<()> {
+#[cfg(feature = "zstd")]
+fn tight_slices_cover_the_dictionary_a_relocated_file_holds() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (tree, kv) = few_survivors_of_a_dictionary_file(dir.path(), None)?;
+    assert_tight_slice_covers_relocation(dir.path(), &tree, &kv, 1)
+}
+
+/// A source written before the tree took a key-domain policy holds values of
+/// several domains, and a relocation closes its outputs at each boundary: a
+/// file per domain, each holding the source's dictionary again. The room a
+/// tight-space pass charges covers every one of them.
+#[test]
+#[cfg(feature = "zstd")]
+fn tight_slices_cover_the_files_each_key_domain_opens() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Each surviving value its own domain.
+    let (tree, kv) = few_survivors_of_a_dictionary_file(dir.path(), Some(Arc::new(PerKeys(500))))?;
+    assert_tight_slice_covers_relocation(dir.path(), &tree, &kv, 1)
+}
+
+/// The writer settings a merge of `inputs` into the last level of `opts`'s
+/// tree at `target_size` writes its outputs with, to bound a slice's tables.
+pub(super) fn slice_probe(
+    opts: &super::Options,
+    inputs: &[Table],
+    target_size: u64,
+) -> crate::Result<crate::table::multi_writer::BoundProbe> {
+    let version = opts.version_history.read().latest_version().version;
+    let Some(last) = version.level_count().checked_sub(1) else {
+        panic!("a tree has levels");
+    };
+    let Ok(last) = u8::try_from(last) else {
+        panic!("a level index fits u8");
+    };
+    let payload = crate::compaction::Input {
+        table_ids: inputs.iter().map(Table::id).collect(),
+        dest_level: last,
+        canonical_level: last,
+        target_size,
+    };
+    crate::compaction::flavour::output_bound_probe(
+        &version,
+        opts,
+        &payload,
+        &opts.runtime_config.load_full(),
+    )
+}
+
+/// What a tight-space slice's governor lets a slice over `inputs` write
+/// within `caps`, the rows read in key order as the merge keeps them all: its
+/// tables and its relocated values as the governor bounds them, and the key
+/// it ends before when the caps cut it.
+pub(super) struct Governed {
+    pub tables: u64,
+    pub blobs: u64,
+    pub end: Option<crate::UserKey>,
+}
+
+/// Runs a slice's governor over every row of `inputs`, a level's tables (see
+/// [`Governed`]).
+pub(super) fn governed(
+    inputs: &[Table],
+    caps: super::SliceCaps,
+    outputs: &super::SliceOutputs<'_>,
+    relocated: Option<&super::Relocated>,
+    comparator: &crate::comparator::SharedComparator,
+) -> crate::Result<Governed> {
+    governed_from(inputs, caps, outputs, relocated, comparator, None)
+}
+
+/// [`governed`] over the rows of `inputs` from `from` on: the slice a pass
+/// runs after one that ended before `from`.
+pub(super) fn governed_from(
+    inputs: &[Table],
+    caps: super::SliceCaps,
+    outputs: &super::SliceOutputs<'_>,
+    relocated: Option<&super::Relocated>,
+    comparator: &crate::comparator::SharedComparator,
+    from: Option<&crate::UserKey>,
+) -> crate::Result<Governed> {
+    let mut governor =
+        super::governor::SliceGovernor::new(caps, outputs, relocated, comparator, from);
+    let dropped = core::cell::RefCell::new(Vec::new());
+    let mut ordered: Vec<&Table> = inputs.iter().collect();
+    ordered
+        .sort_by(|a, b| comparator.compare(a.metadata.key_range.min(), b.metadata.key_range.min()));
+    'feed: for table in ordered {
+        let mut rows = table.scan()?.peekable();
+        while let Some(item) = rows.next() {
+            let item = item?;
+            if from.is_some_and(|from| {
+                comparator.compare(&item.key.user_key, from) == core::cmp::Ordering::Less
+            }) {
+                continue;
+            }
+            // A row known to end its key, as the merge knows it: the next
+            // row of its table carries another. The last row of a table is
+            // not known to, and waits for the next.
+            let ends_key = matches!(
+                rows.peek(),
+                Some(Ok(next)) if !crate::comparator::same_user_key(&next.key.user_key, &item.key.user_key)
+            );
+            match governor.decide(&item, ends_key, &dropped)? {
+                super::governor::Decided::Pass => {}
+                super::governor::Decided::End => break 'feed,
+                super::governor::Decided::Hold => {
+                    if !governor.hold(item, false, &dropped)? {
+                        break 'feed;
+                    }
+                }
+            }
+            while governor.pop_ready().is_some() {}
+        }
+    }
+    governor.finish(&dropped);
+    let (tables, blobs) = governor.committed_bound();
+    Ok(Governed {
+        tables,
+        blobs,
+        end: governor.end().cloned(),
+    })
+}
+
+/// A domain per this many keys of the form `k{n:06}`.
+struct PerKeys(u32);
+
+impl crate::KeyDomains for PerKeys {
+    fn domain_end(&self, key: &[u8]) -> Option<crate::UserKey> {
+        let n: u32 = core::str::from_utf8(key.get(1..)?).ok()?.parse().ok()?;
+        Some(
+            format!("k{:06}", (n / self.0 + 1) * self.0)
+                .as_bytes()
+                .into(),
+        )
+    }
+}
+
+/// A table written before the tree took a key-domain policy holds keys of
+/// several domains, and a merge of it ends a table at each boundary, each
+/// with the bytes every table takes. The room a tight-space pass charges for
+/// its tables covers every one of them.
+#[test]
+fn tight_slices_cover_the_tables_each_key_domain_opens() -> crate::Result<()> {
     use crate::AbstractTree;
 
     let dir = tempfile::tempdir()?;
-    // No cache: every block the cut reads comes from the file.
-    let tree = open_standard(dir.path(), |c| {
-        c.use_cache(Arc::new(crate::Cache::with_capacity_bytes(0)))
-            .data_block_size_policy(BlockSizePolicy::all(512))
-    })?;
-    for i in 0..2_000u32 {
-        tree.insert(format!("k{i:06}"), vec![b'v'; 64], u64::from(i));
+    {
+        let tree = open_standard(dir.path(), |c| c)?;
+        for i in 0..2_000u32 {
+            tree.insert(format!("k{i:06}"), vec![b'v'; 16], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
     }
-    tree.flush_active_memtable(0)?;
+    let tree = open_standard(dir.path(), |c| c.key_domains(Arc::new(PerKeys(50))))?;
     let version = tree.current_version();
     let inputs: Vec<Table> = version.iter_tables().cloned().collect();
-    let total: u64 = inputs.iter().map(Table::file_len).sum();
     let opts = super::Options::from_tree(
         &tree,
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
-
-    let slices = super::tight_slices(
+    let only = governed(
         &inputs,
         super::SliceCaps {
             tables: u64::MAX,
             blobs: u64::MAX,
-            total: total / 4,
+            total: u64::MAX,
         },
         &super::SliceOutputs {
-            target_size: 64 * 1024 * 1024,
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
             cut_keys: &[],
+            domains: tree.config.key_domains.as_deref(),
         },
         None,
         &tree.config.comparator,
-        &super::input_pacer(&opts),
     )?;
-    assert!(slices.len() > 1, "the fixture needs a pass in slices");
+    drop(inputs);
+    drop(version);
+    assert!(only.end.is_none(), "unbounded caps take every key");
+
+    tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
+    let version = tree.current_version();
+    assert_eq!(version.table_count(), 40, "a table per domain");
+    let written: u64 = version.iter_tables().map(Table::file_len).sum();
     assert!(
-        opts.work.report().measured.read > 0,
-        "the blocks read to cut the slices are counted"
+        only.tables >= written,
+        "the pass charges {} bytes for tables that take {written}",
+        only.tables
     );
     Ok(())
+}
+
+/// A tree holding one zstd blob file with a dictionary of its own, of which
+/// every 500th of 4000 values survives, reopened under `domains` when given.
+#[cfg(feature = "zstd")]
+fn few_survivors_of_a_dictionary_file(
+    dir: &std::path::Path,
+    domains: Option<Arc<dyn crate::KeyDomains>>,
+) -> crate::Result<(crate::BlobTree, KvSeparationOptions)> {
+    let kv = KvSeparationOptions::default()
+        .separation_threshold(1)
+        .block_size(0)
+        .age_cutoff(1.0)
+        .staleness_threshold(0.1);
+    let config = || {
+        Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .blob_compression(crate::CompressionType::Zstd(3))
+        .with_kv_separation(Some(kv.clone()))
+    };
+    let open = |config: Config| match config.open() {
+        Ok(crate::AnyTree::Blob(t)) => Ok(t),
+        Ok(crate::AnyTree::Standard(_)) => panic!("expected Blob tree"),
+        Err(e) => Err(e),
+    };
+    let tree = open(config())?;
+    let keys = 4_000u32;
+    for i in 0..keys {
+        let value = format!(
+            "{{\"id\":{i},\"tenant\":\"acme\",\"kind\":\"order\",\"region\":\"eu-west-{}\",\
+             \"sku\":\"SKU-{}\",\"note\":\"customer asked for delivery before noon\"}}",
+            i % 3,
+            i % 97
+        );
+        tree.insert(format!("k{i:06}"), value, u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    // A few survivors: the stale file is worth relocating, and what it
+    // relocates is small beside its dictionary.
+    for i in 0..keys {
+        if i % 500 != 0 {
+            tree.remove(format!("k{i:06}"), u64::from(keys + i));
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    // Drops the removed values and records how much of the file they were.
+    tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
+    let Some(domains) = domains else {
+        return Ok((tree, kv));
+    };
+    drop(tree);
+    Ok((open(config().key_domains(domains))?, kv))
+}
+
+/// Asserts the room a tight-space pass over all of `tree`'s tables charges
+/// for the blob frames it relocates covers what a relocation of them writes;
+/// the fixture needs `own` stale files holding a dictionary of their own.
+#[cfg(feature = "zstd")]
+fn assert_tight_slice_covers_relocation(
+    dir: &std::path::Path,
+    tree: &crate::BlobTree,
+    kv: &KvSeparationOptions,
+    own: usize,
+) -> crate::Result<()> {
+    use std::collections::HashSet;
+
+    let version = tree.index.current_version();
+    let inputs: Vec<Table> = version.iter_tables().cloned().collect();
+    let ids: crate::HashSet<TableId> = inputs.iter().map(Table::id).collect();
+    let stale_files = super::pick_blob_files_to_rewrite(&ids, &version, kv)?;
+    let with_own = stale_files
+        .iter()
+        .filter(|file| file.has_own_dictionary())
+        .count();
+    assert!(
+        with_own >= own,
+        "the fixture needs {own} stale files holding a dictionary of their own, has {with_own}"
+    );
+    let relocated = super::Relocated::new(&stale_files, kv);
+    drop(stale_files);
+    let opts = super::Options::from_tree(
+        &tree.index,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
+    let only = governed(
+        &inputs,
+        super::SliceCaps {
+            tables: u64::MAX,
+            blobs: u64::MAX,
+            total: u64::MAX,
+        },
+        &super::SliceOutputs {
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
+            cut_keys: &[],
+            domains: tree.index.config.key_domains.as_deref(),
+        },
+        Some(&relocated),
+        &tree.index.config.comparator,
+    )?;
+    drop(inputs);
+    drop(version);
+    assert!(only.end.is_none(), "unbounded caps take every key");
+
+    let blobs = dir.join(crate::file::BLOBS_FOLDER);
+    let names = |dir: &std::path::Path| -> crate::Result<HashSet<std::ffi::OsString>> {
+        Ok(std::fs::read_dir(dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<_>>()?)
+    };
+    let before = names(&blobs)?;
+    tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
+    let mut written = 0;
+    for name in names(&blobs)?.difference(&before) {
+        written += std::fs::metadata(blobs.join(name))?.len();
+    }
+    assert!(written > 0, "the relocation writes a blob file");
+    assert!(
+        only.blobs >= written,
+        "the pass charges {} bytes for a relocation that writes {written}",
+        only.blobs
+    );
+    Ok(())
+}
+
+/// Past the sources whose dictionaries a relocation keeps with their frames,
+/// a source's values are written anew without its dictionary. A value that
+/// compresses only against that dictionary then takes what it is raw, and
+/// the room a tight-space pass charges covers that, not the frames it had.
+#[test]
+#[cfg(feature = "zstd")]
+fn tight_slices_cover_values_written_anew_without_their_dictionary() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (tree, kv) = many_dictionary_files(dir.path())?;
+    assert_tight_slice_covers_relocation(
+        dir.path(),
+        &tree,
+        &kv,
+        crate::vlog::blob_file::multi_writer::MAX_COPY_SOURCES + 1,
+    )
+}
+
+/// A slice charges the dictionaries of the sources it relocates values out
+/// of, not those of every stale file: in a room that holds a few of them, a
+/// pass over many files with dictionaries of their own, each slice reaching
+/// a few, cuts slices that fit rather than none.
+#[test]
+#[cfg(feature = "zstd")]
+fn a_tight_slice_charges_only_the_dictionaries_it_relocates_out_of() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (tree, kv) = many_dictionary_files(dir.path())?;
+    let version = tree.index.current_version();
+    let inputs: Vec<Table> = version.iter_tables().cloned().collect();
+    let ids: crate::HashSet<TableId> = inputs.iter().map(Table::id).collect();
+    let stale_files = super::pick_blob_files_to_rewrite(&ids, &version, &kv)?;
+    let relocated = super::Relocated::new(&stale_files, &kv);
+    drop(stale_files);
+    // The room for every stale file's dictionary at once, and no more.
+    let every_dictionary: u64 = relocated.own_dictionaries.values().sum::<u64>() * relocated.groups;
+    assert!(
+        relocated.own_dictionaries.len() > 4,
+        "the fixture needs many files with dictionaries of their own"
+    );
+    let caps = super::SliceCaps {
+        tables: u64::MAX,
+        blobs: every_dictionary,
+        total: u64::MAX,
+    };
+    let opts = super::Options::from_tree(
+        &tree.index,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
+    let first = governed(
+        &inputs,
+        caps,
+        &super::SliceOutputs {
+            probe: &slice_probe(&opts, &inputs, 64 * 1024 * 1024)?,
+            tombstones: crate::table::writer::RewriteLoad::default(),
+            cut_keys: &[],
+            domains: None,
+        },
+        Some(&relocated),
+        &tree.index.config.comparator,
+    )?;
+    assert!(
+        first.blobs > 0 && first.blobs <= caps.blobs,
+        "the first slice fits its room: {} against {}",
+        first.blobs,
+        caps.blobs
+    );
+    assert!(first.end.is_some(), "the pass runs in slices");
+    Ok(())
+}
+
+/// A tree holding more zstd blob files with a dictionary of their own than a
+/// relocation keeps the dictionaries of, half of every file's values
+/// surviving.
+#[cfg(feature = "zstd")]
+fn many_dictionary_files(
+    dir: &std::path::Path,
+) -> crate::Result<(crate::BlobTree, KvSeparationOptions)> {
+    let kv = KvSeparationOptions::default()
+        .separation_threshold(1)
+        // Every value a frame of its own.
+        .block_size(64)
+        .file_dictionary(4 * 1024)
+        // Room for each file to build its dictionary and hold many values
+        // under it: more such files than a pass keeps the dictionaries of.
+        .file_target_size(16 * 1024)
+        .age_cutoff(1.0)
+        .staleness_threshold(0.1);
+    let tree = match Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Zstd(3))
+    .with_kv_separation(Some(kv.clone()))
+    // Table blocks of a few keys: a slice can end every few values.
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    // One run of bytes with nothing to repeat within it, which every value
+    // carries: a file's dictionary, its first values, matches all of a value,
+    // and without it a value does not compress.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let common: Vec<u8> = (0..3_000)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state.to_le_bytes()[7]
+        })
+        .collect();
+    let keys = 3_000u32;
+    for i in 0..keys {
+        let mut value = common.clone();
+        if let Some(head) = value.get_mut(..4) {
+            head.copy_from_slice(&i.to_le_bytes());
+        }
+        tree.insert(format!("k{i:06}"), value, u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    // Half survives in every file: what the values written anew grow by
+    // outweighs the dictionaries the pass leaves behind.
+    for i in 0..keys {
+        if i % 2 != 0 {
+            tree.remove(format!("k{i:06}"), u64::from(keys + i));
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, crate::MAX_SEQNO)?;
+    Ok((tree, kv))
 }
 
 /// Two trees handed one limiter are bounded by it together: what one tree's
@@ -6151,7 +7514,31 @@ mod budget_gate {
             panic!("a bottom-level run with >= 3 tables");
         };
         let ids: Vec<_> = run.iter().map(Table::id).collect();
-        let run_sigma: u64 = run.iter().map(Table::file_len).sum();
+        // What the gate charges the whole run.
+        let payload = crate::compaction::Input {
+            table_ids: ids.iter().copied().collect(),
+            dest_level: 6,
+            canonical_level: 6,
+            target_size: 64 * 1024 * 1024,
+        };
+        let opts = crate::compaction::worker::Options::from_tree(
+            &tree,
+            Arc::new(MergeRun(ids.clone(), 6)),
+        );
+        let probe = crate::compaction::flavour::output_bound_probe(
+            &version,
+            &opts,
+            &payload,
+            &opts.runtime_config.load(),
+        )?;
+        let run_bound = crate::compaction::worker::recorded_table_demand(
+            &version,
+            &opts,
+            &payload,
+            &probe,
+            &[],
+        )?;
+        drop(opts);
         drop(version);
 
         // Room enough for the merge as chosen: the empty budget holds it.
@@ -6170,7 +7557,7 @@ mod budget_gate {
         mem.set_capacity(probe_capacity);
         let stored = probe_capacity
             - crate::fs::Fs::available_space(&mem, dir.path()).unwrap_or(probe_capacity);
-        mem.set_capacity(stored + run_sigma - 1);
+        mem.set_capacity(stored + run_bound - 1);
         tree.update_runtime_config(|_| {})?;
         let tables = tree.table_count();
 
@@ -7001,6 +8388,107 @@ fn produced_compaction_outputs_leave_the_version_lock_free() -> crate::Result<()
         *readable.lock(),
         Some(true),
         "the version is readable while the outputs finish"
+    );
+    Ok(())
+}
+
+/// A row-major table of cell rows, written before columnar tables were
+/// switched on, is split into the columns of its fields when compacted after:
+/// the bound a full compaction is admitted by covers those columns although
+/// the table records none, so the merge writes no more than it was admitted
+/// for.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_row_table_of_cell_rows_is_bounded_by_the_columns_it_splits_into() -> crate::Result<()> {
+    use crate::SeqNo;
+    use crate::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+
+    let folder = tempfile::tempdir()?;
+    let tree = match Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    // No cell is separated: every field stays in the row, as a column.
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(1 << 20),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected a blob tree"),
+    };
+    // Many field columns of small cells, so the columns' own costs outweigh
+    // the bytes of the rows.
+    let fields: Vec<Field<'_>> = (0..200u16)
+        .map(|column| Field::bytes(FIRST_FIELD_COLUMN + column, b"v"))
+        .collect();
+    for row in 0..64u64 {
+        tree.insert_cells(format!("row-{row:04}"), &fields, row)?;
+    }
+    tree.flush_active_memtable(0)?;
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .all(|t| !t.metadata.columnar),
+        "the rows were written row-major"
+    );
+
+    tree.index.update_runtime_config(|rc| rc.columnar = true)?;
+    let (bound, _) = super::full_compaction_demand(&tree.index, &tree.current_version())?;
+    tree.major_compact(u64::MAX, SeqNo::MAX)?;
+    let version = tree.current_version();
+    assert!(
+        version.iter_tables().all(|t| t.metadata.columnar),
+        "the compaction wrote columnar tables"
+    );
+    let written = version
+        .iter_tables()
+        .try_fold(0u64, |sum, t| t.live_file_size().map(|size| sum + size))?;
+    assert!(
+        written <= bound,
+        "the merge wrote {written} bytes past the {bound} it was bounded by"
+    );
+    Ok(())
+}
+
+/// A tight-space pass over a table on a disk with a quarter of its size free
+/// rewrites the whole table: each slice is sized to the room the volume has
+/// when it starts, so the pass's outputs taking more than their punched
+/// inputs freed shrink the next slice instead of ending the pass, and no
+/// input is left restricted.
+#[test]
+fn a_tight_space_pass_rewrites_the_whole_table() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let tree = open_standard(dir.path(), |c| c.with_shared_fs(Arc::new(mem.clone())))?;
+    for i in 0..20_000u64 {
+        tree.insert(format!("key{i:08}").as_bytes(), [0xCD; 100], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    let version = tree.current_version();
+    assert!(mem.punched_bytes() > 0, "the pass ran in slices");
+    assert!(
+        version
+            .iter_tables()
+            .all(|t| t.restrict_lower_bound().is_none()),
+        "a table is left restricted: the pass ended before its input did"
+    );
+    let last = tree.config.level_count - 1;
+    assert!(
+        version
+            .iter_levels()
+            .take(usize::from(last))
+            .all(|level| level.is_empty()),
+        "every key reached the last level"
     );
     Ok(())
 }

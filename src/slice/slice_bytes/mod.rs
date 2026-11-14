@@ -117,6 +117,21 @@ impl Slice {
         self.0 == other.0
     }
 
+    /// The allocation the slice's bytes lie in: `Bytes` does not tell its
+    /// size, nor whether a sibling shares it.
+    #[expect(
+        clippy::unused_self,
+        reason = "the other slice backend tells the allocation"
+    )]
+    pub(crate) fn allocation(&self) -> super::Allocation {
+        super::Allocation::Unknown
+    }
+
+    /// Whether no other slice shares its bytes.
+    pub(crate) fn is_unique(&self) -> bool {
+        self.0.is_unique()
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn fused(left: &[u8], right: &[u8]) -> Self {

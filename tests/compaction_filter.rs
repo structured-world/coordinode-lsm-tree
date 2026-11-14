@@ -16,10 +16,32 @@ fn u32_f(mut buf: &[u8]) -> u32 {
     buf.read_u32::<BE>().unwrap()
 }
 
+/// `len` bytes of an xorshift stream seeded by `seed`, which no codec shrinks.
+fn random(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
 /// A filter reading a value split into chunks gets the whole value, gathered
-/// out of its chunks, as a read of the key does.
+/// out of its chunks, as a read of the key does: compressed chunks decoded
+/// into place, and a run of chunks stored as they are (incompressible ones,
+/// or every chunk of an uncompressed file) read into place in one request.
 #[test]
 fn a_filter_reads_a_chunked_value_whole() -> lsm_tree::Result<()> {
+    a_filter_reads_a_chunked_value_whole_under(None)?;
+    a_filter_reads_a_chunked_value_whole_under(Some(lsm_tree::CompressionType::None))
+}
+
+fn a_filter_reads_a_chunked_value_whole_under(
+    compression: Option<lsm_tree::CompressionType>,
+) -> lsm_tree::Result<()> {
     struct Filter(Arc<Mutex<Option<Vec<u8>>>>);
     impl CompactionFilter for Filter {
         fn filter_item(
@@ -43,16 +65,23 @@ fn a_filter_reads_a_chunked_value_whole() -> lsm_tree::Result<()> {
 
     let seen = Arc::new(Mutex::new(None));
     let folder = get_tmp_folder();
-    let tree = lsm_tree::Config::new(
+    let mut config = lsm_tree::Config::new(
         &folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(2)))
-    .with_compaction_filter_factory(Some(Arc::new(FilterFactory(seen.clone()))))
-    .open()?;
-    // Three chunks of the default size and part of a fourth.
-    let value: Vec<u8> = (0..800 * 1_024).map(|i| (i % 251) as u8).collect();
+    .with_compaction_filter_factory(Some(Arc::new(FilterFactory(seen.clone()))));
+    if let Some(compression) = compression {
+        config = config.blob_compression(compression);
+    }
+    let tree = config.open()?;
+    // Chunks of the default 256 KiB: two no codec shrinks, then two that
+    // compress, then one and part of another that do not, so a run stored as
+    // is ends at a compressed chunk and another ends the value.
+    let mut value = random(11, 512 * 1_024);
+    value.extend((0..512 * 1_024).map(|i| (i % 251) as u8));
+    value.extend(random(12, 300 * 1_024));
     tree.insert("big", &value, 0);
     tree.flush_active_memtable(0)?;
     tree.major_compact(u64::MAX, SeqNo::MAX)?;

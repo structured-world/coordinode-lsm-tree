@@ -83,7 +83,7 @@ impl CompactionStrategy for Strategy {
             ),
             (
                 crate::UserKey::from("fifo_ttl_seconds"),
-                crate::UserValue::from(self.ttl_seconds.map(u64::to_le_bytes).unwrap_or_default()),
+                crate::UserValue::from(self.ttl_seconds.map_or_default(u64::to_le_bytes)),
             ),
         ]
     }

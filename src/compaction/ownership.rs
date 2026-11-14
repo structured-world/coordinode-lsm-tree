@@ -98,7 +98,7 @@ impl OwnershipLedger {
 
     /// Records a dropped version: an indirection's object is charged now, a
     /// cell row's owned objects wait for the end of its key.
-    fn dropped(&mut self, kv: &InternalValue) -> crate::Result<()> {
+    pub(crate) fn dropped(&mut self, kv: &InternalValue) -> crate::Result<()> {
         if !kv.key.value_type.is_cell_row() {
             self.frag.on_dropped(kv);
             return Ok(());

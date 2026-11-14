@@ -22,6 +22,165 @@ fn insert_get_roundtrip() {
     assert_eq!(c.get(&2), None);
 }
 
+/// One shard of 1000 bytes filled with ten entries of 100 bytes, so the next
+/// insert of 100 bytes has to evict.
+fn full_shard(ghost: usize) -> ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighter, FxBuildHasher> {
+    let c = ShardedCache::with_weighter(1_000, 1, ghost, LenWeighter, FxBuildHasher);
+    for key in 1_000..1_010 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    assert_eq!(c.weight(), 1_000);
+    c
+}
+
+/// A shard has filled once an insert made it evict, and stays filled when
+/// eviction leaves it room again: what fills it is whether it still grows
+/// into fresh memory, not what it holds at the moment.
+#[test]
+fn a_shard_has_filled_once_it_has_evicted_and_stays_so() {
+    let c = full_shard(1024);
+    assert!(
+        !c.has_filled(&1),
+        "a shard at capacity has evicted nothing yet"
+    );
+    c.insert(2_000, vec![0u8; 100]);
+    assert!(c.has_filled(&1), "the insert past capacity evicted");
+    c.remove(&2_000);
+    assert!(c.weight() < 1_000, "the removal left room");
+    assert!(c.has_filled(&1), "a shard that has filled stays filled");
+}
+
+/// A miss is admitted into a shard that has filled as any miss is, and into
+/// one that has not, never: with room for it, and with the key remembered as
+/// a recent miss alike.
+#[test]
+fn a_shard_that_has_not_filled_admits_nothing_once_filled() {
+    let c = ShardedCache::with_weighter(1_000, 1, 1024, LenWeighter, FxBuildHasher);
+    c.insert(1_000, vec![0u8; 100]);
+    assert!(c.admit(&1, 100), "room for it");
+    assert!(
+        !c.admit_once_filled(&1, 100),
+        "room, and nothing evicted yet"
+    );
+
+    let c = full_shard(1024);
+    assert!(
+        !c.admit_once_filled(&1, 100),
+        "full, and nothing evicted yet"
+    );
+    assert!(!c.admit(&1, 100), "a first miss into a full shard");
+    assert!(c.admit(&1, 100), "the miss repeated");
+    assert!(
+        !c.admit_once_filled(&1, 100),
+        "a repeated miss, and still nothing evicted"
+    );
+
+    c.insert(2_000, vec![0u8; 100]);
+    assert!(c.admit_once_filled(&1, 100), "filled, and a repeated miss");
+    assert!(!c.admit_once_filled(&2, 100), "filled, and a first miss");
+    c.remove(&2_000);
+    assert!(c.admit_once_filled(&3, 100), "filled, with room");
+}
+
+/// A first miss is taken while its shard has room: inserting it evicts
+/// nothing, so there is no churn to save, and a working set that fits the
+/// cache is cached on its first read.
+#[test]
+fn admit_takes_a_first_miss_while_the_shard_has_room() {
+    let c = byte_cache(10_000);
+    assert!(c.admit(&5, 100));
+    assert_eq!(c.get(&5), None, "admitting stores nothing by itself");
+}
+
+/// Into a full shard a key missed once is only remembered; the second miss
+/// admits it. Guards against caching every one-off read, whose insert and
+/// later eviction cost a miss more than the miss itself.
+#[test]
+fn admit_refuses_a_first_miss_into_a_full_shard_and_takes_the_second() {
+    let c = full_shard(1024);
+    assert!(!c.admit(&5, 100), "a key never seen is not admitted");
+    assert!(c.admit(&5, 100), "a key seen once before is admitted");
+}
+
+/// A key admitted on a repeat goes into the main queue, so churn through the
+/// small queue that evicts one-off entries leaves it resident.
+#[test]
+fn admitted_entry_survives_churn_of_one_off_entries() {
+    let c = full_shard(1024);
+    assert!(!c.admit(&1, 100));
+    assert!(c.admit(&1, 100));
+    c.insert(1, vec![0u8; 100]);
+    for key in 100..200 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    assert_eq!(c.get(&1), Some(vec![0u8; 100]));
+}
+
+/// Main-queue entries left after `count` keys are each missed twice into a
+/// full shard (admitted on the repeat) and inserted at `priority`, none read
+/// again. The shard starts as ten entries read once each, so they move to
+/// main as the first inserts evict.
+fn main_survivors_of_repeat_misses(priority: Priority, count: u64) -> usize {
+    let c = full_shard(1024);
+    for key in 1_000..1_010 {
+        assert!(c.get(&key).is_some());
+    }
+    for key in 0..count {
+        assert!(!c.admit(&key, 100));
+        assert!(c.admit(&key, 100));
+        c.insert_with_priority(key, vec![0u8; 100], priority);
+    }
+    (1_000..1_010).filter(|key| c.peek(key).is_some()).count()
+}
+
+/// A value admitted on a repeat miss goes on probation: a stream of such
+/// values read once each leaves every block already in main resident, where
+/// at normal priority the same stream evicts them all. This is what keeps a
+/// sustained read of separated values from evicting the table blocks every
+/// read walks.
+#[test]
+fn probation_entries_admitted_on_a_repeat_leave_main_resident() {
+    assert_eq!(
+        main_survivors_of_repeat_misses(Priority::Probation, 100),
+        10
+    );
+    assert_eq!(
+        main_survivors_of_repeat_misses(Priority::Normal, 100),
+        0,
+        "a ghost hit at normal priority enters main and evicts there"
+    );
+}
+
+/// On probation an entry still earns main by being read again while in the
+/// small queue, so a value read repeatedly stays cached.
+#[test]
+fn probation_entry_read_again_survives_churn() {
+    let c = full_shard(1024);
+    assert!(!c.admit(&1, 100));
+    assert!(c.admit(&1, 100));
+    c.insert_with_priority(1, vec![0u8; 100], Priority::Probation);
+    assert!(c.get(&1).is_some());
+    for key in 100..200 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    assert_eq!(c.get(&1), Some(vec![0u8; 100]));
+}
+
+/// The doorkeeper is bounded by the ghost queue: a key whose first miss has
+/// aged out of it is refused again rather than remembered forever.
+#[test]
+fn admit_forgets_a_miss_past_the_ghost_capacity() {
+    let c = full_shard(16);
+    assert!(!c.admit(&1, 100));
+    for key in 100..200 {
+        assert!(!c.admit(&key, 100));
+    }
+    assert!(
+        !c.admit(&1, 100),
+        "the first miss aged out of the ghost queue"
+    );
+}
+
 #[test]
 fn peek_does_not_promote_but_get_does() {
     let c = byte_cache(10_000);
@@ -284,4 +443,56 @@ fn concurrent_stress_keeps_invariants() {
         cache.len() as u64 * 64,
         "atomic weight diverged from resident entries",
     );
+}
+
+/// A value of some weight that counts its drops.
+struct Counted {
+    weight: u64,
+    drops: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.drops
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CountedWeight;
+impl Weighter<u64, alloc::sync::Arc<Counted>> for CountedWeight {
+    fn weight(&self, _: &u64, v: &alloc::sync::Arc<Counted>) -> u64 {
+        v.weight
+    }
+}
+
+/// An insert that outweighs more residents than it holds in place evicts
+/// every one of them and drops each once: the ones held in place and the
+/// ones past them alike, and none of what stays.
+#[test]
+fn an_insert_evicting_more_than_it_holds_in_place_drops_each_once() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    let drops = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let value = |weight| {
+        alloc::sync::Arc::new(Counted {
+            weight,
+            drops: alloc::sync::Arc::clone(&drops),
+        })
+    };
+    let c = ShardedCache::with_weighter(1_000, 1, 1024, CountedWeight, FxBuildHasher);
+    for key in 0..20 {
+        c.insert(key, value(50));
+    }
+    assert_eq!((c.len(), drops.load(Ordering::Relaxed)), (20, 0));
+
+    // Twelve residents make room for it, more than are held in place.
+    c.insert(100, value(600));
+    let evicted = 20 + 1 - c.len();
+    assert!(evicted > HELD, "{evicted} evicted");
+    assert_eq!(drops.load(Ordering::Relaxed), evicted);
+    assert!(c.weight() <= 1_000);
+
+    drop(c);
+    assert_eq!(drops.load(Ordering::Relaxed), 21, "each value once");
 }

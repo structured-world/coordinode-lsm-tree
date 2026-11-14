@@ -1,3 +1,31 @@
+/// A writer copies whole the blocks of at most [`super::MAX_COPY_SOURCES`]
+/// sources, each holding a file of its own open: a source it copies already
+/// still fits, one more does not.
+#[test]
+fn whole_block_copies_are_held_to_a_bounded_number_of_sources() -> crate::Result<()> {
+    use super::*;
+    use crate::fs::StdFs;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let mut writer =
+        MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?;
+    assert!(
+        writer.can_copy_block(0, b"a", b"z"),
+        "the first source fits"
+    );
+    writer.copy_sources = (0..MAX_COPY_SOURCES as u64).collect();
+    assert!(
+        writer.can_copy_block(3, b"a", b"z"),
+        "a source it copies already"
+    );
+    assert!(
+        !writer.can_copy_block(MAX_COPY_SOURCES as u64, b"a", b"z"),
+        "one more source than the bound"
+    );
+    Ok(())
+}
+
 /// Values of two key domains, in two lifetime classes, land in blob files of
 /// one domain each: the file a class switch parks is closed at the domain's
 /// end with the active one, so expiring a domain leaves its files wholly dead.

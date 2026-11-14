@@ -151,6 +151,11 @@ pub struct TreeInner {
     #[cfg(feature = "std")]
     pub(crate) insert_gate: Arc<crate::version::insert_gate::InsertGate>,
 
+    /// The current version's L0 run count (shared with
+    /// [`version_history`](Self::version_history) via
+    /// [`SuperVersions::l0_runs_handle`]).
+    pub(crate) l0_runs: Arc<crate::memtable::own_line::OwnLine<core::sync::atomic::AtomicUsize>>,
+
     pub(crate) compaction_state: Arc<Mutex<CompactionState>>,
 
     /// Tree configuration
@@ -435,6 +440,7 @@ impl TreeInner {
         let latest_super_version = super_versions.latest_handle();
         #[cfg(feature = "std")]
         let insert_gate = super_versions.insert_gate_handle();
+        let l0_runs = super_versions.l0_runs_handle();
         #[cfg(feature = "std")]
         if let Some(budget) = &config.write_buffer_budget {
             budget.register(Arc::downgrade(&latest_super_version));
@@ -460,6 +466,7 @@ impl TreeInner {
             latest_super_version,
             #[cfg(feature = "std")]
             insert_gate,
+            l0_runs,
             stop_signal,
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),

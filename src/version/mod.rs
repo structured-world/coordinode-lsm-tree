@@ -534,6 +534,8 @@ impl Version {
             .chain(
                 self.blob_files
                     .iter()
+                    // A file holding its dictionary carries it wherever it goes.
+                    .filter(|bf| !bf.has_own_dictionary())
                     .filter_map(|bf| dict_of(bf.compression())),
             )
             .collect();
@@ -1330,6 +1332,7 @@ impl Version {
     /// and installing this version persists the refreshed digest to the
     /// manifest via the version diff. Level / run structure is untouched
     /// (same table, same key range — only the digest changes).
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn with_refreshed_table_checksum(
         &self,

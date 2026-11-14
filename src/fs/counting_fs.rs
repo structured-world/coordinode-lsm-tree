@@ -468,8 +468,7 @@ impl WriteIoStats {
             unattributed: self
                 .files
                 .get(UNATTRIBUTED)
-                .map(FileCounters::read)
-                .unwrap_or_default(),
+                .map_or_default(FileCounters::read),
             directory: self.directory.read(),
             lifetime: self.lifetime,
         }

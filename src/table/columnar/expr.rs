@@ -186,6 +186,10 @@ pub(crate) enum Ints<'a> {
         values: Box<Self>,
         ends: Vec<u32>,
         /// The ends as stored, kept to describe them.
+        #[cfg_attr(
+            not(feature = "std"),
+            expect(dead_code, reason = "only the std page description reads them")
+        )]
         stored_ends: &'a [u8],
     },
 }
@@ -202,6 +206,10 @@ pub(crate) enum Values<'a> {
         values: Box<Self>,
         ends: Vec<u32>,
         /// The ends as stored, kept to describe them.
+        #[cfg_attr(
+            not(feature = "std"),
+            expect(dead_code, reason = "only the std page description reads them")
+        )]
         stored_ends: &'a [u8],
     },
     /// `size` distinct values in the column's order and a code per row.
@@ -217,6 +225,10 @@ pub(crate) enum Values<'a> {
         lengths: Ints<'a>,
         /// The bytes the lengths are stored in, what replaces the offset
         /// table.
+        #[cfg_attr(
+            not(feature = "std"),
+            expect(dead_code, reason = "only the std page description reads them")
+        )]
         lengths_len: usize,
         payload: &'a [u8],
     },
@@ -380,6 +392,7 @@ impl<'a> Ints<'a> {
     /// # Errors
     ///
     /// As [`describe_ends`].
+    #[cfg(feature = "std")]
     fn describe(&self) -> Result<Expression> {
         Ok(match self {
             Self::Constant(_) => Expression::Constant,
@@ -430,6 +443,7 @@ fn parse_ends<'a>(
 ///
 /// [`Error::InvalidHeader`] if `stored` no longer parses, which only a
 /// caller other than the parse could cause.
+#[cfg(feature = "std")]
 fn describe_ends(stored: &[u8], runs: usize) -> Result<Expression> {
     let mut rest = stored;
     let runs = u32::try_from(runs).map_err(|_| MALFORMED)?;
@@ -612,6 +626,7 @@ impl<'a> Values<'a> {
     /// # Errors
     ///
     /// As [`describe_ends`].
+    #[cfg(feature = "std")]
     pub(crate) fn describe(&self) -> Result<Expression> {
         Ok(match self {
             Self::Plain(_) => Expression::Plain,
@@ -638,6 +653,7 @@ impl<'a> Values<'a> {
     /// page or the lengths that replace it. `None` for a column of another
     /// type, or one whose encoding keeps no per-row position (a constant, a
     /// dictionary, runs).
+    #[cfg(feature = "std")]
     pub(crate) fn offsets_len(&self, type_tag: TypeTag, n: u32) -> Option<usize> {
         match (self, type_tag) {
             (Self::Plain(_), TypeTag::Bytes) => Some((n as usize + 1) * 4),

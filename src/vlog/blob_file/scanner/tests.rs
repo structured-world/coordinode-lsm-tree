@@ -93,8 +93,10 @@ fn a_scan_yields_every_class() -> crate::Result<()> {
     let index = index_of(&path)?;
     let entries = Scanner::new(&path, &StdFs, 0)?.collect::<crate::Result<Vec<_>>>()?;
 
-    let places: Vec<_> = entries.iter().map(|e| (e.frame, e.index)).collect();
-    assert_eq!(places, [(0, 0), (0, 1), (1, 0), (2, 0), (6, 0)]);
+    // The index a handle names each by is checked against the writes in
+    // `a_scan_names_each_value_as_its_handle_does`.
+    let frames: Vec<_> = entries.iter().map(|e| e.frame).collect();
+    assert_eq!(frames, [0, 0, 1, 2, 6]);
     assert_eq!(
         entries[0].frame_end, index[0] as u64,
         "the block is not consumed yet"
@@ -113,12 +115,40 @@ fn a_scan_yields_every_class() -> crate::Result<()> {
     assert_eq!(entries[3].frame_end, index[6] as u64, "past its last chunk");
     assert_eq!(entries[3].value, None, "a chunked value is not gathered");
     assert_eq!(
-        entries[3].whole_value()?,
+        entries[3].whole_value(CompressionType::None)?,
         Slice::from(chunked),
         "its frames hold it whole"
     );
     assert_eq!(entries[2].value, Some(Slice::from(&[b'c'; 150][..])));
     assert!(entries.iter().all(|e| !e.resynced && e.seqno == 7));
+    Ok(())
+}
+
+/// A value comes back at the frame and index its write returned, the place a
+/// handle names it by: in a packed block that is its record's offset, not its
+/// place in the block, or a compaction matching the scan against the tables'
+/// handles drains every record after the first as unreferenced.
+#[test]
+fn a_scan_names_each_value_as_its_handle_does() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("0");
+    let mut writer = BlobFileWriter::new(&path, 0, 0, &StdFs)?.use_frame_sizes(SIZES);
+    let values: [(&[u8], &[u8]); 4] = [
+        (b"a", b"x1"),
+        (b"b", b"x22"),
+        (b"c", &[b'c'; 150]),
+        (b"d", b"x333"),
+    ];
+    let mut written = Vec::new();
+    for (key, value) in values {
+        let at = writer.write(key, 7, value)?;
+        written.push((at.frame, at.index));
+    }
+    writer.finish()?;
+    let entries = Scanner::new(&path, &StdFs, 0)?.collect::<crate::Result<Vec<_>>>()?;
+    let scanned: Vec<_> = entries.iter().map(|e| (e.frame, e.index)).collect();
+    assert_eq!(scanned, written);
+    assert!(written[1].1 > 0, "the second record starts past the first");
     Ok(())
 }
 
@@ -308,18 +338,25 @@ fn a_copying_scan_leaves_frames_of_their_own_undecoded() -> crate::Result<()> {
     let file = writer.finish()?.remove(0);
     let path = file.path().to_path_buf();
     let index = index_of(&path)?;
-    // Frame 1 is the single frame, frame 3 the head's first chunk.
-    let garble = |bytes: &mut Vec<u8>, frame: usize| {
-        let at = &mut bytes[index[frame]..index[frame + 1]];
-        let header = parse_header(at).expect("a frame");
-        assert!(!header.is_raw(), "lz4 compressed frame {frame}");
-        let stored = FRAME_HEADER_LEN + header.entries_len as usize;
-        at[stored..].fill(0xFF);
-        crate::vlog::blob_file::frame::reseal(at);
-    };
+    // Frame 1 is the single frame, frame 2 the head, frame 3 its first chunk:
+    // the single frame's payload garbled and the frame resealed, the chunk's
+    // bytes garbled and its row's checksum set to match them.
     edit(&path, |bytes| {
-        garble(bytes, 1);
-        garble(bytes, 3);
+        let single = &mut bytes[index[1]..index[2]];
+        let header = parse_header(single).expect("a frame");
+        assert!(!header.is_raw(), "lz4 compressed single frame");
+        single[FRAME_HEADER_LEN + header.entries_len as usize..].fill(0xFF);
+        crate::vlog::blob_file::frame::reseal(single);
+
+        let chunk = &mut bytes[index[3]..index[4]];
+        chunk.fill(0xFF);
+        let checksum = crate::vlog::blob_file::frame::chunk_checksum(chunk);
+        let head = &mut bytes[index[2]..index[3]];
+        let header = parse_header(head).expect("a head");
+        let row = FRAME_HEADER_LEN + header.entries_len as usize + 8;
+        assert_eq!(head[row + 4], 0, "lz4 compressed first chunk");
+        head[row + 5..row + 21].copy_from_slice(&checksum.to_le_bytes());
+        crate::vlog::blob_file::frame::reseal(head);
     })?;
     let on_disk = std::fs::read(&path)?;
 
@@ -402,32 +439,185 @@ fn a_damaged_chunk_costs_its_value_alone() -> crate::Result<()> {
     Ok(())
 }
 
-/// A head lost to damage leaves its chunks behind it: by the index, each is
-/// reached and refused as a chunk without its head, and the walk goes on to
-/// the value after them.
+/// A chunk whose stored bytes check but do not decode is refused by a scan
+/// that decodes, as a read of the value would refuse it: the checksum proves
+/// the bytes are the ones written, not that they decode.
+#[cfg(feature = "lz4")]
 #[test]
-fn chunks_whose_head_is_damaged_are_refused_each() -> crate::Result<()> {
+fn a_decoding_scan_refuses_a_chunk_that_checks_but_does_not_decode() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("0");
+    let mut writer = BlobFileWriter::new(&path, 0, 0, &StdFs)?
+        .use_frame_sizes(SIZES)
+        .use_compression(crate::CompressionType::Lz4);
+    writer.write(b"big", 7, &[9; 700])?;
+    writer.write(b"next", 7, &[1; 120])?;
+    writer.finish()?;
+    let index = index_of(&path)?;
+    edit(&path, |bytes| {
+        // The first chunk's stored bytes, frame 1, turned to bytes no LZ4
+        // block decodes, then named in its row by their checksum.
+        let chunk = &mut bytes[index[1]..index[2]];
+        chunk.fill(0xFF);
+        let checksum = crate::vlog::blob_file::frame::chunk_checksum(chunk);
+        let head = &mut bytes[index[0]..index[1]];
+        let entries_len = parse_header(head).expect("a head").entries_len as usize;
+        // The first row's checksum, after the chunk size, the count, the
+        // row's stored length and its flags.
+        let row = FRAME_HEADER_LEN + entries_len + 8;
+        head[row + 5..row + 21].copy_from_slice(&checksum.to_le_bytes());
+        crate::vlog::blob_file::frame::reseal(head);
+    })?;
+    let mut scanner = Scanner::new(&path, &StdFs, 0)?;
+    assert!(scanner.next().expect("the big value").is_err());
+    let next = scanner.next().expect("the value after it")?;
+    assert_eq!(next.key, Slice::from(&b"next"[..]));
+    Ok(())
+}
+
+/// Along the chain, where only the head's table placed its chunks, a value
+/// whose chunks do not read is refused and the walk searches on from the
+/// head for the next frame: a damaged chunk, and a row naming a stored length
+/// a chunk of an uncompressed file cannot have, each cost the value alone,
+/// and what the search finds is tainted.
+#[test]
+fn along_the_chain_a_value_whose_chunks_do_not_read_is_searched_past() -> crate::Result<()> {
+    let damaged_chunk = |path: &std::path::Path| -> crate::Result<()> {
+        let index = index_of(path)?;
+        edit(path, |bytes| bytes[index[2] - 1] ^= 0x40)
+    };
+    let short_row = |path: &std::path::Path| -> crate::Result<()> {
+        let index = index_of(path)?;
+        edit(path, |bytes| {
+            let head = &mut bytes[index[0]..index[1]];
+            let entries_len = parse_header(head).expect("a head").entries_len as usize;
+            // The first row's stored length, after the chunk size and count.
+            let row = FRAME_HEADER_LEN + entries_len + 8;
+            head[row..row + 4].copy_from_slice(&299_u32.to_le_bytes());
+            crate::vlog::blob_file::frame::reseal(head);
+        })
+    };
+    type Damage<'a> = &'a dyn Fn(&std::path::Path) -> crate::Result<()>;
+    let cases: [(&str, Damage<'_>); 2] = [
+        ("a damaged chunk", &damaged_chunk),
+        ("a row it cannot hold", &short_row),
+    ];
+    for (case, damage) in cases {
+        let dir = tempdir()?;
+        let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
+        damage(&path)?;
+        break_index(&path)?;
+        let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+        assert!(results[0].is_err(), "{case}: {:?}", results[0]);
+        let next = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .next_back()
+            .unwrap_or_else(|| panic!("{case}: the value after it"));
+        assert_eq!(next.key, Slice::from(&b"next"[..]), "{case}");
+        assert!(next.resynced, "{case}: found by search");
+    }
+    Ok(())
+}
+
+/// A head lost to damage takes its chunks with it: by the index, which marks
+/// them, the walk passes them without reading one as a frame and goes on to
+/// the value after them, untainted, since the index placed it.
+#[test]
+fn chunks_whose_head_is_damaged_are_passed_with_it() -> crate::Result<()> {
     let dir = tempdir()?;
     let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
     let index = index_of(&path)?;
     // A key byte of the head, frame 0.
     edit(&path, |bytes| bytes[index[0] + 40 + 14] ^= 0x40)?;
     let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
-    assert_eq!(results.len(), 5, "the head, three chunks, the next value");
+    assert_eq!(results.len(), 2, "the head, then the next value");
     assert!(matches!(
         results[0],
         Err(crate::Error::ChecksumMismatch { .. })
     ));
-    for chunk in &results[1..4] {
-        assert!(matches!(
-            chunk,
-            Err(crate::Error::InvalidHeader("BlobFrame"))
-        ));
-    }
-    assert_eq!(
-        results[4].as_ref().expect("the next value").key,
-        Slice::from(&b"next"[..])
-    );
+    let next = results[1].as_ref().expect("the next value");
+    assert_eq!(next.key, Slice::from(&b"next"[..]));
+    assert_eq!(next.frame, 4, "after the head and its three chunks");
+    assert!(!next.resynced);
+    Ok(())
+}
+
+/// The index marks the chunks of a chunked value and no other frame, and a
+/// mark on the first frame or on the data end is refused: a chunk follows a
+/// head.
+#[test]
+fn the_frame_index_marks_chunks_alone() -> crate::Result<()> {
+    use crate::vlog::blob_file::writer::{
+        CHUNK_MARK, decode_frame_index, encode_frame_index_marked,
+    };
+
+    let dir = tempdir()?;
+    let path = write(
+        dir.path(),
+        &[
+            (b"one", &[1; 120]),
+            (b"big", &[9; 700]),
+            (b"next", &[1; 120]),
+        ],
+    )?;
+    let (pos, len) = section(&path, b"frames")?;
+    let bytes = std::fs::read(&path)?;
+    let index = decode_frame_index(&bytes[pos..pos + len])?;
+    // A single, a head, three chunks, a single, the data end.
+    assert_eq!(index.len(), 7);
+    let marked: Vec<bool> = (0..index.len()).map(|at| index.is_chunk(at)).collect();
+    assert_eq!(marked, [false, false, true, true, true, false, false]);
+    assert!(index.iter().all(|start| start & CHUNK_MARK == 0));
+
+    let first = encode_frame_index_marked(&[10, 20], 30, &[0b01]);
+    assert!(decode_frame_index(&first).is_err(), "the first frame");
+    // The writer marks starts alone, so the data end is marked by hand, the
+    // index sealed again.
+    let mut end = encode_frame_index_marked(&[10, 20], 30, &[]);
+    let body = end.len() - 8;
+    end[body - 1] |= 0x80;
+    let digest = xxhash_rust::xxh3::xxh3_64(&end[..body]);
+    end[body..].copy_from_slice(&digest.to_le_bytes());
+    assert!(decode_frame_index(&end).is_err(), "the data end");
+    let second = encode_frame_index_marked(&[10, 20], 30, &[0b10]);
+    assert!(decode_frame_index(&second).is_ok_and(|index| index.is_chunk(1)));
+    Ok(())
+}
+
+/// A chunk is the value's own bytes with no header, so a value can hold a
+/// whole frame that checks. When its head is lost to damage the walk by the
+/// index still knows the frames after it for chunks, and yields none of them
+/// as a value: the frame inside the chunk is the writer's payload, never a
+/// record of the file.
+#[test]
+fn a_frame_inside_a_chunk_whose_head_is_damaged_is_not_a_value() -> crate::Result<()> {
+    // A frame of one value that takes exactly a chunk's 300 bytes.
+    let forged = (100..300_usize)
+        .find_map(|len| {
+            let dir = tempdir().ok()?;
+            let path = write(dir.path(), &[(b"forged", &vec![b'f'; len])]).ok()?;
+            let index = index_of(&path).ok()?;
+            let frame = std::fs::read(&path).ok()?[index[0]..index[1]].to_vec();
+            (frame.len() == 300).then_some(frame)
+        })
+        .expect("a single frame of 300 bytes");
+
+    let mut big = forged;
+    big.extend_from_slice(&[9; 400]);
+    let dir = tempdir()?;
+    let path = write(dir.path(), &[(b"big", &big), (b"next", &[1; 120])])?;
+    let index = index_of(&path)?;
+    // A key byte of the head, frame 0.
+    edit(&path, |bytes| bytes[index[0] + 40 + 14] ^= 0x40)?;
+
+    let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
+    let keys: Vec<_> = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|entry| entry.key.clone())
+        .collect();
+    assert_eq!(keys, [Slice::from(&b"next"[..])], "{results:?}");
     Ok(())
 }
 
@@ -449,12 +639,14 @@ fn rewrite_head_table(
         let head = &mut bytes[index[0]..index[1]];
         // The entry's value length, after its seqno and key length.
         head[40 + 10..40 + 14].copy_from_slice(&value_len.to_le_bytes());
-        // The chunk table after the entry: the chunk size, then the count.
-        let table = head.len() - 8;
+        // The chunk table after the entry: the chunk size, then the count,
+        // then a row per chunk, left as written.
+        let entries_len = parse_header(head).expect("a head").entries_len as usize;
+        let table = FRAME_HEADER_LEN + entries_len;
         if let Some(size) = chunk_size {
             head[table..table + 4].copy_from_slice(&size.to_le_bytes());
         }
-        head[table + 4..].copy_from_slice(&chunks.to_le_bytes());
+        head[table + 4..table + 8].copy_from_slice(&chunks.to_le_bytes());
         crate::vlog::blob_file::frame::reseal(head);
     })
 }
@@ -473,6 +665,39 @@ fn a_head_whose_chunk_run_meets_another_frame_is_refused() -> crate::Result<()> 
         first,
         Err(crate::Error::InvalidHeader("BlobFrame"))
     ));
+    Ok(())
+}
+
+/// A packed block of values that compress far below their size closes before
+/// its values together decode past the cap: its records stay small while what
+/// they decode to grows, and a block whose declared size passes the cap is one
+/// no reader takes.
+#[cfg(zstd_any)]
+#[test]
+fn packed_blocks_close_before_their_values_decode_past_the_cap() -> crate::Result<()> {
+    const VALUES: usize = 320;
+    let dir = tempdir()?;
+    let path = dir.path().join("0");
+    let value = vec![0_u8; 900 * 1024];
+    let mut writer = BlobFileWriter::new(&path, 0, 0, &StdFs)?
+        .use_compression(crate::CompressionType::Zstd(3))
+        .use_frame_sizes(FrameSizes {
+            block_target: 1 << 20,
+            chunk_size: 1 << 20,
+        })
+        .use_file_dictionary(64 * 1024);
+    for i in 0..VALUES {
+        writer.write(format!("k{i:04}").as_bytes(), 7, &value)?;
+    }
+    writer.finish()?;
+    let bytes = std::fs::read(&path)?;
+    let index = index_of(&path)?;
+    let mut values = 0;
+    for frame in index.windows(2) {
+        let header = crate::vlog::blob_file::frame::parse_header(&bytes[frame[0]..frame[1]])?;
+        values += usize::from(header.count);
+    }
+    assert_eq!(values, VALUES, "every value lies in a frame a reader takes");
     Ok(())
 }
 

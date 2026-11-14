@@ -83,6 +83,11 @@ pub(crate) enum Priority {
     Normal,
     /// Pinned admission: straight to main with a full frequency credit.
     High,
+    /// Probationary admission: the small queue even on a ghost hit, so the
+    /// entry reaches main only by being read again there. For entries one
+    /// read each, like a separated value, whose stream must not push the
+    /// main queue's blocks out.
+    Probation,
 }
 
 /// One cached entry: the value, its weight, the S3-FIFO frequency counter, and
@@ -115,8 +120,11 @@ struct ShardCore<K, V, S> {
     hasher: S,
     small: VecDeque<K>,
     main: VecDeque<K>,
-    ghost: VecDeque<K>,
-    ghost_set: hashbrown::HashSet<K, S>,
+    /// Fingerprints (the wrapper's precomputed key hashes) of keys evicted
+    /// cold or missed into a full shard, oldest first. The hash is already
+    /// mixed, so `ghost_set` is keyed by it as is: no key clone, no rehash.
+    ghost: VecDeque<u64>,
+    ghost_set: hashbrown::HashTable<u64>,
     small_bytes: u64,
     main_bytes: u64,
     /// Per-shard byte capacity.
@@ -126,6 +134,10 @@ struct ShardCore<K, V, S> {
     small_target: u64,
     /// Max number of fingerprints retained in the ghost queue.
     ghost_capacity: usize,
+    /// Whether the shard has ever had to evict to stay within capacity: its
+    /// table and queues have grown to what it holds, and an insert now takes
+    /// the place of what it evicts rather than fresh memory.
+    filled: bool,
 }
 
 impl<K, V, S> ShardCore<K, V, S>
@@ -137,11 +149,11 @@ where
     fn new(capacity: u64, ghost_capacity: usize, hasher: S) -> Self {
         Self {
             map: hashbrown::HashTable::new(),
-            hasher: hasher.clone(),
+            hasher,
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
-            ghost_set: hashbrown::HashSet::with_hasher(hasher),
+            ghost_set: hashbrown::HashTable::new(),
             small_bytes: 0,
             main_bytes: 0,
             capacity,
@@ -149,6 +161,7 @@ where
             // meaningful for tiny shards).
             small_target: (capacity / 10).max(1),
             ghost_capacity,
+            filled: false,
         }
     }
 
@@ -198,12 +211,20 @@ where
     /// Inserts or replaces `key`, evicting to stay within capacity. The shard's
     /// running `small_bytes` / `main_bytes` tallies are kept current throughout
     /// (the sharded wrapper reads them under a shared lock for `weight()`).
-    fn insert(&mut self, hash: u64, key: K, value: V, weight: u64, priority: Priority) {
+    fn insert(
+        &mut self,
+        hash: u64,
+        key: K,
+        value: V,
+        weight: u64,
+        priority: Priority,
+        evicted: &mut Evicted<V>,
+    ) {
         if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
             // Replace in place: adjust the owning queue's byte tally by the
             // weight delta.
             let old = slot.weight;
-            slot.value = value;
+            evicted.push(core::mem::replace(&mut slot.value, value));
             slot.weight = weight;
             // Honor a High-priority refresh of a probationary (small) entry:
             // promote it to main with full frequency credit so a re-inserted
@@ -239,11 +260,16 @@ where
             let (loc, init_freq) = match priority {
                 Priority::High => (Location::Main, MAX_FREQ),
                 Priority::Normal => {
-                    if self.ghost_set.remove(&key) {
+                    if self.take_ghost(hash) {
                         (Location::Main, 0)
                     } else {
                         (Location::Small, 0)
                     }
+                }
+                Priority::Probation => {
+                    // The fingerprint was spent on admitting the entry.
+                    self.take_ghost(hash);
+                    (Location::Small, 0)
                 }
             };
             let hasher = &self.hasher;
@@ -272,7 +298,7 @@ where
             }
         }
 
-        self.evict_to_capacity();
+        self.evict_to_capacity(evicted);
     }
 
     /// Removes `key` if present (lazy tombstone — the stale queue entry is
@@ -295,9 +321,14 @@ where
         self.small_bytes + self.main_bytes
     }
 
-    fn evict_to_capacity(&mut self) {
+    /// Evicts until the shard is within capacity, handing what it evicts to
+    /// `evicted` for the caller to drop once the lock is released.
+    fn evict_to_capacity(&mut self, evicted: &mut Evicted<V>) {
+        if self.resident_bytes() > self.capacity {
+            self.filled = true;
+        }
         while self.resident_bytes() > self.capacity {
-            if !self.evict_one() {
+            if !self.evict_one(evicted) {
                 // Both queues are out of live entries — nothing left to free
                 // (e.g. a single entry larger than the whole shard capacity).
                 break;
@@ -313,12 +344,12 @@ where
         clippy::if_same_then_else,
         reason = "the branches differ in which queue `||` tries first; the lint reads them as equal"
     )]
-    fn evict_one(&mut self) -> bool {
+    fn evict_one(&mut self, evicted: &mut Evicted<V>) -> bool {
         let prefer_small = self.main_bytes == 0 || self.small_bytes >= self.small_target;
         if prefer_small {
-            self.evict_from_small() || self.evict_from_main()
+            self.evict_from_small(evicted) || self.evict_from_main(evicted)
         } else {
-            self.evict_from_main() || self.evict_from_small()
+            self.evict_from_main(evicted) || self.evict_from_small(evicted)
         }
     }
 
@@ -326,7 +357,7 @@ where
     /// (freq > 0) migrates to the main queue; an unused one is evicted and its
     /// key recorded in the ghost queue. Returns `false` if the small queue holds
     /// no live entry.
-    fn evict_from_small(&mut self) -> bool {
+    fn evict_from_small(&mut self, evicted: &mut Evicted<V>) -> bool {
         while let Some(key) = self.small.pop_front() {
             let hash = self.hasher.hash_one(&key);
             let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
@@ -349,12 +380,18 @@ where
                 self.main_bytes += w;
                 self.main.push_back(key);
             } else {
-                // Cold: evict, remember the fingerprint in the ghost queue.
-                if let Ok(entry) = self.map.find_entry(hash, |(k, _)| *k == key) {
-                    entry.remove();
-                }
+                // Cold: evict, remember the fingerprint in the ghost queue. The
+                // shard's accounting is whole before the value is handed on.
+                let removed = self
+                    .map
+                    .find_entry(hash, |(k, _)| *k == key)
+                    .ok()
+                    .map(|entry| entry.remove().0.1.value);
                 self.small_bytes -= w;
-                self.push_ghost(key);
+                self.push_ghost(hash);
+                if let Some(value) = removed {
+                    evicted.push(value);
+                }
             }
             return true;
         }
@@ -365,7 +402,7 @@ where
     /// frequency is reinserted at the back with its counter decremented; an
     /// unused one is evicted. Returns `false` if the main queue holds no live
     /// entry.
-    fn evict_from_main(&mut self) -> bool {
+    fn evict_from_main(&mut self, evicted: &mut Evicted<V>) -> bool {
         while let Some(key) = self.main.pop_front() {
             let hash = self.hasher.hash_one(&key);
             let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
@@ -377,29 +414,114 @@ where
                 self.main.push_back(key);
             } else {
                 let w = slot.weight;
-                if let Ok(entry) = self.map.find_entry(hash, |(k, _)| *k == key) {
-                    entry.remove();
-                }
+                let removed = self
+                    .map
+                    .find_entry(hash, |(k, _)| *k == key)
+                    .ok()
+                    .map(|entry| entry.remove().0.1.value);
                 self.main_bytes -= w;
+                if let Some(value) = removed {
+                    evicted.push(value);
+                }
             }
             return true;
         }
         false
     }
 
-    fn push_ghost(&mut self, key: K) {
+    /// Whether the key hashed to `hash` is remembered in the ghost queue.
+    #[inline]
+    fn in_ghost(&self, hash: u64) -> bool {
+        self.ghost_set.find(hash, |&h| h == hash).is_some()
+    }
+
+    /// Forgets `hash` from the ghost set, reporting whether it was there. Its
+    /// queue node stays and ages out whatever `hash` is recorded as then: a
+    /// fingerprint recorded again while its old node is queued is forgotten
+    /// with that node, short of a full stay. Kept so by measurement: holding
+    /// it for the full second stay admitted more blocks straight to the main
+    /// queue, and a scan over a tree a fifth larger than the cache ran 7%
+    /// slower, with no read path faster for it.
+    fn take_ghost(&mut self, hash: u64) -> bool {
+        match self.ghost_set.find_entry(hash, |&h| h == hash) {
+            Ok(entry) => {
+                entry.remove();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn push_ghost(&mut self, hash: u64) {
         if self.ghost_capacity == 0 {
             return;
         }
-        if self.ghost_set.insert(key.clone()) {
-            self.ghost.push_back(key);
+        if let hashbrown::hash_table::Entry::Vacant(slot) =
+            self.ghost_set.entry(hash, |&h| h == hash, |&h| h)
+        {
+            slot.insert(hash);
+            self.ghost.push_back(hash);
         }
         while self.ghost.len() > self.ghost_capacity {
             if let Some(old) = self.ghost.pop_front() {
-                self.ghost_set.remove(&old);
+                self.take_ghost(old);
             }
         }
     }
+}
+
+/// What one insert replaced or evicted, dropped by its caller once the
+/// shard's lock is released, so no read of the shard waits behind the frees.
+/// The first few are held in place, their places unwritten until used, so
+/// collecting them allocates nothing under the lock and an insert that evicts
+/// one or none pays for no more than that one.
+pub(crate) struct Evicted<V> {
+    /// The first [`HELD`] of them, the ones before `len` written.
+    held: [core::mem::MaybeUninit<V>; HELD],
+    len: usize,
+    rest: Vec<V>,
+}
+
+/// The evicted entries held in place: a blob frame of 64 KiB over blocks of
+/// 8 KiB evicts that many.
+const HELD: usize = 8;
+
+impl<V> Evicted<V> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            held: [const { core::mem::MaybeUninit::uninit() }; HELD],
+            len: 0,
+            rest: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, value: V) {
+        if let Some(place) = self.held.get_mut(self.len) {
+            place.write(value);
+            self.len += 1;
+        } else {
+            self.rest.push(value);
+        }
+    }
+}
+
+impl<V> Drop for Evicted<V> {
+    fn drop(&mut self) {
+        for place in self.held.iter_mut().take(self.len) {
+            // SAFETY: `push` wrote every place before `len`, and nothing takes
+            // one out before this drop.
+            #[expect(unsafe_code, reason = "see safety")]
+            unsafe {
+                place.assume_init_drop();
+            }
+        }
+    }
+}
+
+/// Releases an insert's shard lock, then drops what the insert evicted.
+fn release<G, V>(guard: G, evicted: Evicted<V>) {
+    drop(guard);
+    drop(evicted);
 }
 
 /// Applies a weight replacement (`old` → `new`) to a running byte tally without
@@ -517,6 +639,54 @@ where
         shard.read().contains(h, key)
     }
 
+    /// Whether a missed `key`, `weight` once built, should be inserted now:
+    /// at once while its shard has room for it, since an insert that evicts
+    /// nothing costs nothing later; into a full shard only when it was missed
+    /// (or evicted cold) recently, which the ghost queue remembers. A first
+    /// miss into a full shard is remembered there instead, so a read that
+    /// never comes back costs a fingerprint, not an entry built, inserted and
+    /// evicted unread.
+    pub(crate) fn admit(&self, key: &K, weight: u64) -> bool {
+        self.admit_where(key, weight, false)
+    }
+
+    /// [`Self::admit`], and never into a shard that has not yet had to evict
+    /// to stay within capacity: an insert there grows the shard into fresh
+    /// memory, where one into a shard that has filled takes the place of
+    /// what it evicts. One look at the shard answers both.
+    pub(crate) fn admit_once_filled(&self, key: &K, weight: u64) -> bool {
+        self.admit_where(key, weight, true)
+    }
+
+    #[inline]
+    fn admit_where(&self, key: &K, weight: u64, filled_only: bool) -> bool {
+        let (h, shard) = self.locate(key);
+        {
+            let core = shard.read();
+            if filled_only && !core.filled {
+                return false;
+            }
+            if core.resident_bytes() + weight <= core.capacity || core.in_ghost(h) {
+                return true;
+            }
+        }
+        // A hint, taken on the read path: a read never waits for the shard
+        // for it, and a hint lost to a held lock costs the key one more miss.
+        if let Some(mut core) = shard.try_write() {
+            core.push_ghost(h);
+        }
+        false
+    }
+
+    /// Whether `key`'s shard has ever had to evict to stay within capacity,
+    /// so an insert there takes the place of what it evicts instead of
+    /// growing the shard into fresh memory.
+    #[cfg(test)]
+    pub(crate) fn has_filled(&self, key: &K) -> bool {
+        let (_, shard) = self.locate(key);
+        shard.read().filled
+    }
+
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
     /// stay within capacity.
     pub(crate) fn insert(&self, key: K, value: V) {
@@ -535,7 +705,25 @@ where
             return;
         }
         let (h, shard) = self.locate(&key);
-        shard.write().insert(h, key, value, weight, priority);
+        let mut evicted = Evicted::new();
+        let mut core = shard.write();
+        core.insert(h, key, value, weight, priority, &mut evicted);
+        release(core, evicted);
+    }
+
+    /// Inserts `key` as [`Self::insert_with_priority`] does, only when its
+    /// shard's lock is free now: a caller that must not wait drops the entry.
+    pub(crate) fn try_insert_with_priority(&self, key: K, value: V, priority: Priority) {
+        let weight = self.weighter.weight(&key, &value);
+        if weight > self.per_shard_capacity {
+            return;
+        }
+        let (h, shard) = self.locate(&key);
+        if let Some(mut core) = shard.try_write() {
+            let mut evicted = Evicted::new();
+            core.insert(h, key, value, weight, priority, &mut evicted);
+            release(core, evicted);
+        }
     }
 
     /// Inserts the value `merge` derives from what `key` holds now, read and
@@ -554,7 +742,9 @@ where
         if weight > self.per_shard_capacity {
             return;
         }
-        core.insert(h, key, value, weight, Priority::Normal);
+        let mut evicted = Evicted::new();
+        core.insert(h, key, value, weight, Priority::Normal, &mut evicted);
+        release(core, evicted);
     }
 
     /// Removes `key` if present.
@@ -581,6 +771,7 @@ where
 
     /// Removes every entry whose key `doomed` picks. Walks every shard under
     /// its write lock: for a sweep, not the hot path.
+    #[cfg(feature = "std")]
     pub(crate) fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) {
         for shard in &self.shards {
             let mut core = shard.0.write();

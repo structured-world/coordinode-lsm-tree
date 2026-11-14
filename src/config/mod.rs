@@ -294,6 +294,16 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub chunk_size: core::num::NonZeroU32,
 
+    /// The frames a dictionary blob codec compresses with its dictionary. See
+    /// [`Self::dictionary_classes`].
+    #[doc(hidden)]
+    pub dictionary_classes: DictionaryClasses,
+
+    /// The bytes of the dictionary a zstd blob file builds from its own
+    /// values, `0` for none. See [`Self::file_dictionary`].
+    #[doc(hidden)]
+    pub file_dictionary: u32,
+
     /// Separation thresholds of the fields of rows written as cells, as
     /// `(column, bytes)` pairs; a column without one uses
     /// `separation_threshold`. See [`Self::cell_separation_threshold`].
@@ -335,6 +345,52 @@ pub struct KvSeparationOptions {
     pub zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 }
 
+/// The frames of a blob file, by the size class of what they hold, that a
+/// dictionary codec compresses with its dictionary. Set through
+/// [`KvSeparationOptions::dictionary_classes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictionaryClasses {
+    /// Blocks of values below the block size.
+    pub blocks: bool,
+    /// Values from the block size up to the chunk size, a frame each.
+    pub singles: bool,
+    /// The chunks of values above the chunk size.
+    pub chunks: bool,
+}
+
+impl DictionaryClasses {
+    /// Every class.
+    pub const ALL: Self = Self {
+        blocks: true,
+        singles: true,
+        chunks: true,
+    };
+
+    /// Blocks and single values, the default: a chunk builds its own history
+    /// over its 256 KiB and gains nothing from a dictionary, while decoding
+    /// it with one is slower. Measured on documents, chain blocks and
+    /// transactions, and files of KiB to hundreds of MiB, a dictionary on the
+    /// chunks too changed the files' ratio by 0.1% and slowed their scan by
+    /// 7%.
+    pub const DEFAULT: Self = Self {
+        blocks: true,
+        singles: true,
+        chunks: false,
+    };
+
+    /// Whether a frame of `kind` is compressed with the dictionary. A head
+    /// holds its chunk table, which is never compressed.
+    #[cfg(zstd_any)]
+    pub(crate) fn covers(self, kind: crate::vlog::blob_file::frame::FrameKind) -> bool {
+        use crate::vlog::blob_file::frame::FrameKind;
+        match kind {
+            FrameKind::Block => self.blocks,
+            FrameKind::Single => self.singles,
+            FrameKind::Chunk | FrameKind::Head => self.chunks,
+        }
+    }
+}
+
 /// Whether a value read from a blob file goes into the shared cache.
 ///
 /// Lookups are the same either way: a value already cached is served from
@@ -346,11 +402,20 @@ pub enum BlobCacheFill {
     /// Every value read from a blob file is cached, and a scan reads its
     /// values ahead into the cache.
     Always,
-    /// No value read from a blob file is cached: values large enough to be
-    /// separated are mostly read once, and cached they would evict the index,
-    /// filter and data blocks of every tree sharing the cache. A scan still
-    /// reads its values ahead, into a store of its own holding at most one
-    /// coalesced read, from which it hands them out.
+    /// No value of a frame of its own read from a blob file is cached: values
+    /// large enough to be separated are mostly read once, and cached they
+    /// would evict the index, filter and data blocks of every tree sharing the
+    /// cache. A packed small value read as its record alone is cached all the
+    /// same once the cache has filled, where it takes the place of what it
+    /// evicts, on its first miss into room and past it once missed again;
+    /// into a cache still filling it is not, since there it would grow the
+    /// cache on the read's path. A block of small values a
+    /// point read decodes is cached all the same while the cache has room,
+    /// and in a full cache once missed again: the values beside the one read
+    /// are read as often, and each would otherwise decode the whole block
+    /// again. A scan
+    /// still reads its values ahead, into a store of its own holding at most
+    /// one coalesced read, from which it hands them out.
     #[default]
     Never,
 }
@@ -398,6 +463,8 @@ impl Default for KvSeparationOptions {
                 crate::vlog::blob_file::writer::FrameSizes::DEFAULT.chunk_size,
             )
             .expect("the default chunk size is not zero"),
+            dictionary_classes: DictionaryClasses::DEFAULT,
+            file_dictionary: /* 64 KiB */ 64 * 1_024,
             cell_separation_thresholds: alloc::vec::Vec::new(),
 
             staleness_threshold: 0.25,
@@ -457,7 +524,8 @@ impl KvSeparationOptions {
     /// with. A size above [`Self::chunk_size`] or 128 MiB is held to the
     /// smaller of the two, so a block is always one frame a reader decodes.
     ///
-    /// Defaults to 16 KiB.
+    /// Defaults to 8 KiB: a larger block packs more and makes each point read
+    /// of a value in it decode more.
     ///
     /// # Examples
     ///
@@ -502,6 +570,68 @@ impl KvSeparationOptions {
     pub fn chunk_size(mut self, bytes: core::num::NonZeroU32) -> Self {
         self.chunk_size = bytes;
         self
+    }
+
+    /// Sets which frames of a blob file a dictionary codec
+    /// (`CompressionType::ZstdDict`, with the `zstd` feature)
+    /// compresses with its dictionary; the others are compressed at its level
+    /// without one.
+    ///
+    /// A dictionary gives a small frame the history it lacks; a large one
+    /// builds its own, and pays for the dictionary at every decode for little
+    /// or no gain. Other codecs ignore it.
+    ///
+    /// Defaults to blocks and single values ([`DictionaryClasses::DEFAULT`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{DictionaryClasses, KvSeparationOptions};
+    ///
+    /// // The dictionary compresses blocks of small values only.
+    /// let classes = DictionaryClasses {
+    ///     blocks: true,
+    ///     singles: false,
+    ///     chunks: false,
+    /// };
+    /// let opts = KvSeparationOptions::default().dictionary_classes(classes);
+    /// assert_eq!(opts.dictionary_classes, classes);
+    /// ```
+    #[must_use]
+    pub fn dictionary_classes(mut self, classes: DictionaryClasses) -> Self {
+        self.dictionary_classes = classes;
+        self
+    }
+
+    /// Sets the bytes of the dictionary each zstd blob file builds from its
+    /// own values, `0` for none.
+    ///
+    /// A blob file under `CompressionType::Zstd` then gives every value up to
+    /// the chunk size a frame of its own, none shares a block, and compresses
+    /// each with a dictionary of its first small values, stored in the file:
+    /// a small value gains most of what a block's neighbours give it, and a
+    /// read of it decodes that value alone. The values written before the
+    /// dictionary fills are compressed without it.
+    ///
+    /// Defaults to 64 KiB: against blocks of 8 KiB a cold point read of a
+    /// 256-byte value decodes it alone (3.5 us against 12-14 at 70 000 keys,
+    /// and a sustained overwrite's read p99 22-26 us against 41-50), a range
+    /// scan stays faster than values compressed one by one without it, and
+    /// the files take 30% more space than the blocks, 5% less than values
+    /// compressed alone. Dictionaries of 4 and 16 KiB read the same and keep
+    /// slightly more.
+    #[must_use]
+    pub fn file_dictionary(mut self, bytes: u32) -> Self {
+        self.file_dictionary = bytes;
+        self
+    }
+
+    /// The live share of a block at or above which a relocation copies the
+    /// block whole: one whose dead share stays below the staleness that makes
+    /// a file worth collecting carries no more garbage than such a file holds.
+    #[must_use]
+    pub(crate) fn block_copy_share(&self) -> f32 {
+        (1.0 - self.staleness_threshold).clamp(0.0, 1.0)
     }
 
     /// How the blob files written now size their frames, bounded so every
@@ -750,9 +880,11 @@ impl KvSeparationOptions {
     /// Sets the staleness threshold percentage.
     ///
     /// The staleness percentage determines how much a blob file needs to be fragmented to be
-    /// picked up by the garbage collection.
+    /// picked up by the garbage collection. A relocation copies a block whole
+    /// while its dead share stays below it, and rewrites its live values
+    /// otherwise.
     ///
-    /// Defaults to 33%.
+    /// Defaults to 25%.
     #[must_use]
     pub fn staleness_threshold(mut self, ratio: f32) -> Self {
         self.staleness_threshold = ratio;
@@ -761,7 +893,7 @@ impl KvSeparationOptions {
 
     /// Sets the age cutoff threshold.
     ///
-    /// Defaults to 20%.
+    /// Defaults to 25%.
     #[must_use]
     pub fn age_cutoff(mut self, ratio: f32) -> Self {
         self.age_cutoff = ratio;
@@ -2910,6 +3042,8 @@ impl Config {
     /// delays the journal's own syncs. Writeback makes nothing durable; the
     /// final sync still does. Only Linux starts one
     /// (`sync_file_range(SYNC_FILE_RANGE_WRITE)`); elsewhere this is unused.
+    /// A blob file checks after each value it writes, so a value larger than
+    /// this is written back once it is whole.
     ///
     /// # Examples
     ///

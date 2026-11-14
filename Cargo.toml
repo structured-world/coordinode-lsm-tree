@@ -26,7 +26,6 @@ rust-version = "1.99"
 readme = "README.md"
 include = ["src/**/*", "build.rs", "LICENSE-APACHE", "README.md", "CHANGELOG.md"]
 repository = "https://github.com/structured-world/coordinode-lsm-tree"
-homepage = "https://github.com/structured-world/coordinode-lsm-tree"
 documentation = "https://docs.rs/coordinode-lsm-tree"
 keywords = ["lsm-tree", "storage", "database", "embedded", "key-value"]
 categories = [
@@ -67,10 +66,13 @@ path = "src/lib.rs"
 default = ["std", "parallel", "io-uring"]
 std = [
     "dep:arc-swap",
+    "dep:libc",
+    "libc/std",
     "dep:parking_lot",
     "dep:parking_lot_core",
     "dep:tempfile",
     "rustc-hash/std",
+    "dep:varint-rs",
     "varint-rs/std",
 ]
 # Parallel block-compression pipeline (default executor: rayon thread pool).
@@ -99,7 +101,10 @@ io-uring = ["dep:io-uring", "std"]
 # Linux-only by nature (io_uring is a Linux kernel API); the backend module is
 # additionally `cfg(target_os = "linux")`, so enabling this on a non-Linux
 # target compiles to nothing.
-io-uring-raw = ["dep:syscalls"]
+#
+# `libc` comes along for its constants alone: the backend checks the flags it
+# spells out against the C library's as it builds, and links nothing of it.
+io-uring-raw = ["dep:syscalls", "dep:libc"]
 lz4 = ["dep:lz4_flex", "std"]
 # The previous `zstd-pure = ["zstd"]` alias was removed. It was
 # documented as deprecated when there were two candidate zstd backends
@@ -249,6 +254,9 @@ self_cell = "1.2.0"
 # written out, so the crate builds no proc-macro (`syn`, `quote`). No `std`
 # either: the impls need `alloc` only, so `ribbon-serde` builds without it.
 serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }
+# Short lists a read builds and drops, held on its stack while they are
+# short: the rows of a chunked value's table. No `std`.
+smallvec = { version = "1", default-features = false }
 # sfa is vendored under src/sfa/ (upstream does not accept PRs; pinning
 # the format to in-tree code lets us evolve it locally without waiting
 # for a release we cannot influence). License files preserved alongside.
@@ -257,7 +265,9 @@ serde = { version = "1", optional = true, default-features = false, features = [
 # feature so the no-std build does not pull in `fastrand` (which
 # transitively does `extern crate std`).
 tempfile = { version = "3.20.0", optional = true }
-varint-rs = { version = "2.2.1", default-features = false }
+# Only the std build reads varints through it; without std the crate's own
+# `io` varints serve.
+varint-rs = { version = "2.2.1", default-features = false, optional = true }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # CRC32C (Castagnoli) for the optional `Crc32c` checksum algorithm.
 # Hardware-accelerated (SSE4.2 `_mm_crc32` on x86, CRC32 instructions on
@@ -323,8 +333,10 @@ syscalls = { version = "0.8", optional = true, default-features = false }
 #     `ioctl(FS_IOC_SETFLAGS|FS_NOCOW_FL)` CoW disable on Btrfs SSTs, and
 #     `sync_file_range` for incremental writeback.
 # libc provides the arch-correct struct layouts and ioctl constants that are
-# otherwise error-prone to hand-declare per architecture.
-libc = "0.2"
+# otherwise error-prone to hand-declare per architecture. Only the std
+# filesystem calls it; the no-std io_uring backend reads its constants, so it
+# is taken without its own `std` there.
+libc = { version = "0.2", optional = true, default-features = false }
 
 [dev-dependencies]
 # Integration tests assemble their own wire fixtures with byteorder; the
@@ -364,6 +376,13 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [package.metadata.cargo-all-features]
 denylist = []
 
+# The sweep the blob file defaults are chosen from, run by hand on real data
+# (see the example's own docs).
+[[example]]
+name = "blob_sweep"
+path = "examples/blob_sweep/main.rs"
+required-features = ["std", "lz4", "zstd", "metrics"]
+
 [[bench]]
 name = "merge"
 harness = false
@@ -387,6 +406,12 @@ name = "blob_chunked_reads"
 harness = false
 path = "benches/blob_chunked_reads.rs"
 required-features = ["std"]
+
+[[bench]]
+name = "blob_packed_reads"
+harness = false
+path = "benches/blob_packed_reads.rs"
+required-features = ["std", "zstd"]
 
 [[bench]]
 name = "blob_relocation"

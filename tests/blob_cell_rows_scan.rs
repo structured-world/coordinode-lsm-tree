@@ -1143,16 +1143,20 @@ fn a_scan_reads_a_block_its_batches_share_once() -> lsm_tree::Result<()> {
         .field(field(PRICE, u32_le()));
     let (requests, bytes) = (m.blob_read_count(), m.blob_bytes_read());
     assert_eq!(rows_of_scan(&any, prices, Some(&all))?.len(), rows as usize);
-    // Each price is an entry of 14 bytes, its six-byte key and four bytes:
-    // three blocks of 16 KiB hold them all.
-    let entries = u64::from(rows) * (14 + 6 + 4);
+    // Each price is a packed record of 27 bytes, its six-byte key and four
+    // bytes, in packed blocks of the default 8 KiB.
+    let entries = u64::from(rows) * (27 + 6 + 4);
+    let blocks = entries.div_ceil(8 * 1_024);
     let read = m.blob_bytes_read() - bytes;
     let issued = m.blob_read_count() - requests;
     assert!(
         read <= 2 * entries,
         "{read} bytes read for {entries} bytes of blocks in {issued} requests"
     );
-    assert!(issued <= 8, "{issued} requests for three blocks");
+    assert!(
+        issued as u64 <= 2 * blocks,
+        "{issued} requests for {blocks} blocks"
+    );
     Ok(())
 }
 

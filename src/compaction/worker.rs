@@ -643,6 +643,7 @@ fn at_compaction_stop(version: &Version, opts: &Options) -> bool {
 /// whether space freed on one path relieves the other, and guessing
 /// "independent" there admits a transient peak straight into `ENOSPC` or a
 /// reclaim that lands where nothing needed it.
+#[cfg(feature = "std")]
 fn separate_volumes(
     a_fs: &dyn crate::fs::Fs,
     a_path: &crate::path::Path,
@@ -713,6 +714,265 @@ pub(crate) fn merge_would_fit(
     })
 }
 
+/// The bytes the tables a merge of `payload` writes take, bounded from what
+/// its inputs record before any of them is read: their entries' uncompressed
+/// bytes as `probe`, a writer of the merge's output settings, bounds them,
+/// whatever codec the inputs stored them under; an output more for each key
+/// of the level below the merge ends one on and each key domain past the
+/// first its inputs hold; and the files relocating `stale` writes, linked
+/// from the outputs.
+///
+/// When the outputs split cell rows, a table of cells records the field
+/// columns its groups hold; any other table has its rows read for them.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for an input that records no key and value
+/// byte sums, which every table of this format does; and a read of a cell
+/// table's rows.
+fn recorded_table_demand(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+    probe: &crate::table::multi_writer::BoundProbe,
+    stale: &[BlobFile],
+) -> crate::Result<u64> {
+    use crate::table::writer::{CellShapes, RewriteLoad, varint_len};
+
+    let cmp = opts.config.comparator.as_ref();
+    let mut load = RewriteLoad::default();
+    let mut cells = CellShapes::default();
+    let mut tombstones: Vec<&crate::range_tombstone::RangeTombstone> = Vec::new();
+    // The key domains the inputs' keys may lie in: those a table's key range
+    // meets, or as many as its entries for one whose range meets more.
+    let mut domains: HashSet<Option<UserKey>> = HashSet::default();
+    let mut more_domains = 0u64;
+    let tables: Vec<&Table> = payload
+        .table_ids
+        .iter()
+        .filter_map(|&id| version.get_table(id))
+        .collect();
+    for table in &tables {
+        let meta = &table.metadata;
+        // Outputs that split cell rows split those of any input, a row-major
+        // or whole-value one written before columnar tables were switched on
+        // included, and only a table of cells records the columns they make.
+        let cell_table = probe.splits_cells();
+        // A restricted table records the file it was cut from, of which the
+        // merge rewrites the rows past the restriction; a table that records
+        // no field columns holds the ones its cell rows make only in its rows.
+        // Both are read.
+        let mut table_load = if table.is_restricted() || (cell_table && meta.cell_columns.is_none())
+        {
+            read_table_load(table, opts, probe, &mut cells)?
+        } else {
+            let (Some(keys), Some(values)) = (meta.sum_user_key_bytes, meta.sum_value_bytes) else {
+                return Err(crate::Error::InvalidHeader("TableMeta"));
+            };
+            if let (true, Some(shapes)) = (cell_table, &meta.cell_columns) {
+                cells.absorb(shapes);
+            }
+            // A table that does not record its longest key or value: no key
+            // is past the most a key takes, nor longer than all of them.
+            let longest_key = meta
+                .longest_user_key
+                .unwrap_or_else(|| keys.min(u64::from(u16::MAX)));
+            let longest_value = meta.longest_value.unwrap_or(values);
+            RewriteLoad {
+                entries: meta.item_count,
+                key_bytes: keys,
+                value_bytes: values,
+                filter_hashes: probe.filter_hashes_of(meta),
+                longest_key,
+                longest_value: Some(longest_value),
+                highest_seqno: table.get_highest_seqno(),
+                entry_lengths: Some(
+                    meta.item_count * (2 * varint_len(longest_key) + varint_len(longest_value)),
+                ),
+                ..RewriteLoad::default()
+            }
+        };
+        (table_load.linked_blob_files, table_load.owned_blob_objects) =
+            table.blob_reference_bound();
+        load.absorb(&table_load);
+        tombstones.extend(table.range_tombstones());
+        if let Some(policy) = opts.config.key_domains.as_deref() {
+            more_domains += key_range_domains(policy, cmp, table, &mut domains);
+        }
+    }
+    tombstones.sort();
+    tombstones.dedup();
+    for rt in tombstones {
+        let (start, end) = (rt.start.len() as u64, rt.end.len() as u64);
+        load.range_tombstones += 1;
+        load.range_tombstone_bytes += start + end;
+        load.longest_key = load.longest_key.max(start).max(end);
+    }
+    let domain_count = (domains.len() as u64 + more_domains).max(1);
+    if let (Some(blob_opts), false) = (&opts.config.kv_separation_opts, stale.is_empty()) {
+        load.linked_blob_files += relocation_output_files(stale, blob_opts, domain_count)?;
+    }
+    load.cell_columns = cells.columns_with(&CellShapes::default());
+    let cut_keys = super::flavour::output_cut_keys(version, opts, payload).len() as u64;
+    Ok(probe.rewrite_bound(&load, cut_keys + domain_count - 1))
+}
+
+/// The bytes a full compaction of `tree` at `version` writes, bounded as the
+/// space gate bounds a merge: the largest level's tables (by the bytes they
+/// serve) merged into the last level, as its tables and the stale blob files
+/// it relocates. `(0, 0)` for an empty tree.
+///
+/// # Errors
+///
+/// As [`recorded_table_demand`], and a stale blob file's size.
+pub(crate) fn full_compaction_demand(
+    tree: &crate::Tree,
+    version: &Version,
+) -> crate::Result<(u64, u64)> {
+    let mut largest: Option<(u64, HashSet<TableId>)> = None;
+    for level in version.iter_levels() {
+        let mut size = 0u64;
+        let mut ids = HashSet::default();
+        for table in level.iter().flat_map(|run| run.iter()) {
+            // Bounded by the filesystem's capacity.
+            size += table.live_file_size()?;
+            ids.insert(table.id());
+        }
+        if !ids.is_empty() && largest.as_ref().is_none_or(|(most, _)| size > *most) {
+            largest = Some((size, ids));
+        }
+    }
+    let Some((_, table_ids)) = largest else {
+        return Ok((0, 0));
+    };
+    // A tree has a level at the least, and a full compaction lands in its
+    // last.
+    let last = tree.config.level_count - 1;
+    let payload = CompactionPayload {
+        table_ids,
+        dest_level: last,
+        canonical_level: last,
+        target_size: tree.config.table_target_size,
+    };
+    let opts = Options::from_tree(
+        tree,
+        Arc::new(super::major::Strategy::new(tree.config.table_target_size)),
+    );
+    let probe =
+        super::flavour::output_bound_probe(version, &opts, &payload, &opts.runtime_config.load())?;
+    let stale = match &opts.config.kv_separation_opts {
+        Some(blob_opts) => pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?,
+        None => Vec::new(),
+    };
+    let blobs = stale
+        .iter()
+        .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?;
+    Ok((
+        recorded_table_demand(version, &opts, &payload, &probe, &stale)?,
+        blobs,
+    ))
+}
+
+/// The blob files relocating `stale` under `blob_opts` writes, at the most:
+/// a file per target's worth of their bytes, and in each of `domains` key
+/// domains one more for each codec they are written with, a file of values
+/// written anew without their dictionary included, in each lifetime class.
+fn relocation_output_files(
+    stale: &[BlobFile],
+    blob_opts: &crate::KvSeparationOptions,
+    domains: u64,
+) -> crate::Result<u64> {
+    let mut bytes = 0u64;
+    let mut codecs: Vec<crate::CompressionType> = Vec::new();
+    for file in stale {
+        // Bounded by the filesystem's capacity.
+        bytes += file.physical_size()?;
+        if !codecs.contains(&file.compression()) {
+            codecs.push(file.compression());
+        }
+    }
+    let groups = u64::from(blob_opts.lifetime_groups.get());
+    Ok(bytes.div_ceil(blob_opts.file_target_size.max(1))
+        + (codecs.len() as u64 + 1) * groups * domains)
+}
+
+/// Takes into `domains` the key domains of `policy` the key range of `table`
+/// meets, each by the first key past it, and returns how many more its keys
+/// may lie in: a range meeting more domains than the table has entries counts
+/// one per entry, apart from the ones taken.
+fn key_range_domains(
+    policy: &dyn crate::KeyDomains,
+    cmp: &dyn crate::comparator::UserComparator,
+    table: &Table,
+    domains: &mut HashSet<Option<UserKey>>,
+) -> u64 {
+    let range = &table.metadata.key_range;
+    let entries = table.metadata.item_count.max(1);
+    let mut met: Vec<Option<UserKey>> = Vec::new();
+    let mut end = policy.domain_end(range.min());
+    loop {
+        met.push(end.clone());
+        match end {
+            Some(next) if cmp.compare(&next, range.max()) != core::cmp::Ordering::Greater => {
+                if met.len() as u64 >= entries {
+                    // Its keys lie in no more domains than it has entries.
+                    return entries;
+                }
+                end = policy.domain_end(&next);
+            }
+            _ => break,
+        }
+    }
+    domains.extend(met);
+    0
+}
+
+/// What the rows of `table` a merge rewrites put through the output writer
+/// `probe`, read from them: those of its blocks past a restriction, which the
+/// merge reads, and the field columns its cell rows hold, taken into `cells`
+/// when the outputs split them.
+fn read_table_load(
+    table: &Table,
+    opts: &Options,
+    probe: &crate::table::multi_writer::BoundProbe,
+    cells: &mut crate::table::writer::CellShapes,
+) -> crate::Result<crate::table::writer::RewriteLoad> {
+    let cmp = opts.config.comparator.as_ref();
+    let split_cells = probe.splits_cells();
+    let pace = input_pacer(opts);
+    let mut load = crate::table::writer::RewriteLoad::default();
+    for handle in table.maintenance_index_walk().with_pace(Arc::clone(&pace)) {
+        let handle = handle?;
+        if table
+            .restrict_lower_bound()
+            .is_some_and(|bound| cmp.compare(handle.end_key(), bound) == core::cmp::Ordering::Less)
+        {
+            continue;
+        }
+        if let Some(block) = table.load_data_block_for_maintenance(handle.as_ref(), &*pace)? {
+            let wants_key = probe.hashes_read_keys();
+            block.try_for_each_shape(opts.config.comparator.clone(), |entry| {
+                let hashes = if wants_key {
+                    probe.filter_hashes_bound(&entry.key())
+                } else {
+                    1
+                };
+                load.take_entry(
+                    entry.key_len as u64,
+                    entry.value.len() as u64,
+                    entry.seqno,
+                    hashes,
+                );
+                if split_cells && entry.value_type.is_cell_row() {
+                    cells.take_row(entry.value);
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(load)
+}
+
 /// Reserves the room the merge of `payload` takes, narrowing it to a minimal
 /// reclaiming subset when it does not fit.
 ///
@@ -724,10 +984,9 @@ pub(crate) fn merge_would_fit(
 /// write, consuming the flush floor if it must, which breaks the deadlock of
 /// a merge that frees space and has none to start in.
 ///
-/// The tables are bounded by the bytes of the inputs' files (a tight-space
-/// restricted input by its live suffix: the punched prefix is superseded and
-/// never rewritten), the blob files by the physical size of the stale ones
-/// selected for relocation. A compaction filter or merge operator may write
+/// The tables are bounded from the inputs' entries as the output writer
+/// writes them (see [`recorded_table_demand`]), the blob files by the
+/// physical size of the stale ones selected for relocation. A compaction filter or merge operator may write
 /// more: the merge takes the excess on as its outputs land, or stops (see
 /// [`super::capacity::Reservation::landed`]).
 ///
@@ -765,19 +1024,21 @@ fn space_gate_for_merge(
     // payload) the stale blob relocation set, so a narrowed merge can fit where
     // the full one did not. Stat failures propagate (a silent 0 would undercount
     // and admit the very rewrite this gate must block).
+    // What the outputs take is bounded by a writer of their settings, which a
+    // narrowed merge shares with the one it narrows.
+    let probe = super::flavour::output_bound_probe(version, opts, payload, &rc)?;
     let demand = |p: &CompactionPayload| -> crate::Result<(u64, u64)> {
-        let sst_sigma: u64 = p
-            .table_ids
-            .iter()
-            .filter_map(|&id| version.get_table(id))
-            .try_fold(0u64, |acc, t| t.live_file_size().map(|size| acc + size))?;
-        let blob_sigma: u64 = match &opts.config.kv_separation_opts {
-            Some(blob_opts) => pick_blob_files_to_rewrite(&p.table_ids, version, blob_opts)?
-                .iter()
-                .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?,
-            None => 0,
+        let stale = match &opts.config.kv_separation_opts {
+            Some(blob_opts) => pick_blob_files_to_rewrite(&p.table_ids, version, blob_opts)?,
+            None => Vec::new(),
         };
-        Ok((sst_sigma, blob_sigma))
+        let blob_sigma = stale
+            .iter()
+            .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?;
+        Ok((
+            recorded_table_demand(version, opts, p, &probe, &stale)?,
+            blob_sigma,
+        ))
     };
     let reserve = |bytes: (u64, u64), dest_level: u8| {
         with_merge_demands(&opts.config, dest_level, bytes, |demands| {
@@ -1712,17 +1973,6 @@ pub(super) fn cancelled_compaction() -> crate::Error {
     ))
 }
 
-/// One slice of a tight-space pass: the key it ends before (`None` for the
-/// last, which runs to the end of the inputs), and the bytes it writes to
-/// the tables and to the blob files.
-#[cfg(feature = "std")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TightSlice {
-    end: Option<UserKey>,
-    tables: u64,
-    blobs: u64,
-}
-
 /// The most bytes a slice may write: to the tables, to the blob files, and
 /// to both together (a volume they share, and the tree's quota).
 #[cfg(feature = "std")]
@@ -1733,24 +1983,99 @@ struct SliceCaps {
     total: u64,
 }
 
-/// The tables a slice writes: one is opened for every `target_size` bytes,
-/// and one more on every key of `cut_keys` (in key order) the slice passes.
+/// The tables a slice writes: as `probe`, which holds the settings of the
+/// writer that writes them, bounds them, one more on every key of `cut_keys`
+/// (in key order) the slice passes, each holding the range tombstones of
+/// `tombstones`. No table or blob file spans two of `domains`, so each domain
+/// past the first a slice's keys lie in opens its outputs again.
 #[cfg(feature = "std")]
 struct SliceOutputs<'a> {
-    target_size: u64,
+    probe: &'a crate::table::multi_writer::BoundProbe,
+    tombstones: crate::table::writer::RewriteLoad,
     cut_keys: &'a [UserKey],
+    domains: Option<&'a dyn crate::KeyDomains>,
 }
 
 /// What a relocating pass moves: the frames its inputs point at in the
 /// `stale` blob files, written into files of `target_size` bytes split into
 /// chunks of `chunk_size`, a file for each of `file_groups` codecs and
-/// lifetime classes at once.
+/// lifetime classes at once. A file of copied frames holds the dictionary of
+/// its own their source holds: the bytes `own_dictionaries` gives for the
+/// first file of each such source a slice relocates values out of, in each
+/// of `groups` lifetime classes and key domains, and at most
+/// `largest_dictionary` for every file a target's worth of frames opens past
+/// it. The values of the `rewritten` files may be written anew without their
+/// dictionary, as large as they are raw, and so is every inline value of at
+/// least `fresh_threshold` bytes: into a file of their own, which may build a
+/// dictionary of `fresh_dictionary` bytes.
 #[cfg(feature = "std")]
-struct Relocated<'a> {
-    stale: &'a HashSet<BlobFileId>,
+struct Relocated {
+    stale: HashSet<BlobFileId>,
+    rewritten: HashSet<BlobFileId>,
     target_size: u64,
     chunk_size: u32,
     file_groups: u64,
+    groups: u64,
+    own_dictionaries: crate::HashMap<BlobFileId, u64>,
+    fresh_threshold: u64,
+    fresh_dictionary: u64,
+    largest_dictionary: u64,
+}
+
+#[cfg(feature = "std")]
+impl Relocated {
+    /// What a relocation of the `stale` files writes under `opts`.
+    fn new(stale: &[BlobFile], opts: &crate::KvSeparationOptions) -> Self {
+        let groups = u64::from(opts.lifetime_groups.get());
+        // A file for each codec of the sources.
+        let mut codecs: Vec<crate::CompressionType> = Vec::new();
+        let mut largest_dictionary = 0;
+        let mut own_dictionaries = crate::HashMap::default();
+        for file in stale {
+            if !codecs.contains(&file.compression()) {
+                codecs.push(file.compression());
+            }
+            let bytes = file.own_dictionary_bytes();
+            largest_dictionary = largest_dictionary.max(bytes);
+            if file.has_own_dictionary() {
+                own_dictionaries.insert(file.id(), bytes);
+            }
+        }
+        // The values a pass writes anew go to a file of one more codec, which
+        // may build a dictionary of its own: an inline value the separation
+        // threshold now reaches (written before it came down to it, or by the
+        // filter or the merge operator), and, past the sources whose
+        // dictionaries a pass keeps with their frames, a source's values
+        // without it. Which sources those are depends on the order the pass
+        // meets them, so every one may be.
+        let mut file_groups = codecs.len() as u64;
+        let fresh_dictionary = u64::from(opts.file_dictionary);
+        // The file of values written anew is counted once its first value is:
+        // here for a pass that may write a source's values anew, by the
+        // slice for one whose first fresh value comes past it.
+        let rewritten =
+            if own_dictionaries.len() > crate::vlog::blob_file::multi_writer::MAX_COPY_SOURCES {
+                file_groups += 1;
+                largest_dictionary = largest_dictionary.max(fresh_dictionary);
+                own_dictionaries.keys().copied().collect()
+            } else {
+                HashSet::default()
+            };
+        Self {
+            stale: stale.iter().map(BlobFile::id).collect(),
+            rewritten,
+            target_size: opts.file_target_size,
+            // The output files are written with the sizes the options give
+            // now, which may chunk a value its source file holds in a block.
+            chunk_size: opts.frame_sizes().chunk_size,
+            file_groups: file_groups * groups,
+            groups,
+            own_dictionaries,
+            fresh_threshold: u64::from(opts.separation_threshold),
+            fresh_dictionary,
+            largest_dictionary,
+        }
+    }
 }
 
 /// A blob file's metadata past its frames, short of its two keys: the block
@@ -1763,277 +2088,351 @@ const BLOB_META_BYTES: u64 = 1_024;
 /// frames' headers included, for a value with frames of its own; for a value
 /// that shares a block, which is re-encoded, its entry and a frame header the
 /// copy may open, or, when the value is above `chunk_size` (a tree reopened
-/// with a smaller one), a head with its chunk table and a header per chunk.
-/// A block's share is its uncompressed entry, which compression only shrinks.
-/// Each frame the copy writes also takes an entry of the output file's frame
+/// with a smaller one), a head with its chunk table and a row per chunk.
+/// A block's share is its uncompressed entry, which compression only shrinks;
+/// a packed record may hold its value compressed, so its record and the
+/// value it decodes to bound what the copy writes of it. Each frame and
+/// chunk the copy writes also takes an entry of the output file's frame
 /// index: a value with frames of its own is split into chunks of at least
 /// [`MIN_CHUNK_SIZE`](crate::vlog::blob_file::writer::MIN_CHUNK_SIZE), which
 /// bounds how many it has.
 #[cfg(feature = "std")]
 fn frame_bytes(indirection: &crate::blob_tree::handle::BlobIndirection, chunk_size: u32) -> u64 {
     use crate::blob_tree::handle::Stored;
-    use crate::vlog::blob_file::{frame::FRAME_HEADER_LEN, writer::MIN_CHUNK_SIZE};
+    use crate::vlog::blob_file::{
+        frame::{CHUNK_ROW_LEN, FRAME_HEADER_LEN},
+        writer::MIN_CHUNK_SIZE,
+    };
 
-    /// A head's chunk table: the chunk size and the chunk count.
+    /// A head's chunk table, before its rows: the chunk size and the count.
     const CHUNK_TABLE_LEN: u64 = 8;
     /// A frame's entry in the file's frame index: its offset.
     const INDEX_ENTRY_LEN: u64 = 8;
 
-    match indirection.stored {
+    let entry = match indirection.stored {
         // Copied as those frames, under the same codec: at most a head and
         // a chunk per smallest chunk of the value.
         Stored::Frames(bytes) => {
             let frames = 1 + u64::from(indirection.size.div_ceil(MIN_CHUNK_SIZE));
-            u64::from(bytes) + INDEX_ENTRY_LEN * frames
+            return u64::from(bytes) + INDEX_ENTRY_LEN * frames;
         }
-        Stored::InBlock(bytes) if indirection.size > chunk_size => {
-            let frames = 1 + u64::from(indirection.size.div_ceil(chunk_size));
-            u64::from(bytes)
-                + (FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN) * frames
-                + CHUNK_TABLE_LEN
-        }
-        Stored::InBlock(bytes) => u64::from(bytes) + FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN,
+        Stored::InBlock(bytes) => u64::from(bytes),
+        Stored::Packed(record) => u64::from(record) + u64::from(indirection.size),
+    };
+    let head = entry + FRAME_HEADER_LEN as u64 + INDEX_ENTRY_LEN;
+    if indirection.size > chunk_size {
+        let chunks = u64::from(indirection.size.div_ceil(chunk_size));
+        head + CHUNK_TABLE_LEN + chunks * (CHUNK_ROW_LEN as u64 + INDEX_ENTRY_LEN)
+    } else {
+        head
     }
 }
 
-/// The bytes of the blob frames `item` points at in the `stale` files, which
-/// a relocation into files written with `chunk_size` copies: its own value,
-/// or the references among its cells.
+/// At most the bytes the relocated copy of the value `indirection` names,
+/// under a key of `key_len` bytes, takes as `relocated` writes it: its
+/// frames as [`frame_bytes`] bounds them, or, for a value of a source whose
+/// dictionary the pass may leave behind, the value written anew, which a
+/// codec that saves nothing stores as it is: its entry raw.
 #[cfg(feature = "std")]
-fn stale_frame_bytes(
-    item: &InternalValue,
-    stale: &HashSet<BlobFileId>,
-    chunk_size: u32,
-) -> crate::Result<u64> {
+fn copy_bytes(
+    indirection: &crate::blob_tree::handle::BlobIndirection,
+    key_len: usize,
+    relocated: &Relocated,
+) -> u64 {
+    let copied = frame_bytes(indirection, relocated.chunk_size);
+    if !relocated
+        .rewritten
+        .contains(&indirection.vhandle.blob_file_id)
+    {
+        return copied;
+    }
+    copied.max(anew_bytes(indirection.size, key_len, relocated.chunk_size))
+}
+
+/// At most the bytes a value of `size` bytes under a key of `key_len` bytes
+/// takes written anew into a blob file of `chunk_size`: a codec that saves
+/// nothing stores it as it is, a record or an entry of a block, whichever
+/// header is the larger, as much as a frame of its own takes.
+#[cfg(feature = "std")]
+fn anew_bytes(size: u32, key_len: usize, chunk_size: u32) -> u64 {
+    use crate::blob_tree::handle::{BlobIndirection, Stored};
+    use crate::vlog::{
+        ValueHandle,
+        blob_file::{frame::ENTRY_HEADER_LEN, packed::RECORD_HEADER_LEN},
+    };
+
+    // Past `u32` the bound is past any room.
+    let raw = ENTRY_HEADER_LEN.max(RECORD_HEADER_LEN) + key_len + size as usize;
+    let anew = BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 0,
+            frame: 0,
+            index: 0,
+        },
+        size,
+        stored: Stored::InBlock(u32::try_from(raw).unwrap_or(u32::MAX)),
+    };
+    frame_bytes(&anew, chunk_size)
+}
+
+/// What a slice, or the blocks ending on one key, writes: the entries its
+/// tables hold, the field columns its cell rows open, the blob files its rows
+/// point into and the keys it passes that end an output, its bytes to the
+/// blob files, whether it writes an inline value anew into one (`fresh`), the
+/// stale sources holding a dictionary of their own it relocates values out of
+/// and those dictionaries' bytes, and the key domains
+/// its keys lie in and those its relocated values lie in, each by the first
+/// key past it (`None` for the last domain).
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct SliceLoad {
+    rows: crate::table::writer::RewriteLoad,
+    cells: crate::table::writer::CellShapes,
+    links: HashSet<BlobFileId>,
+    cut_keys: u64,
+    blobs: u64,
+    fresh: bool,
+    dictionaries: HashSet<BlobFileId>,
+    dictionary_bytes: u64,
+    table_domains: HashSet<Option<UserKey>>,
+    blob_domains: HashSet<Option<UserKey>>,
+}
+
+/// A [`SliceLoad`] counted: what its tables hold, the field columns and the
+/// blob files of it included, the keys it passes that end an output, its
+/// bytes to the blob files, whether it writes values anew, its dictionaries'
+/// bytes and how many key domains its keys and its relocated values lie in.
+#[cfg(feature = "std")]
+#[derive(Clone)]
+struct SliceMeasure {
+    rows: crate::table::writer::RewriteLoad,
+    cut_keys: u64,
+    blobs: u64,
+    fresh: bool,
+    dictionary_bytes: u64,
+    table_domains: u64,
+    blob_domains: u64,
+}
+
+/// The field columns and blob files a slice takes, and whether it writes a
+/// value anew, past what it `known`s already: where an entry's new columns,
+/// links and first fresh value go.
+#[cfg(feature = "std")]
+struct NewShapes<'a> {
+    known_links: &'a HashSet<BlobFileId>,
+    known_cells: &'a crate::table::writer::CellShapes,
+    known_fresh: bool,
+    links: &'a mut HashSet<BlobFileId>,
+    cells: &'a mut crate::table::writer::CellShapes,
+    fresh: &'a mut bool,
+}
+
+/// What an entry read off an input, of `value_type` at `seqno` with a user
+/// key of `key_len` bytes and `value`, puts into a slice: an entry of its
+/// tables in `rows`, registering `filter_hashes` hashes, the field columns of
+/// a cell row when the outputs split those (`split_cells`), the blob files its
+/// value or references point into and, as owned, every object its cells
+/// reference; and, in a relocating pass, the bytes the frames it points at in
+/// the files `relocated` moves take as it writes them. Columns and blob files
+/// the slice holds already are not taken again (`shapes`). Each of those
+/// files holding a dictionary of its own goes into `dictionaries`, the sources
+/// whose dictionary the copy may hold. An inline value of at least the
+/// threshold `relocated` writes anew leaves a pointer in its table, and its
+/// bytes written raw go to the blob files. Returns the bytes to the blob
+/// files, and whether the entry opened a column, linked a blob file or wrote
+/// a value anew where the slice had not.
+#[cfg(feature = "std")]
+fn take_entry(
+    rows: &mut crate::table::writer::RewriteLoad,
+    shapes: NewShapes<'_>,
+    (value_type, seqno, key_len, value): (crate::ValueType, crate::SeqNo, usize, &[u8]),
+    filter_hashes: u64,
+    split_cells: bool,
+    relocated: Option<&Relocated>,
+    dictionaries: &mut Vec<BlobFileId>,
+) -> crate::Result<(u64, bool)> {
     use crate::blob_tree::field_row::{RowCell, decode_row};
     use crate::blob_tree::handle::BlobIndirection;
-    use crate::coding::Decode;
 
-    if item.key.value_type.is_indirection() {
-        let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
-        return Ok(if stale.contains(&indirection.vhandle.blob_file_id) {
-            frame_bytes(&indirection, chunk_size)
-        } else {
-            0
-        });
+    let value_len = value.len() as u64;
+    if !value_type.is_indirection() && !value_type.is_cell_row() {
+        // A value the pass writes anew into a blob file leaves its pointer in
+        // the table; any other plain value points into no blob file and opens
+        // no column.
+        if let Some(relocated) = relocated
+            && value_type == crate::ValueType::Value
+            && value_len >= relocated.fresh_threshold
+        {
+            rows.take_entry(
+                key_len as u64,
+                BlobIndirection::MAX_ENCODED_LEN,
+                seqno,
+                filter_hashes,
+            );
+            rows.owned_blob_objects += 1;
+            let first = !shapes.known_fresh && !*shapes.fresh;
+            *shapes.fresh = true;
+            // A value is at most `u32::MAX` bytes, the blob format's limit.
+            let size = u32::try_from(value_len).unwrap_or(u32::MAX);
+            return Ok((anew_bytes(size, key_len, relocated.chunk_size), first));
+        }
+        rows.take_entry(key_len as u64, value_len, seqno, filter_hashes);
+        return Ok((0, false));
     }
-    if item.key.value_type.is_cell_row() {
+    let NewShapes {
+        known_links,
+        known_cells,
+        links,
+        cells,
+        ..
+    } = shapes;
+    let mut grew = false;
+    // The bytes to the blob files, and whether the pass writes the pointer
+    // anew: a value it moves gets another file, frame and stored length, so
+    // its new pointer may be longer than the one read.
+    let mut reference = |links: &mut HashSet<BlobFileId>, indirection: &BlobIndirection| {
+        let source = indirection.vhandle.blob_file_id;
+        if !known_links.contains(&source) && links.insert(source) {
+            grew = true;
+        }
+        let Some(relocated) = relocated.filter(|r| r.stale.contains(&source)) else {
+            return (0, false);
+        };
+        if relocated.own_dictionaries.contains_key(&source) {
+            dictionaries.push(source);
+        }
+        (copy_bytes(indirection, key_len, relocated), true)
+    };
+    if value_type.is_indirection() {
+        let indirection = BlobIndirection::decode_slice(value)?;
+        let (bytes, anew) = reference(links, &indirection);
+        let pointer = if anew {
+            indirection.longest_moved().max(value_len)
+        } else {
+            value_len
+        };
+        rows.take_entry(key_len as u64, pointer, seqno, filter_hashes);
+        return Ok((bytes, grew));
+    }
+    if value_type.is_cell_row() {
         let mut bytes = 0;
-        for field in decode_row(&item.value)? {
-            if let RowCell::Ref { indirection, .. } = field.cell
-                && stale.contains(&indirection.vhandle.blob_file_id)
-            {
-                bytes += frame_bytes(&indirection, chunk_size);
+        // What the row's pointers written anew may grow by.
+        let mut growth = 0;
+        for field in decode_row(value)? {
+            // Every reference counts as owned: the end of its key may pass a
+            // dropped version's object to the row, after it was counted.
+            if let RowCell::Ref { indirection, .. } = field.cell {
+                let (copied, anew) = reference(links, &indirection);
+                bytes += copied;
+                if anew {
+                    // No encoding is longer than the longest.
+                    growth += indirection.longest_moved() - indirection.encoded_len();
+                }
+                rows.owned_blob_objects += 1;
             }
         }
-        return Ok(bytes);
+        rows.take_entry(key_len as u64, value_len + growth, seqno, filter_hashes);
+        let opened = split_cells && cells.take_row_past(value, known_cells);
+        return Ok((bytes, grew || opened));
     }
-    Ok(0)
+    rows.take_entry(key_len as u64, value_len, seqno, filter_hashes);
+    Ok((0, false))
 }
 
-/// The slices a tight-space pass of `inputs` runs in, each within `caps`
-/// as far as its blocks allow, and what each writes.
-///
-/// A block weighs its share of its table's file, index and filter included,
-/// and, in a relocating pass, the frames its entries point at in the stale
-/// blob files, which the slice relocates: values are not spread evenly over
-/// the keys, so a share of the table's bytes says nothing of a share of
-/// theirs. A slice's tables weigh their blocks and the bytes each table it
-/// opens holds past them, as `outputs` counts them. A slice ends before the
-/// block that would take it past a cap, on the last key of the block
-/// before. The key it ends on goes to the next slice, so that one counts the
-/// entries of that key again, read from the blocks ending on it. A block of
-/// a restricted input below its restriction is punched and writes nothing.
-///
-/// The index and block reads go through `pace`, the run's input pacer: they
-/// are the run's reads as much as the merge's are.
 #[cfg(feature = "std")]
-fn tight_slices(
-    inputs: &[Table],
-    caps: SliceCaps,
-    outputs: &SliceOutputs<'_>,
-    relocated: Option<&Relocated<'_>>,
-    comparator: &crate::comparator::SharedComparator,
-    pace: &crate::table::util::Pacer,
-) -> crate::Result<Vec<TightSlice>> {
-    /// The blocks ending on one key: what they write, and where they lie as
-    /// the input, the block and the input's bytes per data byte.
-    struct Block<'a> {
-        end_key: UserKey,
-        tables: u64,
-        blobs: u64,
-        sources: Vec<(&'a Table, crate::table::BlockHandle, (u64, u64))>,
-    }
-
-    /// The bytes a table writes for an entry, at the most: its key and value
-    /// and what frames them in a block.
-    const ENTRY_FRAMING: u64 = 32;
-
-    let cmp = comparator.as_ref();
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut longest_key = 0u64;
-    // What a table holds past its blocks and the sections that grow with
-    // them, at the least the inputs show: the bytes every table takes
-    // however few blocks it holds. The rest of a table's bytes go with its
-    // blocks, in each block's share of the file.
-    let mut fixed: Option<u64> = None;
-    for input in inputs {
-        let handles = input
-            .maintenance_index_walk()
-            .with_pace(Arc::clone(pace))
-            .collect::<crate::Result<Vec<_>>>()?;
-        // Bounded by the file's length.
-        let data_bytes: u64 = handles.iter().map(|h| u64::from(h.size())).sum();
-        // A file shorter than its sections says nothing of the rest.
-        if let Some(past_blocks) = input
-            .file_len()
-            .checked_sub(data_bytes)
-            .and_then(|past| past.checked_sub(input.data_scaled_section_bytes()))
-        {
-            fixed = Some(fixed.map_or(past_blocks, |least| least.min(past_blocks)));
-        }
-        for handle in handles {
-            let end_key = handle.end_key().clone();
-            if input
-                .restrict_lower_bound()
-                .is_some_and(|bound| cmp.compare(&end_key, bound) == core::cmp::Ordering::Less)
-            {
-                continue;
-            }
-            // The block's share of the file: at most the file's length.
-            let tables = u64::try_from(
-                u128::from(handle.size()) * u128::from(input.file_len())
-                    / u128::from(data_bytes.max(1)),
-            )
-            .unwrap_or(u64::MAX);
-            let mut blobs = 0u64;
-            if let Some(relocated) = relocated
-                && let Some(block) =
-                    input.load_data_block_for_maintenance(handle.as_ref(), &**pace)?
-            {
-                block.try_for_each_entry(comparator.clone(), |item| {
-                    longest_key = longest_key.max(item.key.user_key.len() as u64);
-                    // Bounded by the stale files' bytes.
-                    blobs += stale_frame_bytes(&item, relocated.stale, relocated.chunk_size)?;
-                    Ok(())
-                })?;
-            }
-            blocks.push(Block {
-                end_key,
-                tables,
-                blobs,
-                sources: alloc::vec![(
-                    input,
-                    *handle.as_ref(),
-                    (input.file_len(), data_bytes.max(1)),
-                )],
-            });
-        }
-    }
-    blocks.sort_by(|a, b| cmp.compare(&a.end_key, &b.end_key));
-    // Blocks ending on one key go into one slice together: a slice ends on a
-    // key, not between the inputs that hold it.
-    let mut grouped: Vec<Block> = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        match grouped.last_mut() {
-            Some(group)
-                if cmp.compare(&group.end_key, &block.end_key) == core::cmp::Ordering::Equal =>
-            {
-                group.tables += block.tables;
-                group.blobs += block.blobs;
-                group.sources.extend(block.sources);
-            }
-            _ => grouped.push(block),
-        }
-    }
-    let mut blocks = grouped;
-    let fixed = fixed.unwrap_or(0);
-    // A table opened on a cut key weighs on the block that passes it.
-    let mut cut_keys = outputs.cut_keys.iter().peekable();
-    for block in &mut blocks {
-        while cut_keys
-            .next_if(|key| cmp.compare(key, &block.end_key) != core::cmp::Ordering::Greater)
-            .is_some()
-        {
-            block.tables += fixed;
+impl SliceLoad {
+    /// Takes `source` into the sources it relocates values out of.
+    fn add_dictionary(&mut self, source: BlobFileId, relocated: Option<&Relocated>) {
+        if self.dictionaries.insert(source) {
+            self.dictionary_bytes += relocated
+                .and_then(|r| r.own_dictionaries.get(&source))
+                .copied()
+                .unwrap_or(0);
         }
     }
 
-    // Every sum is bounded by the inputs' and the stale files' bytes. The
-    // first table of a slice and every one past a target's worth of blocks
-    // weigh their fixed bytes too. The destination level encodes the blocks
-    // its own way (codec, filter, where blocks end), which an input's share
-    // of its file does not bound: a sixteenth more is kept for it. The blob
-    // frames go across as they lie and need none.
-    let with_tables = |tables: u64| {
-        let tables = tables + tables / 16;
-        tables + fixed * (1 + tables / outputs.target_size.max(1))
-    };
-    // Each output blob file closes with its metadata, its first and last keys
-    // among it: a file per target's worth of frames, and one more for each
-    // codec and lifetime class the slice's frames may go to.
-    let with_blobs = |blobs: u64| match relocated {
-        Some(relocated) if blobs > 0 => {
-            let files = blobs.div_ceil(relocated.target_size.max(1)) + relocated.file_groups;
-            blobs + files * (BLOB_META_BYTES + 2 * longest_key)
+    /// Takes `other` in.
+    fn absorb(&mut self, other: &Self, relocated: Option<&Relocated>) {
+        self.rows.absorb(&other.rows);
+        self.cells.absorb(&other.cells);
+        self.links.extend(other.links.iter().copied());
+        self.cut_keys += other.cut_keys;
+        self.blobs += other.blobs;
+        self.fresh |= other.fresh;
+        for &source in &other.dictionaries {
+            self.add_dictionary(source, relocated);
         }
-        _ => blobs,
-    };
-    let past = |acc: (u64, u64), block: &Block| {
-        let tables = with_tables(acc.0 + block.tables);
-        let blobs = with_blobs(acc.1 + block.blobs);
-        tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total
-    };
-    // What the entries of the key the blocks of `group` end on write: the
-    // next slice's, once a slice ends on that key.
-    let key_weight = |group: &Block| -> crate::Result<(u64, u64)> {
-        let mut weight = (0u64, 0u64);
-        for &(input, handle, (file_len, data_bytes)) in &group.sources {
-            let Some(block) = input.load_data_block_for_maintenance(&handle, &**pace)? else {
-                continue;
-            };
-            block.try_for_each_entry(comparator.clone(), |item| {
-                if cmp.compare(&item.key.user_key, &group.end_key) != core::cmp::Ordering::Equal {
-                    return Ok(());
-                }
-                let raw = item.key.user_key.len() as u64 + item.value.len() as u64 + ENTRY_FRAMING;
-                // The entry's share of the file, as a block's is: bounded by
-                // the file's length.
-                weight.0 +=
-                    u64::try_from(u128::from(raw) * u128::from(file_len) / u128::from(data_bytes))
-                        .unwrap_or(u64::MAX);
-                if let Some(relocated) = relocated {
-                    weight.1 += stale_frame_bytes(&item, relocated.stale, relocated.chunk_size)?;
-                }
-                Ok(())
-            })?;
-        }
-        Ok(weight)
-    };
-    let mut slices = Vec::new();
-    let mut acc = (0u64, 0u64);
-    // The blocks ending on the key the slice so far ends on.
-    let mut last: Option<&Block> = None;
-    for block in &blocks {
-        if let Some(previous) = last
-            && past(acc, block)
-        {
-            slices.push(TightSlice {
-                end: Some(previous.end_key.clone()),
-                tables: with_tables(acc.0),
-                blobs: with_blobs(acc.1),
-            });
-            acc = key_weight(previous)?;
-        }
-        acc = (acc.0 + block.tables, acc.1 + block.blobs);
-        last = Some(block);
+        self.table_domains
+            .extend(other.table_domains.iter().cloned());
+        self.blob_domains.extend(other.blob_domains.iter().cloned());
     }
-    slices.push(TightSlice {
-        end: None,
-        tables: with_tables(acc.0),
-        blobs: with_blobs(acc.1),
-    });
-    Ok(slices)
+
+    /// This load with `other` taken in, counted, without taking it in.
+    fn measure_with(&self, other: &Self, relocated: Option<&Relocated>) -> SliceMeasure {
+        let new_dictionaries = other
+            .dictionaries
+            .iter()
+            .filter(|source| !self.dictionaries.contains(*source))
+            .filter_map(|source| relocated.and_then(|r| r.own_dictionaries.get(source)))
+            .sum::<u64>();
+        let new = |mine: &HashSet<Option<UserKey>>, theirs: &HashSet<Option<UserKey>>| {
+            (mine.len() + theirs.iter().filter(|d| !mine.contains(*d)).count()) as u64
+        };
+        let mut rows = self.rows;
+        rows.absorb(&other.rows);
+        rows.cell_columns = self.cells.columns_with(&other.cells);
+        rows.linked_blob_files = (self.links.len()
+            + other
+                .links
+                .iter()
+                .filter(|l| !self.links.contains(*l))
+                .count()) as u64;
+        SliceMeasure {
+            rows,
+            cut_keys: self.cut_keys + other.cut_keys,
+            blobs: self.blobs + other.blobs,
+            fresh: self.fresh || other.fresh,
+            dictionary_bytes: self.dictionary_bytes + new_dictionaries,
+            table_domains: new(&self.table_domains, &other.table_domains),
+            blob_domains: new(&self.blob_domains, &other.blob_domains),
+        }
+    }
+}
+
+/// Where the key domain of the keys taken so far ends.
+#[cfg(feature = "std")]
+#[derive(Default)]
+enum DomainEdge {
+    /// No key taken yet.
+    #[default]
+    Unseen,
+    /// The domain runs to the end of the key space.
+    Open,
+    /// The first key past the domain.
+    At(UserKey),
+}
+
+/// Takes `key`, the next of keys in order, into the domains `seen` holds:
+/// a key short of `edge`, where the domain of the key before ends, shares
+/// it, so `domains` is asked once per domain.
+#[cfg(feature = "std")]
+fn enter_domain(
+    domains: &dyn crate::KeyDomains,
+    cmp: &dyn crate::comparator::UserComparator,
+    edge: &mut DomainEdge,
+    seen: &mut HashSet<Option<UserKey>>,
+    key: &[u8],
+) {
+    let inside = match edge {
+        DomainEdge::At(end) => cmp.compare(key, end) == core::cmp::Ordering::Less,
+        DomainEdge::Open => true,
+        DomainEdge::Unseen => false,
+    };
+    if !inside {
+        let domain = domains.domain_end(key);
+        seen.insert(domain.clone());
+        *edge = domain.map_or(DomainEdge::Open, DomainEdge::At);
+    }
 }
 
 /// Builds a per-slice compaction payload over the still-surviving input ids,
@@ -2130,15 +2529,12 @@ fn run_tight_space_compaction(
     // the pass is sure to run, below.
     let estimate = merge_estimate(opts, &latest.version, payload, &inputs, &stale_files, None);
     let stale_ids: Vec<BlobFileId> = stale_files.iter().map(BlobFile::id).collect();
-    // A relocation writes a file for each codec of its sources.
-    let mut codecs: Vec<crate::CompressionType> = Vec::new();
-    for bf in &stale_files {
-        if !codecs.contains(&bf.compression()) {
-            codecs.push(bf.compression());
-        }
-    }
-    let stale_codecs = codecs.len() as u64;
-    drop(stale_files);
+    // What relocating them writes, read off the files before their handles go.
+    let relocation = opts
+        .config
+        .kv_separation_opts
+        .as_ref()
+        .map(|blob_opts| Relocated::new(&stale_files, blob_opts));
     let relocating = !stale_ids.is_empty();
 
     // The reclaim runs through each INPUT's own backend, not the destination's:
@@ -2218,6 +2614,29 @@ fn run_tight_space_compaction(
     let others_at_start =
         crate::storage_stats::compute_used_bytes_but(&latest.version, &own_tables, &own_blobs)?;
     let cut_keys = super::flavour::output_cut_keys(&latest.version, opts, payload);
+    // What the outputs take is bounded by a writer of their settings, and
+    // each slice is given every input tombstone.
+    let probe = super::flavour::output_bound_probe(
+        &latest.version,
+        opts,
+        payload,
+        &opts.runtime_config.load_full(),
+    )?;
+    // The most the whole merge writes to the tables, as the space gate
+    // charges it: no slice holds more room than that.
+    let merge_tables = recorded_table_demand(&latest.version, opts, payload, &probe, &stale_files)?;
+    drop(stale_files);
+    let mut input_tombstones: Vec<&crate::range_tombstone::RangeTombstone> =
+        inputs.iter().flat_map(Table::range_tombstones).collect();
+    input_tombstones.sort();
+    input_tombstones.dedup();
+    let mut tombstones = crate::table::writer::RewriteLoad::default();
+    for rt in input_tombstones {
+        let (start, end) = (rt.start.len() as u64, rt.end.len() as u64);
+        tombstones.range_tombstones += 1;
+        tombstones.range_tombstone_bytes += start + end;
+        tombstones.longest_key = tombstones.longest_key.max(start).max(end);
+    }
 
     drop(latest);
     drop(version_history_lock);
@@ -2266,83 +2685,37 @@ fn run_tight_space_compaction(
             total: dest_free.min(blob_free).min(quota_headroom).max(1),
         }
     };
-    let stale_set: HashSet<BlobFileId> = stale_ids.iter().copied().collect();
-    let relocated = relocating_blobs.then(|| Relocated {
-        stale: &stale_set,
-        target_size: opts
-            .config
-            .kv_separation_opts
-            .as_ref()
-            .map_or(u64::MAX, |blob_opts| blob_opts.file_target_size),
-        // The output files are written with the sizes the options give now,
-        // which may chunk a value its source file holds in a block.
-        chunk_size: opts
-            .config
-            .kv_separation_opts
-            .as_ref()
-            .map_or(u32::MAX, |blob_opts| blob_opts.frame_sizes().chunk_size),
-        file_groups: stale_codecs
-            * opts
-                .config
-                .kv_separation_opts
-                .as_ref()
-                .map_or(1, |blob_opts| u64::from(blob_opts.lifetime_groups.get())),
-    });
-    let outputs = SliceOutputs {
-        target_size: payload.target_size,
+    let relocated = relocation.filter(|_| relocating_blobs);
+    let slice_outputs = SliceOutputs {
+        probe: &probe,
+        tombstones,
         cut_keys: &cut_keys,
+        domains: opts.config.key_domains.as_deref(),
     };
-    let slices = tight_slices(
-        &inputs,
-        caps,
-        &outputs,
-        relocated.as_ref(),
-        &comparator,
-        &input_pacer(opts),
-    )?;
-    let Some((tail, slices)) = slices.split_last() else {
-        return Ok(CompactionResult::nothing());
-    };
-    // A slice past the caps (a block, or the blocks of one key, alone past
-    // them) cannot be cut any finer: it would write past the room the pass
-    // found. The pass runs the slices before it, which free room as they go,
-    // and stops there; one that comes first leaves the pass nothing to run.
-    // A single slice within them is the whole merge, in one go.
-    let past_caps = |slice: &TightSlice| {
-        slice.tables > caps.tables
-            || slice.blobs > caps.blobs
-            || slice.tables + slice.blobs > caps.total
-    };
-    if past_caps(slices.first().unwrap_or(tail)) {
-        return Ok(CompactionResult::nothing());
-    }
+    // Recorded once the first slice takes a key: the pass is sure to run then.
+    let mut estimate = Some(estimate);
 
-    opts.work.plan(estimate);
-
-    // Each slice holds the room it takes, so the compactions sharing the pool
-    // count it: the tables its blocks rewrite and the stale frames they
-    // relocate, as the slices were cut.
+    // Each slice holds the room it may take, so the compactions sharing the
+    // pool count it, and its merge writes no further than that room lets it
+    // (see `governor`): the caps less what the others took since the pass
+    // measured them.
     //
-    // Checked as each slice starts, in one step with taking it: the caps were
-    // what was free past what the other compactions sharing the pool held
-    // when the pass measured it, and another may have taken that room since,
-    // or between two slices. Only their holds are checked: the pass's own
-    // slices write ahead of the punches that free their inputs, so its room
-    // between slices is not what it measured and is not the question. A slice
-    // the others left no room for ends the pass there, its installed slices
-    // kept; the next compaction picks up the rest. What a slice writes past
-    // its room it takes on as it lands, under the quota as it stands then and
-    // short of the flush floor, or the pass stops. The quota a slice is
-    // checked against is the one the pass was cut for, less what the files
-    // it neither reads nor writes (`own_tables`, `own_blobs`) have grown by
-    // since: a flush, another compaction.
-    let reserve_slice = |slice: &TightSlice,
-                         own_tables: &HashSet<TableId>,
-                         own_blobs: &HashSet<BlobFileId>|
-     -> crate::Result<bool> {
-        if past_caps(slice) {
-            return Ok(false);
-        }
+    // Taken as each slice starts, in one step with checking the others'
+    // holds: the caps were what was free past what the other compactions
+    // sharing the pool held when the pass measured it, and another may have
+    // taken some of that since, or between two slices. Only their holds count:
+    // the pass's own slices write ahead of the punches that free their
+    // inputs, so its room between slices is not what it measured and is not
+    // the question. A slice the others left no room for ends the pass there,
+    // its installed slices kept; the next compaction picks up the rest. What a
+    // slice writes past its room it takes on as it lands, under the quota as
+    // it stands then and short of the flush floor, or the pass stops. The
+    // quota a slice is held to is the one the pass was cut for, less what the
+    // files it neither reads nor writes (`own_tables`, `own_blobs`) have grown
+    // by since: a flush, another compaction.
+    let slice_room = |own_tables: &HashSet<TableId>,
+                      own_blobs: &HashSet<BlobFileId>|
+     -> crate::Result<Option<SliceCaps>> {
         let quota_headroom = match quota_limit {
             Some(limit) => {
                 let others = crate::storage_stats::compute_used_bytes_but(
@@ -2357,18 +2730,6 @@ fn run_tight_space_compaction(
             }
             None => u64::MAX,
         };
-        let demands = [
-            super::capacity::Demand {
-                fs: &*dest_fs,
-                path: &dest_path,
-                bytes: slice.tables,
-            },
-            super::capacity::Demand {
-                fs: &*opts.config.fs,
-                path: &blob_dir,
-                bytes: slice.blobs,
-            },
-        ];
         #[cfg(all(test, feature = "std"))]
         {
             let squeeze = opts
@@ -2387,36 +2748,83 @@ fn run_tight_space_compaction(
                 ));
             }
         }
-        // What the others may hold on each volume: what they held when the
-        // pass measured it, and what room a slice left past it then, both of
-        // its demands taken from a volume they share. The slack is never
-        // below none.
-        let (tables_room, blobs_room) = if shared_volume {
-            let both = slice.tables + slice.blobs;
-            (both, both)
-        } else {
-            (slice.tables, slice.blobs)
-        };
-        let [tables, blobs] = demands;
-        let within = [
-            (tables, dest_held + dest_free.saturating_sub(tables_room)),
-            (blobs, blob_held + blob_free.saturating_sub(blobs_room)),
-        ];
         // The slice before is installed: what it held is not the others'.
         opts.outputs.release_room();
+        // What the others hold on each volume now, and took since the pass
+        // measured it: room no slice has any more. Neither is ever below
+        // what they held then, short of a release, which gives none back to
+        // the caps (clamped at none).
+        let dest_now = opts.capacity.held_on(&*dest_fs, &dest_path);
+        let blob_now = opts.capacity.held_on(&*opts.config.fs, &blob_dir);
+        let quota_room = quota_headroom.saturating_sub(opts.capacity.quota_held(opts.tree_id));
+        let room = if shared_volume {
+            SliceCaps {
+                tables: caps.tables,
+                blobs: caps.blobs,
+                total: caps
+                    .total
+                    .saturating_sub(dest_now.saturating_sub(dest_held))
+                    .min(quota_room),
+            }
+        } else {
+            SliceCaps {
+                tables: caps
+                    .tables
+                    .saturating_sub(dest_now.saturating_sub(dest_held)),
+                blobs: caps
+                    .blobs
+                    .saturating_sub(blob_now.saturating_sub(blob_held)),
+                total: caps.total.min(quota_room),
+            }
+        };
+        if room.tables == 0 || room.blobs == 0 || room.total == 0 {
+            return Ok(None);
+        }
+        // Held on each volume, together no more than the quota lets nor than
+        // the whole merge writes as the space gate charges it (an unbounded
+        // volume's room is no hold): a slice writes at most its room to each
+        // and the total to both, and what it writes to a volume past its hold
+        // there it takes on as it lands.
+        let blobs_whole = if relocating_blobs {
+            stale_total_bytes
+        } else {
+            0
+        };
+        let (tables_hold, blobs_hold) = if shared_volume {
+            (room.total.min(merge_tables + blobs_whole), 0)
+        } else {
+            let blobs = room.blobs.min(room.total).min(blobs_whole);
+            (room.tables.min(room.total - blobs).min(merge_tables), blobs)
+        };
+        let within = [
+            (
+                super::capacity::Demand {
+                    fs: &*dest_fs,
+                    path: &dest_path,
+                    bytes: tables_hold,
+                },
+                dest_now,
+            ),
+            (
+                super::capacity::Demand {
+                    fs: &*opts.config.fs,
+                    path: &blob_dir,
+                    bytes: blobs_hold,
+                },
+                blob_now,
+            ),
+        ];
         let check = super::capacity::Check {
             quota_headroom,
             floor: super::capacity::Floor::MayConsume,
         };
-        Ok(
-            match opts.capacity.reserve_within(opts.tree_id, &within, check) {
-                Some(room) => {
-                    opts.outputs.reserve(room);
-                    true
-                }
-                None => false,
-            },
-        )
+        Ok(opts
+            .capacity
+            .reserve_within(opts.tree_id, &within, check)
+            .map(|reserved| {
+                opts.outputs.reserve(reserved);
+                room
+            }))
     };
     // Set when a slice no longer fits: the pass ends there.
     let mut stopped = false;
@@ -2467,16 +2875,19 @@ fn run_tight_space_compaction(
     let result = (|| -> crate::Result<usize> {
         let mut tables_out = 0usize;
 
-        // Every slice but the tail ends before a key.
-        for (slice, boundary) in slices
-            .iter()
-            .filter_map(|slice| slice.end.as_ref().map(|end| (slice, end)))
-        {
-            if reclaim_deferred || !reserve_slice(slice, &own_tables, &own_blobs)? {
+        // Every slice but the tail ends before a key, found as it merges.
+        loop {
+            let room = if reclaim_deferred {
+                None
+            } else {
+                slice_room(&own_tables, &own_blobs)?
+            };
+            let Some(room) = room else {
                 stopped = true;
                 return Ok(tables_out);
-            }
-            // Merge [lower, boundary) over the surviving (restricted) input views.
+            };
+            // Merge from `lower` over the surviving (restricted) input views,
+            // as far as the room lets.
             let slice_payload = slice_payload_for(&current_views, payload);
             let version = opts.version_history.read().latest_version();
 
@@ -2500,7 +2911,9 @@ fn run_tight_space_compaction(
                 None
             };
 
-            let span = (lower.clone(), Bound::Excluded(boundary.clone()));
+            // The slice's end is found as it merges: it is planned over what
+            // is left of the inputs.
+            let span = (lower.clone(), Bound::Unbounded);
             // Planned per slice over its current views: a plan holds the views
             // it inherits from, and a view held past its slice would block the
             // punch of its consumed prefix. Held until the slice's install, so
@@ -2513,11 +2926,23 @@ fn run_tight_space_compaction(
                 Some(span.clone()),
                 &rc,
             );
+            let from = match &lower {
+                Bound::Included(key) | Bound::Excluded(key) => Some(key),
+                Bound::Unbounded => None,
+            };
+            let mut governor = governor::SliceGovernor::new(
+                room,
+                &slice_outputs,
+                relocated.as_ref(),
+                &comparator,
+                from,
+            );
             let produced = run_subcompaction(
                 opts,
                 &slice_payload,
                 &version.version,
-                Vec::new(),
+                // Removed when the slice turns out to be the tail.
+                current_views.clone(),
                 &rts,
                 None,
                 span,
@@ -2529,8 +2954,35 @@ fn run_tight_space_compaction(
                 reloc,
                 &rc,
                 filter_sizing.clone(),
+                Some(&mut governor),
             )?;
             drop(version);
+            // A slice whose room holds not even its first key ends the pass;
+            // what it opened is the run's to remove.
+            if governor.took_nothing() && governor.end().is_some() {
+                stopped = true;
+                return Ok(tables_out);
+            }
+            if let Some(estimate) = estimate.take() {
+                opts.work.plan(estimate);
+            }
+            let Some(boundary) = governor.end().cloned() else {
+                // The tail [lower, hi): it removes the inputs, and drops the
+                // now fully consumed stale blob files (install_merge deletes
+                // them outright — the prior slices already punched their
+                // prefixes).
+                drop(filter_sizing);
+                drop(current_stale);
+                let tail_out = produced.created_tables().len();
+                let installed = super::flavour::install_merge(
+                    &mut opts.version_history.write(),
+                    opts,
+                    &slice_payload,
+                    vec![produced],
+                )?;
+                return Ok(tables_out + installed.map_or(0, |_| tail_out));
+            };
+            let boundary = &boundary;
 
             let outputs: Vec<Table> = produced.created_tables().to_vec();
             own_tables.extend(outputs.iter().map(Table::id));
@@ -2947,65 +3399,10 @@ fn run_tight_space_compaction(
             }
 
             if current_views.is_empty() {
-                // Every input was consumed before the last boundary.
+                // Every input was consumed before the slice's end.
                 return Ok(tables_out);
             }
         }
-
-        // Tail [last boundary, hi): merge the remainder, remove the inputs, and
-        // drop the now fully-consumed stale blob files (install_merge deletes
-        // them outright — the prior slices already punched their prefixes).
-        if reclaim_deferred || !reserve_slice(tail, &own_tables, &own_blobs)? {
-            stopped = true;
-            return Ok(tables_out);
-        }
-        let slice_payload = slice_payload_for(&current_views, payload);
-        let version = opts.version_history.read().latest_version();
-        let tail_reloc = if relocating {
-            let current_stale: Vec<BlobFile> = stale_ids
-                .iter()
-                .filter_map(|id| version.version.blob_files.get(*id).cloned())
-                .collect();
-            Some(RelocationSetup {
-                stale_files: current_stale,
-                resume_offsets: resume_offsets.clone(),
-            })
-        } else {
-            None
-        };
-        let produced = run_subcompaction(
-            opts,
-            &slice_payload,
-            &version.version,
-            current_views.clone(),
-            &rts,
-            None,
-            (lower.clone(), Bound::Unbounded),
-            dst_lvl,
-            bottommost_gc,
-            // Slices apply no removal semantics; see the parameter docs.
-            false,
-            &blobs_folder,
-            tail_reloc,
-            &rc,
-            super::flavour::plan_filters(
-                &version.version,
-                opts,
-                &slice_payload,
-                &[],
-                Some((lower.clone(), Bound::Unbounded)),
-                &rc,
-            ),
-        )?;
-        drop(version);
-        let tail_out = produced.created_tables().len();
-        let installed = super::flavour::install_merge(
-            &mut opts.version_history.write(),
-            opts,
-            &slice_payload,
-            vec![produced],
-        )?;
-        Ok(tables_out + installed.map_or(0, |_| tail_out))
     })();
     // Held across every slice's install: the installed outputs name their
     // dictionaries from here on (see `WritePin`).
@@ -3089,6 +3486,9 @@ fn run_subcompaction(
     // The compaction's filter plan, shared by all of its sub-compactions (or
     // slices) so they draw on one reservation of the filter budget.
     filter_sizing: Option<crate::filter_budget::FilterPlan>,
+    // A tight-space slice's governor, which ends the merge where the slice's
+    // room runs out (see `governor`); `None` writes every row in `bounds`.
+    mut governor: Option<&mut governor::SliceGovernor<'_>>,
 ) -> crate::Result<super::flavour::ProducedOutput> {
     use super::flavour::CompactionFlavour;
 
@@ -3118,6 +3518,10 @@ fn run_subcompaction(
         ledger: &ledger,
         error: &ledger_error,
     };
+    // The versions a governed slice's merge drops, until its governor places
+    // them among its rows. Declared before the stream that borrows it.
+    let dropped = core::cell::RefCell::new(Vec::new());
+    let mut drop_queue = governor::DropQueue(&dropped);
 
     // Declared before the stream that borrows it, so it outlives it.
     let completeness = input_completeness_for(version, &payload.table_ids, &opts.config);
@@ -3234,9 +3638,15 @@ fn run_subcompaction(
     }
 
     // KV separation (no relocation on this path): track fragmentation from
-    // dropped/GC'd entries so the merged install updates blob GC stats.
+    // dropped/GC'd entries so the merged install updates blob GC stats. A
+    // governed slice holds them back with its rows: a dropped version past
+    // where it ends is the next slice's to count.
     if opts.config.kv_separation_opts.is_some() {
-        merge_iter = merge_iter.with_drop_callback(&mut ledger_hook);
+        merge_iter = if governor.is_some() {
+            merge_iter.with_drop_callback(&mut drop_queue)
+        } else {
+            merge_iter.with_drop_callback(&mut ledger_hook)
+        };
     }
 
     // Versions that go in and do not come out: read after the stream drops, at
@@ -3336,6 +3746,7 @@ fn run_subcompaction(
             .use_writeback_bytes(opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
             .use_frame_sizes(blob_opts.frame_sizes())
+            .use_dictionary_classes(blob_opts.dictionary_classes)
             .use_clock(opts.config.clock.clone())
             .use_key_domains(
                 opts.config.key_domains.clone(),
@@ -3364,6 +3775,11 @@ fn run_subcompaction(
                     opts.tree_id,
                 )
                 .with_drain_below(drain_below)
+                // Every slice, the last one included, reserves room for the
+                // live values it moves; a block copied whole also writes its
+                // dead ones, which that room does not count, so a slice writes
+                // every value anew.
+                .with_block_copy_share(None)
                 .with_fresh_values(FreshValues {
                     options: blob_opts.clone(),
                     compression: rc.blob_compression,
@@ -3454,9 +3870,29 @@ fn run_subcompaction(
             return Err(cancelled_compaction());
         }
 
-        ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
-        if let Some(e) = ledger_error.borrow_mut().take() {
-            return Err(e);
+        if let Some(governor) = governor.as_deref_mut() {
+            // Whether the row ends its key: the next one is known to start
+            // another.
+            let ends_key = merge_iter.next_starts_key();
+            match governor.decide(&item, ends_key, &dropped)? {
+                governor::Decided::Pass => {
+                    ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
+                }
+                // Nothing was held before a row decided where it came.
+                governor::Decided::End => break,
+                governor::Decided::Hold => {
+                    let go_on = governor.hold(item, starts_key, &dropped)?;
+                    hand_on(governor, &ledger, &mut *emit)?;
+                    if !go_on {
+                        break;
+                    }
+                }
+            }
+        } else {
+            ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
+            if let Some(e) = ledger_error.borrow_mut().take() {
+                return Err(e);
+            }
         }
 
         if idx.is_multiple_of(1_000_000) && opts.stop_signal.is_stopped() {
@@ -3466,6 +3902,10 @@ fn run_subcompaction(
         starts_key = merge_iter.next_starts_key();
     }
     drop(merge_iter);
+    if let Some(governor) = governor.as_deref_mut() {
+        governor.finish(&dropped);
+        hand_on(governor, &ledger, &mut *emit)?;
+    }
 
     if let Some(filter) = compaction_filter {
         filter.finish();
@@ -3487,6 +3927,9 @@ fn run_subcompaction(
         })?,
         _ => super::carry::Carried::default(),
     };
+    if let Some(end) = governor.as_deref().and_then(governor::SliceGovernor::end) {
+        compactor.end_before(end.clone());
+    }
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
     produced.set_released_objects(released_objects);
     produced.set_carried(carried);
@@ -3497,6 +3940,25 @@ fn run_subcompaction(
         produced.mark_collected_below_watermark();
     }
     Ok(produced)
+}
+
+/// Hands what a slice's `governor` lets through to the ownership `ledger`,
+/// in the merge's order: its kept rows on toward `emit`, its dropped
+/// versions into the ledger's accounting.
+#[cfg(feature = "std")]
+fn hand_on(
+    governor: &mut governor::SliceGovernor<'_>,
+    ledger: &core::cell::RefCell<super::ownership::OwnershipLedger>,
+    emit: &mut dyn FnMut(InternalValue, bool) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let mut ledger = ledger.borrow_mut();
+    while let Some(event) = governor.pop_ready() {
+        match event {
+            governor::Event::Kept(item, starts_key) => ledger.admit(item, starts_key, emit)?,
+            governor::Event::Dropped(kv) => ledger.dropped(&kv)?,
+        }
+    }
+    Ok(())
 }
 
 #[expect(
@@ -3663,10 +4125,6 @@ pub(crate) fn pick_blob_files_to_rewrite(
 struct BlobRewrite {
     files: Vec<BlobFile>,
     /// Some of `files` are relocated for locality rather than for staleness.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(dead_code, reason = "read only by the std merge-on-read fast path")
-    )]
     for_locality: bool,
 }
 
@@ -3702,10 +4160,10 @@ fn pick_blob_files_for_merge(
 /// the dictionary each output file records, and the dictionary of the
 /// snapshot's blob policy, with its two-pass setting, encodes the new values.
 #[cfg_attr(
-    not(zstd_any),
+    not(any(zstd_any, feature = "std")),
     expect(
         clippy::missing_const_for_fn,
-        reason = "the zstd build reads the dictionaries"
+        reason = "the zstd build reads the dictionaries, the std build the parallel workers"
     )
 )]
 fn with_fresh_encoding(
@@ -3713,6 +4171,10 @@ fn with_fresh_encoding(
     opts: &Options,
     rc: &crate::runtime_config::RuntimeConfig,
 ) -> BlobFileWriter {
+    // New values and the block values rewritten out of their blocks are
+    // compressed here; copied frames are not.
+    #[cfg(feature = "std")]
+    let writer = writer.use_parallel_compression(opts.config.parallel_compression());
     #[cfg(zstd_any)]
     {
         let dicts = opts.config.current_zstd_dictionaries();
@@ -4284,6 +4746,7 @@ fn merge_tables(
             &pace,
         );
     }
+    let for_locality = blob_rewrite.for_locality;
     let blob_files_to_rewrite = blob_rewrite.files;
 
     // ---- Parallel sub-compaction (std only) ----
@@ -4399,6 +4862,7 @@ fn merge_tables(
                                 None,
                                 &rc,
                                 filter_sizing,
+                                None,
                             );
                             // The receiver outlives every send (it drains N
                             // items below), so this cannot fail.
@@ -4447,6 +4911,7 @@ fn merge_tables(
                                 None,
                                 &rc,
                                 filter_sizing.clone(),
+                                None,
                             )
                         })
                         .collect()
@@ -4706,6 +5171,7 @@ fn merge_tables(
                 .use_writeback_bytes(opts.config.writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
                 .use_frame_sizes(blob_opts.frame_sizes())
+                .use_dictionary_classes(blob_opts.dictionary_classes)
                 .use_clock(opts.config.clock.clone())
                 .use_key_domains(
                     opts.config.key_domains.clone(),
@@ -4730,6 +5196,10 @@ fn merge_tables(
                         opts.config.comparator.clone(),
                         opts.tree_id,
                     )
+                    // A pass that relocates for locality rewrites every value
+                    // in key order: a block copied whole would keep its
+                    // source's place among the files it interleaves with.
+                    .with_block_copy_share((!for_locality).then(|| blob_opts.block_copy_share()))
                     .with_fresh_values(FreshValues {
                         options: blob_opts.clone(),
                         compression: rc.blob_compression,
@@ -5180,6 +5650,9 @@ fn drop_tables(
         work: super::WorkReport::default(),
     })
 }
+
+#[cfg(feature = "std")]
+mod governor;
 
 #[cfg(test)]
 mod tests;

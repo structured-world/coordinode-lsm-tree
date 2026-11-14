@@ -313,6 +313,10 @@ pub struct FaultInjector {
     /// Observed `(path, offset, len)` of every `start_writeback`, in call
     /// order: a writeback changes no byte, so only this shows it was asked.
     writeback_log: spin::Mutex<Vec<(PathBuf, u64, u64)>>,
+    /// Observed `(path, len)` of every sequential `write` that reached the
+    /// inner backend, in call order: how many calls a file's bytes take to
+    /// write is a cost the bytes alone do not show.
+    write_log: spin::Mutex<Vec<(PathBuf, usize)>>,
     /// Observed `(path, offset, len)` of every `punch_hole` that reached the
     /// inner backend, in call order: how many calls a reclaim takes and what
     /// each covers decide what it frees.
@@ -772,6 +776,7 @@ impl FaultInjector {
         self.directory_sync_log.lock().clear();
         self.syncs.lock().clear();
         self.writeback_log.lock().clear();
+        self.write_log.lock().clear();
         self.punch_log.lock().clear();
         #[cfg(test)]
         self.read_hooks.lock().clear();
@@ -833,6 +838,18 @@ impl FaultInjector {
             .iter()
             .filter(|(p, ..)| p.to_string_lossy().contains(substr))
             .map(|&(_, offset, len)| (offset, len))
+            .collect()
+    }
+
+    /// The lengths of the sequential writes that reached the inner backend on
+    /// files whose path contains `substr`, in call order.
+    #[must_use]
+    pub fn writes_for(&self, substr: &str) -> Vec<usize> {
+        self.write_log
+            .lock()
+            .iter()
+            .filter(|(p, _)| p.to_string_lossy().contains(substr))
+            .map(|&(_, len)| len)
             .collect()
     }
 
@@ -1455,6 +1472,17 @@ struct FaultFile {
     injector: Arc<FaultInjector>,
 }
 
+impl FaultFile {
+    /// Records `bytes` written to this file's backend, a shortened write as
+    /// well as a whole one.
+    fn log_write(&self, bytes: usize) {
+        self.injector
+            .write_log
+            .lock()
+            .push((self.path.clone(), bytes));
+    }
+}
+
 impl Drop for FaultFile {
     fn drop(&mut self) {
         self.injector.note_closed(self.handle);
@@ -1489,9 +1517,14 @@ impl std::io::Write for FaultFile {
                 }
                 let (head, _) = buf.split_at(take);
                 self.inner.write_all(head)?;
+                self.log_write(take);
                 Ok(take)
             }
-            None => self.inner.write(buf),
+            None => {
+                let written = self.inner.write(buf)?;
+                self.log_write(written);
+                Ok(written)
+            }
         }
     }
 

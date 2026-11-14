@@ -30,6 +30,22 @@ pub(crate) use slice_bytes::UnfilledSlice;
 #[cfg(feature = "bytes_1")]
 pub use slice_bytes::{Builder, Slice};
 
+/// Where a [`Slice`]'s bytes lie, for what holding it keeps in memory.
+#[cfg_attr(feature = "bytes_1", expect(dead_code, reason = "Bytes tells neither"))]
+pub(crate) enum Allocation {
+    /// In the slice itself.
+    Own,
+    /// In a heap allocation of `len` bytes other slices may share; `id` tells
+    /// it apart from every other allocation live at the same time.
+    Shared { id: usize, len: usize },
+    /// In an allocation whose size is not known.
+    #[cfg_attr(
+        not(feature = "bytes_1"),
+        expect(dead_code, reason = "byteview tells it")
+    )]
+    Unknown,
+}
+
 impl AsRef<[u8]> for Slice {
     fn as_ref(&self) -> &[u8] {
         &self.0

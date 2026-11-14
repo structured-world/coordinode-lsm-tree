@@ -170,6 +170,55 @@ fn the_hint_overrides_the_observed_group() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A flush asks the hint once for each value it separates and for nothing
+/// else: not for a value kept inline or a tombstone, and not twice for a
+/// value it does not compress ahead of the writer, as a chunked one.
+#[test]
+#[cfg(feature = "lz4")]
+fn a_flush_asks_the_hint_once_per_separated_value() -> lsm_tree::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let hint = LifetimeHint::new(move |_: &[u8]| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        None
+    });
+    let tree = Config::new(
+        folder.path(),
+        seqno.clone(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(lsm_tree::CompressionType::Lz4)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(64)
+            .chunk_size(std::num::NonZeroU32::new(4 * 1024).expect("not zero"))
+            .lifetime_hint(hint),
+    ))
+    .open()?;
+
+    for i in 0..5 {
+        let key = format!("separated-{i}");
+        tree.insert(&key, value(&key, 0), seqno.next());
+    }
+    // Chunked: written by the writer itself, not compressed ahead.
+    tree.insert("chunked", vec![7_u8; 20 * 1024], seqno.next());
+    for i in 0..3 {
+        tree.insert(format!("inline-{i}"), b"small".to_vec(), seqno.next());
+    }
+    for i in 0..2 {
+        tree.remove(format!("gone-{i}"), seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+
+    assert_eq!(asked.load(Ordering::Relaxed), 6);
+    Ok(())
+}
+
 /// A value relocated out of a file moves one group up, having outlived it.
 #[test]
 fn relocation_moves_survivors_one_group_up() -> lsm_tree::Result<()> {

@@ -233,6 +233,18 @@ pub struct ParsedMeta {
     /// version), or `None` for tables written before this field existed.
     pub sum_value_bytes: Option<u64>,
 
+    /// Length of the longest user key, and of the longest value, among the
+    /// table's entries, or `None` for tables written before these fields
+    /// existed. What a rewrite of the entries is bounded by before it is
+    /// written: an index entry or a zone bound holds one key or value whole.
+    pub longest_user_key: Option<u64>,
+    pub longest_value: Option<u64>,
+
+    /// The field columns the groups of a table of rows written as cells
+    /// hold, or `None` for any other table and for one written before the
+    /// field existed: what a rewrite of its rows is bounded by.
+    pub(crate) cell_columns: Option<crate::table::writer::CellShapes>,
+
     pub data_block_compression: CompressionType,
     pub index_block_compression: CompressionType,
 
@@ -831,6 +843,16 @@ impl ParsedMeta {
         };
         let sum_user_key_bytes = read_opt_u64(b"key_bytes#sum")?;
         let sum_value_bytes = read_opt_u64(b"value_bytes#sum")?;
+        let longest_user_key = read_opt_u64(b"key_bytes#max")?;
+        let longest_value = read_opt_u64(b"value_bytes#max")?;
+        // Present-but-malformed is corrupt meta.
+        let cell_columns = match block.point_read(b"descriptor#cell_columns", SeqNo::MAX, &cmp)? {
+            Some(item) => Some(
+                crate::table::writer::CellShapes::decode(&item.value)
+                    .ok_or(crate::Error::InvalidHeader("TableMeta"))?,
+            ),
+            None => None,
+        };
         // Intentionally OPTIONAL, not a required `read_u64!`: tables written
         // before this field carry no key and must still decode (`None`). It also
         // does not need to be mandatory for the forgery cross-check — the whole
@@ -924,6 +946,9 @@ impl ParsedMeta {
             weak_tombstone_reclaimable,
             sum_user_key_bytes,
             sum_value_bytes,
+            longest_user_key,
+            longest_value,
+            cell_columns,
             data_block_compression,
             index_block_compression,
             kv_checksum_algo,

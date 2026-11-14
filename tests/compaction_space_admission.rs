@@ -611,10 +611,11 @@ fn tight_space_compaction_rewrites_a_gated_kv_separated_merge() -> lsm_tree::Res
     // and the tight path to slice it instead. Completing the merge is what lets
     // the tail drop the shadowed generation's now-dead blob files — the real
     // KV-separated reclaim, which a plain skip would forgo.
-    // Room for a slice of it (a block of each generation and the bytes a
-    // table holds past them), not for the whole merge.
+    // Room for a slice of it, its entries counted uncompressed and in full
+    // as the space check counts them, not for the whole merge, which the
+    // check counts the same way.
     let index_sst = tree.index.disk_space().max(4096);
-    mem.set_capacity(used + index_sst / 2);
+    mem.set_capacity(used + index_sst);
     tree.index.update_runtime_config(|c| {
         c.storage_admission_check = true;
         c.storage_limit_bytes = None;

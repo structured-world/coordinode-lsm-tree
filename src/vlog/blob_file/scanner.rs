@@ -6,14 +6,14 @@ use super::frame::{
     DecodedFrame, FRAME_HEADER_LEN, FRAME_MAGIC, FrameKind, decode_frame, parse_header,
     undecoded_frame,
 };
-use super::reader::ChunkTable;
+use super::writer::FrameIndex;
 use crate::fs::{Fs, FsOpenOptions};
 use crate::io::BufReader;
 #[cfg(not(feature = "std"))]
 use crate::io::{Read, Seek, SeekFrom};
 use crate::path::Path;
 use crate::{CompressionType, SeqNo, Slice, UserKey, UserValue, vlog::BlobFileId};
-use alloc::collections::VecDeque;
+#[cfg(zstd_any)]
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -43,9 +43,10 @@ impl ScanCodec {
 /// How the scanner finds where each frame starts.
 enum Bounds {
     /// From the file's frame index: each frame's start, then the data end.
-    /// A damaged frame costs that frame alone: the next one is where the
-    /// index puts it.
-    Index(Arc<[u64]>),
+    /// A damaged frame costs that frame alone, and a damaged head its chunks
+    /// with it: the next frame is where the index puts it, past the frames
+    /// the index marks as chunks.
+    Index(FrameIndex),
     /// Without a readable index: each frame from the length the one before
     /// declares, and past damage from a byte-wise search for the next magic.
     Chain,
@@ -84,8 +85,9 @@ pub(crate) struct Scanner {
 
     decode: Decode,
 
-    /// Values of the block read last that are still to be yielded.
-    pending: VecDeque<ScanEntry>,
+    /// The single frame or block read last, whose values are yielded from
+    /// it one by one.
+    values: Option<FrameValues>,
 
     /// Set when the chain walk resynchronized at a magic found by a byte-wise
     /// search after a damaged frame, and STICKY thereafter: every value read
@@ -121,7 +123,7 @@ impl Scanner {
             &*blob_file.0.fs,
             blob_file.id(),
             ScanCodec::of(blob_file),
-            Some(Arc::clone(&blob_file.0.frames)),
+            Some(blob_file.0.frames.clone()),
             (start != 0).then_some(start),
             pace,
         )?;
@@ -138,6 +140,7 @@ impl Scanner {
     ///
     /// The file lacks a "data" section, `start` lies outside it, or an IO
     /// error occurs.
+    #[cfg(any(feature = "std", test))]
     pub(crate) fn open<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,
@@ -193,7 +196,7 @@ impl Scanner {
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
         codec: ScanCodec,
-        frames: Option<Arc<[u64]>>,
+        frames: Option<FrameIndex>,
         start: Option<u64>,
         pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
@@ -248,6 +251,10 @@ impl Scanner {
                     Err(at) if seek_to == data_end || (start.is_none() && at == 0) => at,
                     Err(_) => return Err(crate::Error::InvalidHeader("BlobFile")),
                 };
+                // A chunk is read with its head: a walk never starts at one.
+                if frames.is_chunk(next) {
+                    return Err(crate::Error::InvalidHeader("BlobFile"));
+                }
                 let next =
                     u32::try_from(next).map_err(|_| crate::Error::InvalidHeader("BlobFile"))?;
                 (Bounds::Index(frames), next)
@@ -272,7 +279,7 @@ impl Scanner {
             next_frame,
             codec,
             decode: Decode::All,
-            pending: VecDeque::new(),
+            values: None,
             resync_tainted: false,
         })
     }
@@ -340,15 +347,25 @@ impl Scanner {
 
     /// Moves past a frame that did not check: to where the index says the next
     /// one starts, or by a byte-wise search in a chain walk.
+    ///
+    /// By the index, the frames it marks as chunks right after the damaged
+    /// one are passed with it. If that one was their head, they are a value's
+    /// bytes with no header, where a frame that checks may lie as payload;
+    /// read as frames they would yield it as a value of the file.
     fn skip_damaged(&mut self, frame: u32, offset: u64) -> crate::Result<()> {
-        self.next_frame = frame + 1;
-        match self.indexed_end(frame) {
-            Some(end) => {
-                self.inner.seek(SeekFrom::Start(end))?;
-                Ok(())
-            }
-            None => self.resync_to_next_frame(offset),
+        let Bounds::Index(frames) = &self.bounds else {
+            self.next_frame = frame + 1;
+            return self.resync_to_next_frame(offset);
+        };
+        let mut next = frame as usize + 1;
+        while next + 1 < frames.len() && frames.is_chunk(next) {
+            next += 1;
         }
+        let at = frames.get(next).copied().unwrap_or(self.data_end);
+        // A frame number is a u32: the index holds no more.
+        self.next_frame = u32::try_from(next).unwrap_or(u32::MAX);
+        self.inner.seek(SeekFrom::Start(at))?;
+        Ok(())
     }
 
     /// Reads the frame at the current position whole: its bytes as stored and
@@ -367,7 +384,6 @@ impl Scanner {
             }
             Some(Err(e))
         };
-
         // The span to read: the index's, else the header's declared length,
         // bounded by the section either way. An index is taken only when it
         // rises strictly within the data section and ends at its end, and a
@@ -417,7 +433,7 @@ impl Scanner {
                 .get(FRAME_MAGIC.len())
                 .copied()
                 .map(FrameKind::try_from),
-            Some(Ok(FrameKind::Single | FrameKind::Chunk))
+            Some(Ok(FrameKind::Single))
         );
         let parsed = if own && self.decode == Decode::Blocks {
             undecoded_frame(&bytes, self.codec.compression)
@@ -439,8 +455,10 @@ impl Scanner {
         }
     }
 
-    /// The values of the next frame, queued; `None` at the data end.
-    fn fill(&mut self) -> Option<crate::Result<()>> {
+    /// Reads the next frame: a chunked value is yielded whole, the values of
+    /// a single frame or a block one by one from [`Self::values`]. `None` at
+    /// the data end.
+    fn fill(&mut self) -> Option<crate::Result<Option<ScanEntry>>> {
         let (frame, offset, bytes, decoded) = match self.read_one()? {
             Ok(read) => read,
             Err(e) => return Some(Err(e)),
@@ -449,100 +467,124 @@ impl Scanner {
         let frame_end = offset + bytes.len() as u64;
         match decoded.header.kind {
             FrameKind::Single | FrameKind::Block => {
-                let last = decoded.list.len() - 1;
-                let whole = decoded.header.kind == FrameKind::Single;
                 // A single frame left undecoded is yielded by its frame alone.
-                let decoded_value = !whole || self.decode == Decode::All;
-                for (at, entry) in decoded.list.iter().enumerate() {
-                    let Some(key) = decoded.key(at) else {
-                        return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
-                    };
-                    let value = if decoded_value {
-                        let Some(value) = decoded.value(at) else {
-                            return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
-                        };
-                        Some(value)
-                    } else {
-                        None
-                    };
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "a frame lists at most u16::MAX values"
-                    )]
-                    let index = at as u16;
-                    self.pending.push_back(ScanEntry {
-                        key: UserKey::from(key),
-                        seqno: entry.seqno,
-                        // A view into the frame: a block's values are taken
-                        // together, as the scan yields them in a row.
-                        value,
-                        frame,
-                        index,
-                        offset,
-                        uncompressed_len: entry.value_len,
-                        // A block is consumed once its last value is: until
-                        // then the frontier stays at its start.
-                        frame_end: if at == last { frame_end } else { offset },
-                        resynced,
-                        frames: whole.then(|| alloc::vec![bytes.clone()]),
-                    });
-                }
-                Some(Ok(()))
+                let decoded_value =
+                    decoded.header.kind == FrameKind::Block || self.decode == Decode::All;
+                self.values = Some(FrameValues {
+                    frame,
+                    offset,
+                    frame_end,
+                    resynced,
+                    decoded_value,
+                    bytes,
+                    decoded,
+                    at: 0,
+                });
+                Some(Ok(None))
             }
             FrameKind::Head => {
                 // The frames the file can hold bound a head's chunks before
                 // room is reserved for them: the index's count, or, along the
-                // chain, the frame headers the data left can hold. `frame_end`
-                // lies within the section: the frame was read whole in it.
+                // chain, the bytes the data has left, as every chunk takes at
+                // least one. `frame_end` lies within the section: the frame
+                // was read whole in it.
                 let room = match &self.bounds {
                     Bounds::Index(frames) => frames.len() - 1,
                     Bounds::Chain => {
-                        let fit = (self.data_end - frame_end) / FRAME_HEADER_LEN as u64;
+                        let fit = self.data_end - frame_end;
                         // An upper bound: one past `usize::MAX` bounds nothing more.
                         usize::try_from(fit)
                             .map_or(usize::MAX, |fit| fit.saturating_add(frame as usize + 1))
                     }
                 };
-                let (Ok(chunks), Ok(table)) = (
-                    super::reader::chunk_frames(&decoded, frame, room),
-                    ChunkTable::of(&decoded),
-                ) else {
+                let Ok(chunks) = super::reader::chunk_frames(&decoded, frame, room) else {
                     return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
                 };
-                let mut stored = alloc::vec![bytes];
-                let mut end = frame_end;
-                // Proven whole without being gathered, each chunk checked
-                // against the head's table as it is read: every consumer copies
-                // the value as its stored frames.
-                for nth in 0..chunks.end - chunks.start {
-                    let failure = match self.read_one() {
-                        Some(Ok((_, at, chunk_bytes, chunk)))
-                            if chunk.header.kind == FrameKind::Chunk =>
-                        {
-                            if table.check(nth, &chunk).is_ok() {
-                                end = at + chunk_bytes.len() as u64;
-                                stored.push(chunk_bytes);
-                                continue;
-                            }
-                            crate::Error::InvalidHeader("BlobFrame")
-                        }
-                        Some(Ok(_)) | None => crate::Error::InvalidHeader("BlobFrame"),
-                        Some(Err(e)) => e,
+                // A value whose chunks do not read is damage that ends with
+                // them: by the index, the walk goes on at the frame after
+                // them, so the chunks left are not read as frames; a chain
+                // walk, which only the head's table placed, searches on.
+                let failed = |this: &mut Self, e: crate::Error| {
+                    let moved = match this.bounds {
+                        Bounds::Index(_) => this.skip_to_frame(chunks.end),
+                        Bounds::Chain => this.resync_to_next_frame(offset),
                     };
-                    // By the index, the value's damage ends with its chunks:
-                    // the walk goes on at the frame after them, so the chunks
-                    // left do not each read as a chunk without its head.
-                    if let Err(e) = self.skip_to_frame(chunks.end) {
-                        self.is_terminated = true;
-                        return Some(Err(e));
+                    if let Err(seek) = moved {
+                        this.is_terminated = true;
+                        return Some(Err(seek));
                     }
-                    return Some(Err(failure));
-                }
-                let (Some(entry), Some(key)) = (decoded.list.first(), decoded.key(0)) else {
-                    return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+                    Some(Err(e))
                 };
-                self.pending.push_back(ScanEntry {
-                    key: UserKey::from(key),
+                // One pass over the head's table, as many rows as `chunks`:
+                // both are counted from it.
+                let specs = match decoded.chunk_specs() {
+                    Ok(specs) => specs,
+                    Err(e) => return failed(self, e),
+                };
+                let area_len: u64 = specs.iter().map(|spec| u64::from(spec.stored_len)).sum();
+                let end = frame_end + area_len;
+                let placed = chunks.end > chunks.start
+                    && self
+                        .indexed_end(chunks.end - 1)
+                        .is_none_or(|indexed| indexed == end);
+                let Ok(area_len) = usize::try_from(area_len) else {
+                    return failed(self, crate::Error::InvalidHeader("BlobFrame"));
+                };
+                if !placed || end > self.data_end {
+                    return failed(self, crate::Error::InvalidHeader("BlobFrame"));
+                }
+                // The chunks follow the head back to back, read into an
+                // uninitialized buffer as a frame is.
+                let area = match Slice::from_reader(&mut self.inner, area_len) {
+                    Ok(area) => area,
+                    Err(e) => {
+                        self.is_terminated = true;
+                        return Some(Err(e.into()));
+                    }
+                };
+                let (Some(entry), Some(_)) = (decoded.list.first(), decoded.key(0)) else {
+                    return failed(self, crate::Error::InvalidHeader("BlobFrame"));
+                };
+                // Each chunk checked against its row as it lies: every consumer
+                // copies the value as its stored frames. A scan that decodes
+                // (repair, salvage) decodes each chunk too, as a read of the
+                // value would: a checksum proves the bytes are the ones
+                // written, not that they decode.
+                let mut stored = Vec::with_capacity(specs.len() + 1);
+                stored.push(bytes);
+                let mut decoded_chunk = Vec::new();
+                let mut from = 0;
+                for spec in &specs {
+                    let to = from + spec.stored_len as usize;
+                    let chunk = area.slice(from..to);
+                    if !spec.fits(self.codec.compression) {
+                        return failed(self, crate::Error::InvalidHeader("BlobFrame"));
+                    }
+                    let checked = if self.decode == Decode::All {
+                        decoded_chunk.resize(spec.raw_len as usize, 0);
+                        super::frame::decode_chunk_into(
+                            spec,
+                            &chunk,
+                            self.codec.compression,
+                            #[cfg(zstd_any)]
+                            self.codec.dictionary.as_deref(),
+                            &mut decoded_chunk,
+                            &mut 0,
+                        )
+                    } else {
+                        super::frame::check_chunk(spec, &chunk)
+                    };
+                    if let Err(e) = checked {
+                        return failed(self, e);
+                    }
+                    stored.push(chunk);
+                    from = to;
+                }
+                self.next_frame = chunks.end;
+                // `key` read in range, so the view is too.
+                let key = decoded.entries.slice(entry.key.clone());
+                Some(Ok(Some(ScanEntry {
+                    key,
                     seqno: entry.seqno,
                     value: None,
                     frame,
@@ -552,8 +594,8 @@ impl Scanner {
                     frame_end: end,
                     resynced: self.resync_tainted,
                     frames: Some(stored),
-                });
-                Some(Ok(()))
+                    block: None,
+                })))
             }
             // A chunk without its head is damage: the head before it was lost.
             FrameKind::Chunk => Some(Err(crate::Error::InvalidHeader("BlobFrame"))),
@@ -576,7 +618,7 @@ pub(crate) fn read_frame_index<F: Read + Seek>(
     file: &mut F,
     (pos, len): (u64, u64),
     data: core::ops::Range<u64>,
-) -> crate::Result<Option<Arc<[u64]>>> {
+) -> crate::Result<Option<FrameIndex>> {
     // The index lies within the file: a length past it is damage, refused
     // before a buffer is sized from it.
     let file_len = match file.seek(SeekFrom::End(0)) {
@@ -649,36 +691,140 @@ pub(crate) struct ScanEntry {
     /// single frame, or a head and its chunks): what a copy under the same
     /// codec writes as it is. `None` for a value that shares a block.
     pub frames: Option<Vec<Slice>>,
+    /// The block the value shares, for a value in one.
+    pub block: Option<ScanBlock>,
+}
+
+/// The block a scanned value shares with its neighbours.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScanBlock {
+    /// The block's frame as stored, which a copy under the same codec writes
+    /// as it is; every value of the block holds the same bytes.
+    pub stored: Slice,
+    /// How many values the block holds.
+    pub values: u16,
+    /// What this value adds to its file's block entry bytes, as its writer
+    /// counted it (see [`DecodedFrame::block_entry_bytes`]).
+    pub entry_bytes: u64,
 }
 
 #[cfg(test)]
 impl ScanEntry {
-    /// The value whole: decoded, or, for a chunked value of an uncompressed
-    /// file, gathered out of its frames.
-    pub(crate) fn whole_value(&self) -> crate::Result<UserValue> {
+    /// The value whole: decoded, or, for a chunked value of a file under
+    /// `compression` (with no dictionary), gathered out of its frames.
+    pub(crate) fn whole_value(
+        &self,
+        compression: crate::CompressionType,
+    ) -> crate::Result<UserValue> {
+        self.whole_value_with(
+            compression,
+            #[cfg(zstd_any)]
+            None,
+        )
+    }
+
+    /// [`Self::whole_value`] of a file whose codec decodes with `dictionary`.
+    pub(crate) fn whole_value_with(
+        &self,
+        compression: crate::CompressionType,
+        #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    ) -> crate::Result<UserValue> {
         if let Some(value) = &self.value {
             return Ok(value.clone());
         }
-        let decode = |bytes: &Slice| {
-            super::frame::decode_frame(
-                bytes,
-                crate::CompressionType::None,
-                #[cfg(zstd_any)]
-                None,
-                &mut 0,
-            )
-        };
         let (head, chunks) = self
             .frames
             .as_deref()
             .and_then(<[Slice]>::split_first)
             .ok_or(crate::Error::InvalidHeader("Blob"))?;
-        let chunks = chunks
+        let head = super::frame::decode_frame(
+            head,
+            compression,
+            #[cfg(zstd_any)]
+            dictionary,
+            &mut 0,
+        )?;
+        let area: Vec<u8> = chunks
             .iter()
-            .map(decode)
-            .collect::<crate::Result<Vec<_>>>()?;
-        let refs: Vec<&super::frame::DecodedFrame> = chunks.iter().collect();
-        super::reader::assemble(&decode(head)?, &refs, None)
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        super::reader::assemble_stored(
+            &head,
+            &Slice::from(area),
+            compression,
+            #[cfg(zstd_any)]
+            dictionary,
+            &mut 0,
+        )
+    }
+}
+
+/// The values of a single frame or a block a scan read, yielded one by one.
+struct FrameValues {
+    frame: u32,
+    offset: u64,
+    frame_end: u64,
+    resynced: bool,
+    /// Whether values are yielded decoded: a block's always, a single
+    /// frame's when the scan decodes every frame.
+    decoded_value: bool,
+    /// The frame as stored, and decoded.
+    bytes: Slice,
+    decoded: DecodedFrame,
+    /// The next value to yield.
+    at: usize,
+}
+
+impl FrameValues {
+    /// The next value; `None` past the last one.
+    fn next_value(&mut self) -> Option<crate::Result<ScanEntry>> {
+        let at = self.at;
+        let decoded = &self.decoded;
+        let entry = decoded.list.get(at)?;
+        self.at += 1;
+        let in_block = decoded.header.kind == FrameKind::Block;
+        // The index a handle names the value by: in a packed block its
+        // record's offset.
+        let (Some(_), Some(index), Some(entry_bytes)) = (
+            decoded.key(at),
+            decoded.index_of(at),
+            decoded.block_entry_bytes(at),
+        ) else {
+            return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+        };
+        let value = if self.decoded_value {
+            let Some(value) = decoded.value(at) else {
+                return Some(Err(crate::Error::InvalidHeader("BlobFrame")));
+            };
+            Some(value)
+        } else {
+            None
+        };
+        Some(Ok(ScanEntry {
+            // A view into the frame's entries, as the value is into its
+            // payload: `key` read in range, so the view is too.
+            key: decoded.entries.slice(entry.key.clone()),
+            seqno: entry.seqno,
+            value,
+            frame: self.frame,
+            index,
+            offset: self.offset,
+            uncompressed_len: entry.value_len,
+            // A block is consumed once its last value is: until then the
+            // frontier stays at its start.
+            frame_end: if at + 1 == decoded.list.len() {
+                self.frame_end
+            } else {
+                self.offset
+            },
+            resynced: self.resynced,
+            frames: (!in_block).then(|| alloc::vec![self.bytes.clone()]),
+            block: in_block.then(|| ScanBlock {
+                stored: self.bytes.clone(),
+                values: decoded.header.count,
+                entry_bytes,
+            }),
+        }))
     }
 }
 
@@ -687,14 +833,23 @@ impl Iterator for Scanner {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(entry) = self.pending.pop_front() {
-                return Some(Ok(entry));
+            if let Some(values) = &mut self.values {
+                match values.next_value() {
+                    Some(Ok(entry)) => return Some(Ok(entry)),
+                    // A value that does not decode ends its frame's values.
+                    Some(Err(e)) => {
+                        self.values = None;
+                        return Some(Err(e));
+                    }
+                    None => self.values = None,
+                }
             }
             if self.is_terminated {
                 return None;
             }
             match self.fill()? {
-                Ok(()) => {}
+                Ok(Some(entry)) => return Some(Ok(entry)),
+                Ok(None) => {}
                 Err(e) => return Some(Err(e)),
             }
         }

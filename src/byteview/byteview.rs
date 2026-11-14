@@ -257,6 +257,25 @@ impl ByteView {
         self.len() <= INLINE_SIZE
     }
 
+    /// The heap allocation the view's bytes lie in, as its address and its
+    /// size, or `None` for an inline view, which holds its bytes itself.
+    pub(crate) fn heap_allocation(&self) -> Option<(usize, usize)> {
+        if self.is_inline() {
+            return None;
+        }
+        // SAFETY: the view is not inline, so its heap variant is active.
+        let long = unsafe { &*self.trailer.long };
+        Some((
+            long.heap.addr(),
+            core::mem::size_of::<HeapAllocationHeader>() + long.original_len as usize,
+        ))
+    }
+
+    /// Whether no other view shares its bytes: an inline view owns its own.
+    pub(crate) fn is_unique(&self) -> bool {
+        self.is_inline() || self.get_heap_region().ref_count.load(Ordering::Acquire) == 1
+    }
+
     pub(crate) fn update_prefix(&mut self) {
         if !self.is_inline() {
             unsafe {

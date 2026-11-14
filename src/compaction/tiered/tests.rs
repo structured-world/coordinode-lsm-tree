@@ -129,8 +129,7 @@ fn stcs_does_not_merge_around_a_busy_run() -> crate::Result<()> {
         .l0()
         .iter()
         .nth(1)
-        .map(|run| run.iter().map(Table::id).collect())
-        .unwrap_or_default();
+        .map_or_default(|run| run.iter().map(Table::id).collect());
     assert!(!middle.is_empty(), "expected three L0 runs");
     let mut state = CompactionState::default();
     state.hidden_set_mut().hide(middle);

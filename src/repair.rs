@@ -708,8 +708,9 @@ fn trustworthy_restriction_bound(
     }
 }
 
-/// The dictionary a blob file's own compression descriptor names, resolved
-/// against the tree's set; `None` for a file that uses no dictionary.
+/// The dictionary a blob file's own compression descriptor names: the one the
+/// file at `path` stores, or else the tree's; `None` for a file that uses no
+/// dictionary.
 ///
 /// A blob file records ONE descriptor, so this answers with one dictionary; the
 /// set is what turns the recorded id back into bytes. Resolving here rather than
@@ -726,11 +727,17 @@ fn trustworthy_restriction_bound(
 #[cfg(all(feature = "std", zstd_any))]
 fn blob_file_dictionary(
     config: &Config,
-    compression: crate::CompressionType,
+    path: &std::path::Path,
+    meta: &crate::vlog::blob_file::meta::Metadata,
 ) -> crate::Result<Option<Arc<crate::compression::ZstdDictionary>>> {
+    // A dictionary the file stores of its own is in no tree's set: it is read
+    // from the file first, as an open does.
+    if let Some(own) = crate::vlog::read_blob_file_dictionary(path, &*config.fs, meta)? {
+        return Ok(Some(own));
+    }
     config
         .current_zstd_dictionaries()
-        .for_compression(compression)
+        .for_compression(meta.compression)
 }
 
 /// What only the manifest knows of a table's place in the tree: its bulk-ingest
@@ -912,6 +919,15 @@ fn is_environmental(e: &crate::Error) -> bool {
     // identically — the two drifted apart once already, and the difference is
     // invisible until a file is deleted over it.
     e.is_environmental()
+}
+
+/// Whether resolving a blob file's dictionary failed for its environment
+/// while reading the file: a retry may read it. A dictionary the tree does not
+/// hold is no such failure: for a file nothing references, it goes to the
+/// sweep.
+#[cfg(all(feature = "std", zstd_any))]
+fn reading_failed(e: &crate::Error) -> bool {
+    is_environmental(e) && !matches!(e, crate::Error::ZstdDictMismatch { .. })
 }
 
 /// Whether manifest repair must fail closed on a table because its bulk-ingest
@@ -2328,12 +2344,31 @@ fn derive_blob_frontier(
     // Whether frame `at` reads as zeros through, as a punched frame does.
     let zeroed =
         |at: usize| -> crate::Result<bool> { Ok(frame_bytes(at)?.iter().all(|b| *b == 0)) };
-    // Whether frame `at` checks as stored: its codec is not needed for that.
-    let intact = |at: usize| -> crate::Result<bool> {
-        match crate::vlog::blob_file::frame::verify_frame(&frame_bytes(at)?) {
-            Ok(_) => Ok(true),
+    // How many frames the value at `at` takes when it checks as stored, its
+    // codec not needed for that: a head with its chunks, which follow it as
+    // frames of the index and check by its table; `None` when it does not.
+    let intact = |at: usize| -> crate::Result<Option<usize>> {
+        use crate::vlog::blob_file::frame::{FrameKind, check_chunk, head_chunks, verify_frame};
+        // A chunk is its value's bytes with no header: what it checks as is
+        // the writer's payload, never a frame of the file to anchor on.
+        if starts.is_chunk(at) {
+            return Ok(None);
+        }
+        let bytes = frame_bytes(at)?;
+        let checked = verify_frame(&bytes).and_then(|header| {
+            if header.kind != FrameKind::Head {
+                return Ok(1);
+            }
+            let table = head_chunks(&bytes)?;
+            for (n, spec) in table.iter().enumerate() {
+                check_chunk(spec, &frame_bytes(at + 1 + n)?)?;
+            }
+            Ok(1 + table.len())
+        });
+        match checked {
+            Ok(frames) => Ok(Some(frames)),
             Err(e) if is_environmental(&e) => Err(e),
-            Err(_) => Ok(false),
+            Err(_) => Ok(None),
         }
     };
 
@@ -2401,11 +2436,11 @@ fn derive_blob_frontier(
         }
         // The zeroed run is punch geometry only when the frame at its end
         // checks: keep the last anchored frontier otherwise.
-        if !intact(at)? {
+        let Some(taken) = intact(at)? else {
             return Ok(committed(anchored));
-        }
+        };
         anchored = run_end;
-        at += 1;
+        at += taken;
         // Chain frames from the anchor until the section ends cleanly or the
         // chain breaks: another zeroed run continues the walk, a frame that
         // does not check is content corruption and ends it at the last
@@ -2417,10 +2452,10 @@ fn derive_blob_frontier(
             if zeroed(at)? {
                 break;
             }
-            if !intact(at)? {
+            let Some(taken) = intact(at)? else {
                 return Ok(committed(anchored));
-            }
-            at += 1;
+            };
+            at += taken;
         }
     }
 }
@@ -2544,15 +2579,13 @@ fn validate_blob_frames(
                 }
                 count += 1;
                 uncompressed_total += u64::from(entry.uncompressed_len);
-                match &entry.frames {
-                    Some(frames) => {
+                match (&entry.frames, &entry.block) {
+                    (Some(frames), _) => {
                         own_frame_total += frames.iter().map(|f| f.len() as u64).sum::<u64>();
                     }
-                    None => {
-                        block_entry_total += (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN
-                            + entry.key.len()) as u64
-                            + u64::from(entry.uncompressed_len);
-                    }
+                    (None, Some(block)) => block_entry_total += block.entry_bytes,
+                    // A value is a block's or has frames of its own.
+                    (None, None) => return Ok(None),
                 }
                 frames_from.get_or_insert(entry.offset);
                 frames_to = frames_to.max(entry.frame_end);
@@ -3105,9 +3138,9 @@ fn recover_blob_files(
         // references no copy survives either way: it simply does not verify,
         // and every copy takes the unreferenced path to the sweep.
         #[cfg(zstd_any)]
-        let dict = match blob_file_dictionary(config, handle.compression()) {
+        let dict = match blob_file_dictionary(config, blob_path, handle.meta()) {
             Ok(dict) => dict,
-            Err(e) if referenced.contains(&blob_id) => return Err(e),
+            Err(e) if referenced.contains(&blob_id) || reading_failed(&e) => return Err(e),
             Err(_) => {
                 return Err(crate::Error::InvalidHeader(
                     "blob file names a dictionary the tree does not hold",
@@ -3390,9 +3423,9 @@ fn recover_blob_files(
         // supplies the dictionary and re-runs. One nothing references holds no
         // value anyone can reach, and goes to the sweep like any other.
         #[cfg(zstd_any)]
-        let dict = match blob_file_dictionary(config, meta.compression) {
+        let dict = match blob_file_dictionary(config, &blob_path, &meta) {
             Ok(dict) => dict,
-            Err(e) if referenced.contains(&blob_id) => return Err(e),
+            Err(e) if referenced.contains(&blob_id) || reading_failed(&e) => return Err(e),
             Err(e) => {
                 log::debug!(
                     "blob file {blob_id} names a dictionary the tree does not hold \
@@ -5535,7 +5568,7 @@ fn scan_table_folders(
                                         config,
                                         &output_path,
                                         salvaged,
-                                        restrict_bound.clone(),
+                                        restrict_bound,
                                         allow_resurrection,
                                     )?;
                                     keep_salvaged_replacement(

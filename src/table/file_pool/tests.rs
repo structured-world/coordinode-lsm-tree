@@ -380,8 +380,7 @@ fn listed(pools: &TableFilePools) -> Vec<TableId> {
         .folders
         .lock()
         .first()
-        .map(|pool| pool.writing.lock().clone())
-        .unwrap_or_default();
+        .map_or_default(|pool| pool.writing.lock().clone());
     ids.sort_unstable();
     ids
 }

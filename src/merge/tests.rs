@@ -144,3 +144,25 @@ fn merge_mixed_direction() -> crate::Result<()> {
 
     Ok(())
 }
+
+/// One source is handed through without the heap: walked from both ends it
+/// still yields each entry once, in its order, and then stops.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test assertions")]
+fn merge_single_source_walks_both_ends() -> crate::Result<()> {
+    let a = vec![
+        Ok(InternalValue::from_components("a", b"", 0, Value)),
+        Ok(InternalValue::from_components("b", b"", 0, Value)),
+        Ok(InternalValue::from_components("c", b"", 0, Value)),
+    ];
+    let mut iter = Merger::new(vec![a.into_iter()], comparator::default_comparator());
+    let k = |v: InternalValue| String::from_utf8_lossy(&v.key.user_key).to_string();
+
+    assert_eq!(k(iter.next().unwrap()?), "a");
+    assert_eq!(k(iter.next_back().unwrap()?), "c");
+    assert_eq!(k(iter.next().unwrap()?), "b");
+    assert!(iter.next_back().is_none(), "should be exhausted");
+    assert!(iter.next().is_none(), "should be exhausted");
+
+    Ok(())
+}
