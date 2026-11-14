@@ -2533,6 +2533,23 @@ impl AbstractTree for BlobTree {
                 table_writer =
                     table_writer.use_parallel_compression(self.index.config.parallel_compression());
             }
+            // The workers write the buffers of the flush's files when they have
+            // nothing of it to compress, table blocks or values: beside either,
+            // the writes cost the flush more than they save.
+            #[cfg(feature = "std")]
+            let file_workers =
+                if !table_on_pool && rc.blob_compression == crate::CompressionType::None {
+                    self.index
+                        .config
+                        .parallel_compression()
+                        .map(|parallel| parallel.spawner)
+                } else {
+                    None
+                };
+            #[cfg(feature = "std")]
+            {
+                table_writer = table_writer.use_file_workers(file_workers.clone());
+            }
 
             #[expect(
                 clippy::expect_used,
@@ -2574,7 +2591,9 @@ impl AbstractTree for BlobTree {
                     .use_zstd_dictionaries(dicts)
                     .use_file_dictionary(kv_opts.file_dictionary);
                 #[cfg(feature = "std")]
-                let w = w.use_parallel_compression(self.index.config.parallel_compression());
+                let w = w
+                    .use_parallel_compression(self.index.config.parallel_compression())
+                    .use_file_workers(file_workers);
                 w.use_output_ledger(outputs.clone())
             };
 

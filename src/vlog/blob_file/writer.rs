@@ -663,15 +663,18 @@ impl Writer {
         mut self,
         parallel: Option<crate::table::writer::ParallelCompression>,
     ) -> Self {
-        // The file's buffers are written by the same workers.
-        if let Some(parallel) = &parallel {
-            self.writer
-                .get_mut()
-                .settings()
-                .use_spawner(alloc::sync::Arc::clone(&parallel.spawner));
-        }
         self.parallel = parallel;
         self
+    }
+
+    /// Writes the file's buffers on the workers of `spawner` (see
+    /// [`super::multi_writer::MultiWriter::use_file_workers`]).
+    #[cfg(feature = "std")]
+    pub(crate) fn use_file_workers(
+        &mut self,
+        spawner: alloc::sync::Arc<dyn crate::table::writer::CompactionSpawner>,
+    ) {
+        self.writer.get_mut().settings().use_spawner(spawner);
     }
 
     pub(crate) fn use_compression(mut self, compressor: CompressionType) -> Self {

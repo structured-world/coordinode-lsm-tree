@@ -293,6 +293,11 @@ pub(crate) struct MultiWriter {
     #[cfg(feature = "std")]
     parallel: Option<crate::table::writer::ParallelCompression>,
 
+    /// The workers that write every table's buffers, for a run that asked
+    /// for them (see [`Self::use_file_workers`]).
+    #[cfg(feature = "std")]
+    file_workers: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
+
     /// Where a compaction learns of every table file this writer creates, so
     /// it can remove the ones it never installs. `None` outside compaction.
     outputs: Option<crate::compaction::output_ledger::OutputLedger>,
@@ -566,6 +571,8 @@ impl MultiWriter {
 
             #[cfg(feature = "std")]
             parallel: None,
+            #[cfg(feature = "std")]
+            file_workers: None,
 
             outputs: None,
 
@@ -713,6 +720,23 @@ impl MultiWriter {
         if let Some(parallel) = parallel {
             self.writer = self.writer.use_parallel_compression(parallel.clone());
             self.parallel = Some(parallel);
+        }
+        self
+    }
+
+    /// Writes the buffers of this run's tables, rotated successors included,
+    /// on the workers of `spawner` (see
+    /// [`Writer::use_file_workers`](crate::table::writer::Writer)). No-op
+    /// when `spawner` is `None`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn use_file_workers(
+        mut self,
+        spawner: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
+    ) -> Self {
+        if let Some(spawner) = spawner {
+            self.writer = self.writer.use_file_workers(Arc::clone(&spawner));
+            self.file_workers = Some(spawner);
         }
         self
     }
@@ -1802,6 +1826,10 @@ impl MultiWriter {
         #[cfg(feature = "std")]
         if let Some(parallel) = self.parallel.clone() {
             new_writer = new_writer.use_parallel_compression(parallel);
+        }
+        #[cfg(feature = "std")]
+        if let Some(spawner) = self.file_workers.clone() {
+            new_writer = new_writer.use_file_workers(spawner);
         }
         Ok(new_writer)
     }

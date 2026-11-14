@@ -1343,6 +1343,14 @@ impl AbstractTree for Tree {
                 if transform_does_work {
                     table_writer =
                         table_writer.use_parallel_compression(self.config.parallel_compression());
+                } else {
+                    // The pool has no blocks of this flush to prepare: its
+                    // workers write the table's buffers.
+                    table_writer = table_writer.use_file_workers(
+                        self.config
+                            .parallel_compression()
+                            .map(|parallel| parallel.spawner),
+                    );
                 }
             }
 
