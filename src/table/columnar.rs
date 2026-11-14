@@ -1975,6 +1975,8 @@ pub fn validate_columnar_ingest_batch(
 /// # Errors
 ///
 /// As [`entries_to_column_batch`].
+// Its callers and its tests are std builds: the crate's tests build with
+// `std` only, which every codec feature enables.
 #[cfg(feature = "std")]
 pub(crate) fn transpose_like(
     batch: &ColumnBatch,
