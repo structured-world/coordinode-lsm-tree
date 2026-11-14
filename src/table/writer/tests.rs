@@ -102,19 +102,16 @@ fn linked_blob_files_track_their_section_len_as_entries_register() {
             &UserKey::from(key.as_bytes()),
             true,
         );
-        // The file the last entry points into is held apart from the rest.
+        // The file the last entry points into is the one found without a
+        // lookup next time.
         assert_eq!(
-            linked.current.as_ref().map(|link| link.blob_file_id),
+            linked.links.get(linked.last).map(|link| link.blob_file_id),
             Some(file)
         );
-        assert!(!linked.files.contains_key(&file));
-        let links: Vec<LinkedFile> = linked
-            .files
-            .values()
-            .chain(linked.current.as_ref())
-            .cloned()
-            .collect();
-        assert_eq!(linked.section_len(), encode_links(&links).len() as u64);
+        assert_eq!(
+            linked.section_len(),
+            encode_links(&linked.links).len() as u64
+        );
     }
     assert_eq!(linked.len(), 3);
     let mut links: Vec<LinkedFile> = linked.take().collect();
