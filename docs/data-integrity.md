@@ -281,7 +281,10 @@ inspection, or rollback to a known-good point.
   walk follows the file's frame index, whose checksum vouches for every
   frame's place, so a frame that fails its header CRC, its checksum or its
   structure costs that frame alone: a value of its own, or every value of a
-  block it shared. A chunked value goes whole or not at all. When the index
+  block it shared. A chunked value goes whole or not at all: its chunks are
+  its own bytes with no header, where a frame that checks may lie as payload,
+  so the index marks them, and a walk that lost their head to damage passes
+  them instead of reading one as a frame. When the index
   itself is damaged, the walk falls back to the chain of frames: after a
   damaged frame it re-syncs to the next frame magic found in bounds, and that
   magic (and every frame chained after it) has an unproven boundary (it may be

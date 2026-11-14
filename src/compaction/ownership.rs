@@ -45,7 +45,111 @@ pub(crate) struct OwnershipLedger {
     relocating: Vec<crate::vlog::BlobFileId>,
 }
 
+/// What a run of dropped versions is accounted by, without the versions: the
+/// versions of one key, or of keys the compaction kept no row of, folded
+/// together. A pass that decides later whether the run is its own holds this
+/// in place of the versions and the blocks they lie in.
+pub(crate) struct DroppedRun {
+    /// The key the run is placed by: its own, or the first of those folded.
+    key: UserKey,
+    /// The objects its indirections named and, of folded keys, the objects
+    /// their cell rows owned.
+    frag: FragmentationMap,
+    /// The objects the cell rows of the run's one key owned.
+    orphans: Vec<BlobIndirection>,
+    /// The objects the cell rows of folded keys owned, charged in `frag`.
+    released: Vec<crate::vlog::ValueHandle>,
+    /// Whether a cell row is among the versions.
+    cell_rows: bool,
+    /// Whether the run folds keys with no kept row.
+    folded: bool,
+}
+
+impl DroppedRun {
+    /// A run of the versions of `key`.
+    pub(crate) fn of(key: UserKey) -> Self {
+        Self {
+            key,
+            frag: FragmentationMap::default(),
+            orphans: Vec::new(),
+            released: Vec::new(),
+            cell_rows: false,
+            folded: false,
+        }
+    }
+
+    /// The key the run is placed by.
+    pub(crate) fn key(&self) -> &UserKey {
+        &self.key
+    }
+
+    /// Takes in `kv`, a dropped version of the run's key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the version's references do not decode.
+    pub(crate) fn take(&mut self, kv: &InternalValue) -> crate::Result<()> {
+        if kv.key.value_type.is_cell_row() {
+            self.cell_rows = true;
+            for (indirection, owned) in row_refs(&kv.value)? {
+                if owned {
+                    self.orphans.push(indirection);
+                }
+            }
+        } else if kv.key.value_type.is_indirection() {
+            self.frag.on_dropped(kv);
+        }
+        Ok(())
+    }
+
+    /// `run`, the versions of a key the compaction kept no row of, as a run
+    /// later such keys fold into.
+    pub(crate) fn folded(run: Self) -> Self {
+        let mut folded = Self::of(run.key.clone());
+        folded.fold(run);
+        folded
+    }
+
+    /// Folds in `run`, the versions of a later key the compaction kept no
+    /// row of: with no row to pass to, the objects its cell rows owned are
+    /// charged.
+    pub(crate) fn fold(&mut self, run: Self) {
+        self.folded = true;
+        self.cell_rows |= run.cell_rows;
+        run.frag.merge_into(&mut self.frag);
+        for orphan in run.orphans {
+            self.frag.charge(&orphan);
+            self.released.push(orphan.vhandle);
+        }
+        self.released.extend(run.released);
+    }
+}
+
 impl OwnershipLedger {
+    /// Records a run of dropped versions as [`Self::dropped`] records each.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a held cell row that does not decode.
+    pub(crate) fn dropped_run(&mut self, run: DroppedRun) -> crate::Result<()> {
+        run.frag.merge_into(&mut self.frag);
+        if !run.cell_rows {
+            return Ok(());
+        }
+        if run.folded {
+            // Other keys' versions: the open group's key ended.
+            self.close()?;
+            self.released.extend(run.released);
+            return Ok(());
+        }
+        if !self.is_open_for(&run.key) {
+            self.close()?;
+            self.key = Some(run.key);
+        }
+        self.orphans.extend(run.orphans);
+        Ok(())
+    }
+
     /// Marks `files` as relocated by this pass (see `relocating`).
     pub(crate) fn relocating(&mut self, files: impl IntoIterator<Item = crate::vlog::BlobFileId>) {
         self.relocating.extend(files);
@@ -98,7 +202,7 @@ impl OwnershipLedger {
 
     /// Records a dropped version: an indirection's object is charged now, a
     /// cell row's owned objects wait for the end of its key.
-    fn dropped(&mut self, kv: &InternalValue) -> crate::Result<()> {
+    pub(crate) fn dropped(&mut self, kv: &InternalValue) -> crate::Result<()> {
         if !kv.key.value_type.is_cell_row() {
             self.frag.on_dropped(kv);
             return Ok(());

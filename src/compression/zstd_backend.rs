@@ -479,11 +479,20 @@ impl CompressionProvider for ZstdProvider {
 
         TLS_COMPRESSOR.with(|cell| {
             let mut state = cell.borrow_mut();
-            if !matches!(
-                &*state,
-                Some((key, l, cached, _))
-                    if *key == dict.id64() && *l == level && *cached == single_pass
-            ) {
+            if let Some((key, l, cached, compressor)) = state.as_mut()
+                && *l == level
+                && *cached == single_pass
+            {
+                // Another dictionary at the same parameters, as each blob
+                // file brings its own: the compressor keeps its tables and
+                // takes the new handle.
+                if *key != dict.id64() {
+                    compressor
+                        .set_encoder_dictionary(dict.prepared_encoder()?)
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                    *key = dict.id64();
+                }
+            } else {
                 let configured = CompressionLevel::from_level(level);
                 let mut compressor = FrameCompressor::new(configured);
                 // Before the dictionary: attaching it builds match-finder state
@@ -531,9 +540,13 @@ impl CompressionProvider for ZstdProvider {
         // structured-zstd). This eliminates the per-thread `Dictionary` re-parse
         // the cache used to do on every miss — the dictionary's entropy tables
         // are built once globally and the FrameDecoder just shares the Arc.
+        // Several dictionaries at once: blob files that each hold a
+        // dictionary of their own interleave in reads, and one slot would
+        // rebuild the decoder at every switch.
+        const DECODERS: usize = 8;
         thread_local! {
-            static TLS_DECODER: std::cell::RefCell<Option<(u64, FrameDecoder)>> =
-                const { std::cell::RefCell::new(None) };
+            static TLS_DECODERS: std::cell::RefCell<Vec<(u64, FrameDecoder)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
 
         // For raw-content dicts `FrameDecoder::init` does not auto-resolve
@@ -549,26 +562,33 @@ impl CompressionProvider for ZstdProvider {
             .raw()
             .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
 
-        TLS_DECODER.with(|cell| {
-            let mut state = cell.borrow_mut();
+        TLS_DECODERS.with(|cell| {
+            let mut decoders = cell.borrow_mut();
 
-            // Re-initialise if this is the first call in this thread or if
-            // the dictionary has changed (different id64 → different table).
-            if !matches!(&*state, Some((id, _)) if *id == dict.id64()) {
-                // Pull the shared pre-parsed handle from the dictionary. First
-                // caller across all threads parses; everyone after gets an Arc
-                // clone of the cached entropy tables.
-                let handle = dict.prepared_handle()?;
-                let mut decoder = FrameDecoder::new();
-                decoder
-                    .add_dict_handle(handle)
-                    .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-                *state = Some((dict.id64(), decoder));
+            // The decoder of this dictionary moves to the front; a miss builds
+            // one there, evicting the least recently used past the bound.
+            match decoders.iter().position(|(id, _)| *id == dict.id64()) {
+                Some(0) => {}
+                Some(at) => {
+                    let found = decoders.remove(at);
+                    decoders.insert(0, found);
+                }
+                None => {
+                    // Pull the shared pre-parsed handle from the dictionary.
+                    // First caller across all threads parses; everyone after
+                    // gets an Arc clone of the cached entropy tables.
+                    let handle = dict.prepared_handle()?.clone();
+                    let mut decoder = FrameDecoder::new();
+                    decoder
+                        .add_dict_handle(handle)
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                    decoders.truncate(DECODERS - 1);
+                    decoders.insert(0, (dict.id64(), decoder));
+                }
             }
 
-            // Unreachable: the branch above always initialises `state`.
-            let Some((_, decoder)) = state.as_mut() else {
-                unreachable!("TLS_DECODER always initialised above");
+            let Some((_, decoder)) = decoders.first_mut() else {
+                unreachable!("the decoder of this dictionary is at the front");
             };
 
             do_decompress_with_dict(decoder, data, dict.frame_id(), capacity, is_raw_content)
@@ -594,6 +614,46 @@ impl ZstdProvider {
                 decoder,
             );
             bounded_read_into(&mut stream, dest)
+        })
+    }
+
+    /// [`decompress_into`](Self::decompress_into) for a frame compressed under
+    /// `dict`: decoded straight into `dest` (exact expected size) with the
+    /// dictionary borrowed, so a small value costs neither the growing scratch
+    /// `Vec` nor the copy out of it that
+    /// [`decompress_with_dict`](CompressionProvider::decompress_with_dict)
+    /// pays. A frame naming another dictionary is refused before any block
+    /// decodes. Returns the bytes written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame header is invalid, names another
+    /// dictionary, does not decode, or decodes to more than `dest.len()` bytes.
+    pub fn decompress_with_dict_into(
+        data: &[u8],
+        dict: &crate::compression::ZstdDictionary,
+        dest: &mut [u8],
+    ) -> crate::Result<usize> {
+        let handle = dict.prepared_handle()?;
+        // A raw-content dictionary's frames carry the synthetic id it was
+        // compressed under; a finalized one's carry the id of its header,
+        // which the decode checks against the handle by itself.
+        let is_raw_content = !dict
+            .raw()
+            .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
+        // A decoder of its own, apart from the plain one: a frame reset
+        // without a dictionary leaves the last one applied in place, and
+        // every frame decoded here applies its dictionary afresh.
+        thread_local! {
+            static TLS_DICT_DECODER: core::cell::RefCell<structured_zstd::decoding::FrameDecoder> =
+                core::cell::RefCell::new(structured_zstd::decoding::FrameDecoder::new());
+        }
+        TLS_DICT_DECODER.with(|cell| {
+            let mut decoder = cell.borrow_mut();
+            decoder.expect_dict_id(is_raw_content.then(|| dict.frame_id()));
+            decoder
+                .decode_all_with_dict_handle(data, dest, handle)
+                .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))
         })
     }
 }

@@ -65,8 +65,9 @@
 //! in exactly one place per engine and the workload code stays
 //! engine-agnostic. The engines: `ours`, `rocksdb`, `surrealkv` (pure-Rust
 //! embedded LSM/MVCC), and each of ours and RocksDB with its values in blob
-//! files, uncompressed (`blob_tree`, `rocksdb_blob`) and at zstd level 3
-//! (`blob_tree_zstd`, `rocksdb_blob_zstd`, see [`BlobCodec`]). Every group runs
+//! files, uncompressed (`blob_tree`, `rocksdb_blob`), at zstd level 3
+//! (`blob_tree_zstd`, `rocksdb_blob_zstd`) and at zstd level 22
+//! (`blob_tree_zstd22`, `rocksdb_blob_zstd22`, see [`BlobCodec`]). Every group runs
 //! the inline and blob arms of both engines ([`HEAD_TO_HEAD`]); SurrealKV
 //! compresses with zstd at a fixed level 3 only, so it overlays ONLY on the
 //! `None`-compression groups (see [`engines_for`]).
@@ -79,15 +80,21 @@
 //! values inline and in blob files, neither caching blob values, so a blob is
 //! read from its file through the page cache on both (see [`BLOB_SPECS`]).
 //!
-//! ## Compression axis + cross-engine overlay
+//! ## Compression axes + cross-engine overlay
 //!
-//! Every scenario is run twice: once with `None` block compression
-//! (the `<scenario>` group) and once with zstd at level 22, the maximum
-//! "ultra" level (the `<scenario>_zstd22` group). Both engines are
-//! configured identically per variant — ours via
-//! `CompressionType::Zstd(22)`, RocksDB via `DBCompressionType::Zstd`
-//! pinned to level 22 — so the no-compression and high-ratio paths sit
-//! side-by-side on the dashboard.
+//! The keys and the values are compressed apart, each with a codec and a
+//! level of its own, on both engines alike. The tables, which hold the keys
+//! (and the inline arms' values with them), are the group's axis: every
+//! scenario runs once with `None` block compression (the `<scenario>` group)
+//! and once with zstd at level 22, the maximum "ultra" level (the
+//! `<scenario>_zstd22` group), ours via `CompressionType::Zstd(22)` and
+//! RocksDB via `DBCompressionType::Zstd` pinned to level 22. The blob files,
+//! which hold the separated values, are the arm's axis within the group:
+//! uncompressed, zstd 3 or zstd 22, ours through its blob compression and
+//! RocksDB through its blob compression type and `blob_compression_opts`. Each
+//! engine runs its own defaults around that codec: ours, under zstd, gives each
+//! blob file a dictionary of its own (`COMPARE_BLOB_DICT=0` turns it off), and
+//! RocksDB's blob files have none.
 //!
 //! Within each group every engine runs in the SAME process and the SAME
 //! rounds (ours vs rocksdb, plus surrealkv on the `None` groups). Because the
@@ -296,8 +303,10 @@ impl Engine {
             Self::SurrealKv => "surrealkv",
             Self::BlobTree(BlobCodec::Off) => "blob_tree",
             Self::BlobTree(BlobCodec::Zstd) => "blob_tree_zstd",
+            Self::BlobTree(BlobCodec::Zstd22) => "blob_tree_zstd22",
             Self::RocksDbBlob(BlobCodec::Off) => "rocksdb_blob",
             Self::RocksDbBlob(BlobCodec::Zstd) => "rocksdb_blob_zstd",
+            Self::RocksDbBlob(BlobCodec::Zstd22) => "rocksdb_blob_zstd22",
         }
     }
 
@@ -318,43 +327,49 @@ impl Engine {
     }
 }
 
-/// How the blob arms compress their blob files, the same on both engines.
+/// How the blob arms compress their blob files, the same on both engines and
+/// apart from the tables, whose compression is the group's: the keys and the
+/// values each have a codec and a level of their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlobCodec {
     /// Blob files uncompressed.
     Off,
-    /// Blob files at zstd level [`BlobCodec::ZSTD_LEVEL`], whatever the group
-    /// compresses its tables with.
+    /// Blob files at zstd's default level, 3.
     Zstd,
+    /// Blob files at zstd's maximum level, 22.
+    Zstd22,
 }
 
 impl BlobCodec {
-    /// zstd's default level. RocksDB's C API sets the blob codec but not the
-    /// blob level, which stays at its `blob_compression_opts` default, zstd's
-    /// own default; ours is set to the same.
-    const ZSTD_LEVEL: i32 = 3;
+    /// The zstd level of the blob files, `None` for none.
+    fn zstd_level(self) -> Option<i32> {
+        match self {
+            Self::Off => None,
+            Self::Zstd => Some(3),
+            Self::Zstd22 => Some(Compression::ZSTD_MAX_LEVEL),
+        }
+    }
 
     /// Our blob compression. Set in both arms, so a default that changes with a
     /// feature of the bench crate cannot compress the uncompressed arm.
     fn ours(self) -> CompressionType {
-        match self {
-            Self::Off => CompressionType::None,
-            Self::Zstd => CompressionType::Zstd(Self::ZSTD_LEVEL),
-        }
+        self.zstd_level()
+            .map_or(CompressionType::None, CompressionType::Zstd)
     }
 
-    /// RocksDB's blob compression type; its level stays at the default, which
-    /// is [`BlobCodec::ZSTD_LEVEL`].
+    /// RocksDB's blob compression type; its level is set apart (see
+    /// [`set_blob_files`]).
     fn rocksdb(self) -> rocksdb::DBCompressionType {
         match self {
             Self::Off => rocksdb::DBCompressionType::None,
-            Self::Zstd => rocksdb::DBCompressionType::Zstd,
+            Self::Zstd | Self::Zstd22 => rocksdb::DBCompressionType::Zstd,
         }
     }
 }
 
 /// Our engine and RocksDB, each with its values inline and in blob files, the
-/// blob files uncompressed and compressed: the arms of every group.
+/// blob files uncompressed and compressed at the default and the maximum
+/// level: the arms of every group.
 const HEAD_TO_HEAD: &[Engine] = &[
     Engine::Ours,
     Engine::RocksDb,
@@ -362,6 +377,8 @@ const HEAD_TO_HEAD: &[Engine] = &[
     Engine::RocksDbBlob(BlobCodec::Off),
     Engine::BlobTree(BlobCodec::Zstd),
     Engine::RocksDbBlob(BlobCodec::Zstd),
+    Engine::BlobTree(BlobCodec::Zstd22),
+    Engine::RocksDbBlob(BlobCodec::Zstd22),
 ];
 
 /// KV-separation threshold for the `blob_tree` arm: values at or above this many
@@ -390,6 +407,8 @@ fn engines_for(compression: Compression) -> &'static [Engine] {
             Engine::RocksDbBlob(BlobCodec::Off),
             Engine::BlobTree(BlobCodec::Zstd),
             Engine::RocksDbBlob(BlobCodec::Zstd),
+            Engine::BlobTree(BlobCodec::Zstd22),
+            Engine::RocksDbBlob(BlobCodec::Zstd22),
         ],
         Compression::Zstd22 => HEAD_TO_HEAD,
     }
@@ -753,6 +772,14 @@ fn rocksdb_options(
         block_opts.set_data_block_hash_ratio(0.75);
     }
     let mut opts = rocksdb::Options::default();
+    // The blob level has no setter of its own: it is the options string's,
+    // read into the options first, so the cache and table factory set below
+    // are held by the options the engine opens with.
+    if let Some(level) = blob_files.and_then(BlobCodec::zstd_level) {
+        opts = opts
+            .get_options_from_string(format!("blob_compression_opts={{level={level}}}"))
+            .expect("rocksdb: blob compression level");
+    }
     opts.create_if_missing(true);
     match compression {
         Compression::None => opts.set_compression_type(rocksdb::DBCompressionType::None),
@@ -776,7 +803,8 @@ fn rocksdb_options(
 }
 
 /// RocksDB's blob files as the blob arms use them: values at or above
-/// [`BLOB_SEPARATION_THRESHOLD`], compressed as `codec` says.
+/// [`BLOB_SEPARATION_THRESHOLD`], compressed as `codec` says, at the level
+/// [`rocksdb_options`] reads in.
 fn set_blob_files(opts: &mut rocksdb::Options, codec: BlobCodec) {
     opts.set_enable_blob_files(true);
     opts.set_min_blob_size(u64::from(BLOB_SEPARATION_THRESHOLD));
@@ -884,11 +912,36 @@ fn ours_config(
 /// compressed as `blobs` says, or unchanged without it.
 fn separate_values(config: Config, blobs: Option<BlobCodec>) -> Config {
     match blobs {
-        Some(codec) => config
-            .with_kv_separation(Some(
-                KvSeparationOptions::default().separation_threshold(BLOB_SEPARATION_THRESHOLD),
-            ))
-            .blob_compression(codec.ours()),
+        Some(codec) => {
+            // A byte count from `name`, `None` without it. A value that is
+            // not one stops the run, as `COMPARE_SIZES` does: a typo would
+            // otherwise measure the default under the name of the setting.
+            let byte_count = |name: &str| {
+                std::env::var(name).ok().map(|v| {
+                    v.trim()
+                        .parse::<u32>()
+                        .unwrap_or_else(|_| panic!("{name}: not a byte count: {v}"))
+                })
+            };
+            let mut opts =
+                KvSeparationOptions::default().separation_threshold(BLOB_SEPARATION_THRESHOLD);
+            // Blob block size under study: `COMPARE_BLOB_BLOCK` bytes, the
+            // library default without it.
+            if let Some(bytes) = byte_count("COMPARE_BLOB_BLOCK") {
+                opts = opts.block_size(bytes);
+            }
+            // A dictionary of each zstd blob file's own: `COMPARE_BLOB_DICT`
+            // bytes, `0` for none, the library default (64 KiB) without it.
+            // The zstd blob arms therefore run our default layout, a file's
+            // own dictionary included, against RocksDB's blob files, which
+            // have none: the comparison is of the two engines' defaults.
+            if let Some(bytes) = byte_count("COMPARE_BLOB_DICT") {
+                opts = opts.file_dictionary(bytes);
+            }
+            config
+                .with_kv_separation(Some(opts))
+                .blob_compression(codec.ours())
+        }
         None => config,
     }
 }
@@ -1049,7 +1102,7 @@ fn write_throughput_variant(run: &mut Run, group_name: &str, compression: Compre
         .engines
         .contains(&Engine::SurrealKv)
         .then(|| skv_runtime().expect("surrealkv: tokio runtime"));
-    for &n in spec.sizes {
+    for n in run.sizes_of(spec.sizes) {
         // Precompute the keys + values ONCE per `n`, so the timed body does no
         // per-iteration allocation.
         let inputs = WorkloadInputs::of(n, spec.values);
@@ -1159,7 +1212,7 @@ fn point_read_variant(
     }
     series.retain(|&(label, ..)| run.wants_engine(label));
 
-    for &n in spec.sizes {
+    for n in run.sizes_of(spec.sizes) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // Every arm opened and checked before the rounds: they only ever pay
         // for reads, never for open / write / flush.
@@ -1181,6 +1234,158 @@ fn point_read_variant(
             })
             .collect();
         run.measure(group_name, n, arms);
+    }
+}
+
+/// Workload: point-read every key once from an engine opened cold.
+///
+/// Every iteration copies the seed state into a fresh directory, drops the
+/// copy's pages from the OS page cache, opens the engine on it with an empty
+/// block cache and reads each stored key once, in insertion order (scattered
+/// on disk, see [`point_read_variant`]). Only the reads are timed, each on its
+/// own, so the group reports the read latency's median and p99 beside the
+/// mean: the first read of a block, a filter or a separated value goes to the
+/// device, the later reads of a block read it from the cache it filled.
+///
+/// The page cache is dropped with `dd iflag=nocache` per file on Linux; on
+/// another OS the copy's pages stay cached and only the engines' own caches
+/// start empty.
+fn point_read_cold_variant(
+    run: &mut Run,
+    group_name: &str,
+    compression: Compression,
+    spec: Spec,
+    seeds: &mut SeedStates,
+) {
+    if !run.wants(group_name) {
+        return;
+    }
+    let engines: Vec<Engine> = run
+        .engines_of(spec.engines)
+        .into_iter()
+        .filter(|engine| !matches!(engine, Engine::SurrealKv))
+        .collect();
+    for n in run.sizes_of(spec.sizes) {
+        let inputs = WorkloadInputs::of(n, spec.values);
+        let arms = engines
+            .iter()
+            .map(|&engine| {
+                let seed = seeds
+                    .seed(engine, compression, IndexStrategy::Binary, &inputs)
+                    .to_path_buf();
+                let last = Rc::new(Cell::new(ColdSample::default()));
+                let (inputs, sample) = (&inputs, Rc::clone(&last));
+                paired::Arm::new(engine.label(), move |iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let dir = copy_of(&seed);
+                        drop_page_cache(dir.path());
+                        let mut nanos = cold_reads(engine, compression, dir.path(), inputs);
+                        total += Duration::from_nanos(nanos.iter().sum());
+                        sample.set(ColdSample {
+                            read_p50_us: quantile_us(&mut nanos, 500),
+                            read_p99_us: quantile_us(&mut nanos, 990),
+                        });
+                    }
+                    total
+                })
+                .with_metrics(move || last.get().metrics())
+            })
+            .collect();
+        run.measure(group_name, n, arms);
+    }
+}
+
+/// The latencies of one cold pass: `engine` opened on `dir` and every key of
+/// `inputs` read once, each read timed on its own, in nanoseconds.
+fn cold_reads(
+    engine: Engine,
+    compression: Compression,
+    dir: &Path,
+    inputs: &WorkloadInputs,
+) -> Vec<u64> {
+    let mut nanos = Vec::with_capacity(inputs.keys.len());
+    let mut time = |read: &mut dyn FnMut()| {
+        let at = std::time::Instant::now();
+        read();
+        nanos.push(u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    };
+    match engine {
+        Engine::Ours | Engine::BlobTree(_) => {
+            let tree = open_ours(
+                dir,
+                compression,
+                engine.kv_separated(),
+                IndexStrategy::Binary,
+                false,
+            )
+            .expect("ours cold: open");
+            for key in &inputs.keys {
+                time(&mut || {
+                    let got = tree.get(key, MAX_SEQNO).expect("ours cold: get");
+                    assert!(got.is_some(), "ours cold: key unexpectedly missing");
+                    std::hint::black_box(got);
+                });
+            }
+        }
+        Engine::RocksDb | Engine::RocksDbBlob(_) => {
+            let db = open_rocksdb(dir, compression, false, engine.blob_files());
+            for key in &inputs.keys {
+                time(&mut || {
+                    let got = db.get_pinned(key).expect("rocksdb cold: get");
+                    assert!(got.is_some(), "rocksdb cold: key unexpectedly missing");
+                    std::hint::black_box(got);
+                });
+            }
+        }
+        Engine::SurrealKv => unreachable!("surrealkv is not seeded"),
+    }
+    nanos
+}
+
+/// Drops the pages of every file under `dir` from the OS page cache, so the
+/// next reads of them go to the device. The files are clean: [`copy_of`]
+/// synced them.
+fn drop_page_cache(dir: &Path) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    // An entry that cannot be read would stay warm and pass for a cold read.
+    for entry in std::fs::read_dir(dir).expect("read dir") {
+        let entry = entry.expect("read dir entry");
+        let path = entry.path();
+        if entry.file_type().expect("entry file type").is_dir() {
+            drop_page_cache(&path);
+            continue;
+        }
+        let mut input = std::ffi::OsString::from("if=");
+        input.push(&path);
+        let status = std::process::Command::new("dd")
+            .args([
+                input.as_os_str(),
+                "iflag=nocache".as_ref(),
+                "count=0".as_ref(),
+            ])
+            .args(["status=none"])
+            .status()
+            .expect("run dd");
+        assert!(status.success(), "dd iflag=nocache failed: {status}");
+    }
+}
+
+/// What one cold pass measured besides its total read time.
+#[derive(Clone, Copy, Default)]
+struct ColdSample {
+    read_p50_us: f64,
+    read_p99_us: f64,
+}
+
+impl ColdSample {
+    fn metrics(self) -> Vec<(&'static str, f64)> {
+        vec![
+            ("read_p50_us", self.read_p50_us),
+            ("read_p99_us", self.read_p99_us),
+        ]
     }
 }
 
@@ -1484,6 +1689,24 @@ fn bench_seeded(run: &mut Run) {
         false,
         &mut seeds,
     );
+    // The cold reads run the head-to-head arms on both table codecs: a cold
+    // read is where blob files and tables meet the device.
+    let cold = Spec {
+        sizes: SIZES,
+        values: Values::Pool,
+        engines: HEAD_TO_HEAD,
+    };
+    point_read_cold_variant(run, "point_read_cold", none, cold, &mut seeds);
+    point_read_cold_variant(run, "point_read_cold_zstd22", zstd, cold, &mut seeds);
+    for (suffix, spec) in BLOB_SPECS {
+        point_read_cold_variant(
+            run,
+            &format!("point_read_cold{suffix}"),
+            none,
+            *spec,
+            &mut seeds,
+        );
+    }
     multi_get_variant(run, "multi_get", none, Spec::reads(none), &mut seeds);
     multi_get_variant(run, "multi_get_zstd22", zstd, Spec::reads(zstd), &mut seeds);
     range_scan_variant(run, "range_scan", none, Spec::reads(none), &mut seeds);
@@ -1634,7 +1857,7 @@ fn multi_get_variant(
         .filter(|engine| !matches!(engine, Engine::SurrealKv))
         .collect();
 
-    for &n in spec.sizes {
+    for n in run.sizes_of(spec.sizes) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // This measures WARM steady-state batched-MultiGet throughput, NOT
         // cold first-touch latency: every engine opens its seed and probes once
@@ -1786,7 +2009,7 @@ fn warm_read_group(
     if !run.wants(group_name) {
         return;
     }
-    for &n in spec.sizes {
+    for n in run.sizes_of(spec.sizes) {
         let inputs = WorkloadInputs::of(n, spec.values);
         let warm: Vec<(Engine, WarmEngine)> = run
             .engines_of(spec.engines)
@@ -2008,7 +2231,7 @@ fn overwrite_variant(
     if !run.wants(group_name) {
         return;
     }
-    for &n in spec.sizes {
+    for n in run.sizes_of(spec.sizes) {
         let inputs = WorkloadInputs::of(n, spec.values);
         // Every seed written before the rounds; SurrealKV is not seeded (see
         // `SeedStates`) and writes its first copy per iteration instead.
@@ -2314,6 +2537,8 @@ struct Diagnosis {
     data_loads: u64,
     index_loads: u64,
     filter_loads: u64,
+    blob_reads: u64,
+    blob_bytes: u64,
 }
 
 #[cfg(feature = "metrics")]
@@ -2328,6 +2553,8 @@ impl Diagnosis {
             data_loads: m.data_block_load_count() as u64,
             index_loads: m.index_block_load_count() as u64,
             filter_loads: m.filter_block_load_count() as u64,
+            blob_reads: m.blob_read_count() as u64,
+            blob_bytes: m.blob_bytes_read(),
         }
     }
 
@@ -2346,7 +2573,8 @@ impl Diagnosis {
         eprintln!(
             "sustained diagnosis: {reads} reads, l0 runs seen {:.1}, per read: \
              filter queries {:.2}, filter skips {:.2}, block loads cached {:.2} io {:.2} \
-             (data {:.2}, index {:.2}, filter {:.2}); writer stalled {:.1}% of {elapsed:?}; \
+             (data {:.2}, index {:.2}, filter {:.2}), blob reads {:.3} bytes {:.0}; \
+             writer stalled {:.1}% of {elapsed:?}; \
              {tables} tables at the end",
             l0_seen as f64 / reads.max(1) as f64,
             per(self.filter_queries, before.filter_queries),
@@ -2356,6 +2584,8 @@ impl Diagnosis {
             per(self.data_loads, before.data_loads),
             per(self.index_loads, before.index_loads),
             per(self.filter_loads, before.filter_loads),
+            per(self.blob_reads, before.blob_reads),
+            per(self.blob_bytes, before.blob_bytes),
             100.0 * stalled.as_secs_f64() / elapsed.as_secs_f64(),
         );
     }
@@ -2929,7 +3159,7 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
         CompactionShape::Major => &[10_000, 40_000],
         CompactionShape::Split => &[40_000, 100_000],
     };
-    for &n in sizes {
+    for n in run.sizes_of(sizes) {
         let inputs = match shape {
             CompactionShape::Major => WorkloadInputs::build(n),
             CompactionShape::Split => WorkloadInputs::incompressible(n),
@@ -3052,6 +3282,10 @@ const GROUP_NOTES: &[(&str, &str)] = &[
         "One get per stored key on a warm engine. Also our hash index, ribbon locator and row cache, and RocksDB's hash index, on the same chart.",
     ),
     (
+        "point_read_cold",
+        "One get per stored key on an engine opened on a fresh copy of the state, its files dropped from the OS page cache and its block cache empty. Only the reads are timed, each on its own; beside the mean, their p50 and p99.",
+    ),
+    (
         "multi_get",
         "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf).",
     ),
@@ -3139,7 +3373,8 @@ fn baseline_of(label: &str) -> &'static str {
 /// measured.
 struct Run {
     settings: paired::Settings,
-    /// Only groups whose name contains it run.
+    /// Only groups whose name contains it run, or whose name it is when it
+    /// ends in `$`.
     filter: Option<String>,
     /// Started by `cargo bench`, which passes `--bench`. Without it (`cargo
     /// test` runs a bench target too) every group runs once as a smoke test
@@ -3149,6 +3384,9 @@ struct Run {
     /// Only arms with these labels run, from `COMPARE_ENGINES` (comma
     /// separated): one engine's profile or system calls without the others'.
     engines: Option<Vec<String>>,
+    /// Only these key counts run, from `COMPARE_SIZES` (comma separated): one
+    /// size's profile without the others' setup and rounds.
+    sizes: Option<Vec<u64>>,
     results: Vec<paired::ArmResult>,
 }
 
@@ -3228,17 +3466,35 @@ impl Run {
         let engines = std::env::var("COMPARE_ENGINES")
             .ok()
             .map(|list| list.split(',').map(|e| e.trim().to_owned()).collect());
+        let sizes = std::env::var("COMPARE_SIZES").ok().map(|list| {
+            list.split(',')
+                .map(|n| {
+                    n.trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("COMPARE_SIZES: not a key count: {n}"))
+                })
+                .collect()
+        });
         Self {
             settings,
             filter,
             measuring,
             engines,
+            sizes,
             results: Vec::new(),
         }
     }
 
+    /// Whether group `group` runs: its name contains the filter, or is the
+    /// filter exactly when it ends in `$` (`write_throughput$` leaves out
+    /// `write_throughput_zstd22`).
     fn wants(&self, group: &str) -> bool {
-        self.filter.as_deref().is_none_or(|f| group.contains(f))
+        self.filter
+            .as_deref()
+            .is_none_or(|f| match f.strip_suffix('$') {
+                Some(exact) => group == exact,
+                None => group.contains(f),
+            })
     }
 
     /// Whether the arm labelled `label` runs.
@@ -3246,6 +3502,16 @@ impl Run {
         self.engines
             .as_ref()
             .is_none_or(|engines| engines.iter().any(|e| e == label))
+    }
+
+    /// The key counts of `sizes` that run, taken out so a group's loop can
+    /// measure into the run.
+    fn sizes_of(&self, sizes: &[u64]) -> Vec<u64> {
+        sizes
+            .iter()
+            .copied()
+            .filter(|n| self.sizes.as_ref().is_none_or(|wanted| wanted.contains(n)))
+            .collect()
     }
 
     /// The engines of `engines` that run, so a filtered run does not set up
@@ -3335,8 +3601,52 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Fails unless RocksDB writes its blob files at the level each blob arm
+/// names: the level comes from an options string, which a misspelled key or
+/// a struct RocksDB no longer reads would leave at its default unnoticed.
+fn check_rocksdb_blob_levels() {
+    for codec in [BlobCodec::Zstd, BlobCodec::Zstd22] {
+        let Some(level) = codec.zstd_level() else {
+            continue;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        drop(
+            rocksdb::DB::open(
+                &rocksdb_options(Compression::None, false, Some(codec)),
+                dir.path(),
+            )
+            .expect("rocksdb: open"),
+        );
+        // RocksDB can leave several OPTIONS files and `read_dir` lists them in
+        // no order; the newest has the highest number, and the zero-padded
+        // names sort by it.
+        let newest = std::fs::read_dir(dir.path())
+            .expect("rocksdb: list")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("OPTIONS-"))
+            })
+            .max()
+            .expect("rocksdb wrote no OPTIONS file");
+        let options = std::fs::read_to_string(newest).expect("rocksdb: OPTIONS");
+        let blob = options
+            .lines()
+            .find(|line| line.trim_start().starts_with("blob_compression_opts="))
+            .expect("rocksdb: no blob_compression_opts in OPTIONS");
+        assert!(
+            blob.contains(&format!(";level={level};"))
+                || blob.contains(&format!("{{level={level};"))
+                || blob.contains(&format!(";level={level}}}")),
+            "rocksdb blob files not at level {level}: {blob}"
+        );
+    }
+}
+
 fn main() {
     let mut run = Run::from_args();
+    check_rocksdb_blob_levels();
     let mode = if run.measuring {
         "measurement"
     } else {

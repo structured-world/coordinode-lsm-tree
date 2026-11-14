@@ -138,7 +138,7 @@ use alloc::vec::Vec;
 /// [`COLUMNAR_FORMAT_VERSION`](crate::table::meta::COLUMNAR_FORMAT_VERSION),
 /// which is stamped in the descriptor and so is known before any block is
 /// read; this one versions the directory block's own wire form.
-pub const VERSION: u8 = 3;
+pub(crate) const VERSION: u8 = 3;
 
 /// The most rows a row group holds, and so any of its row pages. A writer
 /// closes a group once its rows reach the group size, which is at most
@@ -148,7 +148,7 @@ pub const VERSION: u8 = 3;
 /// forged row count from making a few small pages decode into gigabytes.
 ///
 /// [`MAX_BLOCK_SIZE`]: crate::config::MAX_BLOCK_SIZE
-pub const MAX_GROUP_ROWS: u32 = crate::config::MAX_BLOCK_SIZE;
+pub(crate) const MAX_GROUP_ROWS: u32 = crate::config::MAX_BLOCK_SIZE;
 
 /// The longest varint a `u16` field takes.
 const VAR_U16_MAX_LEN: usize = 3;
@@ -162,7 +162,7 @@ const PART_LEN: usize = 2 + 1;
 /// One zone block after a group's pages: whose zones it holds and how long
 /// it is on disk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ZoneBlock {
+pub(crate) struct ZoneBlock {
     /// The column whose zones the block holds.
     pub column_id: u16,
     /// On-disk length of the block, its header included.
@@ -173,7 +173,7 @@ pub struct ZoneBlock {
 /// index truncates its statistics to by default: long enough that keys and
 /// short fields keep their exact bounds, short enough that a zone of a wide
 /// value costs a small fraction of its page.
-pub const ZONE_BOUND_LEN: usize = 64;
+pub(crate) const ZONE_BOUND_LEN: usize = 64;
 
 /// Zone flag: the zone has no upper bound.
 const ZONE_MAX_UNBOUNDED: u8 = 1;
@@ -194,7 +194,7 @@ struct ZoneSlot {
 
 /// One column's statistics zone over one row page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Zone<'a> {
+pub(crate) struct Zone<'a> {
     /// Null rows of the column in the row page.
     pub null_count: u32,
     /// No non-null value of the column in the row page is below this.
@@ -207,7 +207,7 @@ pub struct Zone<'a> {
 /// The statistics zones of a group's row pages: one per row page and zone
 /// column, row page by row page, their bounds in one buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PageZones {
+pub(crate) struct PageZones {
     columns: Vec<u16>,
     bounds: Vec<u8>,
     slots: Vec<ZoneSlot>,
@@ -217,7 +217,7 @@ impl PageZones {
     /// No zones yet, for the columns `columns` names, in the order each row
     /// page's zones are pushed.
     #[must_use]
-    pub fn new(columns: Vec<u16>) -> Self {
+    pub(crate) fn new(columns: Vec<u16>) -> Self {
         Self {
             columns,
             bounds: Vec::new(),
@@ -228,7 +228,7 @@ impl PageZones {
     /// Appends the next zone from the exact range of its rows' non-null
     /// values, `None` when every row is null, cutting the bounds to
     /// [`ZONE_BOUND_LEN`].
-    pub fn push(&mut self, null_count: u32, range: Option<(&[u8], &[u8])>) {
+    pub(crate) fn push(&mut self, null_count: u32, range: Option<(&[u8], &[u8])>) {
         let Some((min, max)) = range else {
             self.push_bounds(null_count, &[], Some(&[]));
             return;
@@ -278,19 +278,19 @@ impl PageZones {
 
     /// Whether these zones describe column `column_id`.
     #[must_use]
-    pub fn describes(&self, column_id: u16) -> bool {
+    pub(crate) fn describes(&self, column_id: u16) -> bool {
         self.columns.contains(&column_id)
     }
 
     /// The columns these zones describe, in their order.
     #[must_use]
-    pub fn columns(&self) -> &[u16] {
+    pub(crate) fn columns(&self) -> &[u16] {
         &self.columns
     }
 
     /// The zones restricted to the columns `keep` accepts, in the same order.
     #[must_use]
-    pub fn only(&self, keep: impl Fn(u16) -> bool) -> Self {
+    pub(crate) fn only(&self, keep: impl Fn(u16) -> bool) -> Self {
         let kept: Vec<usize> = (0..self.columns.len())
             .filter(|&i| self.columns.get(i).is_some_and(|&c| keep(c)))
             .collect();
@@ -316,7 +316,7 @@ impl PageZones {
     /// Column `column_id`'s zone over row page `row_page`, or `None` when the
     /// column has no zones here or there is no such row page.
     #[must_use]
-    pub fn zone(&self, row_page: u16, column_id: u16) -> Option<Zone<'_>> {
+    pub(crate) fn zone(&self, row_page: u16, column_id: u16) -> Option<Zone<'_>> {
         let column = self.columns.iter().position(|&c| c == column_id)?;
         let index = usize::from(row_page)
             .checked_mul(self.columns.len())?
@@ -354,7 +354,7 @@ impl PageZones {
     }
 
     /// Appends the zones' wire form to `out`.
-    pub fn encode_into(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
         // A zone's fixed fields and its bounds' suffixes, at most.
         out.reserve(
             VAR_U16_MAX_LEN
@@ -476,7 +476,7 @@ fn take_bound(rest: &mut &[u8], reference: &[u8], out: &mut [u8; ZONE_BOUND_LEN]
 /// parts are numbered is its encoding's business, and a column whose encoding
 /// names a single part uses part `0`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct PageId {
+pub(crate) struct PageId {
     /// The column the page belongs to.
     pub column_id: u16,
     /// Which part of that column's encoding the page holds.
@@ -485,7 +485,7 @@ pub struct PageId {
 
 /// One page's placement within its row group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PageEntry {
+pub(crate) struct PageEntry {
     /// Start of the page, measured from the end of the directory.
     pub offset: u32,
     /// On-disk length of the page, its block header included.
@@ -500,7 +500,7 @@ pub struct PageEntry {
 /// was written into, what it holds and for which row page. See the module
 /// docs for why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PageStamp {
+pub(crate) struct PageStamp {
     /// The owning group's [`PageDirectory::group_tag`].
     pub group_tag: u64,
     /// What the page holds.
@@ -511,10 +511,10 @@ pub struct PageStamp {
 
 impl PageStamp {
     /// `group_tag` + `column_id` + `part` + `row_page`.
-    pub const LEN: usize = 8 + 2 + 1 + 2;
+    pub(crate) const LEN: usize = 8 + 2 + 1 + 2;
 
     /// Appends the stamp's wire form to `out`.
-    pub fn encode_into(self, out: &mut Vec<u8>) {
+    pub(crate) fn encode_into(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.group_tag.to_le_bytes());
         out.extend_from_slice(&self.id.column_id.to_le_bytes());
         out.push(self.id.part);
@@ -524,7 +524,7 @@ impl PageStamp {
     /// Reads a stamp from its wire form. Every byte pattern is a stamp; what
     /// makes one wrong is disagreeing with the directory.
     #[must_use]
-    pub fn decode(bytes: [u8; Self::LEN]) -> Self {
+    pub(crate) fn decode(bytes: [u8; Self::LEN]) -> Self {
         let [t0, t1, t2, t3, t4, t5, t6, t7, c0, c1, part, r0, r1] = bytes;
         Self {
             group_tag: u64::from_le_bytes([t0, t1, t2, t3, t4, t5, t6, t7]),
@@ -539,7 +539,7 @@ impl PageStamp {
 
 /// A decoded page directory.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PageDirectory {
+pub(crate) struct PageDirectory {
     row_count: u32,
     group_tag: u64,
     /// Rows in each row page, in row order.
@@ -594,7 +594,7 @@ impl PageDirectory {
     /// The zone blocks, the head one included, are refused unless each names a
     /// distinct column the group has, and their lengths are non-zero and sum
     /// within a `u32`.
-    pub fn new(
+    pub(crate) fn new(
         row_count: u32,
         group_tag: u64,
         row_pages: Vec<u32>,
@@ -760,7 +760,7 @@ impl PageDirectory {
     /// [`Error::InvalidHeader`] when the group has no head zone block, or
     /// `zones` are not that block's column's alone or fail the checks
     /// [`Self::decode_zone_block`] applies.
-    pub fn with_head_zones(mut self, zones: PageZones) -> Result<Self> {
+    pub(crate) fn with_head_zones(mut self, zones: PageZones) -> Result<Self> {
         let Some(head) = self.head_zone_block else {
             return Err(Error::InvalidHeader(
                 "column page: head zones for a group without a head zone block",
@@ -778,7 +778,7 @@ impl PageDirectory {
 
     /// Appends the payload of a zone block of the group `group_tag` names:
     /// the tag, then `zones`, which hold one column's zones.
-    pub fn encode_zone_block(group_tag: u64, zones: &PageZones, out: &mut Vec<u8>) {
+    pub(crate) fn encode_zone_block(group_tag: u64, zones: &PageZones, out: &mut Vec<u8>) {
         out.extend_from_slice(&group_tag.to_le_bytes());
         zones.encode_into(out);
     }
@@ -794,7 +794,7 @@ impl PageDirectory {
     /// [`Self::new`] would refuse. A block of another group or holding another
     /// column's zones is a block in another's place, and its zones would prune
     /// this group's row pages by other values.
-    pub fn decode_zone_block(&self, column_id: u16, bytes: &[u8]) -> Result<PageZones> {
+    pub(crate) fn decode_zone_block(&self, column_id: u16, bytes: &[u8]) -> Result<PageZones> {
         let Some((tag, mut rest)) = bytes.split_first_chunk::<8>() else {
             return Err(Error::InvalidHeader(
                 "ColumnZones: payload shorter than its group tag",
@@ -884,7 +884,7 @@ impl PageDirectory {
     ///
     /// As [`Self::new`], plus [`Error::InvalidHeader`] when the pages' total
     /// length does not fit a `u32`.
-    pub fn contiguous(
+    pub(crate) fn contiguous(
         row_count: u32,
         group_tag: u64,
         row_pages: Vec<u32>,
@@ -918,27 +918,27 @@ impl PageDirectory {
     /// The zone block between the directory and the pages, when the group has
     /// one.
     #[must_use]
-    pub fn head_zone_block(&self) -> Option<ZoneBlock> {
+    pub(crate) fn head_zone_block(&self) -> Option<ZoneBlock> {
         self.head_zone_block
     }
 
     /// The zone blocks after the pages, in the order they follow them.
     #[must_use]
-    pub fn zone_blocks(&self) -> &[ZoneBlock] {
+    pub(crate) fn zone_blocks(&self) -> &[ZoneBlock] {
         &self.zone_blocks
     }
 
     /// Where the pages start, measured from the end of the directory: after
     /// the head zone block, when there is one.
     #[must_use]
-    pub fn pages_start(&self) -> u32 {
+    pub(crate) fn pages_start(&self) -> u32 {
         self.head_zone_block.map_or(0, |head| head.length)
     }
 
     /// Where column `column_id`'s zone block starts, measured from the end of
     /// the directory, and its on-disk length; `None` when the column has none.
     #[must_use]
-    pub fn zone_block(&self, column_id: u16) -> Option<(u32, u32)> {
+    pub(crate) fn zone_block(&self, column_id: u16) -> Option<(u32, u32)> {
         if let Some(head) = self.head_zone_block
             && head.column_id == column_id
         {
@@ -962,7 +962,7 @@ impl PageDirectory {
     /// `u32`. Every walk that frames a group from its directory takes its
     /// extent from here, so none of them can leave a part of the group out.
     #[must_use]
-    pub fn group_len(&self, directory_len: u32) -> Option<u32> {
+    pub(crate) fn group_len(&self, directory_len: u32) -> Option<u32> {
         directory_len
             .checked_add(self.pages_start())?
             .checked_add(self.pages_len())?
@@ -972,7 +972,7 @@ impl PageDirectory {
     /// Total on-disk length of the pages, which is also where the last page
     /// ends relative to the directory.
     #[must_use]
-    pub fn pages_len(&self) -> u32 {
+    pub(crate) fn pages_len(&self) -> u32 {
         // `new` proved every extent fits a u32, and the last page ends
         // furthest because the entries are ascending and non-overlapping.
         self.entries
@@ -982,38 +982,38 @@ impl PageDirectory {
 
     /// Rows in the group.
     #[must_use]
-    pub fn row_count(&self) -> u32 {
+    pub(crate) fn row_count(&self) -> u32 {
         self.row_count
     }
 
     /// Rows in each row page, in row order.
     #[must_use]
-    pub fn row_pages(&self) -> &[u32] {
+    pub(crate) fn row_pages(&self) -> &[u32] {
         &self.row_pages
     }
 
     /// The first row of row page `row_page` within the group, or `None` when
     /// there is no such row page.
     #[must_use]
-    pub fn row_page_start(&self, row_page: u16) -> Option<u32> {
+    pub(crate) fn row_page_start(&self, row_page: u16) -> Option<u32> {
         self.row_page_starts.get(usize::from(row_page)).copied()
     }
 
     /// Rows in row page `row_page`, or `None` when there is no such row page.
     #[must_use]
-    pub fn row_page_rows(&self, row_page: u16) -> Option<u32> {
+    pub(crate) fn row_page_rows(&self, row_page: u16) -> Option<u32> {
         self.row_pages.get(usize::from(row_page)).copied()
     }
 
     /// The tag every page of this group carries in its [`PageStamp`].
     #[must_use]
-    pub fn group_tag(&self) -> u64 {
+    pub(crate) fn group_tag(&self) -> u64 {
         self.group_tag
     }
 
     /// The stamp the page at `entry` must carry.
     #[must_use]
-    pub fn stamp_for(&self, entry: &PageEntry) -> PageStamp {
+    pub(crate) fn stamp_for(&self, entry: &PageEntry) -> PageStamp {
         PageStamp {
             group_tag: self.group_tag,
             id: entry.id,
@@ -1023,14 +1023,14 @@ impl PageDirectory {
 
     /// The pages, in ascending offset order.
     #[must_use]
-    pub fn entries(&self) -> &[PageEntry] {
+    pub(crate) fn entries(&self) -> &[PageEntry] {
         &self.entries
     }
 
     /// The zones of the head zone block, once [`Self::with_head_zones`] kept
     /// them on this directory; empty until then.
     #[must_use]
-    pub fn head_zones(&self) -> &PageZones {
+    pub(crate) fn head_zones(&self) -> &PageZones {
         &self.head_zones
     }
 
@@ -1038,7 +1038,7 @@ impl PageDirectory {
     /// are not kept on this directory yet: a read selecting by that column has
     /// to read the block first.
     #[must_use]
-    pub fn lacks_head_zones_for(&self, column_id: u16) -> bool {
+    pub(crate) fn lacks_head_zones_for(&self, column_id: u16) -> bool {
         self.head_zone_block
             .is_some_and(|head| head.column_id == column_id)
             && self.head_zones.columns.is_empty()
@@ -1047,7 +1047,7 @@ impl PageDirectory {
     /// The bytes the decoded directory holds on the heap, which is what it
     /// costs the block cache to keep it.
     #[must_use]
-    pub fn heap_size(&self) -> usize {
+    pub(crate) fn heap_size(&self) -> usize {
         use core::mem::size_of;
 
         (self.row_pages.len() + self.row_page_starts.len()) * size_of::<u32>()
@@ -1060,7 +1060,7 @@ impl PageDirectory {
     }
 
     /// Serializes the directory into `out`.
-    pub fn encode_into(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
         let row_page_count = self.row_pages.len();
         // `new` proved the pages are one run of every row page per column
         // part, so each part is named by the first page of its run.
@@ -1109,7 +1109,7 @@ impl PageDirectory {
     /// Trailing bytes are refused rather than ignored: a directory longer than
     /// it declares is either a writer this build does not understand or a
     /// corruption that a lenient parse would carry into every page lookup.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         const ERR: Error = Error::InvalidHeader("ColumnPageDirectory");
 
         // Every field is taken in a branch that builds the refusal only when
@@ -1234,7 +1234,7 @@ impl PageDirectory {
 }
 
 /// Appends `value` as a LEB128 varint.
-pub fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         // The low seven bits, a byte by construction.
         let low = (value & 0x7f) as u8;
@@ -1247,27 +1247,7 @@ pub fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
-/// The longest varint a `u64` field takes.
-pub const VAR_U64_MAX_LEN: usize = 10;
-
-/// Takes a LEB128 varint of at most `max_len` bytes off the front of `bytes`;
-/// `None` when it is truncated, runs longer, or carries bits past a `u64`.
-pub fn take_varint(bytes: &mut &[u8], max_len: usize) -> Option<u64> {
-    let mut value = 0u64;
-    for (index, &byte) in bytes.iter().take(max_len.min(VAR_U64_MAX_LEN)).enumerate() {
-        // The tenth byte holds bit 63 alone; anything above it names a value
-        // no `u64` has, which only a damaged or forged varint writes.
-        if index == VAR_U64_MAX_LEN - 1 && byte > 1 {
-            return None;
-        }
-        value |= u64::from(byte & 0x7f) << (7 * index);
-        if byte & 0x80 == 0 {
-            *bytes = bytes.get(index + 1..)?;
-            return Some(value);
-        }
-    }
-    None
-}
+pub(crate) use crate::coding::{VAR_U64_MAX_LEN, take_varint};
 
 /// Takes a varint that must fit a `u16`.
 fn take_var_u16(bytes: &mut &[u8]) -> Option<u16> {
@@ -1283,7 +1263,7 @@ fn take_var_u32(bytes: &mut &[u8]) -> Option<u32> {
 /// when fewer remain. Manual little-endian parsing keeps this codec
 /// `core` + `alloc` clean, like the sibling section codecs, and the fixed-size
 /// array makes every field read infallible once taken.
-pub fn take<const N: usize>(bytes: &mut &[u8]) -> Option<[u8; N]> {
+pub(crate) fn take<const N: usize>(bytes: &mut &[u8]) -> Option<[u8; N]> {
     let (head, tail) = bytes.split_first_chunk::<N>()?;
     *bytes = tail;
     Some(*head)
@@ -1291,7 +1271,7 @@ pub fn take<const N: usize>(bytes: &mut &[u8]) -> Option<[u8; N]> {
 
 /// Takes the next `len` bytes off the front of `bytes`, or `None` when fewer
 /// remain.
-pub fn take_slice<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+pub(crate) fn take_slice<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
     let (head, tail) = bytes.split_at_checked(len)?;
     *bytes = tail;
     Some(head)

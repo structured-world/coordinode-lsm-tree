@@ -100,6 +100,19 @@ impl Slice {
         self.0 == other.0
     }
 
+    /// The allocation the slice's bytes lie in.
+    pub(crate) fn allocation(&self) -> super::Allocation {
+        match self.0.heap_allocation() {
+            Some((id, len)) => super::Allocation::Shared { id, len },
+            None => super::Allocation::Own,
+        }
+    }
+
+    /// Whether no other slice shares its bytes.
+    pub(crate) fn is_unique(&self) -> bool {
+        self.0.is_unique()
+    }
+
     #[doc(hidden)]
     #[cfg(feature = "std")]
     pub fn from_reader<R: std::io::Read>(reader: &mut R, len: usize) -> std::io::Result<Self> {

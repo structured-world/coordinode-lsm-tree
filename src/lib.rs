@@ -588,7 +588,7 @@ pub use {
     cache::Cache,
     comparator::{DefaultUserComparator, SharedComparator, UserComparator},
     compression::CompressionType,
-    config::{BlobLocalityRelocation, Config, KvSeparationOptions, TreeType},
+    config::{BlobLocalityRelocation, Config, DictionaryClasses, KvSeparationOptions, TreeType},
     error::{Error, FormatPart, Result},
     format_version::FormatVersion,
     iter_guard::IterGuard as Guard,

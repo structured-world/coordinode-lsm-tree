@@ -32,6 +32,24 @@ struct BlobRead<'a> {
     read: ValueRead<'a>,
     /// The slot of its blob file in [`MultiGetRead::blob_files`].
     slot: usize,
+    /// The other values of the batch in the frame this reads, a block holding
+    /// many and being read once for all of them: the first of their chain in
+    /// [`MultiGetRead::waiters`], [`NO_WAITER`] for none.
+    waiters: u32,
+}
+
+/// The end of a chain of [`Waiter`]s.
+const NO_WAITER: u32 = u32::MAX;
+
+/// A value of the batch that waits on the read of another's frame: its key
+/// index, its entry, where it lies in the frame, and the next of the chain.
+/// One list holds the waiters of every read, so a batch allocates for them
+/// once rather than per frame.
+struct Waiter {
+    idx: usize,
+    item: InternalValue,
+    index: u16,
+    next: u32,
 }
 
 /// A blob file the value reads go through: opened once, when the read has
@@ -146,6 +164,13 @@ pub(super) struct MultiGetRead<'a, K> {
     merge_room: Option<u64>,
     /// Value reads whose blob file is open, by tag, not yet handed out.
     blobs_ready: VecDeque<usize>,
+    /// The tag of the read out for each blob frame or packed record, by what
+    /// it reads (see [`crate::blob_tree::ValueRead::reads`]): a value in a
+    /// frame already being read waits on that read.
+    frames_out: crate::HashMap<crate::blob_tree::ReadOf, usize>,
+    /// The values waiting on another value's read, chained per read from
+    /// [`BlobRead::waiters`]; `None` once taken.
+    waiters: Vec<Option<Waiter>>,
     /// The bytes of the value reads out.
     blob_bytes_out: usize,
 }
@@ -223,6 +248,8 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             merge_bytes_out: 0,
             merge_room: None,
             blobs_ready: VecDeque::new(),
+            frames_out: crate::HashMap::default(),
+            waiters: Vec::new(),
             blob_bytes_out: 0,
         }
     }
@@ -334,6 +361,25 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                     self.jobs += 1;
                 }
                 ValuePlan::Read(read) => {
+                    let frame = read.reads();
+                    // A batch of more waiters than a chain can number reads
+                    // the rest each on its own read.
+                    if let Some(&tag) = self.frames_out.get(&frame)
+                        && let Some(Some(ValueReadOut::Blob(lead))) = self.reads.get_mut(tag)
+                        && let Ok(at) = u32::try_from(self.waiters.len())
+                        && at != NO_WAITER
+                    {
+                        self.waiters.push(Some(Waiter {
+                            idx,
+                            item: entry,
+                            index: read.vhandle.index,
+                            next: lead.waiters,
+                        }));
+                        lead.waiters = at;
+                        self.jobs += 1;
+                        continue;
+                    }
+                    self.frames_out.insert(frame, self.reads.len());
                     let id = read.vhandle.blob_file_id;
                     let held = self.blob_files.iter().position(|slot| slot.id == id);
                     let slot = held.unwrap_or_else(|| {
@@ -358,6 +404,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                         item: entry,
                         read,
                         slot,
+                        waiters: NO_WAITER,
                     })));
                     self.jobs += 1;
                 }
@@ -383,7 +430,15 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 if let Some(ValueReadOut::Blob(read)) = pending.take_if(
                     |pending| matches!(pending, ValueReadOut::Blob(read) if read.slot == slot),
                 ) {
+                    self.frames_out.remove(&read.read.reads());
                     self.alone.push((read.idx, read.item));
+                    let mut next = read.waiters;
+                    while let Some(waiter) =
+                        self.waiters.get_mut(next as usize).and_then(Option::take)
+                    {
+                        next = waiter.next;
+                        self.alone.push((waiter.idx, waiter.item));
+                    }
                 }
             }
             self.files_held -= 1;
@@ -435,7 +490,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             Ok(()) => done.buf.into_slice(),
             Err(_) => None,
         };
-        let value = match (&self.ctx.values, frame) {
+        let (value, decoded) = match (&self.ctx.values, frame) {
             (Values::Blob(source), Some(frame)) => source
                 .finish_value(
                     self.ctx.version(),
@@ -443,9 +498,8 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                     &pending.read,
                     &frame,
                 )
-                .ok()
-                .flatten(),
-            _ => None,
+                .unwrap_or((None, None)),
+            _ => (None, None),
         };
         // Its last read back, the file is given back: the descriptor cache can
         // close it, and another file can be opened in its place.
@@ -456,9 +510,28 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 self.files_held -= 1;
             }
         }
+        self.frames_out.remove(&pending.read.reads());
         match value {
             Some(value) => self.value_done(pending.idx, Ok(Some(value))),
             None => self.alone.push((pending.idx, pending.item)),
+        }
+        // The other values of the batch in the frame are taken out of it as
+        // it was read and checked: each waits on this read because its
+        // indirection names this frame, and lies there at its own index.
+        let mut next = pending.waiters;
+        while let Some(waiter) = self.waiters.get_mut(next as usize).and_then(Option::take) {
+            next = waiter.next;
+            let ready = decoded.as_ref().and_then(|frame| {
+                crate::blob_tree::BlobSource::value_in_frame(
+                    frame,
+                    waiter.index,
+                    &waiter.item.key.user_key,
+                )
+            });
+            match ready {
+                Some(value) => self.value_done(waiter.idx, Ok(Some(value))),
+                None => self.alone.push((waiter.idx, waiter.item)),
+            }
         }
     }
 

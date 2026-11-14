@@ -6,7 +6,19 @@ runs:
     - if: runner.os == 'Linux'
       shell: bash
       # The image's package index is used first; a stale one is refreshed.
+      # mold only saves disk writes: .cargo/cc-mold.sh links with cc where it
+      # is not installed, so a package mirror the runner cannot reach leaves
+      # the build linking as rustc otherwise would instead of failing it.
+      #
+      # Each apt call is bounded and makes one attempt: a mirror whose name
+      # does not resolve costs apt about 20 s per mirror and suite, which took
+      # this step past 6 minutes of a job with a 10 minute limit. Waiting buys
+      # nothing the cc fallback does not already give.
       run: |
-        sudo apt-get install -y --no-install-recommends mold \
-          || { sudo apt-get update && sudo apt-get install -y --no-install-recommends mold; }
-        mold --version
+        bounded_apt() { sudo timeout 45 apt-get -o Acquire::Retries=0 "$@"; }
+        if bounded_apt install -y --no-install-recommends mold \
+          || { bounded_apt update && bounded_apt install -y --no-install-recommends mold; }; then
+          mold --version
+        else
+          echo "::warning title=mold unavailable::the package mirror did not answer; linking with cc"
+        fi

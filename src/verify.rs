@@ -3030,6 +3030,7 @@ fn toc_catalogue_defects(toc: &crate::sfa::Toc, toc_pos: u64) -> Vec<TocCatalogu
 /// is caught instead inside salvage, which fails closed when the open degrades a
 /// rebuildable section that did not decode as its claimed type (see
 /// `Table::salvage_degraded_a_rebuildable_section`).
+#[cfg(feature = "std")]
 pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64) -> bool {
     !toc_catalogue_defects(toc, toc_pos).is_empty()
 }

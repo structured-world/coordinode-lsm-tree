@@ -30,3 +30,26 @@ pub trait Decode {
     where
         Self: Sized;
 }
+
+/// The longest varint a `u64` field takes.
+pub(crate) const VAR_U64_MAX_LEN: usize = 10;
+
+/// Takes a LEB128 varint of at most `max_len` bytes off the front of `bytes`;
+/// `None` when it is truncated, runs longer, or carries bits past a `u64`.
+#[inline]
+pub(crate) fn take_varint(bytes: &mut &[u8], max_len: usize) -> Option<u64> {
+    let mut value = 0u64;
+    for (index, &byte) in bytes.iter().take(max_len.min(VAR_U64_MAX_LEN)).enumerate() {
+        // The tenth byte holds bit 63 alone; anything above it names a value
+        // no `u64` has, which only a damaged or forged varint writes.
+        if index == VAR_U64_MAX_LEN - 1 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            *bytes = bytes.get(index + 1..)?;
+            return Some(value);
+        }
+    }
+    None
+}

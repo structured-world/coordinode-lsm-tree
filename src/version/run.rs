@@ -24,7 +24,7 @@ pub trait HoldsRangeTombstones {
 ///
 /// May point to an interval [min, max] of tables in the next run.
 #[expect(dead_code, reason = "planned for cascading index optimization")]
-pub struct Indexed<T: Ranged> {
+pub(crate) struct Indexed<T: Ranged> {
     inner: T,
     // cascade_indexes: (u32, u32),
 }
@@ -295,9 +295,9 @@ impl<T: Ranged> Run<T> {
             return &[];
         };
 
-        self.get(lo..=hi)
-            .map(|slice| trim_slice(slice, |x| key_range.contains_range_cmp(x.key_range(), cmp)))
-            .unwrap_or_default()
+        self.get(lo..=hi).map_or_default(|slice| {
+            trim_slice(slice, |x| key_range.contains_range_cmp(x.key_range(), cmp))
+        })
     }
 
     /// Returns the indexes of the interval [min, max] of tables that overlap with a given range.

@@ -158,8 +158,7 @@ fn fifo_overlapping_l0_compacts_without_panic_and_drops_oldest_first() -> crate:
             .current_version()
             .iter_tables()
             .max_by_key(|t| t.get_highest_seqno())
-            .map(crate::table::Table::file_size)
-            .unwrap_or_default();
+            .map_or_default(crate::table::Table::file_size);
         tree.compact(Arc::new(Strategy::new(newest_size, None)), 3)?;
         assert_eq!(1, tree.table_count());
         assert!(tree.get("b", 3)?.is_some(), "the newer table must survive");
@@ -275,8 +274,7 @@ fn fifo_after_major_compaction_drops_oldest_data_first_for_decreasing_keys() -> 
             .current_version()
             .iter_tables()
             .max_by_key(|t| t.get_highest_seqno())
-            .map(crate::table::Table::file_size)
-            .unwrap_or_default();
+            .map_or_default(crate::table::Table::file_size);
         tree.compact(Arc::new(Strategy::new(newest, None)), watermark)?;
 
         assert!(

@@ -180,3 +180,100 @@ fn a_span_stops_at_the_blob_file_boundary() {
     );
     assert_eq!(span.end, 200);
 }
+
+/// Frames read ahead into a read's own store out of one coalesced read hold
+/// none of it: blocks stored as they are (values a codec does not shrink)
+/// decode into views of the read, and a view kept in the store would keep the
+/// whole read, the other frames and the gaps between them, past the payloads
+/// the store counts.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_local_read_ahead_keeps_no_part_of_the_coalesced_read() -> crate::Result<()> {
+    use crate::{
+        AbstractTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
+        blob_tree::handle::BlobIndirection, iter_guard::IterGuard,
+    };
+
+    let dir = tempfile::tempdir()?;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(crate::CompressionType::Lz4)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(16)
+            .block_size(1_024),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Blob(tree) => tree,
+        crate::AnyTree::Standard(_) => panic!("expected a blob tree"),
+    };
+    // Values lz4 does not shrink, a few to a block.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    for i in 0..64u64 {
+        let value: Vec<u8> = (0..200)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        tree.insert(format!("k{i:04}"), value, i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let rows: Vec<(Vec<u8>, ValueHandle)> = tree
+        .index
+        .iter(SeqNo::MAX, None)
+        .map(|guard| {
+            let (key, value) = guard.into_inner()?;
+            Ok((key.to_vec(), BlobIndirection::decode_slice(&value)?.vhandle))
+        })
+        .collect::<crate::Result<_>>()?;
+    let mut items: Vec<(&[u8], ValueHandle, usize)> = rows
+        .iter()
+        .enumerate()
+        .map(|(at, (key, vhandle))| (key.as_slice(), *vhandle, at))
+        .collect();
+    let version = tree.current_version();
+    let accessor = super::Accessor::new(
+        &version.blob_files,
+        crate::config::BlobCacheFill::default(),
+        #[cfg(feature = "metrics")]
+        None,
+    );
+    let mut store = super::Prefetched::default();
+    accessor.prefetch(
+        tree.index.id(),
+        &mut items,
+        &tree.index.config.cache,
+        4_096,
+        1 << 20,
+        super::PrefetchInto::Local(&mut store),
+    );
+    assert!(
+        store.frames.len() > 1,
+        "{} frames read ahead",
+        store.frames.len()
+    );
+    // A frame that was a read by itself stays a view of it, entries and
+    // payload alike; one copied out of a larger read holds its own payload,
+    // and its entries must not keep that read either.
+    let mut copied = 0;
+    for (at, frame) in &store.frames {
+        if frame.payload.is_empty() || !frame.payload.is_unique() {
+            continue;
+        }
+        copied += 1;
+        assert!(
+            frame.entries.is_empty() || frame.entries.is_unique(),
+            "the entries of {at:?} keep the read its payload was copied out of"
+        );
+    }
+    assert!(copied > 0, "some frames came out of a larger read");
+    Ok(())
+}

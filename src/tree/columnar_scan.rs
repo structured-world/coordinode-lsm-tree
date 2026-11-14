@@ -518,15 +518,15 @@ fn memtable_span(
             continue;
         }
         span = Some(match span {
-            None => (rt.start.clone(), rt.end.clone()),
+            None => (rt.start, rt.end),
             Some((min, max)) => (
                 if cmp.compare(&rt.start, &min) == Ordering::Less {
-                    rt.start.clone()
+                    rt.start
                 } else {
                     min
                 },
                 if cmp.compare(&rt.end, &max) == Ordering::Greater {
-                    rt.end.clone()
+                    rt.end
                 } else {
                     max
                 },
@@ -1604,7 +1604,7 @@ impl ColumnarScan {
                 // Same exclusive-MVCC visibility as rows: the deletion exists
                 // for this snapshot only below it.
                 if eff < self.seqno {
-                    rts.push((rt.start.clone(), rt.end.clone(), eff));
+                    rts.push((rt.start, rt.end, eff));
                 }
             }
         }

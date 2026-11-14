@@ -6,6 +6,7 @@ pub(crate) mod frame;
 pub(crate) mod merge;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
+pub(crate) mod packed;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod writer;
@@ -90,7 +91,7 @@ pub(crate) struct Inner {
     /// Where each frame starts, then where the data ends: one more entry than
     /// the file has frames. A handle names a frame by its number, and this is
     /// how a read finds its bytes.
-    pub(crate) frames: Arc<[u64]>,
+    pub(crate) frames: writer::FrameIndex,
 
     pub(crate) file_accessor: FileAccessor,
 
@@ -124,6 +125,12 @@ pub(crate) struct Inner {
     /// the current version still names.
     #[cfg(zstd_any)]
     pub(crate) zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+
+    /// Whether [`Self::zstd_dictionary`] is the file's own, built from its
+    /// values and stored in it: its frames decode with no other file's, so a
+    /// copy of them into another file is a copy of the values, not the frames.
+    #[cfg(zstd_any)]
+    pub(crate) dictionary_in_file: bool,
 
     /// Tree-wide background file deleter. See
     /// [`Table::install_background_deleter`](crate::Table) for the contract:
@@ -645,17 +652,26 @@ impl BlobFile {
     }
 
     /// Whether a frame of this file starts at `offset`, or its data ends
-    /// there.
+    /// there. A chunk is no frame of its own: where one starts is the middle
+    /// of its value.
     #[must_use]
     pub(crate) fn is_frame_boundary(&self, offset: u64) -> bool {
-        self.0.frames.binary_search(&offset).is_ok()
+        self.0
+            .frames
+            .binary_search(&offset)
+            .is_ok_and(|at| !self.0.frames.is_chunk(at))
     }
 
-    /// The number of the frame that starts at `offset`, if one does.
+    /// The number of the frame that starts at `offset`, if one does: a head,
+    /// a single or a block, never a chunk.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn frame_at_offset(&self, offset: u64) -> Option<u32> {
         let starts = self.0.frames.get(..self.frame_count())?;
         let at = starts.binary_search(&offset).ok()?;
+        if self.0.frames.is_chunk(at) {
+            return None;
+        }
         u32::try_from(at).ok()
     }
 
@@ -664,6 +680,46 @@ impl BlobFile {
     #[must_use]
     pub(crate) fn compression(&self) -> crate::CompressionType {
         self.0.meta.compression
+    }
+
+    /// Whether this file decodes with a dictionary of its own, which no other
+    /// file holds: its values are copied out decoded, never as its frames.
+    #[must_use]
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::unused_self,
+            reason = "without zstd no file holds a dictionary of its own"
+        )
+    )]
+    pub(crate) fn has_own_dictionary(&self) -> bool {
+        #[cfg(zstd_any)]
+        return self.0.dictionary_in_file;
+        #[cfg(not(zstd_any))]
+        false
+    }
+
+    /// The bytes of the dictionary of its own this file holds, which a file
+    /// its frames are copied into holds too; `0` for none.
+    #[cfg(feature = "std")]
+    #[must_use]
+    #[cfg_attr(
+        not(zstd_any),
+        expect(
+            clippy::unused_self,
+            reason = "without zstd no file holds a dictionary of its own"
+        )
+    )]
+    pub(crate) fn own_dictionary_bytes(&self) -> u64 {
+        #[cfg(zstd_any)]
+        return self
+            .0
+            .zstd_dictionary
+            .as_ref()
+            .filter(|_| self.has_own_dictionary())
+            .map_or(0, |dict| dict.raw().len() as u64);
+        #[cfg(not(zstd_any))]
+        0
     }
 
     /// The lifetime class this file's values were written under; `0` is the

@@ -339,7 +339,7 @@ fn compute_on_empty_version_maps_compaction_flag_to_status() {
         clippy::unwrap_used,
         reason = "compute_storage_stats cannot fail on an empty in-memory version (no file to stat)"
     )]
-    let busy = compute_storage_stats(&version, true, true).unwrap();
+    let busy = compute_storage_stats(&version, true, true, 0).unwrap();
     assert_eq!(busy.status, StorageStatus::CompactionInProgress);
     assert_eq!(busy.used_bytes, 0);
     assert_eq!(busy.item_count, 0);
@@ -351,7 +351,7 @@ fn compute_on_empty_version_maps_compaction_flag_to_status() {
         clippy::unwrap_used,
         reason = "compute_storage_stats cannot fail on an empty in-memory version (no file to stat)"
     )]
-    let idle = compute_storage_stats(&version, false, true).unwrap();
+    let idle = compute_storage_stats(&version, false, true, 0).unwrap();
     assert_eq!(idle.status, StorageStatus::Healthy);
 }
 
@@ -608,7 +608,7 @@ fn a_restricted_table_contributes_only_its_live_entries() -> crate::Result<()> {
         FragmentationMap::default(),
     );
 
-    let stats = compute_storage_stats(&version, false, true)?;
+    let stats = compute_storage_stats(&version, false, true, 0)?;
     assert!(
         stats.item_count < whole,
         "the consumed prefix must not be counted: reported {} of {whole}",

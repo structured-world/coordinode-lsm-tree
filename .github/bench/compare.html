@@ -62,7 +62,7 @@
       <option value="ratio">Relative to RocksDB</option>
       <option value="time">Time per operation</option>
     </select></label>
-    <label>Codec <select id="codec">
+    <label>Tables <select id="codec">
       <option value="all">All</option>
       <option value="none">Uncompressed</option>
       <option value="zstd22">zstd level 22</option>
@@ -85,6 +85,7 @@
   // One colour per engine on every chart.
   const COLORS = {
     "ours": "#58a6ff", "rocksdb": "#f78166", "surrealkv": "#3fb950", "blob_tree": "#d2a8ff", "rocksdb_blob": "#ffb77a", "blob_tree_zstd": "#bc8cff", "rocksdb_blob_zstd": "#f0883e",
+    "blob_tree_zstd22": "#8957e5", "rocksdb_blob_zstd22": "#bd561d",
     "ours-hash-index": "#79c0ff", "rocksdb-hash-index": "#ffa198", "ours-ribbon": "#e3b341", "ours-row-cache": "#56d4dd",
     "ours-deferred-wal": "#a5d6ff",
   };
@@ -216,7 +217,7 @@
         const card = document.createElement("div");
         card.className = "card";
         const h3 = document.createElement("h3");
-        h3.textContent = base(group) + (codecOf(group) === "zstd22" ? " · zstd-22" : kind === "compaction" ? "" : " · uncompressed") + blobsOf(group);
+        h3.textContent = base(group) + (codecOf(group) === "zstd22" ? " · tables zstd-22" : kind === "compaction" ? "" : " · tables uncompressed") + blobsOf(group);
         const p = document.createElement("p");
         p.textContent = notes[base(group)] || "";
         const wrap = document.createElement("div");

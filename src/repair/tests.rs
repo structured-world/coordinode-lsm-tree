@@ -7876,7 +7876,7 @@ fn validate_frames(
         &config.current_zstd_dictionaries(),
     )?;
     #[cfg(zstd_any)]
-    let dict = super::blob_file_dictionary(config, handle.compression())?;
+    let dict = super::blob_file_dictionary(config, path, handle.meta())?;
     super::validate_blob_frames(
         config,
         path,
@@ -8047,8 +8047,8 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     }
 
     // Overwrite the compressed payload with same-length garbage and RE-STAMP
-    // the frame checksum (xxh3-128 over the entries, the stored payload and
-    // the header CRC), so the frame verifies while the payload no longer
+    // the frame checksum (xxh3-128 over the entries and the stored payload,
+    // seeded with the header CRC), so the frame verifies while the payload no longer
     // decompresses.
     let entry = crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
         .next()
@@ -8064,14 +8064,13 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     let entries_end = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + header.entries_len as usize;
     let garbage = vec![0xA5u8; frame_bytes.len() - entries_end];
     let restamped = {
-        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(u64::from(header.header_crc));
         hasher.update(
             frame_bytes
                 .get(crate::vlog::blob_file::frame::FRAME_HEADER_LEN..entries_end)
                 .expect("the frame holds its entries"),
         );
         hasher.update(&garbage);
-        hasher.update(&header.header_crc.to_le_bytes());
         hasher.digest128()
     };
     {
@@ -8497,9 +8496,38 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
 /// that share blocks: a punched block's values are seeded as block bytes, their
 /// entries uncompressed, so their share of the file's blocks is what the file
 /// is charged, and none as frames of their own.
+#[cfg(feature = "lz4")]
 #[test]
-#[expect(clippy::expect_used, reason = "test code")]
 fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
+    // Blocks of four 64-byte values each, an entry of 83 bytes with its
+    // 14-byte header and five-byte key.
+    let block = punched_first_block_is_seeded(crate::CompressionType::Lz4, 8, 340)?;
+    assert_eq!(block, 4, "the first block holds four values");
+    Ok(())
+}
+
+/// [`repair_seeds_a_punched_block_prefix_as_block_bytes`] for a file that
+/// compresses nothing, whose small values are packed: a punched packed block's
+/// records are seeded as block bytes as they lie.
+#[test]
+fn repair_seeds_a_punched_packed_prefix_as_block_bytes() -> crate::Result<()> {
+    // Packed blocks of four 64-byte values each, a record of 96 bytes with
+    // its 27-byte fixed part and five-byte key.
+    let block = punched_first_block_is_seeded(crate::CompressionType::None, 8, 340)?;
+    assert_eq!(block, 4, "the first packed block holds four records");
+    Ok(())
+}
+
+/// Writes `count` 64-byte values into one blob file compressed as
+/// `compression` with blocks of `block_size`, punches its first block away,
+/// repairs, and checks that block is seeded as garbage of block bytes alone.
+/// Returns how many values the punched block held.
+#[expect(clippy::expect_used, reason = "test code")]
+fn punched_first_block_is_seeded(
+    compression: crate::CompressionType,
+    count: u32,
+    block_size: u32,
+) -> crate::Result<usize> {
     use crate::AbstractTree;
     use crate::fs::{Fs, MemFs};
     use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
@@ -8516,23 +8544,22 @@ fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(memfs.clone())
-        // Blocks of four 64-byte values each, an entry of 83 bytes with its
-        // 14-byte header and five-byte key.
         .with_kv_separation(Some(
             KvSeparationOptions::default()
                 .separation_threshold(16)
-                .block_size(340),
+                .block_size(block_size),
         ))
+        .blob_compression(compression)
     };
     {
         let tree = match open_config().open()? {
             crate::AnyTree::Blob(t) => t,
             crate::AnyTree::Standard(_) => panic!("expected blob tree"),
         };
-        for i in 0..8u32 {
+        for i in 0..count {
             tree.insert(
                 format!("k{i:04}").as_bytes(),
-                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64],
+                alloc::vec![b'a' + u8::try_from(i % 26).expect("below 26"); 64],
                 u64::from(i),
             );
         }
@@ -8543,18 +8570,15 @@ fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
     let blob_path = blobs.join("0");
     let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
         .collect::<crate::Result<Vec<_>>>()?;
-    assert_eq!(entries.len(), 8, "eight separated values");
+    assert_eq!(entries.len(), count as usize, "every value separated");
     let block: Vec<_> = entries.iter().take_while(|e| e.frame == 0).collect();
-    assert_eq!(block.len(), 4, "the first block holds four values");
+    assert!(block.len() < entries.len(), "more than one block");
     assert!(block.iter().all(|e| e.frames.is_none()), "they share it");
-    let frontier = block.last().expect("four values").frame_end;
+    let frontier = block.last().expect("a value").frame_end;
     let prefix_bytes: u64 = block.iter().map(|e| u64::from(e.uncompressed_len)).sum();
     let prefix_entries: u64 = block
         .iter()
-        .map(|e| {
-            (crate::vlog::blob_file::frame::ENTRY_HEADER_LEN + e.key.len()) as u64
-                + u64::from(e.uncompressed_len)
-        })
+        .map(|e| e.block.as_ref().expect("in a block").entry_bytes)
         .sum();
     let data_start = {
         let mut f = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
@@ -8581,12 +8605,13 @@ fn repair_seeds_a_punched_block_prefix_as_block_bytes() -> crate::Result<()> {
         .get(&0)
         .copied()
         .expect("the punched block is seeded as garbage");
+    let len = block.len();
     assert_eq!(
         entry,
-        crate::blob_tree::FragmentationEntry::new(4, prefix_bytes, 0)
+        crate::blob_tree::FragmentationEntry::new(len, prefix_bytes, 0)
             .with_block_bytes(prefix_entries),
     );
-    Ok(())
+    Ok(len)
 }
 
 /// A salvage temp left behind by THIS repair's own failed blob salvage (the
@@ -13531,7 +13556,7 @@ fn a_failed_salvage_output_never_costs_the_source() -> crate::Result<()> {
 
         // The filesystem is healthy again: whatever the first attempt did, the
         // retry (or the open of what it committed) serves every intact value.
-        let tree = config(memfs.clone()).open_or_repair(crate::repair::RepairPolicy::default());
+        let tree = config(memfs).open_or_repair(crate::repair::RepairPolicy::default());
         let tree = match tree {
             Ok((tree, _)) => tree,
             Err(e) => panic!("skip={skip}: the tree does not open after {first:?}: {e:?}"),
@@ -13648,7 +13673,7 @@ fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Resu
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
             )
-            .with_shared_fs(memfs.clone())
+            .with_shared_fs(memfs)
             .with_kv_separation(Some(
                 KvSeparationOptions::default().separation_threshold(16),
             ))
@@ -14286,7 +14311,7 @@ fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
             )
-            .with_shared_fs(memfs.clone())
+            .with_shared_fs(memfs)
             .with_kv_separation(Some(
                 KvSeparationOptions::default().separation_threshold(16),
             ))
@@ -15417,8 +15442,7 @@ fn a_frame_index_past_the_file_is_refused_by_the_frontier_probe() -> crate::Resu
     let data_start = crate::sfa::Reader::new(&path)?
         .toc()
         .section(b"data")
-        .map(crate::sfa::TocEntry::pos)
-        .unwrap_or_default();
+        .map_or_default(crate::sfa::TocEntry::pos);
     {
         let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
         file.seek(SeekFrom::Start(data_start))?;
@@ -15480,6 +15504,175 @@ fn a_wholly_zeroed_blob_section_without_holes_is_not_fully_consumed() -> crate::
         matches!(derived, super::BlobFrontier::Whole),
         "a fully allocated zeroed section is destroyed data, not a relocation \
          whose file removal lagged a crash, got {derived:?}",
+    );
+    Ok(())
+}
+
+/// A reclaim that crashed mid-way leaves holes with consumed values between
+/// them; the walk to the frontier steps over each intact value whole, a value
+/// in chunks as its head and the chunks its table lists, which carry no
+/// header of their own. Stepping frame by frame, it would read the first
+/// chunk as a frame that does not check and stop at the first hole.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn the_frontier_walk_steps_over_a_chunked_value_between_holes() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .blob_compression(crate::CompressionType::None)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(16)
+                .block_size(0)
+                // The smallest chunk size a tree takes.
+                .chunk_size(core::num::NonZeroU32::new(4 * 1024).expect("non-zero")),
+        ))
+        .open()?;
+        // Three chunks each.
+        for i in 0..6u32 {
+            tree.insert(
+                format!("k{i:04}").as_bytes(),
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 12 * 1024],
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let blob_path = root.join(crate::file::BLOBS_FOLDER).join("0");
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 6, "six separated values");
+    let third = entries.get(2).expect("a third value");
+    assert!(
+        third.frames.as_ref().is_some_and(|frames| frames.len() > 1),
+        "the value between the holes lies in a head and its chunks"
+    );
+    let data_start = entries.first().expect("a value").offset;
+    let second = entries.get(1).expect("a second value");
+    let fourth = entries.get(3).expect("a fourth value");
+    // Values 0 and 1 reclaimed, value 2 consumed but not yet, value 3
+    // reclaimed: the shape a reclaim that punches value by value leaves.
+    memfs.punch_hole(&blob_path, data_start, second.frame_end - data_start)?;
+    memfs.punch_hole(&blob_path, fourth.offset, fourth.frame_end - fourth.offset)?;
+
+    let derived = super::derive_blob_frontier(&fs, &blob_path)?;
+    assert!(
+        matches!(derived, super::BlobFrontier::Punched(at) if at == fourth.frame_end),
+        "the frontier ends with the last hole, past the value in chunks between them: \
+         {derived:?}, want {}",
+        fourth.frame_end,
+    );
+    Ok(())
+}
+
+/// A chunk is its value's bytes with no header, so a value can hold a whole
+/// frame that checks. A reclaimed hole followed by a head lost to zeros ends
+/// the zeroed run at that head's first chunk: the chunk is no anchor for a
+/// frontier, whatever its bytes check as, since the index marks it a chunk.
+/// Anchored there, a repair would start at the writer's payload and take the
+/// frame inside it for a record.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_frame_inside_a_chunk_is_no_anchor_for_the_frontier() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    const CHUNK: usize = 4 * 1024;
+    let options = || {
+        KvSeparationOptions::default()
+            .separation_threshold(16)
+            .block_size(0)
+            // The smallest chunk size a tree takes.
+            .chunk_size(core::num::NonZeroU32::new(4 * 1024).expect("non-zero"))
+    };
+    // The values of a tree on `memfs`, as its one blob file holds them.
+    let written = |memfs: &Arc<MemFs>, values: &[(&[u8], Vec<u8>)]| {
+        let root = std::path::absolute("/db")?;
+        let tree = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .blob_compression(crate::CompressionType::None)
+        .with_kv_separation(Some(options()))
+        .open()?;
+        for (seqno, (key, value)) in (0_u64..).zip(values) {
+            tree.insert(*key, value.clone(), seqno);
+        }
+        tree.flush_active_memtable(0)?;
+        let blob_path = root.join(crate::file::BLOBS_FOLDER).join("0");
+        let fs: Arc<dyn Fs> = memfs.clone();
+        let entries = crate::vlog::BlobFileScanner::new(&blob_path, &*fs, 0)?
+            .collect::<crate::Result<Vec<_>>>()?;
+        crate::Result::Ok((blob_path, entries))
+    };
+
+    // A frame of one value that takes exactly a chunk.
+    let forged = (CHUNK - 200..CHUNK)
+        .find_map(|len| {
+            let (_, entries) = written(
+                &Arc::new(MemFs::new()),
+                &[(b"forged", alloc::vec![b'f'; len])],
+            )
+            .ok()?;
+            let frame = entries.first()?.frames.as_ref()?.first()?.to_vec();
+            (frame.len() == CHUNK).then_some(frame)
+        })
+        .expect("a single frame of a chunk's size");
+
+    let mut second = forged;
+    second.extend_from_slice(&[b'b'; 2 * CHUNK]);
+    let memfs = Arc::new(MemFs::new());
+    let (blob_path, entries) = written(
+        &memfs,
+        &[
+            (b"k0", alloc::vec![b'a'; 3 * CHUNK]),
+            (b"k1", second),
+            (b"k2", alloc::vec![b'c'; 3 * CHUNK]),
+        ],
+    )?;
+    let first = entries.first().expect("a first value");
+    let second = entries.get(1).expect("a second value");
+    let head_len = second
+        .frames
+        .as_ref()
+        .and_then(|frames| frames.first())
+        .expect("the second value's head")
+        .len();
+
+    // The first value reclaimed, the second's head zeroed in place.
+    memfs.punch_hole(&blob_path, first.offset, first.frame_end - first.offset)?;
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(second.offset))?;
+        file.write_all(&alloc::vec![0_u8; head_len])?;
+        file.sync_all()?;
+    }
+
+    let fs: Arc<dyn Fs> = memfs;
+    let derived = super::derive_blob_frontier(&fs, &blob_path)?;
+    assert!(
+        matches!(derived, super::BlobFrontier::Whole),
+        "no frame checks at the end of the zeroed run, only a chunk: {derived:?}",
     );
     Ok(())
 }

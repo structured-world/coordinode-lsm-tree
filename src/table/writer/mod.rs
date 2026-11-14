@@ -2,6 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+mod bound;
 mod filter;
 mod index;
 mod meta;
@@ -10,6 +11,7 @@ pub(crate) mod ordered_pipeline;
 #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
 pub(crate) mod parallel_compressor;
 
+pub(crate) use bound::{CellShapes, RewriteLoad, varint_len};
 pub(crate) use index::DEFAULT_SPILL_THRESHOLD;
 #[cfg(feature = "std")]
 pub use parallel_compressor::CompactionSpawner;
@@ -717,6 +719,10 @@ pub struct Writer {
     carries_filter: bool,
 
     /// The prebuilt partition the table's keys have reached.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std import hands in a prebuilt filter")
+    )]
     prebuilt_partition: usize,
 
     /// A `locator` section built elsewhere, written at `finish` in place of
@@ -826,6 +832,11 @@ pub struct Writer {
     /// written (or set up front by a rewrite that mirrors its source): a table
     /// holds one layout, since its descriptor records one.
     value_layout: Option<crate::table::meta::ValueLayout>,
+
+    /// The field columns the table's groups of rows written as cells hold,
+    /// recorded with the table so a rewrite of it is bounded before it reads
+    /// a row (see [`CellShapes`]).
+    cell_shapes: CellShapes,
 
     /// Whether this SST is written by the bulk-ingest path, which stores every
     /// entry at LOCAL seqno 0 and relies on a manifest-only `global_seqno` for
@@ -1111,6 +1122,10 @@ impl PageOut<'_, '_> {
 }
 
 /// A membership filter built elsewhere, as the wire bytes it is written as.
+#[cfg_attr(
+    not(feature = "std"),
+    expect(dead_code, reason = "only the std import hands in a prebuilt filter")
+)]
 pub(crate) enum PrebuiltFilter {
     /// One filter over the whole table.
     Full(Vec<u8>),
@@ -1129,6 +1144,10 @@ impl PrebuiltFilter {
     ///
     /// Returns [`crate::Error::InvalidHeader`] for a key past the last
     /// partition: no filter would answer for it, so a read would miss it.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std import hands in a prebuilt filter")
+    )]
     fn count_key(
         &mut self,
         key: &[u8],
@@ -1205,6 +1224,7 @@ impl Writer {
     }
 
     /// [`Self::new`], the file written as `origin`'s.
+    #[cfg(feature = "std")]
     pub(crate) fn new_for(
         path: PathBuf,
         table_id: TableId,
@@ -1386,6 +1406,7 @@ impl Writer {
             use_zone_map: false,
             use_columnar: false,
             value_layout: None,
+            cell_shapes: CellShapes::default(),
             bulk_ingested: Some(false),
             recency: table_id,
             lineage: None,
@@ -1448,6 +1469,23 @@ impl Writer {
         key_len: u64,
         prefixes: usize,
     ) -> crate::Result<(u64, u64)> {
+        Ok(self.tombstone_only_overhead_with(
+            self.meta_payload_len_without_keys()?,
+            key_len,
+            prefixes,
+        ))
+    }
+
+    /// [`Self::tombstone_only_overhead`] with the meta payload this writer
+    /// writes besides its keys already measured as `meta_without_keys` (see
+    /// [`Self::meta_payload_len`]): what a caller bounding many rewrites
+    /// under unchanged settings measures once.
+    pub(crate) fn tombstone_only_overhead_with(
+        &self,
+        meta_without_keys: u64,
+        key_len: u64,
+        prefixes: usize,
+    ) -> (u64, u64) {
         use crate::table::{
             block::{BlockType, EccParams, framed_len_bound, transform_scratch_bound},
             zone_map::ColumnStats,
@@ -1460,7 +1498,7 @@ impl Writer {
         };
         // An entry holds its key besides a few varints, a seqno and a type.
         let entry = key_len + 32;
-        let meta = self.meta_payload_len_without_keys()? + 2 * key_len + 4;
+        let meta = meta_without_keys + 2 * key_len + 4;
         let index = framed(entry, BlockType::Index, self.index_block_compression);
         let filter = self.bloom_policy.filter_size_bound(1 + prefixes) as u64;
         let seqno_bounds = if self.use_seqno_in_index {
@@ -1514,7 +1552,17 @@ impl Writer {
             + filter
             + transform_scratch_bound(filter, BlockType::Filter, none, encryption, self.ecc)
             + 2 * written;
-        Ok((written, held))
+        (written, held)
+    }
+
+    /// Bytes of the meta block payload with empty key bounds, from above:
+    /// what [`Self::tombstone_only_overhead_with`] takes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the encoding of the meta block.
+    pub(crate) fn meta_payload_len(&self) -> crate::Result<u64> {
+        self.meta_payload_len_without_keys()
     }
 
     /// Bytes of data the table cuts a block at: a row group's for a columnar
@@ -1657,6 +1705,8 @@ impl Writer {
             prefix_extractor: None,
             sum_user_key_bytes: self.meta.sum_user_key_bytes,
             sum_value_bytes: self.meta.sum_value_bytes,
+            longest_user_key: self.meta.longest_user_key,
+            longest_value: self.meta.longest_value,
             uncompressed_size: self.meta.uncompressed_size,
             first_key,
             last_key,
@@ -1690,6 +1740,8 @@ impl Writer {
             value_layout: self
                 .value_layout
                 .unwrap_or(crate::table::meta::ValueLayout::Whole),
+            cell_columns: (self.value_layout == Some(crate::table::meta::ValueLayout::Cells))
+                .then(|| self.cell_shapes.encode()),
             group_shape: crate::table::meta::GroupShape {
                 encoding: self.column_encoding,
                 row_group_size: self.row_group_size,
@@ -1704,8 +1756,7 @@ impl Writer {
             writing_below: self
                 .writing
                 .as_ref()
-                .map(crate::table::file_pool::Writing::below)
-                .unwrap_or_default(),
+                .map_or_default(crate::table::file_pool::Writing::below),
             range_tombstone_count,
             delete_bitmap_len: delete_bitmap.0,
             delete_bitmap_hash: delete_bitmap.1,
@@ -1713,6 +1764,18 @@ impl Writer {
             #[cfg(test)]
             omit_delete_bitmap_hash: self.omit_delete_bitmap_hash_for_test,
         }
+    }
+
+    /// Measures the meta payload the estimates count again once the field
+    /// columns the table records grew past the `recorded` bytes they encoded
+    /// to: a group opening a column the table did not hold adds it to the
+    /// meta block. A column opens a few times per table at most.
+    #[cfg(feature = "columnar")]
+    fn remeasure_meta_if_grown(&mut self, recorded: usize) -> crate::Result<()> {
+        if self.cell_shapes.encoded_len() != recorded && self.meta_base_len.is_some() {
+            self.meta_base_len = Some(self.meta_payload_len_without_keys()?);
+        }
+        Ok(())
     }
 
     /// Bytes of the meta block payload with empty key bounds, from above.
@@ -2357,6 +2420,7 @@ impl Writer {
     /// happens to be non-empty — so a source whose section is present but
     /// unreadable still salvages into a copy that carries one (the writer
     /// re-derives the ranges from the re-emitted entries).
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn mirror_from(
         self,
@@ -2697,6 +2761,7 @@ impl Writer {
     /// Sets the transformed marker at build time (see
     /// [`Self::lineage_transformed`]); the rewrite path carries a source
     /// table's marker onto its replacement.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_lineage_transformed(mut self, transformed: bool) -> Self {
         self.assert_not_started("use_lineage_transformed");
@@ -2712,6 +2777,7 @@ impl Writer {
 
     /// Sets the last-output marker at build time (see [`Self::lineage_last`]);
     /// the rewrite path carries a source table's marker onto its replacement.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_lineage_last(mut self, last: bool) -> Self {
         self.assert_not_started("use_lineage_last");
@@ -2722,6 +2788,7 @@ impl Writer {
     /// Sets the age the table records, in nanoseconds since the Unix epoch,
     /// instead of the time it is finished: a table rebuilt from another store
     /// keeps the age of the data it carries.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_created_at(mut self, created_at: u128) -> Self {
         self.assert_not_started("use_created_at");
@@ -2778,6 +2845,7 @@ impl Writer {
     /// Writes `filter`, built elsewhere for exactly the keys this table will
     /// hold, as the table's membership filter instead of building one from
     /// them. Must be set before the first key.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_prebuilt_filter(mut self, filter: PrebuiltFilter) -> Self {
         self.assert_not_started("use_prebuilt_filter");
@@ -2790,6 +2858,7 @@ impl Writer {
     /// Writes `section`, a `locator` section built elsewhere for exactly the
     /// keys and blocks this table will hold, instead of building one from
     /// them. Must be set before the first key.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn use_prebuilt_locator(mut self, section: Vec<u8>) -> Self {
         self.assert_not_started("use_prebuilt_locator");
@@ -2872,6 +2941,7 @@ impl Writer {
     /// holds: for a table rebuilt from another store, whose range tombstones
     /// reach past its entries. The caller orders the range under the tree's
     /// comparator, and it covers every entry the table receives.
+    #[cfg(feature = "std")]
     pub(crate) fn cover_key_range(&mut self, start: UserKey, end: UserKey) {
         self.key_range_cover = Some((start, end));
     }
@@ -2934,6 +3004,7 @@ impl Writer {
     }
 
     /// As [`Self::write`], plus the refusal of an uncovered key.
+    #[cfg(feature = "std")]
     pub(crate) fn write_counted(
         &mut self,
         item: InternalValue,
@@ -2966,6 +3037,8 @@ impl Writer {
         // version). usize -> u64 is a widening cast on every supported target.
         self.meta.sum_user_key_bytes += user_key_len as u64;
         self.meta.sum_value_bytes += value_len as u64;
+        self.meta.longest_user_key = self.meta.longest_user_key.max(user_key_len as u64);
+        self.meta.longest_value = self.meta.longest_value.max(value_len as u64);
 
         if item.is_tombstone() {
             self.meta.tombstone_count += 1;
@@ -3413,6 +3486,24 @@ impl Writer {
         // out where the pages are. Both are encrypted and ECC-protected exactly
         // like data.
         check_group_column_count(batch)?;
+        // A group of rows written as cells: its field columns go into what
+        // the table records of them.
+        if batch
+            .columns
+            .iter()
+            .any(|c| c.column_id == crate::blob_tree::field_row::WHOLE_VALUE_COLUMN)
+        {
+            let recorded = self.cell_shapes.encoded_len();
+            for column in &batch.columns {
+                if column.column_id == crate::blob_tree::field_row::CELL_REFS_COLUMN {
+                    self.cell_shapes.take_refs();
+                } else if crate::blob_tree::field_row::is_field_column(column.column_id) {
+                    self.cell_shapes
+                        .take_column(column.column_id, column.type_tag.to_wire().1);
+                }
+            }
+            self.remeasure_meta_if_grown(recorded)?;
+        }
         // A group copying another's pages keeps that group's tag, which every
         // copied page's stamp names.
         let group_tag = match carry {
@@ -3772,7 +3863,7 @@ impl Writer {
     ///
     /// As [`Self::write_columnar_batch`], except a non-zero per-row seqno is
     /// accepted (it is stored as the row's sequence number).
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn write_columnar_block_verbatim(
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
@@ -4166,6 +4257,8 @@ impl Writer {
             let user_key = &e.key.user_key;
             self.meta.sum_user_key_bytes += user_key.len() as u64;
             self.meta.sum_value_bytes += e.value.len() as u64;
+            self.meta.longest_user_key = self.meta.longest_user_key.max(user_key.len() as u64);
+            self.meta.longest_value = self.meta.longest_value.max(e.value.len() as u64);
             if e.is_tombstone() {
                 self.meta.tombstone_count += 1;
             }
@@ -4300,7 +4393,7 @@ impl Writer {
     /// before anything is written. Without a prebuilt filter it does nothing.
     /// A column batch is written whole, not entry by entry, so only it needs
     /// the count up front.
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn count_prebuilt_keys(
         &mut self,
         entries: &[InternalValue],
@@ -4358,6 +4451,16 @@ impl Writer {
         }
         // The group opens with its directory, whose header gives its length.
         let directory_len = carried_header(raw)?.on_disk_size_with(self.ecc);
+        // The columns a group of rows written as cells holds come from its
+        // rows, which the copy does not decode into columns: read off their
+        // headers. A table of whole values records none of them.
+        let recorded = self.cell_shapes.encoded_len();
+        for row in entries {
+            if row.key.value_type.is_cell_row() {
+                self.cell_shapes.take_row(&row.value);
+            }
+        }
+        self.remeasure_meta_if_grown(recorded)?;
         let first_key = self.append_verbatim_extent(
             (raw, source),
             uncompressed_length,
@@ -5650,6 +5753,10 @@ struct MetaSectionParams<'a> {
     prefix_extractor: Option<&'a str>,
     sum_user_key_bytes: u64,
     sum_value_bytes: u64,
+    /// The longest user key and value: what a rewrite of the table's entries
+    /// is bounded by before it is written.
+    longest_user_key: u64,
+    longest_value: u64,
     uncompressed_size: u64,
     first_key: &'a [u8],
     last_key: &'a [u8],
@@ -5672,6 +5779,9 @@ struct MetaSectionParams<'a> {
     /// How the columnar blocks store each row's value; written only for a
     /// columnar table.
     value_layout: crate::table::meta::ValueLayout,
+    /// The field columns a table of rows written as cells holds, in the
+    /// wire form [`CellShapes::encode`] gives, written only for one.
+    cell_columns: Option<Vec<u8>>,
     /// How the row groups were cut and encoded; written only for a columnar
     /// table.
     group_shape: crate::table::meta::GroupShape,
@@ -5923,6 +6033,7 @@ fn encode_meta_payload(
         meta("item_count", &p.item_count.to_le_bytes()),
         meta("key#max", p.last_key),
         meta("key#min", p.first_key),
+        meta("key_bytes#max", &p.longest_user_key.to_le_bytes()),
         meta("key_bytes#sum", &p.sum_user_key_bytes.to_le_bytes()),
         meta("key_count", &p.key_count.to_le_bytes()),
         meta("prefix_truncation#data", &[1]),
@@ -5946,6 +6057,7 @@ fn encode_meta_payload(
         meta("table_version", &[3u8]),
         meta("tombstone_count", &p.tombstone_count.to_le_bytes()),
         meta("user_data_size", &p.uncompressed_size.to_le_bytes()),
+        meta("value_bytes#max", &p.longest_value.to_le_bytes()),
         meta("value_bytes#sum", &p.sum_value_bytes.to_le_bytes()),
         meta(
             "weak_tombstone_count",
@@ -5977,6 +6089,12 @@ fn encode_meta_payload(
         // another table keeps all of it, so a copy goes only into a table
         // that would write it the same way.
         meta_items.push(meta("descriptor#group_shape", &p.group_shape.to_bytes()));
+        // The field columns its groups of rows written as cells hold, which
+        // its pages alone record otherwise: what a rewrite of the table is
+        // bounded by before it reads a row.
+        if let Some(shapes) = &p.cell_columns {
+            meta_items.push(meta("descriptor#cell_columns", shapes));
+        }
     }
 
     // L0 recency key, on every table: the reader requires it.

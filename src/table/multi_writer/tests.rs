@@ -2793,3 +2793,142 @@ fn a_partly_carried_group_is_bounded_by_the_rows_it_rebuilds() {
         "bound {bound} under {payload} bytes of rows"
     );
 }
+
+/// A tombstone clipped to an output takes the output's keys as its ends, which
+/// may be far longer than its own: short tombstones over the outputs of long
+/// keys that key domains cut, one per domain, are bounded by those keys, so
+/// the outputs take no more than their bound.
+#[test]
+fn clipped_tombstones_are_bounded_by_the_keys_they_take() -> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::writer::RewriteLoad;
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    /// One domain per first byte.
+    struct FirstByte;
+    impl crate::KeyDomains for FirstByte {
+        fn domain_end(&self, key: &[u8]) -> Option<UserKey> {
+            match key.first() {
+                Some(&b) if b < u8::MAX => Some(UserKey::from([b + 1].as_slice())),
+                _ => None,
+            }
+        }
+    }
+
+    const DOMAINS: u8 = 100;
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let writer = |path: std::path::PathBuf| {
+        super::MultiWriter::new(
+            path,
+            SequenceNumberCounter::default(),
+            64 * 1024 * 1024,
+            1,
+            fs.clone(),
+        )
+        .map(|w| {
+            w.use_clip_range_tombstones()
+                .use_key_domains(Some(Arc::new(FirstByte)))
+        })
+    };
+    // Tombstones of one-byte ends, each spanning every domain.
+    let tombstones: Vec<RangeTombstone> = (0..100u64)
+        .map(|seqno| {
+            RangeTombstone::new(
+                UserKey::from(b"\x01" as &[u8]),
+                UserKey::from(b"\xff" as &[u8]),
+                seqno,
+            )
+        })
+        .collect();
+    // A row of a 1 KB key in each domain.
+    let rows: Vec<InternalValue> = (0..DOMAINS)
+        .map(|domain| {
+            let mut key = vec![0x10 + domain];
+            key.resize(1_000, b'k');
+            InternalValue::from_components(key, b"v".to_vec(), 1_000, crate::ValueType::Value)
+        })
+        .collect();
+
+    let mut load = RewriteLoad::default();
+    for row in &rows {
+        load.take_entry(
+            row.key.user_key.len() as u64,
+            row.value.len() as u64,
+            row.key.seqno,
+            1,
+        );
+    }
+    load.range_tombstones = tombstones.len() as u64;
+    load.range_tombstone_bytes = 2 * tombstones.len() as u64;
+    load.longest_key = 1_000;
+    std::fs::create_dir_all(folder.path().join("probe"))?;
+    let probe = super::BoundProbe::new(writer(folder.path().join("probe"))?)?;
+    // An output more per domain past the first, as the space check counts them.
+    let bound = probe.rewrite_bound(&load, u64::from(DOMAINS) - 1);
+
+    let base = folder.path().join("tables");
+    std::fs::create_dir_all(&base)?;
+    let mut mw = writer(base.clone())?;
+    mw.set_range_tombstones(tombstones);
+    for row in rows {
+        mw.write(row)?;
+    }
+    let tables = mw.finish()?.tables;
+    assert!(tables.len() > 2, "{} outputs", tables.len());
+    let mut written = 0;
+    for (id, _) in &tables {
+        written += std::fs::metadata(base.join(id.to_string()))?.len();
+    }
+    assert!(
+        written <= bound,
+        "{} outputs take {written} bytes past the bound of {bound}",
+        tables.len()
+    );
+    Ok(())
+}
+
+/// The outputs of range tombstones alone take each tombstone's piece once per
+/// side, however many runs the pieces fall into: the bound grows with the
+/// tombstones in step, so twice as many cost twice as much, not four times.
+#[test]
+fn tombstone_only_outputs_are_bounded_in_step_with_their_tombstones() -> crate::Result<()> {
+    use crate::{fs::StdFs, table::writer::RewriteLoad};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let writer = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        64 * 1024 * 1024,
+        1,
+        fs,
+    )?
+    .use_clip_range_tombstones();
+    let probe = super::BoundProbe::new(writer)?;
+    let bound = |tombstones: u64| {
+        probe.rewrite_bound(
+            &RewriteLoad {
+                entries: 1,
+                key_bytes: 16,
+                value_bytes: 100,
+                filter_hashes: 1,
+                longest_key: 16,
+                longest_value: Some(100),
+                range_tombstones: tombstones,
+                range_tombstone_bytes: tombstones * 32,
+                ..RewriteLoad::default()
+            },
+            0,
+        )
+    };
+    let none = bound(0);
+    let (some, twice) = (bound(1_000) - none, bound(2_000) - none);
+    assert!(
+        twice <= 2 * some,
+        "1000 tombstones take {some} bytes past none, 2000 take {twice}"
+    );
+    Ok(())
+}

@@ -709,6 +709,7 @@ impl RateLimiter {
     /// Whether reads charged to this limiter should report how long they take:
     /// a latency backoff is set and the rate is on. Lock-free, for a reader
     /// deciding per read whether to time it.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn steers_by_latency(&self) -> bool {
         self.steers_by_latency.load(Ordering::Relaxed)
