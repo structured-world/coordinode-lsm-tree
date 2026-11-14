@@ -52,9 +52,21 @@ struct Ledger {
     room: Mutex<Option<Arc<super::capacity::Reservation>>>,
     /// The write budget the run holds on each medium it writes to.
     budget: Mutex<Vec<crate::write_budget::BudgetHold>>,
+    /// Holds neither room nor budget, only the files to remove: a finished
+    /// file is not measured.
+    cleanup_only: bool,
 }
 
 impl OutputLedger {
+    /// A ledger for a run that reserves nothing, a flush: it only removes the
+    /// files the run made when the run fails.
+    pub(crate) fn for_cleanup() -> Self {
+        Self(Arc::new(Ledger {
+            cleanup_only: true,
+            ..Ledger::default()
+        }))
+    }
+
     /// Records a table file the run created at `path`.
     pub(crate) fn record_table(&self, id: crate::TableId, path: PathBuf, fs: Arc<dyn Fs>) {
         self.record(Kind::Table, id, path, fs);
@@ -127,6 +139,9 @@ impl OutputLedger {
     /// [`crate::Error::StorageFull`] when the volume has no room for what the
     /// run wrote past its reservation.
     pub(crate) fn landed(&self, fs: &dyn Fs, path: &crate::path::Path) -> crate::Result<()> {
+        if self.0.cleanup_only {
+            return Ok(());
+        }
         let room = self.room();
         let budget = fs.write_budget();
         if room.is_none() && budget.is_none() {

@@ -1216,7 +1216,7 @@ impl AbstractTree for Tree {
         // Every file the flush makes, until it hands them over as tables: a
         // flush that fails removes them before it returns, as a compaction
         // does, rather than leave them to the orphan sweep of the next open.
-        let outputs = crate::compaction::output_ledger::OutputLedger::default();
+        let outputs = crate::compaction::output_ledger::OutputLedger::for_cleanup();
         let table_writer = MultiWriter::from_pool(
             folder.clone(),
             Arc::clone(&self.table_files),
@@ -1553,16 +1553,9 @@ impl AbstractTree for Tree {
         match result {
             Ok(()) => {}
             // A power loss may still make the install the one a reopen finds:
-            // its files stay until an install supersedes it.
-            Err(e @ crate::Error::InstallOutcomeUnknown(_)) => {
-                let kept = crate::compaction::output_ledger::OutputLedger::of(
-                    tables,
-                    blob_files.unwrap_or(&[]),
-                )
-                .keep_uninstalled();
-                version_lock.keep_outputs(kept);
-                return Err(e);
-            }
+            // the files stay with their handles, which the caller may register
+            // again.
+            Err(e @ crate::Error::InstallOutcomeUnknown(_)) => return Err(e),
             Err(e) => {
                 drop(version_lock);
                 retire();

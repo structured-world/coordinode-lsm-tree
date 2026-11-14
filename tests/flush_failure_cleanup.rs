@@ -223,6 +223,68 @@ fn a_flush_whose_install_fails_leaves_none_of_its_tables() -> lsm_tree::Result<(
     )
 }
 
+/// A caller that registers the same tables again after an install of unknown
+/// outcome installs them: the kept files are the installed tables now, and
+/// stay, so the tree reopens with every key.
+#[test]
+fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()> {
+    use lsm_tree::{InternalValue, ValueType};
+
+    let f = open(|c| c)?;
+    let stream = (0..KEYS).map(|i| {
+        Ok(InternalValue::from_components(
+            key(i),
+            value(i),
+            i,
+            ValueType::Value,
+        ))
+    });
+    let Some((tables, blob_files, pin)) = f.tree.flush_to_tables(stream)? else {
+        panic!("the stream holds keys");
+    };
+    f.injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .once(),
+    );
+    assert!(matches!(
+        f.tree
+            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false),
+        Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+    ));
+    f.injector.clear();
+
+    // The retry rotates, superseding the failed edit, and names the same
+    // files.
+    f.tree
+        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false)?;
+    drop(pin);
+    drop(tables);
+    let installed = files(&f.dir.path().join("tables"))?;
+    assert_eq!(
+        installed.len(),
+        f.tree.table_count(),
+        "every installed table is on disk: {installed:?}",
+    );
+
+    let Fixture { tree, dir, .. } = f;
+    drop(tree);
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..KEYS {
+        assert_eq!(
+            tree.get(key(i), MAX_SEQNO)?.as_deref(),
+            Some(value(i).as_slice()),
+            "key {i} after the reopen",
+        );
+    }
+    Ok(())
+}
+
 /// A flush whose install may have happened keeps its files, since a reopen
 /// after a power loss may find them named; they go once a later install
 /// supersedes the unknown one.

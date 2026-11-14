@@ -896,14 +896,27 @@ pub trait AbstractTree: sealed::Sealed {
             #[cfg(all(test, feature = "std"))]
             self.tree_config().fire_before_output_install();
 
-            self.register_tables(
+            if let Err(e) = self.register_tables(
                 &tables,
                 blob_files.as_deref(),
                 None,
                 &sealed_ids,
                 gc_watermark,
                 gc_balance.load(core::sync::atomic::Ordering::Relaxed) > 0,
-            )?;
+            ) {
+                // A power loss may still make the install the one a reopen
+                // finds, so its files stay; a retry writes the memtables to
+                // new ones, and they go once an install supersedes this one.
+                if matches!(e, crate::Error::InstallOutcomeUnknown(_)) {
+                    let kept = crate::compaction::output_ledger::OutputLedger::of(
+                        &tables,
+                        blob_files.as_deref().unwrap_or(&[]),
+                    )
+                    .keep_uninstalled();
+                    self.get_version_history_lock().keep_outputs(kept);
+                }
+                return Err(e);
+            }
             // The installed files name their dictionaries from here on.
             drop(write_pin);
         }
@@ -1203,8 +1216,8 @@ pub trait AbstractTree: sealed::Sealed {
     /// Will return `Err` if an IO error occurs. The files of an install that
     /// failed go once their handles drop, except on
     /// [`Error::InstallOutcomeUnknown`](crate::Error::InstallOutcomeUnknown):
-    /// a reopen after a power loss may find them named, so they stay until a
-    /// later install supersedes the unknown one.
+    /// a reopen after a power loss may find them named, so they stay, and the
+    /// same tables may be registered again.
     fn register_tables(
         &self,
         tables: &[Table],

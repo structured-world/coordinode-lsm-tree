@@ -2414,7 +2414,7 @@ impl AbstractTree for BlobTree {
 
         // Every table and blob file the flush makes, until it hands them over:
         // a flush that fails removes them, as the standard tree's does.
-        let outputs = crate::compaction::output_ledger::OutputLedger::default();
+        let outputs = crate::compaction::output_ledger::OutputLedger::for_cleanup();
         let table_writer = MultiWriter::from_pool(
             table_folder.clone(),
             Arc::clone(&self.index.table_files),
