@@ -180,7 +180,7 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
     // read went uncounted, a change that moved work into it would look like an
     // improvement.
     let folder = get_tmp_folder();
-    let value_len = 8_192;
+    let value_len = 4_096;
     let n = 200_u32;
     let tree = Config::new(
         folder.path(),
@@ -207,13 +207,19 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
         assert_eq!(got.len(), value_len, "the whole value must come back");
     }
 
-    // A point read resolves its value on its own: one request per cold block.
-    // Two 8 KiB values share a 16 KiB block, and the second of them finds the
-    // block in the blob cache its neighbour's read filled.
+    // A point read resolves its value on its own. With a compressor two 4 KiB
+    // values share an 8 KiB block, and the second of them finds the block in
+    // the blob cache its neighbour's read filled: one request per cold block.
+    // A file that compresses nothing packs them as records, each read alone.
+    let expected = if cfg!(feature = "lz4") {
+        n as usize / 2
+    } else {
+        n as usize
+    };
     assert_eq!(
         m.blob_read_count() - requests_before,
-        n as usize / 2,
-        "each cold block of separated values is one blob read request",
+        expected,
+        "each cold block or packed record of separated values is one blob read request",
     );
 
     let blob_read = m.blob_bytes_read() - before.1;
@@ -455,7 +461,9 @@ fn a_blob_read_rejected_as_corrupt_still_counts_its_bytes() {
 }
 
 /// A key-value-separated tree of `n` 8 KiB values over a filesystem whose
-/// faults the returned injector arms, flushed so every value is in a blob file.
+/// faults the returned injector arms, flushed so every value is in a blob file,
+/// each in a frame of its own: a block a point read decodes is cached, and the
+/// next value of it would not reach the filesystem.
 fn faultable_blob_tree(
     n: u32,
 ) -> (
@@ -474,7 +482,7 @@ fn faultable_blob_tree(
         SequenceNumberCounter::default(),
     )
     .with_shared_fs(fs)
-    .with_kv_separation(Some(Default::default()))
+    .with_kv_separation(Some(lsm_tree::KvSeparationOptions::default().block_size(0)))
     .open()
     .expect("open");
     for i in 0..n {
@@ -612,6 +620,67 @@ fn a_blob_admitted_to_the_blob_cache_copies_nothing() -> lsm_tree::Result<()> {
         assert!(tree.get(key(i), SeqNo::MAX)?.is_some());
     }
     assert_eq!(m.bytes_copied(), before, "a blob-cache hit copies nothing");
+    Ok(())
+}
+
+/// Reads 50 small values of a file that compresses nothing, packed and so
+/// each read as its record alone, twice under `fill`, and returns the blob
+/// bytes each pass read.
+fn packed_reads(fill: BlobCacheFill) -> lsm_tree::Result<(u64, u64)> {
+    let folder = get_tmp_folder();
+    let cache =
+        std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(std::sync::Arc::clone(&cache))
+    .blob_compression(CompressionType::None)
+    .with_kv_separation(Some(
+        lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+    ))
+    .blob_cache_fill(fill)
+    .open()?;
+    for i in 0..50 {
+        tree.insert(key(i), vec![b'v'; 200], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let m = tree.metrics();
+    let pass = || -> lsm_tree::Result<u64> {
+        let before = m.blob_bytes_read();
+        for i in 0..50 {
+            assert_eq!(
+                tree.get(key(i), SeqNo::MAX)?.as_deref(),
+                Some(vec![b'v'; 200].as_slice())
+            );
+        }
+        Ok(m.blob_bytes_read() - before)
+    };
+    let cold = pass()?;
+    Ok((cold, pass()?))
+}
+
+#[test]
+fn a_packed_value_read_again_is_served_from_the_cache_that_fills() -> lsm_tree::Result<()> {
+    // A small value packed beside others is read as its record alone. Under
+    // `Always` it is cached as every value read is, and read again comes
+    // from the cache. Under the default it stays out of a cache that has not
+    // filled, which would grow on the reads' path for it, so read again it
+    // reads its record again.
+    for (fill, cached) in [
+        (BlobCacheFill::Always, true),
+        (BlobCacheFill::default(), false),
+    ] {
+        let (cold, again) = packed_reads(fill)?;
+        assert!(cold > 0, "{fill:?}: the first reads read the blob file");
+        assert!(
+            cold < 50 * 300,
+            "{fill:?}: {cold} B read for 50 values of 200 B"
+        );
+        let expected = if cached { 0 } else { cold };
+        assert_eq!(again, expected, "{fill:?}: what a read again reads");
+    }
     Ok(())
 }
 
@@ -767,6 +836,45 @@ fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
         "the read-ahead copied records out of its span but charged {} B",
         m.bytes_copied() - before,
     );
+}
+
+#[test]
+fn a_multi_get_of_chunked_values_reads_them_into_place() -> lsm_tree::Result<()> {
+    // A value in chunks stored as they are lies in one range of its file, so
+    // a batch that reads its frames in one go hands the value out of that
+    // read as it is. Chunks with frame headers between them would leave the
+    // batch to copy every byte of the value once more to join them.
+    let (value_len, n) = (1 << 20, 4_u32);
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(CompressionType::None)
+    .with_kv_separation(Some(Default::default()))
+    .blob_cache_fill(BlobCacheFill::Never)
+    .open()?;
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let keys: Vec<Vec<u8>> = (0..n).map(key).collect();
+
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+    let got = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert!(
+        got.iter()
+            .all(|value| value.as_ref().map(|v| v.len()) == Some(value_len)),
+        "every value is read whole",
+    );
+    assert_eq!(
+        m.bytes_copied() - before,
+        0,
+        "the chunked values were assembled out of another buffer",
+    );
+    Ok(())
 }
 
 #[test]

@@ -269,8 +269,11 @@ fn a_window_reads_its_spans_in_one_batched_call() -> lsm_tree::Result<()> {
         "{} batched reads for {windows} windows: {calls:?}",
         calls.len()
     );
+    // A window's first value is read on its own before the window is read
+    // ahead, and its frame, a block, stays in the cache: the window reads the
+    // other seven files' spans, together.
     assert!(
-        calls.iter().any(|&reqs| reqs >= 8),
+        calls.iter().any(|&reqs| reqs >= 7),
         "a window's spans travel together: {calls:?}"
     );
     Ok(())

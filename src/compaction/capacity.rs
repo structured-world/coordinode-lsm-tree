@@ -56,7 +56,7 @@ impl Pool {
 
 /// Whether a reservation may take the room the engine keeps free for flushes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Floor {
+pub(crate) enum Floor {
     /// Only room the floor leaves: work that may as well wait.
     Keep,
     /// The floor as well, which breaks the deadlock of a compaction that
@@ -108,7 +108,7 @@ impl core::fmt::Debug for CapacityPool {
 }
 
 /// Bytes a compaction is about to write into the folder `path` of `fs`.
-pub struct Demand<'a> {
+pub(crate) struct Demand<'a> {
     pub fs: &'a dyn Fs,
     pub path: &'a Path,
     pub bytes: u64,
@@ -116,7 +116,7 @@ pub struct Demand<'a> {
 
 /// How a reservation is checked.
 #[derive(Clone, Copy, Debug)]
-pub struct Check {
+pub(crate) struct Check {
     /// The room left under the tree's quota, `u64::MAX` without one.
     pub quota_headroom: u64,
     /// Whether the flush floor may be taken.
@@ -223,6 +223,7 @@ impl CapacityPool {
     /// The free space the folder `path` reports, less what the reservations
     /// sharing its volume have still to write; `u64::MAX` when the backend
     /// reports none.
+    #[cfg(feature = "std")]
     pub(crate) fn available(&self, fs: &dyn Fs, path: &Path) -> u64 {
         // Probed with the account locked, as `gather` probes.
         let held = self.held.lock();
@@ -235,6 +236,7 @@ impl CapacityPool {
     }
 
     /// What the compactions of `tree` in progress hold of its quota.
+    #[cfg(feature = "std")]
     pub(crate) fn quota_held(&self, tree: TreeId) -> u64 {
         self.held
             .lock()
@@ -279,6 +281,7 @@ impl CapacityPool {
     }
 
     /// What the reservations sharing the volume of the folder `path` hold.
+    #[cfg(feature = "std")]
     pub(crate) fn held_on(&self, fs: &dyn Fs, path: &Path) -> u64 {
         held_against(&self.held.lock(), Pool::of(fs, path))
     }
@@ -290,6 +293,7 @@ impl CapacityPool {
     /// room another compaction took since. Its own writes are checked against
     /// the tree's quota in `check`, not against the volumes' room it measured;
     /// what it writes past the grant is checked against `check` as it lands.
+    #[cfg(feature = "std")]
     pub(crate) fn reserve_within(
         self: &Arc<Self>,
         tree: TreeId,
@@ -311,6 +315,13 @@ impl CapacityPool {
                 bytes: demand.bytes,
             })
             .collect();
+        // The free space is not probed: between slices it is short of what
+        // the pass measured by the punches still to come of the inputs its
+        // slices consumed, so a slice checked against it would end the pass
+        // part-way. A compaction that wrote and gave its room back since
+        // leaves the holds where they were and its bytes on the volume; a
+        // slice that then runs out of room meets the device's error on a write
+        // and is not installed, its inputs intact for the next compaction.
         let (volumes, total) = gather(&demands, false);
         // The quota is the tree's own limit, not room another took: what the
         // slice writes has to fit what it leaves past the tree's holds, as it
@@ -456,7 +467,7 @@ struct Grants {
 
 /// The room one compaction holds: given back as its outputs land on their
 /// volumes, and wholly once it is dropped.
-pub struct Reservation {
+pub(crate) struct Reservation {
     pool: Arc<CapacityPool>,
     check: Option<Check>,
     /// The tree whose quota it holds.
@@ -637,7 +648,7 @@ impl Reservation {
 
 /// Quota bytes a reservation kept held past its end, for outputs it left on
 /// disk ([`Reservation::strand`]).
-pub struct QuotaHold {
+pub(crate) struct QuotaHold {
     pool: Arc<CapacityPool>,
     quota: Pool,
     bytes: u64,

@@ -1898,3 +1898,36 @@ fn a_forming_block_past_the_slot_width_still_holds_its_locators() -> crate::Resu
     );
     Ok(())
 }
+
+/// The meta block of a table of cells records every field column its groups
+/// hold, and later groups open more of them: the meta payload the estimates
+/// count grows with them, so it is what the table writes at `finish`.
+#[cfg(feature = "columnar")]
+#[test]
+fn the_meta_estimate_grows_with_the_field_columns_groups_open() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
+
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_cell_rows(true)
+        .use_row_group_size(4 * 1_024)
+        .use_columnar_page_size(1_024);
+    // Every ten rows a field column the rows before did not hold.
+    for i in 0..3_000u16 {
+        let note = format!("note {i}");
+        let column = 3 + i / 10;
+        writer.write(InternalValue::from_components(
+            format!("k{i:08}").into_bytes(),
+            encode_row(&[RowField::bytes(column, RowCell::Value(note.as_bytes()))])?,
+            u64::from(i),
+            ValueType::CellRow,
+        ))?;
+    }
+    assert_eq!(
+        writer.meta_base_len,
+        Some(writer.meta_payload_len_without_keys()?),
+        "the estimates count the meta payload the table holds now",
+    );
+    Ok(())
+}

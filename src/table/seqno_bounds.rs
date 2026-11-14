@@ -42,7 +42,7 @@ use crate::SeqNo;
 /// Returns [`crate::Error::InvalidHeader`] if the block count does not fit the
 /// `u32` section-header width. Validating at encode time fails fast at the
 /// source rather than deferring detection to the decoder.
-pub fn encode_seqno_bounds(
+pub(crate) fn encode_seqno_bounds(
     out: &mut Vec<u8>,
     bounds: &[(BlockOffset, (SeqNo, SeqNo))],
 ) -> crate::Result<()> {
@@ -69,7 +69,7 @@ pub fn encode_seqno_bounds(
 /// section was absent), in which case every lookup returns `None` and the scan
 /// falls back to a full per-entry filter.
 #[derive(Debug, Default, Clone)]
-pub struct SeqnoBoundsMap {
+pub(crate) struct SeqnoBoundsMap {
     /// `(block_offset, (seqno_min, seqno_max))`, sorted ascending by offset for
     /// binary-search lookup.
     entries: Vec<(u64, (SeqNo, SeqNo))>,
@@ -84,7 +84,7 @@ impl SeqnoBoundsMap {
     /// entries are not strictly ascending by offset, or any entry has
     /// `seqno_min > seqno_max` (a corrupt section must surface rather than
     /// silently mis-skip a block).
-    pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> crate::Result<Self> {
         const ERR: crate::Error = crate::Error::InvalidHeader("SeqnoBounds");
 
         fn take<'a>(r: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
@@ -145,7 +145,7 @@ impl SeqnoBoundsMap {
     /// The `[seqno_min, seqno_max]` for the data block at `offset`, or `None` if
     /// the block was not recorded (legacy table without seqno bounds).
     #[must_use]
-    pub fn bounds_for(&self, offset: u64) -> Option<(SeqNo, SeqNo)> {
+    pub(crate) fn bounds_for(&self, offset: u64) -> Option<(SeqNo, SeqNo)> {
         let idx = self
             .entries
             .binary_search_by_key(&offset, |(o, _)| *o)
@@ -155,13 +155,13 @@ impl SeqnoBoundsMap {
 
     /// Whether any per-block bounds are recorded.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Number of recorded data blocks.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
@@ -169,8 +169,9 @@ impl SeqnoBoundsMap {
     /// of a tight-space restricted view (its `[0, from_offset)` blocks are
     /// punched, so their entries are dead). `from_offset == 0` yields
     /// [`len`](Self::len).
+    #[cfg(feature = "std")]
     #[must_use]
-    pub fn live_len(&self, from_offset: u64) -> usize {
+    pub(crate) fn live_len(&self, from_offset: u64) -> usize {
         self.entries
             .iter()
             .filter(|(off, _)| *off >= from_offset)

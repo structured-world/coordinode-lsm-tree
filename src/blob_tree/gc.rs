@@ -94,17 +94,21 @@ impl FragmentationMap {
     /// the diff to the tree's fragmentation stats.
     pub fn merge_into(self, other: &mut Self) {
         for (blob_file_id, diff) in self.0 {
-            other
-                .0
-                .entry(blob_file_id)
-                .and_modify(|counter| {
-                    counter.bytes += diff.bytes;
-                    counter.len += diff.len;
-                    counter.on_disk_bytes += diff.on_disk_bytes;
-                    counter.block_bytes += diff.block_bytes;
-                })
-                .or_insert(diff);
+            other.add(blob_file_id, diff);
         }
+    }
+
+    /// Adds `diff` to the counters of `blob_file_id`.
+    pub(crate) fn add(&mut self, blob_file_id: BlobFileId, diff: FragmentationEntry) {
+        self.0
+            .entry(blob_file_id)
+            .and_modify(|counter| {
+                counter.bytes += diff.bytes;
+                counter.len += diff.len;
+                counter.on_disk_bytes += diff.on_disk_bytes;
+                counter.block_bytes += diff.block_bytes;
+            })
+            .or_insert(diff);
     }
 }
 

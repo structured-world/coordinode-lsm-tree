@@ -680,8 +680,7 @@ fn a_partly_carried_group_is_refused_where_it_cannot_land() -> crate::Result<()>
         source,
         directory: &directory,
         directory_len: Header::decode_from(&mut &raw[..])
-            .map(|header| header.on_disk_size_with(None))
-            .unwrap_or_default(),
+            .map_or_default(|header| header.on_disk_size_with(None)),
     };
     let cmp = crate::comparator::default_comparator();
     let pages = directory.row_pages().to_vec();

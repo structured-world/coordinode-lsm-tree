@@ -506,6 +506,32 @@ impl ParsedItem<InternalValue> for DataBlockParsedItem {
     }
 }
 
+/// An entry of a data block as [`DataBlock::try_for_each_shape`] hands it out:
+/// what sizes a rewrite of it, its key built only on demand.
+pub(crate) struct EntryShape<'a> {
+    pub(crate) value_type: ValueType,
+    pub(crate) seqno: SeqNo,
+    pub(crate) key_len: usize,
+    pub(crate) value: &'a [u8],
+    item: &'a DataBlockParsedItem,
+    bytes: &'a Slice,
+}
+
+impl EntryShape<'_> {
+    /// The entry's user key, rebuilt from its prefix where it shares one.
+    pub(crate) fn key(&self) -> Slice {
+        // NOTE: We consider the prefix and key slice indexes to be trustworthy
+        #[expect(clippy::indexing_slicing)]
+        match &self.item.prefix {
+            Some(prefix) => Slice::fused(
+                &self.bytes[prefix.0..prefix.1],
+                &self.bytes[self.item.key.0..self.item.key.1],
+            ),
+            None => self.bytes.slice(self.item.key.0..self.item.key.1),
+        }
+    }
+}
+
 impl DataBlockParsedItem {
     /// [`ParsedItem::materialize`] for a reader taking a whole block, row
     /// after row: a key rebuilt from its prefix lands in `keys` rather than in
@@ -1205,20 +1231,33 @@ impl DataBlock {
         )
     }
 
-    /// Hands every entry of the block to `f`, in block order.
+    /// Hands every entry of the block to `f`, in block order, as what it is
+    /// without building it: its value type, seqno, user key length and value
+    /// bytes, its key built only when asked for (see [`EntryShape::key`]).
     ///
     /// # Errors
     ///
     /// Propagates a block-decode failure from [`try_iter`](Self::try_iter)
     /// and the first error `f` returns.
-    #[cfg(feature = "std")]
-    pub(crate) fn try_for_each_entry(
+    pub(crate) fn try_for_each_shape(
         &self,
         comparator: crate::comparator::SharedComparator,
-        mut f: impl FnMut(InternalValue) -> crate::Result<()>,
+        mut f: impl FnMut(EntryShape<'_>) -> crate::Result<()>,
     ) -> crate::Result<()> {
+        let bytes = &self.inner.data;
         for item in self.try_iter(comparator)? {
-            f(item.materialize(&self.inner.data))?;
+            let prefix_len = item.prefix.as_ref().map_or(0, |p| p.1 - p.0);
+            // The parser checked the indexes against the block's bytes.
+            #[expect(clippy::indexing_slicing, reason = "indexes the parser checked")]
+            let value = item.value.as_ref().map_or(&[][..], |v| &bytes[v.0..v.1]);
+            f(EntryShape {
+                value_type: item.value_type,
+                seqno: item.seqno,
+                key_len: prefix_len + (item.key.1 - item.key.0),
+                value,
+                item: &item,
+                bytes,
+            })?;
         }
         Ok(())
     }

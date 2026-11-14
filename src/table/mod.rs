@@ -137,6 +137,13 @@ pub(crate) enum RecoveryMode {
     /// standalone recovery reader, where the source's own stored id IS the
     /// identity to recover under. An ENCRYPTED open always cross-checks the
     /// caller's id — the meta block's AAD binds it regardless.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "only the std-gated salvage and repair open a table this way"
+        )
+    )]
     Salvage {
         /// The durable table id known out-of-band, or `None` when the
         /// source's stored id is authoritative.
@@ -459,6 +466,7 @@ fn apply_global_seqno(local: SeqNo, global: SeqNo) -> SeqNo {
 
 /// Result of [`Table::salvage_load_block`]: the decoded block plus, when it read
 /// back cleanly, its raw on-disk bytes for a verbatim copy.
+#[cfg(feature = "std")]
 pub(crate) struct SalvageBlock {
     /// The decoded (decompressed / decrypted / ECC-healed) block: the source of
     /// the per-row entries the salvage walk accounts and, on the re-encode path,
@@ -505,6 +513,7 @@ pub(crate) struct SalvageRowGroup {
 
 /// Raw on-disk frame captured for a verbatim block copy:
 /// `(raw_on_disk_bytes, header, inner_layout)`. See [`SalvageBlock::verbatim`].
+#[cfg(feature = "std")]
 pub(crate) type VerbatimCopy = (
     alloc::vec::Vec<u8>,
     crate::table::block::Header,
@@ -902,6 +911,27 @@ impl Table {
         crate::table::writer::parse_owned_blob_objects(&block.data)
     }
 
+    /// The most blob files this table links and blob objects its rows own, as
+    /// the lengths of the sections listing them bound them: each link or
+    /// object takes at least the fixed bytes of its record. Read off the
+    /// table's layout, not its file.
+    pub(crate) fn blob_reference_bound(&self) -> (u64, u64) {
+        let records = |section: Option<BlockHandle>, record: u64| {
+            section.map_or(0, |handle| u64::from(handle.size()) / record.max(1))
+        };
+        (
+            records(
+                self.regions.linked_blob_files,
+                crate::table::writer::LINKED_BLOB_FILE_FIXED_LEN as u64,
+            ),
+            records(
+                self.regions.owned_blob_objects,
+                crate::table::writer::owned_blob_objects_len(1)
+                    - crate::table::writer::owned_blob_objects_len(0),
+            ),
+        )
+    }
+
     /// Reads and parses the `linked_blob_files` section through the descriptor
     /// `open` yields, opened only when the section exists.
     fn read_blob_file_references(
@@ -929,42 +959,14 @@ impl Table {
 
     #[must_use]
     pub fn filter_size(&self) -> u32 {
-        self.regions.filter.map(|x| x.size()).unwrap_or_default()
-    }
-
-    /// The bytes of the sections that grow with the table's data, past its
-    /// data blocks: every section but its metadata and the framing that holds
-    /// the file together.
-    #[cfg(feature = "std")]
-    pub(crate) fn data_scaled_section_bytes(&self) -> u64 {
-        let regions = &self.regions;
-        [
-            Some(regions.tli),
-            regions.tli_tail,
-            regions.index,
-            regions.filter,
-            regions.filter_tli,
-            regions.range_tombstones,
-            regions.block_layout,
-            regions.locator,
-            regions.seqno_bounds,
-            regions.zone_map,
-            regions.delete_bitmap,
-            regions.owned_blob_objects,
-            regions.linked_blob_files,
-        ]
-        .into_iter()
-        .flatten()
-        .map(|handle| u64::from(handle.size()))
-        .sum()
+        self.regions.filter.map_or_default(|x| x.size())
     }
 
     #[must_use]
     pub fn pinned_filter_size(&self) -> usize {
         self.pinned_filter_block
             .as_ref()
-            .map(FilterBlock::size)
-            .unwrap_or_default()
+            .map_or_default(FilterBlock::size)
     }
 
     /// Filter bytes held in memory now: the pinned filter, or the filter
@@ -1077,7 +1079,7 @@ impl Table {
     /// before masking. A present section with a missing hash (a table written
     /// before the field) cannot be authenticated → `false` (fail closed). A table
     /// with no delete-bitmap section has nothing to authenticate → `true`.
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn delete_bitmap_authenticated(&self) -> bool {
         if !self.has_delete_bitmap_section() {
             return true;
@@ -1549,7 +1551,6 @@ impl Table {
     /// [`Self::load_data_block`] for maintenance that sizes a rewrite of the
     /// table: not counted as a read, and told to `pace`, the rewrite's own,
     /// as the rewrite's reads are.
-    #[cfg(feature = "std")]
     pub(crate) fn load_data_block_for_maintenance(
         &self,
         handle: &BlockHandle,
@@ -1756,7 +1757,7 @@ impl Table {
     ///
     /// `pub(crate)` for the salvage walk ([`crate::salvage`]). Salvage is
     /// maintenance, so nothing here is charged to the gather counter.
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn load_columnar_block_masked(
         &self,
         handle: &BlockHandle,
@@ -1831,7 +1832,7 @@ impl Table {
     /// `allow_delete_resurrection == false` — abort salvage, letting
     /// `repair_with_salvage` rebuild the manifest WITHOUT a table a retry (or
     /// the right key) could have recovered faithfully.
-    #[cfg(feature = "columnar")]
+    #[cfg(all(feature = "columnar", feature = "std"))]
     pub(crate) fn delete_positions_verified(&self) -> crate::Result<bool> {
         let Some(starts) = self.delete_block_starts.as_deref() else {
             // No materialized deletes: there is nothing to position.
@@ -1923,6 +1924,7 @@ impl Table {
     /// healed payload in [`block`](SalvageBlock::block) instead.
     ///
     /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    #[cfg(feature = "std")]
     pub(crate) fn salvage_load_block(
         &self,
         handle: &BlockHandle,
@@ -2144,6 +2146,7 @@ impl Table {
     /// for a table without a recognized ECC scheme; a build without `page_ecc`
     /// never reaches this for an ECC table (the caller's gate already routes
     /// those to the re-encode path).
+    #[cfg(feature = "std")]
     #[cfg_attr(
         not(feature = "page_ecc"),
         expect(
@@ -2222,6 +2225,7 @@ impl Table {
     /// never split. Salvage's verbatim copy passes this through so a multi-inner
     /// block keeps its layout at its new file offset (the offsets are
     /// decompressed-space and block-relative, so they stay valid after the move).
+    #[cfg(feature = "std")]
     #[cfg_attr(
         not(feature = "zstd"),
         expect(
@@ -2234,8 +2238,7 @@ impl Table {
         {
             self.block_layout
                 .ends_for(offset)
-                .map(<[u32]>::to_vec)
-                .unwrap_or_default()
+                .map_or_default(<[u32]>::to_vec)
         }
         #[cfg(not(feature = "zstd"))]
         {
@@ -8021,14 +8024,11 @@ impl Table {
     /// reconstruction). The chunked `multi_get` resolver reads these via
     /// [`Table::load_data_block`] instead of [`Table::decode_data_block_from_bytes`].
     pub(crate) fn is_chunk_special(&self) -> bool {
-        if self.metadata.ecc_params.is_some() {
-            return true;
-        }
         #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            return true;
-        }
-        false
+        let columnar = self.metadata.columnar;
+        #[cfg(not(feature = "columnar"))]
+        let columnar = false;
+        self.metadata.ecc_params.is_some() || columnar
     }
 
     /// Plans the data blocks [`Table::batch_get`] would read for `sorted_keys`
@@ -10467,6 +10467,7 @@ impl Table {
     /// keeps the checksum stable across the punch, and it is what
     /// [`reopen_restricted`](Self::reopen_restricted) records and what
     /// verification / heal reconciliation must recompute for a restricted view.
+    #[cfg(feature = "std")]
     pub(crate) fn live_region_checksum(&self) -> crate::Result<Checksum> {
         self.suffix_checksum_for(self.restrict_lower_bound())
     }
@@ -10883,6 +10884,7 @@ impl Table {
     /// in-place heal changed the file's bytes, and installing this view into
     /// a new version makes the diff persist the refreshed digest to the
     /// manifest (see [`crate::Version::with_refreshed_table_checksum`]).
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn with_refreshed_checksum(&self, checksum: Checksum) -> Self {
         Self(self.0.clone(), self.1.clone(), Some(checksum))
@@ -11300,6 +11302,7 @@ impl Table {
     /// seqno 0 may itself be a legacy bulk-ingested table.
     ///
     /// [`get_highest_seqno`]: Self::get_highest_seqno
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn max_local_seqno(&self) -> SeqNo {
         self.metadata.seqnos.1

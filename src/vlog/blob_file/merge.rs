@@ -8,15 +8,6 @@ use crate::vlog::{BlobFileId, blob_file::scanner::ScanEntry};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
-type IteratorIndex = usize;
-
-#[derive(Debug)]
-struct IteratorValue {
-    index: IteratorIndex,
-    scan_entry: ScanEntry,
-    blob_file_id: BlobFileId,
-}
-
 /// Interleaves multiple blob file readers into a single stream, ordered by
 /// key under the tree's comparator, newest version first.
 ///
@@ -24,12 +15,16 @@ struct IteratorValue {
 /// stream, which is in the comparator's order; merging by raw key bytes
 /// instead would put the two out of step under any other ordering. The heap
 /// is kept here rather than in a `BinaryHeap` because its ordering needs the
-/// comparator, which would otherwise have to ride along in every entry.
+/// comparator, which would otherwise have to ride along in every entry. It
+/// orders the readers' indices, each reader's next entry waiting in its slot:
+/// an entry is moved once, out of its slot, however deep the heap.
 pub(crate) struct MergeScanner {
     readers: Vec<BlobFileScanner>,
     comparator: SharedComparator,
-    /// Min-heap by [`Self::order`].
-    heap: Vec<IteratorValue>,
+    /// Each reader's next entry, `None` once it ran out.
+    slots: Vec<Option<ScanEntry>>,
+    /// Min-heap of the readers holding an entry, by [`Self::order`].
+    heap: Vec<usize>,
     started: bool,
 }
 
@@ -37,80 +32,82 @@ impl MergeScanner {
     /// Initializes a new merging reader over `readers`, ordering keys by
     /// `comparator`.
     pub(crate) fn new(readers: Vec<BlobFileScanner>, comparator: SharedComparator) -> Self {
+        let slots = core::iter::repeat_with(|| None)
+            .take(readers.len())
+            .collect();
         let heap = Vec::with_capacity(readers.len());
         Self {
             readers,
             comparator,
+            slots,
             heap,
             started: false,
         }
     }
 
-    /// Key ascending under the comparator, then seqno descending.
-    fn order(&self, a: &IteratorValue, b: &IteratorValue) -> Ordering {
-        self.comparator
-            .compare(&a.scan_entry.key, &b.scan_entry.key)
-            .then_with(|| b.scan_entry.seqno.cmp(&a.scan_entry.seqno))
-    }
-
-    fn push(&mut self, value: IteratorValue) {
-        self.heap.push(value);
-        let mut child = self.heap.len() - 1;
-        while child > 0 {
-            let parent = (child - 1) / 2;
-            match (self.heap.get(child), self.heap.get(parent)) {
-                (Some(c), Some(p)) if self.order(c, p) == Ordering::Less => {
-                    self.heap.swap(child, parent);
-                    child = parent;
-                }
-                _ => break,
+    /// Whether reader `a`'s entry comes before reader `b`'s: key ascending
+    /// under the comparator, then seqno descending. Both hold one.
+    fn before(&self, a: usize, b: usize) -> bool {
+        match (self.slots.get(a), self.slots.get(b)) {
+            (Some(Some(a)), Some(Some(b))) => {
+                self.comparator
+                    .compare(&a.key, &b.key)
+                    .then_with(|| b.seqno.cmp(&a.seqno))
+                    == Ordering::Less
             }
+            _ => false,
         }
     }
 
-    fn pop(&mut self) -> Option<IteratorValue> {
-        if self.heap.is_empty() {
-            return None;
-        }
-        let head = self.heap.swap_remove(0);
-        let mut parent = 0;
+    /// Moves the reader at heap position `at` down to its place.
+    fn sift_down(&mut self, mut at: usize) {
         loop {
-            let mut least = parent;
-            for child in [2 * parent + 1, 2 * parent + 2] {
-                if let (Some(c), Some(l)) = (self.heap.get(child), self.heap.get(least))
-                    && self.order(c, l) == Ordering::Less
+            let mut least = at;
+            for child in [2 * at + 1, 2 * at + 2] {
+                if let (Some(&c), Some(&l)) = (self.heap.get(child), self.heap.get(least))
+                    && self.before(c, l)
                 {
                     least = child;
                 }
             }
-            if least == parent {
-                break;
+            if least == at {
+                return;
             }
-            self.heap.swap(parent, least);
-            parent = least;
+            self.heap.swap(at, least);
+            at = least;
         }
-        Some(head)
     }
 
-    fn advance_reader(&mut self, idx: usize) -> crate::Result<()> {
-        let Some(reader) = self.readers.get_mut(idx) else {
-            return Ok(());
+    /// Moves the reader at heap position `at` up to its place.
+    fn sift_up(&mut self, mut at: usize) {
+        while at > 0 {
+            let parent = (at - 1) / 2;
+            match (self.heap.get(at), self.heap.get(parent)) {
+                (Some(&c), Some(&p)) if self.before(c, p) => {
+                    self.heap.swap(at, parent);
+                    at = parent;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Reads reader `idx`'s next entry into its slot; `true` when it had one.
+    fn refill(&mut self, idx: usize) -> crate::Result<bool> {
+        let (Some(reader), Some(slot)) = (self.readers.get_mut(idx), self.slots.get_mut(idx))
+        else {
+            return Ok(false);
         };
-        if let Some(value) = reader.next() {
-            let scan_entry = value?;
-            let blob_file_id = reader.blob_file_id;
-            self.push(IteratorValue {
-                index: idx,
-                blob_file_id,
-                scan_entry,
-            });
-        }
-        Ok(())
+        *slot = reader.next().transpose()?;
+        Ok(slot.is_some())
     }
 
-    fn push_next(&mut self) -> crate::Result<()> {
+    fn start(&mut self) -> crate::Result<()> {
         for idx in 0..self.readers.len() {
-            self.advance_reader(idx)?;
+            if self.refill(idx)? {
+                self.heap.push(idx);
+                self.sift_up(self.heap.len() - 1);
+            }
         }
         Ok(())
     }
@@ -122,12 +119,19 @@ impl Iterator for MergeScanner {
     fn next(&mut self) -> Option<Self::Item> {
         if !self.started {
             self.started = true;
-            fail_iter!(self.push_next());
+            fail_iter!(self.start());
         }
 
-        let head = self.pop()?;
-        fail_iter!(self.advance_reader(head.index));
-        Some(Ok((head.scan_entry, head.blob_file_id)))
+        let &idx = self.heap.first()?;
+        let entry = self.slots.get_mut(idx)?.take()?;
+        let blob_file_id = self.readers.get(idx)?.blob_file_id;
+        // The reader's next entry takes its place at the top, or, once the
+        // reader runs out, the heap's last reader does.
+        if !fail_iter!(self.refill(idx)) {
+            self.heap.swap_remove(0);
+        }
+        self.sift_down(0);
+        Some(Ok((entry, blob_file_id)))
     }
 }
 

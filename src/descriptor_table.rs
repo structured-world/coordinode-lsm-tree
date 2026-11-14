@@ -74,6 +74,7 @@ impl DescriptorTable {
 
     /// Closes the cached descriptors of every tree whose id is `first` or
     /// later, tables and blob files alike.
+    #[cfg(feature = "std")]
     pub(crate) fn remove_trees_from(&self, first: crate::tree::inner::TreeId) {
         self.inner.remove_where(|key| key.1 >= first);
         self.advance_table_epoch();

@@ -394,6 +394,11 @@ pub struct SuperVersions {
     #[cfg(feature = "std")]
     latest: Arc<ArcSwap<SuperVersion>>,
 
+    /// The current version's L0 run count, written at every publish: a writer
+    /// pacing itself against L0 reads it with one load, without the history
+    /// lock or a version clone, whose cache lines the readers share.
+    l0_runs: Arc<crate::memtable::own_line::OwnLine<core::sync::atomic::AtomicUsize>>,
+
     /// What inserts hold instead of the history lock, and where they get the
     /// active memtable from: the gate's own copy, not [`Self::latest`]. Only
     /// [`Self::publish`] replaces it, through a closed gate, so no insert lands
@@ -415,6 +420,11 @@ pub struct SuperVersions {
     /// persisted, so a test can act inside that window.
     #[cfg(test)]
     pub(crate) before_persist: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+/// The runs `version` holds in L0.
+fn l0_run_count(version: &Version) -> usize {
+    version.level(0).map_or_default(|level| level.run_count())
 }
 
 impl SuperVersions {
@@ -443,6 +453,9 @@ impl SuperVersions {
         };
 
         Self {
+            l0_runs: Arc::new(crate::memtable::own_line::OwnLine(
+                core::sync::atomic::AtomicUsize::new(l0_run_count(&initial.version)),
+            )),
             #[cfg(feature = "std")]
             latest: Arc::new(ArcSwap::from_pointee(initial.clone())),
             #[cfg(feature = "std")]
@@ -1048,6 +1061,10 @@ impl SuperVersions {
         if let Some(budget) = &self.filter_budget {
             budget.publish(&version.version);
         }
+        self.l0_runs.store(
+            l0_run_count(&version.version),
+            core::sync::atomic::Ordering::Release,
+        );
         // A new active memtable is handed to inserts with the insert gate
         // closed: the inserts already into the old one finish first, and the
         // ones after land in the new one. The gate is closed here unless the
@@ -1097,6 +1114,15 @@ impl SuperVersions {
     #[must_use]
     pub(crate) fn latest_handle(&self) -> Arc<ArcSwap<SuperVersion>> {
         Arc::clone(&self.latest)
+    }
+
+    /// Returns the current version's L0 run count as every publish writes it
+    /// (see `l0_runs`).
+    #[must_use]
+    pub(crate) fn l0_runs_handle(
+        &self,
+    ) -> Arc<crate::memtable::own_line::OwnLine<core::sync::atomic::AtomicUsize>> {
+        Arc::clone(&self.l0_runs)
     }
 
     /// Returns the gate inserts pass instead of taking the history lock (see

@@ -838,9 +838,16 @@ impl AbstractTree for Tree {
         // estimate below: a second `current_version()` could race a concurrent
         // flush / compaction and mix two snapshots.
         let version = self.current_version();
+        // What a full compaction writes, as the space gate bounds it. A
+        // standard tree relocates no blob file.
+        let (sst_need, _) = crate::compaction::worker::full_compaction_demand(self, &version)?;
         // Standard tree: SST values ARE user values (no KV separation).
-        let mut stats =
-            crate::storage_stats::compute_storage_stats(&version, self.is_compacting(), true)?;
+        let mut stats = crate::storage_stats::compute_storage_stats(
+            &version,
+            self.is_compacting(),
+            true,
+            sst_need,
+        )?;
         // Fill the disk-aware capacity figures (quota + free-space probe) the
         // version-only computation can't know.
         let (capacity, available, compaction_possible) = self.admission_capacity(stats.used_bytes);
@@ -858,14 +865,12 @@ impl AbstractTree for Tree {
             && capacity.is_some()
             && stats.status == crate::StorageStatus::Healthy
         {
-            // A full compaction's transient output is bounded by the largest
-            // level's on-disk size, but it LANDS in the last configured level's
+            // A full compaction's output LANDS in the last configured level's
             // volume (`level_count - 1`), which under tiered routing can be a
             // different filesystem than the largest level. A standard tree has no
             // blob relocation. Using the per-volume gate (not `available >=
             // full_compaction_bytes` against the min-volume free) keeps the status
             // from reporting tight when a routed merge would actually be admitted.
-            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version)?;
             // `saturating_sub`: `level_count >= 1` always, so this is the last
             // level index; the clamp only guards a degenerate zero-level config.
             let sst_dest_level = self.0.config.level_count.saturating_sub(1);
@@ -1097,10 +1102,9 @@ impl AbstractTree for Tree {
     }
 
     fn l0_run_count(&self) -> usize {
-        self.current_version()
-            .level(0)
-            .map(|x| x.run_count())
-            .unwrap_or_default()
+        // Every publish writes it: one load, no history lock, no version
+        // clone on the lines the readers share.
+        self.0.l0_runs.load(core::sync::atomic::Ordering::Acquire)
     }
 
     fn size_of<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<u32>> {
@@ -1410,7 +1414,7 @@ impl AbstractTree for Tree {
         log::trace!(
             "Registering {} tables, {} blob files",
             tables.len(),
-            blob_files.map(<[BlobFile]>::len).unwrap_or_default(),
+            blob_files.map_or_default(<[BlobFile]>::len),
         );
 
         // Wire the tree-wide deletion pause into every fresh table / blob
@@ -5947,6 +5951,7 @@ impl Tree {
         let latest_super_version = super_versions.latest_handle();
         #[cfg(feature = "std")]
         let insert_gate = super_versions.insert_gate_handle();
+        let l0_runs = super_versions.l0_runs_handle();
         #[cfg(feature = "std")]
         if let Some(budget) = &config.write_buffer_budget {
             budget.register(Arc::downgrade(&latest_super_version));
@@ -5964,6 +5969,7 @@ impl Tree {
             latest_super_version,
             #[cfg(feature = "std")]
             insert_gate,
+            l0_runs,
             stop_signal,
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
@@ -6338,6 +6344,7 @@ impl Tree {
         // then), and only an id no copy delivers surfaces its ambiguity.
         // A LIST, not a per-id map: routing can put a temp for the same id in
         // more than one folder, and each one is a file that has to be settled.
+        #[cfg(feature = "std")]
         let mut deferred_temps: Vec<(
             TableId,
             crate::path::PathBuf,

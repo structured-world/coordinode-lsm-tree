@@ -10,8 +10,10 @@
 //!   its neighbours, compressed together;
 //! - a value from the block target up to the chunk size is a
 //!   [`FrameKind::Single`] of its own;
-//! - a larger value is a [`FrameKind::Head`] naming its length and chunk size,
-//!   followed by one [`FrameKind::Chunk`] per chunk, each compressed on its own.
+//! - a larger value is a [`FrameKind::Head`] naming its length, its chunk size
+//!   and how each chunk is stored, followed by its chunks back to back, each
+//!   compressed on its own and carrying no header: a value whose chunks are
+//!   stored as they are lies in one range after its head.
 //!
 //! ```text
 //! [magic "BLO5"; 4][kind; 1][flags; 1][count; 2]
@@ -21,11 +23,25 @@
 //!
 //! `entries` lists the frame's values, each `[seqno; 8][key len; 2][value len;
 //! 4][key]`, uncompressed, so a scan, a collection and a salvage read keys
-//! without decoding values. `payload` is the values back to back (a head's is
-//! its chunk table), compressed under the file's codec unless [`FLAG_RAW`]
-//! says compression saved nothing and the bytes are stored as they are.
+//! without decoding values. `payload` is the values back to back, compressed
+//! under the file's codec unless [`FLAG_RAW`] says compression saved nothing
+//! and the bytes are stored as they are, or [`FLAG_PLAIN`] says a dictionary
+//! codec compressed it without its dictionary.
+//!
+//! A head's payload, stored as it is, is its chunk table:
+//!
+//! ```text
+//! [chunk size; 4][chunk count; 4]
+//! ([stored len; 4][flags; 1][checksum; 16]) * chunk count
+//! ```
+//!
+//! Each chunk's flags read as a frame's do, and its checksum is xxh3-128 over
+//! the chunk as stored; a chunk holds the chunk size of the value, the last
+//! what is left.
 //! `header_crc` covers the fixed fields after the magic; `checksum` is
-//! xxh3-128 over the entries, the payload as stored and `header_crc`.
+//! xxh3-128 over the entries and the payload as stored, which lie back to
+//! back, seeded with `header_crc`; a packed block has no entries, and its
+//! payload is its records (see [`super::packed`]).
 
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
@@ -49,8 +65,16 @@ pub(crate) const ENTRY_HEADER_LEN: usize = 8 + 2 + 4;
 /// The payload is stored as it is: compression did not make it smaller.
 pub(crate) const FLAG_RAW: u8 = 1;
 
-/// The length of a head's payload: its chunk size and chunk count.
-const HEAD_PAYLOAD_LEN: usize = 8;
+/// Under a dictionary codec, the payload is compressed without the dictionary,
+/// at the codec's level: the frame's class is one the dictionary does not
+/// apply to (see [`crate::config::DictionaryClasses`]).
+pub(crate) const FLAG_PLAIN: u8 = 2;
+
+/// The fixed part of a head's payload: its chunk size and chunk count.
+const HEAD_TABLE_LEN: usize = 8;
+
+/// One chunk's row of a head's table: its stored length, flags and checksum.
+pub(crate) const CHUNK_ROW_LEN: usize = 4 + 1 + 16;
 
 /// What a frame holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,10 +84,12 @@ pub(crate) enum FrameKind {
     Single = 0,
     /// Small values, back to back.
     Block = 1,
-    /// A value split into chunks: its key, length and chunk size, the chunks
-    /// following as frames of their own.
+    /// A value split into chunks: its key, length, chunk size and the table of
+    /// its chunks, which follow it back to back.
     Head = 2,
-    /// One chunk of the value the head before it names.
+    /// One chunk of the value a head names, decoded by the head's table: a
+    /// chunk carries no header of its own, so no frame on disk is of this
+    /// kind.
     Chunk = 3,
 }
 
@@ -190,13 +216,22 @@ impl<'b> Put<'b> {
     }
 }
 
-/// The checksum of a frame's entries and stored payload, `header_crc` folded
-/// in so a header recomputed after tampering is still caught.
-fn frame_checksum(entries: &[u8], payload: &[u8], header_crc: u32) -> u128 {
-    let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+/// The checksum of a frame's entries and stored payload, `stored` the two as
+/// they lie back to back, seeded with `header_crc` so a header recomputed
+/// after tampering is still caught.
+///
+/// Blob layout 5 is in no release yet, so changing how it is checksummed keeps
+/// its version: no supported store holds frames checksummed the other way.
+pub(crate) fn frame_checksum(stored: &[u8], header_crc: u32) -> u128 {
+    xxhash_rust::xxh3::xxh3_128_with_seed(stored, u64::from(header_crc))
+}
+
+/// [`frame_checksum`] over `entries` followed by `payload`, where the writer
+/// holds them apart.
+fn frame_checksum_parts(entries: &[u8], payload: &[u8], header_crc: u32) -> u128 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(u64::from(header_crc));
     hasher.update(entries);
     hasher.update(payload);
-    hasher.update(&header_crc.to_le_bytes());
     hasher.digest128()
 }
 
@@ -209,10 +244,12 @@ fn frame_checksum(entries: &[u8], payload: &[u8], header_crc: u32) -> u128 {
 /// [`crate::Error::HeaderCrcMismatch`] for fields that do not match their CRC;
 /// [`crate::Error::DecompressedSizeTooLarge`] for lengths past the value cap.
 pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
-    let short = crate::Error::InvalidHeader("BlobFrame");
+    // Built only on the way out: an error made up front is dropped, glue and
+    // all, on every frame that checks.
+    let short = || crate::Error::InvalidHeader("BlobFrame");
     let mut fields = Fields::new(bytes);
     if fields.take::<4>() != Some(FRAME_MAGIC) {
-        return Err(short);
+        return Err(short());
     }
     let (
         Some(kind),
@@ -234,7 +271,7 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
         fields.u128(),
     )
     else {
-        return Err(short);
+        return Err(short());
     };
     let kind = FrameKind::try_from(kind)?;
 
@@ -258,19 +295,33 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
     let count64 = u64::from(count);
     let entries_max = count64 * (ENTRY_HEADER_LEN as u64 + u64::from(u16::MAX));
     let entries_min = count64 * (ENTRY_HEADER_LEN as u64 + 1);
-    if !(entries_min..=entries_max).contains(&u64::from(entries_len)) {
-        return Err(short);
+    // A packed block lists its values in its records, its entries empty.
+    let packed = flags == super::packed::FLAG_PACKED;
+    let entries_ok = if packed {
+        kind == FrameKind::Block && count >= 1 && entries_len == 0
+    } else {
+        (entries_min..=entries_max).contains(&u64::from(entries_len))
+    };
+    if !entries_ok {
+        return Err(short());
     }
     let shape_ok = match kind {
         FrameKind::Single | FrameKind::Head => count == 1,
         FrameKind::Block => count >= 1,
-        FrameKind::Chunk => count == 0,
+        FrameKind::Chunk => false,
     };
     // A head's payload is its chunk table, never compressed.
-    let head_ok =
-        kind != FrameKind::Head || (flags & FLAG_RAW != 0 && raw_len as usize == HEAD_PAYLOAD_LEN);
-    if !shape_ok || !head_ok {
-        return Err(short);
+    let head_ok = kind != FrameKind::Head
+        || (flags & FLAG_RAW != 0
+            && raw_len == disk_len
+            && (raw_len as usize)
+                .checked_sub(HEAD_TABLE_LEN)
+                .is_some_and(|rows| rows % CHUNK_ROW_LEN == 0));
+    // A stored payload is compressed one way or not at all.
+    let flags_ok =
+        packed || (flags & !(FLAG_RAW | FLAG_PLAIN) == 0 && flags != FLAG_RAW | FLAG_PLAIN);
+    if !shape_ok || !head_ok || !flags_ok {
+        return Err(short());
     }
     Ok(FrameHeader {
         kind,
@@ -294,6 +345,28 @@ pub(crate) struct FrameEntry {
     pub(crate) value_len: u32,
     /// Where the value lies in the payload (single and block frames).
     pub(crate) value: Range<usize>,
+    /// Where the value's record starts in a packed block, which its handle
+    /// names it by; `0` in any other frame.
+    pub(crate) at: u32,
+}
+
+/// The entries a frame lists: the one of a single frame or a head held in
+/// place, so decoding a frame of one value allocates no list for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FrameEntries {
+    One(FrameEntry),
+    Many(Vec<FrameEntry>),
+}
+
+impl core::ops::Deref for FrameEntries {
+    type Target = [FrameEntry];
+
+    fn deref(&self) -> &[FrameEntry] {
+        match self {
+            Self::One(entry) => core::slice::from_ref(entry),
+            Self::Many(list) => list,
+        }
+    }
 }
 
 /// A frame checked and decoded.
@@ -302,12 +375,72 @@ pub(crate) struct DecodedFrame {
     pub(crate) header: FrameHeader,
     /// The entries as stored: keys are views into it.
     pub(crate) entries: Slice,
-    pub(crate) list: Vec<FrameEntry>,
+    pub(crate) list: FrameEntries,
     /// The payload decoded.
     pub(crate) payload: Slice,
 }
 
 impl DecodedFrame {
+    /// Whether the frame is a packed block, whose values a handle names by
+    /// their records' offsets.
+    #[must_use]
+    pub(crate) fn is_packed(&self) -> bool {
+        self.header.flags & super::packed::FLAG_PACKED != 0
+    }
+
+    /// The place in the list of the value a handle's `index` names: the
+    /// place itself, or in a packed block the value whose record starts there.
+    #[must_use]
+    pub(crate) fn place_of(&self, index: u16) -> Option<usize> {
+        if !self.is_packed() {
+            return Some(usize::from(index));
+        }
+        let index = u32::from(index);
+        // Records of one length lie at even steps, so the offset's share of
+        // the block is the place: tried first, it spares the search a scan
+        // would otherwise run for every value. The product fits: an offset
+        // and a block's count are both within `u16`.
+        let guess = (index as usize * self.list.len())
+            .checked_div(self.entries.len())
+            .unwrap_or(0);
+        if self.list.get(guess).is_some_and(|entry| entry.at == index) {
+            return Some(guess);
+        }
+        self.list
+            .binary_search_by_key(&index, |entry| entry.at)
+            .ok()
+    }
+
+    /// The index a handle names entry `at` by, as [`Self::place_of`] reads
+    /// it back: the place itself, or in a packed block its record's offset.
+    /// `None` past what a handle's index holds.
+    #[must_use]
+    pub(crate) fn index_of(&self, at: usize) -> Option<u16> {
+        if self.is_packed() {
+            return self
+                .list
+                .get(at)
+                .and_then(|entry| u16::try_from(entry.at).ok());
+        }
+        u16::try_from(at).ok()
+    }
+
+    /// What entry `at` adds to its file's block entry bytes, as its writer
+    /// counted it: a block's entry uncompressed, or a packed block's record
+    /// as it lies.
+    #[must_use]
+    pub(crate) fn block_entry_bytes(&self, at: usize) -> Option<u64> {
+        let entry = self.list.get(at)?;
+        if self.is_packed() {
+            let end = self
+                .list
+                .get(at + 1)
+                .map_or(self.entries.len() as u64, |next| u64::from(next.at));
+            return end.checked_sub(u64::from(entry.at));
+        }
+        Some((ENTRY_HEADER_LEN + entry.key.len()) as u64 + u64::from(entry.value_len))
+    }
+
     /// The key of entry `at`.
     #[must_use]
     pub(crate) fn key(&self, at: usize) -> Option<&[u8]> {
@@ -331,38 +464,306 @@ impl DecodedFrame {
     ///
     /// The frame is not a head, or its table does not cover its value.
     pub(crate) fn chunk_table(&self) -> crate::Result<(u32, u32)> {
-        let malformed = crate::Error::InvalidHeader("BlobFrame");
         if self.header.kind != FrameKind::Head {
-            return Err(malformed);
+            return Err(crate::Error::InvalidHeader("BlobFrame"));
         }
-        let mut fields = Fields::new(&self.payload);
-        let (Some(size), Some(chunks)) = (fields.u32(), fields.u32()) else {
-            return Err(malformed);
-        };
         let total = self.list.first().map_or(0, |e| u64::from(e.value_len));
-        // A value is written within the cap, and callers size their chunk
-        // list and buffer from this table: a larger one is damage.
-        if size == 0
-            || total > super::writer::MAX_DECOMPRESSION_SIZE as u64
-            || u64::from(chunks) != total.div_ceil(u64::from(size))
-        {
-            return Err(malformed);
-        }
-        Ok((size, chunks))
+        head_table(&self.payload, total)
+    }
+
+    /// Chunk `at` of a head, as its table lists it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::chunk_table`], and a chunk the table does not list.
+    pub(crate) fn chunk(&self, at: u32) -> crate::Result<ChunkSpec> {
+        let (size, chunks) = self.chunk_table()?;
+        let total = self.list.first().map_or(0, |e| u64::from(e.value_len));
+        chunk_row(&self.payload, size, chunks, total, at)
+    }
+
+    /// Every chunk of a head in order, the table's bounds checked once for
+    /// all of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::chunk_table`]; each row yields its own error.
+    pub(crate) fn chunks(
+        &self,
+    ) -> crate::Result<impl ExactSizeIterator<Item = crate::Result<ChunkSpec>> + '_> {
+        let (size, chunks) = self.chunk_table()?;
+        let total = self.list.first().map_or(0, |e| u64::from(e.value_len));
+        Ok((0..chunks).map(move |at| chunk_row(&self.payload, size, chunks, total, at)))
+    }
+
+    /// [`Self::chunks`] gathered, on the caller's stack for a value of a few
+    /// chunks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::chunk_table`], and a row that does not parse.
+    pub(crate) fn chunk_specs(&self) -> crate::Result<ChunkSpecs> {
+        self.chunks()?.collect()
     }
 
     /// Bytes this frame takes in a cache: what it decoded, its entries and
     /// their list.
     #[must_use]
     pub(crate) fn weight(&self) -> u64 {
-        (self.entries.len() + self.payload.len() + self.list.len() * size_of::<FrameEntry>()) as u64
+        // A packed block stored as it is: its payload is its records.
+        let payload = if self.payload.as_ptr_range() == self.entries.as_ptr_range() {
+            0
+        } else {
+            self.payload.len()
+        };
+        (self.entries.len() + payload + self.list.len() * size_of::<FrameEntry>()) as u64
     }
 }
 
-/// Parses the entries of a frame whose header is `header`.
-fn parse_entries(header: &FrameHeader, entries: &[u8]) -> crate::Result<Vec<FrameEntry>> {
+/// The rows of a head's table: in place for a value of up to eight chunks
+/// (2 MiB at the default chunk size), which is most chunked values, and on
+/// the heap past that.
+pub(crate) type ChunkSpecs = smallvec::SmallVec<[ChunkSpec; 8]>;
+
+/// One chunk of a chunked value as its head's table lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChunkSpec {
+    /// The chunk's decoded length: the chunk size, the last chunk's what is
+    /// left of the value.
+    pub(crate) raw_len: u32,
+    /// What the chunk takes on disk.
+    pub(crate) stored_len: u32,
+    /// How it is stored, as a frame's flags say it.
+    pub(crate) flags: u8,
+    /// xxh3-128 over the chunk as stored.
+    pub(crate) checksum: u128,
+}
+
+impl ChunkSpec {
+    /// Whether the chunk is stored as it is under a file of `compression`.
+    #[must_use]
+    pub(crate) fn is_stored_as_is(&self, compression: CompressionType) -> bool {
+        self.flags & FLAG_RAW != 0 || compression == CompressionType::None
+    }
+
+    /// Whether the row is one a file of `compression` can hold: a chunk
+    /// stored as it is takes its own length. A row breaking it names a value
+    /// no read assembles, so a copy refuses it before carrying its bytes.
+    #[must_use]
+    pub(crate) fn fits(&self, compression: CompressionType) -> bool {
+        !self.is_stored_as_is(compression) || self.stored_len == self.raw_len
+    }
+}
+
+/// The chunk size and chunk count of a head's `table`, for a value of
+/// `total` bytes.
+fn head_table(table: &[u8], total: u64) -> crate::Result<(u32, u32)> {
     let malformed = || crate::Error::InvalidHeader("BlobFrame");
-    let mut list = Vec::with_capacity(usize::from(header.count));
+    let mut fields = Fields::new(table);
+    let (Some(size), Some(chunks)) = (fields.u32(), fields.u32()) else {
+        return Err(malformed());
+    };
+    let rows_ok = (chunks as usize)
+        .checked_mul(CHUNK_ROW_LEN)
+        .and_then(|rows| rows.checked_add(HEAD_TABLE_LEN))
+        == Some(table.len());
+    // A value is written within the cap, and callers size their chunk list
+    // and buffer from this table: a larger one is damage.
+    if size == 0
+        || total > super::writer::MAX_DECOMPRESSION_SIZE as u64
+        || u64::from(chunks) != total.div_ceil(u64::from(size))
+        || !rows_ok
+    {
+        return Err(malformed());
+    }
+    Ok((size, chunks))
+}
+
+/// Row `at` of a head's `table` of `chunks` chunks of `size` bytes over a
+/// value of `total` bytes.
+fn chunk_row(
+    table: &[u8],
+    size: u32,
+    chunks: u32,
+    total: u64,
+    at: u32,
+) -> crate::Result<ChunkSpec> {
+    let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    if at >= chunks {
+        return Err(malformed());
+    }
+    let row = HEAD_TABLE_LEN + at as usize * CHUNK_ROW_LEN;
+    let mut fields = Fields::new(table.get(row..row + CHUNK_ROW_LEN).ok_or_else(malformed)?);
+    let (Some(stored_len), Some(flags), Some(checksum)) =
+        (fields.u32(), fields.u8(), fields.u128())
+    else {
+        return Err(malformed());
+    };
+    // A chunk is stored one way, as a frame is.
+    if flags & !(FLAG_RAW | FLAG_PLAIN) != 0 || flags == FLAG_RAW | FLAG_PLAIN {
+        return Err(malformed());
+    }
+    let raw_len = if at + 1 == chunks {
+        total - u64::from(at) * u64::from(size)
+    } else {
+        u64::from(size)
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a chunk holds at most the chunk size, a u32"
+    )]
+    let raw_len = raw_len as u32;
+    // Stored as it is, a chunk takes its own length.
+    if flags & FLAG_RAW != 0 && stored_len != raw_len {
+        return Err(malformed());
+    }
+    Ok(ChunkSpec {
+        raw_len,
+        stored_len,
+        flags,
+        checksum,
+    })
+}
+
+/// The table of a head `head` as stored, a frame that checks: each of its
+/// chunks as listed.
+///
+/// # Errors
+///
+/// The frame does not check, is not a head, or its table is malformed.
+#[cfg(feature = "std")]
+pub(crate) fn head_chunks(head: &[u8]) -> crate::Result<Vec<ChunkSpec>> {
+    let (header, list) = check_frame(head)?;
+    let table = head
+        .get(FRAME_HEADER_LEN + header.entries_len as usize..)
+        .unwrap_or_default();
+    if header.kind != FrameKind::Head {
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
+    let total = list.first().map_or(0, |e| u64::from(e.value_len));
+    let (size, chunks) = head_table(table, total)?;
+    (0..chunks)
+        .map(|at| chunk_row(table, size, chunks, total, at))
+        .collect()
+}
+
+/// Whether `chunks` are, in order, the chunks the table of `head` lists for a
+/// value of `total` bytes, each one whole frame in its listed length and
+/// stored as `compression` can hold. `head` is a head frame a scan already
+/// checked, whose entries end at `entries_end`: its table is read as it lies,
+/// its checksum not taken again, nothing gathered.
+///
+/// # Errors
+///
+/// A table that does not hold.
+pub(crate) fn chunks_fit_head(
+    head: &[u8],
+    entries_end: usize,
+    total: u64,
+    chunks: &[Slice],
+    compression: CompressionType,
+) -> crate::Result<bool> {
+    let table = head.get(entries_end..).unwrap_or_default();
+    let (size, count) = head_table(table, total)?;
+    if count as usize != chunks.len() {
+        return Ok(false);
+    }
+    for (at, chunk) in (0..count).zip(chunks) {
+        let spec = chunk_row(table, size, count, total, at)?;
+        if chunk.len() != spec.stored_len as usize || !spec.fits(compression) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The table a head of a value split into `chunks` writes.
+#[must_use]
+pub(crate) fn head_payload(chunk_size: u32, chunks: &[ChunkSpec]) -> Vec<u8> {
+    let mut table = Vec::with_capacity(HEAD_TABLE_LEN + chunks.len() * CHUNK_ROW_LEN);
+    table.extend_from_slice(&chunk_size.to_le_bytes());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a value of at most the 256 MiB cap holds fewer than u32::MAX chunks"
+    )]
+    table.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    for chunk in chunks {
+        table.extend_from_slice(&chunk.stored_len.to_le_bytes());
+        table.push(chunk.flags);
+        table.extend_from_slice(&chunk.checksum.to_le_bytes());
+    }
+    table
+}
+
+/// The checksum a chunk carries in its head's table.
+#[must_use]
+pub(crate) fn chunk_checksum(stored: &[u8]) -> u128 {
+    xxhash_rust::xxh3::xxh3_128(stored)
+}
+
+/// Checks `stored` against `spec`: its length and its checksum.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] for another length,
+/// [`crate::Error::ChecksumMismatch`] when the bytes do not check.
+pub(crate) fn check_chunk(spec: &ChunkSpec, stored: &[u8]) -> crate::Result<()> {
+    if stored.len() != spec.stored_len as usize {
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
+    let checksum = chunk_checksum(stored);
+    if checksum != spec.checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: crate::Checksum::from_raw(checksum),
+            expected: crate::Checksum::from_raw(spec.checksum),
+        });
+    }
+    Ok(())
+}
+
+/// `chunk` encoded under `codec`: its stored bytes when compression shrank
+/// it (`None` when it is stored as it is) and its row in the head's table.
+///
+/// # Errors
+///
+/// Propagates the compression.
+pub(crate) fn encode_chunk(
+    chunk: &[u8],
+    codec: Codec<'_>,
+) -> crate::Result<(Option<Vec<u8>>, ChunkSpec)> {
+    let raw_len = super::writer::check_size_cap(chunk.len())?;
+    let compressed = compress(chunk, codec)?;
+    let flags = if compressed.is_none() && codec.compression != CompressionType::None {
+        FLAG_RAW
+    } else if compressed.is_some() && codec.plain {
+        FLAG_PLAIN
+    } else {
+        0
+    };
+    let stored: &[u8] = compressed.as_deref().unwrap_or(chunk);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "compression keeps only what shrank the chunk, itself within the cap"
+    )]
+    let spec = ChunkSpec {
+        raw_len,
+        stored_len: stored.len() as u32,
+        flags,
+        checksum: chunk_checksum(stored),
+    };
+    Ok((compressed, spec))
+}
+
+/// Parses the entries of a frame whose header is `header`.
+fn parse_entries(header: &FrameHeader, entries: &[u8]) -> crate::Result<FrameEntries> {
+    let malformed = || crate::Error::InvalidHeader("BlobFrame");
+    // A list only for a block: a frame of one value holds its entry in place.
+    let mut list = if header.count > 1 {
+        Vec::with_capacity(usize::from(header.count))
+    } else {
+        Vec::new()
+    };
+    let mut only = None;
     let mut fields = Fields::new(entries);
     let mut value_at = 0_usize;
     for _ in 0..header.count {
@@ -380,12 +781,18 @@ fn parse_entries(header: &FrameHeader, entries: &[u8]) -> crate::Result<Vec<Fram
         let value_end = value_at
             .checked_add(value_len as usize)
             .ok_or_else(malformed)?;
-        list.push(FrameEntry {
+        let entry = FrameEntry {
             seqno,
             key: key_start..key_end,
             value_len,
             value: value_at..value_end,
-        });
+            at: 0,
+        };
+        if header.count == 1 {
+            only = Some(entry);
+        } else {
+            list.push(entry);
+        }
         value_at = value_end;
     }
     if fields.at != entries.len() {
@@ -397,7 +804,10 @@ fn parse_entries(header: &FrameHeader, entries: &[u8]) -> crate::Result<Vec<Fram
     {
         return Err(malformed());
     }
-    Ok(list)
+    Ok(match only {
+        Some(entry) => FrameEntries::One(entry),
+        None => FrameEntries::Many(list),
+    })
 }
 
 /// Checks the frame `bytes` holds whole as stored, without decoding its
@@ -407,6 +817,7 @@ fn parse_entries(header: &FrameHeader, entries: &[u8]) -> crate::Result<Vec<Fram
 /// # Errors
 ///
 /// As [`decode_frame`], short of decompression.
+#[cfg(feature = "std")]
 pub(crate) fn verify_frame(bytes: &[u8]) -> crate::Result<FrameHeader> {
     check_frame(bytes).map(|(header, _)| header)
 }
@@ -442,20 +853,31 @@ pub(crate) fn undecoded_frame(
 }
 
 /// [`verify_frame`]'s checks, the entries parsed kept.
-fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, Vec<FrameEntry>)> {
-    let header = parse_header(bytes)?;
+pub(crate) fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, FrameEntries)> {
+    check_frame_with(parse_header(bytes)?, bytes)
+}
+
+/// [`check_frame`] of `bytes` whose header, `header`, is parsed already.
+fn check_frame_with(
+    header: FrameHeader,
+    bytes: &[u8],
+) -> crate::Result<(FrameHeader, FrameEntries)> {
+    if header.frame_len() != bytes.len() as u64 {
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
+    if header.flags & super::packed::FLAG_PACKED != 0 {
+        let records = bytes.get(FRAME_HEADER_LEN..).unwrap_or_default();
+        let list = super::packed::check_packed(&header, records)?;
+        return Ok((header, list));
+    }
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
-    // Whole: the entries, then exactly the stored payload the header names.
-    let (Some(entries), Some(stored)) = (
+    let (Some(entries), Some(checked)) = (
         bytes.get(FRAME_HEADER_LEN..entries_end),
-        bytes.get(entries_end..),
+        bytes.get(FRAME_HEADER_LEN..),
     ) else {
         return Err(crate::Error::InvalidHeader("BlobFrame"));
     };
-    if stored.len() != header.disk_len as usize {
-        return Err(crate::Error::InvalidHeader("BlobFrame"));
-    }
-    let checksum = frame_checksum(entries, stored, header.header_crc);
+    let checksum = frame_checksum(checked, header.header_crc);
     if checksum != header.checksum {
         return Err(crate::Error::ChecksumMismatch {
             got: crate::Checksum::from_raw(checksum),
@@ -482,11 +904,33 @@ pub(crate) fn decode_frame(
     #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
     decoded: &mut usize,
 ) -> crate::Result<DecodedFrame> {
-    let (header, list) = check_frame(bytes)?;
+    // A packed block is checked as it is decoded, each record parsed once.
+    let header = parse_header(bytes)?;
+    if header.flags & super::packed::FLAG_PACKED != 0 {
+        if header.frame_len() != bytes.len() as u64 {
+            return Err(crate::Error::InvalidHeader("BlobFrame"));
+        }
+        return super::packed::decode_packed(
+            header,
+            &bytes.slice(FRAME_HEADER_LEN..bytes.len()),
+            compression,
+            #[cfg(zstd_any)]
+            dictionary,
+            decoded,
+        );
+    }
+    let (header, list) = check_frame_with(header, bytes)?;
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
     let entries = bytes.slice(FRAME_HEADER_LEN..entries_end);
     let stored = bytes.slice(entries_end..bytes.len());
     let raw_len = header.raw_len as usize;
+    #[cfg(zstd_any)]
+    let (compression, dictionary) = frame_codec(header.flags, compression, dictionary)?;
+    #[cfg(not(zstd_any))]
+    if header.flags & FLAG_PLAIN != 0 {
+        // Only a zstd codec writes a plain frame.
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
     let (entries, payload) = if header.is_raw() || compression == CompressionType::None {
         *decoded = stored.len();
         if stored.len() != raw_len {
@@ -513,6 +957,197 @@ pub(crate) fn decode_frame(
         list,
         payload,
     })
+}
+
+/// The codec a frame of `flags` under a file of `compression` decodes with: a
+/// plain frame is zstd at the file's level without a dictionary, which a file
+/// training its own dictionary writes before the dictionary exists, whether
+/// or not it ends up with one.
+#[cfg(zstd_any)]
+pub(crate) fn frame_codec(
+    flags: u8,
+    compression: CompressionType,
+    dictionary: Option<&crate::compression::ZstdDictionary>,
+) -> crate::Result<(CompressionType, Option<&crate::compression::ZstdDictionary>)> {
+    if flags & FLAG_PLAIN == 0 {
+        return Ok((compression, dictionary));
+    }
+    match compression {
+        CompressionType::ZstdDict { level, .. } | CompressionType::Zstd(level) => {
+            Ok((CompressionType::Zstd(level), None))
+        }
+        _ => Err(crate::Error::InvalidHeader("BlobFrame")),
+    }
+}
+
+/// The codec a chunk of `spec` under a file of `compression` decodes with.
+#[cfg(zstd_any)]
+fn chunk_codec<'d>(
+    spec: &ChunkSpec,
+    compression: CompressionType,
+    dictionary: Option<&'d crate::compression::ZstdDictionary>,
+) -> crate::Result<(
+    CompressionType,
+    Option<&'d crate::compression::ZstdDictionary>,
+)> {
+    frame_codec(spec.flags, compression, dictionary)
+}
+
+/// The codec a chunk of `spec` under a file of `compression` decodes with:
+/// only a dictionary codec writes a plain chunk.
+#[cfg(not(zstd_any))]
+fn chunk_codec(spec: &ChunkSpec, compression: CompressionType) -> crate::Result<CompressionType> {
+    if spec.flags & FLAG_PLAIN == 0 {
+        Ok(compression)
+    } else {
+        Err(crate::Error::InvalidHeader("BlobFrame"))
+    }
+}
+
+/// Checks the chunk `stored` against `spec` and writes it, decoded under
+/// `compression`, into `out`, which takes exactly the chunk.
+///
+/// `decoded` receives the length the decompressor produced, as
+/// [`decode_frame`] does.
+///
+/// # Errors
+///
+/// As [`check_chunk`], an `out` of another length than the chunk, and a
+/// decompression that fails or produces another length.
+pub(crate) fn decode_chunk_into(
+    spec: &ChunkSpec,
+    stored: &[u8],
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    out: &mut [u8],
+    decoded: &mut usize,
+) -> crate::Result<()> {
+    check_chunk(spec, stored)?;
+    if spec.raw_len as usize != out.len() {
+        return Err(crate::Error::InvalidHeader("BlobFrame"));
+    }
+    #[cfg(zstd_any)]
+    let (compression, dictionary) = chunk_codec(spec, compression, dictionary)?;
+    #[cfg(not(zstd_any))]
+    let compression = chunk_codec(spec, compression)?;
+    if spec.is_stored_as_is(compression) {
+        *decoded = stored.len();
+        if stored.len() != out.len() {
+            return Err(crate::Error::InvalidHeader("BlobFrame"));
+        }
+        out.copy_from_slice(stored);
+        return Ok(());
+    }
+    decompress_to(
+        stored,
+        out,
+        compression,
+        #[cfg(zstd_any)]
+        dictionary,
+        decoded,
+    )
+}
+
+/// Checks the chunk `stored` against `spec` and decodes it under
+/// `compression` into a frame of its own: a chunk stored as it is stays a
+/// view into `stored`.
+///
+/// # Errors
+///
+/// As [`decode_chunk_into`].
+pub(crate) fn decode_chunk(
+    spec: &ChunkSpec,
+    stored: &Slice,
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    decoded: &mut usize,
+) -> crate::Result<DecodedFrame> {
+    check_chunk(spec, stored)?;
+    #[cfg(zstd_any)]
+    let (compression, dictionary) = chunk_codec(spec, compression, dictionary)?;
+    #[cfg(not(zstd_any))]
+    let compression = chunk_codec(spec, compression)?;
+    let raw_len = spec.raw_len as usize;
+    let payload = if spec.is_stored_as_is(compression) {
+        *decoded = stored.len();
+        if stored.len() != raw_len {
+            return Err(crate::Error::InvalidHeader("BlobFrame"));
+        }
+        stored.clone()
+    } else {
+        decompress(
+            stored,
+            raw_len,
+            compression,
+            #[cfg(zstd_any)]
+            dictionary,
+            decoded,
+        )?
+    };
+    Ok(DecodedFrame {
+        header: FrameHeader {
+            kind: FrameKind::Chunk,
+            flags: spec.flags,
+            count: 0,
+            entries_len: 0,
+            raw_len: spec.raw_len,
+            disk_len: spec.stored_len,
+            header_crc: 0,
+            checksum: spec.checksum,
+        },
+        entries: Slice::empty(),
+        list: FrameEntries::Many(Vec::new()),
+        payload,
+    })
+}
+
+/// `stored` decompressed under `compression` into `out`: without a codec
+/// built in, nothing is compressed, so nothing decompresses.
+#[cfg(not(any(feature = "lz4", zstd_any)))]
+pub(super) fn decompress_to(
+    _stored: &[u8],
+    _out: &mut [u8],
+    _compression: CompressionType,
+    _decoded: &mut usize,
+) -> crate::Result<()> {
+    Err(crate::Error::InvalidHeader("BlobFrame"))
+}
+
+/// `stored` decompressed under `compression` into `out`, exactly its length.
+#[cfg(any(feature = "lz4", zstd_any))]
+pub(super) fn decompress_to(
+    stored: &[u8],
+    out: &mut [u8],
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    decoded: &mut usize,
+) -> crate::Result<()> {
+    let written = match compression {
+        CompressionType::None => return Err(crate::Error::InvalidHeader("BlobFrame")),
+
+        #[cfg(feature = "lz4")]
+        CompressionType::Lz4 => lz4_flex::block::decompress_into(stored, out)
+            .map_err(|_| crate::Error::Decompress(compression))?,
+
+        #[cfg(zstd_any)]
+        CompressionType::Zstd(_) => crate::compression::ZstdBackend::decompress_into(stored, out)
+            .map_err(|_| crate::Error::Decompress(compression))?,
+
+        #[cfg(zstd_any)]
+        CompressionType::ZstdDict { dict_id, .. } => {
+            let dict = dictionary.ok_or(crate::Error::ZstdDictMismatch {
+                expected: dict_id,
+                got: None,
+            })?;
+            crate::compression::ZstdBackend::decompress_with_dict_into(stored, dict, out)
+                .map_err(|_| crate::Error::Decompress(compression))?
+        }
+    };
+    *decoded = written;
+    if written != out.len() {
+        return Err(crate::Error::Decompress(compression));
+    }
+    Ok(())
 }
 
 /// `stored` decompressed under `compression` into exactly `raw_len` bytes.
@@ -574,13 +1209,23 @@ fn decompress(
                 expected: dict_id,
                 got: None,
             })?;
-            let out = crate::compression::ZstdBackend::decompress_with_dict(stored, dict, raw_len)
-                .map_err(|_| crate::Error::Decompress(compression))?;
-            *decoded = out.len();
-            if out.len() != raw_len {
+            // SAFETY: as for zstd above: the decoder refuses an offset reaching
+            // past what it wrote and the dictionary's history, so it never
+            // reads an unwritten position; the length check below rejects a
+            // short fill.
+            #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+            let mut builder = unsafe { Slice::builder_unzeroed(raw_len) };
+            let written = crate::compression::ZstdBackend::decompress_with_dict_into(
+                stored,
+                dict,
+                &mut builder,
+            )
+            .map_err(|_| crate::Error::Decompress(compression))?;
+            *decoded = written;
+            if written != raw_len {
                 return Err(crate::Error::Decompress(compression));
             }
-            Ok(Slice::from(out))
+            Ok(builder.freeze().into())
         }
     }
 }
@@ -595,6 +1240,9 @@ pub(crate) struct Codec<'d> {
     pub(crate) two_pass_seed: bool,
     #[cfg(not(zstd_any))]
     pub(crate) dictionary: core::marker::PhantomData<&'d ()>,
+    /// `compression` is a dictionary codec's level without its dictionary,
+    /// which the frame says by [`FLAG_PLAIN`] once it is compressed.
+    pub(crate) plain: bool,
 }
 
 /// `payload` compressed under `codec`, or `None` when that saves nothing and
@@ -646,6 +1294,66 @@ fn compress(payload: &[u8], codec: Codec<'_>) -> crate::Result<Option<Vec<u8>>> 
     Ok((compressed.len() < payload.len()).then_some(compressed))
 }
 
+/// `payload` compressed under `codec`, or `None` when that saves nothing.
+///
+/// # Errors
+///
+/// Propagates the compression.
+pub(crate) fn compress_payload(payload: &[u8], codec: Codec<'_>) -> crate::Result<Option<Vec<u8>>> {
+    compress(payload, codec)
+}
+
+/// `stored` decompressed under `compression` into exactly `raw_len` bytes.
+///
+/// # Errors
+///
+/// A decompression that fails or produces another length.
+pub(crate) fn decompress_payload(
+    stored: &[u8],
+    raw_len: usize,
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    decoded: &mut usize,
+) -> crate::Result<Slice> {
+    decompress(
+        stored,
+        raw_len,
+        compression,
+        #[cfg(zstd_any)]
+        dictionary,
+        decoded,
+    )
+}
+
+/// The header of a frame of `kind` and `flags` listing `count` values whose
+/// entries take `entries_len` bytes, `raw_len` decoded, its payload
+/// `disk_len` stored, its checksum what `checksum` computes from the header's
+/// CRC.
+#[must_use]
+pub(crate) fn stamp_header(
+    kind: FrameKind,
+    flags: u8,
+    count: u16,
+    entries_len: u32,
+    raw_len: u32,
+    disk_len: u32,
+    checksum: impl FnOnce(u32) -> u128,
+) -> [u8; FRAME_HEADER_LEN] {
+    let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
+    let checksum = checksum(crc);
+    let mut header = [0_u8; FRAME_HEADER_LEN];
+    let mut put = Put::new(&mut header);
+    put.bytes(&FRAME_MAGIC);
+    put.bytes(&[kind as u8, flags]);
+    put.bytes(&count.to_le_bytes());
+    put.bytes(&entries_len.to_le_bytes());
+    put.bytes(&raw_len.to_le_bytes());
+    put.bytes(&disk_len.to_le_bytes());
+    put.bytes(&crc.to_le_bytes());
+    put.bytes(&checksum.to_le_bytes());
+    header
+}
+
 /// One value a frame lists: its key, sequence number and length.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EntrySpec<'k> {
@@ -667,6 +1375,7 @@ pub(crate) struct EntrySpec<'k> {
 ///
 /// A key is empty or longer than `u16::MAX`, or a frame lists more than
 /// `u16::MAX` entries: the writer never builds one.
+#[cfg(test)]
 pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
     kind: FrameKind,
     entries: impl IntoIterator<Item = E, IntoIter: ExactSizeIterator>,
@@ -674,6 +1383,59 @@ pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
     codec: Codec<'_>,
     out: &mut Vec<u8>,
 ) -> crate::Result<()> {
+    if encode_frame_parts(kind, entries, payload, codec, out)? {
+        out.extend_from_slice(payload);
+    }
+    Ok(())
+}
+
+/// [`encode_frame`], the payload left out of `out` when it is stored as it is
+/// (`true`): the frame is `out` followed by `payload`, which a writer then
+/// writes from where it lies rather than copying it in first.
+///
+/// # Errors
+///
+/// As [`encode_frame`].
+///
+/// # Panics
+///
+/// As [`encode_frame`].
+pub(crate) fn encode_frame_parts<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
+    kind: FrameKind,
+    entries: impl IntoIterator<Item = E, IntoIter: ExactSizeIterator>,
+    payload: &[u8],
+    codec: Codec<'_>,
+    out: &mut Vec<u8>,
+) -> crate::Result<bool> {
+    super::writer::check_size_cap(payload.len())?;
+    let compressed = if kind == FrameKind::Head {
+        None
+    } else {
+        compress(payload, codec)?
+    };
+    encode_frame_parts_compressed(kind, entries, payload, codec, compressed.as_deref(), out)
+}
+
+/// [`encode_frame_parts`] with the payload compressed already as
+/// `compressed`, what compressing it under `codec` made (`None` when that
+/// saved nothing).
+///
+/// # Errors
+///
+/// [`crate::Error::DecompressedSizeTooLarge`] for a payload past the value
+/// cap.
+///
+/// # Panics
+///
+/// As [`encode_frame`].
+pub(crate) fn encode_frame_parts_compressed<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
+    kind: FrameKind,
+    entries: impl IntoIterator<Item = E, IntoIter: ExactSizeIterator>,
+    payload: &[u8],
+    codec: Codec<'_>,
+    compressed: Option<&[u8]>,
+    out: &mut Vec<u8>,
+) -> crate::Result<bool> {
     let entries = entries.into_iter();
     super::writer::check_size_cap(payload.len())?;
     #[expect(
@@ -681,21 +1443,18 @@ pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
         reason = "the writer closes a block before u16::MAX entries"
     )]
     let count = u16::try_from(entries.len()).expect("a frame lists at most u16::MAX entries");
-    let compressed = if kind == FrameKind::Head {
-        None
-    } else {
-        compress(payload, codec)?
-    };
     // Raw when nothing compressed it although the file names a codec, and for
     // a head always: the flag tells a reader not to decode.
     let flags = if kind == FrameKind::Head
         || (compressed.is_none() && codec.compression != CompressionType::None)
     {
         FLAG_RAW
+    } else if codec.plain {
+        FLAG_PLAIN
     } else {
         0
     };
-    let stored: &[u8] = compressed.as_deref().unwrap_or(payload);
+    let stored: &[u8] = compressed.unwrap_or(payload);
 
     out.clear();
     out.resize(FRAME_HEADER_LEN, 0);
@@ -713,7 +1472,9 @@ pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
         out.extend_from_slice(entry.key);
     }
     let entries_end = out.len();
-    out.extend_from_slice(stored);
+    if let Some(compressed) = compressed {
+        out.extend_from_slice(compressed);
+    }
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -725,7 +1486,7 @@ pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
         stored.len() as u32,
     );
     let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
-    let checksum = frame_checksum(
+    let checksum = frame_checksum_parts(
         out.get(FRAME_HEADER_LEN..entries_end).unwrap_or_default(),
         stored,
         crc,
@@ -744,7 +1505,7 @@ pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
     // `out` was laid out with room for the header first.
     let (slot, _) = out.split_at_mut(FRAME_HEADER_LEN);
     slot.copy_from_slice(&header);
-    Ok(())
+    Ok(compressed.is_none())
 }
 
 /// Relists the value `frame` lists, a single or head frame listing one, at
@@ -789,21 +1550,11 @@ pub(crate) fn relist_prefix(
     let (head, entries) = prefix.split_at_mut(FRAME_HEADER_LEN);
     let (listed_seqno, _) = entries.split_at_mut(8);
     listed_seqno.copy_from_slice(&seqno.to_le_bytes());
-    let checksum = frame_checksum(entries, payload, header.header_crc);
+    let checksum = frame_checksum_parts(entries, payload, header.header_crc);
     // The checksum is the header's last field.
     let (_, stored_checksum) = head.split_at_mut(FRAME_HEADER_LEN - 16);
     stored_checksum.copy_from_slice(&checksum.to_le_bytes());
     Ok(Some(entries_end))
-}
-
-/// The payload of a head naming chunks of `chunk_size` bytes, `chunks` of them.
-#[must_use]
-pub(crate) fn head_payload(chunk_size: u32, chunks: u32) -> [u8; HEAD_PAYLOAD_LEN] {
-    let mut payload = [0_u8; HEAD_PAYLOAD_LEN];
-    let mut put = Put::new(&mut payload);
-    put.bytes(&chunk_size.to_le_bytes());
-    put.bytes(&chunks.to_le_bytes());
-    payload
 }
 
 /// A frame header of `kind` with these fields under a header CRC that holds
@@ -858,12 +1609,7 @@ pub(crate) fn restamp_header_crc(frame: &mut [u8]) {
 pub(crate) fn reseal(frame: &mut [u8]) {
     restamp_header_crc(frame);
     let header = parse_header(frame).unwrap();
-    let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
-    let checksum = frame_checksum(
-        frame.get(FRAME_HEADER_LEN..entries_end).unwrap(),
-        frame.get(entries_end..).unwrap(),
-        header.header_crc,
-    );
+    let checksum = frame_checksum(frame.get(FRAME_HEADER_LEN..).unwrap(), header.header_crc);
     frame
         .get_mut(FRAME_HEADER_LEN - 16..FRAME_HEADER_LEN)
         .unwrap()
@@ -901,6 +1647,7 @@ pub(crate) fn decoded_frame(values: &[(&[u8], &[u8])]) -> DecodedFrame {
         two_pass_seed: false,
         #[cfg(not(zstd_any))]
         dictionary: core::marker::PhantomData,
+        plain: false,
     };
     let mut out = Vec::new();
     encode_frame(kind, &entries, &payload, codec, &mut out).unwrap();

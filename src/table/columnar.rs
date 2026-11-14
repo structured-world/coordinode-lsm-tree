@@ -1975,6 +1975,9 @@ pub fn validate_columnar_ingest_batch(
 /// # Errors
 ///
 /// As [`entries_to_column_batch`].
+// Its callers and its tests are std builds: the crate's tests build with
+// `std` only, which every codec feature enables.
+#[cfg(feature = "std")]
 pub(crate) fn transpose_like(
     batch: &ColumnBatch,
     entries: &[InternalValue],
@@ -1991,6 +1994,7 @@ pub(crate) fn transpose_like(
 /// Whether the rows of `batch`, once decoded, can be laid out again as the
 /// batch lays them out ([`transpose_like`]): every layout but a batch of
 /// caller sub-columns.
+#[cfg(feature = "std")]
 pub(crate) fn rows_round_trip(batch: &ColumnBatch) -> bool {
     // A batch of the intrinsic columns and one caller sub-column has as many
     // columns as a whole-value batch: the value column itself tells them
