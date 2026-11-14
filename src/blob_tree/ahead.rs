@@ -86,10 +86,22 @@ pub(crate) struct ValuesAhead {
 }
 
 impl ValuesAhead {
-    /// The values of a flush that has a pool to compress on.
-    pub(crate) fn for_flush(parallel: Option<ParallelCompression>) -> Option<Self> {
+    /// The values of a flush that has a pool to compress on. `table_on_pool`
+    /// says the flush's table writer prepares its blocks on the same pool:
+    /// the values then take one worker fewer than it has, since values on
+    /// every thread leave the table's blocks to the flush's own thread
+    /// (measured with tables at zstd 22: 7.27 to 6.20 us per write at 10 000
+    /// keys). With the table off the pool that worker is the values' (4.26
+    /// against 4.74 us at 70 000 keys without it).
+    pub(crate) fn for_flush(
+        parallel: Option<ParallelCompression>,
+        table_on_pool: bool,
+    ) -> Option<Self> {
         let parallel = parallel?;
-        let threads = parallel.threads.max(1);
+        let threads = parallel
+            .threads
+            .saturating_sub(usize::from(table_on_pool))
+            .max(1);
         // A batch per worker, and three more gathered behind each so no
         // worker waits for the flush.
         let batches = threads * 4;

@@ -2530,14 +2530,13 @@ impl AbstractTree for BlobTree {
         // flush for why this is safe wherever the host runs the flush (the
         // pipeline's help-first drain, see `parallel_compressor`).
         #[cfg(feature = "std")]
-        {
-            let transform_does_work = data_block_compression != crate::CompressionType::None
-                || self.index.config.encryption.is_some()
-                || self.index.config.page_ecc;
-            if transform_does_work {
-                table_writer =
-                    table_writer.use_parallel_compression(self.index.config.parallel_compression());
-            }
+        let table_on_pool = data_block_compression != crate::CompressionType::None
+            || self.index.config.encryption.is_some()
+            || self.index.config.page_ecc;
+        #[cfg(feature = "std")]
+        if table_on_pool {
+            table_writer =
+                table_writer.use_parallel_compression(self.index.config.parallel_compression());
         }
 
         #[expect(
@@ -2602,7 +2601,7 @@ impl AbstractTree for BlobTree {
         let mut ahead = if self.index.config.key_domains.is_none()
             && rc.blob_compression != crate::CompressionType::None
         {
-            ahead::ValuesAhead::for_flush(self.index.config.parallel_compression())
+            ahead::ValuesAhead::for_flush(self.index.config.parallel_compression(), table_on_pool)
         } else {
             None
         };

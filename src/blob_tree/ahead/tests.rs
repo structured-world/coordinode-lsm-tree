@@ -28,11 +28,14 @@ fn a_batch_that_finds_every_place_taken_brings_the_oldest_back() -> crate::Resul
     let writer =
         Writer::new(folder.path().join("blob"), 0, 0, &StdFs)?.use_compression(compression);
 
-    let mut ahead = ValuesAhead::for_flush(Some(ParallelCompression {
-        spawner: alloc::sync::Arc::new(ThreadSpawner),
-        threads: 1,
-        inline_below: None,
-    }))
+    let mut ahead = ValuesAhead::for_flush(
+        Some(ParallelCompression {
+            spawner: alloc::sync::Arc::new(ThreadSpawner),
+            threads: 1,
+            inline_below: None,
+        }),
+        false,
+    )
     .expect("a pool to compress on");
 
     // Small values that share a batch, then values of a batch each, more of
