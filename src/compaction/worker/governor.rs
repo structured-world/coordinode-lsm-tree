@@ -452,7 +452,6 @@ impl<'a> SliceGovernor<'a> {
         let cmp = self.comparator.as_ref();
         let key = &item.key.user_key;
         let key_len = key.len() as u64;
-        let value_len = item.value.len() as u64;
         self.longest_key = self.longest_key.max(key_len);
         if new_key {
             while self
@@ -472,6 +471,7 @@ impl<'a> SliceGovernor<'a> {
             1
         };
         let owned = self.committed.rows.owned_blob_objects;
+        let value_bytes = self.committed.rows.value_bytes;
         let taken = take_entry(
             &mut self.committed.rows,
             super::NewShapes {
@@ -503,6 +503,9 @@ impl<'a> SliceGovernor<'a> {
         }
         let (blobs, grew) = taken?;
         self.committed.blobs += blobs;
+        // What the row's value takes in the table: more than the bytes read
+        // where the pass writes its pointers anew.
+        let value_len = self.committed.rows.value_bytes - value_bytes;
         if let Some(domains) = self.outputs.domains {
             let (table_end, blob_end) = &mut self.edges;
             let seen = (self.load.table_domains.len(), self.load.blob_domains.len());

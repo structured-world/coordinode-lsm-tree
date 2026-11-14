@@ -2279,7 +2279,6 @@ fn take_entry(
         rows.take_entry(key_len as u64, value_len, seqno, filter_hashes);
         return Ok((0, false));
     }
-    rows.take_entry(key_len as u64, value_len, seqno, filter_hashes);
     let NewShapes {
         known_links,
         known_cells,
@@ -2288,37 +2287,55 @@ fn take_entry(
         ..
     } = shapes;
     let mut grew = false;
+    // The bytes to the blob files, and whether the pass writes the pointer
+    // anew: a value it moves gets another file, frame and stored length, so
+    // its new pointer may be longer than the one read.
     let mut reference = |links: &mut HashSet<BlobFileId>, indirection: &BlobIndirection| {
         let source = indirection.vhandle.blob_file_id;
         if !known_links.contains(&source) && links.insert(source) {
             grew = true;
         }
         let Some(relocated) = relocated.filter(|r| r.stale.contains(&source)) else {
-            return 0;
+            return (0, false);
         };
         if relocated.own_dictionaries.contains_key(&source) {
             dictionaries.push(source);
         }
-        copy_bytes(indirection, key_len, relocated)
+        (copy_bytes(indirection, key_len, relocated), true)
     };
     if value_type.is_indirection() {
         let indirection = BlobIndirection::decode_slice(value)?;
-        let bytes = reference(links, &indirection);
+        let (bytes, anew) = reference(links, &indirection);
+        let pointer = if anew {
+            BlobIndirection::MAX_ENCODED_LEN.max(value_len)
+        } else {
+            value_len
+        };
+        rows.take_entry(key_len as u64, pointer, seqno, filter_hashes);
         return Ok((bytes, grew));
     }
     if value_type.is_cell_row() {
         let mut bytes = 0;
+        // What the row's pointers written anew may grow by.
+        let mut growth = 0;
         for field in decode_row(value)? {
             // Every reference counts as owned: the end of its key may pass a
             // dropped version's object to the row, after it was counted.
             if let RowCell::Ref { indirection, .. } = field.cell {
-                bytes += reference(links, &indirection);
+                let (copied, anew) = reference(links, &indirection);
+                bytes += copied;
+                if anew {
+                    // No encoding is longer than the longest.
+                    growth += BlobIndirection::MAX_ENCODED_LEN - indirection.encoded_len();
+                }
                 rows.owned_blob_objects += 1;
             }
         }
+        rows.take_entry(key_len as u64, value_len + growth, seqno, filter_hashes);
         let opened = split_cells && cells.take_row_past(value, known_cells);
         return Ok((bytes, grew || opened));
     }
+    rows.take_entry(key_len as u64, value_len, seqno, filter_hashes);
     Ok((0, false))
 }
 

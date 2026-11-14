@@ -82,6 +82,21 @@ impl BlobIndirection {
     #[cfg(feature = "std")]
     pub(crate) const MAX_ENCODED_LEN: u64 = 10 + 5 + 3 + 5 + 5;
 
+    /// The bytes this indirection takes encoded.
+    #[cfg(feature = "std")]
+    pub(crate) fn encoded_len(&self) -> u64 {
+        use crate::table::writer::varint_len;
+
+        let stored = match self.stored {
+            Stored::Frames(bytes) | Stored::InBlock(bytes) | Stored::Packed(bytes) => bytes,
+        };
+        varint_len(self.vhandle.blob_file_id)
+            + varint_len(u64::from(self.vhandle.frame))
+            + varint_len(u64::from(self.vhandle.index))
+            + varint_len(u64::from(self.size))
+            + varint_len(u64::from(stored) << 2)
+    }
+
     /// Decodes the indirection a table row stores as `value`, straight off the
     /// slice: what [`Decode`] reads of a well-formed one.
     ///

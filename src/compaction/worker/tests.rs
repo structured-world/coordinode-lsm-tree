@@ -6274,6 +6274,107 @@ fn a_cell_row_relocates_its_references_into_stale_files() -> crate::Result<()> {
     Ok(())
 }
 
+/// A relocating pass writes a new pointer for a value it moves, and the new
+/// one may be longer than the one read: another file id, another frame,
+/// another stored length. The slice charges its table with the longest a
+/// pointer can be for every reference into a file it relocates, alone or in
+/// a cell row, and with the bytes read for one it leaves where it is.
+#[test]
+fn a_relocated_reference_is_charged_at_the_longest_its_new_pointer_can_be() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, vlog::BlobFileId};
+
+    let indirection = |blob_file_id: BlobFileId| BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id,
+            frame: 0,
+            index: 0,
+        },
+        size: 100,
+        stored: crate::blob_tree::handle::Stored::Frames(100),
+    };
+    let relocated = super::Relocated {
+        stale: core::iter::once::<BlobFileId>(7).collect(),
+        rewritten: crate::HashSet::default(),
+        target_size: u64::MAX,
+        chunk_size: u32::MAX,
+        file_groups: 1,
+        groups: 1,
+        own_dictionaries: crate::HashMap::default(),
+        fresh_threshold: u64::MAX,
+        fresh_dictionary: 0,
+        largest_dictionary: 0,
+    };
+    // The table's value bytes after taking `item` alone.
+    let charged = |item: &InternalValue| {
+        let mut load = super::SliceLoad::default();
+        let known = super::SliceLoad::default();
+        super::take_entry(
+            &mut load.rows,
+            super::NewShapes {
+                known_links: &known.links,
+                known_cells: &known.cells,
+                known_fresh: known.fresh,
+                links: &mut load.links,
+                cells: &mut load.cells,
+                fresh: &mut load.fresh,
+            },
+            (
+                item.key.value_type,
+                item.key.seqno,
+                item.key.user_key.len(),
+                &item.value,
+            ),
+            1,
+            false,
+            Some(&relocated),
+            &mut Vec::new(),
+        )?;
+        crate::Result::Ok(load.rows.value_bytes)
+    };
+    let pointer = |blob_file_id| {
+        let mut bytes = Vec::new();
+        indirection(blob_file_id).encode_into(&mut bytes)?;
+        crate::Result::Ok(bytes)
+    };
+
+    let (moved, kept) = (pointer(7)?, pointer(8)?);
+    let read = moved.len() as u64;
+    assert!(read < BlobIndirection::MAX_ENCODED_LEN);
+    let item =
+        |value: Vec<u8>, value_type| InternalValue::from_components(*b"key", value, 1, value_type);
+    assert_eq!(
+        charged(&item(moved, crate::ValueType::Indirection))?,
+        BlobIndirection::MAX_ENCODED_LEN,
+        "a pointer the pass writes anew",
+    );
+    assert_eq!(
+        charged(&item(kept, crate::ValueType::Indirection))?,
+        read,
+        "a pointer the pass copies as it is",
+    );
+
+    let reference = |blob_file_id| RowCell::Ref {
+        indirection: indirection(blob_file_id),
+        owner: true,
+    };
+    let row = encode_row(&[
+        RowField::bytes(3, reference(7)),
+        RowField::bytes(4, reference(8)),
+        RowField::bytes(5, reference(7)),
+    ])?;
+    let row_len = row.len() as u64;
+    assert_eq!(
+        charged(&item(row, crate::ValueType::CellRow))?,
+        row_len + 2 * (BlobIndirection::MAX_ENCODED_LEN - read),
+        "each of the two references the pass writes anew may grow to the longest",
+    );
+    Ok(())
+}
+
 /// An inline value the separation threshold reaches is written anew into a
 /// blob file by a relocating pass: the slice charges the blob files with it
 /// as written raw, and its table with the pointer left in its place. A value
