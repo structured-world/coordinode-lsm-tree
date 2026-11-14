@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794337606308,
+  "lastUpdate": 1794693988339,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103306,6 +103306,90 @@ window.BENCHMARK_DATA = {
             "value": 359063.7804023656,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 11.8us | P99.9: 84.8us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b9c4b4fc11a36c83c4e041df7219d64e927c9b8d",
+          "message": "ci(bench): fit the head-to-head run's time limits to its length (#1073)\n\n## Summary\n\n- The `Benchmark` workflow's head-to-head step has 140 minutes and its\njob 180, in place of 35 and 40.\n\n## Changes\n\n- The head-to-head run takes 76 minutes on an idle benchmark host (4587\ns on `ce36c3c27b`): every group runs the blob files at zstd 22 on both\nengines since #1071, and the cold point-read groups were added. The two\nsustained overwrites are 29 minutes of it. With the old limits the run\non `main` was cancelled 32 minutes into the step.\n- The comments beside both limits state what the run takes and where.\n\n## Testing\n\nA workflow-only change: the `Benchmark` workflow runs on `main` after\nthe merge, where it has to complete and publish the head-to-head page.\n\nCloses #1072\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Extended benchmark workflow time limits to accommodate longer\nwarm-cache runs, cold-cache compilation, and idle-host comparisons.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-14T22:06:48+02:00",
+          "tree_id": "26124928f9e33d6819aea567fab1f848922a6b26",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b9c4b4fc11a36c83c4e041df7219d64e927c9b8d"
+        },
+        "date": 1794693987030,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 149587.05637052088,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.9us | P99.9: 21.0us\nthreads: 1 | elapsed: 3.58s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2969714.157142632,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 938122.4691771772,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 504850.15603100864,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.6us | P99.9: 19.8us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3193925.562402782,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 320864.8457572766,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.4us | P99.9: 16.5us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 193370.682558385,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.6us | P99.9: 19.7us\nthreads: 1 | elapsed: 1.03s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 955591.475814424,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1071918.530075547,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.2us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 375514.4383517853,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 11.5us | P99.9: 80.1us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
           }
         ]
       }
