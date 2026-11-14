@@ -200,14 +200,93 @@ impl<W: Write> Lane<W> {
 /// A buffering writer whose full buffers a worker writes (see the module
 /// docs). Without a spawner it writes them itself.
 pub(crate) struct DeferredWriter<W: Write + Send + 'static> {
-    lane: Arc<Lane<W>>,
+    sink: Sink<W>,
     buf: Vec<u8>,
     capacity: usize,
     /// Whether a write that overflows the buffer first fills it, as
     /// [`super::FillingBufWriter`] does, or goes into the next one whole, as
     /// std's buffering writer does.
     fill: bool,
-    spawner: Option<Arc<dyn CompactionSpawner>>,
+    /// The first failed write of a writer that writes on the caller's
+    /// thread; a lane keeps its own.
+    failed: Option<Failure>,
+    /// Whether a write on the caller's thread is under way: one that
+    /// panicked leaves it set, and the drop then calls the writer no more.
+    panicked: bool,
+}
+
+/// Where a [`DeferredWriter`]'s buffers go.
+enum Sink<W> {
+    /// To the inner writer, on the caller's thread: one buffer, no lock, as
+    /// a plain buffering writer.
+    Here(W),
+    /// To the inner writer's lane, drained by the workers of a spawner.
+    Lane(Arc<Lane<W>>, Arc<dyn CompactionSpawner>),
+    /// Nowhere: the inner writer was taken.
+    Gone,
+}
+
+/// The error of a writer whose inner writer is gone.
+fn gone() -> io::Error {
+    io::Error::other("the file's writer panicked")
+}
+
+/// Queues `job` behind what `lane` holds and sees that it is drained: by a
+/// worker of `spawner`, or here when the lane is full and no thread drains
+/// it.
+fn queue<W: Write + Send + 'static>(
+    lane: &Arc<Lane<W>>,
+    spawner: &Arc<dyn CompactionSpawner>,
+    job: Job<W>,
+) -> io::Result<()> {
+    let bytes = match &job {
+        Job::Write(buf) => buf.len(),
+        Job::Run(_) => 0,
+    };
+    let mut state = lane.lock();
+    if let Some(failed) = &state.failed {
+        return Err(failed.error());
+    }
+    state.queue.push_back(job);
+    state.queued_bytes += bytes;
+    let ask = !state.draining && !state.asked;
+    if ask {
+        state.asked = true;
+    }
+    let full = state.queued_bytes > LANE_BYTES_MAX;
+    drop(state);
+    if ask {
+        let lane = Arc::clone(lane);
+        spawner.spawn(Box::new(move || {
+            lane.lock().asked = false;
+            lane.drain();
+        }));
+    }
+    if full {
+        make_room(lane);
+    }
+    Ok(())
+}
+
+/// Brings a full lane back under its bound: drains it here when no thread
+/// does, waits for the one that does otherwise.
+fn make_room<W: Write>(lane: &Lane<W>) {
+    loop {
+        let state = lane.lock();
+        if state.queued_bytes <= LANE_BYTES_MAX || state.inner.is_none() && !state.draining {
+            return;
+        }
+        if state.draining {
+            drop(
+                lane.progress
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        } else {
+            drop(state);
+            lane.drain();
+        }
+    }
 }
 
 impl<W: Write + Send + 'static> DeferredWriter<W> {
@@ -215,22 +294,12 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
     /// [`super::FillingBufWriter`] fills its buffer.
     pub(crate) fn with_capacity(capacity: usize, inner: W, fill: bool) -> Self {
         Self {
-            lane: Arc::new(Lane {
-                state: Mutex::new(State {
-                    inner: Some(inner),
-                    queue: VecDeque::new(),
-                    queued_bytes: 0,
-                    draining: false,
-                    asked: false,
-                    failed: None,
-                    spare: Vec::new(),
-                }),
-                progress: Condvar::new(),
-            }),
+            sink: Sink::Here(inner),
             buf: Vec::with_capacity(capacity),
             capacity,
             fill,
-            spawner: None,
+            failed: None,
+            panicked: false,
         }
     }
 
@@ -241,122 +310,66 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
 
     /// Hands the buffers filled from here on to the workers of `spawner`.
     pub(crate) fn use_spawner(&mut self, spawner: Arc<dyn CompactionSpawner>) {
-        self.spawner = Some(spawner);
+        self.sink = match core::mem::replace(&mut self.sink, Sink::Gone) {
+            Sink::Here(inner) => Sink::Lane(
+                Arc::new(Lane {
+                    state: Mutex::new(State {
+                        inner: Some(inner),
+                        queue: VecDeque::new(),
+                        queued_bytes: 0,
+                        draining: false,
+                        asked: false,
+                        failed: self.failed.take(),
+                        spare: Vec::new(),
+                    }),
+                    progress: Condvar::new(),
+                }),
+                spawner,
+            ),
+            Sink::Lane(lane, _) => Sink::Lane(lane, spawner),
+            Sink::Gone => Sink::Gone,
+        };
     }
 
-    /// Queues `job` behind what the lane holds and sees that it is drained:
-    /// by a worker, or here when the lane is full and no thread drains it.
-    fn queue(&self, job: Job<W>) -> io::Result<()> {
-        let Some(spawner) = &self.spawner else {
-            return self.run_here(job);
-        };
-        let bytes = match &job {
-            Job::Write(buf) => buf.len(),
-            Job::Run(_) => 0,
-        };
-        let mut state = self.lane.lock();
-        if let Some(failed) = &state.failed {
+    /// Writes `data` to `inner` on the calling thread.
+    fn write_here(
+        inner: &mut W,
+        (failed, panicked): (&mut Option<Failure>, &mut bool),
+        data: &[u8],
+    ) -> io::Result<()> {
+        if let Some(failed) = failed {
             return Err(failed.error());
         }
-        state.queue.push_back(job);
-        state.queued_bytes += bytes;
-        let ask = !state.draining && !state.asked;
-        if ask {
-            state.asked = true;
-        }
-        let full = state.queued_bytes > LANE_BYTES_MAX;
-        drop(state);
-        if ask {
-            let lane = Arc::clone(&self.lane);
-            spawner.spawn(Box::new(move || {
-                lane.lock().asked = false;
-                lane.drain();
-            }));
-        }
-        if full {
-            self.make_room();
-        }
-        Ok(())
-    }
-
-    /// Brings a full lane back under its bound: drains it here when no
-    /// thread does, waits for the one that does otherwise.
-    fn make_room(&self) {
-        loop {
-            let state = self.lane.lock();
-            if state.queued_bytes <= LANE_BYTES_MAX || state.inner.is_none() && !state.draining {
-                return;
-            }
-            if state.draining {
-                drop(
-                    self.lane
-                        .progress
-                        .wait(state)
-                        .unwrap_or_else(PoisonError::into_inner),
-                );
-            } else {
-                drop(state);
-                self.lane.drain();
-            }
-        }
-    }
-
-    /// Runs `job` on the calling thread: the writer has no workers, so
-    /// nothing is queued and the inner writer is in place.
-    fn run_here(&self, job: Job<W>) -> io::Result<()> {
-        let mut state = self.lane.lock();
-        if let Some(failed) = &state.failed {
-            return Err(failed.error());
-        }
-        let Some(inner) = state.inner.as_mut() else {
-            return Err(io::Error::other("the file's writer panicked"));
-        };
-        let result = match job {
-            Job::Write(mut buf) => {
-                let result = inner.write_all(&buf);
-                buf.clear();
-                if state.spare.len() < SPARE_BUFFERS_MAX {
-                    state.spare.push(buf);
-                }
-                result
-            }
-            Job::Run(run) => {
-                run(inner);
-                Ok(())
-            }
-        };
+        *panicked = true;
+        let result = inner.write_all(data);
+        *panicked = false;
         if let Err(e) = &result {
-            state.failed = Some(Failure::of(e));
+            *failed = Some(Failure::of(e));
         }
         result
     }
 
-    /// Writes `data` on the calling thread, the writer having no workers.
-    fn write_through(&self, data: &[u8]) -> io::Result<usize> {
-        let mut state = self.lane.lock();
-        if let Some(failed) = &state.failed {
-            return Err(failed.error());
-        }
-        let Some(inner) = state.inner.as_mut() else {
-            return Err(io::Error::other("the file's writer panicked"));
-        };
-        let result = inner.write_all(data);
-        if let Err(e) = &result {
-            state.failed = Some(Failure::of(e));
-        }
-        drop(state);
-        result.map(|()| data.len())
-    }
-
-    /// Hands the buffer to the lane and takes an empty one.
+    /// Hands the buffer on: to the inner writer here, or to its lane, taking
+    /// an empty buffer in its place.
     fn hand_over(&mut self) -> io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        let spare = self.lane.lock().spare.pop();
-        let next = spare.unwrap_or_else(|| Vec::with_capacity(self.capacity));
-        let full = core::mem::replace(&mut self.buf, next);
-        self.queue(Job::Write(full))
+        match &mut self.sink {
+            Sink::Here(inner) => {
+                let result =
+                    Self::write_here(inner, (&mut self.failed, &mut self.panicked), &self.buf);
+                self.buf.clear();
+                result
+            }
+            Sink::Lane(lane, spawner) => {
+                let spare = lane.lock().spare.pop();
+                let next = spare.unwrap_or_else(|| Vec::with_capacity(self.capacity));
+                let full = core::mem::replace(&mut self.buf, next);
+                queue(lane, spawner, Job::Write(full))
+            }
+            Sink::Gone => Err(gone()),
+        }
     }
 
     /// Does `run` with the inner writer once every byte written so far has
@@ -371,7 +384,17 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
         run: impl FnOnce(&mut W) + Send + 'static,
     ) -> io::Result<()> {
         self.hand_over()?;
-        self.queue(Job::Run(Box::new(run)))
+        match &mut self.sink {
+            Sink::Here(inner) => {
+                if let Some(failed) = &self.failed {
+                    return Err(failed.error());
+                }
+                run(inner);
+                Ok(())
+            }
+            Sink::Lane(lane, spawner) => queue(lane, spawner, Job::Run(Box::new(run))),
+            Sink::Gone => Err(gone()),
+        }
     }
 
     /// Writes out what is buffered and queued and hands back the inner
@@ -383,14 +406,20 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
     #[cfg(test)]
     pub(crate) fn finish(mut self) -> io::Result<W> {
         self.hand_over()?;
-        let mut state = self.lane.settle();
-        if let Some(failed) = &state.failed {
-            return Err(failed.error());
+        match core::mem::replace(&mut self.sink, Sink::Gone) {
+            Sink::Here(inner) => match &self.failed {
+                Some(failed) => Err(failed.error()),
+                None => Ok(inner),
+            },
+            Sink::Lane(lane, _) => {
+                let mut state = lane.settle();
+                if let Some(failed) = &state.failed {
+                    return Err(failed.error());
+                }
+                state.inner.take().ok_or_else(gone)
+            }
+            Sink::Gone => Err(gone()),
         }
-        state
-            .inner
-            .take()
-            .ok_or_else(|| io::Error::other("the file's writer panicked"))
     }
 
     /// Does `read` with the inner writer once everything written so far has
@@ -401,15 +430,29 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
     /// Returns the first failure of a write.
     pub(crate) fn with_inner<R>(&mut self, read: impl FnOnce(&mut W) -> R) -> io::Result<R> {
         self.hand_over()?;
-        let mut state = self.lane.settle();
-        if let Some(failed) = &state.failed {
-            return Err(failed.error());
+        match &mut self.sink {
+            Sink::Here(inner) => match &self.failed {
+                Some(failed) => Err(failed.error()),
+                None => Ok(read(inner)),
+            },
+            Sink::Lane(lane, _) => {
+                let mut state = lane.settle();
+                if let Some(failed) = &state.failed {
+                    return Err(failed.error());
+                }
+                state.inner.as_mut().map(read).ok_or_else(gone)
+            }
+            Sink::Gone => Err(gone()),
         }
-        state
-            .inner
-            .as_mut()
-            .map(read)
-            .ok_or_else(|| io::Error::other("the file's writer panicked"))
+    }
+
+    /// The bytes the lane holds, `0` for a writer without one.
+    #[cfg(test)]
+    fn queued_bytes(&self) -> usize {
+        match &self.sink {
+            Sink::Lane(lane, _) => lane.lock().queued_bytes,
+            Sink::Here(_) | Sink::Gone => 0,
+        }
     }
 }
 
@@ -420,16 +463,19 @@ impl<W: Write + Send + 'static> Write for DeferredWriter<W> {
             self.buf.extend_from_slice(data);
             return Ok(data.len());
         }
-        // A write at least as large as the buffer goes down in a buffer of
-        // its own, after what is buffered.
+        // A write at least as large as the buffer goes down after what is
+        // buffered: as it lies on the caller's thread, in a buffer of its
+        // own on a lane.
         if data.len() >= self.capacity {
             self.hand_over()?;
-            if self.spawner.is_none() {
-                // Written here anyway: as it lies, without a copy.
-                return self.write_through(data);
+            return match &mut self.sink {
+                Sink::Here(inner) => {
+                    Self::write_here(inner, (&mut self.failed, &mut self.panicked), data)
+                }
+                Sink::Lane(lane, spawner) => queue(lane, spawner, Job::Write(data.to_vec())),
+                Sink::Gone => Err(gone()),
             }
-            self.queue(Job::Write(data.to_vec()))?;
-            return Ok(data.len());
+            .map(|()| data.len());
         }
         if self.fill {
             self.buf
@@ -458,11 +504,15 @@ impl<W: Write + Seek + Send + 'static> Seek for DeferredWriter<W> {
 impl<W: Write + Send + 'static> Drop for DeferredWriter<W> {
     fn drop(&mut self) {
         // As std's buffering writer, what is buffered is written, and a
-        // failure has no one to go to. The lane is left idle, so the inner
-        // writer is dropped here and not later by a worker, and the caller
-        // may remove the file.
-        drop(self.hand_over());
-        drop(self.lane.settle().inner.take());
+        // failure has no one to go to; a writer whose write panicked is not
+        // called again. A lane is left idle, so the inner writer is dropped
+        // here and not later by a worker, and the caller may remove the file.
+        if !self.panicked {
+            drop(self.hand_over());
+        }
+        if let Sink::Lane(lane, _) = &self.sink {
+            drop(lane.settle().inner.take());
+        }
     }
 }
 

@@ -193,7 +193,7 @@ fn a_full_lane_holds_the_writer_back() -> io::Result<()> {
     let mut most = 0;
     for chunk in data.chunks(64 * 1_024) {
         out.write_all(chunk)?;
-        most = most.max(out.lane.lock().queued_bytes);
+        most = most.max(out.queued_bytes());
     }
     let sink = out.finish()?;
     assert_eq!(sink.bytes, data);
@@ -352,6 +352,55 @@ fn a_dropped_writer_leaves_no_work_behind() -> io::Result<()> {
     out.write_all(&pattern(64 * 1_024))?;
     drop(out);
     assert!(dropped.load(Ordering::SeqCst));
+    Ok(())
+}
+
+/// A sink that counts its writes and panics in the second.
+struct CountsThenPanics(Arc<AtomicUsize>);
+
+impl Write for CountsThenPanics {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let writes = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(writes != 2, "the sink's second write");
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A writer on the caller's thread whose inner writer panicked does not call
+/// it again when dropped: the buffer the panic interrupted is not written a
+/// second time.
+#[test]
+fn a_writer_that_panicked_on_the_callers_thread_is_not_called_again() {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut out = DeferredWriter::with_capacity(8, CountsThenPanics(Arc::clone(&writes)), true);
+    let panicked = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+        // Two full buffers go down; the second write panics, with bytes
+        // buffered behind it.
+        for _ in 0..3 {
+            out.write_all(&[7; 6])?;
+        }
+        io::Result::Ok(())
+    }));
+    assert!(panicked.is_err());
+    drop(out);
+    assert_eq!(writes.load(Ordering::SeqCst), 2);
+}
+
+/// Workers taken on after writes on the caller's thread keep the file's
+/// order: what was buffered goes to the lane behind what was written.
+#[test]
+fn workers_taken_on_midway_keep_the_order() -> io::Result<()> {
+    let data = pattern(40_000);
+    let mut out = DeferredWriter::with_capacity(1_024, Sink::default(), true);
+    let (before, after) = data.split_at(10_500);
+    out.write_all(before)?;
+    out.use_spawner(Arc::new(Threads));
+    out.write_all(after)?;
+    assert_eq!(out.finish()?.bytes, data);
     Ok(())
 }
 
