@@ -458,6 +458,12 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
 
 impl<W: Write + Send + 'static> Write for DeferredWriter<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        // A buffer left exactly full by the last write has no room to take
+        // a byte of this one: it goes down first, or a writer that fills
+        // would take nothing of the write.
+        if self.buf.len() == self.capacity && !data.is_empty() {
+            self.hand_over()?;
+        }
         let room = self.capacity - self.buf.len();
         if data.len() <= room {
             self.buf.extend_from_slice(data);

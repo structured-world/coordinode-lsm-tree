@@ -116,6 +116,70 @@ fn a_writer_that_does_not_fill_keeps_a_write_whole() -> io::Result<()> {
     Ok(())
 }
 
+/// A buffer the last write left exactly full takes the next write: it goes
+/// down first, where a writer that took nothing of the write would have it
+/// fail as a write of zero bytes.
+#[test]
+fn a_write_after_an_exactly_full_buffer_is_taken() -> io::Result<()> {
+    for (fill, workers) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut out = DeferredWriter::with_capacity(1_000, Sink::default(), fill);
+        if workers {
+            out.use_spawner(Arc::new(Threads));
+        }
+        out.write_all(&[1; 400])?;
+        out.write_all(&[2; 600])?;
+        out.write_all(&[3; 10])?;
+        let sink = out.finish()?;
+        let mut expected = vec![1; 400];
+        expected.extend_from_slice(&[2; 600]);
+        expected.extend_from_slice(&[3; 10]);
+        assert_eq!(sink.bytes, expected, "fill: {fill}, workers: {workers}");
+    }
+    Ok(())
+}
+
+/// Writes of every size around the buffer's, in any sequence, reach the file
+/// whole and in order, whichever way the writer fills its buffer and whoever
+/// writes it.
+#[test]
+fn writes_of_any_size_reach_the_file_in_order() -> io::Result<()> {
+    const CAPACITY: usize = 1_000;
+    for (fill, workers) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut out = DeferredWriter::with_capacity(CAPACITY, Sink::default(), fill);
+        if workers {
+            out.use_spawner(Arc::new(Threads));
+        }
+        let mut expected = Vec::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for round in 0..3_000_u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Mostly small, with sizes at and around the buffer's and a few
+            // past it.
+            let len = match state % 10 {
+                0 => CAPACITY,
+                1 => CAPACITY - 1,
+                2 => CAPACITY + 1,
+                3 => 2 * CAPACITY + 7,
+                4 => 0,
+                _ => usize::try_from(state >> 32).unwrap_or(0) % CAPACITY,
+            };
+            let piece = vec![round.to_le_bytes()[0]; len];
+            out.write_all(&piece)?;
+            expected.extend_from_slice(&piece);
+        }
+        let sink = out.finish()?;
+        assert!(
+            sink.bytes == expected,
+            "fill: {fill}, workers: {workers}: {} bytes against {}",
+            sink.bytes.len(),
+            expected.len()
+        );
+    }
+    Ok(())
+}
+
 /// With workers the buffers are written off the caller's thread, and the
 /// file takes its bytes in the order they were written.
 #[test]
