@@ -82,6 +82,14 @@ impl BlobIndirection {
     #[cfg(feature = "std")]
     pub(crate) const MAX_ENCODED_LEN: u64 = 10 + 5 + 3 + 5 + 5;
 
+    /// The most bytes the indirection of this value takes once the value is
+    /// moved: its length stays, so that field keeps its bytes, and its file,
+    /// frame, index and stored word may each take the most theirs can.
+    #[cfg(feature = "std")]
+    pub(crate) fn longest_moved(&self) -> u64 {
+        Self::MAX_ENCODED_LEN - 5 + crate::table::writer::varint_len(u64::from(self.size))
+    }
+
     /// The bytes this indirection takes encoded.
     #[cfg(feature = "std")]
     pub(crate) fn encoded_len(&self) -> u64 {

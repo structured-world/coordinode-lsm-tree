@@ -2307,7 +2307,7 @@ fn take_entry(
         let indirection = BlobIndirection::decode_slice(value)?;
         let (bytes, anew) = reference(links, &indirection);
         let pointer = if anew {
-            BlobIndirection::MAX_ENCODED_LEN.max(value_len)
+            indirection.longest_moved().max(value_len)
         } else {
             value_len
         };
@@ -2326,7 +2326,7 @@ fn take_entry(
                 bytes += copied;
                 if anew {
                     // No encoding is longer than the longest.
-                    growth += BlobIndirection::MAX_ENCODED_LEN - indirection.encoded_len();
+                    growth += indirection.longest_moved() - indirection.encoded_len();
                 }
                 rows.owned_blob_objects += 1;
             }

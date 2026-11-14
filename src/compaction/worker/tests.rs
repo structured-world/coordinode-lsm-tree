@@ -6343,12 +6343,15 @@ fn a_relocated_reference_is_charged_at_the_longest_its_new_pointer_can_be() -> c
 
     let (moved, kept) = (pointer(7)?, pointer(8)?);
     let read = moved.len() as u64;
-    assert!(read < BlobIndirection::MAX_ENCODED_LEN);
+    // A value of 100 bytes: its length takes one byte, moved or not.
+    let longest = BlobIndirection::MAX_ENCODED_LEN - 4;
+    assert_eq!(indirection(7).longest_moved(), longest);
+    assert!(read < longest);
     let item =
         |value: Vec<u8>, value_type| InternalValue::from_components(*b"key", value, 1, value_type);
     assert_eq!(
         charged(&item(moved, crate::ValueType::Indirection))?,
-        BlobIndirection::MAX_ENCODED_LEN,
+        longest,
         "a pointer the pass writes anew",
     );
     assert_eq!(
@@ -6369,7 +6372,7 @@ fn a_relocated_reference_is_charged_at_the_longest_its_new_pointer_can_be() -> c
     let row_len = row.len() as u64;
     assert_eq!(
         charged(&item(row, crate::ValueType::CellRow))?,
-        row_len + 2 * (BlobIndirection::MAX_ENCODED_LEN - read),
+        row_len + 2 * (longest - read),
         "each of the two references the pass writes anew may grow to the longest",
     );
     Ok(())
