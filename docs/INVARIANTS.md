@@ -213,6 +213,24 @@ matching entry (and add one for a new subsystem).
   `src/version/super_version.rs` (tests `tests/table_file_pool.rs`,
   `tests/sync_census.rs`).
 
+- **A flush returns only once its files and its manifest edit are both
+  durable, and an open keeps that edit only if its files reached the disk.**
+  A synced flush appends its edit while its tables and blob files are synced
+  beside it, not before it, and the edit lists each such file with its length.
+  Nothing else appends to the log before the flush returns, so only the last
+  edit of the log can carry that list. On open, that edit is kept when every
+  file it lists lies in a scanned folder at the listed length (a folder the
+  configuration no longer scans tells nothing and keeps it); a file that is
+  missing or shorter means a power loss came before the flush returned, so
+  the edit is taken back and the log cut where it began. File contents are
+  not read here: damage to a file that did reach the disk is caught by the
+  checks every read makes, as for any table. A sync that fails after the edit
+  was appended ends the flush in `Error::InstallOutcomeUnknown`. Rotation of
+  the manifest, a table folder whose name is not UTF-8, and builds without
+  `std` keep the ordered syncs (files first, then the edit). Enforced in
+  `src/version/super_version.rs` and `src/version/recovery.rs` (tests
+  `tests/flush_alongside_sync.rs`).
+
 - **Every file the engine opens for writing names what it is written for.**
   The open options carry a `WriteOrigin`, so a counting backend the caller
   gives the tree charges each byte, write call and sync to one origin and none

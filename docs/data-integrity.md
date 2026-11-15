@@ -221,7 +221,10 @@ them differently:
   (length + XXH3-64) per version edit. A power loss mid-append leaves a record
   the writer never finished and never acknowledged. A fully framed record whose
   digest or decode fails is different: it was committed, and its bytes changed
-  afterwards.
+  afterwards. A flush syncs its files beside its edit, so a power loss can also
+  leave a complete last record whose flush never returned: the record lists
+  its files with their lengths, and when one is missing or shorter on open the
+  record is taken back and the log cut where it began, in every mode.
 
 `Config::manifest_recovery_mode` decides only what happens to the first shape:
 
