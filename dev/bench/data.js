@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794693996919,
+  "lastUpdate": 1794749829124,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103390,6 +103390,90 @@ window.BENCHMARK_DATA = {
             "value": 375514.4383517853,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 11.5us | P99.9: 80.1us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c51f17760489a139fd880ab91faa5183a0e4b966",
+          "message": "fix(flush): remove a failed flush's files before it returns (#1076)\n\n## Summary\n\n- A flush that fails removes the table and blob files it wrote before it\nreturns, instead of leaving them to the orphan sweep of the next open.\nOn a full volume a retried flush no longer strands more files each time.\n- A flush whose install has an unknown outcome keeps its files until a\nlater install supersedes that one, which then removes them.\n\n## Changes\n\n- The standard and blob-tree flushes record every file they create in\nthe output ledger compactions use, and remove the recorded files on any\nerror before handing them over as tables.\n- When the install fails, the flush drops its table and blob-file\nhandles and removes their files itself; on `InstallOutcomeUnknown` it\nkeeps them in the version history instead.\n- The version history removes the outputs kept after an install of\nunknown outcome, a flush's or a compaction's, at the rotation that\nsupersedes that install, whichever install makes it (`clear`, an\ningestion, a flush, a compaction). Holding them makes the next install\nrotate, and under `SyncMode::Barrier` that rotation syncs its snapshot\nin full when any of them lies on another device than the manifest.\n- `register_tables` leaves the files of a failed install with the\ncaller's handles, so a caller may register the same tables again.\n- A flush's ledger only removes files: it holds no room or budget and\ndoes not measure finished files.\n\n## Testing\n\n- New `tests/flush_failure_cleanup.rs` covers a full volume part-way\nthrough a flush's tables, its blob files, a blob tree's tables and the\nheavy cells of rows; a failure loading the written tables; a failed\ninstall; an install of unknown outcome for both trees; a `clear` after\none, also with the blob files on another volume under\n`SyncMode::Barrier`; and a registration retried after one, both\nsucceeding and failing again.\n- Gates: nextest with all features on Linux, macOS and Windows, doc\ntests, clippy (default and all features), the no-std check, rustdoc with\n`-D warnings` and fmt.\n- A/B of the write and overwrite benches against `main` on a Linux bench\nhost: every arm within the noise of the base.\n\nCloses #1075\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved cleanup when a flush fails: files that were not installed are\nremoved before the error is returned.\n* Files from installs with an unknown outcome are retained until a later\nsuccessful registration or version update resolves their status, helping\nprevent data loss.\n* Flushes can be retried after failures, while sealed data remains\nreadable.\n* Improved durability when cleanup involves files stored on a different\nvolume.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-15T14:17:33+02:00",
+          "tree_id": "713eb2565fc73750baa240691573c2e6a1af04dd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c51f17760489a139fd880ab91faa5183a0e4b966"
+        },
+        "date": 1794749827778,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 149232.92126020734,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.5us | P99.9: 26.8us\nthreads: 1 | elapsed: 3.59s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2911579.960567599,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 903143.90761405,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.1us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 502688.2182443822,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.7us | P99.9: 23.8us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3162959.0171130155,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 319038.07569964137,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.4us | P99.9: 16.0us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 183535.22189388136,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 10.4us | P99.9: 22.0us\nthreads: 1 | elapsed: 1.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 955945.0432547926,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.8us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1044340.646499286,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 366771.0948331008,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 11.7us | P99.9: 80.2us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
           }
         ]
       }
