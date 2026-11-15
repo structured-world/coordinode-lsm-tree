@@ -290,7 +290,102 @@ fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()>
 /// supersedes the unknown one.
 #[test]
 fn a_flush_of_unknown_install_outcome_keeps_its_tables_until_superseded() -> lsm_tree::Result<()> {
+    assert_unknown_outcome_keeps_until_superseded(&open(|c| c)?)
+}
+
+/// The same for a blob tree's flush, its blob files with its tables.
+#[test]
+fn a_blob_flush_of_unknown_install_outcome_keeps_its_files_until_superseded() -> lsm_tree::Result<()>
+{
+    assert_unknown_outcome_keeps_until_superseded(&open(blob_tree)?)
+}
+
+/// The tables are written and finished, and loading one of them fails: none
+/// of the flush's files stays.
+#[test]
+fn a_flush_failing_to_load_its_tables_leaves_none_of_them() -> lsm_tree::Result<()> {
     let f = open(|c| c)?;
+    assert_flush_fails_cleanly(&f, [read_error("tables")], |_| true)
+}
+
+/// The same for a blob tree's flush, its blob files with its tables.
+#[test]
+fn a_blob_flush_failing_to_load_its_tables_leaves_none_of_its_files() -> lsm_tree::Result<()> {
+    let f = open(blob_tree)?;
+    assert_flush_fails_cleanly(&f, [read_error("tables")], |_| true)
+}
+
+/// A blob tree with a partitioned index and no filter whose flush fills the
+/// volume part-way through its blob files leaves none of them.
+#[test]
+fn a_blob_flush_without_filters_leaves_none_of_its_files() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{FilterPolicy, PinningPolicy};
+
+    let f = open(|c| {
+        blob_tree(c)
+            .filter_policy(FilterPolicy::disabled())
+            .index_block_partitioning_policy(PinningPolicy::all(true))
+    })?;
+    assert_flush_fails_cleanly(&f, [full_after("blobs", 4)], storage_full)
+}
+
+/// A blob tree's flush that fills the volume while it moves the heavy cells
+/// of rows into its blob files leaves none of its files, and the rows read
+/// back once a retry has flushed them.
+#[test]
+fn a_flush_of_cell_rows_the_volume_fills_under_leaves_none_of_its_files() -> lsm_tree::Result<()> {
+    use lsm_tree::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+
+    let f = open(blob_tree)?;
+    let AnyTree::Blob(tree) = &f.tree else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    let body = vec![b'b'; 1_000];
+    for i in 0..KEYS {
+        tree.insert_cells(
+            key(i),
+            &[
+                Field::bytes(FIRST_FIELD_COLUMN, b"draft"),
+                Field::bytes(FIRST_FIELD_COLUMN + 1, &body),
+            ],
+            i,
+        )?;
+    }
+    let before = on_disk(f.dir.path())?;
+    f.injector.arm(full_after("blobs", 4));
+    let result = f.tree.flush_active_memtable(0);
+    f.injector.clear();
+    assert!(
+        result.as_ref().is_err_and(storage_full),
+        "the full volume fails the flush: {result:?}"
+    );
+    let left_behind: BTreeSet<String> = on_disk(f.dir.path())?
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(
+        left_behind.is_empty(),
+        "the failed flush must leave none of its files behind: {left_behind:?}",
+    );
+
+    let lock = f.tree.get_flush_lock();
+    f.tree.flush(&lock, 0)?;
+    drop(lock);
+    for i in (0..KEYS).step_by(97) {
+        let row = tree
+            .get_cells(key(i), MAX_SEQNO)?
+            .expect("the row is flushed");
+        assert_eq!(row.fields()?.len(), 2, "row {i} after the retry");
+    }
+    Ok(())
+}
+
+/// Fails every positioned read under `folder`.
+fn read_error(folder: &str) -> FaultRule {
+    FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).on_path(folder)
+}
+
+fn assert_unknown_outcome_keeps_until_superseded(f: &Fixture) -> lsm_tree::Result<()> {
     for i in 0..KEYS {
         f.tree.insert(key(i), value(i), i);
     }

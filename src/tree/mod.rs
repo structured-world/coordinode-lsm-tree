@@ -1453,27 +1453,13 @@ impl AbstractTree for Tree {
             bf.bind_to_tree(&sinks);
         }
 
-        // Files no version names go with their handles, as a declined flush's
-        // do below.
-        let retire = || {
-            for table in tables {
-                table.mark_as_deleted();
-            }
-            for blob_file in blob_files.unwrap_or(&[]) {
-                blob_file.mark_as_deleted();
-            }
-        };
-
         let mut installed = InstalledCharge::default();
-        if let Err(e) = installed.add(
+        installed.add(
             tables,
             blob_files.unwrap_or(&[]),
             crate::fs::WriteOrigin::FlushTable,
             crate::fs::WriteOrigin::FlushBlob,
-        ) {
-            retire();
-            return Err(e);
-        }
+        )?;
 
         // Held through the install, so no compaction installs in between.
         let compaction_state = self.compaction_state.lock();
@@ -1491,7 +1477,12 @@ impl AbstractTree for Tree {
                 "Flushed memtables left the version before the install, declining the flush"
             );
             drop(version_lock);
-            retire();
+            for table in tables {
+                table.mark_as_deleted();
+            }
+            for blob_file in blob_files.unwrap_or(&[]) {
+                blob_file.mark_as_deleted();
+            }
             return Ok(());
         }
 
@@ -1512,7 +1503,9 @@ impl AbstractTree for Tree {
                     )
                     .collect()
             });
-        let result = version_lock.upgrade_version_deferring(
+        // A failed install leaves the files with the caller's handles: the
+        // caller may register them again, or remove them.
+        version_lock.upgrade_version_deferring(
             &self.config.path,
             |current| {
                 let mut copy = current.clone();
@@ -1549,19 +1542,7 @@ impl AbstractTree for Tree {
             // compaction filter, so `DropsData` is unreachable here.
             crate::version::RetentionEffect::of_run(false, collected_below_watermark, gc_watermark),
             deferred,
-        );
-        match result {
-            Ok(()) => {}
-            // A power loss may still make the install the one a reopen finds:
-            // the files stay with their handles, which the caller may register
-            // again.
-            Err(e @ crate::Error::InstallOutcomeUnknown(_)) => return Err(e),
-            Err(e) => {
-                drop(version_lock);
-                retire();
-                return Err(e);
-            }
-        }
+        )?;
         installed.charge();
 
         // Outputs an install of unknown outcome kept, which this one has

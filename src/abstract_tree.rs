@@ -904,16 +904,26 @@ pub trait AbstractTree: sealed::Sealed {
                 gc_watermark,
                 gc_balance.load(core::sync::atomic::Ordering::Relaxed) > 0,
             ) {
-                // A power loss may still make the install the one a reopen
-                // finds, so its files stay; a retry writes the memtables to
-                // new ones, and they go once an install supersedes this one.
+                let outputs = crate::compaction::output_ledger::OutputLedger::of(
+                    &tables,
+                    blob_files.as_deref().unwrap_or(&[]),
+                );
+                // A retry writes the memtables to new files, so these are
+                // nobody's once their handles go.
+                drop(tables);
+                drop(blob_files);
                 if matches!(e, crate::Error::InstallOutcomeUnknown(_)) {
-                    let kept = crate::compaction::output_ledger::OutputLedger::of(
-                        &tables,
-                        blob_files.as_deref().unwrap_or(&[]),
-                    )
-                    .keep_uninstalled();
-                    self.get_version_history_lock().keep_outputs(kept);
+                    // A power loss may still make the install the one a
+                    // reopen finds: they stay until an install supersedes it.
+                    self.get_version_history_lock()
+                        .keep_outputs(outputs.keep_uninstalled());
+                } else {
+                    // Removed now, not by the handles' deferred retirement,
+                    // so the room they take is free when the flush returns.
+                    outputs.remove_uninstalled(
+                        self.id(),
+                        self.tree_config().descriptor_table.as_deref(),
+                    );
                 }
                 return Err(e);
             }
@@ -1214,10 +1224,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs. The files of an install that
-    /// failed go once their handles drop, except on
-    /// [`Error::InstallOutcomeUnknown`](crate::Error::InstallOutcomeUnknown):
-    /// a reopen after a power loss may find them named, so they stay, and the
-    /// same tables may be registered again.
+    /// failed stay with the caller's handles, which may register them again.
     fn register_tables(
         &self,
         tables: &[Table],
