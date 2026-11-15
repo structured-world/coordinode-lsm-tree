@@ -366,7 +366,7 @@ fn a_blob_flush_failing_to_load_its_tables_leaves_none_of_its_files() -> lsm_tre
     assert_flush_fails_cleanly(&f, [read_error("tables")], |_| true)
 }
 
-/// A blob tree with a partitioned index and no filter whose flush fills the
+/// A blob tree with a single-level index and no filter whose flush fills the
 /// volume part-way through its blob files leaves none of them.
 #[test]
 fn a_blob_flush_without_filters_leaves_none_of_its_files() -> lsm_tree::Result<()> {
@@ -375,7 +375,7 @@ fn a_blob_flush_without_filters_leaves_none_of_its_files() -> lsm_tree::Result<(
     let f = open(|c| {
         blob_tree(c)
             .filter_policy(FilterPolicy::disabled())
-            .index_block_partitioning_policy(PinningPolicy::all(true))
+            .index_block_partitioning_policy(PinningPolicy::disabled())
     })?;
     assert_flush_fails_cleanly(&f, [full_after("blobs", 4)], storage_full)
 }
