@@ -1638,11 +1638,18 @@ fn copy_of(seed: &Path) -> tempfile::TempDir {
 /// finished one leave tens of megabytes for the kernel to write back later;
 /// left alone, that write-back lands in the next engine's timed syncs, and in
 /// the write groups it doubled one engine's time while halving another's.
+///
+/// Windows has no command that writes back every file system, and flushing a
+/// volume needs administrator rights: there the harness runs without this
+/// step.
 fn settle() {
-    let status = std::process::Command::new("sync")
-        .status()
-        .expect("run sync");
-    assert!(status.success(), "sync failed: {status}");
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("sync")
+            .status()
+            .expect("run sync");
+        assert!(status.success(), "sync failed: {status}");
+    }
 }
 
 /// Writes the seed state for `key` into a new directory and closes the engine
