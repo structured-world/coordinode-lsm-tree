@@ -1420,6 +1420,7 @@ impl AbstractTree for Tree {
         }
     }
 
+    #[expect(clippy::significant_drop_tightening)]
     fn register_tables(
         &self,
         tables: &[Table],
@@ -1461,8 +1462,7 @@ impl AbstractTree for Tree {
             crate::fs::WriteOrigin::FlushBlob,
         )?;
 
-        // Held through the install, so no compaction installs in between.
-        let compaction_state = self.compaction_state.lock();
+        let mut _compaction_state = self.compaction_state.lock();
         let mut version_lock = self.version_history.write();
 
         // A sealed memtable that left the version while it was flushed was
@@ -1544,19 +1544,6 @@ impl AbstractTree for Tree {
             deferred,
         )?;
         installed.charge();
-
-        // Outputs an install of unknown outcome kept, which this one has
-        // superseded if it rotated: no version names them any longer.
-        let superseded = if version_lock.holds_kept_outputs() {
-            version_lock.take_superseded_outputs()
-        } else {
-            Vec::new()
-        };
-        drop(version_lock);
-        drop(compaction_state);
-        for kept in superseded {
-            kept.remove(self.id, self.config.descriptor_table.as_deref());
-        }
 
         Ok(())
     }

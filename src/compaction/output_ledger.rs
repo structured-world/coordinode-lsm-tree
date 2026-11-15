@@ -203,8 +203,14 @@ impl OutputLedger {
     /// Leaves every recorded file in place, after an install whose outcome is
     /// unknown: a power loss may still make it the installed one, naming
     /// them. They and the quota bytes they take are handed back as
-    /// [`KeptOutputs`], to go once an install proves no version names them.
-    pub(crate) fn keep_uninstalled(&self) -> KeptOutputs {
+    /// [`KeptOutputs`], to go once an install proves no version names them;
+    /// `tree_id` and `descriptor_table` are the tree's, whose cached
+    /// descriptors on them that removal evicts.
+    pub(crate) fn keep_uninstalled(
+        &self,
+        tree_id: TreeId,
+        descriptor_table: Option<Arc<DescriptorTable>>,
+    ) -> KeptOutputs {
         let files = core::mem::take(&mut *self.0.files.lock());
         let room = self.0.room.lock().take();
         let hold = room.as_ref().map(|room| {
@@ -215,7 +221,12 @@ impl OutputLedger {
             }))
         });
         drop(room);
-        KeptOutputs { files, hold }
+        KeptOutputs {
+            files,
+            hold,
+            tree_id,
+            descriptor_table,
+        }
     }
 
     /// Deletes every recorded file, then gives the run's room back. Called
@@ -252,13 +263,15 @@ impl OutputLedger {
 pub(crate) struct KeptOutputs {
     files: Vec<Output>,
     hold: Option<super::capacity::QuotaHold>,
+    tree_id: TreeId,
+    descriptor_table: Option<Arc<DescriptorTable>>,
 }
 
 impl KeptOutputs {
     /// Deletes the files, as [`OutputLedger::remove_uninstalled`] deletes
     /// uninstalled ones, and gives back the quota of each one gone.
-    pub(crate) fn remove(self, tree_id: TreeId, descriptor_table: Option<&DescriptorTable>) {
-        let stranded = remove_files(self.files, tree_id, descriptor_table);
+    pub(crate) fn remove(self) {
+        let stranded = remove_files(self.files, self.tree_id, self.descriptor_table.as_deref());
         if let Some(hold) = self.hold {
             hold.release_but(stranded);
         }

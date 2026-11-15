@@ -431,6 +431,39 @@ fn a_flush_of_cell_rows_the_volume_fills_under_leaves_none_of_its_files() -> lsm
     Ok(())
 }
 
+/// Any install that rotates supersedes an install of unknown outcome, not a
+/// flush or a compaction alone: the files kept for it go with a `clear` that
+/// follows, with nothing flushed or compacted after it.
+#[test]
+fn a_clear_after_an_install_of_unknown_outcome_removes_the_kept_files() -> lsm_tree::Result<()> {
+    let f = open(blob_tree)?;
+    for i in 0..KEYS {
+        f.tree.insert(key(i), value(i), i);
+    }
+    f.injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .once(),
+    );
+    assert!(matches!(
+        f.tree.flush_active_memtable(0),
+        Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+    ));
+    f.injector.clear();
+    assert!(
+        !on_disk(f.dir.path())?.is_empty(),
+        "the flush keeps its files"
+    );
+
+    f.tree.clear()?;
+    let left = on_disk(f.dir.path())?;
+    assert!(
+        left.is_empty(),
+        "the clear supersedes the unknown install, and its files go: {left:?}"
+    );
+    Ok(())
+}
+
 /// Fails every positioned read under `folder`.
 fn read_error(folder: &str) -> FaultRule {
     FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).on_path(folder)

@@ -915,8 +915,9 @@ pub trait AbstractTree: sealed::Sealed {
                 if matches!(e, crate::Error::InstallOutcomeUnknown(_)) {
                     // A power loss may still make the install the one a
                     // reopen finds: they stay until an install supersedes it.
-                    self.get_version_history_lock()
-                        .keep_outputs(outputs.keep_uninstalled());
+                    let kept = outputs
+                        .keep_uninstalled(self.id(), self.tree_config().descriptor_table.clone());
+                    self.get_version_history_lock().keep_outputs(kept);
                 } else {
                     // Removed now, not by the handles' deferred retirement,
                     // so the room they take is free when the flush returns.

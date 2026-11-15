@@ -364,15 +364,10 @@ pub struct SuperVersions {
     /// supersedes either outcome.
     rotation_pending: bool,
 
-    /// The rotations that succeeded, which order a kept output against the
-    /// full snapshot that supersedes it.
-    rotations: u64,
-
-    /// Compaction outputs an install of unknown outcome left on disk, each
-    /// with the count of rotations a rotation has to pass to supersede the
-    /// edit that may name them, `None` once one has: from then on no version
-    /// does.
-    kept_outputs: Vec<(Option<u64>, crate::compaction::output_ledger::KeptOutputs)>,
+    /// Outputs installs of unknown outcome left on disk, each kept while
+    /// [`Self::rotation_pending`] was set: the next rotation that succeeds
+    /// supersedes every edit that may name them, and removes them.
+    kept_outputs: Vec<crate::compaction::output_ledger::KeptOutputs>,
 
     /// Reusable payload-assembly buffer for edit appends — the scratch
     /// `edit_log::append_edit` documents as reusable; allocating it per
@@ -471,7 +466,6 @@ impl SuperVersions {
             log_rotate_bytes,
             log_bytes: None,
             rotation_pending: false,
-            rotations: 0,
             kept_outputs: Vec::new(),
             edit_scratch: Vec::new(),
             filter_budget: None,
@@ -487,35 +481,24 @@ impl SuperVersions {
         &self.released
     }
 
-    /// Holds `kept`, the outputs of a compaction whose install had an unknown
-    /// outcome, until a rotation after that install supersedes it.
+    /// Holds `kept`, the outputs of a flush or compaction whose install had an
+    /// unknown outcome, until the rotation after that install supersedes it,
+    /// whichever install makes it.
     ///
     /// The failed install marked the next one to rotate, and only a rotation
     /// that succeeds clears the mark: with it cleared, one has succeeded since
     /// the failure (another install may have rotated before this call), and
-    /// the outputs are superseded already. With it set, the next install is
-    /// that rotation.
+    /// the outputs go at once.
+    ///
+    /// The removal runs under the history's lock. It is rare, after a failed
+    /// install only, and what it takes (the descriptor cache, the space pool)
+    /// never waits on the history.
     pub(crate) fn keep_outputs(&mut self, kept: crate::compaction::output_ledger::KeptOutputs) {
-        let until = self.rotation_pending.then_some(self.rotations);
-        self.kept_outputs.push((until, kept));
-    }
-
-    /// Whether outputs are held for [`Self::take_superseded_outputs`].
-    pub(crate) fn holds_kept_outputs(&self) -> bool {
-        !self.kept_outputs.is_empty()
-    }
-
-    /// The kept outputs a rotation has superseded since they were kept, for
-    /// the caller to remove: no version names them any longer.
-    pub(crate) fn take_superseded_outputs(
-        &mut self,
-    ) -> Vec<crate::compaction::output_ledger::KeptOutputs> {
-        let rotations = self.rotations;
-        let (superseded, held) = core::mem::take(&mut self.kept_outputs)
-            .into_iter()
-            .partition::<Vec<_>, _>(|(until, _)| until.is_none_or(|kept_at| kept_at < rotations));
-        self.kept_outputs = held;
-        superseded.into_iter().map(|(_, kept)| kept).collect()
+        if self.rotation_pending {
+            self.kept_outputs.push(kept);
+        } else {
+            kept.remove();
+        }
     }
 
     /// Makes every version this history publishes, the current one first,
@@ -1008,7 +991,11 @@ impl SuperVersions {
             return Err(e);
         }
         self.rotation_pending = false;
-        self.rotations += 1;
+        // The snapshot on disk names none of the kept outputs, and no version
+        // in memory ever did.
+        for kept in self.kept_outputs.drain(..) {
+            kept.remove();
+        }
         self.snapshot_id = next.id();
         // The new generation starts with the empty log the persist created,
         // its name durable under the persist's directory sync.
