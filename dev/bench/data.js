@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794749833560,
+  "lastUpdate": 1794749838068,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -112746,6 +112746,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.399131566,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c51f17760489a139fd880ab91faa5183a0e4b966",
+          "message": "fix(flush): remove a failed flush's files before it returns (#1076)\n\n## Summary\n\n- A flush that fails removes the table and blob files it wrote before it\nreturns, instead of leaving them to the orphan sweep of the next open.\nOn a full volume a retried flush no longer strands more files each time.\n- A flush whose install has an unknown outcome keeps its files until a\nlater install supersedes that one, which then removes them.\n\n## Changes\n\n- The standard and blob-tree flushes record every file they create in\nthe output ledger compactions use, and remove the recorded files on any\nerror before handing them over as tables.\n- When the install fails, the flush drops its table and blob-file\nhandles and removes their files itself; on `InstallOutcomeUnknown` it\nkeeps them in the version history instead.\n- The version history removes the outputs kept after an install of\nunknown outcome, a flush's or a compaction's, at the rotation that\nsupersedes that install, whichever install makes it (`clear`, an\ningestion, a flush, a compaction). Holding them makes the next install\nrotate, and under `SyncMode::Barrier` that rotation syncs its snapshot\nin full when any of them lies on another device than the manifest.\n- `register_tables` leaves the files of a failed install with the\ncaller's handles, so a caller may register the same tables again.\n- A flush's ledger only removes files: it holds no room or budget and\ndoes not measure finished files.\n\n## Testing\n\n- New `tests/flush_failure_cleanup.rs` covers a full volume part-way\nthrough a flush's tables, its blob files, a blob tree's tables and the\nheavy cells of rows; a failure loading the written tables; a failed\ninstall; an install of unknown outcome for both trees; a `clear` after\none, also with the blob files on another volume under\n`SyncMode::Barrier`; and a registration retried after one, both\nsucceeding and failing again.\n- Gates: nextest with all features on Linux, macOS and Windows, doc\ntests, clippy (default and all features), the no-std check, rustdoc with\n`-D warnings` and fmt.\n- A/B of the write and overwrite benches against `main` on a Linux bench\nhost: every arm within the noise of the base.\n\nCloses #1075\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved cleanup when a flush fails: files that were not installed are\nremoved before the error is returned.\n* Files from installs with an unknown outcome are retained until a later\nsuccessful registration or version update resolves their status, helping\nprevent data loss.\n* Flushes can be retried after failures, while sealed data remains\nreadable.\n* Improved durability when cleanup involves files stored on a different\nvolume.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-15T14:17:33+02:00",
+          "tree_id": "713eb2565fc73750baa240691573c2e6a1af04dd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c51f17760489a139fd880ab91faa5183a0e4b966"
+        },
+        "date": 1794749836439,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 629.889,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 165.655668ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 346.578,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 197.120331ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1578.8239999999998,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 258.315746ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4898.18,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 23746.978,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.383,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.381375,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.403734302,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.919,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.068351,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.401729114,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
