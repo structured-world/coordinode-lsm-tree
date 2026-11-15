@@ -126,6 +126,33 @@ pub struct AddedBlobFile {
     pub checksum: u128,
 }
 
+/// A file an edit adds that was synced at the same time as the edit, with
+/// the length it was written to: recovery trusts the edit only once each such
+/// file is on disk at that length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlongsideFile {
+    /// Which file.
+    pub kind: AlongsideKind,
+    /// Its id.
+    pub id: u64,
+    /// Its length in bytes, as written.
+    pub len: u64,
+}
+
+/// Which kind of file an [`AlongsideFile`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlongsideKind {
+    /// A table, in this folder. The folder is kept because routes are
+    /// configured, not recorded: a table missing from a folder the open does
+    /// not scan says nothing about whether it reached the disk.
+    Table {
+        /// The folder the table was written to, as UTF-8.
+        folder: alloc::string::String,
+    },
+    /// A blob file, in the tree's blob folder.
+    Blob,
+}
+
 /// The delta between two consecutive versions: what one flush / compaction
 /// changed. Applied in order on top of a snapshot during recovery.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -171,10 +198,21 @@ pub struct VersionEdit {
     /// exactly as the restriction sets above: an edit that drops a dictionary
     /// has to be able to say the id is gone.
     pub dicts: Option<Vec<crate::file::DictId>>,
+    /// The files this edit adds that were synced at the same time as the edit,
+    /// not before it (empty for every other edit): a power loss can then keep
+    /// the edit without them, so recovery checks that each is there at its
+    /// length before it trusts the edit (only ever the log's last).
+    pub synced_alongside: Vec<AlongsideFile>,
 }
 
 /// `checksum_type` byte written for XXH3-128 (matches the snapshot encoder).
 const CHECKSUM_TYPE_XXH3: u8 = 0;
+
+/// Tag of a table among the files synced alongside an edit.
+const ALONGSIDE_TABLE: u8 = 0;
+
+/// Tag of a blob file among the files synced alongside an edit.
+const ALONGSIDE_BLOB: u8 = 1;
 
 impl VersionEdit {
     /// Serializes the edit payload (without the framing header) into `out`.
@@ -190,6 +228,13 @@ impl VersionEdit {
         if self.dicts.is_some() && self.retention_floor.is_none() {
             return Err(crate::Error::InvalidHeader(
                 "VersionEdit: dictionary ids without a retention floor",
+            ));
+        }
+        // The mark is the fourth appended section, after the dictionary ids,
+        // so an edit carrying it states the floor and the set in full.
+        if !self.synced_alongside.is_empty() && self.dicts.is_none() {
+            return Err(crate::Error::InvalidHeader(
+                "VersionEdit: synced alongside without its dictionary ids",
             ));
         }
 
@@ -286,6 +331,21 @@ impl VersionEdit {
             out.write_u32::<LittleEndian>(u32_len(dicts.len())?)?;
             for id in dicts {
                 out.write_u32::<LittleEndian>(*id)?;
+            }
+        }
+        if !self.synced_alongside.is_empty() {
+            out.write_u32::<LittleEndian>(u32_len(self.synced_alongside.len())?)?;
+            for file in &self.synced_alongside {
+                match &file.kind {
+                    AlongsideKind::Table { folder } => {
+                        out.write_u8(ALONGSIDE_TABLE)?;
+                        out.write_u32::<LittleEndian>(u32_len(folder.len())?)?;
+                        out.write_all(folder.as_bytes())?;
+                    }
+                    AlongsideKind::Blob => out.write_u8(ALONGSIDE_BLOB)?,
+                }
+                out.write_u64::<LittleEndian>(file.id)?;
+                out.write_u64::<LittleEndian>(file.len)?;
             }
         }
         Ok(())
@@ -444,6 +504,39 @@ impl VersionEdit {
             Some(ids)
         };
 
+        // The files synced alongside are the fourth appended section, written
+        // only when there is one: absent, the edit's files were synced before
+        // it. An empty list is never written, so a zero count is mis-encoded.
+        let mut synced_alongside = Vec::new();
+        if !r.is_empty() {
+            let count = r.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+            if count == 0 {
+                return Err(ERR);
+            }
+            synced_alongside.reserve(cap(count));
+            for _ in 0..count {
+                let kind = match r.read_u8().map_err(|_| ERR)? {
+                    ALONGSIDE_TABLE => {
+                        let len = r.read_u32::<LittleEndian>().map_err(|_| ERR)? as usize;
+                        if r.len() < len {
+                            return Err(ERR);
+                        }
+                        let (head, tail) = r.split_at(len);
+                        *r = tail;
+                        let folder = core::str::from_utf8(head).map_err(|_| ERR)?;
+                        AlongsideKind::Table {
+                            folder: folder.into(),
+                        }
+                    }
+                    ALONGSIDE_BLOB => AlongsideKind::Blob,
+                    _ => return Err(ERR),
+                };
+                let id = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+                let len = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+                synced_alongside.push(AlongsideFile { kind, id, len });
+            }
+        }
+
         // A well-formed edit consumes its payload exactly. Trailing bytes mean a
         // corrupt / mis-encoded record (format drift, not power loss — the
         // framing checksum already passed), so reject rather than silently
@@ -462,6 +555,7 @@ impl VersionEdit {
             blob_restrictions,
             retention_floor,
             dicts,
+            synced_alongside,
         })
     }
 }
@@ -510,16 +604,19 @@ fn tail_defect_kind(outcome: &framing::FramedRecordOutcome) -> &'static str {
 /// payload fails to decode is a genuine format error, not power loss, and is
 /// surfaced as an error in every mode rather than silently truncating the log.
 ///
+/// Each edit comes with the byte offset in the log at which its record starts:
+/// where the log is cut to take that edit, and every one after it, back.
+///
 /// # Errors
 ///
 /// Returns an I/O error from `reader`, [`crate::Error::InvalidHeader`] if a
 /// checksum-valid record fails to decode, or
 /// [`crate::Error::TornManifestEditLog`] when the trailing record is
 /// torn / bit-rotted / mis-framed and `mode` does not tolerate that defect.
-pub fn replay_edits<R: Read>(
+pub fn replay_edits_at<R: Read>(
     reader: &mut R,
     mode: crate::config::ManifestRecoveryMode,
-) -> crate::Result<Vec<VersionEdit>> {
+) -> crate::Result<Vec<(u64, VersionEdit)>> {
     use crate::config::ManifestRecoveryMode;
     #[cfg(not(feature = "std"))]
     use crate::io::BufRead;
@@ -535,6 +632,7 @@ pub fn replay_edits<R: Read>(
     let mut reader = crate::io::BufReader::new(reader);
     let mut edits = Vec::new();
     let mut scratch = Vec::new();
+    let mut offset = 0u64;
     loop {
         // No bytes left at a record boundary: the normal end of the log. A crash
         // exactly at a boundary is indistinguishable from a pristine close, so
@@ -544,7 +642,11 @@ pub fn replay_edits<R: Read>(
         }
         let outcome = framing::read_framed_record(&mut reader, u64::MAX, None, &mut scratch)?;
         match outcome {
-            FramedRecordOutcome::Ok => edits.push(VersionEdit::decode_payload(&scratch)?),
+            FramedRecordOutcome::Ok => {
+                edits.push((offset, VersionEdit::decode_payload(&scratch)?));
+                // A record is its header and its payload, both read whole.
+                offset += (framing::FRAME_HEADER_LEN + scratch.len()) as u64;
+            }
             // Writer-incomplete tail (power loss mid-append): unacknowledged, so
             // TolerateCorruptedTailRecords drops it; AbsoluteConsistency surfaces it.
             FramedRecordOutcome::TailTruncation => {

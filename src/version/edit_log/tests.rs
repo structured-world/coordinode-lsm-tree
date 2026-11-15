@@ -19,6 +19,45 @@ fn edit(id: u64) -> VersionEdit {
     }
 }
 
+/// The edits of the log at `path`, without their offsets.
+fn replay_log(
+    fs: &dyn Fs,
+    path: &Path,
+    mode: ManifestRecoveryMode,
+) -> crate::Result<Vec<VersionEdit>> {
+    Ok(replay_log_at(fs, path, mode)?
+        .into_iter()
+        .map(|(_, edit)| edit)
+        .collect())
+}
+
+/// Each edit's record starts where the one before it ends, and cutting the log
+/// at an edit's offset takes that edit back and keeps every one before it.
+#[test]
+fn a_log_cut_at_an_edits_offset_keeps_only_the_edits_before_it() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = log_path(dir.path(), 0);
+    new_log(&StdFs, &path);
+    let mut scratch = Vec::new();
+    let mut sizes = Vec::new();
+    for id in 1..=3 {
+        sizes.push(
+            append_edit(&StdFs, &path, &edit(id), &mut scratch, SyncMode::Normal)?
+                .expect("fits one record"),
+        );
+    }
+    let replayed = replay_log_at(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)?;
+    let offsets: Vec<u64> = replayed.iter().map(|(offset, _)| *offset).collect();
+    assert_eq!(offsets, vec![0, sizes[0], sizes[0] + sizes[1]]);
+
+    truncate_log(&StdFs, &path, offsets[2], SyncMode::Normal)?;
+    assert_eq!(
+        replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)?,
+        vec![edit(1), edit(2)],
+    );
+    Ok(())
+}
+
 /// An empty log at `path`, as the install of its snapshot makes one.
 fn new_log(fs: &dyn Fs, path: &Path) {
     drop(

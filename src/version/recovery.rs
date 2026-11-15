@@ -791,11 +791,84 @@ impl Recovery {
     }
 }
 
+use super::edit::{AlongsideFile, AlongsideKind};
+
+/// How recovery settles a last edit whose files were synced alongside it,
+/// not before it (see [`super::edit::VersionEdit::synced_alongside`]).
+pub(crate) struct AlongsideCheck<'a> {
+    /// Whether recovery keeps the edit for this file of it (see
+    /// [`file_intact`]). `Ok(false)` takes the edit back; an error ends the
+    /// recovery.
+    pub intact: &'a dyn Fn(&AlongsideFile) -> crate::Result<bool>,
+    /// The mode the log is cut with when the edit is taken back.
+    pub sync_mode: crate::fs::SyncMode,
+}
+
+#[cfg(feature = "std")]
+impl AlongsideCheck<'_> {
+    /// For a manifest that holds no edit log, which writes none such edit.
+    pub(crate) const NONE: AlongsideCheck<'static> = AlongsideCheck {
+        intact: &|_| Ok(true),
+        sync_mode: crate::fs::SyncMode::Normal,
+    };
+}
+
+/// Whether recovery keeps the edit naming `file`: a copy of the file lies in
+/// a folder the tree configured by `config` scans, at the length the edit
+/// names, or the folder it was written to is not scanned (a route the config
+/// leaves out, a tree moved since), which tells nothing. A file a power loss
+/// kept from the disk is not there or is shorter; its content is not read, so
+/// damage to a file that did reach the disk is left to the checks every read
+/// makes (block checksums, ECC, repair), as for any other table. A fault of
+/// the environment is an error.
+///
+/// # Errors
+///
+/// Propagates an environmental failure to stat the file.
+pub(crate) fn file_intact(config: &crate::Config, file: &AlongsideFile) -> crate::Result<bool> {
+    let name = alloc::format!("{}", file.id);
+    let places: Vec<(crate::path::PathBuf, alloc::sync::Arc<dyn Fs>)> = match &file.kind {
+        AlongsideKind::Table { folder } => {
+            // The table's folder is one this open scans, or the edit stays: a
+            // route left out of the config, or a tree moved since, is no power
+            // loss, and taking the edit back would cut it from the log for
+            // good. The open reports what it cannot find, as for any table.
+            let folders = config.all_tables_folders();
+            if !folders
+                .iter()
+                .any(|(scanned, _)| scanned.as_path() == Path::new(folder.as_str()))
+            {
+                return Ok(true);
+            }
+            // Any scanned folder may hold the copy: the open picks between
+            // copies of one id by the manifest's checksum, wherever they lie.
+            folders
+                .into_iter()
+                .map(|(scanned, file_fs)| (scanned.join(&name), file_fs))
+                .collect()
+        }
+        AlongsideKind::Blob => alloc::vec![(
+            config.path.join(crate::file::BLOBS_FOLDER).join(&name),
+            config.fs.clone(),
+        )],
+    };
+    for (path, file_fs) in places {
+        match file_fs.metadata(&path) {
+            Ok(meta) if !meta.is_dir && meta.len == file.len => return Ok(true),
+            Ok(_) => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn recover(
     folder: &Path,
     fs: &dyn Fs,
     mode: ManifestRecoveryMode,
     encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+    alongside: &AlongsideCheck<'_>,
 ) -> crate::Result<Recovery> {
     let curr_version_id = installed_snapshot(folder, fs)?.ok_or(
         crate::Error::ManifestFooterInvalid("the tree holds no installed manifest snapshot"),
@@ -919,14 +992,38 @@ pub(crate) fn recover(
     // accepted. Each applied edit advances `recovery.curr_version_id` past the
     // snapshot's id.
     let log_path = super::edit_log::log_path(folder, curr_version_id);
-    let edits = super::edit_log::replay_log(fs, &log_path, mode)?;
+    let mut edits = super::edit_log::replay_log_at(fs, &log_path, mode)?;
+    // Only the last edit can be one whose files were synced alongside it: a
+    // flush returns once both syncs are done, and nothing appends before.
+    let last = edits.pop_if(|(_, edit)| !edit.synced_alongside.is_empty());
     if !edits.is_empty() {
         log::info!(
             "Replaying {} manifest edit(s) on top of snapshot #{curr_version_id}",
             edits.len(),
         );
-        for edit in &edits {
-            recovery.apply_edit(edit)?;
+    }
+    for (_, edit) in &edits {
+        recovery.apply_edit(edit)?;
+    }
+    if let Some((offset, edit)) = last {
+        let mut intact = true;
+        for file in &edit.synced_alongside {
+            if !(alongside.intact)(file)? {
+                log::warn!(
+                    "manifest edit #{} names {file:?}, which a power loss kept from disk; \
+                     taking the edit back, as its flush never returned",
+                    edit.new_version_id,
+                );
+                intact = false;
+                break;
+            }
+        }
+        if intact {
+            recovery.apply_edit(&edit)?;
+        } else {
+            // Cut, so the next append lands where the edit began: one after it
+            // would make it a middle edit, replayed unchecked.
+            super::edit_log::truncate_log(fs, &log_path, offset, alongside.sync_mode)?;
         }
     }
 

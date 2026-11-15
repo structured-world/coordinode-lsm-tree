@@ -11,14 +11,14 @@
 //! structure). On recovery the snapshot is loaded and the log replayed; under
 //! `TolerateCorruptedTailRecords` a power-loss-truncated trailing record is
 //! dropped, while
-//! `AbsoluteConsistency` surfaces it for deliberate repair (see [`replay_log`]).
+//! `AbsoluteConsistency` surfaces it for deliberate repair (see [`replay_log_at`]).
 //!
 //! Rotation (writing a fresh snapshot and starting a new log) is driven by
 //! [`log_size`] exceeding a threshold. Recovery takes the highest `v{N}` and
 //! replays its `edits-{N}`; a log that is not there is empty (see the
 //! recovery / persist layers).
 
-use super::edit::{VersionEdit, replay_edits};
+use super::edit::{VersionEdit, replay_edits_at};
 use crate::fs::{Fs, FsOpenOptions, SyncMode};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -147,13 +147,14 @@ pub fn append_edit(
     Ok(Some(appended))
 }
 
-/// Replays the durable prefix of the log at `path`. An absent log is an empty
-/// edit list (a snapshot with no edits yet).
+/// Replays the durable prefix of the log at `path`, each edit with the offset
+/// of its record. An absent log is an empty edit list (a snapshot with no
+/// edits yet).
 ///
-/// `mode` selects the trailing-record policy (see [`replay_edits`]): a clean
-/// end-of-log is always tolerated, a writer-incomplete tail is rolled back
-/// under `TolerateCorruptedTailRecords`, and a fully-framed corrupt record
-/// fails the replay in every mode.
+/// `mode` selects the trailing-record policy (see [`replay_edits_at`]): a
+/// clean end-of-log is always tolerated, a writer-incomplete tail is rolled
+/// back under `TolerateCorruptedTailRecords`, and a fully-framed corrupt
+/// record fails the replay in every mode.
 ///
 /// # Errors
 ///
@@ -161,16 +162,35 @@ pub fn append_edit(
 /// [`crate::Error::InvalidHeader`] if a checksum-valid record fails to decode,
 /// or [`crate::Error::TornManifestEditLog`] when the trailing record is
 /// torn / bit-rotted / mis-framed and `mode` does not tolerate that defect.
-pub fn replay_log(
+pub fn replay_log_at(
     fs: &dyn Fs,
     path: &Path,
     mode: crate::config::ManifestRecoveryMode,
-) -> crate::Result<Vec<VersionEdit>> {
+) -> crate::Result<Vec<(u64, VersionEdit)>> {
     match fs.open(path, &FsOpenOptions::new().read(true)) {
-        Ok(mut file) => replay_edits(&mut file, mode),
+        Ok(mut file) => replay_edits_at(&mut file, mode),
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(crate::Error::from(e)),
     }
+}
+
+/// Cuts the log at `path` back to its first `len` bytes, durably: the edits
+/// from that offset on are taken back, and the next append lands where the
+/// first of them began.
+///
+/// # Errors
+///
+/// Propagates the open, truncation or sync failure.
+pub fn truncate_log(fs: &dyn Fs, path: &Path, len: u64, sync_mode: SyncMode) -> crate::Result<()> {
+    let file = fs.open(
+        path,
+        &FsOpenOptions::new()
+            .write(true)
+            .write_origin(crate::fs::WriteOrigin::Manifest),
+    )?;
+    file.set_len(len)?;
+    file.sync_data_with(sync_mode)?;
+    Ok(())
 }
 
 /// Current size of the log at `path` in bytes (`0` if absent). Drives snapshot

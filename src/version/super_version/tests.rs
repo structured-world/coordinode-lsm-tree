@@ -182,6 +182,7 @@ fn persist_next(history: &mut SuperVersions, fs: &dyn crate::fs::Fs) -> crate::R
         Arc::default(),
         None,
         SyncMode::Normal,
+        None,
     )
 }
 

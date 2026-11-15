@@ -118,6 +118,7 @@ impl Version {
             blob_restrictions,
             retention_floor,
             dicts,
+            synced_alongside: Vec::new(),
         })
     }
 }

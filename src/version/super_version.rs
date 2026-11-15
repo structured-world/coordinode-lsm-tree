@@ -182,6 +182,33 @@ impl UnsyncedFile {
         Ok(())
     }
 
+    /// The file as an edit names it among the files synced alongside it, with
+    /// the length it was written to; `None` for a table whose folder is no
+    /// UTF-8 path, which the edit cannot name.
+    #[cfg(feature = "std")]
+    fn alongside(&self) -> crate::Result<Option<super::edit::AlongsideFile>> {
+        let (fs, path) = self.location();
+        let (kind, id) = match self {
+            Self::Table(table) => {
+                let Some(folder) = path.parent().and_then(Path::to_str) else {
+                    return Ok(None);
+                };
+                (
+                    super::edit::AlongsideKind::Table {
+                        folder: folder.into(),
+                    },
+                    table.id(),
+                )
+            }
+            Self::Blob(blob_file) => (super::edit::AlongsideKind::Blob, blob_file.id()),
+        };
+        Ok(Some(super::edit::AlongsideFile {
+            kind,
+            id,
+            len: fs.metadata(path)?.len,
+        }))
+    }
+
     /// Whether `other` is the same file.
     fn same(&self, other: &Self) -> bool {
         match (self, other) {
@@ -199,6 +226,35 @@ impl UnsyncedFile {
             Self::Blob(blob_file) => version.blob_files.get(blob_file.id()).is_some(),
         }
     }
+}
+
+/// Files an install syncs at the same time as the edit naming them.
+struct Alongside<'a> {
+    /// The files, as the edit names them.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "without threads no edit is written beside its files"
+        )
+    )]
+    files: Vec<super::edit::AlongsideFile>,
+    /// Syncs them, and the folders of the new tables.
+    sync: &'a (dyn Fn() -> crate::Result<()> + Sync),
+}
+
+/// Who syncs the files an install adds.
+pub(crate) enum NewFiles {
+    /// Their writers did, before the install.
+    Synced,
+    /// None yet: the version is installed in memory only, and the next
+    /// install that persists, or [`SuperVersions::persist_current`], syncs
+    /// them and writes it to the manifest (a flush under
+    /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred)).
+    Deferred(Vec<UnsyncedFile>),
+    /// The install, at the same time as the manifest edit naming them: the
+    /// edit says so, and recovery checks the files before it trusts the edit.
+    Alongside(Vec<UnsyncedFile>),
 }
 
 /// A super version is a point-in-time snapshot of memtables and a [`Version`] (list of disk files)
@@ -557,7 +613,7 @@ impl SuperVersions {
             runtime,
             encryption,
             retention,
-            None,
+            NewFiles::Synced,
         )
     }
 
@@ -593,21 +649,17 @@ impl SuperVersions {
             runtime,
             encryption,
             retention,
-            None,
+            NewFiles::Synced,
         )
     }
 
-    /// Like `upgrade_version`, but with `deferred` holding the files the new
-    /// version adds unsynced (a flush under
-    /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred))
-    /// the version is installed in memory only: the next install that
-    /// persists, or [`Self::persist_current`], syncs those files and writes
-    /// it to the manifest.
+    /// Like `upgrade_version`, with `files` saying who syncs the files the
+    /// new version adds (see [`NewFiles`]).
     #[expect(
         clippy::too_many_arguments,
-        reason = "the same load-bearing surface as `upgrade_version`, plus the deferred files"
+        reason = "the same load-bearing surface as `upgrade_version`, plus the new files"
     )]
-    pub(crate) fn upgrade_version_deferring<
+    pub(crate) fn upgrade_version_adding<
         F: FnOnce(&SuperVersion) -> crate::Result<SuperVersion>,
     >(
         &mut self,
@@ -619,7 +671,7 @@ impl SuperVersions {
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
         retention: RetentionEffect,
-        deferred: Option<Vec<UnsyncedFile>>,
+        files: NewFiles,
     ) -> crate::Result<()> {
         self.install(
             tree_path,
@@ -630,7 +682,7 @@ impl SuperVersions {
             runtime,
             encryption,
             retention,
-            deferred,
+            files,
         )
     }
 
@@ -649,7 +701,7 @@ impl SuperVersions {
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
         retention: RetentionEffect,
-        deferred: Option<Vec<UnsyncedFile>>,
+        files: NewFiles,
     ) -> crate::Result<()> {
         let prior = self.latest_version();
         let mut next_version = f(&prior)?;
@@ -722,12 +774,29 @@ impl SuperVersions {
         if let Some(hook) = &self.before_persist {
             hook();
         }
-        match deferred {
+        match files {
             // The floor rides in the version too: lost with it in a crash,
             // together with the flush whose collection raised it.
-            Some(files) => self.unsynced.extend(files),
-            None => {
-                self.persist_version(tree_path, &next_version.version, fs, runtime, encryption)?;
+            NewFiles::Deferred(files) => self.unsynced.extend(files),
+            NewFiles::Synced => {
+                self.persist_version(
+                    tree_path,
+                    &next_version.version,
+                    fs,
+                    runtime,
+                    encryption,
+                    &[],
+                )?;
+            }
+            NewFiles::Alongside(files) => {
+                self.persist_version(
+                    tree_path,
+                    &next_version.version,
+                    fs,
+                    runtime,
+                    encryption,
+                    &files,
+                )?;
             }
         }
         self.publish(
@@ -751,6 +820,10 @@ impl SuperVersions {
     /// version is written. A file a deferred flush wrote and `next` no longer
     /// names (a compaction consumed it) never reaches the manifest and is not
     /// synced.
+    ///
+    /// `alongside` are files `next` adds that no one has synced yet: they and
+    /// the folders of the new tables are synced at the same time as the
+    /// change is written, which then says so (see [`Self::persist_change`]).
     fn persist_version(
         &mut self,
         tree_path: &Path,
@@ -758,6 +831,7 @@ impl SuperVersions {
         fs: &dyn Fs,
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+        alongside: &[UnsyncedFile],
     ) -> crate::Result<()> {
         let persisted = self.persisted.clone();
         if !self.unsynced.is_empty() {
@@ -765,7 +839,11 @@ impl SuperVersions {
             // next one to sync again.
             Self::sync_files(&self.unsynced_named_by(next), self.sync_mode)?;
         }
-        sync_new_table_directories(&persisted, next, tree_path, fs, self.sync_mode)?;
+        let sync_mode = self.sync_mode;
+        let sync_new = || -> crate::Result<()> {
+            Self::sync_files(alongside, sync_mode)?;
+            sync_new_table_directories(&persisted, next, tree_path, fs, sync_mode)
+        };
         // Outputs are kept only while the next persist rotates, which removes
         // them.
         let manifest_mode = manifest_sync_mode(
@@ -776,6 +854,25 @@ impl SuperVersions {
             fs,
             self.sync_mode,
         );
+        // A file the edit cannot name is synced before it, with the rest, and
+        // so is every file without threads to sync them beside the edit.
+        #[cfg(feature = "std")]
+        let files: Option<Vec<_>> = alongside
+            .iter()
+            .map(UnsyncedFile::alongside)
+            .collect::<crate::Result<_>>()?;
+        #[cfg(not(feature = "std"))]
+        let files: Option<Vec<super::edit::AlongsideFile>> = None;
+        let alongside_job = match files {
+            Some(files) if !files.is_empty() => Some(Alongside {
+                files,
+                sync: &sync_new,
+            }),
+            _ => {
+                sync_new()?;
+                None
+            }
+        };
         self.persist_change(
             tree_path,
             &persisted,
@@ -784,6 +881,7 @@ impl SuperVersions {
             runtime,
             encryption,
             manifest_mode,
+            alongside_job,
         )?;
         self.unsynced.clear();
         self.persisted = next.clone();
@@ -908,7 +1006,7 @@ impl SuperVersions {
             return Ok(());
         }
         let next = self.current.version.clone();
-        self.persist_version(tree_path, &next, fs, runtime, encryption)
+        self.persist_version(tree_path, &next, fs, runtime, encryption, &[])
     }
 
     /// Persists the transition from `prior` to `next` to disk, durably, the
@@ -929,6 +1027,14 @@ impl SuperVersions {
     ///
     /// `sync_mode` is the mode this transition is persisted with (see
     /// `manifest_sync_mode`).
+    ///
+    /// `alongside` syncs files the transition adds that no one synced yet.
+    /// An appended edit runs it at the same time as its own append and sync,
+    /// and says so ([`VersionEdit::synced_alongside`](super::edit::VersionEdit::synced_alongside)):
+    /// a power loss may keep the edit without the files, and recovery then
+    /// checks them and takes the edit back. That edit is the log's last, as
+    /// the install returns once both are done and nothing appends before. A
+    /// rotation runs it first: a snapshot carries no such mark.
     #[expect(
         clippy::too_many_arguments,
         reason = "the transition, where it goes, how it is encoded and how durably: \
@@ -943,6 +1049,7 @@ impl SuperVersions {
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
         sync_mode: SyncMode,
+        mut alongside: Option<Alongside<'_>>,
     ) -> crate::Result<()> {
         let log_path = edit_log::log_path(tree_path, self.snapshot_id);
 
@@ -964,7 +1071,48 @@ impl SuperVersions {
         {
             // Common path: append the delta and fsync. No snapshot rewrite.
             let edit = next.diff(prior)?;
-            match edit_log::append_edit(fs, &log_path, &edit, &mut self.edit_scratch, sync_mode) {
+            let appended = match alongside.take() {
+                #[cfg(feature = "std")]
+                Some(Alongside {
+                    files,
+                    sync: sync_files,
+                }) => {
+                    let mut edit = edit;
+                    edit.synced_alongside = files;
+                    // The mark is positional after the floor and the set.
+                    edit.retention_floor
+                        .get_or_insert_with(|| next.retention_floor());
+                    edit.dicts.get_or_insert_with(|| next.dicts().to_vec());
+                    let scratch = &mut self.edit_scratch;
+                    let (appended, synced) = std::thread::scope(|scope| {
+                        let synced = scope.spawn(sync_files);
+                        let appended =
+                            edit_log::append_edit(fs, &log_path, &edit, scratch, sync_mode);
+                        let synced = synced
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                        (appended, synced)
+                    });
+                    match (appended, synced) {
+                        // The edit is durable and its files may not be: a later
+                        // append would make it a middle edit, replayed
+                        // unchecked, so the next persist rotates.
+                        (Ok(Some(appended)), Err(e)) => {
+                            self.log_bytes = Some(log_size + appended);
+                            self.rotation_pending = true;
+                            return Err(crate::Error::InstallOutcomeUnknown(
+                                alloc::boxed::Box::new(e),
+                            ));
+                        }
+                        // Nothing was written.
+                        (Ok(None), Err(e)) => return Err(e),
+                        (appended, _) => appended,
+                    }
+                }
+                // Without threads `persist_version` builds none.
+                _ => edit_log::append_edit(fs, &log_path, &edit, &mut self.edit_scratch, sync_mode),
+            };
+            match appended {
                 Ok(Some(appended)) => {
                     self.log_bytes = Some(log_size + appended);
                     return Ok(());
@@ -992,7 +1140,14 @@ impl SuperVersions {
             }
         }
 
-        // Rotation: write `next` as a fresh full snapshot and install it.
+        // Rotation: write `next` as a fresh full snapshot and install it, once
+        // the files it adds are synced.
+        if let Some(Alongside {
+            sync: sync_files, ..
+        }) = alongside
+        {
+            sync_files()?;
+        }
         let old_snapshot = self.snapshot_id;
         if let Err(e) = persist_version(
             tree_path,

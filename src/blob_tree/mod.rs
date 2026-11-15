@@ -210,35 +210,6 @@ fn write_ahead(
     Ok(true)
 }
 
-/// Finishes a flush's blob and table outputs. Nothing orders the syncs of the
-/// two against each other, only both against the manifest edit that names them,
-/// so a synced flush runs them side by side.
-#[cfg_attr(
-    not(feature = "std"),
-    expect(unused_variables, reason = "without threads the two run in turn")
-)]
-fn finish_flush(
-    blob_writer: BlobFileWriter,
-    table_writer: crate::table::multi_writer::MultiWriter,
-    durability: crate::config::FlushDurability,
-) -> (
-    crate::Result<Vec<BlobFile>>,
-    crate::Result<crate::table::multi_writer::Written>,
-) {
-    #[cfg(feature = "std")]
-    if durability == crate::config::FlushDurability::Synced {
-        return std::thread::scope(|scope| {
-            let blob = scope.spawn(|| blob_writer.finish());
-            let table = table_writer.finish();
-            let blob = blob
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (blob, table)
-        });
-    }
-    (blob_writer.finish(), table_writer.finish())
-}
-
 /// The value `prefetched` holds for `vhandle`: read ahead for this very item,
 /// under its key, so its place and declared size are what identify it.
 fn prefetched_value(
@@ -2493,9 +2464,11 @@ impl AbstractTree for BlobTree {
             // blob tree's index honors columnar, zone maps, ECC, seqno-in-index,
             // per-KV checksums, locator policy, sync mode, and CoW disable.
             table_writer = table_writer.use_page_ecc(self.index.config.page_ecc, rc.ecc_scheme);
+            // The install syncs a flush's files, whatever the tree's flush
+            // durability (see the index tree's `register_tables`).
             table_writer = table_writer
                 .use_sync_mode(self.index.config.sync_mode)
-                .use_durability(self.index.config.flush_durability)
+                .use_durability(crate::config::FlushDurability::Deferred)
                 .use_writeback_bytes(self.index.config.writeback_bytes);
             table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
             table_writer = table_writer.use_zone_map(rc.zone_map);
@@ -2574,7 +2547,7 @@ impl AbstractTree for BlobTree {
                 .use_target_size(kv_opts.file_target_size)
                 .use_compression(rc.blob_compression)
                 .use_sync_mode(self.index.config.sync_mode)
-                .use_durability(self.index.config.flush_durability)
+                .use_durability(crate::config::FlushDurability::Deferred)
                 .use_writeback_bytes(self.index.config.writeback_bytes)
                 .use_lifetime_groups(kv_opts.lifetime_groups)
                 .use_frame_sizes(kv_opts.frame_sizes())
@@ -2699,11 +2672,9 @@ impl AbstractTree for BlobTree {
                 while write_ahead(ahead, &mut blob_writer, &mut table_writer)? {}
             }
 
-            let (blob_files, written) = finish_flush(
-                blob_writer,
-                table_writer,
-                self.index.config.flush_durability,
-            );
+            // Neither finish syncs: the install does, for both at once.
+            let blob_files = blob_writer.finish();
+            let written = table_writer.finish();
             let blob_files = blob_files?;
             let written = written?;
             let entries_durable = written.entries_durable;

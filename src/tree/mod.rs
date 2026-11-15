@@ -1294,9 +1294,11 @@ impl AbstractTree for Tree {
             // / `kv_checksums` below), so a flush after a scheme change writes the
             // SST with the current scheme rather than the startup one.
             table_writer = table_writer.use_page_ecc(self.config.page_ecc, rc.ecc_scheme);
+            // Whatever the tree's flush durability, the install syncs a flush's
+            // tables (see `register_tables`), so the writer leaves them unsynced.
             table_writer = table_writer
                 .use_sync_mode(self.config.sync_mode)
-                .use_durability(self.config.flush_durability)
+                .use_durability(crate::config::FlushDurability::Deferred)
                 .use_writeback_bytes(self.config.writeback_bytes);
 
             table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
@@ -1494,26 +1496,30 @@ impl AbstractTree for Tree {
             return Ok(());
         }
 
-        // A deferred flush wrote its files unsynced: installed in memory only,
-        // they are synced and written to the manifest by the next persist.
-        let deferred = (self.config.flush_durability == crate::config::FlushDurability::Deferred)
-            .then(|| {
-                tables
+        // A flush writes its files unsynced. Deferred, the version is
+        // installed in memory only and the next persist syncs them; otherwise
+        // the install syncs them while it writes the edit naming them.
+        let unsynced = tables
+            .iter()
+            .cloned()
+            .map(crate::version::UnsyncedFile::Table)
+            .chain(
+                blob_files
+                    .unwrap_or(&[])
                     .iter()
                     .cloned()
-                    .map(crate::version::UnsyncedFile::Table)
-                    .chain(
-                        blob_files
-                            .unwrap_or(&[])
-                            .iter()
-                            .cloned()
-                            .map(crate::version::UnsyncedFile::Blob),
-                    )
-                    .collect()
-            });
+                    .map(crate::version::UnsyncedFile::Blob),
+            )
+            .collect();
+        let files = match self.config.flush_durability {
+            crate::config::FlushDurability::Deferred => {
+                crate::version::NewFiles::Deferred(unsynced)
+            }
+            crate::config::FlushDurability::Synced => crate::version::NewFiles::Alongside(unsynced),
+        };
         // A failed install leaves the files with the caller's handles: the
         // caller may register them again, or remove them.
-        version_lock.upgrade_version_deferring(
+        version_lock.upgrade_version_adding(
             &self.config.path,
             |current| {
                 let mut copy = current.clone();
@@ -1549,7 +1555,7 @@ impl AbstractTree for Tree {
             // `false` for the filter: the flush stream carries no user
             // compaction filter, so `DropsData` is unreachable here.
             crate::version::RetentionEffect::of_run(false, collected_below_watermark, gc_watermark),
-            deferred,
+            files,
         )?;
         installed.charge();
 
@@ -6274,11 +6280,16 @@ impl Tree {
 
         let tree_path = tree_path.as_ref();
 
+        let intact = |file: &_| crate::version::recovery::file_intact(config, file);
         let recovery = recover(
             tree_path,
             &*config.fs,
             config.manifest_recovery_mode,
             config.encryption.clone(),
+            &crate::version::recovery::AlongsideCheck {
+                intact: &intact,
+                sync_mode: config.sync_mode,
+            },
         )?;
 
         // The installed on-disk snapshot: the generation orphan cleanup

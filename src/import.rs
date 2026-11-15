@@ -963,6 +963,7 @@ pub fn install_manifest(
         &**fs,
         ManifestRecoveryMode::AbsoluteConsistency,
         encryption,
+        &crate::version::recovery::AlongsideCheck::NONE,
     )?;
     Ok(recorded)
 }

@@ -39,7 +39,7 @@ pub(crate) use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
 pub(crate) use run::Run;
 pub(crate) use super_version::RetentionEffect;
 pub(crate) use super_version::SnapshotRef;
-pub(crate) use super_version::{SuperVersion, SuperVersions, UnsyncedFile};
+pub(crate) use super_version::{NewFiles, SuperVersion, SuperVersions, UnsyncedFile};
 
 use crate::TreeType;
 use crate::blob_tree::{FragmentationEntry, FragmentationMap};
