@@ -377,14 +377,32 @@ fn a_blob_flush_failing_to_load_its_tables_leaves_none_of_its_files() -> lsm_tre
 fn a_blob_flush_without_filters_leaves_none_of_its_files() -> lsm_tree::Result<()> {
     use lsm_tree::config::{FilterPolicy, PinningPolicy};
 
-    let f = open(|c| {
+    fn configure(c: Config) -> Config {
         blob_tree(c)
             .filter_policy(FilterPolicy::disabled())
             .index_block_partitioning_policy(PinningPolicy::disabled())
-    })?;
-    // The flush writes some 30 blob files; the volume fills three quarters
-    // of the way through them.
-    let full = full_after("blobs", 24);
+    }
+
+    // How many writes the flush makes to its blob files depends on how the
+    // build buffers them, so a flush that succeeds counts them first.
+    let sample = open(configure)?;
+    for i in 0..KEYS {
+        sample.tree.insert(key(i), value(i), i);
+    }
+    sample.tree.flush_active_memtable(0)?;
+    let blob_writes = sample.injector.writes_for("blobs").len();
+    assert!(
+        blob_writes >= 4,
+        "the flush writes {blob_writes} times to blob files"
+    );
+    drop(sample);
+
+    // The volume fills three quarters of the way through those writes.
+    let f = open(configure)?;
+    let full = full_after(
+        "blobs",
+        u64::try_from(blob_writes * 3 / 4).unwrap_or(u64::MAX),
+    );
     let probe = Arc::clone(&f.injector);
     assert_flush_fails_cleanly(&f, [full], |e| {
         // A table reaches the volume only once it is finished.
