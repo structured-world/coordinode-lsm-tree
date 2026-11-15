@@ -32,10 +32,13 @@ fn value(i: u64) -> Vec<u8> {
     v
 }
 
-/// Every non-empty file name in `folder`, none when the folder does not
-/// exist. An empty file under a table name is one the tables folder keeps for
-/// tables to come, no output of a flush.
+/// Every file name in `folder`, none when the folder does not exist. In the
+/// tables folder an empty file is one its pool keeps for tables to come, made
+/// by the pool whenever it runs low, a flush's included: no output of a
+/// flush, so it is not counted. The blobs folder has no pool, so an empty
+/// file there is an output left behind, and counts.
 fn files(folder: &Path) -> std::io::Result<BTreeSet<String>> {
+    let pooled = folder.ends_with("tables");
     let entries = match std::fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
@@ -45,7 +48,7 @@ fn files(folder: &Path) -> std::io::Result<BTreeSet<String>> {
     for entry in entries {
         let entry = entry?;
         match entry.metadata() {
-            Ok(meta) if meta.len() > 0 => {}
+            Ok(meta) if meta.len() > 0 || !pooled => {}
             Ok(_) => continue,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
@@ -129,12 +132,13 @@ fn assert_flush_fails_cleanly(
         f.injector.arm(rule);
     }
     let result = f.tree.flush_active_memtable(0);
-    f.injector.clear();
-
+    // Checked before the faults are cleared, with what the injector observed.
     match &result {
         Err(e) => assert!(failed(e), "the flush failed otherwise: {e:?}"),
         Ok(()) => panic!("the injected fault must fail the flush"),
     }
+    f.injector.clear();
+
     let left_behind: BTreeSet<String> = on_disk(f.dir.path())?
         .difference(&before)
         .cloned()
@@ -367,7 +371,8 @@ fn a_blob_flush_failing_to_load_its_tables_leaves_none_of_its_files() -> lsm_tre
 }
 
 /// A blob tree with a single-level index and no filter whose flush fills the
-/// volume part-way through its blob files leaves none of them.
+/// volume part-way through its blob files, after some of its tables are
+/// finished, leaves none of them.
 #[test]
 fn a_blob_flush_without_filters_leaves_none_of_its_files() -> lsm_tree::Result<()> {
     use lsm_tree::config::{FilterPolicy, PinningPolicy};
@@ -377,7 +382,18 @@ fn a_blob_flush_without_filters_leaves_none_of_its_files() -> lsm_tree::Result<(
             .filter_policy(FilterPolicy::disabled())
             .index_block_partitioning_policy(PinningPolicy::disabled())
     })?;
-    assert_flush_fails_cleanly(&f, [full_after("blobs", 4)], storage_full)
+    // The flush writes some 30 blob files; the volume fills three quarters
+    // of the way through them.
+    let full = full_after("blobs", 24);
+    let probe = Arc::clone(&f.injector);
+    assert_flush_fails_cleanly(&f, [full], |e| {
+        // A table reaches the volume only once it is finished.
+        assert!(
+            !probe.writes_for("tables").is_empty(),
+            "a table is finished before the volume fills"
+        );
+        storage_full(e)
+    })
 }
 
 /// A blob tree's flush that fills the volume while it moves the heavy cells
