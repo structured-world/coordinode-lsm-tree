@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! The files one compaction run creates, held until a version names them.
+//! The files one flush or compaction run creates, held until a version names
+//! them.
 
 use crate::fs::Fs;
 use crate::path::PathBuf;
@@ -31,8 +32,8 @@ struct Output {
     fs: Arc<dyn Fs>,
 }
 
-/// The table and blob files a compaction run has created that no installed
-/// version names, and the room the run reserved for them.
+/// The table and blob files a flush or compaction run has created that no
+/// installed version names, and the room the run reserved for them.
 ///
 /// Each writer the run opens records a file here once it has created it, and
 /// tells it once it has finished one; each install of the run's outputs
@@ -51,9 +52,21 @@ struct Ledger {
     room: Mutex<Option<Arc<super::capacity::Reservation>>>,
     /// The write budget the run holds on each medium it writes to.
     budget: Mutex<Vec<crate::write_budget::BudgetHold>>,
+    /// Holds neither room nor budget, only the files to remove: a finished
+    /// file is not measured.
+    cleanup_only: bool,
 }
 
 impl OutputLedger {
+    /// A ledger for a run that reserves nothing, a flush: it only removes the
+    /// files the run made when the run fails.
+    pub(crate) fn for_cleanup() -> Self {
+        Self(Arc::new(Ledger {
+            cleanup_only: true,
+            ..Ledger::default()
+        }))
+    }
+
     /// Records a table file the run created at `path`.
     pub(crate) fn record_table(&self, id: crate::TableId, path: PathBuf, fs: Arc<dyn Fs>) {
         self.record(Kind::Table, id, path, fs);
@@ -126,6 +139,9 @@ impl OutputLedger {
     /// [`crate::Error::StorageFull`] when the volume has no room for what the
     /// run wrote past its reservation.
     pub(crate) fn landed(&self, fs: &dyn Fs, path: &crate::path::Path) -> crate::Result<()> {
+        if self.0.cleanup_only {
+            return Ok(());
+        }
         let room = self.room();
         let budget = fs.write_budget();
         if room.is_none() && budget.is_none() {
@@ -159,11 +175,42 @@ impl OutputLedger {
         self.0.files.lock().clear();
     }
 
+    /// The recorded files now belong to the table and blob-file handles made
+    /// on them, which the caller installs or retires: a flush hands its
+    /// finished outputs over this way.
+    pub(crate) fn hand_over(&self) {
+        self.0.files.lock().clear();
+    }
+
+    /// A ledger holding `tables` and `blob_files`, the outputs of an install
+    /// that failed, for [`Self::keep_uninstalled`] to keep when its outcome is
+    /// unknown.
+    pub(crate) fn of(tables: &[crate::Table], blob_files: &[crate::BlobFile]) -> Self {
+        let ledger = Self::default();
+        for table in tables {
+            ledger.record_table(table.id(), (*table.path).clone(), Arc::clone(&table.fs));
+        }
+        for blob_file in blob_files {
+            ledger.record_blob_file(
+                blob_file.id(),
+                blob_file.path().to_path_buf(),
+                Arc::clone(&blob_file.0.fs),
+            );
+        }
+        ledger
+    }
+
     /// Leaves every recorded file in place, after an install whose outcome is
     /// unknown: a power loss may still make it the installed one, naming
     /// them. They and the quota bytes they take are handed back as
-    /// [`KeptOutputs`], to go once an install proves no version names them.
-    pub(crate) fn keep_uninstalled(&self) -> KeptOutputs {
+    /// [`KeptOutputs`], to go once an install proves no version names them;
+    /// `tree_id` and `descriptor_table` are the tree's, whose cached
+    /// descriptors on them that removal evicts.
+    pub(crate) fn keep_uninstalled(
+        &self,
+        tree_id: TreeId,
+        descriptor_table: Option<Arc<DescriptorTable>>,
+    ) -> KeptOutputs {
         let files = core::mem::take(&mut *self.0.files.lock());
         let room = self.0.room.lock().take();
         let hold = room.as_ref().map(|room| {
@@ -174,7 +221,12 @@ impl OutputLedger {
             }))
         });
         drop(room);
-        KeptOutputs { files, hold }
+        KeptOutputs {
+            files,
+            hold,
+            tree_id,
+            descriptor_table,
+        }
     }
 
     /// Deletes every recorded file, then gives the run's room back. Called
@@ -211,13 +263,22 @@ impl OutputLedger {
 pub(crate) struct KeptOutputs {
     files: Vec<Output>,
     hold: Option<super::capacity::QuotaHold>,
+    tree_id: TreeId,
+    descriptor_table: Option<Arc<DescriptorTable>>,
 }
 
 impl KeptOutputs {
+    /// Each kept file's backend and path.
+    pub(crate) fn files(&self) -> impl Iterator<Item = (&dyn Fs, &crate::path::Path)> {
+        self.files
+            .iter()
+            .map(|output| (&*output.fs, output.path.as_path()))
+    }
+
     /// Deletes the files, as [`OutputLedger::remove_uninstalled`] deletes
     /// uninstalled ones, and gives back the quota of each one gone.
-    pub(crate) fn remove(self, tree_id: TreeId, descriptor_table: Option<&DescriptorTable>) {
-        let stranded = remove_files(self.files, tree_id, descriptor_table);
+    pub(crate) fn remove(self) {
+        let stranded = remove_files(self.files, self.tree_id, self.descriptor_table.as_deref());
         if let Some(hold) = self.hold {
             hold.release_but(stranded);
         }
@@ -242,15 +303,12 @@ fn remove_files(
             }
         }
         match output.fs.remove_file(&output.path) {
-            Ok(()) => log::debug!(
-                "Removed uninstalled compaction output {}",
-                output.path.display(),
-            ),
+            Ok(()) => log::debug!("Removed uninstalled output {}", output.path.display()),
             Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
             Err(e) => {
                 log::warn!(
-                    "Could not remove uninstalled compaction output {} ({e}); it stays until \
-                     the next open's orphan sweep",
+                    "Could not remove uninstalled output {} ({e}); it stays until the next \
+                     open's orphan sweep",
                     output.path.display(),
                 );
                 // A length that cannot be read holds the whole grant: the

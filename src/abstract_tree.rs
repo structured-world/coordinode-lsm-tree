@@ -896,14 +896,38 @@ pub trait AbstractTree: sealed::Sealed {
             #[cfg(all(test, feature = "std"))]
             self.tree_config().fire_before_output_install();
 
-            self.register_tables(
+            if let Err(e) = self.register_tables(
                 &tables,
                 blob_files.as_deref(),
                 None,
                 &sealed_ids,
                 gc_watermark,
                 gc_balance.load(core::sync::atomic::Ordering::Relaxed) > 0,
-            )?;
+            ) {
+                let outputs = crate::compaction::output_ledger::OutputLedger::of(
+                    &tables,
+                    blob_files.as_deref().unwrap_or(&[]),
+                );
+                // A retry writes the memtables to new files, so these are
+                // nobody's once their handles go.
+                drop(tables);
+                drop(blob_files);
+                if matches!(e, crate::Error::InstallOutcomeUnknown(_)) {
+                    // A power loss may still make the install the one a
+                    // reopen finds: they stay until an install supersedes it.
+                    let kept = outputs
+                        .keep_uninstalled(self.id(), self.tree_config().descriptor_table.clone());
+                    self.get_version_history_lock().keep_outputs(kept);
+                } else {
+                    // Removed now, not by the handles' deferred retirement,
+                    // so the room they take is free when the flush returns.
+                    outputs.remove_uninstalled(
+                        self.id(),
+                        self.tree_config().descriptor_table.as_deref(),
+                    );
+                }
+                return Err(e);
+            }
             // The installed files name their dictionaries from here on.
             drop(write_pin);
         }
@@ -1152,7 +1176,8 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
+    /// Will return `Err` if an IO error occurs; the files written up to it are
+    /// removed before it returns.
     fn flush_to_tables(
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
@@ -1199,7 +1224,8 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
+    /// Will return `Err` if an IO error occurs. The files of an install that
+    /// failed stay with the caller's handles, which may register them again.
     fn register_tables(
         &self,
         tables: &[Table],

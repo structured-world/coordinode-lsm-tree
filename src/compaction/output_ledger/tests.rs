@@ -186,7 +186,7 @@ fn kept_outputs_hold_their_quota_until_removed() -> crate::Result<()> {
         ledger.record_table(id, path.clone(), fs.clone());
         ledger.landed(&*fs, path)?;
     }
-    let kept = ledger.keep_uninstalled();
+    let kept = ledger.keep_uninstalled(tree_id, None);
     assert!(fs.exists(&stuck)? && fs.exists(&removed)?, "kept in place");
     assert_eq!(pool.quota_held(tree_id), 500, "held for what they take");
 
@@ -197,7 +197,7 @@ fn kept_outputs_hold_their_quota_until_removed() -> crate::Result<()> {
         )
         .on_path("tables/1"),
     );
-    kept.remove(tree_id, None);
+    kept.remove();
     injector.clear();
 
     assert!(fs.exists(&stuck)?, "the fixture must refuse the removal");

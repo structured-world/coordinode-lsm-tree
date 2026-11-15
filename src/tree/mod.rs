@@ -1213,6 +1213,10 @@ impl AbstractTree for Tree {
             folder.display(),
         );
 
+        // Every file the flush makes, until it hands them over as tables: a
+        // flush that fails removes them before it returns, as a compaction
+        // does, rather than leave them to the orphan sweep of the next open.
+        let outputs = crate::compaction::output_ledger::OutputLedger::for_cleanup();
         let table_writer = MultiWriter::from_pool(
             folder.clone(),
             Arc::clone(&self.table_files),
@@ -1221,184 +1225,199 @@ impl AbstractTree for Tree {
             0,
             level_fs.clone(),
             crate::fs::WriteOrigin::FlushTable,
-        )?;
-        // The flush's L0 recency, taken once its first file is: flushes are
-        // serialized, so it is above every table already flushed and below
-        // every one flushed later. A pooled file's id was taken when its batch
-        // was made and says nothing about when the table was written; a file
-        // made now carries an id taken now, which serves.
-        let recency = table_writer
-            .first_made_now()
-            .unwrap_or_else(|| self.table_id_counter.next());
-        let mut table_writer = table_writer
-            .set_comparator(self.config.comparator.clone())
-            .use_recency(Some(recency))
-            .use_data_block_restart_interval(data_block_restart_interval)
-            .use_index_block_restart_interval(index_block_restart_interval)
-            .use_data_block_compression(data_block_compression)
-            .use_index_block_compression(index_block_compression)
-            .use_data_block_size(data_block_size)
-            .use_index_partition_size(self.config.index_block_partition_size_policy.get(0))
-            .use_filter_partition_size(self.config.filter_block_partition_size_policy.get(0))
-            .use_row_group_size(self.config.columnar_row_group_size_policy.get(0))
-            .use_columnar_page_size(self.config.columnar_page_size_policy.get(0))
-            .use_column_encoding(self.config.column_encoding_policy.get(0))
-            .use_data_block_hash_ratio(data_block_hash_ratio);
+        )?
+        .use_output_ledger(outputs.clone());
+        let written = (move || -> crate::Result<_> {
+            // The flush's L0 recency, taken once its first file is: flushes are
+            // serialized, so it is above every table already flushed and below
+            // every one flushed later. A pooled file's id was taken when its batch
+            // was made and says nothing about when the table was written; a file
+            // made now carries an id taken now, which serves.
+            let recency = table_writer
+                .first_made_now()
+                .unwrap_or_else(|| self.table_id_counter.next());
+            let mut table_writer = table_writer
+                .set_comparator(self.config.comparator.clone())
+                .use_recency(Some(recency))
+                .use_data_block_restart_interval(data_block_restart_interval)
+                .use_index_block_restart_interval(index_block_restart_interval)
+                .use_data_block_compression(data_block_compression)
+                .use_index_block_compression(index_block_compression)
+                .use_data_block_size(data_block_size)
+                .use_index_partition_size(self.config.index_block_partition_size_policy.get(0))
+                .use_filter_partition_size(self.config.filter_block_partition_size_policy.get(0))
+                .use_row_group_size(self.config.columnar_row_group_size_policy.get(0))
+                .use_columnar_page_size(self.config.columnar_page_size_policy.get(0))
+                .use_column_encoding(self.config.column_encoding_policy.get(0))
+                .use_data_block_hash_ratio(data_block_hash_ratio);
 
-        let bloom_policy = {
-            use crate::config::FilterPolicyEntry::{Bloom, None};
-            use crate::table::filter::BloomConstructionPolicy;
+            let bloom_policy = {
+                use crate::config::FilterPolicyEntry::{Bloom, None};
+                use crate::table::filter::BloomConstructionPolicy;
 
-            match self.config.filter_policy.get(0) {
-                Bloom(policy) => policy,
-                None => BloomConstructionPolicy::BitsPerKey(0.0),
-            }
-        };
-        table_writer = table_writer.use_bloom_policy(bloom_policy);
-        let filter_sizing = self.new_data_filter_sizing(
-            0,
-            bloom_policy,
-            crate::filter_budget::FilterCount { keys, hashes },
-            rc.ecc_scheme,
-        );
-        table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
-
-        if index_partitioning {
-            // Size-adaptive: single-level index for small SSTs (where pinning
-            // the whole index is cheap and a two-level lookup is pure overhead),
-            // spilling to a partitioned index only once the index grows past the
-            // threshold. Recovers the point-read cost of an unconditional
-            // two-level index on small/medium SSTs.
-            table_writer = table_writer.use_adaptive_index(
-                self.config
-                    .index_spill_threshold(0, rc.index_partition_spill_threshold),
+                match self.config.filter_policy.get(0) {
+                    Bloom(policy) => policy,
+                    None => BloomConstructionPolicy::BitsPerKey(0.0),
+                }
+            };
+            table_writer = table_writer.use_bloom_policy(bloom_policy);
+            let filter_sizing = self.new_data_filter_sizing(
+                0,
+                bloom_policy,
+                crate::filter_budget::FilterCount { keys, hashes },
+                rc.ecc_scheme,
             );
-        }
-        if filter_partitioning {
-            table_writer = table_writer.use_partitioned_filter();
-        } else if let Some(limit) = self.config.whole_filter_limit(0) {
-            table_writer = table_writer.use_whole_filter_up_to(limit);
-        }
+            table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
 
-        table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
-        table_writer = table_writer.use_key_domains(self.config.key_domains.clone());
-        table_writer = table_writer.use_encryption(self.config.encryption.clone());
-        table_writer = table_writer.use_clock(self.config.clock.clone());
-        // ECC scheme from the live runtime snapshot (same as `seqno_in_index`
-        // / `kv_checksums` below), so a flush after a scheme change writes the
-        // SST with the current scheme rather than the startup one.
-        table_writer = table_writer.use_page_ecc(self.config.page_ecc, rc.ecc_scheme);
-        table_writer = table_writer
-            .use_sync_mode(self.config.sync_mode)
-            .use_durability(self.config.flush_durability)
-            .use_writeback_bytes(self.config.writeback_bytes);
-
-        table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
-        table_writer = table_writer.use_zone_map(rc.zone_map);
-        table_writer = table_writer.use_columnar(rc.columnar);
-        table_writer = table_writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
-        // `Off` (default) emits no per-KV footer and leaves the data-block
-        // payload encoding unchanged (the V5 header carries a block_flags byte
-        // and the meta block a descriptor key regardless, so the on-disk bytes
-        // are not identical to a pre-V5 table).
-        table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
-        // Flush writes level 0; resolve that level's locator policy entry.
-        table_writer = table_writer.use_locator(self.config.locator_policy.get(0));
-
-        // The dictionary THIS snapshot's policy names. The flush holds the
-        // snapshot until its tables are installed: a collection spares what a
-        // held snapshot names, however the policy has changed since.
-        #[cfg(zstd_any)]
-        {
-            table_writer = table_writer
-                .use_zstd_dictionary(
+            if index_partitioning {
+                // Size-adaptive: single-level index for small SSTs (where pinning
+                // the whole index is cheap and a two-level lookup is pure overhead),
+                // spilling to a partitioned index only once the index grows past the
+                // threshold. Recovers the point-read cost of an unconditional
+                // two-level index on small/medium SSTs.
+                table_writer = table_writer.use_adaptive_index(
                     self.config
-                        .current_zstd_dictionaries()
-                        .for_compression(data_block_compression)?,
-                )
-                .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
-        }
-        let write_pin = crate::runtime_config::WritePin::new(&rc).with_filter_sizing(filter_sizing);
+                        .index_spill_threshold(0, rc.index_partition_spill_threshold),
+                );
+            }
+            if filter_partitioning {
+                table_writer = table_writer.use_partitioned_filter();
+            } else if let Some(limit) = self.config.whole_filter_limit(0) {
+                table_writer = table_writer.use_whole_filter_up_to(limit);
+            }
 
-        // Parallel block compression for the flush writer, on the same pool the
-        // compaction writers use. Engaged only when the per-block transform does
-        // real CPU work (a codec, encryption, or page ECC): with the identity
-        // transform the pipeline's owned buffer + queue hop per block buys
-        // nothing over the serial reusable-buffer path. Safe wherever the host
-        // runs this flush — even on a thread of an injected pool — because the
-        // pipeline's help-first drain executes queued jobs inline instead of
-        // waiting on a saturated pool (see `parallel_compressor`).
-        #[cfg(feature = "std")]
-        {
-            let transform_does_work = data_block_compression != crate::CompressionType::None
-                || self.config.encryption.is_some()
-                || self.config.page_ecc;
-            if transform_does_work {
-                table_writer =
-                    table_writer.use_parallel_compression(self.config.parallel_compression());
+            table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
+            table_writer = table_writer.use_key_domains(self.config.key_domains.clone());
+            table_writer = table_writer.use_encryption(self.config.encryption.clone());
+            table_writer = table_writer.use_clock(self.config.clock.clone());
+            // ECC scheme from the live runtime snapshot (same as `seqno_in_index`
+            // / `kv_checksums` below), so a flush after a scheme change writes the
+            // SST with the current scheme rather than the startup one.
+            table_writer = table_writer.use_page_ecc(self.config.page_ecc, rc.ecc_scheme);
+            table_writer = table_writer
+                .use_sync_mode(self.config.sync_mode)
+                .use_durability(self.config.flush_durability)
+                .use_writeback_bytes(self.config.writeback_bytes);
+
+            table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
+            table_writer = table_writer.use_zone_map(rc.zone_map);
+            table_writer = table_writer.use_columnar(rc.columnar);
+            table_writer = table_writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
+            // `Off` (default) emits no per-KV footer and leaves the data-block
+            // payload encoding unchanged (the V5 header carries a block_flags byte
+            // and the meta block a descriptor key regardless, so the on-disk bytes
+            // are not identical to a pre-V5 table).
+            table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
+            // Flush writes level 0; resolve that level's locator policy entry.
+            table_writer = table_writer.use_locator(self.config.locator_policy.get(0));
+
+            // The dictionary THIS snapshot's policy names. The flush holds the
+            // snapshot until its tables are installed: a collection spares what a
+            // held snapshot names, however the policy has changed since.
+            #[cfg(zstd_any)]
+            {
+                table_writer = table_writer
+                    .use_zstd_dictionary(
+                        self.config
+                            .current_zstd_dictionaries()
+                            .for_compression(data_block_compression)?,
+                    )
+                    .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
+            }
+            let write_pin =
+                crate::runtime_config::WritePin::new(&rc).with_filter_sizing(filter_sizing);
+
+            // Parallel block compression for the flush writer, on the same pool the
+            // compaction writers use. Engaged only when the per-block transform does
+            // real CPU work (a codec, encryption, or page ECC): with the identity
+            // transform the pipeline's owned buffer + queue hop per block buys
+            // nothing over the serial reusable-buffer path. Safe wherever the host
+            // runs this flush — even on a thread of an injected pool — because the
+            // pipeline's help-first drain executes queued jobs inline instead of
+            // waiting on a saturated pool (see `parallel_compressor`).
+            #[cfg(feature = "std")]
+            {
+                let transform_does_work = data_block_compression != crate::CompressionType::None
+                    || self.config.encryption.is_some()
+                    || self.config.page_ecc;
+                if transform_does_work {
+                    table_writer =
+                        table_writer.use_parallel_compression(self.config.parallel_compression());
+                }
+            }
+
+            // Set range tombstones BEFORE writing KV items so that if MultiWriter
+            // rotates to a new table during the write loop, earlier tables already
+            // carry the RT metadata.
+            table_writer.set_range_tombstones(range_tombstones);
+
+            for item in stream {
+                table_writer.write(item?)?;
+            }
+
+            let written = table_writer.finish()?;
+            let entries_durable = written.entries_durable;
+
+            log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
+
+            let pin_filter = self.config.filter_block_pinning_policy.get(0);
+            let pin_index = self.config.index_block_pinning_policy.get(0);
+
+            // Load tables
+            let tables = written
+                .tables
+                .into_iter()
+                .map(|(table_id, checksum)| -> crate::Result<Table> {
+                    let mut params = crate::table::RecoverParams::new(
+                        folder.join(table_id.to_string()),
+                        checksum,
+                        table_id,
+                        level_fs.clone(),
+                        self.config.comparator.clone(),
+                        self.config.cache.clone(),
+                    );
+                    params.tree_id = self.id;
+                    params
+                        .descriptor_table
+                        .clone_from(&self.config.descriptor_table);
+                    params.pin_filter = pin_filter;
+                    params.pin_index = pin_index;
+                    params.encryption.clone_from(&self.config.encryption);
+                    params
+                        .prefix_extractor
+                        .clone_from(&self.config.prefix_extractor);
+                    #[cfg(zstd_any)]
+                    {
+                        params.zstd_dictionaries = self.config.current_zstd_dictionaries();
+                    }
+                    #[cfg(feature = "metrics")]
+                    {
+                        params.metrics = self.metrics.clone();
+                    }
+                    let table = Table::recover(params)?;
+                    if entries_durable {
+                        table.mark_entry_durable();
+                    }
+                    Ok(table)
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok((tables, write_pin))
+        })();
+
+        match written {
+            // Return Some even when tables is empty (RT-only flush): the
+            // caller (AbstractTree::flush) handles empty tables by
+            // re-inserting RTs into the active memtable and still needs to
+            // delete sealed memtables.
+            Ok((tables, write_pin)) => {
+                outputs.hand_over();
+                Ok(Some((tables, None, write_pin)))
+            }
+            Err(e) => {
+                outputs.remove_uninstalled(self.id, self.config.descriptor_table.as_deref());
+                Err(e)
             }
         }
-
-        // Set range tombstones BEFORE writing KV items so that if MultiWriter
-        // rotates to a new table during the write loop, earlier tables already
-        // carry the RT metadata.
-        table_writer.set_range_tombstones(range_tombstones);
-
-        for item in stream {
-            table_writer.write(item?)?;
-        }
-
-        let written = table_writer.finish()?;
-        let entries_durable = written.entries_durable;
-
-        log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
-
-        let pin_filter = self.config.filter_block_pinning_policy.get(0);
-        let pin_index = self.config.index_block_pinning_policy.get(0);
-
-        // Load tables
-        let tables = written
-            .tables
-            .into_iter()
-            .map(|(table_id, checksum)| -> crate::Result<Table> {
-                let mut params = crate::table::RecoverParams::new(
-                    folder.join(table_id.to_string()),
-                    checksum,
-                    table_id,
-                    level_fs.clone(),
-                    self.config.comparator.clone(),
-                    self.config.cache.clone(),
-                );
-                params.tree_id = self.id;
-                params
-                    .descriptor_table
-                    .clone_from(&self.config.descriptor_table);
-                params.pin_filter = pin_filter;
-                params.pin_index = pin_index;
-                params.encryption.clone_from(&self.config.encryption);
-                params
-                    .prefix_extractor
-                    .clone_from(&self.config.prefix_extractor);
-                #[cfg(zstd_any)]
-                {
-                    params.zstd_dictionaries = self.config.current_zstd_dictionaries();
-                }
-                #[cfg(feature = "metrics")]
-                {
-                    params.metrics = self.metrics.clone();
-                }
-                let table = Table::recover(params)?;
-                if entries_durable {
-                    table.mark_entry_durable();
-                }
-                Ok(table)
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-
-        // Return Some even when tables is empty (RT-only flush): the caller
-        // (AbstractTree::flush) handles empty tables by re-inserting RTs into
-        // the active memtable and still needs to delete sealed memtables.
-        Ok(Some((tables, None, write_pin)))
     }
 
     #[expect(clippy::significant_drop_tightening)]
@@ -1484,6 +1503,8 @@ impl AbstractTree for Tree {
                     )
                     .collect()
             });
+        // A failed install leaves the files with the caller's handles: the
+        // caller may register them again, or remove them.
         version_lock.upgrade_version_deferring(
             &self.config.path,
             |current| {
