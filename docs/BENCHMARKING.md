@@ -105,7 +105,11 @@ engine:
   of interval.
 
 An arm runs as many iterations per sample as fill 20 ms, and a group runs as
-many rounds as fit a 4-second budget, between ten and forty (ten is the fewest
+many rounds as fit a 4-second budget, both in wall time: an iteration costs
+its whole call, the setup it does outside the clock included (a write group
+copies its starting state and writes the host's files back before each timed
+write), while a sample records only the timed part. Between ten and forty
+rounds (ten is the fewest
 for which a 95% interval of the median exists at ranks 2 and 9), rounded to a
 multiple of the group's engine count so every engine takes every position
 equally often. Two runs of
