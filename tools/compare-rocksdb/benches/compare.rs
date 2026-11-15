@@ -988,7 +988,7 @@ fn run_write_throughput(
     compression: Compression,
     inputs: &WorkloadInputs,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
+    let dir = state_dir();
     let start = std::time::Instant::now();
     let elapsed = match engine {
         Engine::Ours | Engine::BlobTree(_) => {
@@ -1627,7 +1627,7 @@ impl SeedStates {
 /// A fresh directory holding a copy of the state at `seed`, on disk before it
 /// is returned (see [`settle`]).
 fn copy_of(seed: &Path) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = state_dir();
     copy_dir(seed, dir.path()).expect("copy seed state");
     settle(dir.path());
     dir
@@ -1647,11 +1647,61 @@ fn settle(root: &Path) {
     }
 }
 
-/// Commits the removal of a finished state, made in the system's temporary
-/// folder, before the next timed write: the removal is a metadata change the
-/// file system would otherwise write back with that write's own syncs.
+/// Commits the removal of a finished state, made under the run's state root,
+/// before the next timed write: the removal is a metadata change the file
+/// system would otherwise write back with that write's own syncs.
 fn settle_removal() {
-    sync_folder(&std::env::temp_dir()).expect("sync the temporary folder");
+    sync_folder(state_root()).expect("sync the state root");
+}
+
+/// The folder every state a run writes lies under, set once by `main` (see
+/// [`make_state_root`]).
+static STATE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The run's state root.
+fn state_root() -> &'static Path {
+    STATE_ROOT.get().expect("main sets the state root")
+}
+
+/// A new empty folder under the run's state root, for one engine's state.
+fn state_dir() -> tempfile::TempDir {
+    tempfile::tempdir_in(state_root()).expect("a state folder")
+}
+
+/// Makes the folder every state of a run lies under, with copy-on-write off
+/// (`chattr +C`), which every file and folder made under it inherits: both
+/// engines' files and the copies of their starting states. Our engine turns
+/// it off for its own files by default and the parity preset keeps that off,
+/// as RocksDB has no such setting; set on the folder, it holds for both. On
+/// Btrfs a copy-on-write file is also compressed by the file system when it
+/// is written back, a cost of the file system the comparison would otherwise
+/// time inside each engine's syncs. A file system without the flag (ext4)
+/// refuses it, and the run goes on as it is.
+fn make_state_root() -> tempfile::TempDir {
+    let root = tempfile::Builder::new()
+        .prefix("compare-rocksdb-")
+        .tempdir()
+        .expect("a state root");
+    #[cfg(target_os = "linux")]
+    match std::process::Command::new("chattr")
+        .arg("+C")
+        .arg(root.path())
+        .status()
+    {
+        Ok(status) if status.success() => eprintln!(
+            "compare-rocksdb: copy-on-write off under {}",
+            root.path().display()
+        ),
+        Ok(status) => eprintln!(
+            "compare-rocksdb: chattr +C on {} failed ({status}): files keep the file system's \
+             copy-on-write",
+            root.path().display()
+        ),
+        Err(e) => eprintln!(
+            "compare-rocksdb: chattr did not run ({e}): files keep the file system's copy-on-write"
+        ),
+    }
+    root
 }
 
 /// Syncs every file and folder under `path`, `path` included.
@@ -1685,7 +1735,7 @@ fn sync_folder(path: &Path) -> std::io::Result<()> {
 /// Writes the seed state for `key` into a new directory and closes the engine
 /// before returning, so the files are complete before anything copies them.
 fn write_seed(key: SeedKey, inputs: &WorkloadInputs) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("seed tempdir");
+    let dir = state_dir();
     match key.engine {
         Engine::Ours | Engine::BlobTree(_) => drop(populate_ours(
             dir.path(),
@@ -1851,7 +1901,7 @@ impl WarmEngine {
                 Self::RocksDb { db, _dir: dir }
             }
             Engine::SurrealKv => {
-                let dir = tempfile::tempdir().expect("tempdir");
+                let dir = state_dir();
                 let (rt, tree) = setup_surrealkv_warm(dir.path(), inputs)
                     .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                 Self::SurrealKv {
@@ -2350,7 +2400,7 @@ fn overwrite_variant(
                                 // First copy (untimed) so the timed pass
                                 // overwrites existing keys; SurrealKV is not
                                 // seeded (see `SeedStates`).
-                                let dir = tempfile::tempdir().expect("tempdir");
+                                let dir = state_dir();
                                 let (rt, tree) = setup_surrealkv_warm(dir.path(), inputs)
                                     .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                                 settle(dir.path());
@@ -2387,7 +2437,7 @@ fn overwrite_variant(
                             .expect("ours-deferred-wal: open");
                     // Beside the tree's folder, not in it: the engine owns
                     // what its folder holds.
-                    let wal_dir = tempfile::tempdir().expect("caller wal dir");
+                    let wal_dir = state_dir();
                     let mut wal =
                         CallerWal::create(&wal_dir.path().join("caller.wal")).expect("caller wal");
                     let start = std::time::Instant::now();
@@ -2652,7 +2702,7 @@ fn sustained_ours(
     keys: &[[u8; 16]],
     pool: &ValuePool,
 ) -> (Duration, SustainedSample) {
-    let dir = tempfile::tempdir().expect("ours sustained dir");
+    let dir = state_dir();
     let tree = ours_config(dir.path(), compression, blobs, IndexStrategy::Binary, false)
         .flush_durability(FlushDurability::Deferred)
         .open()
@@ -2867,7 +2917,7 @@ fn sustained_rocksdb(
     keys: &[[u8; 16]],
     pool: &ValuePool,
 ) -> (Duration, SustainedSample) {
-    let dir = tempfile::tempdir().expect("rocksdb sustained dir");
+    let dir = state_dir();
     let opts = rocksdb_sustained_options(compression, blob_files);
     let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb sustained: open");
     let mut write_opts = rocksdb::WriteOptions::default();
@@ -3205,7 +3255,7 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
             .engines_of(HEAD_TO_HEAD)
             .into_iter()
             .map(|engine| {
-                let dir = tempfile::tempdir().expect("compaction state tempdir");
+                let dir = state_dir();
                 write_compaction_state(engine, level, shape, &inputs, dir.path()).unwrap_or_else(
                     |e| panic!("compaction setup failed for {}: {e}", engine.label()),
                 );
@@ -3646,7 +3696,7 @@ fn check_rocksdb_blob_levels() {
         let Some(level) = codec.zstd_level() else {
             continue;
         };
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = state_dir();
         drop(
             rocksdb::DB::open(
                 &rocksdb_options(Compression::None, false, Some(codec)),
@@ -3682,6 +3732,11 @@ fn check_rocksdb_blob_levels() {
 }
 
 fn main() {
+    // Removed when the run ends, with every state still under it.
+    let root = make_state_root();
+    STATE_ROOT
+        .set(root.path().to_path_buf())
+        .expect("the state root is set once");
     let mut run = Run::from_args();
     check_rocksdb_blob_levels();
     let mode = if run.measuring {
