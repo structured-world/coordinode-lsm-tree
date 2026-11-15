@@ -285,6 +285,57 @@ fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()>
     Ok(())
 }
 
+/// A registration retried after an install of unknown outcome fails again,
+/// before it could supersede that install: the files stay, since a reopen
+/// after a power loss may still find the first install, and it reads every
+/// key.
+#[test]
+fn a_failed_retry_of_a_registration_keeps_the_tables_it_may_name() -> lsm_tree::Result<()> {
+    use lsm_tree::{InternalValue, ValueType};
+
+    let f = open(|c| c)?;
+    let stream = (0..KEYS).map(|i| {
+        Ok(InternalValue::from_components(
+            key(i),
+            value(i),
+            i,
+            ValueType::Value,
+        ))
+    });
+    let Some((tables, blob_files, pin)) = f.tree.flush_to_tables(stream)? else {
+        panic!("the stream holds keys");
+    };
+    f.injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .once(),
+    );
+    assert!(matches!(
+        f.tree
+            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false),
+        Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+    ));
+    f.injector.clear();
+    let written = files(&f.dir.path().join("tables"))?;
+
+    // The retry rotates: its snapshot fails to write, an ordinary error.
+    f.injector
+        .arm(FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path(".tmp"));
+    let retry = f
+        .tree
+        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false);
+    f.injector.clear();
+    assert!(
+        matches!(&retry, Err(e) if !matches!(e, lsm_tree::Error::InstallOutcomeUnknown(_))),
+        "the retry fails before it installs: {retry:?}"
+    );
+    drop(pin);
+    drop(tables);
+    let now = files(&f.dir.path().join("tables"))?;
+    assert_eq!(now, written, "the tables the first install may name stay");
+    Ok(())
+}
+
 /// A flush whose install may have happened keeps its files, since a reopen
 /// after a power loss may find them named; they go once a later install
 /// supersedes the unknown one.
