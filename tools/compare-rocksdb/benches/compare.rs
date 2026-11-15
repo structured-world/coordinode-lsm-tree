@@ -1060,7 +1060,7 @@ fn run_write_throughput(
         }
     };
     drop(dir);
-    settle();
+    settle_removal();
     Ok(elapsed)
 }
 
@@ -1629,27 +1629,57 @@ impl SeedStates {
 fn copy_of(seed: &Path) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     copy_dir(seed, dir.path()).expect("copy seed state");
-    settle();
+    settle(dir.path());
     dir
 }
 
-/// Writes out every dirty page and pending metadata change of the host's file
-/// systems, outside any timed window. Copying a starting state and removing a
-/// finished one leave tens of megabytes for the kernel to write back later;
-/// left alone, that write-back lands in the next engine's timed syncs, and in
-/// the write groups it doubled one engine's time while halving another's.
-///
-/// Windows has no command that writes back every file system, and flushing a
-/// volume needs administrator rights: there the harness runs without this
-/// step.
-fn settle() {
+/// Writes the files and folders under `root` to disk, and `root`'s entry in
+/// its folder, outside any timed window. Copying a starting state leaves tens
+/// of megabytes for the kernel to write back later; left alone, that
+/// write-back lands in the next engine's timed syncs, and in the write groups
+/// it doubled one engine's time while halving another's. Only what the
+/// harness wrote is synced: the host's other files are not this run's to
+/// write back, and a sync of every file system waits for them too.
+fn settle(root: &Path) {
+    sync_tree(root).expect("sync a starting state");
+    if let Some(parent) = root.parent() {
+        sync_folder(parent).expect("sync the folder of a starting state");
+    }
+}
+
+/// Commits the removal of a finished state, made in the system's temporary
+/// folder, before the next timed write: the removal is a metadata change the
+/// file system would otherwise write back with that write's own syncs.
+fn settle_removal() {
+    sync_folder(&std::env::temp_dir()).expect("sync the temporary folder");
+}
+
+/// Syncs every file and folder under `path`, `path` included.
+fn sync_tree(path: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_tree(&entry.path())?;
+        } else {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    sync_folder(path)
+}
+
+/// Syncs the folder `path`, which makes the names in it durable. Windows
+/// opens no folder as a file to sync it: a file's name there is durable with
+/// the file system's own log, and the step is skipped.
+fn sync_folder(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let status = std::process::Command::new("sync")
-            .status()
-            .expect("run sync");
-        assert!(status.success(), "sync failed: {status}");
+        std::fs::File::open(path)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Writes the seed state for `key` into a new directory and closes the engine
@@ -2323,7 +2353,7 @@ fn overwrite_variant(
                                 let dir = tempfile::tempdir().expect("tempdir");
                                 let (rt, tree) = setup_surrealkv_warm(dir.path(), inputs)
                                     .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
-                                settle();
+                                settle(dir.path());
                                 let start = std::time::Instant::now();
                                 let mut txn = tree.begin().expect("surrealkv: begin");
                                 for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
@@ -2338,7 +2368,7 @@ fn overwrite_variant(
                         }
                         // The engine and its folder are gone: their removal
                         // goes to disk before the next timed write.
-                        settle();
+                        settle_removal();
                     }
                     total
                 })
@@ -2371,7 +2401,7 @@ fn overwrite_variant(
                         .expect("ours-deferred-wal: overwrite flush");
                     total += start.elapsed();
                     drop((tree, wal, wal_dir, dir));
-                    settle();
+                    settle_removal();
                 }
                 total
             }));
@@ -3194,7 +3224,7 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
                             |e| panic!("compaction failed for {}: {e}", engine.label()),
                         );
                         drop(work);
-                        settle();
+                        settle_removal();
                     }
                     total
                 })
