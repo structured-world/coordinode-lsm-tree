@@ -222,6 +222,33 @@ fn prefetched_value(
         .map(|(_, value)| value.clone())
 }
 
+/// Finishes a flush's blob and table outputs side by side. Neither syncs (the
+/// install does), but a blob writer's finish still compresses its last frames,
+/// which is work the table's finish need not wait for.
+fn finish_flush(
+    blob_writer: BlobFileWriter,
+    table_writer: crate::table::multi_writer::MultiWriter,
+) -> (
+    crate::Result<Vec<BlobFile>>,
+    crate::Result<crate::table::multi_writer::Written>,
+) {
+    #[cfg(feature = "std")]
+    {
+        std::thread::scope(|scope| {
+            let blob = scope.spawn(|| blob_writer.finish());
+            let table = table_writer.finish();
+            let blob = blob
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (blob, table)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        (blob_writer.finish(), table_writer.finish())
+    }
+}
+
 pub(crate) fn resolve_value_handle(
     tree_id: TreeId,
     cache: &crate::Cache,
@@ -2672,9 +2699,7 @@ impl AbstractTree for BlobTree {
                 while write_ahead(ahead, &mut blob_writer, &mut table_writer)? {}
             }
 
-            // Neither finish syncs: the install does, for both at once.
-            let blob_files = blob_writer.finish();
-            let written = table_writer.finish();
+            let (blob_files, written) = finish_flush(blob_writer, table_writer);
             let blob_files = blob_files?;
             let written = written?;
             let entries_durable = written.entries_durable;
