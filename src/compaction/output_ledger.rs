@@ -268,6 +268,13 @@ pub(crate) struct KeptOutputs {
 }
 
 impl KeptOutputs {
+    /// Each kept file's backend and path.
+    pub(crate) fn files(&self) -> impl Iterator<Item = (&dyn Fs, &crate::path::Path)> {
+        self.files
+            .iter()
+            .map(|output| (&*output.fs, output.path.as_path()))
+    }
+
     /// Deletes the files, as [`OutputLedger::remove_uninstalled`] deletes
     /// uninstalled ones, and gives back the quota of each one gone.
     pub(crate) fn remove(self) {

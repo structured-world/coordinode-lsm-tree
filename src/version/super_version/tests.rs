@@ -236,23 +236,25 @@ fn a_rotation_failing_at_its_directory_sync_marks_the_next_to_rotate() -> crate:
     Ok(())
 }
 
-/// Outputs kept after an install of unknown outcome are superseded by the
-/// first rotation that succeeds after that install. When another install
-/// rotated before the outputs are handed over, they are superseded already
-/// and go at once; otherwise they wait for that rotation.
+/// Outputs kept after an install of unknown outcome wait for a rotation that
+/// counts them, even when another install rotated before they were handed
+/// over: that one synced its snapshot without knowing where they lie.
 #[test]
-fn kept_outputs_wait_only_for_the_rotation_after_their_install() {
+fn kept_outputs_wait_for_a_rotation_that_counts_them() -> crate::Result<()> {
     use crate::compaction::output_ledger::OutputLedger;
 
-    let mut history = history_at_floor(0);
+    let fs = crate::fs::MemFs::new();
+    let mut history = installed_history(&fs)?;
     // The failure's mark was cleared by a rotation before the handover.
     history.rotation_pending = false;
     history.keep_outputs(OutputLedger::default().keep_uninstalled(0, None));
-    assert!(history.kept_outputs.is_empty(), "superseded already");
+    assert_eq!(history.kept_outputs.len(), 1, "held");
+    assert!(history.rotation_pending, "the next install rotates");
 
-    history.rotation_pending = true;
-    history.keep_outputs(OutputLedger::default().keep_uninstalled(0, None));
-    assert_eq!(history.kept_outputs.len(), 1, "the rotation is next");
+    persist_next(&mut history, &fs)?;
+    assert!(history.kept_outputs.is_empty(), "the rotation removed them");
+    assert!(!history.rotation_pending);
+    Ok(())
 }
 
 #[test]
