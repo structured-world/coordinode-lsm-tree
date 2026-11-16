@@ -44,7 +44,7 @@ fn sync_through(ring: &mut IoUring, targets: &[SyncTarget<'_>]) -> io::Result<()
             // `StdFs::sync_directory_with` issues.
             SyncTarget::Folder { .. } => sync,
         };
-        push(ring, &sync.build().user_data(at as u64));
+        push(ring, &sync.build().user_data(at as u64))?;
     }
     let mut first_error = None;
     let mut reaped = 0;
@@ -71,14 +71,14 @@ fn sync_through(ring: &mut IoUring, targets: &[SyncTarget<'_>]) -> io::Result<()
     first_error.map_or(Ok(()), Err)
 }
 
-/// Queues `entry`. The ring has an entry for every target, so it is never
-/// full here.
-fn push(ring: &mut IoUring, entry: &squeue::Entry) {
+/// Queues `entry`. The ring has an entry for every target, so a full queue
+/// is no state a batch reaches; it is reported, not assumed away.
+fn push(ring: &mut IoUring, entry: &squeue::Entry) -> io::Result<()> {
     // SAFETY: the entry names a descriptor of `opened` in `sync_through`, open
     // until every entry is reaped (or the ring that holds them is dropped), and
     // carries no buffer.
     let pushed = unsafe { ring.submission().push(entry) };
-    pushed.expect("the ring has an entry for every target");
+    pushed.map_err(|_| io::Error::other("io_uring submission queue full"))
 }
 
 /// The file or folder `target` names, open for its sync.
