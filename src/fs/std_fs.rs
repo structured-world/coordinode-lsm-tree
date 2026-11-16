@@ -9,6 +9,9 @@ use crate::path::{Path, PathBuf};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use std::fs::{File, OpenOptions};
 
+#[cfg(io_uring_fs)]
+mod ring_sync;
+
 /// Delays between the attempts of a rename or delete that another process is
 /// briefly holding the file against, before the last error is returned: about
 /// half a second in all, longer than an antivirus or indexer scan of a fresh
@@ -531,6 +534,18 @@ impl Fs for StdFs {
         {
             let _ = path;
             Ok(())
+        }
+    }
+
+    #[cfg(io_uring_fs)]
+    fn sync_many(&self, targets: &[super::SyncTarget<'_>]) -> io::Result<()> {
+        if let [target] = targets {
+            return target.sync_alone(self);
+        }
+        match ring_sync::sync_on_ring(targets) {
+            Some(result) => result,
+            // No ring on this kernel (or none allowed): one thread per sync.
+            None => super::sync_each_target(self, targets),
         }
     }
 

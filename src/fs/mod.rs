@@ -512,6 +512,105 @@ pub enum SyncMode {
     Barrier,
 }
 
+/// One sync of a batch [`Fs::sync_many`] makes.
+// no-std: pure data type - borrowed paths, no allocator needed.
+#[derive(Clone, Copy, Debug)]
+pub enum SyncTarget<'a> {
+    /// The data and size of the file at `path`, opened for writing as
+    /// `origin`'s, synced as [`FsFile::sync_data_with`] syncs them.
+    FileData {
+        /// The file.
+        path: &'a Path,
+        /// What the file is written for, as its open names it.
+        origin: WriteOrigin,
+        /// The durability the sync reaches.
+        mode: SyncMode,
+    },
+    /// The entries of the folder at `path`, synced as
+    /// [`Fs::sync_directory_with`] syncs them.
+    Folder {
+        /// The folder.
+        path: &'a Path,
+        /// The durability the sync reaches.
+        mode: SyncMode,
+    },
+}
+
+impl SyncTarget<'_> {
+    /// Syncs this target alone through `fs`.
+    ///
+    /// # Errors
+    ///
+    /// The error the open or the sync returned.
+    pub fn sync_alone<F: Fs + ?Sized>(&self, fs: &F) -> io::Result<()> {
+        match *self {
+            Self::FileData { path, origin, mode } => {
+                let file = fs.open(path, &FsOpenOptions::new().write(true).write_origin(origin))?;
+                file.sync_data_with(mode)
+            }
+            Self::Folder { path, mode } => fs.sync_directory_with(path, mode),
+        }
+    }
+}
+
+/// [`Fs::sync_many`] by one call per target: the files side by side on
+/// threads of their own (one after another without `std`), then the folders.
+///
+/// # Errors
+///
+/// The first error a target's sync returned, once every file sync has ended.
+pub(crate) fn sync_each_target<F: Fs + ?Sized>(
+    fs: &F,
+    targets: &[SyncTarget<'_>],
+) -> io::Result<()> {
+    let (files, folders): (Vec<&SyncTarget<'_>>, Vec<&SyncTarget<'_>>) = targets
+        .iter()
+        .partition(|target| matches!(target, SyncTarget::FileData { .. }));
+    sync_side_by_side(fs, &files)?;
+    for folder in folders {
+        folder.sync_alone(fs)?;
+    }
+    Ok(())
+}
+
+/// Syncs `files` on threads of their own, at most a few at once.
+#[cfg(feature = "std")]
+fn sync_side_by_side<F: Fs + ?Sized>(fs: &F, files: &[&SyncTarget<'_>]) -> io::Result<()> {
+    /// Syncs in flight at once: enough for a journal commit to fold a
+    /// barrier's worth of them, few enough to stay a handful of threads.
+    const IN_FLIGHT: usize = 16;
+
+    if let [file] = files {
+        return file.sync_alone(fs);
+    }
+    let next = core::sync::atomic::AtomicUsize::new(0);
+    let failed: parking_lot::Mutex<Option<io::Error>> = parking_lot::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..files.len().min(IN_FLIGHT) {
+            scope.spawn(|| {
+                while let Some(file) =
+                    files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
+                {
+                    if let Err(e) = file.sync_alone(fs) {
+                        failed.lock().get_or_insert(e);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    failed.into_inner().map_or(Ok(()), Err)
+}
+
+/// Syncs `files` one after another: no threads without `std`.
+#[cfg(not(feature = "std"))]
+fn sync_side_by_side<F: Fs + ?Sized>(fs: &F, files: &[&SyncTarget<'_>]) -> io::Result<()> {
+    for file in files {
+        file.sync_alone(fs)?;
+    }
+    Ok(())
+}
+
 /// Filesystem operations on an open file handle.
 ///
 /// Extends [`Read`] + [`Write`] + [`Seek`] with persistence and
@@ -1741,6 +1840,25 @@ pub trait Fs: Send + Sync + 'static {
     fn sync_device(&self, path: &Path) -> io::Result<()> {
         let _ = path;
         Ok(())
+    }
+
+    /// Makes every target of `targets` durable, as one call per target would
+    /// ([`FsFile::sync_data_with`] on the file opened for writing,
+    /// [`Fs::sync_directory_with`] on the folder), and returns once all of
+    /// them are. The targets are independent: none waits for another.
+    ///
+    /// The default syncs the files side by side on threads of their own,
+    /// then the folders. The std backend on Linux submits all of them from
+    /// the calling thread to one `io_uring`: they run side by side all the
+    /// same, and an I/O scheduler that serves each thread's I/O in turn (BFQ)
+    /// does not idle between them.
+    ///
+    /// # Errors
+    ///
+    /// The first error any target's sync returned; every other target has
+    /// been waited out by then.
+    fn sync_many(&self, targets: &[SyncTarget<'_>]) -> io::Result<()> {
+        sync_each_target(self, targets)
     }
 
     /// Returns `Ok(true)` if a file or directory exists at `path`.

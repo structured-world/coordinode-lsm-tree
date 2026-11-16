@@ -1525,34 +1525,36 @@ impl AbstractTree for Tree {
                     .version_history
                     .write()
                     .serial_syncs(&*self.config.fs, &self.config.path);
+                let self_described =
+                    !tables.is_empty() && tables.iter().all(|table| table.metadata.flush.is_some());
+                // A self-described flush owes no later persist: its tables'
+                // names are made durable here too, each folder on the backend
+                // holding it (a routed level lies on another one than the
+                // tree folder), in the batch that syncs the files.
+                let folders: Vec<(&Arc<dyn crate::fs::Fs>, &Path)> = if self_described {
+                    tables
+                        .iter()
+                        .filter(|table| !table.entry_durable())
+                        .filter_map(|table| Some((&table.fs, table.path.parent()?)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 crate::version::SuperVersions::sync_files(
                     &unsynced,
+                    &folders,
                     self.config.sync_mode,
                     serial,
                 )?;
-                let self_described =
-                    !tables.is_empty() && tables.iter().all(|table| table.metadata.flush.is_some());
                 if self_described {
-                    // No later persist is owed for them: their names are
-                    // made durable here too.
-                    // Each on the backend holding it: a routed level lies on
-                    // another one than the tree folder.
-                    let mut folders: Vec<(&Arc<dyn crate::fs::Fs>, &Path)> = Vec::new();
-                    for table in tables {
-                        if let Some(folder) = table.path.parent()
-                            && !table.entry_durable()
-                            && !folders
-                                .iter()
-                                .any(|(fs, at)| Arc::ptr_eq(fs, &table.fs) && *at == folder)
-                        {
-                            folders.push((&table.fs, folder));
+                    for table in tables.iter().filter(|table| !table.entry_durable()) {
+                        if let Some(folder) = table.path.parent() {
+                            self.table_files.synced_with(folder, &table.fs, table.id());
                         }
+                        table.mark_entry_durable();
                     }
-                    for (fs, folder) in folders {
-                        let mode =
-                            crate::file::folder_sync_mode(&**fs, folder, self.config.sync_mode);
-                        crate::file::fsync_directory(folder, &**fs, mode)?;
-                    }
+                }
+                if self_described {
                     crate::version::NewFiles::SelfDescribed
                 } else {
                     crate::version::NewFiles::Synced

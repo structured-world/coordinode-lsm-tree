@@ -286,14 +286,13 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
     }
 }
 
-/// Over a run of flushes the default pool, refilled off the flushing thread,
+/// Over a run of flushes the default pool, refilled on the flushing thread,
 /// syncs the tables folder once per batch, where 33 flushes without a pool
-/// sync it 33 times. The first flush finds the pool dry: its install syncs
-/// the folder for the file made for it, and the first batch is made and
-/// synced. From there a flush that leaves half a batch starts the next one:
-/// the 9th and the 25th. Every flush syncs its table and its edit either
-/// way, and no edit. The refills are waited for before each count, so each
-/// lands on the flush that started it.
+/// sync it 33 times. A flush that finds the pool dry makes a batch, takes its
+/// first file, and its install syncs the folder among its own syncs, which
+/// makes the whole batch durable: the 1st, the 17th and the 33rd. The flushes
+/// between take a pooled file and sync no folder. Every flush syncs its table
+/// either way, and no edit.
 #[test]
 fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
     const FLUSHES: u64 = 33;
@@ -334,7 +333,7 @@ fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
         let expected: Vec<u64> = if pool == 0 {
             (1..=FLUSHES).collect()
         } else {
-            vec![1, 1, 9, 25]
+            vec![1, 17, 33]
         };
         assert_eq!(folder_syncs, expected, "pool {pool}");
     }

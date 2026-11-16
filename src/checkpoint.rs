@@ -787,6 +787,7 @@ pub(crate) fn run_checkpoint<T: AbstractTree>(
         let config = tree.tree_config();
         crate::version::SuperVersions::sync_files(
             &unsynced,
+            &[],
             sync_mode,
             config.fs.capabilities(&config.path).serial_syncs,
         )?;

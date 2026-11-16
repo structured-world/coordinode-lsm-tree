@@ -1029,17 +1029,17 @@ impl Table {
         self.0.l0_recency
     }
 
-    /// Records that the directory entry naming this table's file was durable
-    /// before the table was written into it.
+    /// Records that the directory entry naming this table's file is durable:
+    /// it was before the table was written into it, or the install that wrote
+    /// it synced the folder.
     pub(crate) fn mark_entry_durable(&self) {
         self.0
             .entry_durable
             .store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether the directory entry naming this table's file was durable before
-    /// the table was written into it, so the install that names it need not
-    /// sync its folder.
+    /// Whether the directory entry naming this table's file is known durable,
+    /// so an install that names it need not sync its folder.
     #[must_use]
     pub(crate) fn entry_durable(&self) -> bool {
         self.0

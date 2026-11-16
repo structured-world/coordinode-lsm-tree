@@ -347,6 +347,7 @@ impl TreeInner {
         if !pending.is_empty() {
             SuperVersions::sync_files(
                 &pending,
+                &[],
                 self.config.sync_mode,
                 self.config.fs.capabilities(&self.config.path).serial_syncs,
             )?;

@@ -34,25 +34,38 @@ fn exists(fs: &Arc<dyn Fs>, folder: &Path, id: TableId) -> crate::Result<bool> {
     Ok(fs.exists(&folder.join(id.to_string()))?)
 }
 
-/// The first claim makes a batch with one folder sync and hands out its
-/// lowest id, durable by name; the claims after it use the batch, syncing
-/// nothing, until it runs out.
+/// The first claim makes a batch without syncing its folder and hands out its
+/// lowest id with the entry not yet durable: the install of its table syncs
+/// the folder among its own syncs, on the writer's thread. The next claim
+/// syncs the folder once (the batch may have no install behind it yet) and
+/// hands out durable entries; the claims after it sync nothing until the
+/// batch runs out. One folder sync per batch on the claims, none on a thread
+/// of the pool's own.
 #[test]
 fn claims_use_one_folder_sync_per_batch() -> crate::Result<()> {
     let (pools, fault, fs, folder) = pools(3)?;
 
+    let claimed = pools.claim(&folder, &fs, None, true)?;
+    assert_eq!(claimed.id, 0, "the batch's lowest id");
+    assert!(
+        !claimed.durable_entry,
+        "the claim that made the batch leaves its folder to the install"
+    );
+    assert_eq!(directory_syncs(&fault), 0, "making the batch syncs nothing");
+
     let mut ids = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         let claimed = pools.claim(&folder, &fs, None, true)?;
         assert!(claimed.durable_entry, "a pooled file's entry is durable");
         ids.push(claimed.id);
     }
-    assert_eq!(ids, vec![0, 1, 2], "ascending, in the order made");
+    assert_eq!(ids, vec![1, 2], "ascending, in the order made");
     assert_eq!(directory_syncs(&fault), 1, "one sync for the batch");
 
     let claimed = pools.claim(&folder, &fs, None, true)?;
     assert_eq!(claimed.id, 3);
-    assert_eq!(directory_syncs(&fault), 1, "a new batch, synced once");
+    assert!(!claimed.durable_entry, "a new batch, left to its install");
+    assert_eq!(directory_syncs(&fault), 0, "a new batch syncs nothing");
     for id in 4..6 {
         assert!(exists(&fs, &folder, id)?, "the rest of the batch is pooled");
     }
@@ -85,8 +98,15 @@ fn a_claim_above_every_pooled_id_makes_a_new_batch() -> crate::Result<()> {
 
     let claimed = pools.claim(&folder, &fs, Some(1), true)?;
     assert_eq!(claimed.id, 2, "the new batch's first id");
-    assert!(claimed.durable_entry);
-    assert_eq!(directory_syncs(&fault), 1, "the new batch's sync");
+    assert!(
+        !claimed.durable_entry,
+        "the new batch's folder is the install's to sync"
+    );
+    assert_eq!(
+        directory_syncs(&fault),
+        0,
+        "making the new batch syncs nothing"
+    );
     Ok(())
 }
 
@@ -732,16 +752,23 @@ fn a_write_that_runs_the_pool_dry_makes_its_further_files() -> crate::Result<()>
     for may_refill in [true, false, false, false] {
         durable.push(pools.claim(&folder, &fs, None, may_refill)?.durable_entry);
     }
-    assert_eq!(durable, vec![true, true, false, false]);
+    assert_eq!(
+        durable,
+        vec![false, true, false, false],
+        "the batch's first file is its install's to sync, the second synced by its claim"
+    );
     assert_eq!(directory_syncs(&fault), 1, "the first batch alone");
     Ok(())
 }
 
-/// A batch whose folder sync fails stays pooled, its entries not known
-/// durable: the next claim syncs the folder before handing one out.
+/// A folder sync a claim makes for a batch that fails leaves the batch
+/// pooled, its entries not known durable: the next claim syncs the folder
+/// again before handing one out.
 #[test]
 fn a_batch_whose_sync_failed_is_synced_by_the_next_claim() -> crate::Result<()> {
-    let (pools, fault, fs, folder) = pools(2)?;
+    let (pools, fault, fs, folder) = pools(3)?;
+    let made = pools.claim(&folder, &fs, None, true)?;
+    assert!(!made.durable_entry, "the batch is not synced when made");
     fault.injector().arm(
         FaultRule::new(
             FaultOp::SyncDirectory,
@@ -753,7 +780,7 @@ fn a_batch_whose_sync_failed_is_synced_by_the_next_claim() -> crate::Result<()> 
     directory_syncs(&fault);
 
     let claimed = pools.claim(&folder, &fs, None, true)?;
-    assert_eq!(claimed.id, 0, "the batch made before the failure");
+    assert_eq!(claimed.id, 1, "the batch made before the failure");
     assert!(claimed.durable_entry);
     assert_eq!(directory_syncs(&fault), 1, "synced before it is used");
     Ok(())

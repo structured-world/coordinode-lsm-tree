@@ -165,21 +165,12 @@ impl UnsyncedFile {
         }
     }
 
-    /// Syncs the file's data and size, all a read of it needs.
-    fn sync(&self, sync_mode: SyncMode) -> crate::Result<()> {
-        let origin = match self {
+    /// What the file was written for, as the open that syncs it names it.
+    fn origin(&self) -> crate::fs::WriteOrigin {
+        match self {
             Self::Table(_) => crate::fs::WriteOrigin::FlushTable,
             Self::Blob(_) => crate::fs::WriteOrigin::FlushBlob,
-        };
-        let (fs, path) = self.location();
-        let file = fs.open(
-            path,
-            &crate::fs::FsOpenOptions::new()
-                .write(true)
-                .write_origin(origin),
-        )?;
-        crate::fs::FsFile::sync_data_with(&*file, sync_mode)?;
-        Ok(())
+        }
     }
 
     /// Whether `other` is the same file.
@@ -791,7 +782,7 @@ impl SuperVersions {
             let serial = self.serial_syncs(fs, tree_path);
             // Kept until the persist succeeds: a failure leaves them for the
             // next one to sync again.
-            Self::sync_files(&self.unsynced_named_by(next), self.sync_mode, serial)?;
+            Self::sync_files(&self.unsynced_named_by(next), &[], self.sync_mode, serial)?;
         }
         sync_new_table_directories(&persisted, next, tree_path, fs, self.sync_mode)?;
         // Outputs are kept only while the next persist rotates, which removes
@@ -831,31 +822,79 @@ impl SuperVersions {
             .get_or_insert_with(|| fs.capabilities(tree_path).serial_syncs)
     }
 
-    /// Syncs `files`, then each folder their blob files lie in, once. A
-    /// deferred table's folder is synced by the persist, with the folders of
-    /// every table it adds (`sync_new_table_directories`). `serial`: one file
-    /// at a time (see [`FsCapabilities::serial_syncs`](crate::fs::FsCapabilities::serial_syncs)).
+    /// Syncs `files`, each folder their blob files lie in, and `folders`
+    /// (each on the backend given with it), every one once. A deferred
+    /// table's folder is synced by the persist, with the folders of every
+    /// table it adds (`sync_new_table_directories`).
+    ///
+    /// The syncs on one backend go to it as one batch
+    /// ([`Fs::sync_many`]), which runs them side by side: syncs of separate
+    /// files on one file system are committed together (a journaling file
+    /// system folds them into one journal commit), so a barrier over many
+    /// deferred flushes waits about as long as for one. `serial`: one at a
+    /// time instead (see [`FsCapabilities::serial_syncs`](crate::fs::FsCapabilities::serial_syncs)).
     pub(crate) fn sync_files(
         files: &[UnsyncedFile],
+        folders: &[(&Arc<dyn Fs>, &Path)],
         sync_mode: SyncMode,
         serial: bool,
     ) -> crate::Result<()> {
-        Self::sync_each(files, sync_mode, serial)?;
-        let mut blob_folders: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
+        // Every sync, with the backend it goes to.
+        let mut syncs: Vec<(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)> = Vec::new();
+        let mut named_folders: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
         for file in files {
             let (file_fs, path) = file.location();
+            syncs.push((
+                file_fs,
+                crate::fs::SyncTarget::FileData {
+                    path,
+                    origin: file.origin(),
+                    mode: sync_mode,
+                },
+            ));
             if matches!(file, UnsyncedFile::Blob(_))
                 && let Some(folder) = path.parent()
-                && !blob_folders
-                    .iter()
-                    .any(|(fs, at)| Arc::ptr_eq(fs, file_fs) && *at == folder)
             {
-                blob_folders.push((file_fs, folder));
+                named_folders.push((file_fs, folder));
             }
         }
-        for (fs, folder) in blob_folders {
-            let mode = crate::file::folder_sync_mode(&**fs, folder, sync_mode);
-            crate::file::fsync_directory(folder, &**fs, mode)?;
+        named_folders.extend_from_slice(folders);
+        let mut synced_folders: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
+        for (fs, folder) in named_folders {
+            if synced_folders
+                .iter()
+                .any(|(known, at)| Arc::ptr_eq(known, fs) && *at == folder)
+            {
+                continue;
+            }
+            synced_folders.push((fs, folder));
+            syncs.push((
+                fs,
+                crate::fs::SyncTarget::Folder {
+                    path: folder,
+                    mode: crate::file::folder_sync_mode(&**fs, folder, sync_mode),
+                },
+            ));
+        }
+        if serial {
+            for (fs, target) in &syncs {
+                target.sync_alone(&***fs)?;
+            }
+            return Ok(());
+        }
+        // One batch per backend, in the order the backends are first named.
+        let mut done: Vec<&Arc<dyn Fs>> = Vec::new();
+        for (fs, _) in &syncs {
+            if done.iter().any(|known| Arc::ptr_eq(known, fs)) {
+                continue;
+            }
+            done.push(fs);
+            let targets: Vec<crate::fs::SyncTarget<'_>> = syncs
+                .iter()
+                .filter(|(on, _)| Arc::ptr_eq(on, fs))
+                .map(|(_, target)| *target)
+                .collect();
+            fs.sync_many(&targets)?;
         }
         Ok(())
     }
@@ -875,52 +914,6 @@ impl SuperVersions {
             )
             .map(crate::Table::get_highest_seqno)
             .max()
-    }
-
-    /// Syncs every file of `files`, concurrently: syncs of separate files on
-    /// one file system are committed together (a journaling file system
-    /// folds them into one journal commit), so a barrier over many deferred
-    /// flushes waits about as long as for one, where one after another each
-    /// would wait its own commit out.
-    #[cfg(feature = "std")]
-    fn sync_each(files: &[UnsyncedFile], sync_mode: SyncMode, serial: bool) -> crate::Result<()> {
-        /// Syncs in flight at once: enough for a journal commit to fold a
-        /// barrier's worth of them, few enough to stay a handful of threads.
-        const IN_FLIGHT: usize = 16;
-
-        if serial || files.len() == 1 {
-            for file in files {
-                file.sync(sync_mode)?;
-            }
-            return Ok(());
-        }
-        let next = core::sync::atomic::AtomicUsize::new(0);
-        let failed: parking_lot::Mutex<Option<crate::Error>> = parking_lot::Mutex::new(None);
-        std::thread::scope(|scope| {
-            for _ in 0..files.len().min(IN_FLIGHT) {
-                scope.spawn(|| {
-                    while let Some(file) =
-                        files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
-                    {
-                        if let Err(e) = file.sync(sync_mode) {
-                            failed.lock().get_or_insert(e);
-                            return;
-                        }
-                    }
-                });
-            }
-        });
-        failed.into_inner().map_or(Ok(()), Err)
-    }
-
-    /// Syncs every file of `files`, one after another: no threads without
-    /// `std`.
-    #[cfg(not(feature = "std"))]
-    fn sync_each(files: &[UnsyncedFile], sync_mode: SyncMode, _serial: bool) -> crate::Result<()> {
-        for file in files {
-            file.sync(sync_mode)?;
-        }
-        Ok(())
     }
 
     /// The files deferred flushes left unsynced, for a caller to sync before
