@@ -398,6 +398,11 @@ pub struct SuperVersions {
     /// version persist this history performs. Immutable for the tree's life.
     sync_mode: SyncMode,
 
+    /// Whether the backend syncs files one at a time
+    /// ([`FsCapabilities::serial_syncs`](crate::fs::FsCapabilities::serial_syncs)),
+    /// asked at the first persist: the backend does not change under a tree.
+    serial_syncs: Option<bool>,
+
     /// Version id of the installed on-disk snapshot. Each version upgrade
     /// appends a [`VersionEdit`](crate::version::edit::VersionEdit) to the log
     /// `edits-{snapshot_id}` instead of rewriting the whole manifest; once that
@@ -527,6 +532,7 @@ impl SuperVersions {
             unsynced: Vec::new(),
             comparator_name,
             sync_mode,
+            serial_syncs: None,
             snapshot_id,
             log_rotate_bytes,
             log_bytes: None,
@@ -834,14 +840,17 @@ impl SuperVersions {
         alongside: &[UnsyncedFile],
     ) -> crate::Result<()> {
         let persisted = self.persisted.clone();
+        let serial = *self
+            .serial_syncs
+            .get_or_insert_with(|| fs.capabilities(tree_path).serial_syncs);
         if !self.unsynced.is_empty() {
             // Kept until the persist succeeds: a failure leaves them for the
             // next one to sync again.
-            Self::sync_files(&self.unsynced_named_by(next), self.sync_mode)?;
+            Self::sync_files(&self.unsynced_named_by(next), self.sync_mode, serial)?;
         }
         let sync_mode = self.sync_mode;
         let sync_new = || -> crate::Result<()> {
-            Self::sync_files(alongside, sync_mode)?;
+            Self::sync_files(alongside, sync_mode, serial)?;
             sync_new_table_directories(&persisted, next, tree_path, fs, sync_mode)
         };
         // Outputs are kept only while the next persist rotates, which removes
@@ -855,12 +864,17 @@ impl SuperVersions {
             self.sync_mode,
         );
         // A file the edit cannot name is synced before it, with the rest, and
-        // so is every file without threads to sync them beside the edit.
+        // so is every file without threads to sync them beside the edit, or
+        // on a backend whose syncs go one at a time.
         #[cfg(feature = "std")]
-        let files: Option<Vec<_>> = alongside
-            .iter()
-            .map(UnsyncedFile::alongside)
-            .collect::<crate::Result<_>>()?;
+        let files: Option<Vec<_>> = if serial {
+            None
+        } else {
+            alongside
+                .iter()
+                .map(UnsyncedFile::alongside)
+                .collect::<crate::Result<_>>()?
+        };
         #[cfg(not(feature = "std"))]
         let files: Option<Vec<super::edit::AlongsideFile>> = None;
         let alongside_job = match files {
@@ -890,9 +904,14 @@ impl SuperVersions {
 
     /// Syncs `files`, then each folder their blob files lie in, once. A
     /// deferred table's folder is synced by the persist, with the folders of
-    /// every table it adds (`sync_new_table_directories`).
-    pub(crate) fn sync_files(files: &[UnsyncedFile], sync_mode: SyncMode) -> crate::Result<()> {
-        Self::sync_each(files, sync_mode)?;
+    /// every table it adds (`sync_new_table_directories`). `serial`: one file
+    /// at a time (see [`FsCapabilities::serial_syncs`](crate::fs::FsCapabilities::serial_syncs)).
+    pub(crate) fn sync_files(
+        files: &[UnsyncedFile],
+        sync_mode: SyncMode,
+        serial: bool,
+    ) -> crate::Result<()> {
+        Self::sync_each(files, sync_mode, serial)?;
         let mut blob_folders: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
         for file in files {
             let (file_fs, path) = file.location();
@@ -924,13 +943,16 @@ impl SuperVersions {
     /// flushes waits about as long as for one, where one after another each
     /// would wait its own commit out.
     #[cfg(feature = "std")]
-    fn sync_each(files: &[UnsyncedFile], sync_mode: SyncMode) -> crate::Result<()> {
+    fn sync_each(files: &[UnsyncedFile], sync_mode: SyncMode, serial: bool) -> crate::Result<()> {
         /// Syncs in flight at once: enough for a journal commit to fold a
         /// barrier's worth of them, few enough to stay a handful of threads.
         const IN_FLIGHT: usize = 16;
 
-        if let [file] = files {
-            return file.sync(sync_mode);
+        if serial || files.len() == 1 {
+            for file in files {
+                file.sync(sync_mode)?;
+            }
+            return Ok(());
         }
         let next = core::sync::atomic::AtomicUsize::new(0);
         let failed: parking_lot::Mutex<Option<crate::Error>> = parking_lot::Mutex::new(None);
@@ -954,7 +976,7 @@ impl SuperVersions {
     /// Syncs every file of `files`, one after another: no threads without
     /// `std`.
     #[cfg(not(feature = "std"))]
-    fn sync_each(files: &[UnsyncedFile], sync_mode: SyncMode) -> crate::Result<()> {
+    fn sync_each(files: &[UnsyncedFile], sync_mode: SyncMode, _serial: bool) -> crate::Result<()> {
         for file in files {
             file.sync(sync_mode)?;
         }

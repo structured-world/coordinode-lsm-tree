@@ -781,7 +781,12 @@ pub(crate) fn run_checkpoint<T: AbstractTree>(
     // consumes one later cannot take it off the list before the sync.
     let (version, unsynced) = params.source.current_version_and_unsynced();
     if !unsynced.is_empty() {
-        crate::version::SuperVersions::sync_files(&unsynced, sync_mode)?;
+        let config = tree.tree_config();
+        crate::version::SuperVersions::sync_files(
+            &unsynced,
+            sync_mode,
+            config.fs.capabilities(&config.path).serial_syncs,
+        )?;
     }
 
     // Reflink the snapshot files when the live config opts in (default) and

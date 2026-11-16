@@ -385,6 +385,13 @@ pub struct FsCapabilities {
     /// as the table file pool, is then skipped: it would cost and save
     /// nothing.
     pub directory_sync_noop: bool,
+
+    /// Syncs of separate files issued at the same time take longer here than
+    /// the same syncs one after another (NTFS: each file's flush writes the
+    /// volume's log, and two at once wait out each other). The engine then
+    /// syncs a flush's files and its manifest edit one after another instead
+    /// of side by side.
+    pub serial_syncs: bool,
 }
 
 /// A directory entry returned by [`Fs::read_dir`].

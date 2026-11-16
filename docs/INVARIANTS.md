@@ -226,10 +226,12 @@ matching entry (and add one for a new subsystem).
   not read here: damage to a file that did reach the disk is caught by the
   checks every read makes, as for any table. A sync that fails after the edit
   was appended ends the flush in `Error::InstallOutcomeUnknown`. Rotation of
-  the manifest, a table folder whose name is not UTF-8, and builds without
-  `std` keep the ordered syncs (files first, then the edit). Enforced in
+  the manifest, a table folder whose name is not UTF-8, builds without `std`,
+  and a backend reporting `FsCapabilities::serial_syncs` (Windows, where two
+  syncs at once cost more than one after another) keep the ordered syncs
+  (files first, one at a time, then the edit). Enforced in
   `src/version/super_version.rs` and `src/version/recovery.rs` (tests
-  `tests/flush_alongside_sync.rs`).
+  `tests/flush_alongside_sync.rs`, `tests/serial_syncs.rs`).
 
 - **Every file the engine opens for writing names what it is written for.**
   The open options carry a `WriteOrigin`, so a counting backend the caller

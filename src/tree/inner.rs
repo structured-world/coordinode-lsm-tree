@@ -341,7 +341,11 @@ impl TreeInner {
     pub(crate) fn persist_flushes(&self) -> crate::Result<()> {
         let pending = self.version_history.read().unsynced_files();
         if !pending.is_empty() {
-            SuperVersions::sync_files(&pending, self.config.sync_mode)?;
+            SuperVersions::sync_files(
+                &pending,
+                self.config.sync_mode,
+                self.config.fs.capabilities(&self.config.path).serial_syncs,
+            )?;
         }
         let mut versions = self.version_history.write();
         versions.forget_synced(&pending);

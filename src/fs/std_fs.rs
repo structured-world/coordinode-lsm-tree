@@ -633,12 +633,13 @@ impl Fs for StdFs {
     }
 
     /// Windows: no directory can be synced (see `sync_directory`), so the
-    /// directory sync is reported as doing nothing; every other capability
-    /// is the conservative default.
+    /// directory sync is reported as doing nothing, and files are synced one
+    /// at a time; every other capability is the conservative default.
     #[cfg(target_os = "windows")]
     fn capabilities(&self, _path: &Path) -> super::FsCapabilities {
         super::FsCapabilities {
             directory_sync_noop: true,
+            serial_syncs: true,
             ..super::FsCapabilities::default()
         }
     }
