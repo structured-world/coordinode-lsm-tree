@@ -898,6 +898,11 @@ pub struct Writer {
     /// the marker key `lineage_last`, only alongside `lineage`.
     lineage_last: bool,
 
+    /// What a synced flush writes about itself into the table (the `flush#`
+    /// properties), so an open can install it with no manifest edit naming
+    /// it; `None` for every other table.
+    flush_mark: Option<crate::table::meta::FlushMark>,
+
     /// This table's place among the files its folder is writing, when its
     /// file came from the folder's pool: the ids below it still being written
     /// when it finishes are persisted as `writing_below`, and the place is
@@ -1418,6 +1423,7 @@ impl Writer {
             lineage_prev: None,
             lineage_transformed: false,
             lineage_last: false,
+            flush_mark: None,
             writing: None,
             created_at: None,
             clock: None,
@@ -1758,6 +1764,7 @@ impl Writer {
             lineage_prev: self.lineage_prev,
             lineage_transformed: self.lineage_transformed,
             lineage_last: self.lineage_last,
+            flush_mark: self.flush_mark,
             writing_below: self
                 .writing
                 .as_ref()
@@ -1808,6 +1815,11 @@ impl Writer {
         let has_lineage = params.lineage.is_some();
         params.lineage_transformed |= has_lineage;
         params.lineage_last |= has_lineage;
+        // From above: a flush's last table carries the run's length and a floor.
+        if let Some(mark) = &mut params.flush_mark {
+            mark.run_len = Some(u32::MAX);
+            mark.floor = Some(crate::SeqNo::MAX);
+        }
         // From above: as many files written below this one as are recorded.
         if self.writing.is_some() {
             params.writing_below =
@@ -2783,6 +2795,30 @@ impl Writer {
     /// [`Self::lineage_last`]).
     pub(crate) fn mark_lineage_last(&mut self) {
         self.lineage_last = true;
+    }
+
+    /// Makes the table describe itself as table `index` of synced flush `seq`
+    /// (see [`Self::flush_mark`]).
+    #[must_use]
+    pub(crate) fn use_flush_mark(mut self, seq: u64, index: u32) -> Self {
+        self.assert_not_started("use_flush_mark");
+        self.flush_mark = Some(crate::table::meta::FlushMark {
+            seq,
+            index,
+            run_len: None,
+            floor: None,
+        });
+        self
+    }
+
+    /// Marks the table as the one its flush's run of `run_len` tables
+    /// finishes with, with the retention floor the flush raised (callable at
+    /// finish time; see [`Self::flush_mark`]).
+    pub(crate) fn mark_flush_end(&mut self, run_len: u32, floor: Option<crate::SeqNo>) {
+        if let Some(mark) = &mut self.flush_mark {
+            mark.run_len = Some(run_len);
+            mark.floor = floor;
+        }
     }
 
     /// Sets the last-output marker at build time (see [`Self::lineage_last`]);
@@ -5802,6 +5838,8 @@ struct MetaSectionParams<'a> {
     /// `true` writes the `lineage_last` marker (only alongside `lineage`):
     /// this output closed its compaction run.
     lineage_last: bool,
+    /// A synced flush's self-description: written as the `flush#` properties.
+    flush_mark: Option<crate::table::meta::FlushMark>,
     /// The ids below this table's of the files its folder was still writing
     /// when it finished: written as `writing_below` when any.
     writing_below: Vec<TableId>,
@@ -6149,6 +6187,20 @@ fn encode_meta_payload(
         }
         if p.lineage_last {
             meta_items.push(meta("lineage_last", &[]));
+        }
+    }
+
+    // A synced flush's self-description: the flush and the table's place in
+    // its run, the run's length and the raised floor on the table the run
+    // finishes with.
+    if let Some(mark) = &p.flush_mark {
+        meta_items.push(meta("flush#seq", &mark.seq.to_le_bytes()));
+        meta_items.push(meta("flush#index", &mark.index.to_le_bytes()));
+        if let Some(run_len) = mark.run_len {
+            meta_items.push(meta("flush#run_len", &run_len.to_le_bytes()));
+            if let Some(floor) = mark.floor {
+                meta_items.push(meta("flush#floor", &floor.to_le_bytes()));
+            }
         }
     }
 

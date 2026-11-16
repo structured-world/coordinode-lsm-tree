@@ -102,6 +102,57 @@ fn a_flush_after_a_clear_installs_nothing() -> crate::Result<()> {
     Ok(())
 }
 
+/// The tables of a flush a clear declined do not come back after a power loss
+/// that left them on disk: they describe themselves, and the clear's manifest
+/// decides that flush. Guards against cleared keys returning through an open
+/// that installs self-described flushes.
+#[test]
+fn a_flush_a_clear_declined_stays_out_after_a_power_loss() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    for blob in [false, true] {
+        let crash = crate::fs::CrashFs::new(crate::fs::MemFs::new());
+        let config = |fs: Arc<dyn crate::fs::Fs>| {
+            let config = Config::new(
+                "/db",
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(fs);
+            if blob {
+                config.with_kv_separation(Some(
+                    crate::KvSeparationOptions::default().separation_threshold(1),
+                ))
+            } else {
+                config
+            }
+        };
+        let fs = Arc::new(FaultFs::new(crash.clone()));
+        let tree = config(fs.clone()).open()?;
+        write_keys(&tree, 1);
+        clear_before_install(&tree);
+        // The declined files stay where the flush synced them, as when the
+        // power goes before their removal.
+        for op in [FaultOp::RemoveFile, FaultOp::SetLen, FaultOp::Rename] {
+            fs.injector().arm(FaultRule::new(
+                op,
+                Fault::Error(crate::io::ErrorKind::Other),
+            ));
+        }
+        tree.flush_active_memtable(0)?;
+        crash.crash();
+        drop(tree);
+
+        let tree = config(Arc::new(crash)).open()?;
+        assert_eq!(
+            tree.iter(SeqNo::MAX, None).count(),
+            0,
+            "cleared keys came back, blob: {blob}"
+        );
+        assert_eq!(tree.table_count(), 0);
+    }
+    Ok(())
+}
+
 /// A merge whose input tables `clear` dropped installs nothing.
 #[test]
 fn a_merge_after_a_clear_installs_nothing() -> crate::Result<()> {

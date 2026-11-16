@@ -61,6 +61,7 @@ fn history_at_floor(floor: SeqNo) -> SuperVersions {
         SyncMode::Normal,
         7,
         1024 * 1024,
+        Arc::default(),
     )
 }
 
@@ -161,6 +162,7 @@ fn installed_history(fs: &dyn crate::fs::Fs) -> crate::Result<SuperVersions> {
         Arc::default(),
         None,
         SyncMode::Normal,
+        0,
     )?;
     Ok(SuperVersions::new(
         version,
@@ -168,6 +170,7 @@ fn installed_history(fs: &dyn crate::fs::Fs) -> crate::Result<SuperVersions> {
         SyncMode::Normal,
         0,
         1024 * 1024,
+        Arc::default(),
     ))
 }
 
@@ -182,7 +185,6 @@ fn persist_next(history: &mut SuperVersions, fs: &dyn crate::fs::Fs) -> crate::R
         Arc::default(),
         None,
         SyncMode::Normal,
-        None,
     )
 }
 

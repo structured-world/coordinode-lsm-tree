@@ -61,98 +61,52 @@ fn sample() -> VersionEdit {
         // appended section as well.
         retention_floor: Some(77),
         dicts: None,
-        synced_alongside: Vec::new(),
+        flush_watermark: None,
     }
 }
 
-/// Files synced alongside a flush's edit: a table, with the folder it lies
-/// in, and a blob file.
-fn alongside() -> Vec<AlongsideFile> {
-    vec![
-        AlongsideFile {
-            kind: AlongsideKind::Table {
-                folder: "/db/tables".into(),
-            },
-            id: 7,
-            len: 4_096,
-        },
-        AlongsideFile {
-            kind: AlongsideKind::Blob,
-            id: 9,
-            len: 1 << 40,
-        },
-    ]
-}
-
-/// The files a flush synced alongside its edit round-trip with their kinds and
-/// lengths, and an edit without them decodes as synced before (the
-/// shape every other edit has), so recovery checks files only where the writer
-/// took that shortcut.
+/// The flush watermark round-trips, and an edit written before it existed
+/// decodes as carrying none, which leaves the recovered watermark as it was.
 #[test]
-fn the_files_synced_alongside_roundtrip_and_default_to_none() {
+fn the_flush_watermark_roundtrips_and_defaults_to_none() {
     let mut edit = sample();
     edit.dicts = Some(vec![5]);
-    edit.synced_alongside = alongside();
+    edit.flush_watermark = Some(42);
     let mut payload = Vec::new();
     edit.encode_payload(&mut payload).expect("encode");
     assert_eq!(VersionEdit::decode_payload(&payload).expect("decode"), edit);
 
-    edit.synced_alongside = Vec::new();
+    edit.flush_watermark = None;
     let mut payload = Vec::new();
     edit.encode_payload(&mut payload).expect("encode");
     let decoded = VersionEdit::decode_payload(&payload).expect("decode");
-    assert_eq!(decoded.synced_alongside, Vec::new());
+    assert_eq!(decoded.flush_watermark, None);
     assert_eq!(decoded, edit);
 }
 
-/// The section is positional after the dictionary ids; without them its
-/// count would be read as a dictionary count, so the encoder refuses that edit.
+/// The section is positional after the dictionary ids; without them it would
+/// be read as a dictionary count, so the encoder refuses that edit.
 #[test]
-fn files_synced_alongside_without_dictionary_ids_are_refused_by_the_encoder() {
+fn a_flush_watermark_without_dictionary_ids_is_refused_by_the_encoder() {
     let mut edit = sample();
     edit.dicts = None;
-    edit.synced_alongside = alongside();
+    edit.flush_watermark = Some(1);
     let mut payload = Vec::new();
     assert!(edit.encode_payload(&mut payload).is_err());
 }
 
-/// A zero count, or an entry of an unknown kind, is a mis-encoded record: the
-/// encoder writes neither, and reading a zero count as "none" would skip the
-/// check on the files.
+/// `u64::MAX` is no number a flush takes, so an edit naming it is mis-encoded:
+/// the counter that starts above the watermark would overflow on its first
+/// flush.
 #[test]
-fn a_mis_encoded_alongside_section_fails_to_decode() {
+fn a_flush_watermark_at_u64_max_fails_to_decode() {
     let mut edit = sample();
     edit.dicts = Some(vec![]);
-    edit.synced_alongside = vec![AlongsideFile {
-        kind: AlongsideKind::Blob,
-        id: 1,
-        len: 2,
-    }];
+    edit.flush_watermark = Some(0);
     let mut payload = Vec::new();
     edit.encode_payload(&mut payload).expect("encode");
-    // One entry: kind, id, len after the count.
-    let entry = payload.len() - (1 + 8 + 8);
-
-    let mut zero_count = payload.clone();
-    zero_count.truncate(entry);
-    let count_at = entry - 4;
-    zero_count[count_at..].copy_from_slice(&0u32.to_le_bytes());
-    assert!(VersionEdit::decode_payload(&zero_count).is_err());
-
-    let mut unknown_kind = payload;
-    unknown_kind[entry] = 2;
-    assert!(VersionEdit::decode_payload(&unknown_kind).is_err());
-
-    // A table's folder that is not UTF-8 is mis-encoded too.
-    edit.synced_alongside = vec![AlongsideFile {
-        kind: AlongsideKind::Table { folder: "t".into() },
-        id: 1,
-        len: 2,
-    }];
-    let mut payload = Vec::new();
-    edit.encode_payload(&mut payload).expect("encode");
-    let folder_byte = payload.len() - (8 + 8 + 1);
-    payload[folder_byte] = 0xFF;
+    let at = payload.len() - 8;
+    payload[at..].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(VersionEdit::decode_payload(&payload).is_err());
 }
 
@@ -407,17 +361,6 @@ fn bitflip_in_payload_fails_checksum() {
         ),
         "bit-flip must surface as ChecksumMismatch, got {outcome:?}",
     );
-}
-
-/// The edits `reader` replays, without their offsets.
-fn replay_edits<R: Read>(
-    reader: &mut R,
-    mode: ManifestRecoveryMode,
-) -> crate::Result<Vec<VersionEdit>> {
-    Ok(replay_edits_at(reader, mode)?
-        .into_iter()
-        .map(|(_, edit)| edit)
-        .collect())
 }
 
 #[test]

@@ -388,9 +388,11 @@ fn manifest_rotation_writes_snapshots_charged_to_the_manifest() -> lsm_tree::Res
     let (fs, stats) = counted(MemFs::new());
     let tree = config("/db", fs).manifest_log_rotate_bytes(1).open()?;
     let before = stats.snapshot();
+    // A flush writes no manifest: each persist of one is an install.
     for flush in 0..8u32 {
         tree.insert(format!("key{flush}"), "value", u64::from(flush));
         tree.flush_active_memtable(0)?;
+        tree.persist_flushes()?;
     }
 
     let rotated = stats.snapshot().since(&before).expect("one counter set");

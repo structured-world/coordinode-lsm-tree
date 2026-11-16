@@ -118,7 +118,9 @@ impl Version {
             blob_restrictions,
             retention_floor,
             dicts,
-            synced_alongside: Vec::new(),
+            // The history that appends the edit knows it (see
+            // `SuperVersions::persist_change`).
+            flush_watermark: None,
         })
     }
 }

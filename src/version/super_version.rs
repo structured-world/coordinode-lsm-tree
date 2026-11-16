@@ -182,33 +182,6 @@ impl UnsyncedFile {
         Ok(())
     }
 
-    /// The file as an edit names it among the files synced alongside it, with
-    /// the length it was written to; `None` for a table whose folder is no
-    /// UTF-8 path, which the edit cannot name.
-    #[cfg(feature = "std")]
-    fn alongside(&self) -> crate::Result<Option<super::edit::AlongsideFile>> {
-        let (fs, path) = self.location();
-        let (kind, id) = match self {
-            Self::Table(table) => {
-                let Some(folder) = path.parent().and_then(Path::to_str) else {
-                    return Ok(None);
-                };
-                (
-                    super::edit::AlongsideKind::Table {
-                        folder: folder.into(),
-                    },
-                    table.id(),
-                )
-            }
-            Self::Blob(blob_file) => (super::edit::AlongsideKind::Blob, blob_file.id()),
-        };
-        Ok(Some(super::edit::AlongsideFile {
-            kind,
-            id,
-            len: fs.metadata(path)?.len,
-        }))
-    }
-
     /// Whether `other` is the same file.
     fn same(&self, other: &Self) -> bool {
         match (self, other) {
@@ -228,33 +201,20 @@ impl UnsyncedFile {
     }
 }
 
-/// Files an install syncs at the same time as the edit naming them.
-struct Alongside<'a> {
-    /// The files, as the edit names them.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "without threads no edit is written beside its files"
-        )
-    )]
-    files: Vec<super::edit::AlongsideFile>,
-    /// Syncs them, and the folders of the new tables.
-    sync: &'a (dyn Fn() -> crate::Result<()> + Sync),
-}
-
 /// Who syncs the files an install adds.
 pub(crate) enum NewFiles {
-    /// Their writers did, before the install.
+    /// Their writers did, before the install, which writes the manifest.
     Synced,
     /// None yet: the version is installed in memory only, and the next
     /// install that persists, or [`SuperVersions::persist_current`], syncs
     /// them and writes it to the manifest (a flush under
     /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred)).
     Deferred(Vec<UnsyncedFile>),
-    /// The install, at the same time as the manifest edit naming them: the
-    /// edit says so, and recovery checks the files before it trusts the edit.
-    Alongside(Vec<UnsyncedFile>),
+    /// Their writers did, and the files describe themselves: the version is
+    /// installed in memory only, and the next install that persists writes
+    /// it to the manifest, while an open until then finds the files by their
+    /// own description (a synced flush, see [`super::FlushSeqs`]).
+    SelfDescribed,
 }
 
 /// A super version is a point-in-time snapshot of memtables and a [`Version`] (list of disk files)
@@ -403,6 +363,10 @@ pub struct SuperVersions {
     /// asked at the first persist: the backend does not change under a tree.
     serial_syncs: Option<bool>,
 
+    /// The tree's synced-flush numbers: every manifest this history writes
+    /// records the highest it decides.
+    flush_seqs: Arc<super::FlushSeqs>,
+
     /// Version id of the installed on-disk snapshot. Each version upgrade
     /// appends a [`VersionEdit`](crate::version::edit::VersionEdit) to the log
     /// `edits-{snapshot_id}` instead of rewriting the whole manifest; once that
@@ -501,12 +465,13 @@ impl SuperVersions {
     /// The seed version's seqno is the recovered
     /// [`retention_floor`](Version::retention_floor), below which the data a
     /// snapshot saw may be gone (`0` on a fresh create).
-    pub fn new(
+    pub(crate) fn new(
         version: Version,
         comparator: &SharedComparator,
         sync_mode: SyncMode,
         snapshot_id: VersionId,
         log_rotate_bytes: u64,
+        flush_seqs: Arc<super::FlushSeqs>,
     ) -> Self {
         let comparator_name: Arc<str> = comparator.name().into();
 
@@ -533,6 +498,7 @@ impl SuperVersions {
             comparator_name,
             sync_mode,
             serial_syncs: None,
+            flush_seqs,
             snapshot_id,
             log_rotate_bytes,
             log_bytes: None,
@@ -784,25 +750,11 @@ impl SuperVersions {
             // The floor rides in the version too: lost with it in a crash,
             // together with the flush whose collection raised it.
             NewFiles::Deferred(files) => self.unsynced.extend(files),
+            // The floor rides in the tables' description as well, which an
+            // open reads back with them.
+            NewFiles::SelfDescribed => {}
             NewFiles::Synced => {
-                self.persist_version(
-                    tree_path,
-                    &next_version.version,
-                    fs,
-                    runtime,
-                    encryption,
-                    &[],
-                )?;
-            }
-            NewFiles::Alongside(files) => {
-                self.persist_version(
-                    tree_path,
-                    &next_version.version,
-                    fs,
-                    runtime,
-                    encryption,
-                    &files,
-                )?;
+                self.persist_version(tree_path, &next_version.version, fs, runtime, encryption)?;
             }
         }
         self.publish(
@@ -826,10 +778,6 @@ impl SuperVersions {
     /// version is written. A file a deferred flush wrote and `next` no longer
     /// names (a compaction consumed it) never reaches the manifest and is not
     /// synced.
-    ///
-    /// `alongside` are files `next` adds that no one has synced yet: they and
-    /// the folders of the new tables are synced at the same time as the
-    /// change is written, which then says so (see [`Self::persist_change`]).
     fn persist_version(
         &mut self,
         tree_path: &Path,
@@ -837,56 +785,30 @@ impl SuperVersions {
         fs: &dyn Fs,
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
-        alongside: &[UnsyncedFile],
     ) -> crate::Result<()> {
         let persisted = self.persisted.clone();
-        let serial = *self
-            .serial_syncs
-            .get_or_insert_with(|| fs.capabilities(tree_path).serial_syncs);
         if !self.unsynced.is_empty() {
+            let serial = self.serial_syncs(fs, tree_path);
             // Kept until the persist succeeds: a failure leaves them for the
             // next one to sync again.
             Self::sync_files(&self.unsynced_named_by(next), self.sync_mode, serial)?;
         }
-        let sync_mode = self.sync_mode;
-        let sync_new = || -> crate::Result<()> {
-            Self::sync_files(alongside, sync_mode, serial)?;
-            sync_new_table_directories(&persisted, next, tree_path, fs, sync_mode)
-        };
+        sync_new_table_directories(&persisted, next, tree_path, fs, self.sync_mode)?;
         // Outputs are kept only while the next persist rotates, which removes
-        // them.
+        // them. What the install retires is judged against the version in
+        // memory, not the manifest: a self-described flush's files are named
+        // by no manifest yet, and durable all the same, so their removal must
+        // not reach their device before this edit does. Installs that write no
+        // manifest only add files, so that version holds every one the
+        // manifest names.
         let manifest_mode = manifest_sync_mode(
-            &persisted,
+            &self.current.version,
             next,
             &self.kept_outputs,
             tree_path,
             fs,
             self.sync_mode,
         );
-        // A file the edit cannot name is synced before it, with the rest, and
-        // so is every file without threads to sync them beside the edit, or
-        // on a backend whose syncs go one at a time.
-        #[cfg(feature = "std")]
-        let files: Option<Vec<_>> = if serial {
-            None
-        } else {
-            alongside
-                .iter()
-                .map(UnsyncedFile::alongside)
-                .collect::<crate::Result<_>>()?
-        };
-        #[cfg(not(feature = "std"))]
-        let files: Option<Vec<super::edit::AlongsideFile>> = None;
-        let alongside_job = match files {
-            Some(files) if !files.is_empty() => Some(Alongside {
-                files,
-                sync: &sync_new,
-            }),
-            _ => {
-                sync_new()?;
-                None
-            }
-        };
         self.persist_change(
             tree_path,
             &persisted,
@@ -895,11 +817,18 @@ impl SuperVersions {
             runtime,
             encryption,
             manifest_mode,
-            alongside_job,
         )?;
         self.unsynced.clear();
         self.persisted = next.clone();
         Ok(())
+    }
+
+    /// Whether the backend syncs files one at a time (see
+    /// [`Self::serial_syncs`] field), asked once per tree.
+    pub(crate) fn serial_syncs(&mut self, fs: &dyn Fs, tree_path: &Path) -> bool {
+        *self
+            .serial_syncs
+            .get_or_insert_with(|| fs.capabilities(tree_path).serial_syncs)
     }
 
     /// Syncs `files`, then each folder their blob files lie in, once. A
@@ -931,10 +860,21 @@ impl SuperVersions {
         Ok(())
     }
 
-    /// The version the manifest on disk holds: the current one, unless
-    /// deferred flushes installed versions after it in memory only.
-    pub(crate) fn persisted_version(&self) -> &Version {
-        &self.persisted
+    /// The highest seqno a power loss now keeps: of the tables the manifest
+    /// names, and of the self-described ones the current version holds, which
+    /// an open installs from their own description. A deferred flush's tables
+    /// count only once a persist names them, synced or not before it.
+    pub(crate) fn durable_highest_seqno(&self) -> Option<crate::SeqNo> {
+        self.persisted
+            .iter_tables()
+            .chain(
+                self.current
+                    .version
+                    .iter_tables()
+                    .filter(|table| table.metadata.flush.is_some()),
+            )
+            .map(crate::Table::get_highest_seqno)
+            .max()
     }
 
     /// Syncs every file of `files`, concurrently: syncs of separate files on
@@ -1010,8 +950,15 @@ impl SuperVersions {
             .retain(|file| !synced.iter().any(|done| done.same(file)));
     }
 
-    /// Writes the current version to the manifest when deferred flushes
-    /// installed it in memory only; a no-op otherwise.
+    /// Writes the current version to the manifest when flushes installed it
+    /// in memory only (deferred or self-described); a no-op otherwise.
+    ///
+    /// After a rotation that failed, the snapshot it left may lie under the
+    /// id after the current one, naming files the failure kept: a snapshot
+    /// under the current id would sit below it, and a reopen would take that
+    /// one once the kept files are gone. The current version is installed
+    /// under that next id then, replacing what the failed rotation left, as
+    /// any other install would.
     ///
     /// # Errors
     ///
@@ -1027,8 +974,23 @@ impl SuperVersions {
         if self.persisted.id() == self.current.version.id() {
             return Ok(());
         }
-        let next = self.current.version.clone();
-        self.persist_version(tree_path, &next, fs, runtime, encryption, &[])
+        if !self.rotation_pending {
+            let next = self.current.version.clone();
+            return self.persist_version(tree_path, &next, fs, runtime, encryption);
+        }
+        let current = &self.current.version;
+        // Ids stay below the top half of the range (see
+        // `Version::is_renumbered_on_open`): one more never overflows.
+        let next = current.with_id_and_dicts(current.id() + 1, current.dicts().to_vec());
+        self.persist_version(tree_path, &next, fs, runtime, encryption)?;
+        let mut installed = self.current.clone();
+        installed.version = next;
+        self.publish(
+            installed,
+            #[cfg(feature = "std")]
+            None,
+        );
+        Ok(())
     }
 
     /// Persists the transition from `prior` to `next` to disk, durably, the
@@ -1050,13 +1012,8 @@ impl SuperVersions {
     /// `sync_mode` is the mode this transition is persisted with (see
     /// `manifest_sync_mode`).
     ///
-    /// `alongside` syncs files the transition adds that no one synced yet.
-    /// An appended edit runs it at the same time as its own append and sync,
-    /// and says so ([`VersionEdit::synced_alongside`](super::edit::VersionEdit::synced_alongside)):
-    /// a power loss may keep the edit without the files, and recovery then
-    /// checks them and takes the edit back. That edit is the log's last, as
-    /// the install returns once both are done and nothing appends before. A
-    /// rotation runs it first: a snapshot carries no such mark.
+    /// Every edit and snapshot records how far the synced flushes are decided
+    /// (see [`super::FlushSeqs`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the transition, where it goes, how it is encoded and how durably: \
@@ -1071,7 +1028,6 @@ impl SuperVersions {
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
         sync_mode: SyncMode,
-        mut alongside: Option<Alongside<'_>>,
     ) -> crate::Result<()> {
         let log_path = edit_log::log_path(tree_path, self.snapshot_id);
 
@@ -1092,48 +1048,16 @@ impl SuperVersions {
             && prior.repair_report() == next.repair_report()
         {
             // Common path: append the delta and fsync. No snapshot rewrite.
-            let edit = next.diff(prior)?;
-            let appended = match alongside.take() {
-                #[cfg(feature = "std")]
-                Some(Alongside {
-                    files,
-                    sync: sync_files,
-                }) => {
-                    let mut edit = edit;
-                    edit.synced_alongside = files;
-                    // The mark is positional after the floor and the set.
-                    edit.retention_floor
-                        .get_or_insert_with(|| next.retention_floor());
-                    edit.dicts.get_or_insert_with(|| next.dicts().to_vec());
-                    let scratch = &mut self.edit_scratch;
-                    let (appended, synced) = std::thread::scope(|scope| {
-                        let synced = scope.spawn(sync_files);
-                        let appended =
-                            edit_log::append_edit(fs, &log_path, &edit, scratch, sync_mode);
-                        let synced = synced
-                            .join()
-                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                        (appended, synced)
-                    });
-                    match (appended, synced) {
-                        // The edit is durable and its files may not be: a later
-                        // append would make it a middle edit, replayed
-                        // unchecked, so the next persist rotates.
-                        (Ok(Some(appended)), Err(e)) => {
-                            self.log_bytes = Some(log_size + appended);
-                            self.rotation_pending = true;
-                            return Err(crate::Error::InstallOutcomeUnknown(
-                                alloc::boxed::Box::new(e),
-                            ));
-                        }
-                        // Nothing was written.
-                        (Ok(None), Err(e)) => return Err(e),
-                        (appended, _) => appended,
-                    }
-                }
-                // Without threads `persist_version` builds none.
-                _ => edit_log::append_edit(fs, &log_path, &edit, &mut self.edit_scratch, sync_mode),
-            };
+            let mut edit = next.diff(prior)?;
+            // Every edit says how far the synced flushes are decided. The
+            // watermark is positional after the floor and the dictionary set,
+            // which it states in full.
+            edit.flush_watermark = Some(self.flush_seqs.decided());
+            edit.retention_floor
+                .get_or_insert_with(|| next.retention_floor());
+            edit.dicts.get_or_insert_with(|| next.dicts().to_vec());
+            let appended =
+                edit_log::append_edit(fs, &log_path, &edit, &mut self.edit_scratch, sync_mode);
             match appended {
                 Ok(Some(appended)) => {
                     self.log_bytes = Some(log_size + appended);
@@ -1162,14 +1086,7 @@ impl SuperVersions {
             }
         }
 
-        // Rotation: write `next` as a fresh full snapshot and install it, once
-        // the files it adds are synced.
-        if let Some(Alongside {
-            sync: sync_files, ..
-        }) = alongside
-        {
-            sync_files()?;
-        }
+        // Rotation: write `next` as a fresh full snapshot and install it.
         let old_snapshot = self.snapshot_id;
         if let Err(e) = persist_version(
             tree_path,
@@ -1179,6 +1096,7 @@ impl SuperVersions {
             runtime,
             encryption,
             sync_mode,
+            self.flush_seqs.decided(),
         ) {
             self.rotation_pending = true;
             return Err(e);

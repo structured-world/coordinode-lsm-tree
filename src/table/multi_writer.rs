@@ -254,6 +254,17 @@ pub(crate) struct MultiWriter {
     /// live only in a LOST sibling slice.
     owns_whole_run: bool,
 
+    /// The synced flush this writer writes the run of, whose tables describe
+    /// themselves as its (see [`Writer::use_flush_mark`]); `None` for every
+    /// other writer.
+    flush_seq: Option<u64>,
+
+    /// The place the next output takes in the flush's run.
+    flush_index: u32,
+
+    /// The retention floor the flush raised, written on its last table.
+    flush_floor: Option<crate::SeqNo>,
+
     /// The id of the writer CURRENTLY receiving records, so rotation can
     /// stamp the successor's `lineage_prev` adjacency link.
     current_writer_id: TableId,
@@ -561,6 +572,9 @@ impl MultiWriter {
             transforms_at_output_start: 0,
             transforms_after_last_write: 0,
             owns_whole_run: false,
+            flush_seq: None,
+            flush_index: 0,
+            flush_floor: None,
             current_writer_id: current_table_id,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
@@ -1467,6 +1481,22 @@ impl MultiWriter {
         self
     }
 
+    /// Makes this and every rotated successor writer's table describe itself
+    /// as part of synced flush `seq`, numbered in the order the run writes
+    /// them (see [`Writer::use_flush_mark`]).
+    #[must_use]
+    pub(crate) fn use_flush_seq(mut self, seq: u64) -> Self {
+        self.flush_seq = Some(seq);
+        self.writer = self.writer.use_flush_mark(seq, 0);
+        self.flush_index = 1;
+        self
+    }
+
+    /// The retention floor the flush raised, written on the run's last table.
+    pub(crate) fn set_flush_floor(&mut self, floor: Option<crate::SeqNo>) {
+        self.flush_floor = floor;
+    }
+
     /// Declares that this writer receives the run's ENTIRE merged stream
     /// (see the `owns_whole_run` field), allowing its final output to carry
     /// the `lineage_last` marker. Never set on a parallel sub-compaction or
@@ -1814,6 +1844,13 @@ impl MultiWriter {
         // which is what lets manifest repair union UNBROKEN sibling chains.
         new_writer = new_writer.use_lineage_prev(Some(self.current_writer_id));
         self.current_writer_id = new_table_id;
+        if let Some(seq) = self.flush_seq {
+            new_writer = new_writer.use_flush_mark(seq, self.flush_index);
+            self.flush_index = self
+                .flush_index
+                .checked_add(1)
+                .ok_or(crate::Error::InvalidHeader("flush run exceeds u32 tables"))?;
+        }
         new_writer = new_writer.delete_strategy(self.delete_strategy);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);
@@ -2836,6 +2873,13 @@ impl MultiWriter {
             self.write_tombstones_alone(writer, pieces, index + 1 == count)?;
         }
 
+        // A flush's run finishes with this table, written after every other:
+        // it records how many the run holds, so an open can tell a whole run
+        // from one a power loss cut short.
+        if self.flush_seq.is_some() {
+            self.writer
+                .mark_flush_end(self.flush_index, self.flush_floor);
+        }
         let path = self.writer.path.clone();
         if let Some((table_id, checksum)) = self
             .writer

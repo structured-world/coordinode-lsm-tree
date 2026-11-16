@@ -4175,16 +4175,11 @@ enum ManifestRestriction {
 fn sweep_superseded_by_committed_manifest(
     config: &Config,
 ) -> crate::Result<Option<CommittedManifest>> {
-    let intact = |file: &_| crate::version::recovery::file_intact(config, file);
     let recovery = match crate::version::recovery::recover(
         &config.path,
         &*config.fs,
         crate::config::ManifestRecoveryMode::AbsoluteConsistency,
         config.encryption.clone(),
-        &crate::version::recovery::AlongsideCheck {
-            intact: &intact,
-            sync_mode: config.sync_mode,
-        },
     ) {
         Ok(recovery) => recovery,
         // A one-shot read fault on an otherwise healthy manifest must NOT be
@@ -7311,6 +7306,9 @@ fn publish_repaired_manifest(
         Arc::new(config.initial_runtime_config.clone()),
         config.encryption.clone(),
         config.sync_mode,
+        // Raised to the highest flush the rebuilt tables carry: the repair
+        // decides every table it found.
+        0,
     );
     // The guard stays ARMED until the commit is decided: every fallible
     // `persist_version` step before it installs the snapshot (manifest

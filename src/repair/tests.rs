@@ -16142,6 +16142,7 @@ fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> cra
         Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
+        0,
     )?;
 
     // The mount can punch but cannot attribute zeros to a hole, so the
@@ -16257,6 +16258,7 @@ fn a_committed_frontier_at_the_data_end_is_a_consumed_blob_file() -> crate::Resu
         Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
+        0,
     )?;
     memfs.remove_file(&root.join("tables").join("1"))?;
 
@@ -18411,6 +18413,7 @@ fn owe_report(config: crate::Config, report: &super::RepairReport) -> crate::Res
         std::sync::Arc::default(),
         None,
         crate::fs::SyncMode::Normal,
+        0,
     )
 }
 

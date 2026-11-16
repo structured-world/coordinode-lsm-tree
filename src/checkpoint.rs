@@ -548,6 +548,8 @@ pub(crate) fn copy_metadata(
     //
     // A repair report the source still owes describes losses in the data
     // just linked, so the checkpoint owes it too: it rides in the version.
+    // The checkpoint holds only the tables its version names: no flush above
+    // the ones they carry has a table in it.
     crate::version::persist_version(
         target_root,
         version,
@@ -556,6 +558,7 @@ pub(crate) fn copy_metadata(
         runtime,
         encryption,
         sync_mode,
+        0,
     )?;
     Ok(())
 }

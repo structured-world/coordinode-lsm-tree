@@ -20,7 +20,29 @@ fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> R
         retention_floor: 0,
         dicts: Vec::new(),
         repair_report: None,
+        flush_watermark: 0,
     }
+}
+
+/// The flush watermark an edit carries replaces the recovered one, as an
+/// absolute value; an edit without one leaves it as it was.
+#[test]
+fn apply_edit_overwrites_the_flush_watermark_only_when_carried() {
+    let mut rec = recovery_with(1, vec![]);
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 2,
+        flush_watermark: Some(9),
+        ..Default::default()
+    })
+    .expect("apply");
+    assert_eq!(rec.flush_watermark, 9);
+
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 3,
+        ..Default::default()
+    })
+    .expect("apply");
+    assert_eq!(rec.flush_watermark, 9);
 }
 
 /// An edit that raised the retention floor carries the new absolute value;
@@ -609,13 +631,7 @@ fn recover_tables(levels: u8, records: &[(u8, u32, u64)]) -> crate::Result<Recov
     fs.create_dir_all(folder)?;
     write_tables(folder, 1, levels, records, &fs)?;
     install_fixture(folder, 1, &fs)?;
-    recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::AbsoluteConsistency,
-        None,
-        &AlongsideCheck::NONE,
-    )
+    recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
 }
 
 /// Records group back into the levels and runs they name, in order, and a
@@ -725,13 +741,7 @@ fn recover_rejects_corrupt_blob_file_count() -> crate::Result<()> {
     write_corrupt_blob_count(folder, 1, &fs)?;
     install_fixture(folder, 1, &fs)?;
 
-    let Err(err) = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::AbsoluteConsistency,
-        None,
-        &AlongsideCheck::NONE,
-    ) else {
+    let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None) else {
         panic!("corrupt blob_file_count should fail");
     };
     assert!(
@@ -756,7 +766,7 @@ fn assert_refused_in_every_mode(
         ManifestRecoveryMode::AbsoluteConsistency,
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
     ] {
-        match recover(folder, fs, mode, None, &AlongsideCheck::NONE) {
+        match recover(folder, fs, mode, None) {
             Err(e) if refused(&e) => {}
             Err(e) => panic!("{mode:?}: wrong refusal: {e:?}"),
             Ok(_) => panic!("{mode:?}: a defective snapshot section must not recover"),
@@ -844,7 +854,6 @@ fn recover_tolerate_tail_does_not_swallow_invalid_tag() -> crate::Result<()> {
         &fs,
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
         None,
-        &AlongsideCheck::NONE,
     );
     let err = result.expect_err("InvalidTag must still abort under TolerateCorruptedTailRecords");
     assert!(
@@ -1162,14 +1171,8 @@ fn recover_refuses_a_manifest_of_another_format_version() -> crate::Result<()> {
     fs.create_dir_all(folder)?;
     write_manifest_labelled(folder, &fs, 5)?;
 
-    let err = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::AbsoluteConsistency,
-        None,
-        &AlongsideCheck::NONE,
-    )
-    .expect_err("a V5 manifest must be refused");
+    let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
+        .expect_err("a V5 manifest must be refused");
     assert!(
         matches!(err, crate::Error::InvalidVersion(5)),
         "expected InvalidVersion(5), got {err:?}",
@@ -1266,7 +1269,6 @@ fn a_snapshot_under_another_number_is_refused() -> crate::Result<()> {
         &*fs,
         ManifestRecoveryMode::AbsoluteConsistency,
         None,
-        &AlongsideCheck::NONE,
     )
     .expect_err("a snapshot under another number must be refused");
     assert!(
@@ -1363,6 +1365,7 @@ fn a_tree_at_version(fs: &std::sync::Arc<MemFs>, id: u64) -> crate::Result<crate
         alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
+        0,
     )?;
     Ok(folder)
 }
@@ -1611,14 +1614,8 @@ fn a_snapshot_whose_version_id_is_not_one_id_wide_is_refused() -> crate::Result<
     w.finish()?;
     install_fixture(folder, 1, &fs)?;
 
-    let err = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::AbsoluteConsistency,
-        None,
-        &AlongsideCheck::NONE,
-    )
-    .expect_err("a narrow version id must be refused");
+    let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
+        .expect_err("a narrow version id must be refused");
     assert!(
         matches!(
             err,

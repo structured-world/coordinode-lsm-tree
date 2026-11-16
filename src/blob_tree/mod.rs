@@ -2231,6 +2231,13 @@ impl AbstractTree for BlobTree {
         versions.upgrade_version(
             &config.path,
             |v| {
+                // Under the history's lock, which a flush takes to read the
+                // memtables it writes: every flush holding memtables this
+                // clear drops has taken its number. Its tables describe
+                // themselves, and an open after a power loss would install
+                // them, with the cleared data, unless this manifest decides
+                // that number.
+                self.index.flush_seqs.decide_taken();
                 let mut copy = v.clone();
                 copy.active_memtable = Arc::new(Memtable::new(
                     self.index.memtable_id_counter.next(),
@@ -2362,6 +2369,14 @@ impl AbstractTree for BlobTree {
         self.index.get_flush_lock()
     }
 
+    fn begin_synced_flush(&self) -> Option<u64> {
+        self.index.begin_synced_flush()
+    }
+
+    fn end_synced_flush(&self) {
+        self.index.end_synced_flush();
+    }
+
     #[expect(clippy::too_many_lines, reason = "flush logic is inherently complex")]
     fn flush_to_tables_with_rt(
         &self,
@@ -2370,6 +2385,7 @@ impl AbstractTree for BlobTree {
         keys: u64,
         hashes: u64,
         overwritten: Option<&overwritten::OverwrittenKeys>,
+        self_described: Option<&crate::abstract_tree::FlushSelf>,
     ) -> crate::Result<
         Option<(
             Vec<Table>,
@@ -2423,6 +2439,11 @@ impl AbstractTree for BlobTree {
             crate::fs::WriteOrigin::FlushTable,
         )?
         .use_output_ledger(outputs.clone());
+        // A synced flush's tables describe themselves (see `register_tables`).
+        let table_writer = match self_described {
+            Some(flush) => table_writer.use_flush_seq(flush.seq),
+            None => table_writer,
+        };
         let written = (|| -> crate::Result<_> {
             // The flush's L0 recency, taken as the standard tree's flush takes
             // it: a pooled file's id says nothing about when it was written, a
@@ -2697,6 +2718,10 @@ impl AbstractTree for BlobTree {
             #[cfg(feature = "std")]
             if let Some(ahead) = &mut ahead {
                 while write_ahead(ahead, &mut blob_writer, &mut table_writer)? {}
+            }
+            // The stream is drained: whether it collected history is known.
+            if let Some(flush) = self_described {
+                table_writer.set_flush_floor(flush.raised_floor());
             }
 
             let (blob_files, written) = finish_flush(blob_writer, table_writer);

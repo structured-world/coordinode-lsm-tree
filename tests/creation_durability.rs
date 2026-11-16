@@ -31,11 +31,12 @@ fn reopen(fs: &CrashFs, blob: bool) -> AnyTree {
         .expect("the tree reopens after the power loss")
 }
 
-/// A flush whose edit could not be synced is still in the log a later open
-/// reads, and that open shows its keys as persisted, so a caller may trim its
-/// own log by them. The open removes nothing, yet it makes the log it read
+/// An ingestion whose edit could not be synced is still in the log a later
+/// open reads, and that open shows its keys as persisted, so a caller may trim
+/// its own log by them. The open removes nothing, yet it makes the log it read
 /// durable before it returns the tree: a power loss then keeps the keys the
-/// open showed.
+/// open showed. (A synced flush writes no edit: its tables describe
+/// themselves, so an ingestion is the install whose keys only the edit names.)
 #[test]
 fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() {
     use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
@@ -51,7 +52,8 @@ fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() {
     };
     {
         let tree = config().open().expect("create");
-        tree.insert("key", "value", 0);
+        let mut ingestion = tree.ingestion().expect("ingestion");
+        ingestion.write("key", "value").expect("write");
         fault.injector().arm(
             FaultRule::new(
                 FaultOp::SyncData,
@@ -61,8 +63,8 @@ fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() {
             .once(),
         );
         assert!(
-            tree.flush_active_memtable(0).is_err(),
-            "self-check: the flush's edit is not synced"
+            ingestion.finish().is_err(),
+            "self-check: the ingestion's edit is not synced"
         );
     }
     {
@@ -199,8 +201,9 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
     let fs = CrashFs::new(mem.clone());
     {
         // The first install appends, the second rotates, the third appends
-        // to the rotated generation's log. No pooled table files, so the log
-        // is the only state left.
+        // to the rotated generation's log. A flush writes no manifest, so
+        // each is persisted. No pooled table files, so the log is the only
+        // state left.
         let tree = config(&fs, false)
             .manifest_log_rotate_bytes(1)
             .table_file_pool(0)
@@ -209,6 +212,7 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
         for i in 0..2u64 {
             tree.insert(format!("key{i}"), "value", i);
             tree.flush_active_memtable(0).expect("flush");
+            tree.persist_flushes().expect("persist");
         }
         tree.clear().expect("clear");
     }

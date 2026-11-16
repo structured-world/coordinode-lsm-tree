@@ -286,9 +286,9 @@ fn version_upgrades_on_reopen_replay_from_one_snapshot_generation() -> lsm_tree:
 /// edit in the log is dropped on recovery, and the tree recovers exactly the
 /// durable prefix — but only when the recovery mode opts into tail tolerance.
 ///
-/// Two flushes append two edits to `edits-0`. Truncating the file mid-second
-/// record simulates a crash between the second flush's edit being partially
-/// written and its fsync completing.
+/// A persisted flush and an ingestion append two edits to `edits-0`.
+/// Truncating the file mid-second record simulates a crash between the
+/// ingestion's edit being partially written and its fsync completing.
 ///
 /// Under the default [`ManifestRecoveryMode::AbsoluteConsistency`] the torn
 /// trailing edit must NOT be silently rolled back: reopen fails with
@@ -297,8 +297,8 @@ fn version_upgrades_on_reopen_replay_from_one_snapshot_generation() -> lsm_tree:
 ///
 /// Under [`ManifestRecoveryMode::TolerateCorruptedTailRecords`] the snapshot
 /// (`v0`, empty) plus the first edit are replayed and the torn second edit is
-/// discarded. So `a` (first flush) is present and `b` (second flush) is gone:
-/// the second flush was never durably committed, an unacknowledged write may be
+/// discarded. So `a` (the flush) is present and `b` (the ingestion) is gone:
+/// the ingestion was never durably committed, an unacknowledged write may be
 /// lost, but the recovered state is always internally consistent.
 #[test]
 fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result<()> {
@@ -318,12 +318,16 @@ fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result
 
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
+        // A flush writes no edit: the persist naming its table does.
+        tree.persist_flushes()?;
         // Size of the log after exactly one durable edit — the boundary the torn
         // tail must collapse back to.
         clean_after_first = std::fs::metadata(path.join("edits-0"))?.len();
 
-        tree.insert("b", "b", 1);
-        tree.flush_active_memtable(1)?;
+        // An ingestion's tables are named by its edit alone.
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write("b", "b")?;
+        ingestion.finish()?;
     }
 
     // The second edit made the log strictly longer; chop part of it off so the
@@ -332,7 +336,7 @@ fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result
     let full = std::fs::metadata(path.join("edits-0"))?.len();
     assert!(
         full > clean_after_first,
-        "second flush must have appended a second edit ({full} > {clean_after_first})"
+        "the ingestion must have appended a second edit ({full} > {clean_after_first})"
     );
     let torn_len = clean_after_first + (full - clean_after_first) / 2;
     let log = std::fs::OpenOptions::new()
@@ -355,8 +359,8 @@ fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result
         strict.map(|_| "Ok"),
     );
 
-    // Tolerant mode: recover the durable prefix (first flush survives, torn
-    // second flush is dropped).
+    // Tolerant mode: recover the durable prefix (the flush survives, the torn
+    // ingestion is dropped).
     {
         let tree = Config::new(
             path,
@@ -368,11 +372,11 @@ fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result
 
         assert!(
             tree.contains_key("a", 2)?,
-            "the first flush's edit was durable — its key must survive"
+            "the first edit was durable — its key must survive"
         );
         assert!(
-            !tree.contains_key("b", 2)?,
-            "the second flush's edit was torn off — its key must be dropped"
+            !tree.contains_key("b", u64::MAX)?,
+            "the ingestion's edit was torn off — its key must be dropped"
         );
     }
 
