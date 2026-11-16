@@ -99,7 +99,7 @@ fn bounded_read_into(reader: &mut impl Read, dest: &mut [u8]) -> crate::Result<u
 /// `BlockDecodingStrategy::UptoBytes(remaining)` to stop decoding once the
 /// internal buffer reaches the remaining capacity budget, then drains
 /// collectible bytes into the output vector before the next iteration.
-fn decode_raw_content_bounded(
+fn decode_bounded(
     decoder: &mut structured_zstd::decoding::FrameDecoder,
     cursor: &mut std::io::Cursor<&[u8]>,
     capacity: usize,
@@ -175,125 +175,64 @@ fn decode_raw_content_bounded(
     Ok(output)
 }
 
-/// Executes the actual decompression once the `decoder` has been initialised
-/// with the correct dictionary.
+/// Decodes the frame `data`, compressed under `dict` (whose prepared handle is
+/// `handle`), on `decoder`, into at most `capacity` bytes.
 ///
-/// Separated from the `TLS_DECODER.with` closure so that LLVM's coverage
-/// instrumentation can attribute lines to this named function (closure bodies
-/// are not always attributed correctly by `llvm-cov`).
+/// The frame starts with `dict` handed to it, whatever the decoder decoded
+/// before, so one decoder serves every dictionary. A raw-content
+/// dictionary's frames carry the synthetic id they were compressed under,
+/// which is pinned (`expect_dict_id`); a finalized one's carry its header's
+/// id, which the start checks against the handle. Either way a frame
+/// compressed under another dictionary is refused before any block decodes,
+/// rather than decoded against the wrong tables into silent garbage. The
+/// block checksum, and the AAD for an encrypted block, already reject a
+/// substituted frame; the frame's own id is a third witness behind them.
+/// Frames written before a raw-content dictionary's id was kept name none and
+/// take the handle as given.
 ///
-/// Dispatches to the appropriate path based on `is_raw_content`:
-/// - `true` → manual `init` + `force_dict` + [`decode_raw_content_bounded`]
-/// - `false` → `decode_all_to_vec` (finalized dict, embedded dictID)
+/// Separated from the `with_dict_decoder` closure so that LLVM's coverage
+/// instrumentation can attribute lines to this named function.
 fn do_decompress_with_dict(
     decoder: &mut structured_zstd::decoding::FrameDecoder,
     data: &[u8],
-    // Pre-computed synthetic id for the raw-content path: `dict.frame_id()`.
-    // Unused on the finalized-dict path (`is_raw_content = false`).
-    raw_content_id: u32,
+    dict: &crate::compression::ZstdDictionary,
+    handle: &structured_zstd::decoding::DictionaryHandle,
     capacity: usize,
-    is_raw_content: bool,
 ) -> crate::Result<Vec<u8>> {
-    if is_raw_content {
-        // Raw-content dict path. `FrameDecoder::init` does not
-        // auto-resolve a raw-content dictionary, so drive the decode
-        // manually: `init` → `force_dict` → `decode_blocks` → `collect`.
-        //
-        // `force_dict` applies the dictionary regardless of whether the
-        // frame header carries a dictID, so one path covers both on-disk
-        // shapes:
-        //   - newer frames that keep the synthetic xxh3 dictID in the
-        //     header, and
-        //   - older frames written before the id was retained (header
-        //     omits it).
-        let mut cursor = std::io::Cursor::new(data);
-        // Inner-frame defense-in-depth: pin the frame's embedded Dictionary_ID
-        // against the dictionary we are about to decode with. On the raw-content
-        // path the frame carries the synthetic `raw_content_id` we wrote at
-        // compress time, so a genuine frame always matches; a frame body
-        // compressed under a different dictionary diverges here and is rejected
-        // BEFORE `force_dict` blindly applies the wrong tables and yields silent
-        // garbage. `init` validates the pinned id against the parsed header
-        // before any block decode runs.
-        //
-        // Primary value is correctness, with defense-in-depth on top:
-        // - Correctness: `force_dict` applies the given dictionary REGARDLESS of
-        //   the frame's id, so a wrong-dictionary configuration would otherwise
-        //   decode to silent garbage. The gate turns that into a clear typed
-        //   error at the source.
-        // - Defense-in-depth: the block-level integrity checksum (a fixed
-        //   XXH3-128 over the compressed bytes, verified before we get here) and,
-        //   for encrypted blocks, the AAD `dict_id` binding (AEAD verify) already
-        //   reject a substituted frame; the embedded Dictionary_ID is an
-        //   independent third witness behind them.
-        // (Note: the configurable `ChecksumAlgorithm` — `Xxh3_64` / `Xxh3Low32`
-        // / `Crc32c` — is the per-KV / per-entry checksum, NOT this block
-        // checksum, which is unconditionally XXH3-128.)
-        decoder.expect_dict_id(Some(raw_content_id));
-        decoder.init(&mut cursor).map_err(|e| {
-            if matches!(
-                e,
-                structured_zstd::decoding::errors::FrameDecoderError::UnexpectedDictId { .. }
-            ) {
-                // Typed signal: the inner frame was compressed under a different
-                // dictionary than this block claims. Never silent wrong output.
+    use structured_zstd::decoding::errors::FrameDecoderError;
+
+    let is_raw_content = !dict
+        .raw()
+        .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
+    let mut cursor = std::io::Cursor::new(data);
+    decoder.expect_dict_id(is_raw_content.then(|| dict.frame_id()));
+    decoder
+        .init_with_dict_handle(&mut cursor, handle)
+        .map_err(|e| match e {
+            // Typed signal: the frame was compressed under another dictionary
+            // than this block claims. Never silent wrong output.
+            FrameDecoderError::UnexpectedDictId { .. }
+            | FrameDecoderError::DictIdMismatch { .. } => {
                 crate::Error::Decompress(crate::CompressionType::ZstdDict {
                     level: 0,
-                    dict_id: raw_content_id,
+                    dict_id: dict.frame_id(),
                 })
-            } else {
-                crate::Error::Io(crate::io::Error::other(e.to_string()))
             }
+            e => crate::Error::Io(crate::io::Error::other(e.to_string())),
         })?;
 
-        // Decompression-bomb guard: if the frame header declares a
-        // content size larger than `capacity`, reject before allocating
-        // the output buffer. `content_size()` returns 0 when the
-        // frame omits the FCS field (size unknown); in that case the
-        // post-decode check on `output.len()` below acts as fallback.
-        let declared_size = decoder.content_size();
-        if declared_size > 0 && declared_size > capacity as u64 {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: declared_size,
-                limit: capacity as u64,
-            });
-        }
-
-        // `raw_content_id` is the caller's `dict.frame_id()`, derived from the
-        // cached xxh3 fingerprint without re-hashing the dictionary.
-        decoder
-            .force_dict(raw_content_id)
-            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-
-        decode_raw_content_bounded(decoder, &mut cursor, capacity)
-    } else {
-        // Finalized dict path: the frame embeds the dictID from the
-        // dict header; `decode_all_to_vec` → `init` loads the matching
-        // dict automatically via the standard dictID lookup.
-        //
-        // The capacity limit is enforced by `decode_all_to_vec`: it
-        // pre-allocates exactly `capacity` bytes (via `Vec::with_capacity`)
-        // and `TargetTooSmall` is returned if the frame exceeds that.
-        let mut output = Vec::with_capacity(capacity);
-        decoder.decode_all_to_vec(data, &mut output).map_err(|e| {
-            if matches!(
-                e,
-                structured_zstd::decoding::errors::FrameDecoderError::TargetTooSmall
-            ) {
-                crate::Error::DecompressedSizeTooLarge {
-                    declared: capacity as u64 + 1,
-                    limit: capacity as u64,
-                }
-            } else {
-                crate::Error::Io(crate::io::Error::other(e.to_string()))
-            }
-        })?;
-        // `decode_all_to_vec` returns `TargetTooSmall` if the frame would exceed
-        // `Vec::with_capacity(capacity)`, so reaching here guarantees
-        // output.len() <= capacity. A post-decode size assert is therefore
-        // structurally unreachable and is omitted to keep coverage clean.
-        Ok(output)
+    // Decompression-bomb guard: a frame declaring more than `capacity` is
+    // refused before any output is allocated. `content_size()` is 0 when the
+    // frame omits its size; the bounded decode below enforces it then.
+    let declared_size = decoder.content_size();
+    if declared_size > 0 && declared_size > capacity as u64 {
+        return Err(crate::Error::DecompressedSizeTooLarge {
+            declared: declared_size,
+            limit: capacity as u64,
+        });
     }
+
+    decode_bounded(decoder, &mut cursor, capacity)
 }
 
 /// Extract the inner-block layout (cumulative decompressed END offsets) from a
@@ -525,74 +464,12 @@ impl CompressionProvider for ZstdProvider {
         dict: &crate::compression::ZstdDictionary,
         capacity: usize,
     ) -> crate::Result<Vec<u8>> {
-        use structured_zstd::decoding::FrameDecoder;
-
-        // Thread-local `FrameDecoder` with the dictionary pre-loaded.
-        //
-        // `FrameDecoder` is not `Send`, so we keep one per thread. The cached
-        // entry is keyed by the full 64-bit xxh3 fingerprint (`dict.id64()`),
-        // not the truncated 32-bit public fingerprint, to avoid decoder reuse
-        // when two distinct dictionaries happen to share the same 32-bit
-        // prefix. A 64-bit collision is 2^32× less likely than a 32-bit one.
-        //
-        // On miss we register the *pre-parsed* dictionary handle held by the
-        // `ZstdDictionary` itself (lazy-parsed once, shared via Arc inside
-        // structured-zstd). This eliminates the per-thread `Dictionary` re-parse
-        // the cache used to do on every miss — the dictionary's entropy tables
-        // are built once globally and the FrameDecoder just shares the Arc.
-        // Several dictionaries at once: blob files that each hold a
-        // dictionary of their own interleave in reads, and one slot would
-        // rebuild the decoder at every switch.
-        const DECODERS: usize = 8;
-        thread_local! {
-            static TLS_DECODERS: std::cell::RefCell<Vec<(u64, FrameDecoder)>> =
-                const { std::cell::RefCell::new(Vec::new()) };
-        }
-
-        // For raw-content dicts `FrameDecoder::init` does not auto-resolve
-        // the dictionary (it skips dict lookup whether the header carries
-        // the synthetic dictID or, in older frames, omits it), so the
-        // raw-content branch below uses `force_dict` after `init` to apply
-        // it explicitly.
-        //
-        // For finalized dicts the frame embeds the dictID from the dict header;
-        // `init` loads the matching dict automatically. `decode_all_to_vec`
-        // handles this via the standard path.
-        let is_raw_content = !dict
-            .raw()
-            .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
-
-        TLS_DECODERS.with(|cell| {
-            let mut decoders = cell.borrow_mut();
-
-            // The decoder of this dictionary moves to the front; a miss builds
-            // one there, evicting the least recently used past the bound.
-            match decoders.iter().position(|(id, _)| *id == dict.id64()) {
-                Some(0) => {}
-                Some(at) => {
-                    let found = decoders.remove(at);
-                    decoders.insert(0, found);
-                }
-                None => {
-                    // Pull the shared pre-parsed handle from the dictionary.
-                    // First caller across all threads parses; everyone after
-                    // gets an Arc clone of the cached entropy tables.
-                    let handle = dict.prepared_handle()?.clone();
-                    let mut decoder = FrameDecoder::new();
-                    decoder
-                        .add_dict_handle(handle)
-                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-                    decoders.truncate(DECODERS - 1);
-                    decoders.insert(0, (dict.id64(), decoder));
-                }
-            }
-
-            let Some((_, decoder)) = decoders.first_mut() else {
-                unreachable!("the decoder of this dictionary is at the front");
-            };
-
-            do_decompress_with_dict(decoder, data, dict.frame_id(), capacity, is_raw_content)
-        })
+        // One decoder per thread for every dictionary: each frame is handed
+        // the dictionary's shared, once-parsed handle as it starts, so a read
+        // that moves between dictionaries (blob files each bring their own)
+        // neither registers one with the decoder nor builds a decoder for it.
+        let handle = dict.prepared_handle()?;
+        with_dict_decoder(|decoder| do_decompress_with_dict(decoder, data, dict, handle, capacity))
     }
 }
 
@@ -641,21 +518,28 @@ impl ZstdProvider {
         let is_raw_content = !dict
             .raw()
             .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
-        // A decoder of its own, apart from the plain one: a frame reset
-        // without a dictionary leaves the last one applied in place, and
-        // every frame decoded here applies its dictionary afresh.
-        thread_local! {
-            static TLS_DICT_DECODER: core::cell::RefCell<structured_zstd::decoding::FrameDecoder> =
-                core::cell::RefCell::new(structured_zstd::decoding::FrameDecoder::new());
-        }
-        TLS_DICT_DECODER.with(|cell| {
-            let mut decoder = cell.borrow_mut();
+        with_dict_decoder(|decoder| {
             decoder.expect_dict_id(is_raw_content.then(|| dict.frame_id()));
             decoder
                 .decode_all_with_dict_handle(data, dest, handle)
                 .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))
         })
     }
+}
+
+/// Runs `decode` on this thread's `FrameDecoder` for frames compressed under a
+/// dictionary, any dictionary: each frame is handed its dictionary as it
+/// starts. Apart from the plain decoder, since a frame started without a
+/// dictionary leaves the last one applied in place.
+fn with_dict_decoder<T>(
+    decode: impl FnOnce(&mut structured_zstd::decoding::FrameDecoder) -> T,
+) -> T {
+    thread_local! {
+        static TLS_DICT_DECODER: core::cell::RefCell<structured_zstd::decoding::FrameDecoder> =
+            core::cell::RefCell::new(structured_zstd::decoding::FrameDecoder::new());
+    }
+
+    TLS_DICT_DECODER.with(|cell| decode(&mut cell.borrow_mut()))
 }
 
 /// Runs `decode` on this thread's `FrameDecoder` for frames without a dictionary.
