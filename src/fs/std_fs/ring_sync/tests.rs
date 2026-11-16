@@ -66,6 +66,39 @@ fn a_missing_file_fails_the_batch_with_not_found() -> crate::Result<()> {
     Ok(())
 }
 
+/// Batches on one thread share its ring, a larger batch than the ring holds
+/// gets a larger one, and a batch after a failed one syncs on a ring that
+/// holds nothing of the failure: each reports its own result.
+#[test]
+fn batches_after_a_failure_and_a_larger_batch_still_sync() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<std::path::PathBuf> =
+        (0..20).map(|i| dir.path().join(format!("f{i}"))).collect();
+    for path in &paths {
+        std::fs::File::create(path)?.write_all(b"x")?;
+    }
+    fn target(path: &std::path::PathBuf) -> SyncTarget<'_> {
+        SyncTarget::FileData {
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        }
+    }
+    let small: Vec<SyncTarget<'_>> = paths.iter().take(2).map(target).collect();
+    let Some(first) = sync_on_ring(&small) else {
+        return Ok(());
+    };
+    first?;
+    let missing = dir.path().join("missing");
+    let present = dir.path().join("f0");
+    let failing = [target(&present), target(&missing)];
+    assert!(matches!(sync_on_ring(&failing), Some(Err(_))));
+    let large: Vec<SyncTarget<'_>> = paths.iter().map(target).collect();
+    assert!(matches!(sync_on_ring(&large), Some(Ok(()))));
+    assert!(matches!(sync_on_ring(&small), Some(Ok(()))));
+    Ok(())
+}
+
 /// A folder target that names a file is refused, as
 /// `StdFs::sync_directory_with` refuses it: the ring path does not sync a
 /// file in place of the folder a caller meant to make durable.

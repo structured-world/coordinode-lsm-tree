@@ -13,23 +13,53 @@
 
 use super::super::SyncTarget;
 use crate::io;
+use core::cell::RefCell;
 use io_uring::{IoUring, opcode, squeue, types};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 
-/// Syncs every target of `targets` through one ring and waits for all of
-/// them: `None` when no ring can be set up, for the caller to sync another
-/// way. Linux has one data sync for every [`crate::fs::SyncMode`].
+/// The fewest entries a ring is set up with: a flush of a table, a blob file
+/// and their folders fits.
+const MIN_ENTRIES: u32 = 8;
+
+std::thread_local! {
+    /// The ring this thread's batches go through, kept between them: setting
+    /// one up maps its queues and its first sync starts the kernel's workers,
+    /// work a flush would otherwise pay each time.
+    // no-std: unreachable without std (the kernel backend is std-only).
+    static RING: RefCell<Option<IoUring>> = const { RefCell::new(None) };
+}
+
+/// Syncs every target of `targets` through this thread's ring and waits for
+/// all of them: `None` when no ring can be set up, for the caller to sync
+/// another way. Linux has one data sync for every [`crate::fs::SyncMode`].
 pub(super) fn sync_on_ring(targets: &[SyncTarget<'_>]) -> Option<io::Result<()>> {
-    let entries = u32::try_from(targets.len()).ok()?.next_power_of_two();
-    let mut ring = match IoUring::new(entries) {
-        Ok(ring) => ring,
-        Err(e) => {
-            log::debug!("no io_uring for a batch of syncs, syncing on threads: {e}");
-            return None;
+    let entries = u32::try_from(targets.len())
+        .ok()?
+        .next_power_of_two()
+        .max(MIN_ENTRIES);
+    RING.with_borrow_mut(|slot| {
+        let fits = slot
+            .as_ref()
+            .is_some_and(|ring| ring.params().sq_entries() >= entries);
+        if !fits {
+            match IoUring::new(entries) {
+                Ok(ring) => *slot = Some(ring),
+                Err(e) => {
+                    log::debug!("no io_uring for a batch of syncs, syncing on threads: {e}");
+                    return None;
+                }
+            }
         }
-    };
-    Some(sync_through(&mut ring, targets))
+        let ring = slot.as_mut()?;
+        let synced = sync_through(ring, targets);
+        if synced.is_err() {
+            // A batch that failed may have left entries in flight: the next
+            // batch gets a ring of its own rather than their completions.
+            *slot = None;
+        }
+        Some(synced)
+    })
 }
 
 /// Opens every target, submits a sync of each to `ring` and reaps them all.
