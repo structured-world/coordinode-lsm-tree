@@ -90,149 +90,33 @@ fn bounded_read_into(reader: &mut impl Read, dest: &mut [u8]) -> crate::Result<u
     Ok(filled)
 }
 
-/// Incrementally decodes `data` using the pre-initialised `decoder` and
-/// collects the output, enforcing a hard `capacity` limit even when the frame
-/// has no `Frame_Content_Size` field (FCS omitted → `content_size()` == 0).
+/// The error a frame compressed under `dict` failed with, decoded into a
+/// `capacity`-byte buffer.
 ///
-/// Unlike `decode_blocks(All)`, which fills the decoder's internal buffer
-/// without bound before the caller can check the size, this uses
-/// `BlockDecodingStrategy::UptoBytes(remaining)` to stop decoding once the
-/// internal buffer reaches the remaining capacity budget, then drains
-/// collectible bytes into the output vector before the next iteration.
-fn decode_bounded(
-    decoder: &mut structured_zstd::decoding::FrameDecoder,
-    cursor: &mut std::io::Cursor<&[u8]>,
-    capacity: usize,
-) -> crate::Result<Vec<u8>> {
-    use structured_zstd::decoding::BlockDecodingStrategy;
-
-    let mut output: Vec<u8> = Vec::new();
-    loop {
-        // Clamp-to-zero: remaining output budget = capacity minus what has been
-        // decoded so far (never negative once the cap is reached).
-        let remaining = capacity.saturating_sub(output.len());
-
-        if !decoder.is_finished() {
-            // Use `remaining.max(1)` so the decoder advances past empty frames even
-            // when `capacity == 0` (remaining would be 0 before any blocks are
-            // decoded). For non-empty frames `can_collect()` will be > 0 after this
-            // call and the size guard below rejects them; for empty frames the
-            // decoder marks itself finished with 0 bytes collectible.
-            //
-            // Note: `UptoBytes(N)` is a best-effort hint. The decoder may decode
-            // one additional zstd block (≤ 128 KiB by the zstd standard) into its
-            // internal buffer before returning, so `can_collect()` can transiently
-            // exceed `remaining` by up to one block. The `new_len > capacity` guard
-            // below immediately rejects such frames and frees the buffer. This is
-            // acceptable because this path only decompresses data from SST files
-            // that have already passed checksum verification — adversarial frames
-            // are not a threat model concern here. FCS-less frames produced by
-            // trusted writers are handled by the post-decode check alone.
-            decoder
-                .decode_blocks(
-                    &mut *cursor,
-                    BlockDecodingStrategy::UptoBytes(remaining.max(1)),
-                )
-                .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-        }
-
-        // Drain collectible bytes from the decoder's internal buffer.
-        let can = decoder.can_collect();
-        if can > 0 {
-            // Use checked_add to avoid usize overflow when output.len() or can
-            // are near usize::MAX.  Overflow is treated as a limit violation.
-            let new_len =
-                output
-                    .len()
-                    .checked_add(can)
-                    .ok_or(crate::Error::DecompressedSizeTooLarge {
-                        declared: u64::MAX,
-                        limit: capacity as u64,
-                    })?;
-            if new_len > capacity {
-                return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: new_len as u64,
-                    limit: capacity as u64,
-                });
-            }
-            let prev_len = output.len();
-            output.resize(new_len, 0u8);
-            // Invariant: output was just resized to new_len (= prev_len + can), so
-            // prev_len.. is always a valid slice. This cannot fail.
-            let dest = output
-                .get_mut(prev_len..)
-                .unwrap_or_else(|| unreachable!("output resized to new_len above"));
-            // `read_exact` ensures all `can` bytes are drained in one call.
-            // `Read::read` may do short reads, which would leave zero-filled
-            // slack and corrupt capacity accounting on the next iteration.
-            decoder.read_exact(dest).map_err(crate::Error::from)?;
-        }
-
-        if decoder.is_finished() && decoder.can_collect() == 0 {
-            break;
-        }
-    }
-    Ok(output)
-}
-
-/// Decodes the frame `data`, compressed under `dict` (whose prepared handle is
-/// `handle`), on `decoder`, into at most `capacity` bytes.
-///
-/// The frame starts with `dict` handed to it, whatever the decoder decoded
-/// before, so one decoder serves every dictionary. A raw-content
-/// dictionary's frames carry the synthetic id they were compressed under,
-/// which is pinned (`expect_dict_id`); a finalized one's carry its header's
-/// id, which the start checks against the handle. Either way a frame
-/// compressed under another dictionary is refused before any block decodes,
-/// rather than decoded against the wrong tables into silent garbage. The
-/// block checksum, and the AAD for an encrypted block, already reject a
-/// substituted frame; the frame's own id is a third witness behind them.
-/// Frames written before a raw-content dictionary's id was kept name none and
-/// take the handle as given.
-///
-/// Separated from the `with_dict_decoder` closure so that LLVM's coverage
-/// instrumentation can attribute lines to this named function.
-fn do_decompress_with_dict(
-    decoder: &mut structured_zstd::decoding::FrameDecoder,
-    data: &[u8],
+/// A frame naming another dictionary is a typed [`crate::Error::Decompress`]
+/// carrying the dictionary it was read under, never silent wrong output; one
+/// decoding to more than `capacity` bytes is
+/// [`crate::Error::DecompressedSizeTooLarge`].
+fn dict_decode_error(
+    e: &structured_zstd::decoding::errors::FrameDecoderError,
     dict: &crate::compression::ZstdDictionary,
-    handle: &structured_zstd::decoding::DictionaryHandle,
     capacity: usize,
-) -> crate::Result<Vec<u8>> {
+) -> crate::Error {
     use structured_zstd::decoding::errors::FrameDecoderError;
 
-    let is_raw_content = !dict
-        .raw()
-        .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
-    let mut cursor = std::io::Cursor::new(data);
-    decoder.expect_dict_id(is_raw_content.then(|| dict.frame_id()));
-    decoder
-        .init_with_dict_handle(&mut cursor, handle)
-        .map_err(|e| match e {
-            // Typed signal: the frame was compressed under another dictionary
-            // than this block claims. Never silent wrong output.
-            FrameDecoderError::UnexpectedDictId { .. }
-            | FrameDecoderError::DictIdMismatch { .. } => {
-                crate::Error::Decompress(crate::CompressionType::ZstdDict {
-                    level: 0,
-                    dict_id: dict.frame_id(),
-                })
-            }
-            e => crate::Error::Io(crate::io::Error::other(e.to_string())),
-        })?;
-
-    // Decompression-bomb guard: a frame declaring more than `capacity` is
-    // refused before any output is allocated. `content_size()` is 0 when the
-    // frame omits its size; the bounded decode below enforces it then.
-    let declared_size = decoder.content_size();
-    if declared_size > 0 && declared_size > capacity as u64 {
-        return Err(crate::Error::DecompressedSizeTooLarge {
-            declared: declared_size,
+    match e {
+        FrameDecoderError::UnexpectedDictId { .. } | FrameDecoderError::DictIdMismatch { .. } => {
+            crate::Error::Decompress(crate::CompressionType::ZstdDict {
+                level: 0,
+                dict_id: dict.frame_id(),
+            })
+        }
+        FrameDecoderError::TargetTooSmall => crate::Error::DecompressedSizeTooLarge {
+            declared: capacity as u64 + 1,
             limit: capacity as u64,
-        });
+        },
+        e => crate::Error::Io(crate::io::Error::other(e.to_string())),
     }
-
-    decode_bounded(decoder, &mut cursor, capacity)
 }
 
 /// Extract the inner-block layout (cumulative decompressed END offsets) from a
@@ -464,12 +348,13 @@ impl CompressionProvider for ZstdProvider {
         dict: &crate::compression::ZstdDictionary,
         capacity: usize,
     ) -> crate::Result<Vec<u8>> {
-        // One decoder per thread for every dictionary: each frame is handed
-        // the dictionary's shared, once-parsed handle as it starts, so a read
-        // that moves between dictionaries (blob files each bring their own)
-        // neither registers one with the decoder nor builds a decoder for it.
-        let handle = dict.prepared_handle()?;
-        with_dict_decoder(|decoder| do_decompress_with_dict(decoder, data, dict, handle, capacity))
+        // Straight into the result's buffer, as `decompress_with_dict_into`
+        // decodes: the frame's header is read in place and its blocks land
+        // where they stay, with no scratch or copy out of one.
+        let mut output = vec![0; capacity];
+        let written = Self::decompress_with_dict_into(data, dict, &mut output)?;
+        output.truncate(written);
+        Ok(output)
     }
 }
 
@@ -518,11 +403,20 @@ impl ZstdProvider {
         let is_raw_content = !dict
             .raw()
             .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
+        // The frame is handed the dictionary as it starts, whatever the
+        // decoder decoded before, so one decoder serves every dictionary. A
+        // raw-content dictionary's frames carry the synthetic id they were
+        // compressed under, which is pinned; a finalized one's carry its
+        // header's id, which the start checks against the handle. Either way
+        // a frame compressed under another dictionary is refused before any
+        // block decodes. The block checksum, and the AAD for an encrypted
+        // block, already reject a substituted frame; the frame's own id is a
+        // third witness behind them.
         with_dict_decoder(|decoder| {
             decoder.expect_dict_id(is_raw_content.then(|| dict.frame_id()));
             decoder
                 .decode_all_with_dict_handle(data, dest, handle)
-                .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))
+                .map_err(|e| dict_decode_error(&e, dict, dest.len()))
         })
     }
 }
