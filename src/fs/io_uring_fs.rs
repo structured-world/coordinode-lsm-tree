@@ -537,6 +537,10 @@ impl Fs for IoUringFs {
         super::StdFs.capabilities(path)
     }
 
+    fn writeback_stalls_syncs(&self, path: &Path) -> bool {
+        super::StdFs.writeback_stalls_syncs(path)
+    }
+
     fn try_disable_cow(&self, path: &Path) -> crate::io::Result<()> {
         super::StdFs.try_disable_cow(path)
     }

@@ -1160,10 +1160,11 @@ pub struct Config {
     /// starts. Set via [`Config::writeback_bytes`].
     pub(crate) writeback_bytes: u64,
 
-    /// What a blob file's writer uses in place of `writeback_bytes`: the same,
-    /// or `0` on a device whose I/O scheduler leaves started writeback behind
-    /// the syncs that follow it. Set by the open from the backend's
-    /// capabilities.
+    /// What the writer of a flush's blob files uses in place of
+    /// `writeback_bytes`: the same, or `0` on a device whose I/O scheduler
+    /// leaves started writeback behind the syncs that follow it (see
+    /// [`Fs::writeback_stalls_syncs`](crate::fs::Fs::writeback_stalls_syncs)).
+    /// Set by the open.
     pub(crate) blob_writeback_bytes: u64,
 
     /// Size a flush or an ingestion cuts its output tables at. Set via

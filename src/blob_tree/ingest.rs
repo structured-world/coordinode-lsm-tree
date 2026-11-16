@@ -69,7 +69,7 @@ impl<'a> BlobIngestion<'a> {
         .use_target_size(blob_file_size)
         .use_compression(blob_compression)
         .use_sync_mode(tree.index.config.sync_mode)
-        .use_writeback_bytes(tree.index.config.blob_writeback_bytes)
+        .use_writeback_bytes(tree.index.config.writeback_bytes)
         .use_lifetime_groups(kv.lifetime_groups)
         .use_frame_sizes(kv.frame_sizes())
         .use_dictionary_classes(kv.dictionary_classes)

@@ -6,7 +6,7 @@
 //!
 //! BFQ serves the asynchronous queue that started writeback lands in last,
 //! and idles for each queue's next request: a sync waits out writeback that
-//! never gets its turn (see [`FsCapabilities::writeback_stalls_syncs`](crate::fs::FsCapabilities::writeback_stalls_syncs)).
+//! never gets its turn (see [`Fs::writeback_stalls_syncs`](crate::fs::Fs::writeback_stalls_syncs)).
 //!
 //! The folder's mount gives the block device it was mounted from
 //! (`/proc/self/mountinfo`; Btrfs reports a device number of its own for its

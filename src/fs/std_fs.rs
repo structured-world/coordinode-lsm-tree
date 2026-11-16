@@ -644,14 +644,16 @@ impl Fs for StdFs {
     /// snapshot); XFS reports copy-on-write plus reflink (reflink only when the
     /// volume was formatted `reflink=1`, which `reflink_file` handles by falling
     /// back). Other filesystems and any detection failure report the
-    /// conservative default. Whether started writeback stalls the syncs after
-    /// it comes from the I/O scheduler of the disks under `path`.
+    /// conservative default.
     #[cfg(target_os = "linux")]
     fn capabilities(&self, path: &Path) -> super::FsCapabilities {
-        super::FsCapabilities {
-            writeback_stalls_syncs: scheduler::writeback_stalls_syncs(path),
-            ..linux_caps::capabilities(path)
-        }
+        linux_caps::capabilities(path)
+    }
+
+    /// Linux: from the I/O scheduler of the disks under `path`.
+    #[cfg(target_os = "linux")]
+    fn writeback_stalls_syncs(&self, path: &Path) -> bool {
+        scheduler::writeback_stalls_syncs(path)
     }
 
     /// Windows: no directory can be synced (see `sync_directory`), so the

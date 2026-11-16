@@ -4927,10 +4927,9 @@ impl Tree {
 
         // The writeback blob writers start as they write: none on a device
         // whose scheduler leaves it behind the syncs that follow it (see
-        // `FsCapabilities::writeback_stalls_syncs`). Tables keep theirs: a
-        // table synced alone was synced faster with it there too.
-        config.blob_writeback_bytes = if config.fs.capabilities(&config.path).writeback_stalls_syncs
-        {
+        // `Fs::writeback_stalls_syncs`). Tables keep theirs: a table synced
+        // alone was synced faster with it there too.
+        config.blob_writeback_bytes = if config.fs.writeback_stalls_syncs(&config.path) {
             0
         } else {
             config.writeback_bytes

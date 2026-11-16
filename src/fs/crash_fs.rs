@@ -1356,6 +1356,10 @@ impl Fs for CrashFs {
         self.inner.capabilities(path)
     }
 
+    fn writeback_stalls_syncs(&self, path: &Path) -> bool {
+        self.inner.writeback_stalls_syncs(path)
+    }
+
     fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
         self.inner.try_disable_cow(path)
     }

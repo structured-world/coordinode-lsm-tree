@@ -392,17 +392,6 @@ pub struct FsCapabilities {
     /// syncs a flush's files and its manifest edit one after another instead
     /// of side by side.
     pub serial_syncs: bool,
-
-    /// Writeback a writer starts while it writes (see
-    /// [`FsFile::start_writeback`]) delays the syncs that follow instead of
-    /// shortening them. The I/O it starts is asynchronous, and an I/O
-    /// scheduler that serves the asynchronous queue last and idles for each
-    /// queue's next request (BFQ) leaves it waiting while a sync of another
-    /// file is served: a flush of a table and a 2.6 MB blob file synced them
-    /// in 22 ms with writeback started, in 6 to 11 without, where under
-    /// `mq-deadline` writeback halved the same syncs. The engine then starts
-    /// no writeback for the blob files a write syncs beside its tables.
-    pub writeback_stalls_syncs: bool,
 }
 
 /// A directory entry returned by [`Fs::read_dir`].
@@ -2003,6 +1992,27 @@ pub trait Fs: Send + Sync + 'static {
     fn capabilities(&self, path: &Path) -> FsCapabilities {
         let _ = path;
         FsCapabilities::default()
+    }
+
+    /// Whether writeback a writer starts while it writes (see
+    /// [`FsFile::start_writeback`]) delays the syncs that follow on the
+    /// device under `path` instead of shortening them.
+    ///
+    /// The I/O started writeback issues is asynchronous, and an I/O scheduler
+    /// that serves the asynchronous queue last and idles for each queue's next
+    /// request (BFQ) leaves it waiting while a sync of another file is served:
+    /// a flush of a table and a 2.6 MB blob file synced them in 22 ms with
+    /// writeback started, in 6 to 11 without, where under `mq-deadline`
+    /// writeback halved the same syncs. A tree asks once, at open, and the
+    /// blob files its flushes write then start no writeback.
+    ///
+    /// Asked apart from [`Self::capabilities`] because answering it reads the
+    /// system's mount table and the disks' queues, which `capabilities`, asked
+    /// on the write path, must not. The default is `false`: writeback started
+    /// as configured.
+    fn writeback_stalls_syncs(&self, path: &Path) -> bool {
+        let _ = path;
+        false
     }
 
     /// Requests that per-file copy-on-write be disabled for the file at `path`.
