@@ -149,7 +149,9 @@
 //! (merge-operator semantics differ across engines) from [#244]'s list.
 
 mod paired;
+mod skip_sync;
 
+use skip_sync::{Skip, SkipSyncFs};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -166,8 +168,8 @@ use std::time::Duration;
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
     config::{
-        CompressionPolicy, FlushDurability, HashRatioPolicy, KvSeparationOptions, LocatorPolicy,
-        LocatorPolicyEntry, LocatorPrecision, PinningPolicy,
+        CompressionPolicy, FilterPolicy, FilterPolicyEntry, FlushDurability, HashRatioPolicy,
+        KvSeparationOptions, LocatorPolicy, LocatorPolicyEntry, LocatorPrecision, PinningPolicy,
     },
     runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
@@ -1820,6 +1822,8 @@ fn bench_seeded(run: &mut Run) {
         Spec::writes(zstd),
         &mut seeds,
     );
+    overwrite_parts_variant(run, "overwrite_parts", none, &mut seeds);
+    overwrite_parts_variant(run, "overwrite_parts_zstd22", zstd, &mut seeds);
     // Blobs: tables uncompressed, as random bytes give a codec nothing to do;
     // the compressed blob arms show what each engine stores and reads for a
     // value its codec cannot shrink. No seek group: with one key per blob it
@@ -2456,6 +2460,143 @@ fn overwrite_variant(
                 total
             }));
         }
+        run.measure(group_name, n, arms);
+    }
+}
+
+/// What one arm of the `overwrite_parts` groups leaves out of the timed body.
+#[derive(Clone, Copy)]
+enum Part {
+    /// The inserts and the flush, with the syncs `skip` names left out and
+    /// the filter built or not.
+    Flush { skip: Skip, filter: bool },
+    /// The inserts alone: the memtable's share.
+    Memtable,
+}
+
+/// The arms of the `overwrite_parts` groups. Each differs from `full` in one
+/// part, or from `no-sync` in one, so a part's cost is the difference of two
+/// arms' times measured in the same rounds. A sync left out shows what it adds
+/// beside the syncs that overlap it, not what it takes alone.
+const PARTS: &[(&str, Part)] = &[
+    (
+        "full",
+        Part::Flush {
+            skip: Skip::NONE,
+            filter: true,
+        },
+    ),
+    (
+        "no-table-sync",
+        Part::Flush {
+            skip: Skip {
+                flush_files: true,
+                ..Skip::NONE
+            },
+            filter: true,
+        },
+    ),
+    (
+        "no-manifest-sync",
+        Part::Flush {
+            skip: Skip {
+                manifest: true,
+                ..Skip::NONE
+            },
+            filter: true,
+        },
+    ),
+    (
+        "no-dir-sync",
+        Part::Flush {
+            skip: Skip {
+                directories: true,
+                ..Skip::NONE
+            },
+            filter: true,
+        },
+    ),
+    (
+        "no-sync",
+        Part::Flush {
+            skip: Skip::ALL,
+            filter: true,
+        },
+    ),
+    (
+        "no-sync-no-filter",
+        Part::Flush {
+            skip: Skip::ALL,
+            filter: false,
+        },
+    ),
+    ("memtable", Part::Memtable),
+];
+
+/// Where the time of an `overwrite` goes in our engine: the timed body of
+/// [`overwrite_variant`] with one part left out per arm (see [`PARTS`]). Runs
+/// only when the filter names it (contains `parts`), so the published
+/// head-to-head run does not pay for it.
+fn overwrite_parts_variant(
+    run: &mut Run,
+    group_name: &str,
+    compression: Compression,
+    seeds: &mut SeedStates,
+) {
+    if !run.filter.as_deref().is_some_and(|f| f.contains("parts")) || !run.wants(group_name) {
+        return;
+    }
+    let spec = Spec::writes(compression);
+    for n in run.sizes_of(spec.sizes) {
+        let inputs = WorkloadInputs::of(n, spec.values);
+        let seed = seeds
+            .seed(Engine::Ours, compression, IndexStrategy::Binary, &inputs)
+            .to_path_buf();
+        let arms = PARTS
+            .iter()
+            .map(|&(label, part)| {
+                let (inputs, seed) = (&inputs, &seed);
+                paired::Arm::new(label, move |iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let dir = copy_of(seed);
+                        let config = ours_config(
+                            dir.path(),
+                            compression,
+                            None,
+                            IndexStrategy::Binary,
+                            false,
+                        );
+                        let (skip, filter) = match part {
+                            Part::Flush { skip, filter } => (skip, filter),
+                            Part::Memtable => (Skip::NONE, true),
+                        };
+                        let fs = Arc::new(SkipSyncFs::new(Arc::clone(&config.fs), skip));
+                        let config = config.with_shared_fs(fs);
+                        let config = if filter {
+                            config
+                        } else {
+                            config.filter_policy(FilterPolicy::all(FilterPolicyEntry::None))
+                        };
+                        let tree = config.open().expect("overwrite parts: open");
+                        let start = std::time::Instant::now();
+                        for ((key, value), seqno) in
+                            inputs.keys.iter().zip(inputs.values.iter()).zip(n..)
+                        {
+                            tree.insert(key, value, seqno);
+                        }
+                        if let Part::Flush { .. } = part {
+                            tree.flush_active_memtable(0)
+                                .expect("overwrite parts: flush");
+                        }
+                        total += start.elapsed();
+                        drop((tree, dir));
+                        settle_removal();
+                    }
+                    total
+                })
+            })
+            .collect();
         run.measure(group_name, n, arms);
     }
 }
