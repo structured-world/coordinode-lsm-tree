@@ -23,42 +23,37 @@ use alloc::sync::Arc;
 /// What a flush does on the device under its tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IoStrategy {
-    /// The blob files a flush writes start no writeback while written.
-    blob_writeback_off: bool,
-    /// A flush syncs its files one after another rather than side by side.
-    serial_syncs: bool,
+    /// A flush one of whose files started writeback while written syncs its
+    /// files one after another rather than side by side.
+    ///
+    /// BFQ serves the writeback such a file started from its asynchronous
+    /// queue and idles between the queues of syncs issued side by side: a
+    /// flush of 2.5 MB synced its table and blob file 25% faster one after
+    /// the other, one of 18 MB 15% faster. A flush of 256 KB, which started
+    /// no writeback, synced them 6% faster side by side, as every flush does
+    /// under a scheduler that does not idle.
+    serial_after_writeback: bool,
 }
 
 impl IoStrategy {
-    /// Writeback and syncs as configured: a device whose scheduler does not
-    /// idle between queues, or one nothing is known about.
+    /// Syncs side by side: a device whose scheduler does not idle between
+    /// queues, or one nothing is known about.
     pub(crate) const NONE: Self = Self {
-        blob_writeback_off: false,
-        serial_syncs: false,
+        serial_after_writeback: false,
     };
 
     /// The strategy for a device whose I/O scheduler idles between queues
     /// (`idles`), or does not.
     pub(crate) const fn for_scheduler(idles: bool) -> Self {
         Self {
-            blob_writeback_off: idles,
-            serial_syncs: false,
+            serial_after_writeback: idles,
         }
     }
 
-    /// The bytes the blob files of a flush gather between the writebacks
-    /// their writer starts: `configured`, or none.
-    pub(crate) const fn blob_writeback_bytes(self, configured: u64) -> u64 {
-        if self.blob_writeback_off {
-            0
-        } else {
-            configured
-        }
-    }
-
-    /// Whether a flush syncs its files one after another.
-    pub(crate) const fn serial_syncs(self) -> bool {
-        self.serial_syncs
+    /// Whether a flush syncs its files one after another, given whether one
+    /// of them started writeback while it was written.
+    pub(crate) const fn serial_syncs(self, started_writeback: bool) -> bool {
+        self.serial_after_writeback && started_writeback
     }
 }
 

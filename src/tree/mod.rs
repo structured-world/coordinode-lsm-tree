@@ -1523,7 +1523,16 @@ impl AbstractTree for Tree {
                 crate::version::NewFiles::Deferred(unsynced)
             }
             crate::config::FlushDurability::Synced => {
-                let serial = runtime.io.serial_syncs()
+                // A file this size or more had writeback started while it was
+                // written (the writers start it every `writeback_bytes`).
+                let wb = self.config.writeback_bytes;
+                let started_writeback = wb != 0
+                    && (tables.iter().any(|table| table.file_size() >= wb)
+                        || blob_files
+                            .unwrap_or(&[])
+                            .iter()
+                            .any(|blob| blob.meta().total_compressed_bytes >= wb));
+                let serial = runtime.io.serial_syncs(started_writeback)
                     || self
                         .version_history
                         .write()

@@ -144,13 +144,14 @@ fn a_closed_tree_is_let_go() {
     );
 }
 
-/// A blob writer under the strategy for a device that idles between queues
-/// starts no writeback; anywhere else it gathers what is configured.
+/// Under a scheduler that idles between queues only a flush that started
+/// writeback syncs its files one after another; anywhere else every flush
+/// syncs them side by side.
 #[test]
-fn the_strategy_sets_the_blob_writeback() {
-    assert_eq!(
-        IoStrategy::for_scheduler(true).blob_writeback_bytes(1 << 20),
-        0
-    );
-    assert_eq!(IoStrategy::NONE.blob_writeback_bytes(1 << 20), 1 << 20);
+fn only_a_flush_that_started_writeback_syncs_serially_under_bfq() {
+    let bfq = IoStrategy::for_scheduler(true);
+    assert!(bfq.serial_syncs(true));
+    assert!(!bfq.serial_syncs(false));
+    assert!(!IoStrategy::NONE.serial_syncs(true));
+    assert!(!IoStrategy::NONE.serial_syncs(false));
 }
