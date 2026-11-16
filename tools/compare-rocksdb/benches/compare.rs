@@ -1713,7 +1713,13 @@ fn sync_tree(path: &Path) -> std::io::Result<()> {
         if entry.file_type()?.is_dir() {
             sync_tree(&entry.path())?;
         } else {
-            std::fs::File::open(entry.path())?.sync_all()?;
+            // Opened for writing: Windows flushes a file only through a
+            // handle that may write it (`FlushFileBuffers` needs write
+            // access), and fails on a read-only one.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(entry.path())?
+                .sync_all()?;
         }
     }
     sync_folder(path)
