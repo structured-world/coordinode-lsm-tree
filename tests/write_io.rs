@@ -159,9 +159,12 @@ fn trees_on_one_medium_share_its_set() -> lsm_tree::Result<()> {
 
     fill(&first, 100, 0);
     first.flush_active_memtable(0)?;
+    // The batch each flush reserves is made off its thread after it.
+    first.wait_for_table_file_refills();
     let one = stats.snapshot();
     fill(&second, 100, 0);
     second.flush_active_memtable(0)?;
+    second.wait_for_table_file_refills();
     let both = stats.snapshot();
 
     let (one_table, both_tables) = (

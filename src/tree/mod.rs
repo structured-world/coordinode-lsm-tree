@@ -1456,7 +1456,6 @@ impl AbstractTree for Tree {
         }
     }
 
-    #[expect(clippy::significant_drop_tightening)]
     fn register_tables(
         &self,
         tables: &[Table],
@@ -1632,6 +1631,10 @@ impl AbstractTree for Tree {
             files,
         )?;
         installed.charge();
+        drop(version_lock);
+        // The flush's syncs are done: a pool refill its claim reserved runs
+        // now, never beside them.
+        self.table_files.start_pending();
 
         Ok(())
     }
@@ -4920,11 +4923,18 @@ impl Tree {
         // config a registry of its own rather than storing through the one it
         // arrived with, which is what keeps two trees opened from clones of one
         // config from sharing a set.
-        #[cfg_attr(
-            not(any(feature = "parallel", zstd_any)),
-            expect(unused_mut, reason = "assigned only by the parallel / zstd builds")
-        )]
         let mut config = config;
+
+        // The writeback blob writers start as they write: none on a device
+        // whose scheduler leaves it behind the syncs that follow it (see
+        // `FsCapabilities::writeback_stalls_syncs`). Tables keep theirs: a
+        // table synced alone was synced faster with it there too.
+        config.blob_writeback_bytes = if config.fs.capabilities(&config.path).writeback_stalls_syncs
+        {
+            0
+        } else {
+            config.writeback_bytes
+        };
 
         #[cfg(feature = "parallel")]
         if config.compaction_pool.is_none() && config.compaction_threads > 1 {

@@ -12,6 +12,9 @@ use std::fs::{File, OpenOptions};
 #[cfg(io_uring_fs)]
 mod ring_sync;
 
+#[cfg(target_os = "linux")]
+mod scheduler;
+
 /// Delays between the attempts of a rename or delete that another process is
 /// briefly holding the file against, before the last error is returned: about
 /// half a second in all, longer than an antivirus or indexer scan of a fresh
@@ -641,10 +644,14 @@ impl Fs for StdFs {
     /// snapshot); XFS reports copy-on-write plus reflink (reflink only when the
     /// volume was formatted `reflink=1`, which `reflink_file` handles by falling
     /// back). Other filesystems and any detection failure report the
-    /// conservative default.
+    /// conservative default. Whether started writeback stalls the syncs after
+    /// it comes from the I/O scheduler of the disks under `path`.
     #[cfg(target_os = "linux")]
     fn capabilities(&self, path: &Path) -> super::FsCapabilities {
-        linux_caps::capabilities(path)
+        super::FsCapabilities {
+            writeback_stalls_syncs: scheduler::writeback_stalls_syncs(path),
+            ..linux_caps::capabilities(path)
+        }
     }
 
     /// Windows: no directory can be synced (see `sync_directory`), so the

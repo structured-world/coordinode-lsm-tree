@@ -331,7 +331,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             .use_target_size(blob_opts.file_target_size)
             .use_compression(rc.blob_compression)
             .use_sync_mode(self.shared.opts.config.sync_mode)
-            .use_writeback_bytes(self.shared.opts.config.writeback_bytes)
+            .use_writeback_bytes(self.shared.opts.config.blob_writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
             .use_frame_sizes(blob_opts.frame_sizes())
             .use_dictionary_classes(blob_opts.dictionary_classes)

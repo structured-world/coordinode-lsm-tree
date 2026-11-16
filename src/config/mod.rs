@@ -1160,6 +1160,12 @@ pub struct Config {
     /// starts. Set via [`Config::writeback_bytes`].
     pub(crate) writeback_bytes: u64,
 
+    /// What a blob file's writer uses in place of `writeback_bytes`: the same,
+    /// or `0` on a device whose I/O scheduler leaves started writeback behind
+    /// the syncs that follow it. Set by the open from the backend's
+    /// capabilities.
+    pub(crate) blob_writeback_bytes: u64,
+
     /// Size a flush or an ingestion cuts its output tables at. Set via
     /// [`Config::table_target_size`].
     pub(crate) table_target_size: u64,
@@ -1203,8 +1209,9 @@ pub struct Config {
     /// [`Config::table_file_pool`].
     pub(crate) table_file_pool: usize,
 
-    /// Where a table file pool refills: on the claiming write's thread (the
-    /// default, and the only place without `std`), or off it. Set via
+    /// Where a table file pool refills: off the claiming write's thread once
+    /// its install has synced (the default), or on it, as it does without
+    /// `std`. Set via
     /// [`Config::table_file_refill_inline`].
     pub(crate) table_file_refill: crate::table::file_pool::RefillOn,
 
@@ -1491,6 +1498,7 @@ impl Default for Config {
             sync_mode: SyncMode::Normal,
             flush_durability: FlushDurability::Synced,
             writeback_bytes: 1_024 * 1_024,
+            blob_writeback_bytes: 1_024 * 1_024,
             table_target_size: DEFAULT_TABLE_TARGET_SIZE,
             directory_lock: true,
             #[cfg(feature = "std")]
@@ -3148,11 +3156,11 @@ impl Config {
     }
 
     /// Refills a table file pool on the thread of the write that claims from
-    /// it (`true`, the default), or off it (`false`). On it, the write that
-    /// starts a batch makes its files and the install of its table syncs their
-    /// folder among its own syncs. Off it, the batch's files and folder sync
-    /// reach the device from another thread beside the writes' syncs, which a
-    /// scheduler that serves each thread's I/O in turn (BFQ) idles between.
+    /// it (`true`), or off it once that write's install has synced (`false`,
+    /// the default). On it, the write that starts a batch makes its files and
+    /// the install of its table syncs their folder among its own syncs; every
+    /// sync the pool issues falls inside one write, so a test that counts an
+    /// operation's syncs, or fails one of them, sees the same ones every run.
     #[doc(hidden)]
     #[must_use]
     pub fn table_file_refill_inline(mut self, inline: bool) -> Self {

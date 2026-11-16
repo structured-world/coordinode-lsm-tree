@@ -193,6 +193,9 @@ pub(crate) fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
         ..opts.clone()
     };
     let result = run_compaction(opts);
+    // The run's syncs are done: a pool refill one of its claims reserved runs
+    // now, never beside them.
+    opts.table_files.start_pending();
     // A run its room stopped declined, as one the gate skips does: its
     // inputs are as they were, and only its outputs go, below.
     let result = match result {
@@ -3741,7 +3744,7 @@ fn run_subcompaction(
             .use_target_size(blob_opts.file_target_size)
             .use_passthrough_compression(rc.blob_compression)
             .use_sync_mode(opts.config.sync_mode)
-            .use_writeback_bytes(opts.config.writeback_bytes)
+            .use_writeback_bytes(opts.config.blob_writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
             .use_frame_sizes(blob_opts.frame_sizes())
             .use_dictionary_classes(blob_opts.dictionary_classes)
@@ -5166,7 +5169,7 @@ fn merge_tables(
                 .use_target_size(blob_opts.file_target_size)
                 .use_passthrough_compression(rc.blob_compression)
                 .use_sync_mode(opts.config.sync_mode)
-                .use_writeback_bytes(opts.config.writeback_bytes)
+                .use_writeback_bytes(opts.config.blob_writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
                 .use_frame_sizes(blob_opts.frame_sizes())
                 .use_dictionary_classes(blob_opts.dictionary_classes)

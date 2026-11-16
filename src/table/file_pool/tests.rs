@@ -579,17 +579,41 @@ fn a_refill_that_panics_leaves_no_claim_waiting() -> crate::Result<()> {
 }
 
 /// Pools that go wait for their refills: no file is made in a folder after
-/// its tree is closed.
+/// its tree is closed. A refill the install started finishes its batch.
 #[cfg(feature = "std")]
 #[test]
 fn closing_the_pools_waits_for_their_refills() -> crate::Result<()> {
     let (pools, _fault, fs, folder) = background_pools(8)?;
     drop(pools.claim(&folder, &fs, None, true)?);
+    // What the install of the claim's table does once its syncs are done.
+    pools.start_pending();
     drop(pools);
     assert_eq!(
         empty_files(&fs, &folder)?.len(),
         1 + 8,
         "the claim's file and the whole batch"
+    );
+    Ok(())
+}
+
+/// A refill a claim reserved is held until the install of its write has
+/// synced, so it never runs beside that write's syncs; held at close, it
+/// makes nothing for a tree that is going and gives its ids back.
+#[cfg(feature = "std")]
+#[test]
+fn a_refill_held_at_close_makes_nothing() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(8)?;
+    drop(pools.claim(&folder, &fs, None, true)?);
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1,
+        "the batch waits for the install of the claim's write"
+    );
+    drop(pools);
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1,
+        "the claim's file alone: the held batch was never made"
     );
     Ok(())
 }
