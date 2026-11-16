@@ -48,10 +48,10 @@ fn the_longest_mount_point_over_a_path_gives_its_source() {
 /// device by, the high bits of each included.
 #[test]
 fn a_device_number_splits_as_the_kernel_encodes_it() {
-    assert_eq!(split_device((8 << 8) | 17), (8, 17));
+    assert_eq!(split_device((8 << 8) | 0x11), (8, 17));
     assert_eq!(split_device(253 << 8), (253, 0));
     // minor 300 spills into the high minor bits.
-    let wide = (259 << 8) | (300 & 0xff) | ((300 & !0xff) << 12);
+    let wide = (259 << 8) | (0x12c & 0xff) | ((0x12c & !0xff) << 12);
     assert_eq!(split_device(wide), (259, 300));
 }
 

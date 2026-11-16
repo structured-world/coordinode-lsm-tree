@@ -89,15 +89,12 @@ fn unescape(field: &str) -> String {
         let escaped = after
             .get(..3)
             .and_then(|digits| u8::from_str_radix(digits, 8).ok());
-        match (escaped, after.get(3..)) {
-            (Some(byte), Some(tail)) => {
-                out.push(char::from(byte));
-                rest = tail;
-            }
-            _ => {
-                out.push('\\');
-                rest = after;
-            }
+        if let (Some(byte), Some(tail)) = (escaped, after.get(3..)) {
+            out.push(char::from(byte));
+            rest = tail;
+        } else {
+            out.push('\\');
+            rest = after;
         }
     }
     out.push_str(rest);
