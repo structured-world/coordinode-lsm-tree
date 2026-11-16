@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! Whether the I/O scheduler of the disks under a folder leaves writeback a
-//! writer started behind the syncs that follow it.
-//!
-//! BFQ serves the asynchronous queue that started writeback lands in last,
-//! and idles for each queue's next request: a sync waits out writeback that
-//! never gets its turn (see [`Fs::writeback_stalls_syncs`](crate::fs::Fs::writeback_stalls_syncs)).
+//! Whether the I/O scheduler of the disks under a folder serves each queue in
+//! turn and idles for its next request (BFQ); see
+//! [`Fs::idles_between_io_queues`](crate::fs::Fs::idles_between_io_queues).
 //!
 //! The folder's mount gives the block device it was mounted from
 //! (`/proc/self/mountinfo`; Btrfs reports a device number of its own for its
@@ -24,9 +21,8 @@ use std::path::{Path, PathBuf};
 /// partition is three.
 const MAX_STACK: u8 = 8;
 
-/// Whether a disk under `folder` runs an I/O scheduler that leaves started
-/// writeback behind the syncs that follow it.
-pub(super) fn writeback_stalls_syncs(folder: &Path) -> bool {
+/// Whether a disk under `folder` runs BFQ.
+pub(super) fn idles_between_queues(folder: &Path) -> bool {
     let Some(device) = block_device(folder) else {
         return false;
     };

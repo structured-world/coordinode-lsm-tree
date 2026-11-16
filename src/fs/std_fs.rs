@@ -652,8 +652,8 @@ impl Fs for StdFs {
 
     /// Linux: from the I/O scheduler of the disks under `path`.
     #[cfg(target_os = "linux")]
-    fn writeback_stalls_syncs(&self, path: &Path) -> bool {
-        scheduler::writeback_stalls_syncs(path)
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        scheduler::idles_between_queues(path)
     }
 
     /// Windows: no directory can be synced (see `sync_directory`), so the

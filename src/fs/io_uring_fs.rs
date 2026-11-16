@@ -537,8 +537,8 @@ impl Fs for IoUringFs {
         super::StdFs.capabilities(path)
     }
 
-    fn writeback_stalls_syncs(&self, path: &Path) -> bool {
-        super::StdFs.writeback_stalls_syncs(path)
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        super::StdFs.idles_between_io_queues(path)
     }
 
     fn try_disable_cow(&self, path: &Path) -> crate::io::Result<()> {

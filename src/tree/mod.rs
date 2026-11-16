@@ -1515,15 +1515,19 @@ impl AbstractTree for Tree {
                     .map(crate::version::UnsyncedFile::Blob),
             )
             .collect();
+        // The snapshot the install below takes, loaded once: it carries the
+        // flush strategy for the device under the tree too.
+        let runtime = self.0.runtime_config.load_full();
         let files = match self.config.flush_durability {
             crate::config::FlushDurability::Deferred => {
                 crate::version::NewFiles::Deferred(unsynced)
             }
             crate::config::FlushDurability::Synced => {
-                let serial = self
-                    .version_history
-                    .write()
-                    .serial_syncs(&*self.config.fs, &self.config.path);
+                let serial = runtime.io.serial_syncs()
+                    || self
+                        .version_history
+                        .write()
+                        .serial_syncs(&*self.config.fs, &self.config.path);
                 let self_described =
                     !tables.is_empty() && tables.iter().all(|table| table.metadata.flush.is_some());
                 // A self-described flush owes no later persist: its tables'
@@ -1615,7 +1619,7 @@ impl AbstractTree for Tree {
             &self.config.seqno,
             &self.config.visible_seqno,
             &*self.config.fs,
-            self.0.runtime_config.load_full(),
+            runtime,
             self.0.config.encryption.clone(),
             // A flush adds a run, but it does not only add: `AbstractTree::flush`
             // feeds the sealed memtables through the same `CompactionStream`
@@ -4923,17 +4927,11 @@ impl Tree {
         // config a registry of its own rather than storing through the one it
         // arrived with, which is what keeps two trees opened from clones of one
         // config from sharing a set.
+        #[cfg_attr(
+            not(any(feature = "parallel", zstd_any)),
+            expect(unused_mut, reason = "assigned only by the parallel / zstd builds")
+        )]
         let mut config = config;
-
-        // The writeback blob writers start as they write: none on a device
-        // whose scheduler leaves it behind the syncs that follow it (see
-        // `Fs::writeback_stalls_syncs`). Tables keep theirs: a table synced
-        // alone was synced faster with it there too.
-        config.blob_writeback_bytes = if config.fs.writeback_stalls_syncs(&config.path) {
-            0
-        } else {
-            config.writeback_bytes
-        };
 
         #[cfg(feature = "parallel")]
         if config.compaction_pool.is_none() && config.compaction_threads > 1 {
@@ -5238,6 +5236,11 @@ impl Tree {
             }
             return Err(e);
         }
+
+        // What its flushes do on the device under it, from the device's I/O
+        // scheduler, asked once for the location and followed on it by
+        // `refresh_io_policy`.
+        crate::io_policy::attach(&*tree.config.fs, &tree.config.path, &tree.0.runtime_config);
 
         Ok((tree, creation))
     }

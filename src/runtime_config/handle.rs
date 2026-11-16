@@ -80,6 +80,29 @@ impl RuntimeConfigHandle {
         self.inner.read()
     }
 
+    /// Sets the flush strategy for the device under the tree (see
+    /// [`crate::io_policy`]). Swapped in by compare-and-swap, retried until
+    /// it lands on the snapshot it read: an update a caller published
+    /// meanwhile is kept, not overwritten with the snapshot before it.
+    pub(crate) fn set_io_strategy(&self, io: crate::io_policy::IoStrategy) {
+        if self.load().io == io {
+            return;
+        }
+        #[cfg(feature = "std")]
+        self.inner.rcu(|current| {
+            let mut next = RuntimeConfig::clone(current);
+            next.io = io;
+            next
+        });
+        #[cfg(not(feature = "std"))]
+        {
+            let mut current = self.inner.write();
+            let mut next = RuntimeConfig::clone(&current);
+            next.io = io;
+            *current = Arc::new(next);
+        }
+    }
+
     /// Load the current snapshot as an owned `Arc`.
     /// Slightly more expensive than [`Self::load`] (one atomic
     /// increment) but the result outlives the handle.

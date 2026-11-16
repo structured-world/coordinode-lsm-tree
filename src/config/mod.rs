@@ -1160,13 +1160,6 @@ pub struct Config {
     /// starts. Set via [`Config::writeback_bytes`].
     pub(crate) writeback_bytes: u64,
 
-    /// What the writer of a flush's blob files uses in place of
-    /// `writeback_bytes`: the same, or `0` on a device whose I/O scheduler
-    /// leaves started writeback behind the syncs that follow it (see
-    /// [`Fs::writeback_stalls_syncs`](crate::fs::Fs::writeback_stalls_syncs)).
-    /// Set by the open.
-    pub(crate) blob_writeback_bytes: u64,
-
     /// Size a flush or an ingestion cuts its output tables at. Set via
     /// [`Config::table_target_size`].
     pub(crate) table_target_size: u64,
@@ -1499,7 +1492,6 @@ impl Default for Config {
             sync_mode: SyncMode::Normal,
             flush_durability: FlushDurability::Synced,
             writeback_bytes: 1_024 * 1_024,
-            blob_writeback_bytes: 1_024 * 1_024,
             table_target_size: DEFAULT_TABLE_TARGET_SIZE,
             directory_lock: true,
             #[cfg(feature = "std")]

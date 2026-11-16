@@ -1994,23 +1994,17 @@ pub trait Fs: Send + Sync + 'static {
         FsCapabilities::default()
     }
 
-    /// Whether writeback a writer starts while it writes (see
-    /// [`FsFile::start_writeback`]) delays the syncs that follow on the
-    /// device under `path` instead of shortening them.
+    /// Whether the I/O scheduler of the device under `path` serves each
+    /// queue in turn and idles for its next request (BFQ), which rewards
+    /// other choices on the flush path than a scheduler that does not
+    /// (`mq-deadline`, `none`): see [`crate::refresh_io_policy`].
     ///
-    /// The I/O started writeback issues is asynchronous, and an I/O scheduler
-    /// that serves the asynchronous queue last and idles for each queue's next
-    /// request (BFQ) leaves it waiting while a sync of another file is served:
-    /// a flush of a table and a 2.6 MB blob file synced them in 22 ms with
-    /// writeback started, in 6 to 11 without, where under `mq-deadline`
-    /// writeback halved the same syncs. A tree asks once, at open, and the
-    /// blob files its flushes write then start no writeback.
-    ///
-    /// Asked apart from [`Self::capabilities`] because answering it reads the
-    /// system's mount table and the disks' queues, which `capabilities`, asked
-    /// on the write path, must not. The default is `false`: writeback started
-    /// as configured.
-    fn writeback_stalls_syncs(&self, path: &Path) -> bool {
+    /// Asked once per location, when the first tree opens on it, and again
+    /// by `refresh_io_policy`: answering reads the system's mount table and
+    /// the disks' queues, which is why it is not part of
+    /// [`Self::capabilities`], asked on the write path. The default is
+    /// `false`: nothing known about the device.
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
         let _ = path;
         false
     }
