@@ -328,9 +328,14 @@ impl TreeInner {
     /// lock, so flushes and reads go on meanwhile; under the lock only the
     /// files flushed in between are synced before the manifest is written.
     pub(crate) fn persist_flushes(&self) -> crate::Result<()> {
-        let pending = self.version_history.read().unsynced_files();
-        if !pending.is_empty() {
-            SuperVersions::sync_files(
+        let pending = {
+            let versions = self.version_history.read();
+            let pending = versions.unsynced_files();
+            versions.refuse_sync_failed(&pending)?;
+            pending
+        };
+        if !pending.is_empty()
+            && let Err(e) = SuperVersions::sync_files(
                 pending
                     .iter()
                     .map(crate::version::UnsyncedFile::as_flush_file),
@@ -340,7 +345,11 @@ impl TreeInner {
                     false,
                     self.config.fs.capabilities(&self.config.path).serial_syncs,
                 ),
-            )?;
+                (&*self.config.fs, &self.config.path),
+            )
+        {
+            self.version_history.write().mark_sync_failed(&pending);
+            return Err(e);
         }
         let mut versions = self.version_history.write();
         versions.forget_synced(&pending);
@@ -355,15 +364,27 @@ impl TreeInner {
     /// The current version and the files deferred flushes left unsynced that
     /// it names, read under one lock: a flush installed between two reads
     /// would be named by the version and missing from the files.
+    ///
+    /// # Errors
+    ///
+    /// When a sync failed on one of those files: no copy may name it.
     #[cfg(feature = "std")]
     pub(crate) fn current_version_and_unsynced(
         &self,
-    ) -> (Version, Vec<crate::version::UnsyncedFile>) {
+    ) -> crate::Result<(Version, Vec<crate::version::UnsyncedFile>)> {
         let versions = self.version_history.read();
         let version = versions.latest_version_ref().version.clone();
         let unsynced = versions.unsynced_named_by(&version);
+        versions.refuse_sync_failed(&unsynced)?;
         drop(versions);
-        (version, unsynced)
+        Ok((version, unsynced))
+    }
+
+    /// Records that a sync of `files` failed (see
+    /// [`SuperVersions::mark_sync_failed`]).
+    #[cfg(feature = "std")]
+    pub(crate) fn mark_sync_failed(&self, files: &[crate::version::UnsyncedFile]) {
+        self.version_history.write().mark_sync_failed(files);
     }
 
     pub(crate) fn create_new(

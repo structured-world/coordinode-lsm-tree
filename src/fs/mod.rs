@@ -915,7 +915,12 @@ pub(crate) struct Writeback {
     pub(crate) bytes: u64,
     /// Set by a refused request, which may run on a worker; made with the
     /// first request, so a writer that makes none allocates nothing.
+    #[cfg(feature = "std")]
     refused: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+    /// Set by a refused request: without `std` the writer makes each request
+    /// on the calling thread, so the flag needs no sharing.
+    #[cfg(not(feature = "std"))]
+    refused: bool,
 }
 
 impl Writeback {
@@ -923,7 +928,10 @@ impl Writeback {
     pub(crate) const fn every(bytes: u64) -> Self {
         Self {
             bytes,
+            #[cfg(feature = "std")]
             refused: None,
+            #[cfg(not(feature = "std"))]
+            refused: false,
         }
     }
 
@@ -941,6 +949,7 @@ impl Writeback {
     /// # Errors
     ///
     /// Returns the failure of an earlier write of `writer`.
+    #[cfg(feature = "std")]
     pub(crate) fn hint(
         &mut self,
         writer: &mut crate::io::FileWriter<alloc::boxed::Box<dyn FsFile>>,
@@ -965,6 +974,35 @@ impl Writeback {
                     "writeback hint refused, the file is written back by its final sync: {error}"
                 );
                 refused.store(true, Relaxed);
+            }
+        })?;
+        Ok(())
+    }
+
+    /// As the `std` hint; the request is made on this thread before the
+    /// call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of an earlier write of `writer`.
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn hint(
+        &mut self,
+        writer: &mut crate::io::FileWriter<alloc::boxed::Box<dyn FsFile>>,
+        offset: u64,
+        len: u64,
+    ) -> crate::Result<()> {
+        if self.refused {
+            self.bytes = 0;
+            return Ok(());
+        }
+        let refused = &mut self.refused;
+        writer.after_writes(|file| {
+            if let Err(error) = file.start_writeback(offset, len) {
+                log::warn!(
+                    "writeback hint refused, the file is written back by its final sync: {error}"
+                );
+                *refused = true;
             }
         })?;
         Ok(())

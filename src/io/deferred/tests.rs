@@ -530,6 +530,58 @@ fn a_panic_on_a_worker_is_a_failure_of_the_file() {
     );
 }
 
+/// An error payload whose message panics when formatted.
+#[derive(Debug)]
+struct Unprintable;
+
+impl core::fmt::Display for Unprintable {
+    fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        panic!("the payload cannot be printed")
+    }
+}
+
+impl std::error::Error for Unprintable {}
+
+/// A sink whose every write fails with an [`Unprintable`] error.
+struct FailsUnprintably;
+
+impl Write for FailsUnprintably {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other(Unprintable))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A write failure whose message panics when formatted is still a failure
+/// of the file, kept with its kind. Guards against the panic unwinding out
+/// of the lane with its drain still marked, every later call then waiting
+/// on a drainer that is gone.
+#[test]
+fn a_failure_whose_message_panics_still_fails_the_file() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = DeferredWriter::with_capacity(1_024, FailsUnprintably, true);
+        out.use_spawner_now(Arc::new(Prompt));
+        let mut failed = None;
+        for _ in 0..64 {
+            if let Err(e) = out.write_all(&[7; 1_024]) {
+                failed = Some(e.kind());
+                break;
+            }
+        }
+        let finished = out.finish().is_err();
+        let _ = done.send((failed, finished));
+    });
+    let Ok((failed, finished)) = finished.recv_timeout(Duration::from_secs(10)) else {
+        panic!("the writer hangs on the failure");
+    };
+    assert_eq!(failed, Some(io::ErrorKind::Other), "the kind is kept");
+    assert!(finished, "the file stays failed");
+}
+
 /// A sink that notes when it is dropped.
 struct Noted(Arc<AtomicBool>, Vec<u8>);
 
@@ -637,7 +689,10 @@ fn a_caught_panic_before_workers_are_taken_on_fails_the_lane() {
     }));
     assert!(panicked.is_err());
     out.use_spawner_now(Arc::new(Prompt));
-    let _ = out.write_all(&[1; 16]);
+    assert!(
+        out.write_all(&[1; 16]).is_err(),
+        "a write larger than the buffer"
+    );
     assert!(out.with_inner(|_| ()).is_err(), "the file is short");
     assert_eq!(writes.load(Ordering::SeqCst), 2, "no write after the panic");
 }

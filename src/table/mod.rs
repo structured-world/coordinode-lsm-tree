@@ -857,7 +857,6 @@ impl Table {
 
     /// [`Self::list_blob_file_references`] for verification: the descriptor is
     /// taken without promoting or caching it, so the check leaves no trace.
-    #[cfg(feature = "std")]
     fn untraced_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
         self.read_blob_file_references(|| {
             Ok(self
@@ -4207,7 +4206,6 @@ impl Table {
     ///
     /// [`crate::Error::InvalidHeader`] when the recorded records disagree
     /// with the derived ones; any I/O / decode error from the full scan.
-    #[cfg(feature = "std")]
     pub(crate) fn verify_blob_links(&self) -> crate::Result<()> {
         use crate::coding::Decode;
         use alloc::collections::BTreeMap;
@@ -4283,7 +4281,11 @@ impl Table {
             // Like `scan`, the walk is verification: uncounted, and it leaves
             // the workload's block cache as it found it.
             if restricted {
-                for kv in self.range_iter(..).untraced() {
+                let live = self.range_iter(..);
+                // Without std the iterator has no untraced mode.
+                #[cfg(feature = "std")]
+                let live = live.untraced();
+                for kv in live {
                     accumulate(kv?)?;
                 }
             } else {
@@ -4391,7 +4393,6 @@ impl Table {
     ///
     /// [`crate::Error::InvalidHeader`] when the section disagrees, and any
     /// error reading it.
-    #[cfg(feature = "std")]
     fn verify_owned_blob_objects(
         &self,
         mut derived: Vec<(crate::vlog::BlobFileId, u64)>,

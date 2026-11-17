@@ -82,6 +82,36 @@ fn same_device(fs: &dyn Fs, path: &Path, other_fs: &dyn Fs, other: &Path) -> boo
     )
 }
 
+/// Flushes, once each, every device `syncs` reached that is not provably the
+/// one `step` lies on: barrier syncs there are ordered apart from `step`'s
+/// device, so the write `step` makes next could outlast them. A device whose
+/// id a backend cannot tell is flushed per folder.
+fn flush_other_devices(
+    syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)],
+    (step_fs, step_path): (&dyn Fs, &Path),
+) -> crate::Result<()> {
+    let step_volume = step_fs.volume_id(step_path);
+    let mut flushed: Vec<(&Arc<dyn Fs>, Option<u64>, &Path)> = Vec::new();
+    for (fs, target) in syncs {
+        let folder = match *target {
+            crate::fs::SyncTarget::FileData { path, .. } => crate::file::entry_directory(path),
+            crate::fs::SyncTarget::Folder { path, .. } => path,
+        };
+        let volume = fs.volume_id(folder);
+        if volume.is_some() && volume == step_volume {
+            continue;
+        }
+        if flushed.iter().any(|&(on, known, at)| {
+            Arc::ptr_eq(on, fs) && (volume.is_some() && known == volume || at == folder)
+        }) {
+            continue;
+        }
+        fs.sync_device(folder)?;
+        flushed.push((fs, volume, folder));
+    }
+    Ok(())
+}
+
 /// The sync mode the manifest edit from `prior` to `next` is persisted with.
 /// Under [`SyncMode::Barrier`] an edit that drops a table or a blob file on
 /// another device than the manifest at `tree_path`, or narrows one there (a
@@ -362,6 +392,12 @@ pub struct SuperVersions {
     /// has made durable: the persist that next names them syncs them first.
     unsynced: Vec<UnsyncedFile>,
 
+    /// The files of `unsynced` a sync failed on. A later sync through a new
+    /// handle may not report the writeback error the failed one consumed
+    /// (Linux reports it once per file), so its success proves nothing: no
+    /// persist names them again.
+    sync_failed: Vec<UnsyncedFile>,
+
     /// Stable comparator identity persisted in every version file.
     comparator_name: Arc<str>,
 
@@ -506,6 +542,7 @@ impl SuperVersions {
             current: initial,
             persisted: version,
             unsynced: Vec::new(),
+            sync_failed: Vec::new(),
             comparator_name,
             sync_mode,
             serial_syncs: None,
@@ -802,16 +839,20 @@ impl SuperVersions {
             let schedule = runtime
                 .io
                 .sync_schedule(false, self.serial_syncs(fs, tree_path));
-            // Kept until the persist succeeds: a failure leaves them for the
-            // next one to sync again.
-            Self::sync_files(
-                self.unsynced_named_by(next)
-                    .iter()
-                    .map(UnsyncedFile::as_flush_file),
+            // Kept until the persist succeeds. A failed sync leaves them
+            // unacknowledged for good: no later sync can vouch for them.
+            let named = self.unsynced_named_by(next);
+            self.refuse_sync_failed(&named)?;
+            if let Err(e) = Self::sync_files(
+                named.iter().map(UnsyncedFile::as_flush_file),
                 &[],
                 self.sync_mode,
                 schedule,
-            )?;
+                (fs, tree_path),
+            ) {
+                self.mark_sync_failed(&named);
+                return Err(e);
+            }
         }
         sync_new_table_directories(&persisted, next, tree_path, fs, self.sync_mode)?;
         // Outputs are kept only while the next persist rotates, which removes
@@ -839,6 +880,8 @@ impl SuperVersions {
             manifest_mode,
         )?;
         self.unsynced.clear();
+        // The failed files left are named by no version on disk from here.
+        self.sync_failed.clear();
         self.persisted = next.clone();
         Ok(())
     }
@@ -862,11 +905,18 @@ impl SuperVersions {
     /// barrier over many deferred flushes waits about as long as for one.
     /// Side by side, the syncs on one backend go either on threads or to it as
     /// one batch ([`Fs::sync_many`]), as `schedule` says.
+    ///
+    /// `step` is where the write that depends on these files goes: the
+    /// tables of a self-described flush, or the manifest. Under
+    /// [`SyncMode::Barrier`] a device other than its own orders its syncs
+    /// apart from it, so each such device is flushed once
+    /// ([`Fs::sync_device`]) before this returns.
     pub(crate) fn sync_files<'a>(
         files: impl IntoIterator<Item = FlushFile<'a>>,
         folders: &[(&'a Arc<dyn Fs>, &'a Path)],
         sync_mode: SyncMode,
         schedule: crate::io_policy::SyncSchedule,
+        step: (&dyn Fs, &Path),
     ) -> crate::Result<()> {
         // Every sync, with the backend it goes to.
         let mut syncs: Vec<(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)> = Vec::new();
@@ -909,25 +959,28 @@ impl SuperVersions {
             for (fs, target) in &syncs {
                 target.sync_alone(&***fs)?;
             }
-            return Ok(());
+        } else {
+            // One batch per backend, in the order the backends are first named.
+            let mut done: Vec<&Arc<dyn Fs>> = Vec::new();
+            for (fs, _) in &syncs {
+                if done.iter().any(|known| Arc::ptr_eq(known, fs)) {
+                    continue;
+                }
+                done.push(fs);
+                let targets: Vec<crate::fs::SyncTarget<'_>> = syncs
+                    .iter()
+                    .filter(|(on, _)| Arc::ptr_eq(on, fs))
+                    .map(|(_, target)| *target)
+                    .collect();
+                if schedule == crate::io_policy::SyncSchedule::Batched {
+                    fs.sync_many(&targets)?;
+                } else {
+                    crate::fs::sync_each_target(&***fs, &targets)?;
+                }
+            }
         }
-        // One batch per backend, in the order the backends are first named.
-        let mut done: Vec<&Arc<dyn Fs>> = Vec::new();
-        for (fs, _) in &syncs {
-            if done.iter().any(|known| Arc::ptr_eq(known, fs)) {
-                continue;
-            }
-            done.push(fs);
-            let targets: Vec<crate::fs::SyncTarget<'_>> = syncs
-                .iter()
-                .filter(|(on, _)| Arc::ptr_eq(on, fs))
-                .map(|(_, target)| *target)
-                .collect();
-            if schedule == crate::io_policy::SyncSchedule::Batched {
-                fs.sync_many(&targets)?;
-            } else {
-                crate::fs::sync_each_target(&***fs, &targets)?;
-            }
+        if sync_mode == SyncMode::Barrier {
+            flush_other_devices(&syncs, step)?;
         }
         Ok(())
     }
@@ -967,6 +1020,33 @@ impl SuperVersions {
             .filter(|file| file.named_by(&tables, version))
             .cloned()
             .collect()
+    }
+
+    /// Records that a sync of `files` failed: no persist names them after it.
+    pub(crate) fn mark_sync_failed(&mut self, files: &[UnsyncedFile]) {
+        for file in files {
+            if !self.sync_failed.iter().any(|failed| failed.same(file)) {
+                self.sync_failed.push(file.clone());
+            }
+        }
+    }
+
+    /// Refuses `files` when a sync failed on one of them.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error naming the failed sync.
+    pub(crate) fn refuse_sync_failed(&self, files: &[UnsyncedFile]) -> crate::Result<()> {
+        if files
+            .iter()
+            .any(|file| self.sync_failed.iter().any(|failed| failed.same(file)))
+        {
+            return Err(crate::Error::Io(crate::io::Error::other(
+                "a file a deferred flush wrote failed to sync, so no persist \
+                 can name it",
+            )));
+        }
+        Ok(())
     }
 
     /// Takes `synced`, which [`Self::sync_files`] made durable, off the files

@@ -1642,18 +1642,28 @@ fn copy_of(seed: &Path) -> tempfile::TempDir {
 /// it doubled one engine's time while halving another's. Only what the
 /// harness wrote is synced: the host's other files are not this run's to
 /// write back, and a sync of every file system waits for them too.
+///
+/// A failure ends the run (as every I/O failure of the harness does), so no
+/// arm is measured on a state that did not reach the disk.
 fn settle(root: &Path) {
-    sync_tree(root).expect("sync a starting state");
+    sync_tree(root).unwrap_or_else(|e| panic!("sync the starting state {}: {e}", root.display()));
     if let Some(parent) = root.parent() {
-        sync_folder(parent).expect("sync the folder of a starting state");
+        sync_folder(parent).unwrap_or_else(|e| {
+            panic!(
+                "sync the folder {} of a starting state: {e}",
+                parent.display()
+            )
+        });
     }
 }
 
 /// Commits the removal of a finished state, made under the run's state root,
 /// before the next timed write: the removal is a metadata change the file
-/// system would otherwise write back with that write's own syncs.
+/// system would otherwise write back with that write's own syncs. A failure
+/// ends the run.
 fn settle_removal() {
-    sync_folder(state_root()).expect("sync the state root");
+    let root = state_root();
+    sync_folder(root).unwrap_or_else(|e| panic!("sync the state root {}: {e}", root.display()));
 }
 
 /// The folder every state a run writes lies under, set once by `main` (see

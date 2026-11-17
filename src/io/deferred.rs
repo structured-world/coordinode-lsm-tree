@@ -25,8 +25,13 @@
 //!
 //! ## Failure
 //!
-//! The first failed write is kept and returned by every later call; what was
-//! queued behind it is dropped, as the file is the caller's to remove. A
+//! The first failed write is kept and returned by every later call that
+//! reaches the file: a hand-over of a buffer, a flush, a seek, a job, the
+//! inner writer's return. A write that fits the buffer only fills it, as
+//! with std's buffering writer, and is refused at the next of those, since
+//! checking a lane's failure on every small write would lock the lane on the
+//! hottest path. What was queued behind the failure is dropped, as the file
+//! is the caller's to remove. A
 //! panic of the inner writer is kept as a failure and the writer is called
 //! no more.
 //!
@@ -78,9 +83,13 @@ struct Failure {
 
 impl Failure {
     fn of(error: &io::Error) -> Self {
+        // A backend's error payload is formatted while the lane is held: a
+        // panic there must not leave the drain marked, as a write's may not.
+        let message = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| error.to_string()))
+            .unwrap_or_else(|_| String::from("the file's writer failed with an unprintable error"));
         Self {
             kind: error.kind(),
-            message: error.to_string(),
+            message,
         }
     }
 

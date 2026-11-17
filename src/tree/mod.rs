@@ -1568,6 +1568,14 @@ impl AbstractTree for Tree {
                 } else {
                     Vec::new()
                 };
+                // What depends on these files next: the flush's own tables,
+                // which a later flush names as returned, or else the manifest.
+                let step: (&dyn crate::fs::Fs, &Path) = match tables.first() {
+                    Some(table) if self_described => {
+                        (&*table.fs, crate::file::entry_directory(&table.path))
+                    }
+                    _ => (&*self.config.fs, &self.config.path),
+                };
                 crate::version::SuperVersions::sync_files(
                     tables.iter().map(crate::version::FlushFile::Table).chain(
                         blob_files
@@ -1578,6 +1586,7 @@ impl AbstractTree for Tree {
                     &folders,
                     self.config.sync_mode,
                     schedule,
+                    step,
                 )?;
                 if self_described {
                     for table in tables.iter().filter(|table| !table.entry_durable()) {
@@ -6556,9 +6565,14 @@ impl Tree {
                 // blocks before them (a file size that runs past blocks never
                 // written back reads them as zeros): the data blocks, and the
                 // filter blocks a point read loads only when it needs them.
+                // The blob files the table links decide which blob files the
+                // open keeps, and their section has no checksum: it is checked
+                // against the table's entries, or a link rotted into another
+                // file's id would leave the table's own file to be deleted.
                 let blocks_read = match table
                     .verify_data_blocks()
                     .and_then(|()| table.verify_filter_blocks())
+                    .and_then(|()| table.verify_blob_links())
                 {
                     Ok(()) => true,
                     Err(e) if fails_adoption(&e) => return Err(e),

@@ -643,7 +643,9 @@ pub trait AbstractTree: sealed::Sealed {
     /// ordered then, and the entries may go once
     /// [`sync_devices`](Self::sync_devices) has returned `Ok` too.
     ///
-    /// The flush survives a power loss once it returns. It survives damage to
+    /// The flush survives a power loss once it returns, under
+    /// [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) once
+    /// [`sync_devices`](Self::sync_devices) has returned `Ok`. It survives damage to
     /// its files on the medium only once a later flush or
     /// [`persist_flushes`](Self::persist_flushes) has recorded that it
     /// returned: until then an open cannot tell its damage from a flush a
@@ -726,7 +728,11 @@ pub trait AbstractTree: sealed::Sealed {
     /// # Errors
     ///
     /// Returns a sync or manifest write error; the flushes stay installed and
-    /// readable, and the next persist retries them.
+    /// readable. A failed manifest write is retried by the next persist. A
+    /// failed sync of a flush's file is not: a later sync cannot tell its data
+    /// reached the disk, so every persist naming the file fails until a
+    /// compaction rewrites it, and a reopen leaves that flush out for the
+    /// caller's journal to replay.
     fn persist_flushes(&self) -> crate::Result<()>;
 
     /// Makes durable everything this tree synced on each device it lies on:
@@ -934,19 +940,23 @@ pub trait AbstractTree: sealed::Sealed {
 
         drop(version_history);
 
-        // Bounded as the install bounds it, by the counter: a snapshot taken
-        // after the flush sees its complete data. Read now, it is at most the
-        // one the install reads, so an open restores no higher a floor.
+        // The floor is bounded by the counter, read once: every version the
+        // sealed memtables hold lies below it, so a snapshot above it sees
+        // the flush's complete data. The table describes this floor and the
+        // install raises the live one to it, never to a later reading, so an
+        // open after a power loss restores the floor the live tree held.
+        let counter = self.tree_config().seqno.get();
         let self_described = flush_seq.map(|(seq, returned_through)| FlushSelf {
             seq,
             returned_through,
-            floor: gc_watermark.checked_sub(1).map(|floor| {
-                (
-                    floor.min(self.tree_config().seqno.get()),
-                    Arc::clone(&gc_balance),
-                )
-            }),
+            floor: gc_watermark
+                .checked_sub(1)
+                .map(|floor| (floor.min(counter), Arc::clone(&gc_balance))),
         });
+        // The install's floor is the watermark less one, bounded by its own
+        // counter reading, which is at least this one: a watermark bounded
+        // here makes it the table's. The counter stays below `SeqNo::MAX`.
+        let install_watermark = gc_watermark.min(counter + 1);
 
         let has_range_tombstones = !range_tombstones.is_empty();
         if let Some((tables, blob_files, write_pin)) = self.flush_to_tables_with_rt(
@@ -969,7 +979,7 @@ pub trait AbstractTree: sealed::Sealed {
                 blob_files.as_deref(),
                 None,
                 &sealed_ids,
-                gc_watermark,
+                install_watermark,
                 gc_balance.load(core::sync::atomic::Ordering::Relaxed) > 0,
             ) {
                 let outputs = crate::compaction::output_ledger::OutputLedger::of(

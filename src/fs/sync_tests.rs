@@ -116,6 +116,7 @@ fn the_backends_batch_is_taken_only_when_scheduled() -> crate::Result<()> {
             &folders,
             SyncMode::default(),
             schedule,
+            (&*fs, Path::new("/db")),
         )?;
         assert_eq!(
             backend
@@ -125,6 +126,103 @@ fn the_backends_batch_is_taken_only_when_scheduled() -> crate::Result<()> {
             "{schedule:?}"
         );
     }
+    Ok(())
+}
+
+/// A backend over [`MemFs`] on two devices, `/fast` and everything else,
+/// that records the devices it is asked to flush.
+struct TwoDevices {
+    inner: MemFs,
+    flushed: parking_lot::Mutex<Vec<String>>,
+}
+
+impl Fs for TwoDevices {
+    fn volume_id(&self, path: &Path) -> Option<u64> {
+        Some(if path.starts_with("/fast") { 2 } else { 1 })
+    }
+    fn sync_device(&self, path: &Path) -> crate::io::Result<()> {
+        self.flushed.lock().push(path.display().to_string());
+        Ok(())
+    }
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn super::FsFile>> {
+        self.inner.open(path, opts)
+    }
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<super::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn metadata(&self, path: &Path) -> crate::io::Result<super::FsMetadata> {
+        self.inner.metadata(path)
+    }
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        self.inner.exists(path)
+    }
+}
+
+/// Barrier syncs on a device other than the one the next write goes to are
+/// flushed once per device before the batch returns, and syncs on that one
+/// device, or under another mode, flush nothing. Guards against a flush's
+/// blob files on one device being lost to a power loss that keeps a later
+/// flush's tables on another, which name the first flush as returned.
+#[test]
+fn barrier_syncs_on_another_device_are_flushed_once() -> crate::Result<()> {
+    use crate::io_policy::SyncSchedule;
+    let backend = std::sync::Arc::new(TwoDevices {
+        inner: MemFs::new(),
+        flushed: parking_lot::Mutex::new(Vec::new()),
+    });
+    for folder in ["/db", "/db/blobs", "/fast/tables", "/fast/more"] {
+        backend.create_dir_all(Path::new(folder))?;
+    }
+    let fs: std::sync::Arc<dyn Fs> = backend.clone();
+    let folders = [
+        (&fs, Path::new("/db/blobs")),
+        (&fs, Path::new("/fast/tables")),
+        (&fs, Path::new("/fast/more")),
+    ];
+    let flushed = |mode: SyncMode, step: &str| -> crate::Result<Vec<String>> {
+        crate::version::SuperVersions::sync_files(
+            core::iter::empty(),
+            &folders,
+            mode,
+            SyncSchedule::SideBySide,
+            (&*fs, Path::new(step)),
+        )?;
+        Ok(core::mem::take(&mut *backend.flushed.lock()))
+    };
+    let none: [&str; 0] = [];
+
+    assert_eq!(
+        flushed(SyncMode::Barrier, "/fast/tables")?,
+        ["/db/blobs"],
+        "the other device, once"
+    );
+    assert_eq!(
+        flushed(SyncMode::Barrier, "/db")?,
+        ["/fast/tables"],
+        "one flush covers both folders of a device"
+    );
+    assert_eq!(flushed(SyncMode::Normal, "/fast/tables")?, none);
+    assert_eq!(flushed(SyncMode::Full, "/fast/tables")?, none);
+    assert_eq!(
+        flushed(SyncMode::Barrier, "/db/blobs")?,
+        ["/fast/tables"],
+        "the step's own device is not flushed"
+    );
     Ok(())
 }
 
