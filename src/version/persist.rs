@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use crate::path::Path;
 
 /// The suffix of the name a snapshot is written under until it is installed.
-pub const SNAPSHOT_TEMPORARY_SUFFIX: &str = ".tmp";
+pub(crate) const SNAPSHOT_TEMPORARY_SUFFIX: &str = ".tmp";
 
 /// Crate-internal (version module is not exported).
 ///
@@ -39,7 +39,16 @@ pub const SNAPSHOT_TEMPORARY_SUFFIX: &str = ".tmp";
 /// generation stays the installed one; when the withdrawal cannot be made
 /// durable, a power loss may still keep the rename, and the error is
 /// [`crate::Error::InstallOutcomeUnknown`].
-pub fn persist_version(
+///
+/// `flush_watermark` is the highest synced-flush number the snapshot decides
+/// (see [`super::FlushSeqs`]); the snapshot records it raised to the highest
+/// number a table of `version` carries, so a writer that knows of no flush
+/// passes `0`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the snapshot, where it goes, how it is encoded and how durably"
+)]
+pub(crate) fn persist_version(
     folder: &Path,
     version: &Version,
     comparator_name: &str,
@@ -47,6 +56,7 @@ pub fn persist_version(
     runtime: Arc<RuntimeConfig>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     sync_mode: SyncMode,
+    flush_watermark: u64,
 ) -> crate::Result<()> {
     if comparator_name.len() > crate::comparator::MAX_COMPARATOR_NAME_BYTES {
         return Err(crate::Error::from(crate::io::Error::new(
@@ -88,7 +98,7 @@ pub fn persist_version(
     // Block + size-hint trailer + optional head mirror per the
     // runtime config, and syncs the file.
     let mut writer = ManifestArchiveWriter::create(&temporary, fs, runtime, encryption, sync_mode)?;
-    version.encode_into(&mut writer, comparator_name)?;
+    version.encode_into(&mut writer, comparator_name, flush_watermark)?;
     writer.finish()?;
     super::edit_log::create_log(fs, folder, version.id(), sync_mode)?;
     fs.rename(&temporary, &path)?;

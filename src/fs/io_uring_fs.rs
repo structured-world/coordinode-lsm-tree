@@ -537,6 +537,16 @@ impl Fs for IoUringFs {
         super::StdFs.capabilities(path)
     }
 
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        super::StdFs.idles_between_io_queues(path)
+    }
+
+    // The batch goes to the calling thread's sync ring, as on `StdFs`, not to
+    // a thread per target.
+    fn sync_many(&self, targets: &[super::SyncTarget<'_>]) -> crate::io::Result<()> {
+        super::StdFs.sync_many(targets)
+    }
+
     fn try_disable_cow(&self, path: &Path) -> crate::io::Result<()> {
         super::StdFs.try_disable_cow(path)
     }

@@ -1521,7 +1521,8 @@ pub struct FillingBufWriter<W: Write> {
     inner: W,
     buf: alloc::vec::Vec<u8>,
     /// Whether an inner write is under way: one that panicked leaves it
-    /// set, and the drop then calls that writer no more.
+    /// set, and every later write, hand-off and the drop then call that
+    /// writer no more.
     panicked: bool,
 }
 
@@ -1568,6 +1569,7 @@ impl<W: Write> FillingBufWriter<W> {
     /// even when a later write of the flush fails or panics, so a retry does
     /// not put it down again.
     fn flush_buf(&mut self) -> BufResult<()> {
+        self.refuse_after_panic()?;
         let mut done = Written {
             buf: &mut self.buf,
             written: 0,
@@ -1588,8 +1590,19 @@ impl<W: Write> FillingBufWriter<W> {
         }
     }
 
+    /// The error of a write or hand-off after an inner write that panicked,
+    /// which a caller caught: what that write took is unknown, so the file
+    /// fails for good rather than go on short of bytes.
+    fn refuse_after_panic(&self) -> BufResult<()> {
+        if self.panicked {
+            return Err(panicked_write());
+        }
+        Ok(())
+    }
+
     /// Hands `data` to the inner writer, marking the write under way.
     fn write_through(&mut self, data: &[u8]) -> BufResult<usize> {
+        self.refuse_after_panic()?;
         self.panicked = true;
         let result = self.inner.write(data);
         self.panicked = false;
@@ -1712,6 +1725,70 @@ impl<W: Write> Drop for FillingBufWriter<W> {
             let _ = self.flush_buf();
         }
     }
+}
+
+#[cfg(feature = "std")]
+pub(crate) mod deferred;
+
+/// The buffering writer a table or blob file is written through: one that
+/// can hand its buffers to a worker under `std`, [`FillingBufWriter`]
+/// otherwise.
+#[cfg(feature = "std")]
+pub(crate) type FileWriter<W> = deferred::DeferredWriter<W>;
+/// The buffering writer a table or blob file is written through.
+#[cfg(not(feature = "std"))]
+pub(crate) type FileWriter<W> = FillingBufWriter<W>;
+
+#[cfg(not(feature = "std"))]
+impl<W: Write> FillingBufWriter<W> {
+    /// Wraps `inner` with a `capacity`-byte buffer. `fill` is the choice the
+    /// `std` writer has; this one always fills its buffer.
+    pub(crate) fn for_file(capacity: usize, inner: W, _fill: bool) -> Self {
+        Self::with_capacity(capacity, inner)
+    }
+}
+
+// The file writer's hand-offs to the inner writer; built under `std` for the
+// tests only, where the file writer is the deferred one.
+#[cfg(any(test, not(feature = "std")))]
+impl<W: Write> FillingBufWriter<W> {
+    /// Does `run` with the inner writer once every byte written so far has
+    /// reached it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the write, or an error when the last inner
+    /// write panicked: the file then lacks bytes a caller was told nothing
+    /// about.
+    pub(crate) fn after_writes(&mut self, run: impl FnOnce(&mut W)) -> BufResult<()> {
+        // Refuses after a panicked write, with nothing buffered too.
+        self.flush_buf()?;
+        run(&mut self.inner);
+        Ok(())
+    }
+
+    /// Does `read` with the inner writer once everything written so far has
+    /// reached it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::after_writes`].
+    pub(crate) fn with_inner<R>(&mut self, read: impl FnOnce(&mut W) -> R) -> BufResult<R> {
+        self.flush_buf()?;
+        Ok(read(&mut self.inner))
+    }
+}
+
+/// The error a write or hand-off after a panicked inner write ends with.
+#[cfg(feature = "std")]
+fn panicked_write() -> std::io::Error {
+    std::io::Error::other("an earlier write to this file panicked")
+}
+
+/// [`panicked_write`] without `std`.
+#[cfg(not(feature = "std"))]
+fn panicked_write() -> Error {
+    Error::new(ErrorKind::Other, "an earlier write to this file panicked")
 }
 
 #[cfg(test)]

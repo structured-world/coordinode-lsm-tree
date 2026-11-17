@@ -123,6 +123,45 @@ fn run_sizes_rounds_by_budget_within_bounds() {
     );
 }
 
+/// An arm whose every iteration sets up a state outside the clock (20 ms here,
+/// as a write group copies a seed and syncs the host) is sized by what its
+/// calls cost, not by the 1 ms it times: one iteration per sample, and the
+/// 100 ms budget over 21 ms a round is four rounds. Sized by the timed part it
+/// would run ten iterations a sample for ten rounds, two seconds against a
+/// budget of a tenth of that.
+#[test]
+fn run_sizes_samples_and_rounds_by_what_a_call_costs() {
+    use std::cell::Cell;
+    let calls = Cell::new(0_u32);
+    let arm = Arm::new("a", |iters| {
+        let mut timed = Duration::ZERO;
+        for _ in 0..iters {
+            calls.set(calls.get() + 1);
+            std::thread::sleep(Duration::from_millis(20));
+            timed += Duration::from_millis(1);
+        }
+        timed
+    });
+    let s = Settings {
+        warm_up: Duration::ZERO,
+        sample_target: Duration::from_millis(10),
+        budget: Duration::from_millis(100),
+        min_rounds: 3,
+        max_rounds: 40,
+    };
+    let results = run("g", 1, &|_| "a", vec![arm], &s);
+    // A sleep may take longer than asked, which only makes a call cost more:
+    // fewer rounds, never fewer than the floor.
+    let rounds = results[0].rounds;
+    assert!(
+        (s.min_rounds..=4).contains(&rounds),
+        "sized by what a call costs: {rounds} rounds"
+    );
+    // One warm-up iteration, then one iteration in each sample.
+    assert_eq!(calls.get() as usize, rounds + 1);
+    assert_eq!(results[0].ns_per_op.median, 1_000_000.0);
+}
+
 /// Every arm takes every position equally often: the rounds are a multiple of
 /// the arm count. Eight arms at a floor of ten rounds would let two arms go
 /// first twice and the other six once, and any effect of position (caches,

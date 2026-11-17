@@ -114,6 +114,96 @@ fn failed_writes_and_syncs_are_counted_as_failures() -> crate::io::Result<()> {
     Ok(())
 }
 
+/// A backend over [`MemFs`] that counts the batches handed to it.
+struct Batching {
+    inner: MemFs,
+    batches: std::sync::atomic::AtomicUsize,
+}
+
+impl Fs for Batching {
+    fn sync_many(&self, targets: &[crate::fs::SyncTarget<'_>]) -> crate::io::Result<()> {
+        self.batches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::fs::sync_each_target(&self.inner, targets)
+    }
+    fn open(
+        &self,
+        path: &Path,
+        opts: &FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        self.inner.open(path, opts)
+    }
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn metadata(&self, path: &Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata(path)
+    }
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        self.inner.exists(path)
+    }
+}
+
+/// A batch of syncs goes to the wrapped backend as one batch, and each of its
+/// targets is counted as its own sync would be. Guards against the wrapper
+/// syncing them one by one on threads, which drops the batch the backend
+/// submits from one thread under a scheduler that idles between queues.
+#[test]
+fn a_batch_of_syncs_reaches_the_backend_as_one_and_is_counted() -> crate::io::Result<()> {
+    let inner = Arc::new(Batching {
+        inner: MemFs::new(),
+        batches: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let fs = CountingFs::new(inner.clone());
+    fs.create_dir_all(Path::new("/db"))?;
+    for name in ["/db/1", "/db/2"] {
+        fs.open(Path::new(name), &writable(Some(WriteOrigin::FlushTable)))?
+            .write_all(b"x")?;
+    }
+    let mode = crate::fs::SyncMode::default();
+    fs.sync_many(&[
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/1"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/2"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+        crate::fs::SyncTarget::Folder {
+            path: Path::new("/db"),
+            mode,
+        },
+    ])?;
+
+    assert_eq!(
+        inner.batches.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the backend got the batch"
+    );
+    let snapshot = fs.stats().snapshot();
+    assert_eq!(snapshot.origin(WriteOrigin::FlushTable).syncs, 2);
+    assert_eq!(snapshot.directory.syncs, 1);
+    Ok(())
+}
+
 /// A writeback started ahead of a sync is counted apart from the syncs: it is
 /// no durability point and writes no byte the writes did not.
 #[test]

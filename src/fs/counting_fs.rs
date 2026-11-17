@@ -711,6 +711,25 @@ impl Fs for CountingFs {
         result
     }
 
+    fn sync_many(&self, targets: &[super::SyncTarget<'_>]) -> io::Result<()> {
+        // The wrapped backend's batch, as the tree chose it; each target is
+        // counted as its own sync would be. A batch that fails does not say
+        // which target did, so each counts the failure: the caller retries
+        // them all.
+        let result = self.inner.sync_many(targets);
+        for target in targets {
+            match *target {
+                super::SyncTarget::FileData { origin, .. } => {
+                    if let Some(counters) = self.stats.slot(Some(origin)) {
+                        counters.synced(&result);
+                    }
+                }
+                super::SyncTarget::Folder { .. } => self.directory_synced(&result),
+            }
+        }
+        result
+    }
+
     fn exists(&self, path: &Path) -> io::Result<bool> {
         self.inner.exists(path)
     }
@@ -729,6 +748,10 @@ impl Fs for CountingFs {
 
     fn capabilities(&self, path: &Path) -> FsCapabilities {
         self.inner.capabilities(path)
+    }
+
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        self.inner.idles_between_io_queues(path)
     }
 
     fn try_disable_cow(&self, path: &Path) -> io::Result<()> {

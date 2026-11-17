@@ -362,6 +362,8 @@ pub mod io;
 
 mod heap;
 mod ingestion;
+mod io_policy;
+pub use io_policy::IoPolicy;
 mod iter_guard;
 mod key;
 mod key_range;

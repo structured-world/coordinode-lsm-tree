@@ -444,18 +444,23 @@ impl std::io::Write for PanicsOnce {
 }
 
 /// A flush whose inner write panics after an earlier write of it took bytes
-/// keeps only what was not taken: retried after the panic is caught, it puts
-/// every byte down once.
+/// is not retried: what the panicking write took is unknown, so a flush
+/// after the caught panic fails and puts nothing down again.
 #[cfg(feature = "std")]
 #[test]
-fn buf_writer_keeps_only_what_a_panicking_flush_did_not_write() -> std::io::Result<()> {
+fn buf_writer_refuses_to_retry_a_panicking_flush() -> std::io::Result<()> {
     use std::io::Write as _;
     let mut out = FillingBufWriter::with_capacity(8, PanicsOnce::default());
     out.write_all(b"abcdef")?;
     let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.flush())).is_err();
     assert!(caught, "the injected panic surfaces");
-    out.flush()?;
-    assert_eq!(out.get_ref().bytes, b"abcdef");
+    assert!(out.flush().is_err(), "the retry fails");
+    assert_eq!(out.get_ref().bytes, b"ab");
+    assert_eq!(
+        out.get_ref().calls,
+        2,
+        "the writer that panicked is called no more"
+    );
     Ok(())
 }
 
@@ -476,6 +481,74 @@ fn buf_writer_dropped_after_a_panicking_write_replays_nothing() -> std::io::Resu
     assert_eq!(inner.bytes, b"ab");
     assert_eq!(inner.calls, 2, "the drop calls the writer no more");
     Ok(())
+}
+
+/// The file writer's hand-offs give the inner writer every byte written so
+/// far, buffered ones included.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_hands_off_after_every_write_reached_it() -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut out = FillingBufWriter::with_capacity(8, Vec::new());
+    out.write_all(b"abc")?;
+    assert_eq!(out.with_inner(|inner| inner.clone())?, b"abc");
+    out.write_all(b"defghijk")?;
+    let mut seen = Vec::new();
+    out.after_writes(|inner| seen.clone_from(inner))?;
+    assert_eq!(seen, b"abcdefghijk");
+    Ok(())
+}
+
+/// A write that goes past the buffer and panics, caught by the caller,
+/// leaves the file short of bytes: a later hand-off of the file (its sync)
+/// fails instead of calling the writer that panicked. Guards against a sync
+/// of a short file reported as a success.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_refuses_a_hand_off_after_a_panicking_write() {
+    use std::io::Write as _;
+    let mut inner = PanicsOnce {
+        // The first call already happened: the next one panics.
+        calls: 1,
+        ..PanicsOnce::default()
+    };
+    {
+        let mut out = FillingBufWriter::with_capacity(4, &mut inner);
+        let caught =
+            std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.write(b"abcdefgh")))
+                .is_err();
+        assert!(caught, "the injected panic surfaces");
+        let mut handed = 0;
+        assert!(out.with_inner(|_| handed += 1).is_err(), "the sync fails");
+        assert!(out.after_writes(|_| handed += 1).is_err());
+        assert_eq!(handed, 0, "the writer that panicked is not handed over");
+    }
+    assert_eq!(inner.calls, 2, "nor written to again");
+}
+
+/// A write that panics, caught by the caller, fails the file for good: a
+/// later write that would reach the inner writer whole is refused, and so is
+/// the hand-off after it. Guards against a write that goes through clearing
+/// the panic and a sync then reporting a short file whole.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_stays_failed_after_a_panicking_write() {
+    use std::io::Write as _;
+    let mut inner = PanicsOnce {
+        // The first call already happened: the next one panics.
+        calls: 1,
+        ..PanicsOnce::default()
+    };
+    {
+        let mut out = FillingBufWriter::with_capacity(4, &mut inner);
+        let caught =
+            std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.write(b"abcdefgh")))
+                .is_err();
+        assert!(caught, "the injected panic surfaces");
+        assert!(out.write(b"ijklmnop").is_err(), "a later write is refused");
+        assert!(out.with_inner(|_| ()).is_err(), "so is the sync");
+    }
+    assert_eq!(inner.calls, 2, "the writer that panicked is called no more");
 }
 
 /// Every `ErrorKind` discriminant — kept in one place so the

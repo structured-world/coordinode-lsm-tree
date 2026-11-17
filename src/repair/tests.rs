@@ -11552,6 +11552,10 @@ fn a_manifest_referenced_table_missing_from_disk_is_unknowable() -> crate::Resul
         tree.flush_active_memtable(0)?;
         tree.insert(b"b", b"v", 2);
         tree.flush_active_memtable(0)?;
+        // A later flush: the missing table is not one the log's last edit
+        // added, which recovery takes back when its file is not on disk.
+        tree.insert(b"c", b"v", 3);
+        tree.flush_active_memtable(0)?;
     }
     // The manifest stays intact; one referenced SST vanishes outright.
     memfs.remove_file(&root.join("tables").join("1"))?;
@@ -11564,8 +11568,8 @@ fn a_manifest_referenced_table_missing_from_disk_is_unknowable() -> crate::Resul
     .with_shared_fs(memfs)
     .repair()?;
     assert_eq!(
-        report.recovered, 1,
-        "the surviving table is rebuilt: {report:?}"
+        report.recovered, 2,
+        "the surviving tables are rebuilt: {report:?}"
     );
     assert!(
         report.unknowable_losses.iter().any(|p| p.ends_with("1")),
@@ -12002,6 +12006,10 @@ fn a_repair_without_the_dictionary_never_discards_the_blob_file() -> crate::Resu
         }
         tree.flush_active_memtable(0)?;
         tree.insert(b"zzz", vec![b'w'; 64], 100);
+        tree.flush_active_memtable(0)?;
+        // A later flush: the missing table is not one the log's last edit
+        // added, which recovery takes back when its file is not on disk.
+        tree.insert(b"zzzz", vec![b'x'; 64], 101);
         tree.flush_active_memtable(0)?;
     }
     // Repair entered over a missing table, with the tree's own copy of the
@@ -16182,6 +16190,7 @@ fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> cra
         Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
+        0,
     )?;
 
     // The mount can punch but cannot attribute zeros to a hole, so the
@@ -16297,6 +16306,7 @@ fn a_committed_frontier_at_the_data_end_is_a_consumed_blob_file() -> crate::Resu
         Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
+        0,
     )?;
     memfs.remove_file(&root.join("tables").join("1"))?;
 
@@ -18449,6 +18459,7 @@ fn owe_report(config: crate::Config, report: &super::RepairReport) -> crate::Res
         std::sync::Arc::default(),
         None,
         crate::fs::SyncMode::Normal,
+        0,
     )
 }
 

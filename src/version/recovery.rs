@@ -361,6 +361,20 @@ fn parse_retention_floor_section(mut bytes: &[u8]) -> crate::Result<SeqNo> {
     Ok(floor)
 }
 
+/// Parses the optional `flush_watermark` section: one `u64 LE`, the highest
+/// synced-flush number the manifest decides. Read strictly (exactly eight
+/// bytes): a watermark read too low would install the tables of a flush the
+/// manifest dropped. `u64::MAX` is no number a flush takes.
+pub(crate) fn parse_flush_watermark_section(mut bytes: &[u8]) -> crate::Result<u64> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("flush_watermark section");
+    let r = &mut bytes;
+    let watermark = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+    if !r.is_empty() || watermark == u64::MAX {
+        return Err(ERR);
+    }
+    Ok(watermark)
+}
+
 /// Reads the registered dictionary ids: `count: u32 | id: u32 * count`.
 ///
 /// Read strictly, like the sections above: a lost id is a dictionary the tree
@@ -688,6 +702,11 @@ pub(crate) struct Recovery {
     /// The encoded report of a repair the tree still owes, from the snapshot's
     /// `repair_report` section. Edits never carry it: only a snapshot does.
     pub repair_report: Option<Vec<u8>>,
+    /// The highest synced-flush number the recovered manifest decides (see
+    /// [`super::FlushSeqs`]): a flush up to it is in the tree if the manifest
+    /// names its tables, gone if not. From the snapshot's `flush_watermark`
+    /// section (`0` when absent) and overwritten by each edit that carries one.
+    pub flush_watermark: u64,
 }
 
 impl Recovery {
@@ -784,6 +803,11 @@ impl Recovery {
         // replaces rather than merges.
         if let Some(dicts) = &edit.dicts {
             self.dicts.clone_from(dicts);
+        }
+
+        // Absolute, as the floor.
+        if let Some(watermark) = edit.flush_watermark {
+            self.flush_watermark = watermark;
         }
 
         self.curr_version_id = edit.new_version_id;
@@ -906,6 +930,13 @@ pub(crate) fn recover(
             Some(archive.read_section("repair_report")?)
         } else {
             None
+        },
+        // Absent from a snapshot written before synced flushes described
+        // themselves: none of its tables does, so none is above 0.
+        flush_watermark: if archive.section("flush_watermark").is_some() {
+            parse_flush_watermark_section(&archive.read_section("flush_watermark")?)?
+        } else {
+            0
         },
     };
 

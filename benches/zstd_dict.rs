@@ -8,12 +8,11 @@
 //! Two scenarios are covered:
 //!
 //! - **`warm`** — steady-state per-block cost with a long-lived `ZstdDictionary`
-//!   handle; the TLS `FrameDecoder` is pre-populated before timing starts.
-//! - **`tls_hit`** — each iteration receives a *fresh* `ZstdDictionary` handle,
-//!   but because all iterations share the same dictionary bytes (same xxh3 hash
-//!   key), the thread-local `FrameDecoder` remains cached across iterations.
-//!   This measures the steady-state per-block cost when callers reconstruct the
-//!   handle on every operation.
+//!   handle, parsed before timing starts.
+//! - **`switch/N`** — one frame each of `N` dictionaries, read in turn on one
+//!   thread, as reads of blob files that each hold a dictionary of their own
+//!   interleave: every read changes the dictionary its decoder decodes with.
+//!   Each prints the P50, P99 and P999 of single reads after its arm.
 //!
 //! Run with:
 //!
@@ -23,8 +22,6 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-#[cfg(zstd_any)]
-use criterion::BatchSize;
 #[cfg(zstd_any)]
 use lsm_tree::compression::ZstdDictionary;
 
@@ -80,25 +77,74 @@ fn bench_decompress_with_dict(c: &mut Criterion) {
         });
     });
 
-    // TLS-hit benchmark: each iteration gets a fresh `ZstdDictionary` handle,
-    // but the TLS decoder is keyed by the 64-bit content hash. All iterations
-    // share the same DICT bytes and therefore the same hash, so the TLS entry
-    // remains live across iterations — this measures the steady-state per-block
-    // decompression cost with the decoder already cached.
-    c.bench_function("decompress_with_dict/tls_hit", |b| {
-        b.iter_batched(
-            || ZstdDictionary::new(DICT),
-            |d| {
-                Backend::decompress_with_dict(
-                    std::hint::black_box(COMPRESSED),
-                    std::hint::black_box(&d),
-                    PLAINTEXT_LEN + 1,
-                )
-                .expect("decompression failed")
-            },
-            BatchSize::SmallInput,
-        );
-    });
+    // Dictionary switches: each read decodes under another dictionary than
+    // the read before it, all parsed before timing starts.
+    let plaintext = b"hello world hello world hello world";
+    for count in [4usize, 16] {
+        let pairs: Vec<(ZstdDictionary, Vec<u8>)> = (0..count)
+            .map(|i| {
+                let dict = ZstdDictionary::new(
+                    format!("raw content dictionary {i:02}: hello world").as_bytes(),
+                );
+                let frame = Backend::compress_with_dict(plaintext, 3, &dict, true)
+                    .expect("compression failed");
+                Backend::decompress_with_dict(&frame, &dict, PLAINTEXT_LEN)
+                    .expect("pre-warm decompression failed");
+                (dict, frame)
+            })
+            .collect();
+        let mut next = pairs.iter().cycle();
+        let mut read = || {
+            let (dict, frame) = next.next().expect("a cycle never ends");
+            Backend::decompress_with_dict(
+                std::hint::black_box(frame),
+                std::hint::black_box(dict),
+                PLAINTEXT_LEN,
+            )
+            .expect("decompression failed")
+        };
+        let label = format!("decompress_with_dict/switch/{count}");
+        // Set by the routine: Criterion applies the command-line filter by
+        // skipping it, and the tail-latency pass below skips with it.
+        let mut ran = false;
+        c.bench_function(&label, |b| {
+            ran = true;
+            b.iter(&mut read);
+        });
+        if ran {
+            // Run once Criterion is done with the arm, so the samples are the
+            // steady state it measured and not its warm-up.
+            let samples = (0..PCT_SAMPLES)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(read());
+                    start.elapsed()
+                })
+                .collect();
+            report_percentiles(&label, samples);
+        }
+    }
+}
+
+/// Timed reads in the tail-latency pass after each switch arm: a thousand
+/// samples behind the P999.
+#[cfg(zstd_any)]
+const PCT_SAMPLES: usize = 1_000_000;
+
+/// Reports per-read tail latency (P50/P99/P999) to stderr: Criterion's summary
+/// surfaces only mean and confidence interval.
+#[cfg(zstd_any)]
+fn report_percentiles(label: &str, mut samples: Vec<std::time::Duration>) {
+    samples.sort_unstable();
+    let pick =
+        |per_mille: usize| samples[(samples.len() * per_mille / 1000).min(samples.len() - 1)];
+    eprintln!(
+        "  [{label}] n={} P50={:?} P99={:?} P999={:?}",
+        samples.len(),
+        pick(500),
+        pick(990),
+        pick(999),
+    );
 }
 
 #[cfg(not(zstd_any))]
