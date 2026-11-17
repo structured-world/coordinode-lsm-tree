@@ -230,6 +230,7 @@ fn a_recovered_version_registers_what_its_files_reference() -> crate::Result<()>
             tree.runtime_config.load_full(),
             tree.config.encryption.clone(),
             tree.config.sync_mode,
+            0,
         )?;
     }
 

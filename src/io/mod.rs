@@ -1714,5 +1714,49 @@ impl<W: Write> Drop for FillingBufWriter<W> {
     }
 }
 
+#[cfg(feature = "std")]
+pub(crate) mod deferred;
+
+/// The buffering writer a table or blob file is written through: one that
+/// can hand its buffers to a worker under `std`, [`FillingBufWriter`]
+/// otherwise.
+#[cfg(feature = "std")]
+pub(crate) type FileWriter<W> = deferred::DeferredWriter<W>;
+/// The buffering writer a table or blob file is written through.
+#[cfg(not(feature = "std"))]
+pub(crate) type FileWriter<W> = FillingBufWriter<W>;
+
+#[cfg(not(feature = "std"))]
+impl<W: Write> FillingBufWriter<W> {
+    /// Wraps `inner` with a `capacity`-byte buffer. `fill` is the choice the
+    /// `std` writer has; this one always fills its buffer.
+    pub(crate) fn for_file(capacity: usize, inner: W, _fill: bool) -> Self {
+        Self::with_capacity(capacity, inner)
+    }
+
+    /// Does `run` with the inner writer once every byte written so far has
+    /// reached it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the write.
+    pub(crate) fn after_writes(&mut self, run: impl FnOnce(&mut W)) -> Result<()> {
+        self.flush_buf()?;
+        run(&mut self.inner);
+        Ok(())
+    }
+
+    /// Does `read` with the inner writer once everything written so far has
+    /// reached it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the write.
+    pub(crate) fn with_inner<R>(&mut self, read: impl FnOnce(&mut W) -> R) -> Result<R> {
+        self.flush_buf()?;
+        Ok(read(&mut self.inner))
+    }
+}
+
 #[cfg(test)]
 mod tests;

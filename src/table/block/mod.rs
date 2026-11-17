@@ -1286,19 +1286,27 @@ impl Block {
                     });
                 }
 
-                let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
+                // SAFETY: as for zstd above: the decoder refuses an offset
+                // reaching past what it wrote and the dictionary's history, so
+                // it never reads an unwritten position; the length equality
+                // below rejects a short fill.
+                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                let mut builder =
+                    unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
+
+                let bytes_written = crate::compression::ZstdBackend::decompress_with_dict_into(
                     &payload,
                     dict,
-                    header.uncompressed_length as usize,
+                    &mut builder,
                 )
                 .map_err(|_| crate::Error::Decompress(compression))?;
-                *produced = decompressed.len();
+                *produced = bytes_written;
 
-                if decompressed.len() != header.uncompressed_length as usize {
+                if bytes_written != header.uncompressed_length as usize {
                     return Err(crate::Error::Decompress(compression));
                 }
 
-                Ok(Slice::from(decompressed))
+                Ok(builder.freeze().into())
             }
         }
     }

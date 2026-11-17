@@ -388,12 +388,15 @@ pub(super) fn prepare_table_writer(
     let above = payload.table_ids.iter().copied().max();
     let table_writer = MultiWriter::from_pool(
         table_base_folder,
-        alloc::sync::Arc::clone(&opts.table_files),
-        above,
+        crate::table::multi_writer::TableFiles::new(
+            alloc::sync::Arc::clone(&opts.table_files),
+            above,
+            crate::fs::WriteOrigin::CompactionTable,
+            rc.io.refill_after_install(),
+        ),
         payload.target_size,
         payload.dest_level,
         level_fs,
-        crate::fs::WriteOrigin::CompactionTable,
     )?
     .use_output_ledger(opts.outputs.clone());
     let mut table_writer = configure_table_writer(

@@ -254,6 +254,17 @@ pub(crate) struct MultiWriter {
     /// live only in a LOST sibling slice.
     owns_whole_run: bool,
 
+    /// The synced flush this writer writes the run of, whose tables describe
+    /// themselves as its (see [`Writer::use_flush_mark`]); `None` for every
+    /// other writer.
+    flush_seq: Option<u64>,
+
+    /// The place the next output takes in the flush's run.
+    flush_index: u32,
+
+    /// The retention floor the flush raised, written on its last table.
+    flush_floor: Option<crate::SeqNo>,
+
     /// The id of the writer CURRENTLY receiving records, so rotation can
     /// stamp the successor's `lineage_prev` adjacency link.
     current_writer_id: TableId,
@@ -292,6 +303,11 @@ pub(crate) struct MultiWriter {
     /// [`Writer`] of a rotated run shares the same pool and settings.
     #[cfg(feature = "std")]
     parallel: Option<crate::table::writer::ParallelCompression>,
+
+    /// The workers that write every table's buffers, for a run that asked
+    /// for them (see [`Self::use_file_workers`]).
+    #[cfg(feature = "std")]
+    file_workers: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
 
     /// Where a compaction learns of every table file this writer creates, so
     /// it can remove the ones it never installs. `None` outside compaction.
@@ -375,7 +391,7 @@ impl OutputLoad {
 
 /// Where a [`MultiWriter`]'s output files come from: its folder's pool, each
 /// id above `above` when given.
-struct TableFiles {
+pub(crate) struct TableFiles {
     pools: Arc<super::file_pool::TableFilePools>,
     above: Option<TableId>,
     /// Whether an output was opened already: only the first refills the
@@ -383,9 +399,29 @@ struct TableFiles {
     opened: bool,
     /// What the outputs are written for.
     origin: WriteOrigin,
+    /// Whether a refill an output's claim starts waits for the install.
+    refill_after_install: bool,
 }
 
 impl TableFiles {
+    /// Outputs claimed from `pools` as `origin`'s, each id above `above` when
+    /// given; a refill a claim starts waits for the write's install when
+    /// `refill_after_install`.
+    pub(crate) fn new(
+        pools: Arc<super::file_pool::TableFilePools>,
+        above: Option<TableId>,
+        origin: WriteOrigin,
+        refill_after_install: bool,
+    ) -> Self {
+        Self {
+            pools,
+            above,
+            opened: false,
+            origin,
+            refill_after_install,
+        }
+    }
+
     /// A writer for the next output in `folder`, and whether its file's
     /// directory entry is durable already.
     fn open(
@@ -396,9 +432,14 @@ impl TableFiles {
     ) -> crate::Result<(Writer, bool)> {
         let may_refill = !self.opened;
         self.opened = true;
-        let claimed = self
-            .pools
-            .claim_as(folder, fs, self.above, may_refill, self.origin)?;
+        let claimed = self.pools.claim_as(
+            folder,
+            fs,
+            self.above,
+            may_refill,
+            self.origin,
+            self.refill_after_install,
+        )?;
         let durable = claimed.durable_entry;
         Ok((Writer::into_claimed(claimed, level, fs.clone())?, durable))
     }
@@ -418,12 +459,10 @@ impl MultiWriter {
         let pools = super::file_pool::TableFilePools::new(table_id_generator, 0, SyncMode::Normal);
         Self::from_pool(
             base_path,
-            Arc::new(pools),
-            None,
+            TableFiles::new(Arc::new(pools), None, WriteOrigin::FlushTable, true),
             target_size,
             initial_level,
             fs,
-            WriteOrigin::FlushTable,
         )
     }
 
@@ -444,33 +483,22 @@ impl MultiWriter {
         );
         Self::from_pool(
             folder,
-            Arc::new(pools),
-            None,
+            TableFiles::new(Arc::new(pools), None, WriteOrigin::CompactionTable, true),
             target_size,
             initial_level,
             fs,
-            WriteOrigin::CompactionTable,
         )
     }
 
     /// Sets up a `MultiWriter` at the given tables folder, its outputs written
-    /// into files claimed from `pools` as `origin`'s, each output's id above
-    /// `above` when given.
+    /// into the files `files` claims.
     pub(crate) fn from_pool(
         base_path: PathBuf,
-        pools: Arc<super::file_pool::TableFilePools>,
-        above: Option<TableId>,
+        mut files: TableFiles,
         target_size: u64,
         initial_level: u8,
         fs: Arc<dyn Fs>,
-        origin: WriteOrigin,
     ) -> crate::Result<Self> {
-        let mut files = TableFiles {
-            pools,
-            above,
-            opened: false,
-            origin,
-        };
         // Own-id recency until `use_recency` overrides it (see the `recency`
         // field).
         let (writer, entries_durable) = files.open(&base_path, initial_level, &fs)?;
@@ -556,6 +584,9 @@ impl MultiWriter {
             transforms_at_output_start: 0,
             transforms_after_last_write: 0,
             owns_whole_run: false,
+            flush_seq: None,
+            flush_index: 0,
+            flush_floor: None,
             current_writer_id: current_table_id,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
@@ -566,6 +597,8 @@ impl MultiWriter {
 
             #[cfg(feature = "std")]
             parallel: None,
+            #[cfg(feature = "std")]
+            file_workers: None,
 
             outputs: None,
 
@@ -713,6 +746,23 @@ impl MultiWriter {
         if let Some(parallel) = parallel {
             self.writer = self.writer.use_parallel_compression(parallel.clone());
             self.parallel = Some(parallel);
+        }
+        self
+    }
+
+    /// Writes the buffers of this run's tables, rotated successors included,
+    /// on the workers of `spawner` (see
+    /// [`Writer::use_file_workers`](crate::table::writer::Writer)). No-op
+    /// when `spawner` is `None`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn use_file_workers(
+        mut self,
+        spawner: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
+    ) -> Self {
+        if let Some(spawner) = spawner {
+            self.writer = self.writer.use_file_workers(Arc::clone(&spawner));
+            self.file_workers = Some(spawner);
         }
         self
     }
@@ -1443,6 +1493,22 @@ impl MultiWriter {
         self
     }
 
+    /// Makes this and every rotated successor writer's table describe itself
+    /// as part of synced flush `seq`, numbered in the order the run writes
+    /// them (see [`Writer::use_flush_mark`]).
+    #[must_use]
+    pub(crate) fn use_flush_seq(mut self, seq: u64) -> Self {
+        self.flush_seq = Some(seq);
+        self.writer = self.writer.use_flush_mark(seq, 0);
+        self.flush_index = 1;
+        self
+    }
+
+    /// The retention floor the flush raised, written on the run's last table.
+    pub(crate) fn set_flush_floor(&mut self, floor: Option<crate::SeqNo>) {
+        self.flush_floor = floor;
+    }
+
     /// Declares that this writer receives the run's ENTIRE merged stream
     /// (see the `owns_whole_run` field), allowing its final output to carry
     /// the `lineage_last` marker. Never set on a parallel sub-compaction or
@@ -1790,6 +1856,13 @@ impl MultiWriter {
         // which is what lets manifest repair union UNBROKEN sibling chains.
         new_writer = new_writer.use_lineage_prev(Some(self.current_writer_id));
         self.current_writer_id = new_table_id;
+        if let Some(seq) = self.flush_seq {
+            new_writer = new_writer.use_flush_mark(seq, self.flush_index);
+            self.flush_index = self
+                .flush_index
+                .checked_add(1)
+                .ok_or(crate::Error::InvalidHeader("flush run exceeds u32 tables"))?;
+        }
         new_writer = new_writer.delete_strategy(self.delete_strategy);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);
@@ -1802,6 +1875,10 @@ impl MultiWriter {
         #[cfg(feature = "std")]
         if let Some(parallel) = self.parallel.clone() {
             new_writer = new_writer.use_parallel_compression(parallel);
+        }
+        #[cfg(feature = "std")]
+        if let Some(spawner) = self.file_workers.clone() {
+            new_writer = new_writer.use_file_workers(spawner);
         }
         Ok(new_writer)
     }
@@ -2808,6 +2885,13 @@ impl MultiWriter {
             self.write_tombstones_alone(writer, pieces, index + 1 == count)?;
         }
 
+        // A flush's run finishes with this table, written after every other:
+        // it records how many the run holds, so an open can tell a whole run
+        // from one a power loss cut short.
+        if self.flush_seq.is_some() {
+            self.writer
+                .mark_flush_end(self.flush_index, self.flush_floor);
+        }
         let path = self.writer.path.clone();
         if let Some((table_id, checksum)) = self
             .writer

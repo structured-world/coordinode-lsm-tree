@@ -23,6 +23,30 @@ pub(crate) type FlushToTablesResult = (
     crate::runtime_config::WritePin,
 );
 
+/// A synced flush's self-description, handed to the writer of its tables.
+///
+/// An internal extension hook type of the crate's sealed tree types, hidden
+/// from generated documentation.
+#[doc(hidden)]
+pub struct FlushSelf {
+    /// The flush's sequence number.
+    pub seq: u64,
+    /// The retention floor the flush raises if it collects history below its
+    /// watermark, and the stream's count of versions it collected, read once
+    /// the stream is drained.
+    pub floor: Option<(SeqNo, Arc<portable_atomic::AtomicU64>)>,
+}
+
+impl FlushSelf {
+    /// The floor the flush raised, once its stream is drained.
+    #[must_use]
+    pub fn raised_floor(&self) -> Option<SeqNo> {
+        self.floor.as_ref().and_then(|(floor, collected)| {
+            (collected.load(core::sync::atomic::Ordering::Relaxed) > 0).then_some(*floor)
+        })
+    }
+}
+
 /// Summary of a checkpoint produced by
 /// [`AbstractTree::create_checkpoint`].
 ///
@@ -657,8 +681,9 @@ pub trait AbstractTree: sealed::Sealed {
     /// may drop its own log up to the writes those flushes held; under
     /// [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) after
     /// [`sync_devices`](Self::sync_devices) as well. A no-op when nothing is
-    /// pending, and under [`FlushDurability::Synced`](crate::config::FlushDurability::Synced)
-    /// every flush is durable when it returns.
+    /// pending. Under [`FlushDurability::Synced`](crate::config::FlushDurability::Synced)
+    /// every flush is durable when it returns, and this only writes the
+    /// manifest naming the tables those flushes wrote.
     ///
     /// Every other install (a compaction, an ingestion, a drop) persists the
     /// pending flushes with it, and so do a checkpoint and a dropped tree.
@@ -784,6 +809,21 @@ pub trait AbstractTree: sealed::Sealed {
             return Ok(None);
         }
 
+        // A synced flush's tables describe themselves under the number it
+        // takes here, so it writes no manifest edit of its own. Taken under
+        // the history's lock, with the memtables it writes: a clear that drops
+        // them installs under that lock and decides every number taken. The
+        // number is given back however the flush ends: installed, failed or
+        // declined.
+        struct GiveBack<F: FnMut()>(F);
+        impl<F: FnMut()> Drop for GiveBack<F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        let flush_seq = self.begin_synced_flush();
+        let _give_back = flush_seq.map(|seq| GiveBack(move || self.end_synced_flush(seq)));
+
         let sealed_ids = latest
             .sealed_memtables
             .iter()
@@ -878,6 +918,19 @@ pub trait AbstractTree: sealed::Sealed {
 
         drop(version_history);
 
+        // Bounded as the install bounds it, by the counter: a snapshot taken
+        // after the flush sees its complete data. Read now, it is at most the
+        // one the install reads, so an open restores no higher a floor.
+        let self_described = flush_seq.map(|seq| FlushSelf {
+            seq,
+            floor: gc_watermark.checked_sub(1).map(|floor| {
+                (
+                    floor.min(self.tree_config().seqno.get()),
+                    Arc::clone(&gc_balance),
+                )
+            }),
+        });
+
         let has_range_tombstones = !range_tombstones.is_empty();
         if let Some((tables, blob_files, write_pin)) = self.flush_to_tables_with_rt(
             stream,
@@ -885,6 +938,7 @@ pub trait AbstractTree: sealed::Sealed {
             flushed.keys,
             flushed.hashes,
             marks,
+            self_described.as_ref(),
         )? {
             // A writer given range tombstones and no key writes a table around
             // them, so a flush that acknowledges a deletion has put it on disk.
@@ -892,9 +946,6 @@ pub trait AbstractTree: sealed::Sealed {
                 !tables.is_empty() || !has_range_tombstones,
                 "a flush of range tombstones wrote no table"
             );
-
-            #[cfg(all(test, feature = "std"))]
-            self.tree_config().fire_before_output_install();
 
             if let Err(e) = self.register_tables(
                 &tables,
@@ -1188,7 +1239,7 @@ pub trait AbstractTree: sealed::Sealed {
             .size_hint()
             .1
             .map_or(0, |upper| u64::try_from(upper).unwrap_or(u64::MAX));
-        self.flush_to_tables_with_rt(stream, Vec::new(), keys, keys, None)
+        self.flush_to_tables_with_rt(stream, Vec::new(), keys, keys, None, None)
     }
 
     /// Like [`AbstractTree::flush_to_tables`], but also writes range tombstones.
@@ -1196,6 +1247,8 @@ pub trait AbstractTree: sealed::Sealed {
     /// filter hashes over them, zero when unknown: a filter advisor keeps room
     /// for every table the flush writes by them. `overwritten`, when given,
     /// names the keys of `stream` its source held more than one version of.
+    /// `self_described`, when given, makes the tables describe themselves as
+    /// the synced flush it names.
     ///
     /// This is an internal extension hook on the crate's sealed tree types and
     /// is hidden from generated documentation.
@@ -1211,7 +1264,19 @@ pub trait AbstractTree: sealed::Sealed {
         keys: u64,
         hashes: u64,
         overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
+        self_described: Option<&FlushSelf>,
     ) -> crate::Result<Option<FlushToTablesResult>>;
+
+    /// Takes the sequence number of a synced flush about to write its tables,
+    /// whose tables then describe themselves so the flush needs no manifest
+    /// edit of its own; `None` when the tree's flushes are deferred. Each
+    /// number taken is given back with [`Self::end_synced_flush`].
+    #[doc(hidden)]
+    fn begin_synced_flush(&self) -> Option<u64>;
+
+    /// The flush that took `seq` is installed, failed or was declined.
+    #[doc(hidden)]
+    fn end_synced_flush(&self, seq: u64);
 
     /// Atomically registers flushed tables into the tree, removing their associated sealed memtables.
     ///

@@ -172,15 +172,12 @@ fn creation() -> Vec<(Synced, SyncKind)> {
     ])
 }
 
-/// What a flush syncs once its tables folder's pool is warm: its table, the
-/// edit naming it, and for a KV-separated tree its blob file and the blob
-/// folder for that file's new name. `first` adds the tables folder, synced
-/// for the batch of pooled files the first flush makes.
+/// What a flush syncs once its tables folder's pool is warm: its table, and
+/// for a KV-separated tree its blob file and the blob folder for that file's
+/// new name. No manifest edit: the table describes itself. `first` adds the
+/// tables folder, synced for the batch of pooled files the first flush makes.
 fn flush_syncs(blob: bool, first: bool) -> Vec<(Synced, SyncKind)> {
-    let mut flush = vec![
-        (Synced::Table, SyncKind::FileData),
-        (Synced::EditLog, SyncKind::FileData),
-    ];
+    let mut flush = vec![(Synced::Table, SyncKind::FileData)];
     if first {
         flush.push((Synced::TablesDir, SyncKind::Directory));
     }
@@ -195,8 +192,8 @@ fn flush_syncs(blob: bool, first: bool) -> Vec<(Synced, SyncKind)> {
 /// and KV-separated, each syncs only what it makes durable: a new entry's
 /// folder once, a written file once, and a reopen the snapshot it installs.
 /// A table is written into a file whose name a batch made durable, so once
-/// the batch is made a flush and a compaction sync their tables and the edit
-/// naming them, and no folder for them.
+/// the batch is made a flush syncs its table and a compaction its table and
+/// the edit naming it, and no folder for them.
 #[test]
 fn each_tree_operation_syncs_only_what_it_makes_durable() {
     for blob in [false, true] {
@@ -289,14 +286,14 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
     }
 }
 
-/// Over a run of flushes the default pool, refilled off the flushing thread,
-/// syncs the tables folder once per batch, where 33 flushes without a pool
-/// sync it 33 times. The first flush finds the pool dry: its install syncs
-/// the folder for the file made for it, and the first batch is made and
-/// synced. From there a flush that leaves half a batch starts the next one:
-/// the 9th and the 25th. Every flush syncs its table and its edit either
-/// way. The refills are waited for before each count, so each lands on the
-/// flush that started it.
+/// Over a run of flushes the default pool, refilled off the flushing thread
+/// once the flush's install has synced, syncs the tables folder once per
+/// batch, where 33 flushes without a pool sync it 33 times. The first flush
+/// finds the pool dry: its install syncs the folder for the file made for it,
+/// and the first batch is made and synced after it. From there a flush that
+/// leaves half a batch starts the next one: the 9th and the 25th. Every flush
+/// syncs its table either way, and no edit. The refills are waited for before
+/// each count, so each lands on the flush that started it.
 #[test]
 fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
     const FLUSHES: u64 = 33;
@@ -329,7 +326,7 @@ fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
             let syncs = census.take();
             let count = |synced: &Synced| syncs.iter().filter(|(s, _)| s == synced).count();
             assert_eq!(count(&Synced::Table), 1, "flush {round} (pool {pool})");
-            assert_eq!(count(&Synced::EditLog), 1, "flush {round} (pool {pool})");
+            assert_eq!(count(&Synced::EditLog), 0, "flush {round} (pool {pool})");
             for _ in 0..count(&Synced::TablesDir) {
                 folder_syncs.push(round);
             }
@@ -344,7 +341,7 @@ fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
 }
 
 /// Without a pool every table file is made as its table is written, and the
-/// install naming it syncs its folder.
+/// flush syncs its folder before it returns.
 #[test]
 fn without_a_pool_each_install_syncs_the_tables_folder() {
     let base = PathBuf::from("/census/unpooled");
@@ -369,7 +366,6 @@ fn without_a_pool_each_install_syncs_the_tables_folder() {
             sorted(vec![
                 (Synced::Table, SyncKind::FileData),
                 (Synced::TablesDir, SyncKind::Directory),
-                (Synced::EditLog, SyncKind::FileData),
             ]),
             "flush {round}"
         );
@@ -432,9 +428,10 @@ fn without_a_pool_every_write_kind_syncs_the_tables_folder() {
 }
 
 /// Under barrier syncs a pooled table on another device than the manifest
-/// still has its folder synced in full: that is the sync that makes the
-/// table's data durable on its device before the edit on the other one names
-/// it.
+/// still has its folder synced in full when a manifest first names it: that
+/// is the sync that makes the table's data durable on its device before the
+/// edit on the other one names it. A flush writes no edit, so the install
+/// that persists it is that one.
 #[test]
 fn a_pooled_table_on_another_device_flushes_that_device() {
     use lsm_tree::fs::{Fs, SyncMode};
@@ -465,13 +462,15 @@ fn a_pooled_table_on_another_device_flushes_that_device() {
     .expect("open");
     fill(&tree, 1);
     tree.flush_active_memtable(0).expect("flush");
+    tree.persist_flushes().expect("persist");
+
+    fill(&tree, 2);
+    tree.flush_active_memtable(0).expect("flush");
     let before = route_fs
         .injector()
         .directory_sync_modes_for("elsewhere")
         .len();
-
-    fill(&tree, 2);
-    tree.flush_active_memtable(0).expect("flush");
+    tree.persist_flushes().expect("persist");
     let modes = route_fs.injector().directory_sync_modes_for("elsewhere");
     assert_eq!(
         modes.get(before..),
@@ -480,9 +479,10 @@ fn a_pooled_table_on_another_device_flushes_that_device() {
     );
 }
 
-/// A flush that rotates the manifest installs its fresh snapshot with two
+/// An install that rotates the manifest installs its fresh snapshot with two
 /// syncs: the snapshot's bytes, then the tree folder for the names of the
-/// renamed snapshot and its empty log.
+/// renamed snapshot and its empty log. A flush writes no manifest, so the
+/// persist of its tables is that install.
 #[test]
 fn a_rotating_install_syncs_the_snapshot_and_its_folder_once() {
     let base = PathBuf::from("/census/rotating");
@@ -507,10 +507,17 @@ fn a_rotating_install_syncs_the_snapshot_and_its_folder_once() {
         sorted(vec![
             (Synced::Table, SyncKind::FileData),
             (Synced::TablesDir, SyncKind::Directory),
+        ]),
+        "the flush"
+    );
+    tree.persist_flushes().expect("persist");
+    assert_eq!(
+        census.take(),
+        sorted(vec![
             (Synced::Snapshot, SyncKind::FileData),
             (Synced::TreeDir, SyncKind::Directory),
         ]),
-        "a flush whose install rotates"
+        "the install that rotates"
     );
 }
 
@@ -538,7 +545,6 @@ fn creating_a_routed_tree_syncs_the_route_once() {
         sorted(vec![
             (Synced::Table, SyncKind::FileData),
             (Synced::RouteTablesDir, SyncKind::Directory),
-            (Synced::EditLog, SyncKind::FileData),
         ]),
         "the first flush"
     );

@@ -406,6 +406,32 @@ pub struct ParsedMeta {
     /// property (empty when none was). Every other id below this table's in
     /// its folder had its table written by then.
     pub writing_below: Vec<TableId>,
+
+    /// What a synced flush wrote into the table about itself (the `flush#`
+    /// properties), so an open can install the flush with no manifest edit
+    /// naming it; `None` for every other table.
+    pub flush: Option<FlushMark>,
+}
+
+/// A synced flush's table, as it describes itself: which flush wrote it and
+/// where it lies in that flush's run.
+///
+/// A synced flush writes no manifest edit of its own. Its files are synced
+/// before it returns, and the next install that writes the manifest names
+/// them; until then an open finds them by this mark (see
+/// [`crate::version::FlushSeqs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlushMark {
+    /// The flush's sequence number, unique in the tree and rising.
+    pub seq: u64,
+    /// The table's place in the flush's run, from 0.
+    pub index: u32,
+    /// The number of tables in the run, on the table the run finishes with
+    /// (`None` on every other): what tells a whole run from one cut short.
+    pub run_len: Option<u32>,
+    /// The retention floor the flush raised the tree's to, when it collected
+    /// history below its watermark (only beside `run_len`).
+    pub floor: Option<crate::SeqNo>,
 }
 
 macro_rules! read_u8 {
@@ -922,6 +948,37 @@ impl ParsedMeta {
             }
             None => Vec::new(),
         };
+        // A synced flush's self-description: the sequence number and the place
+        // together, the run's length and the floor only on the table the run
+        // finishes with.
+        let read_opt_u32 = |key: &[u8]| -> crate::Result<Option<u32>> {
+            match block.point_read(key, SeqNo::MAX, &cmp)? {
+                Some(item) => {
+                    let bytes = <[u8; 4]>::try_from(&item.value[..])
+                        .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+                    Ok(Some(u32::from_le_bytes(bytes)))
+                }
+                None => Ok(None),
+            }
+        };
+        let flush = match read_opt_u64(b"flush#seq")? {
+            None => None,
+            Some(seq) => {
+                let index = read_opt_u32(b"flush#index")?
+                    .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
+                let run_len = read_opt_u32(b"flush#run_len")?;
+                let floor = read_opt_u64(b"flush#floor")?;
+                if floor.is_some() && run_len.is_none() {
+                    return Err(crate::Error::InvalidHeader("TableMeta"));
+                }
+                Some(FlushMark {
+                    seq,
+                    index,
+                    run_len,
+                    floor,
+                })
+            }
+        };
 
         Ok(Self {
             id,
@@ -971,6 +1028,7 @@ impl ParsedMeta {
             lineage_transformed,
             lineage_last,
             writing_below,
+            flush,
         })
     }
 }

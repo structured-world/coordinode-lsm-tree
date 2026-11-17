@@ -357,10 +357,10 @@ fn an_edit_dropping_a_blob_file_on_another_volume_is_synced_in_full() -> lsm_tre
     Ok(())
 }
 
-/// The blob files a flush of unknown install outcome kept, on another volume
+/// The tables a compaction of unknown install outcome kept, on another volume
 /// than the manifest, go with the rotation that supersedes that install, here
 /// a `clear`'s. The rotation's snapshot is synced in full: a barrier on the
-/// manifest's volume would not keep their removal from reaching the blobs
+/// manifest's volume would not keep their removal from reaching the tables'
 /// volume first, and a power loss could then reopen the edit naming them.
 #[test]
 fn a_rotation_removing_kept_files_on_another_volume_is_synced_in_full() -> lsm_tree::Result<()> {
@@ -368,7 +368,7 @@ fn a_rotation_removing_kept_files_on_another_volume_is_synced_in_full() -> lsm_t
 
     let recorder = lsm_tree::fs::FaultFs::new(MemFs::new());
     let injector = recorder.injector();
-    let fs = NestedFs::new(Arc::new(recorder), "blobs");
+    let fs = NestedFs::new(Arc::new(recorder), "tables");
     let tree = Config::new(
         base(),
         SequenceNumberCounter::default(),
@@ -376,11 +376,11 @@ fn a_rotation_removing_kept_files_on_another_volume_is_synced_in_full() -> lsm_t
     )
     .with_shared_fs(Arc::clone(&fs) as Arc<dyn Fs>)
     .sync_mode(SyncMode::Barrier)
-    .with_kv_separation(Some(
-        lsm_tree::KvSeparationOptions::default().separation_threshold(1),
-    ))
     .open()?;
-    tree.insert("key", "a blob value", 0);
+    for seqno in 0..2 {
+        tree.insert("key", "a value", seqno);
+        tree.flush_active_memtable(0)?;
+    }
     injector.arm(
         FaultRule::new(
             FaultOp::SyncData,
@@ -390,7 +390,7 @@ fn a_rotation_removing_kept_files_on_another_volume_is_synced_in_full() -> lsm_t
         .once(),
     );
     assert!(matches!(
-        tree.flush_active_memtable(0),
+        tree.major_compact(64 * 1024 * 1024, 0),
         Err(lsm_tree::Error::InstallOutcomeUnknown(_))
     ));
 

@@ -42,7 +42,7 @@ use spin::RwLock;
 /// `arc_swap::Guard` and cannot outlive the handle; callers who
 /// need an owned reference from a `Guard` can clone the inner
 /// `Arc` out of it via `Arc::clone(&*guard)`.
-pub struct RuntimeConfigHandle {
+pub(crate) struct RuntimeConfigHandle {
     /// `std`: lock-free `ArcSwap` (single atomic load on the read hot path).
     #[cfg(feature = "std")]
     inner: ArcSwap<RuntimeConfig>,
@@ -55,7 +55,7 @@ pub struct RuntimeConfigHandle {
 impl RuntimeConfigHandle {
     /// Build a handle wrapping the given initial config.
     #[must_use]
-    pub fn new(initial: RuntimeConfig) -> Self {
+    pub(crate) fn new(initial: RuntimeConfig) -> Self {
         Self {
             #[cfg(feature = "std")]
             inner: ArcSwap::from_pointee(initial),
@@ -69,22 +69,45 @@ impl RuntimeConfigHandle {
     /// drop; for longer-lived references use [`Self::load_full`] which returns
     /// an owned `Arc<RuntimeConfig>`.
     #[cfg(feature = "std")]
-    pub fn load(&self) -> arc_swap::Guard<Arc<RuntimeConfig>> {
+    pub(crate) fn load(&self) -> arc_swap::Guard<Arc<RuntimeConfig>> {
         self.inner.load()
     }
 
     /// See the `std` variant. Under `no_std` the guard borrows the handle via
     /// the read lock; deref reaches `RuntimeConfig` through the inner `Arc`.
     #[cfg(not(feature = "std"))]
-    pub fn load(&self) -> spin::RwLockReadGuard<'_, Arc<RuntimeConfig>> {
+    pub(crate) fn load(&self) -> spin::RwLockReadGuard<'_, Arc<RuntimeConfig>> {
         self.inner.read()
+    }
+
+    /// Sets the flush strategy for the device under the tree (see
+    /// [`crate::io_policy`]). Swapped in by compare-and-swap, retried until
+    /// it lands on the snapshot it read: an update a caller published
+    /// meanwhile is kept, not overwritten with the snapshot before it.
+    pub(crate) fn set_io_strategy(&self, io: crate::io_policy::IoStrategy) {
+        if self.load().io == io {
+            return;
+        }
+        #[cfg(feature = "std")]
+        self.inner.rcu(|current| {
+            let mut next = RuntimeConfig::clone(current);
+            next.io = io;
+            next
+        });
+        #[cfg(not(feature = "std"))]
+        {
+            let mut current = self.inner.write();
+            let mut next = RuntimeConfig::clone(&current);
+            next.io = io;
+            *current = Arc::new(next);
+        }
     }
 
     /// Load the current snapshot as an owned `Arc`.
     /// Slightly more expensive than [`Self::load`] (one atomic
     /// increment) but the result outlives the handle.
     #[must_use]
-    pub fn load_full(&self) -> Arc<RuntimeConfig> {
+    pub(crate) fn load_full(&self) -> Arc<RuntimeConfig> {
         #[cfg(feature = "std")]
         {
             self.inner.load_full()
@@ -143,7 +166,7 @@ impl RuntimeConfigHandle {
     ///   count, single-parity `ReedSolomon`), or sets
     ///   `kv_checksum_compute_point = AtInsert` with an 8-byte or
     ///   not-compiled-in algorithm.
-    pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
+    pub(crate) fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),
     {
@@ -218,13 +241,20 @@ impl RuntimeConfigHandle {
                 ));
             }
         }
+        // The flush strategy is the device's, set only by
+        // `set_io_strategy`: one a refresh published since the load above is
+        // kept rather than overwritten with the loaded one.
         #[cfg(feature = "std")]
-        {
-            self.inner.store(Arc::new(next));
-        }
+        self.inner.rcu(|current| {
+            let mut published = next.clone();
+            published.io = current.io;
+            published
+        });
         #[cfg(not(feature = "std"))]
         {
-            *self.inner.write() = Arc::new(next);
+            let mut current = self.inner.write();
+            next.io = current.io;
+            *current = Arc::new(next);
         }
         Ok(())
     }

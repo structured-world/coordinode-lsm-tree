@@ -174,6 +174,10 @@ pub struct TreeInner {
     /// Serializes flush operations.
     pub(crate) flush_lock: Mutex<()>,
 
+    /// The sequence numbers of synced flushes, shared with the version
+    /// history, which records in every manifest how far they are decided.
+    pub(crate) flush_seqs: Arc<crate::version::FlushSeqs>,
+
     /// Holds the cross-process exclusive directory lock for this tree's
     /// lifetime: the locked `LOCK` file handle acquired by `Config::open` (via
     /// `acquire_directory_lock`). Dropping it on tree close releases the OS
@@ -341,7 +345,12 @@ impl TreeInner {
     pub(crate) fn persist_flushes(&self) -> crate::Result<()> {
         let pending = self.version_history.read().unsynced_files();
         if !pending.is_empty() {
-            SuperVersions::sync_files(&pending, self.config.sync_mode)?;
+            SuperVersions::sync_files(
+                &pending,
+                &[],
+                self.config.sync_mode,
+                self.config.fs.capabilities(&self.config.path).serial_syncs,
+            )?;
         }
         let mut versions = self.version_history.write();
         versions.forget_synced(&pending);
@@ -396,6 +405,7 @@ impl TreeInner {
             Arc::clone(&initial_runtime),
             config.encryption.clone(),
             config.sync_mode,
+            0,
         )?;
 
         let comparator = config.comparator.clone();
@@ -426,12 +436,14 @@ impl TreeInner {
         // `v{version.id()}`, so that id is the initial manifest snapshot.
         let snapshot_id = version.id();
         let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
+        let flush_seqs = Arc::<crate::version::FlushSeqs>::default();
         let mut super_versions = SuperVersions::new(
             version,
             &comparator,
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
+            Arc::clone(&flush_seqs),
         );
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
@@ -470,6 +482,7 @@ impl TreeInner {
             stop_signal,
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
+            flush_seqs,
             #[cfg(feature = "std")]
             directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
@@ -536,13 +549,14 @@ impl Drop for TreeInner {
         log::trace!("Sending stop signal to compactors");
         self.stop_signal.send();
 
-        // A tree closing persists its deferred flushes, so a reopen needs no
-        // replay of them. A failure loses nothing a caller still needs: what
-        // was not persisted is still in the caller's log.
-        if self.config.flush_durability == crate::config::FlushDurability::Deferred
-            && let Err(e) = self.persist_flushes()
-        {
-            log::warn!("closing tree: could not persist its deferred flushes: {e}");
+        // A tree closing persists its flushes: deferred ones, so a reopen
+        // needs no replay of them; self-described ones, so the manifest names
+        // their tables and a reopen that misses one refuses rather than takes
+        // it for a flush that never returned. A failure loses nothing: what a
+        // deferred flush held is still in the caller's log, and a
+        // self-described flush is durable without the manifest.
+        if let Err(e) = self.persist_flushes() {
+            log::warn!("closing tree: could not persist its flushes: {e}");
         }
 
         // A pool shared by trees that come and go would keep every one's

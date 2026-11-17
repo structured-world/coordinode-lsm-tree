@@ -4174,8 +4174,9 @@ enum ManifestRestriction {
 #[cfg(feature = "std")]
 fn sweep_superseded_by_committed_manifest(
     config: &Config,
+    tree_id: crate::tree::inner::TreeId,
 ) -> crate::Result<Option<CommittedManifest>> {
-    let recovery = match crate::version::recovery::recover(
+    let mut recovery = match crate::version::recovery::recover(
         &config.path,
         &*config.fs,
         crate::config::ManifestRecoveryMode::AbsoluteConsistency,
@@ -4224,6 +4225,11 @@ fn sweep_superseded_by_committed_manifest(
             actual: recovery.tree_type,
         });
     }
+
+    // The flushes that returned since the manifest last persisted are named
+    // by their tables only: an open installs them, so they are not superseded
+    // and the sweep below must not remove them.
+    crate::Tree::adopt_synced_flushes(&mut recovery, config, tree_id)?;
 
     // The full per-table records, not just the id set: the checksum drives
     // temp-swap resolution below, and the `global_seqno` ingest offset is
@@ -4599,7 +4605,7 @@ fn repair_tree(
     // manifest-only ingest offset instead of being failed closed.
     #[cfg(feature = "std")]
     let manifest_referenced: Option<CommittedManifest> =
-        sweep_superseded_by_committed_manifest(config)?;
+        sweep_superseded_by_committed_manifest(config, first_tree_id)?;
     #[cfg(not(feature = "std"))]
     let manifest_referenced: Option<CommittedManifest> = None;
 
@@ -4762,6 +4768,10 @@ struct TableScan {
     /// Every table id the scan actually SAW on disk, joined against the
     /// committed manifest to report ids whose file is gone entirely.
     scanned_table_ids: crate::HashSet<TableId>,
+    /// The highest synced-flush number of a table that opened, kept or not:
+    /// the rebuilt manifest decides every flush the scan found, so a table
+    /// it leaves out is not installed by an open from its own description.
+    highest_flush: u64,
 }
 
 /// The tables that opened in one folder: each id with the ids below it its
@@ -4778,6 +4788,14 @@ fn note_opened(opened: &mut OpenedTables, folder: &std::path::Path, table: &Tabl
         .entry(folder.to_path_buf())
         .or_default()
         .push((table.id(), table.metadata.writing_below.clone()));
+}
+
+/// Raises `highest` to the synced-flush number `table` carries.
+#[cfg(feature = "std")]
+fn note_flush(highest: &mut u64, table: &Table) {
+    if let Some(mark) = &table.metadata.flush {
+        *highest = (*highest).max(mark.seq);
+    }
 }
 
 /// Whether one of `tables` (ids with what their folder was still writing
@@ -4855,6 +4873,7 @@ fn scan_table_folders(
     // written there either way, each telling which files below it were
     // still being written when it was finished.
     let mut opened_tables: OpenedTables = crate::HashMap::default();
+    let mut highest_flush: u64 = 0;
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
@@ -5141,7 +5160,10 @@ fn scan_table_folders(
                     // It opened as a table, so one was written into this
                     // folder, whatever the walk below finds and wherever the
                     // kept copy lives.
-                    .inspect(|table| note_opened(&mut opened_tables, &table_base_folder, table))
+                    .inspect(|table| {
+                        note_opened(&mut opened_tables, &table_base_folder, table);
+                        note_flush(&mut highest_flush, table);
+                    })
                     // The digest was recomputed from THESE bytes, so recovery
                     // can only prove the file is self-consistent — and it stops
                     // at the trailer, meta and index, leaving every lazily-read
@@ -5258,6 +5280,7 @@ fn scan_table_folders(
             // distinguish from "the key was simply never rewritten".
             if let Ok(t) = &recovered {
                 note_opened(&mut opened_tables, &table_base_folder, t);
+                note_flush(&mut highest_flush, t);
                 let range = t.metadata.key_range.clone();
                 // The bound is UNKNOWN when the table's sequence base lived in
                 // the LOST manifest: that open passes offset 0, so
@@ -5917,6 +5940,7 @@ fn scan_table_folders(
         swap_after_commit,
         live_sidecars,
         scanned_table_ids,
+        highest_flush,
     })
 }
 
@@ -5951,6 +5975,7 @@ fn rebuild_from_scan(
         mut swap_after_commit,
         live_sidecars,
         scanned_table_ids,
+        highest_flush,
     } = scan;
 
     // Collect the best copy per id, carrying each candidate's completeness so
@@ -6897,6 +6922,7 @@ fn rebuild_from_scan(
             salvaged,
             first_tree_id,
             outstanding,
+            highest_flush,
             #[cfg(zstd_any)]
             damaged_dictionaries,
         },
@@ -6939,6 +6965,9 @@ struct RepairPublication<'a> {
     /// The report of an earlier repair over the installed snapshot that never
     /// reached the caller: its losses are owed as well.
     outstanding: Option<RepairReport>,
+    /// The highest synced-flush number of a table the scan opened (see
+    /// [`TableScan::highest_flush`]).
+    highest_flush: u64,
     /// Dictionaries found damaged at the start; those still damaged when the
     /// report is assembled are set aside after the commit.
     #[cfg(zstd_any)]
@@ -6982,6 +7011,7 @@ fn publish_repaired_manifest(
         salvaged,
         first_tree_id,
         outstanding,
+        highest_flush,
         #[cfg(zstd_any)]
         damaged_dictionaries,
     } = publication;
@@ -7306,6 +7336,9 @@ fn publish_repaired_manifest(
         Arc::new(config.initial_runtime_config.clone()),
         config.encryption.clone(),
         config.sync_mode,
+        // Every flush a table the scan opened carries, kept or left out: the
+        // repair decides every table it found.
+        highest_flush,
     );
     // The guard stays ARMED until the commit is decided: every fallible
     // `persist_version` step before it installs the snapshot (manifest

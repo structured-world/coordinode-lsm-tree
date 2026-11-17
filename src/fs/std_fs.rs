@@ -9,6 +9,12 @@ use crate::path::{Path, PathBuf};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use std::fs::{File, OpenOptions};
 
+#[cfg(io_uring_fs)]
+mod ring_sync;
+
+#[cfg(target_os = "linux")]
+mod scheduler;
+
 /// Delays between the attempts of a rename or delete that another process is
 /// briefly holding the file against, before the last error is returned: about
 /// half a second in all, longer than an antivirus or indexer scan of a fresh
@@ -534,6 +540,18 @@ impl Fs for StdFs {
         }
     }
 
+    #[cfg(io_uring_fs)]
+    fn sync_many(&self, targets: &[super::SyncTarget<'_>]) -> io::Result<()> {
+        if let [target] = targets {
+            return target.sync_alone(self);
+        }
+        match ring_sync::sync_on_ring(targets) {
+            Some(result) => result,
+            // No ring on this kernel (or none allowed): one thread per sync.
+            None => super::sync_each_target(self, targets),
+        }
+    }
+
     fn exists(&self, path: &Path) -> io::Result<bool> {
         path.try_exists().map_err(io::Error::from)
     }
@@ -632,13 +650,20 @@ impl Fs for StdFs {
         linux_caps::capabilities(path)
     }
 
+    /// Linux: from the I/O scheduler of the disks under `path`.
+    #[cfg(target_os = "linux")]
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        scheduler::idles_between_queues(path)
+    }
+
     /// Windows: no directory can be synced (see `sync_directory`), so the
-    /// directory sync is reported as doing nothing; every other capability
-    /// is the conservative default.
+    /// directory sync is reported as doing nothing, and files are synced one
+    /// at a time; every other capability is the conservative default.
     #[cfg(target_os = "windows")]
     fn capabilities(&self, _path: &Path) -> super::FsCapabilities {
         super::FsCapabilities {
             directory_sync_noop: true,
+            serial_syncs: true,
             ..super::FsCapabilities::default()
         }
     }

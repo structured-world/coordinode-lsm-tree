@@ -20,7 +20,35 @@ fn persist(fs: &MemFs, folder: &Path, id: u64) -> crate::Result<()> {
         Arc::default(),
         None,
         SyncMode::Normal,
+        0,
     )
+}
+
+/// The snapshot records the flush watermark it is given, and never one below
+/// the flushes its own tables name: a reopen starts numbering above both.
+#[test]
+fn a_snapshot_records_the_flush_watermark() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let folder = Path::new("/tree");
+    fs.create_dir_all(folder)?;
+    persist_version(
+        folder,
+        &Version::new(3, crate::TreeType::Standard),
+        "default",
+        &fs,
+        Arc::default(),
+        None,
+        SyncMode::Normal,
+        17,
+    )?;
+    let recovery = crate::version::recovery::recover(
+        folder,
+        &fs,
+        crate::config::ManifestRecoveryMode::AbsoluteConsistency,
+        None,
+    )?;
+    assert_eq!(recovery.flush_watermark, 17);
+    Ok(())
 }
 
 /// A temporary, a snapshot and a log of the id being installed, left by a
@@ -104,6 +132,7 @@ fn a_withdrawal_that_is_not_durable_leaves_the_outcome_unknown() -> crate::Resul
             Arc::default(),
             None,
             SyncMode::Normal,
+            0,
         );
         assert!(
             result.is_err(),

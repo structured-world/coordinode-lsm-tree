@@ -213,6 +213,34 @@ matching entry (and add one for a new subsystem).
   `src/version/super_version.rs` (tests `tests/table_file_pool.rs`,
   `tests/sync_census.rs`).
 
+- **A synced flush writes no manifest edit: its tables describe themselves,
+  and an open installs every whole flush the manifest has not decided.**
+  A synced flush takes a number, writes it into each of its tables with the
+  table's place in the run (the last one also the run's length, and the
+  retention floor the flush raised, if any), and returns once its tables, its
+  blob files and their folders are synced; it is then installed in memory
+  only. Every manifest snapshot and edit records the flush watermark, the
+  highest number whose outcome it decides: a flush up to it is in the tree if
+  the manifest names its tables, gone if not (a compaction consumed it, a clear
+  dropped it). The flush being written stays above every watermark written
+  meanwhile, except a clear's, which decides it, since the clear drops what it
+  writes. On open, the tables of the level-0 folder above the watermark are
+  read and grouped by flush; a flush is installed when every place of its run
+  is present and reads, and every blob file its tables refer to reads whole,
+  and left out otherwise, as it never returned. The open then records a
+  watermark past every flush it found, installed or not, before the tree
+  flushes again, so a table left behind never joins a later flush. A tree
+  that closes, and `persist_flushes`, name the self-described tables in the
+  manifest, so a reopen that misses one refuses it. A persist after a rotation
+  that failed installs under the id that rotation took, so the snapshot it may
+  have left never sits above the one written. A backend reporting
+  `FsCapabilities::serial_syncs` (Windows, where two syncs at once cost more
+  than one after another) syncs a flush's files one at a time. Enforced in
+  `src/tree/mod.rs`, `src/version/flush_seqs.rs` and
+  `src/version/super_version.rs` (tests `tests/flush_self_described.rs`,
+  `tests/serial_syncs.rs`, `src/tree/clear_race_tests.rs`,
+  `tests/manifest_rotation_retry.rs`).
+
 - **Every file the engine opens for writing names what it is written for.**
   The open options carry a `WriteOrigin`, so a counting backend the caller
   gives the tree charges each byte, write call and sync to one origin and none

@@ -228,14 +228,14 @@ fn compress_with_dict_raw_content_dict_works() {
 
 #[test]
 fn raw_content_dict_substitution_rejected_by_inner_frame_gate() {
-    // Defense-in-depth for the dict-substitution threat (#253): the
-    // raw-content decode path applies the dictionary via `force_dict`, which
-    // ignores the inner zstd frame's embedded Dictionary_ID. Without the
-    // `expect_dict_id` gate, a frame body compressed under a DIFFERENT
-    // dictionary (spliced in while the block header + AAD dict_id are kept
-    // valid) would be decoded against the wrong tables and yield silent
-    // garbage. The gate pins the frame id to the decoding dict, so the
-    // substitution surfaces a typed error instead of wrong plaintext.
+    // Defense-in-depth for the dict-substitution threat (#253): the decode
+    // hands the frame the dictionary it was given, and a frame that names no
+    // dictionary takes it as given. Without the `expect_dict_id` gate, a frame
+    // body compressed under a DIFFERENT dictionary (spliced in while the block
+    // header + AAD dict_id are kept valid) would be decoded against the wrong
+    // tables and yield silent garbage. The gate pins the frame id to the
+    // decoding dict, so the substitution surfaces a typed error instead of
+    // wrong plaintext.
     let dict_a_raw = b"raw content dictionary ALPHA for the substitution test".to_vec();
     let dict_b_raw = b"raw content dictionary BRAVO for the substitution test".to_vec();
     let dict_a = ZstdDictionary::new(&dict_a_raw);
@@ -258,8 +258,8 @@ fn raw_content_dict_substitution_rejected_by_inner_frame_gate() {
     assert_eq!(ok, payload, "matching-dict round-trip must be exact");
 
     // Substitution: decode frame B against dict A. The inner-frame id (B)
-    // diverges from the expectation (A) and the gate rejects it before
-    // `force_dict` can apply A's tables to B's frame.
+    // diverges from the expectation (A) and the gate rejects it before A's
+    // tables are applied to B's frame.
     let err = ZstdProvider::decompress_with_dict(&frame_b, &dict_a, payload.len() + 1)
         .expect_err("dict substitution must be rejected by the inner-frame gate");
     // Lock down the exact mismatch payload the gate emits, not just any
@@ -293,6 +293,55 @@ fn forced_id_copy_writes_and_reads_under_its_own_id() {
     assert_eq!(back, PLAINTEXT);
 }
 
+/// A dictionary's bytes exist once: the dictionaries prepared for the
+/// decoder and for the encoder both hold their content inside the buffer the
+/// `ZstdDictionary` keeps, for a raw-content dictionary and a finalized one,
+/// rather than a copy each.
+#[test]
+fn prepared_dictionaries_hold_the_dictionarys_own_buffer() {
+    for raw in [
+        &b"raw content dictionary both sides read in place"[..],
+        DICT,
+    ] {
+        let dict = ZstdDictionary::new(raw);
+        let buffer = dict.raw().as_ptr_range();
+        let decoder = dict.prepared_handle().expect("the decoder side");
+        assert!(buffer.contains(&decoder.as_dict().dict_content.as_ptr()));
+        let encoder = dict.prepared_encoder().expect("the encoder side");
+        assert!(buffer.contains(&encoder.content().as_ptr()));
+    }
+}
+
+/// One decoder serves every dictionary: frames compressed under different
+/// dictionaries, read interleaved on one thread, each decode under their own,
+/// and a frame read under the wrong one after them is refused.
+#[test]
+fn one_thread_reads_frames_of_many_dictionaries_interleaved() {
+    let dicts: Vec<ZstdDictionary> = (0..12)
+        .map(|i| ZstdDictionary::new(format!("raw content dictionary number {i:02}").as_bytes()))
+        .collect();
+    let frames: Vec<Vec<u8>> = dicts
+        .iter()
+        .map(|dict| ZstdProvider::compress_with_dict(PLAINTEXT, 3, dict, true).expect("compress"))
+        .collect();
+    for round in 0..3 {
+        for (at, (dict, frame)) in dicts.iter().zip(&frames).enumerate() {
+            let mut into = vec![0; PLAINTEXT.len()];
+            let written = ZstdProvider::decompress_with_dict_into(frame, dict, &mut into)
+                .expect("decompress into");
+            assert_eq!(
+                &into[..written],
+                PLAINTEXT,
+                "round {round}, dictionary {at}"
+            );
+            let back = ZstdProvider::decompress_with_dict(frame, dict, PLAINTEXT.len())
+                .expect("decompress");
+            assert_eq!(back, PLAINTEXT, "round {round}, dictionary {at}");
+        }
+    }
+    assert!(ZstdProvider::decompress_with_dict(&frames[0], &dicts[1], PLAINTEXT.len()).is_err());
+}
+
 #[test]
 fn compress_with_dict_empty_plaintext_roundtrips() {
     // Edge case: compressing an empty payload with a dictionary must round-trip.
@@ -313,10 +362,8 @@ fn compress_with_dict_empty_plaintext_roundtrips() {
 #[test]
 fn compress_with_dict_raw_content_empty_plaintext_roundtrips_at_capacity_one() {
     // Regression: empty plaintext with a raw-content (non-finalized) dictionary
-    // must round-trip when capacity=1. The raw-content path goes through
-    // `decode_raw_content_bounded`; this smoke test ensures it handles an empty
-    // frame correctly (FCS=0, so the bomb-check is skipped before we enter the
-    // loop).
+    // must round-trip when capacity=1: an empty frame decodes into a buffer
+    // larger than what it holds.
     let raw_dict = b"raw content dictionary for empty payload smoke test";
     let dict = ZstdDictionary::new(raw_dict);
 
@@ -335,10 +382,8 @@ fn compress_with_dict_raw_content_empty_plaintext_roundtrips_at_capacity_one() {
 #[test]
 fn compress_with_dict_raw_content_empty_plaintext_roundtrips_at_exact_capacity() {
     // Regression: empty plaintext with a raw-content dictionary must succeed even
-    // when capacity=0 (exact capacity for 0-byte output). The raw-content path
-    // still enters block decoding for empty frames by calling `decode_blocks`
-    // with `remaining.max(1)`, then relies on the post-collect size guard to
-    // enforce the exact-capacity check after the frame is marked finished.
+    // when capacity=0 (exact capacity for 0-byte output): an empty frame fits
+    // an empty buffer.
     let raw_dict = b"raw content dictionary for empty payload exact-capacity test";
     let dict = ZstdDictionary::new(raw_dict);
 
@@ -359,8 +404,8 @@ fn decompress_with_dict_raw_content_rejects_frame_exceeding_capacity() {
     // Raw-content dict path: the frame is produced by the pure backend with a
     // raw-content (non-finalized) dictionary. The decompressor must return
     // DecompressedSizeTooLarge when the capacity limit is smaller than the
-    // plaintext — exercising the FCS pre-check in decompress_with_dict and
-    // the decode_raw_content_bounded loop capacity guard.
+    // plaintext: the frame decodes into a buffer of that limit, which it
+    // outgrows.
     let dict = ZstdDictionary::new(b"this is raw content dictionary data for matching");
 
     let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
@@ -379,10 +424,8 @@ fn decompress_with_dict_raw_content_rejects_frame_exceeding_capacity() {
 
 #[test]
 fn decompress_with_dict_raw_content_rejects_zero_capacity_non_empty() {
-    // Capacity=0 with non-empty plaintext must return an error immediately:
-    // either the FCS pre-check rejects the frame up front, or the bounded
-    // raw-content decode path hits its size/capacity guard when decoding the
-    // first block for a zero-capacity output buffer.
+    // Capacity=0 with non-empty plaintext must return an error: the frame
+    // cannot fit an empty buffer.
     let dict = ZstdDictionary::new(b"raw content dict for zero-capacity test");
 
     let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
@@ -466,8 +509,7 @@ fn bounded_read_propagates_io_error_from_probe_read() {
 #[test]
 fn decompress_with_dict_returns_error_on_corrupt_finalized_frame() {
     // Build a real compressed frame, then truncate it to force a decode
-    // failure on the finalized-dict path.  Exercises the Io error branch in
-    // do_decompress_with_dict when decode_all_to_vec fails.
+    // failure on the finalized-dict path: a broken frame is an Io error.
     let dict = ZstdDictionary::new(DICT);
     let mut frame = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
         .expect("compression must succeed");
@@ -482,8 +524,7 @@ fn decompress_with_dict_returns_error_on_corrupt_finalized_frame() {
 #[test]
 fn decompress_with_dict_returns_error_on_corrupt_raw_content_frame() {
     // Build a real raw-content compressed frame, then truncate it to force a
-    // failure on the raw-content path.  Exercises the init()/decode error
-    // branch in do_decompress_with_dict.
+    // failure on the raw-content path: a broken frame is an Io error.
     let raw_dict = b"some raw content dictionary bytes for testing corruption";
     let dict = ZstdDictionary::new(raw_dict);
     let mut frame = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
@@ -493,68 +534,6 @@ fn decompress_with_dict_returns_error_on_corrupt_raw_content_frame() {
     assert!(
         matches!(result, Err(crate::Error::Io(_))),
         "corrupt frame must return Err(Io(_)) on raw-content dict path; got {result:?}",
-    );
-}
-
-// --- decode_raw_content_bounded direct tests ---
-//
-// The post-decode `output.len() + can_collect() > capacity` size guard inside
-// `decode_raw_content_bounded` is normally bypassed by the FCS pre-check in
-// `do_decompress_with_dict`: if the frame embeds a content size that exceeds
-// `capacity`, `do_decompress_with_dict` returns early before ever calling
-// this helper. `decode_raw_content_bounded` always calls `decode_blocks` with
-// `remaining.max(1)` — there is no `remaining == 0` early-return.
-//
-// To exercise the post-decode size guard directly, the tests below set up a
-// `FrameDecoder` manually (mirroring `do_decompress_with_dict`) and call the
-// private function directly, bypassing the FCS pre-check.
-
-/// Build a `FrameDecoder` initialised with `dict_raw` for the raw-content
-/// path, pointing `cursor` at the blocks region of `compressed`.
-///
-/// Mirrors the setup performed by `do_decompress_with_dict(is_raw_content=true)`.
-fn make_raw_content_decoder<'a>(
-    dict_raw: &[u8],
-    compressed: &'a [u8],
-    cursor: &mut std::io::Cursor<&'a [u8]>,
-) -> structured_zstd::decoding::FrameDecoder {
-    use structured_zstd::decoding::{Dictionary, FrameDecoder};
-    let id = ZstdDictionary::new(dict_raw).frame_id();
-    let parsed = Dictionary::from_raw_content(id, dict_raw.to_vec())
-        .expect("Dictionary::from_raw_content should succeed");
-    let mut decoder = FrameDecoder::new();
-    decoder.add_dict(parsed).expect("add_dict should succeed");
-    *cursor = std::io::Cursor::new(compressed);
-    decoder
-        .init(cursor)
-        .expect("FrameDecoder::init should succeed");
-    decoder.force_dict(id).expect("force_dict should succeed");
-    decoder
-}
-
-#[test]
-fn decode_raw_content_bounded_remaining_zero_returns_error() {
-    // capacity = 0 on the very first loop iteration.
-    // The decoder still advances with `remaining.max(1)`, so it can decode
-    // a block and report collected output. Once `can_collect()` becomes
-    // non-zero, the `output.len() + can_collect() > capacity` guard returns
-    // DecompressedSizeTooLarge.
-    //
-    // This path is unreachable through the high-level API because the FCS
-    // pre-check in do_decompress_with_dict returns early first (frames
-    // produced by compress_with_dict include the frame content size).
-    let raw_dict = b"raw content dict for remaining-zero test";
-    let compressed =
-        ZstdProvider::compress_with_dict(PLAINTEXT, 3, &ZstdDictionary::new(raw_dict), true)
-            .expect("compression should succeed");
-
-    let mut cursor = std::io::Cursor::new(compressed.as_slice());
-    let mut decoder = make_raw_content_decoder(raw_dict, &compressed, &mut cursor);
-
-    let result = decode_raw_content_bounded(&mut decoder, &mut cursor, 0);
-    assert!(
-        matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
-        "capacity=0 must return DecompressedSizeTooLarge; got {result:?}",
     );
 }
 
@@ -647,24 +626,15 @@ fn compress_with_layout_subrange_partial_decode_matches_full_slice() {
 }
 
 #[test]
-fn decode_raw_content_bounded_collected_exceeds_capacity_returns_error() {
-    // capacity = 5 (smaller than PLAINTEXT = 35 bytes).
-    // decode_blocks(UptoBytes(5)) decodes the block containing 35 bytes.
-    // Since zstd blocks cannot be split, the decoder collects 35 bytes
-    // even though only 5 were requested.  0 + 35 > 5 fires the
-    // `can > capacity` guard, returning DecompressedSizeTooLarge.
-    //
-    // This path is unreachable through the high-level API for the same
-    // reason as the test above.
-    let raw_dict = b"raw content dict for can-exceeds-capacity test";
-    let compressed =
-        ZstdProvider::compress_with_dict(PLAINTEXT, 3, &ZstdDictionary::new(raw_dict), true)
-            .expect("compression should succeed");
+fn decompress_with_dict_into_a_buffer_too_small_returns_error() {
+    // capacity = 5, smaller than PLAINTEXT (35 bytes): the frame decodes
+    // straight into a 5-byte buffer, which it outgrows, and the decode is
+    // refused as too large rather than truncated.
+    let dict = ZstdDictionary::new(b"raw content dict for can-exceeds-capacity test");
+    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true)
+        .expect("compression should succeed");
 
-    let mut cursor = std::io::Cursor::new(compressed.as_slice());
-    let mut decoder = make_raw_content_decoder(raw_dict, &compressed, &mut cursor);
-
-    let result = decode_raw_content_bounded(&mut decoder, &mut cursor, 5);
+    let result = ZstdProvider::decompress_with_dict(&compressed, &dict, 5);
     assert!(
         matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
         "capacity < plaintext must return DecompressedSizeTooLarge; got {result:?}",
