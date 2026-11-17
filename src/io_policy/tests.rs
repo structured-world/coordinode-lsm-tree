@@ -233,6 +233,51 @@ fn a_refresh_that_asked_first_does_not_overwrite_a_later_one() {
     assert_eq!(tree.load().io, IoStrategy::NONE, "the later answer stands");
 }
 
+/// A location whose scheduler is slow to answer holds up only the trees on
+/// it: a tree opening on another location takes its strategy meanwhile.
+/// Guards against one device's query stalling every open in the process.
+#[test]
+fn a_slow_location_does_not_hold_up_another() {
+    let gate = std::sync::Arc::new(Gate::default());
+    let mut slow = Scheduled::on_volume(0xa6, true);
+    // The open asks once; the refresh's ask is the second.
+    slow.hold = Some((2, std::sync::Arc::clone(&gate)));
+    let slow = std::sync::Arc::new(slow);
+    let tree = handle();
+    attach(&*slow, Path::new("/a"), &tree);
+    let refresh = {
+        let slow = std::sync::Arc::clone(&slow);
+        std::thread::spawn(move || refresh_io_policy(&*slow, Path::new("/a")))
+    };
+    while !gate.entered.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+
+    let opened = std::sync::Arc::new(AtomicBool::new(false));
+    let other = {
+        let opened = std::sync::Arc::clone(&opened);
+        std::thread::spawn(move || {
+            let fs = Scheduled::on_volume(0xa7, false);
+            let tree = handle();
+            attach(&fs, Path::new("/b"), &tree);
+            opened.store(true, Ordering::SeqCst);
+            tree.load().io
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !opened.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let opened_meanwhile = opened.load(Ordering::SeqCst);
+    gate.open.store(true, Ordering::SeqCst);
+    assert!(refresh.join().is_ok_and(|idles| idles));
+    assert!(other.join().is_ok_and(|io| io == IoStrategy::NONE));
+    assert!(
+        opened_meanwhile,
+        "the other location's tree opened while the slow one was asked"
+    );
+}
+
 /// Under a scheduler that idles between queues only a flush that started
 /// writeback syncs its files one after another; anywhere else every flush
 /// syncs them side by side.

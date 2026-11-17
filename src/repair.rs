@@ -4137,6 +4137,9 @@ struct CommittedManifest {
     blob_checksums: crate::HashMap<crate::vlog::BlobFileId, crate::Checksum>,
     /// The synced flushes that returned and of which no table was found.
     lost_flushes: Vec<u64>,
+    /// The flush watermark past every synced flush found, set-aside ones
+    /// included.
+    flush_watermark: u64,
 }
 
 #[cfg(feature = "std")]
@@ -4366,6 +4369,7 @@ fn sweep_superseded_by_committed_manifest(
         blob_frontiers: recovery.blob_restrictions,
         blob_checksums: recovery.blob_file_ids.iter().copied().collect(),
         lost_flushes,
+        flush_watermark: recovery.flush_watermark,
     }))
 }
 
@@ -4892,7 +4896,10 @@ fn scan_table_folders(
     // written there either way, each telling which files below it were
     // still being written when it was finished.
     let mut opened_tables: OpenedTables = crate::HashMap::default();
-    let mut highest_flush: u64 = 0;
+    // From the watermark taking in the synced flushes raised it to, past every
+    // flush found, a set-aside one included: the scan does not open a
+    // set-aside table, and below that watermark it no longer names a flush.
+    let mut highest_flush: u64 = manifest_referenced.map_or(0, |manifest| manifest.flush_watermark);
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {

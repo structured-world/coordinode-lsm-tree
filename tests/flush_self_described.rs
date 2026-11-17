@@ -699,6 +699,51 @@ fn a_set_aside_table_still_names_the_flush_before_it() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A repair of a store that lost a returned flush, named only by a later flush
+/// it sets aside, leaves a store that opens: its manifest covers the flushes
+/// the set-aside tables name. Guards against a repair that reports success
+/// while the next open reads the set-aside evidence again and refuses.
+#[test]
+fn a_repair_past_a_set_aside_flush_leaves_a_store_that_opens() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let open = |fs| config(fs).table_target_size(1_024);
+    let tree = open(disk.fs()).open()?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let returned = added_by(&disk.crash, &tables, || {
+        tree.insert("a", "new", 1);
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert_eq!(returned.len(), 1, "self-check: the flush wrote one table");
+    // The latest flush, of several tables naming the returned one, cut short.
+    let filler = "y".repeat(256);
+    let torn = added_by(&disk.crash, &tables, || {
+        for i in 0..64u64 {
+            tree.insert(format!("k{i:03}"), &filler, 10 + i);
+        }
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert!(
+        torn.len() > 1,
+        "self-check: the latest flush wrote several tables"
+    );
+    let crash = disk.power_loss(tree);
+    crash.remove_file(&tables.join(returned[0].to_string()))?;
+    crash.remove_file(&tables.join(torn[0].to_string()))?;
+
+    let report = open(Arc::new(crash.clone())).repair()?;
+    assert_eq!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::FullHistory,
+        "the lost flush is reported: {report:?}"
+    );
+    let tree = open(Arc::new(crash)).open()?;
+    assert_eq!(value(&tree, "a")?.as_deref(), Some("old"));
+    Ok(())
+}
+
 /// An open that fails on a damaged returned flush leaves the store as it
 /// found it: a retry fails the same way. Guards against the first open
 /// setting aside the cut-short flush whose tables named the damaged one, so a
