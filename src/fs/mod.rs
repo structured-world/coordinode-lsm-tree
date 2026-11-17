@@ -385,6 +385,13 @@ pub struct FsCapabilities {
     /// as the table file pool, is then skipped: it would cost and save
     /// nothing.
     pub directory_sync_noop: bool,
+
+    /// Syncs of separate files issued at the same time take longer here than
+    /// the same syncs one after another (NTFS: each file's flush writes the
+    /// volume's log, and two at once wait out each other). The engine then
+    /// syncs a flush's files and its manifest edit one after another instead
+    /// of side by side.
+    pub serial_syncs: bool,
 }
 
 /// A directory entry returned by [`Fs::read_dir`].
@@ -503,6 +510,113 @@ pub enum SyncMode {
     /// another device it depends on. Elsewhere it is identical to
     /// [`Self::Normal`], where `fsync` already reaches the medium.
     Barrier,
+}
+
+/// One sync of a batch [`Fs::sync_many`] makes.
+// no-std: pure data type - borrowed paths, no allocator needed.
+#[derive(Clone, Copy, Debug)]
+pub enum SyncTarget<'a> {
+    /// The data and size of the file at `path`, opened for writing as
+    /// `origin`'s, synced as [`FsFile::sync_data_with`] syncs them.
+    FileData {
+        /// The file.
+        path: &'a Path,
+        /// What the file is written for, as its open names it.
+        origin: WriteOrigin,
+        /// The durability the sync reaches.
+        mode: SyncMode,
+    },
+    /// The entries of the folder at `path`, synced as
+    /// [`Fs::sync_directory_with`] syncs them.
+    Folder {
+        /// The folder.
+        path: &'a Path,
+        /// The durability the sync reaches.
+        mode: SyncMode,
+    },
+}
+
+impl SyncTarget<'_> {
+    /// Syncs this target alone through `fs`.
+    ///
+    /// # Errors
+    ///
+    /// The error the open or the sync returned.
+    pub fn sync_alone<F: Fs + ?Sized>(&self, fs: &F) -> io::Result<()> {
+        match *self {
+            Self::FileData { path, origin, mode } => {
+                let file = fs.open(path, &FsOpenOptions::new().write(true).write_origin(origin))?;
+                file.sync_data_with(mode)
+            }
+            Self::Folder { path, mode } => fs.sync_directory_with(path, mode),
+        }
+    }
+}
+
+/// [`Fs::sync_many`] by one call per target: the files side by side on
+/// threads of their own (one after another without `std`), then the folders.
+///
+/// # Errors
+///
+/// The first error a target's sync returned, once every file sync has ended.
+pub(crate) fn sync_each_target<F: Fs + ?Sized>(
+    fs: &F,
+    targets: &[SyncTarget<'_>],
+) -> io::Result<()> {
+    let (files, folders): (Vec<&SyncTarget<'_>>, Vec<&SyncTarget<'_>>) = targets
+        .iter()
+        .partition(|target| matches!(target, SyncTarget::FileData { .. }));
+    sync_side_by_side(fs, &files)?;
+    for folder in folders {
+        folder.sync_alone(fs)?;
+    }
+    Ok(())
+}
+
+/// Syncs `files` on threads of their own, at most a few at once.
+#[cfg(feature = "std")]
+fn sync_side_by_side<F: Fs + ?Sized>(fs: &F, files: &[&SyncTarget<'_>]) -> io::Result<()> {
+    /// Syncs in flight at once: enough for a journal commit to fold a
+    /// barrier's worth of them, few enough to stay a handful of threads.
+    const IN_FLIGHT: usize = 16;
+
+    if let [file] = files {
+        return file.sync_alone(fs);
+    }
+    let next = core::sync::atomic::AtomicUsize::new(0);
+    let failed: parking_lot::Mutex<Option<io::Error>> = parking_lot::Mutex::new(None);
+    let work = || {
+        while let Some(file) = files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed)) {
+            if let Err(e) = file.sync_alone(fs) {
+                failed.lock().get_or_insert(e);
+                return;
+            }
+        }
+    };
+    let work = &work;
+    std::thread::scope(|scope| {
+        // The calling thread is one of the syncers: a thread that cannot be
+        // started leaves the files to the ones that run, down to this one.
+        for _ in 1..files.len().min(IN_FLIGHT) {
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, work)
+                .is_err()
+            {
+                break;
+            }
+        }
+        work();
+    });
+    failed.into_inner().map_or(Ok(()), Err)
+}
+
+/// Syncs `files` one after another: no threads without `std`.
+#[cfg(not(feature = "std"))]
+fn sync_side_by_side<F: Fs + ?Sized>(fs: &F, files: &[&SyncTarget<'_>]) -> io::Result<()> {
+    for file in files {
+        file.sync_alone(fs)?;
+    }
+    Ok(())
 }
 
 /// Filesystem operations on an open file handle.
@@ -794,16 +908,66 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     }
 }
 
-/// Asks `file` to start writing back `len` bytes at `offset` for a writer that
-/// writes back every `writeback_bytes`. The request is a hint: a refusal turns
-/// writeback off for the file (`*writeback_bytes = 0`) instead of failing the
-/// write, since the file's final sync still writes it and reports a failed
-/// write. On Linux `sync_file_range` without `SYNC_FILE_RANGE_WAIT_AFTER` does
-/// not consume the file's writeback error, so that sync still sees it.
-pub(crate) fn hint_writeback(file: &dyn FsFile, offset: u64, len: u64, writeback_bytes: &mut u64) {
-    if let Err(error) = file.start_writeback(offset, len) {
-        log::warn!("writeback hint refused, the file is written back by its final sync: {error}");
-        *writeback_bytes = 0;
+/// How a file's writer asks for writeback as it writes: every `bytes` it
+/// wrote (`0` for never), until a request is refused.
+pub(crate) struct Writeback {
+    /// The bytes written between two requests, `0` for no requests.
+    pub(crate) bytes: u64,
+    /// Set by a refused request, which may run on a worker; made with the
+    /// first request, so a writer that makes none allocates nothing.
+    refused: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+}
+
+impl Writeback {
+    /// Requests every `bytes` written, `0` for none.
+    pub(crate) const fn every(bytes: u64) -> Self {
+        Self {
+            bytes,
+            refused: None,
+        }
+    }
+
+    /// Asks the file to start writing back the `len` bytes `writer` took at
+    /// `offset`, once they have reached it: on a worker when the writer
+    /// hands its buffers to one, so the request, which a filesystem may
+    /// serve by placing the range's blocks, is not waited for here.
+    ///
+    /// The request is a hint: a refusal turns the requests off from the next
+    /// one on instead of failing the write, since the file's final sync
+    /// still writes it and reports a failed write. On Linux
+    /// `sync_file_range` without `SYNC_FILE_RANGE_WAIT_AFTER` does not
+    /// consume the file's writeback error, so that sync still sees it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of an earlier write of `writer`.
+    pub(crate) fn hint(
+        &mut self,
+        writer: &mut crate::io::FileWriter<alloc::boxed::Box<dyn FsFile>>,
+        offset: u64,
+        len: u64,
+    ) -> crate::Result<()> {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        let refused = self.refused.get_or_insert_with(alloc::sync::Arc::default);
+        if refused.load(Relaxed) {
+            self.bytes = 0;
+            return Ok(());
+        }
+        let refused = alloc::sync::Arc::clone(refused);
+        writer.after_writes(move |file| {
+            // A request queued before an earlier one was refused is not made.
+            if refused.load(Relaxed) {
+                return;
+            }
+            if let Err(error) = file.start_writeback(offset, len) {
+                log::warn!(
+                    "writeback hint refused, the file is written back by its final sync: {error}"
+                );
+                refused.store(true, Relaxed);
+            }
+        })?;
+        Ok(())
     }
 }
 
@@ -1688,6 +1852,25 @@ pub trait Fs: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Makes every target of `targets` durable, as one call per target would
+    /// ([`FsFile::sync_data_with`] on the file opened for writing,
+    /// [`Fs::sync_directory_with`] on the folder), and returns once all of
+    /// them are. The targets are independent: none waits for another.
+    ///
+    /// The default syncs the files side by side on threads of their own,
+    /// then the folders. The std backend on Linux submits all of them from
+    /// the calling thread to one `io_uring`: they run side by side all the
+    /// same, and an I/O scheduler that serves each thread's I/O in turn (BFQ)
+    /// does not idle between them.
+    ///
+    /// # Errors
+    ///
+    /// The first error any target's sync returned; every other target has
+    /// been waited out by then.
+    fn sync_many(&self, targets: &[SyncTarget<'_>]) -> io::Result<()> {
+        sync_each_target(self, targets)
+    }
+
     /// Returns `Ok(true)` if a file or directory exists at `path`.
     ///
     /// # Errors
@@ -1819,6 +2002,21 @@ pub trait Fs: Send + Sync + 'static {
     fn capabilities(&self, path: &Path) -> FsCapabilities {
         let _ = path;
         FsCapabilities::default()
+    }
+
+    /// Whether the I/O scheduler of the device under `path` serves each
+    /// queue in turn and idles for its next request (BFQ), which rewards
+    /// other choices on the flush path than a scheduler that does not
+    /// (`mq-deadline`, `none`): see [`crate::refresh_io_policy`].
+    ///
+    /// Asked once per location, when the first tree opens on it, and again
+    /// by `refresh_io_policy`: answering reads the system's mount table and
+    /// the disks' queues, which is why it is not part of
+    /// [`Self::capabilities`], asked on the write path. The default is
+    /// `false`: nothing known about the device.
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        let _ = path;
+        false
     }
 
     /// Requests that per-file copy-on-write be disabled for the file at `path`.

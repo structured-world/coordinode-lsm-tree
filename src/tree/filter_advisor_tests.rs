@@ -287,8 +287,9 @@ fn filterless_tables_do_not_price_the_others() -> crate::Result<()> {
 }
 
 /// A flush whose filters would take the budget past its limit, and whose
-/// install then fails, leaves the over-budget state to the filters that are
-/// live: they still fit, so the tree is not over its budget.
+/// install then fails (its tables cannot be made durable), leaves the
+/// over-budget state to the filters that are live: they still fit, so the
+/// tree is not over its budget.
 #[test]
 fn a_failed_install_leaves_the_budget_to_the_live_filters() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
@@ -318,7 +319,8 @@ fn a_failed_install_leaves_the_budget_to_the_live_filters() -> crate::Result<()>
         tree.insert(key("new", 2 * i), "value", u64::from(KEYS + i));
     }
     injector.arm(
-        FaultRule::new(FaultOp::Write, Fault::Error(crate::io::ErrorKind::Other)).on_path("edits-"),
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("tables"),
     );
     assert!(tree.flush_active_memtable(0).is_err(), "the install fails");
     injector.clear();

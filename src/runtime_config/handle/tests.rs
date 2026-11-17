@@ -14,6 +14,21 @@ fn load_returns_initial_config() {
     assert_eq!(snap.block_checksum_algo, ChecksumAlgorithm::Xxh3_64);
 }
 
+/// A caller's update keeps a flush strategy a refresh set after the update
+/// loaded its snapshot. Guards against the update publishing the strategy it
+/// loaded, which leaves the tree on the old one until the next refresh.
+#[test]
+fn an_update_keeps_a_strategy_set_while_it_ran() -> crate::Result<()> {
+    let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+    let bfq = crate::io_policy::IoStrategy::for_scheduler(true);
+    handle.try_update(|config| {
+        handle.set_io_strategy(bfq);
+        config.auto_heal = !config.auto_heal;
+    })?;
+    assert_eq!(handle.load().io, bfq);
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "page_ecc")]
 fn try_update_accepts_ecc_on_with_secded_and_shard_schemes() {

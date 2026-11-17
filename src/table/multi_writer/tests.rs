@@ -1153,20 +1153,29 @@ fn an_output_opened_at_finish_counts_toward_entry_durability() -> crate::Result<
     let folder = tempfile::tempdir()?;
     let base_path = folder.path().to_path_buf();
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
-    // One pooled file: the first output takes it, every later one is made.
+    // A batch of three made ahead, its first file taken by another write: the
+    // writer's first output and one more take pooled files, durable by name,
+    // and every later one is made. Only the outputs `finish` opens then make
+    // the writer's entries not durable.
     let pools = Arc::new(TableFilePools::new(
         SequenceNumberCounter::default(),
-        1,
+        3,
         SyncMode::Normal,
     ));
+    drop(pools.claim_as(
+        &base_path,
+        &fs,
+        None,
+        true,
+        crate::fs::WriteOrigin::FlushTable,
+        false,
+    )?);
     let mut mw = super::MultiWriter::from_pool(
         base_path,
-        pools,
-        None,
+        super::TableFiles::new(pools, None, crate::fs::WriteOrigin::FlushTable, true),
         12 * 1_024,
         0,
         fs,
-        crate::fs::WriteOrigin::FlushTable,
     )?;
     mw.set_range_tombstones(
         (0..2_000usize)

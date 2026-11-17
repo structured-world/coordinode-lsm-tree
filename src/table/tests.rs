@@ -11048,3 +11048,53 @@ fn a_restricted_view_keeps_its_prefix_filter() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// A table whose filter block did not reach the disk reads its data blocks
+/// whole, and fails the filter check an open runs on a table no manifest
+/// names. Guards against an open adopting a table whose point reads then fail
+/// on the filter they load only when they need it.
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test fixture: a byte of the filter block"
+)]
+fn a_damaged_filter_block_fails_the_filter_check_only() -> crate::Result<()> {
+    use super::regions::ParsedRegions;
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            i.to_be_bytes(),
+            b"v",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("the fixture writes entries");
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    table.verify_data_blocks()?;
+    table.verify_filter_blocks()?;
+
+    let filter = {
+        let mut f = std::fs::File::open(&file)?;
+        let trailer = crate::sfa::Reader::from_reader(&mut f)?;
+        ParsedRegions::parse_from_toc(trailer.toc())?
+            .filter
+            .expect("self-check: the fixture writes a full filter")
+    };
+    let mut bytes = std::fs::read(&file)?;
+    let at = usize::try_from(*filter.offset()).expect("offset fits usize")
+        + crate::table::block::Header::MIN_LEN
+        + 3;
+    bytes[at] ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    table.verify_data_blocks()?;
+    assert!(
+        table.verify_filter_blocks().is_err(),
+        "the damaged filter block is found"
+    );
+    Ok(())
+}

@@ -1283,6 +1283,10 @@ impl<F: Fs> Fs for FaultFs<F> {
         self.inner.capabilities(path)
     }
 
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        self.inner.idles_between_io_queues(path)
+    }
+
     fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
         self.inner.try_disable_cow(path)
     }

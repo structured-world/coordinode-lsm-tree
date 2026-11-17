@@ -193,6 +193,9 @@ pub(crate) fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
         ..opts.clone()
     };
     let result = run_compaction(opts);
+    // The run's syncs are done: a pool refill one of its claims reserved runs
+    // now, never beside them.
+    opts.table_files.start_pending();
     // A run its room stopped declined, as one the gate skips does: its
     // inputs are as they were, and only its outputs go, below.
     let result = match result {
@@ -4566,6 +4569,7 @@ fn run_merge_on_read_relocation(
                 Some(source.id()),
                 true,
                 crate::fs::WriteOrigin::CompactionTable,
+                opts.runtime_config.load().io.refill_after_install(),
             )
         },
         &*level_fs,
