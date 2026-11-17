@@ -1158,10 +1158,15 @@ fn repair_and_reconciled_replay_recover_identical_state() -> lsm_tree::Result<()
         !report.lost_coverage.is_empty(),
         "the excluded SST's coverage must be reported: {report:?}",
     );
+    let [(_, _, _, bound)] = report.lost_coverage.as_slice() else {
+        panic!("one excluded SST: {report:?}");
+    };
+    assert_eq!(*bound, Some(3), "the lost SST topped out at seqno 3");
+    // The crash took the manifest too: nothing says what else the store
+    // held, so the whole history is reconciled.
     assert_eq!(
         report.wal_replay_scope(),
-        lsm_tree::WalReplayScope::LostUpTo(3),
-        "the lost SST topped out at seqno 3",
+        lsm_tree::WalReplayScope::FullHistory,
     );
 
     // W: everything through the last flush (seqno 5) was applied and
@@ -1964,9 +1969,13 @@ fn reconciled_replay_covers_the_whole_keyspace_for_unknowable_losses() -> lsm_tr
         report.lost_coverage.is_empty(),
         "an unparseable SST has no coverage to report: {report:?}",
     );
+    // The unparseable SST, beside the manifest the store lost.
     assert_eq!(
-        report.unknowable_losses.len(),
-        1,
+        report.unknowable_losses,
+        [
+            crash_dir.path().join("tables").join("0"),
+            crash_dir.path().join("manifest"),
+        ],
         "the unparseable SST is an unscopable loss: {report:?}",
     );
     assert_eq!(
