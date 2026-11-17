@@ -44,6 +44,49 @@ fn the_longest_mount_point_over_a_path_gives_its_source() {
     assert_eq!(mount_source(mountinfo, Path::new("/proc/self")), None);
 }
 
+/// Lines of `/proc/self/mountinfo` that are cut short are skipped, a mount
+/// over the same point hides the one before it, and a backslash that starts
+/// no octal escape is kept as it is.
+#[test]
+fn a_malformed_mountinfo_line_is_skipped() {
+    let mountinfo = "\
+22 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw
+no separator in this line
+23 1
+24 22 8:3 / /data rw - ext4
+25 22 8:4 / /data rw - xfs /dev/sdd1 rw
+26 22 8:5 / /odd\\x rw - xfs /dev/sde1 rw
+";
+    assert_eq!(
+        mount_source(mountinfo, Path::new("/data/tree")),
+        Some(PathBuf::from("/dev/sdd1")),
+        "the later mount over /data wins, the one without a source is skipped"
+    );
+    assert_eq!(
+        mount_source(mountinfo, Path::new("/odd\\x/tree")),
+        Some(PathBuf::from("/dev/sde1")),
+        "a backslash that starts no escape stays"
+    );
+}
+
+/// A stack of devices deeper than any real one answers no rather than
+/// following links forever: a loop in a fake sysfs ends.
+#[test]
+fn a_device_stack_past_the_limit_answers_no() -> std::io::Result<()> {
+    let root = tempfile::tempdir()?;
+    let a = root.path().join("devices/dm-0");
+    let b = root.path().join("devices/dm-1");
+    for device in [&a, &b] {
+        std::fs::create_dir_all(device.join("queue"))?;
+        std::fs::write(device.join("queue/scheduler"), "none\n")?;
+        std::fs::create_dir_all(device.join("slaves"))?;
+    }
+    symlink(&b, a.join("slaves/dm-1"))?;
+    symlink(&a, b.join("slaves/dm-0"))?;
+    assert!(!stalls_under(&a, 0));
+    Ok(())
+}
+
 /// A device number splits into the major and minor numbers sysfs names its
 /// device by, the high bits of each included.
 #[test]

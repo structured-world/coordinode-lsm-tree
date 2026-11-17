@@ -133,6 +133,33 @@ fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
     Ok(())
 }
 
+/// A sync the kernel refuses fails the batch with its own error, once every
+/// entry of the batch is reaped: `/dev/null` takes no data sync.
+#[test]
+fn a_sync_the_kernel_refuses_fails_the_batch() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("f");
+    std::fs::File::create(&file)?.write_all(b"x")?;
+    let null = std::path::Path::new("/dev/null");
+    let targets = [
+        SyncTarget::FileData {
+            path: &file,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        },
+        SyncTarget::FileData {
+            path: null,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        },
+    ];
+    let Some(result) = sync_on_ring(&targets) else {
+        return Ok(());
+    };
+    assert!(result.is_err(), "the refused sync is reported");
+    Ok(())
+}
+
 /// A folder target that names a file is refused, as
 /// `StdFs::sync_directory_with` refuses it: the ring path does not sync a
 /// file in place of the folder a caller meant to make durable.

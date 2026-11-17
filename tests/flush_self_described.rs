@@ -537,6 +537,31 @@ fn a_returned_flush_with_no_table_left_fails_the_open() -> lsm_tree::Result<()> 
     Ok(())
 }
 
+/// A blob flush whose files are whole is taken in after a power loss with its
+/// values read back, one of them too large for a frame and stored as a head
+/// and chunks. Guards against the frame check an open runs refusing a whole
+/// flush.
+#[test]
+fn a_whole_blob_flush_with_chunked_values_is_taken_in() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = blob_config(disk.fs()).open()?;
+    let big = noise(4 << 20, 7);
+    tree.insert("big", &big, 0);
+    for i in 0..200u64 {
+        tree.insert(format!("k{i:04}"), noise(64, i), 1 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+
+    let tree = blob_config(Arc::new(crash)).open()?;
+    assert_eq!(tree.get("big", u64::MAX)?.as_deref(), Some(big.as_slice()));
+    assert_eq!(
+        tree.get("k0199", u64::MAX)?.as_deref(),
+        Some(noise(64, 199).as_slice())
+    );
+    Ok(())
+}
+
 /// A repair of a store that lost a returned flush whole reports the loss as
 /// unscopable, so a caller replays its whole journal. Guards against a report
 /// that tells the caller only the tail needs replaying while the lost flush's

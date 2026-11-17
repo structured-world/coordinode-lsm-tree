@@ -150,8 +150,10 @@ mod registry {
         let known = locations
             .iter_mut()
             .find(|at| at.backend == backend && at.volume == volume);
-        let location = if let Some(location) = known {
-            location
+        let idles = if let Some(location) = known {
+            location.trees.retain(|tree| tree.strong_count() > 0);
+            location.trees.push(Arc::downgrade(handle));
+            location.idles
         } else {
             // Asked under the lock: two trees opening on one new location
             // ask it once.
@@ -160,17 +162,11 @@ mod registry {
                 backend,
                 volume,
                 idles,
-                trees: Vec::new(),
+                trees: alloc::vec![Arc::downgrade(handle)],
             });
-            let Some(location) = locations.last_mut() else {
-                handle.set_io_strategy(IoStrategy::for_scheduler(idles));
-                return;
-            };
-            location
+            idles
         };
-        location.trees.retain(|tree| tree.strong_count() > 0);
-        location.trees.push(Arc::downgrade(handle));
-        handle.set_io_strategy(IoStrategy::for_scheduler(location.idles));
+        handle.set_io_strategy(IoStrategy::for_scheduler(idles));
         drop(locations);
     }
 

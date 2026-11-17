@@ -113,3 +113,18 @@ fn any_tree_standard_forwards_to_tree() -> crate::Result<()> {
 fn any_tree_blob_forwards_to_blob_tree() -> crate::Result<()> {
     forwards_to_the_tree_it_holds(true)
 }
+
+/// A synced flush's number taken through `AnyTree` is the tree's: the next
+/// one taken after it ends is the one above, with it recorded as not
+/// returned (it was never installed).
+#[test]
+fn any_tree_takes_flush_numbers_from_the_tree_it_holds() -> crate::Result<()> {
+    for blob in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let tree = open(dir.path(), blob)?;
+        let (first, returned) = tree.begin_synced_flush().expect("a number");
+        tree.end_synced_flush(first);
+        assert_eq!(tree.begin_synced_flush(), Some((first + 1, returned)));
+    }
+    Ok(())
+}

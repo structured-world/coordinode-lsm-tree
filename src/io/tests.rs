@@ -478,6 +478,22 @@ fn buf_writer_dropped_after_a_panicking_write_replays_nothing() -> std::io::Resu
     Ok(())
 }
 
+/// The file writer's hand-offs give the inner writer every byte written so
+/// far, buffered ones included.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_hands_off_after_every_write_reached_it() -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut out = FillingBufWriter::with_capacity(8, Vec::new());
+    out.write_all(b"abc")?;
+    assert_eq!(out.with_inner(|inner| inner.clone())?, b"abc");
+    out.write_all(b"defghijk")?;
+    let mut seen = Vec::new();
+    out.after_writes(|inner| seen.clone_from(inner))?;
+    assert_eq!(seen, b"abcdefghijk");
+    Ok(())
+}
+
 /// A write that goes past the buffer and panics, caught by the caller,
 /// leaves the file short of bytes: a later hand-off of the file (its sync)
 /// fails instead of calling the writer that panicked. Guards against a sync

@@ -115,6 +115,63 @@ fn without_workers_the_count_stops_at_the_threshold() -> io::Result<()> {
     Ok(())
 }
 
+/// A seek puts what is buffered and queued down first: the bytes written
+/// before it land before the target, and a write after it overwrites there.
+#[test]
+fn a_seek_lands_after_what_was_written_before_it() -> io::Result<()> {
+    let mut out = DeferredWriter::with_capacity(8, std::io::Cursor::new(Vec::new()), true);
+    out.use_spawner_now(Arc::new(Prompt));
+    out.write_all(b"abcdefghij")?;
+    assert_eq!(out.seek(SeekFrom::Start(2))?, 2);
+    out.write_all(b"XY")?;
+    out.flush()?;
+    assert_eq!(
+        out.with_inner(|inner| inner.get_ref().clone())?,
+        b"abXYefghij"
+    );
+    Ok(())
+}
+
+/// What a lane holds behind a failed write is dropped, not written: the file
+/// is the caller's to remove, and every later call reports the failure.
+#[test]
+fn a_lane_drops_what_is_queued_behind_a_failed_write() {
+    let sink = Sink {
+        fail_past: Some(0),
+        ..Sink::default()
+    };
+    let mut out = DeferredWriter::with_capacity(8, sink, true);
+    // Workers that never run: the jobs wait in the lane until the caller
+    // drains it.
+    out.use_spawner_now(Arc::new(Never::default()));
+    for _ in 0..3 {
+        drop(out.write_all(&[7; 8]));
+    }
+    assert!(
+        out.queued_bytes() > 8,
+        "self-check: jobs wait behind the first"
+    );
+    let bytes = out.with_inner(|inner| inner.bytes.len());
+    assert!(bytes.is_err(), "the failure is reported");
+    assert_eq!(out.queued_bytes(), 0, "what was behind it is dropped");
+}
+
+/// A writer already on a lane takes a new spawner for its later buffers and
+/// keeps the file's order.
+#[test]
+fn a_writer_on_a_lane_takes_a_new_spawner() -> io::Result<()> {
+    let data = pattern(4_096);
+    let mut out = DeferredWriter::with_capacity(256, Sink::default(), true);
+    out.use_spawner_now(Arc::new(Prompt));
+    let (first, second) = data.split_at(2_048);
+    write_in(&mut out, first, 100)?;
+    out.use_spawner(Arc::new(Threads));
+    write_in(&mut out, second, 100)?;
+    let sink = out.finish()?;
+    assert_eq!(sink.bytes, data);
+    Ok(())
+}
+
 /// A writer that does not fill its buffer puts a write that does not fit
 /// into the next one whole, as std's buffering writer does.
 #[test]

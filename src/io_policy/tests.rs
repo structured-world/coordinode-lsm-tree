@@ -54,8 +54,9 @@ impl Fs for Scheduled {
         }
         idles
     }
+    /// Volume `0` stands for a backend that names no volume.
     fn volume_id(&self, _path: &Path) -> Option<u64> {
-        Some(self.volume)
+        (self.volume != 0).then_some(self.volume)
     }
     fn backend_id(&self) -> Option<u64> {
         Some(0x5c_4ed)
@@ -181,6 +182,20 @@ fn a_location_without_open_trees_is_let_go() {
         2,
         "the location was asked anew, its record gone with its last tree"
     );
+}
+
+/// A backend that names no volume is asked each time and kept nowhere: a
+/// tree opening on it takes what it answers, and a refresh answers what it
+/// answers now.
+#[test]
+fn a_backend_without_volumes_is_asked_each_time() {
+    let fs = Scheduled::on_volume(0, true);
+    let tree = handle();
+    attach(&fs, Path::new("/a"), &tree);
+    assert_eq!(tree.load().io, IoStrategy::for_scheduler(true));
+    fs.idles.store(false, Ordering::SeqCst);
+    assert!(!refresh_io_policy(&fs, Path::new("/a")));
+    assert_eq!(fs.asked.load(Ordering::SeqCst), 2);
 }
 
 /// Of two refreshes, the trees run what the one that asked last found: a
