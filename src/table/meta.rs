@@ -432,10 +432,11 @@ pub struct FlushMark {
     /// The retention floor the flush raised the tree's to, when it collected
     /// history below its watermark (only beside `run_len`).
     pub floor: Option<crate::SeqNo>,
-    /// The highest synced flush that had returned when this one began, `0`
-    /// for none. Flushes run one at a time, so it is durable evidence that
-    /// every flush up to it returned: an open tells a flush that returned and
-    /// was damaged since from one a power loss cut short by it.
+    /// The last synced flush that had returned when this one began, `0` for
+    /// none. Flushes run one at a time, so the flushes that returned form a
+    /// chain through these numbers, and a flush that failed is named by none:
+    /// an open tells a flush that returned and was damaged since from one
+    /// that failed or a power loss cut short by whether a table names it.
     pub returned_through: u64,
 }
 

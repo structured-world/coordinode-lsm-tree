@@ -824,6 +824,9 @@ pub trait AbstractTree: sealed::Sealed {
                 (self.0)();
             }
         }
+        // With the number, the last flush installed before this one: its
+        // tables name it, and an open counts as returned only a flush some
+        // table names, so a number a failed flush took never counts.
         let flush_seq = self.begin_synced_flush();
         let _give_back = flush_seq.map(|(seq, _)| GiveBack(move || self.end_synced_flush(seq)));
 
