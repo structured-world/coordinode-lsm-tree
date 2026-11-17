@@ -144,6 +144,24 @@ fn a_closed_tree_is_let_go() {
     );
 }
 
+/// A location whose trees have all closed is not kept: the next tree opened
+/// on it asks its device again. Guards against a process that opens trees on
+/// ever new volumes keeping a record of each for good.
+#[test]
+fn a_location_without_open_trees_is_let_go() {
+    let fs = Scheduled::on_volume(0xa4, false);
+    let closed = handle();
+    attach(&fs, Path::new("/a"), &closed);
+    drop(closed);
+    let reopened = handle();
+    attach(&fs, Path::new("/a"), &reopened);
+    assert_eq!(
+        fs.asked.load(Ordering::Relaxed),
+        2,
+        "the location was asked anew, its record gone with its last tree"
+    );
+}
+
 /// Under a scheduler that idles between queues only a flush that started
 /// writeback syncs its files one after another; anywhere else every flush
 /// syncs them side by side.

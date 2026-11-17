@@ -127,8 +127,10 @@ mod registry {
         trees: Vec<Weak<RuntimeConfigHandle>>,
     }
 
-    /// Every location a tree has opened on, in this process. A host fact
-    /// read from the system, not tree state: shared by every tree on it.
+    /// Every location a tree is open on, in this process. A host fact read
+    /// from the system, not tree state: what a device's scheduler does is one
+    /// answer for every tree on it whatever opened them, so the registry is
+    /// the process's, as the device is.
     static LOCATIONS: parking_lot::Mutex<Vec<Location>> = parking_lot::Mutex::new(Vec::new());
 
     /// Sets in `handle` the strategy for the location of `path`, asking it
@@ -144,6 +146,9 @@ mod registry {
         };
         let backend = fs.backend_id();
         let mut locations = LOCATIONS.lock();
+        // A location goes with its last tree: the registry holds the locations
+        // trees are open on, not every one the process ever opened a tree on.
+        locations.retain(|at| at.trees.iter().any(|tree| tree.strong_count() > 0));
         let known = locations
             .iter_mut()
             .find(|at| at.backend == backend && at.volume == volume);
