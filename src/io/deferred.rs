@@ -35,8 +35,9 @@
 
 use crate::table::writer::CompactionSpawner;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// The bytes a lane holds before its writer drains it or waits.
 const LANE_BYTES_MAX: usize = 1024 * 1024;
@@ -49,6 +50,14 @@ const LANE_BYTES_MAX: usize = 1024 * 1024;
 /// (9.0 to 20.2 µs per value), where flushes of 10 000 values and up took
 /// 17 to 31% less.
 const WORKERS_AFTER_BYTES: usize = 1024 * 1024;
+
+/// `counted` plus `written`, counted no further than [`WORKERS_AFTER_BYTES`]:
+/// a writer with no workers stays on the caller's thread and writes on, past
+/// any count a `usize` holds on a 32-bit target. `counted` is at most the
+/// threshold and `written` the length of a slice, so the sum fits.
+fn count_up_to_threshold(counted: usize, written: usize) -> usize {
+    (counted + written).min(WORKERS_AFTER_BYTES)
+}
 
 /// The buffers a lane keeps to hand back to its writer.
 const SPARE_BUFFERS_MAX: usize = 4;
@@ -102,10 +111,10 @@ struct Lane<W> {
 }
 
 impl<W: Write> Lane<W> {
-    /// A poisoned lock is taken as it is: the state is changed in single
-    /// steps, none of which leaves it torn.
+    /// The state is changed in single steps under the lock, none of which
+    /// leaves it torn should it unwind.
     fn lock(&self) -> MutexGuard<'_, State<W>> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        self.state.lock()
     }
 
     /// Drains the lane on the calling thread unless another drains it,
@@ -188,16 +197,13 @@ impl<W: Write> Lane<W> {
     /// on the calling thread when none does.
     fn settle(&self) -> MutexGuard<'_, State<W>> {
         loop {
-            let state = self.lock();
+            let mut state = self.lock();
             if !state.draining && (state.queue.is_empty() || state.inner.is_none()) {
                 return state;
             }
             if state.draining {
-                drop(
-                    self.progress
-                        .wait(state)
-                        .unwrap_or_else(PoisonError::into_inner),
-                );
+                self.progress.wait(&mut state);
+                drop(state);
             } else {
                 drop(state);
                 self.drain();
@@ -286,16 +292,13 @@ fn queue<W: Write + Send + 'static>(
 /// does, waits for the one that does otherwise.
 fn make_room<W: Write>(lane: &Lane<W>) {
     loop {
-        let state = lane.lock();
+        let mut state = lane.lock();
         if state.queued_bytes <= LANE_BYTES_MAX || state.inner.is_none() && !state.draining {
             return;
         }
         if state.draining {
-            drop(
-                lane.progress
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner),
-            );
+            lane.progress.wait(&mut state);
+            drop(state);
         } else {
             drop(state);
             lane.drain();
@@ -407,9 +410,7 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
             Sink::Here(inner) => {
                 let result =
                     Self::write_here(inner, (&mut self.failed, &mut self.panicked), &self.buf);
-                // Bounded by the threshold it is compared with: past it the
-                // writer is on a lane and counts no more.
-                self.written_here += self.buf.len();
+                self.written_here = count_up_to_threshold(self.written_here, self.buf.len());
                 self.buf.clear();
                 self.take_on_workers();
                 result
@@ -530,8 +531,7 @@ impl<W: Write + Send + 'static> Write for DeferredWriter<W> {
                 Sink::Here(inner) => {
                     let result =
                         Self::write_here(inner, (&mut self.failed, &mut self.panicked), data);
-                    // As in `hand_over`: counted only up to the threshold.
-                    self.written_here += data.len();
+                    self.written_here = count_up_to_threshold(self.written_here, data.len());
                     self.take_on_workers();
                     result
                 }

@@ -28,10 +28,7 @@ struct Never(Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>);
 
 impl CompactionSpawner for Never {
     fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(task);
+        self.0.lock().push(task);
     }
 }
 
@@ -101,6 +98,20 @@ fn without_workers_buffers_go_down_on_the_callers_thread() -> io::Result<()> {
     );
     let here = std::thread::current().id();
     assert!(sink.threads.iter().all(|&thread| thread == here));
+    Ok(())
+}
+
+/// A writer without workers counts what it wrote on the caller's thread no
+/// further than the threshold, through buffered and passed-through writes.
+/// Guards against the count overflowing a 32-bit `usize` on a file past
+/// 4 GiB, which would panic after the bytes went down.
+#[test]
+fn without_workers_the_count_stops_at_the_threshold() -> io::Result<()> {
+    let mut out = DeferredWriter::with_capacity(1_024, Sink::default(), true);
+    write_in(&mut out, &pattern(WORKERS_AFTER_BYTES + 4_096), 100)?;
+    out.write_all(&pattern(8_192))?;
+    out.flush()?;
+    assert_eq!(out.written_here, WORKERS_AFTER_BYTES);
     Ok(())
 }
 
