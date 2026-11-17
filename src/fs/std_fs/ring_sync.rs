@@ -22,6 +22,11 @@ use std::os::unix::io::AsRawFd;
 /// and their folders fits.
 const MIN_ENTRIES: u32 = 8;
 
+/// The most targets open and in flight at once: a persist of many deferred
+/// flushes goes in chunks of this many, never holding a descriptor for each
+/// of its files.
+const MAX_IN_FLIGHT: usize = 64;
+
 std::thread_local! {
     /// The ring this thread's batches go through, kept between them: setting
     /// one up maps its queues and its first sync starts the kernel's workers,
@@ -34,7 +39,7 @@ std::thread_local! {
 /// all of them: `None` when no ring can be set up, for the caller to sync
 /// another way. Linux has one data sync for every [`crate::fs::SyncMode`].
 pub(super) fn sync_on_ring(targets: &[SyncTarget<'_>]) -> Option<io::Result<()>> {
-    let entries = u32::try_from(targets.len())
+    let entries = u32::try_from(targets.len().min(MAX_IN_FLIGHT))
         .ok()?
         .next_power_of_two()
         .max(MIN_ENTRIES);
@@ -52,7 +57,9 @@ pub(super) fn sync_on_ring(targets: &[SyncTarget<'_>]) -> Option<io::Result<()>>
             }
         }
         let ring = slot.as_mut()?;
-        let synced = sync_through(ring, targets);
+        let synced = targets
+            .chunks(MAX_IN_FLIGHT)
+            .try_for_each(|chunk| sync_through(ring, chunk));
         if synced.is_err() {
             // A batch that failed may have left entries in flight: the next
             // batch gets a ring of its own rather than their completions.

@@ -99,6 +99,40 @@ fn batches_after_a_failure_and_a_larger_batch_still_sync() -> crate::Result<()> 
     Ok(())
 }
 
+/// A batch of more files than the process may hold open syncs: it goes to
+/// the ring in bounded chunks. Guards against a persist of many deferred
+/// flushes failing with `EMFILE` on every retry.
+#[test]
+fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
+    const FILES: usize = 400;
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<std::path::PathBuf> = (0..FILES)
+        .map(|i| dir.path().join(format!("f{i}")))
+        .collect();
+    for path in &paths {
+        std::fs::File::create(path)?.write_all(b"x")?;
+    }
+    let targets: Vec<SyncTarget<'_>> = paths
+        .iter()
+        .map(|path| SyncTarget::FileData {
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        })
+        .collect();
+    // Room for what this process holds open and a chunk, not for the batch.
+    let open_now = std::fs::read_dir("/proc/self/fd")?.count() as u64;
+    let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
+    rlimit::setrlimit(rlimit::Resource::NOFILE, open_now + 128, hard)?;
+    let result = sync_on_ring(&targets);
+    rlimit::setrlimit(rlimit::Resource::NOFILE, soft, hard)?;
+    let Some(result) = result else {
+        return Ok(());
+    };
+    result?;
+    Ok(())
+}
+
 /// A folder target that names a file is refused, as
 /// `StdFs::sync_directory_with` refuses it: the ring path does not sync a
 /// file in place of the folder a caller meant to make durable.
