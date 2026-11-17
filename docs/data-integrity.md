@@ -231,7 +231,12 @@ them differently:
   (which nothing names yet): it is taken for one a power loss cut short, set
   aside as `{id}.torn-flush`, and left out in every mode. Damage to the latest
   flush before a later flush or a persist names it is therefore indistinguishable
-  from a cut-short flush and drops its writes, as a torn log tail does.
+  from a cut-short flush and drops its writes, as a torn log tail does. A
+  caller that drops its own journal once a flush returns is covered against a
+  power loss; to be covered against that damage too, it calls
+  `persist_flushes` (one manifest write and sync) before dropping the journal.
+  After an open, `get_highest_persisted_seqno` marks where the tree's contents
+  end, and a caller that kept its journal replays from there.
 
 `Config::manifest_recovery_mode` decides only what happens to the first shape:
 

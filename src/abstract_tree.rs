@@ -643,6 +643,14 @@ pub trait AbstractTree: sealed::Sealed {
     /// ordered then, and the entries may go once
     /// [`sync_devices`](Self::sync_devices) has returned `Ok` too.
     ///
+    /// The flush survives a power loss once it returns. It survives damage to
+    /// its files on the medium only once a later flush or
+    /// [`persist_flushes`](Self::persist_flushes) has recorded that it
+    /// returned: until then an open cannot tell its damage from a flush a
+    /// power loss cut short, and leaves it out. A caller that drops its own
+    /// journal on the flush and wants it kept against such damage too calls
+    /// [`persist_flushes`](Self::persist_flushes) before dropping it.
+    ///
     /// `gc_watermark` has the meaning documented at
     /// [`major_compact`](Self::major_compact); pass `0` to collect nothing.
     ///
@@ -686,7 +694,9 @@ pub trait AbstractTree: sealed::Sealed {
     /// [`sync_devices`](Self::sync_devices) as well. A no-op when nothing is
     /// pending. Under [`FlushDurability::Synced`](crate::config::FlushDurability::Synced)
     /// every flush is durable when it returns, and this only writes the
-    /// manifest naming the tables those flushes wrote.
+    /// manifest naming the tables those flushes wrote: from then on a damaged
+    /// table of theirs fails the open instead of being taken for a flush a
+    /// power loss cut short (see [`flush_active_memtable`](Self::flush_active_memtable)).
     ///
     /// Every other install (a compaction, an ingestion, a drop) persists the
     /// pending flushes with it, and so do a checkpoint and a dropped tree.
