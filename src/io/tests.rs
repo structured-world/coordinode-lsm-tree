@@ -478,6 +478,33 @@ fn buf_writer_dropped_after_a_panicking_write_replays_nothing() -> std::io::Resu
     Ok(())
 }
 
+/// A write that goes past the buffer and panics, caught by the caller,
+/// leaves the file short of bytes: a later hand-off of the file (its sync)
+/// fails instead of calling the writer that panicked. Guards against a sync
+/// of a short file reported as a success.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_refuses_a_hand_off_after_a_panicking_write() {
+    use std::io::Write as _;
+    let mut inner = PanicsOnce {
+        // The first call already happened: the next one panics.
+        calls: 1,
+        ..PanicsOnce::default()
+    };
+    {
+        let mut out = FillingBufWriter::with_capacity(4, &mut inner);
+        let caught =
+            std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.write(b"abcdefgh")))
+                .is_err();
+        assert!(caught, "the injected panic surfaces");
+        let mut handed = 0;
+        assert!(out.with_inner(|_| handed += 1).is_err(), "the sync fails");
+        assert!(out.after_writes(|_| handed += 1).is_err());
+        assert_eq!(handed, 0, "the writer that panicked is not handed over");
+    }
+    assert_eq!(inner.calls, 2, "nor written to again");
+}
+
 /// Every `ErrorKind` discriminant — kept in one place so the
 /// exhaustive bridge tests below stay total. A new variant added
 /// to the enum without a row here fails the per-arm assertions

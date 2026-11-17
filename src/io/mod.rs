@@ -1733,14 +1733,22 @@ impl<W: Write> FillingBufWriter<W> {
     pub(crate) fn for_file(capacity: usize, inner: W, _fill: bool) -> Self {
         Self::with_capacity(capacity, inner)
     }
+}
 
+// The file writer's hand-offs to the inner writer; built under `std` for the
+// tests only, where the file writer is the deferred one.
+#[cfg(any(test, not(feature = "std")))]
+impl<W: Write> FillingBufWriter<W> {
     /// Does `run` with the inner writer once every byte written so far has
     /// reached it.
     ///
     /// # Errors
     ///
-    /// Returns the failure of the write.
-    pub(crate) fn after_writes(&mut self, run: impl FnOnce(&mut W)) -> Result<()> {
+    /// Returns the failure of the write, or an error when the last inner
+    /// write panicked: the file then lacks bytes a caller was told nothing
+    /// about.
+    pub(crate) fn after_writes(&mut self, run: impl FnOnce(&mut W)) -> BufResult<()> {
+        self.refuse_after_panic()?;
         self.flush_buf()?;
         run(&mut self.inner);
         Ok(())
@@ -1751,11 +1759,32 @@ impl<W: Write> FillingBufWriter<W> {
     ///
     /// # Errors
     ///
-    /// Returns the failure of the write.
-    pub(crate) fn with_inner<R>(&mut self, read: impl FnOnce(&mut W) -> R) -> Result<R> {
+    /// As [`Self::after_writes`].
+    pub(crate) fn with_inner<R>(&mut self, read: impl FnOnce(&mut W) -> R) -> BufResult<R> {
+        self.refuse_after_panic()?;
         self.flush_buf()?;
         Ok(read(&mut self.inner))
     }
+
+    /// The error of a hand-off after an inner write that panicked.
+    fn refuse_after_panic(&self) -> BufResult<()> {
+        if self.panicked {
+            return Err(panicked_write());
+        }
+        Ok(())
+    }
+}
+
+/// The error a hand-off after a panicked inner write ends with.
+#[cfg(all(test, feature = "std"))]
+fn panicked_write() -> std::io::Error {
+    std::io::Error::other("an earlier write to this file panicked")
+}
+
+/// [`panicked_write`] without `std`.
+#[cfg(not(feature = "std"))]
+fn panicked_write() -> Error {
+    Error::new(ErrorKind::Other, "an earlier write to this file panicked")
 }
 
 #[cfg(test)]

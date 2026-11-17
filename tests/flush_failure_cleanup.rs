@@ -534,7 +534,16 @@ fn assert_unknown_outcome_keeps_until_superseded(f: &Fixture) -> lsm_tree::Resul
             "the kept table {name} goes once superseded"
         );
     }
-    let tables = files(&f.dir.path().join("tables"))?;
+    // The retired inputs leave through the background deleter: wait for it,
+    // bounded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let tables = loop {
+        let tables = files(&f.dir.path().join("tables"))?;
+        if tables.len() == f.tree.table_count() || std::time::Instant::now() >= deadline {
+            break tables;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(
         tables.len(),
         f.tree.table_count(),
