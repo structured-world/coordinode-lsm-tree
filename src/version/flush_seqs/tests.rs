@@ -3,18 +3,33 @@ use super::FlushSeqs;
 /// The next number, which these tests never run out of.
 fn take(seqs: &FlushSeqs) -> u64 {
     match seqs.begin() {
-        Some(seq) => seq,
+        Some((seq, _)) => seq,
         None => panic!("the numbers ran out"),
     }
 }
 
 /// Numbering resumes above the watermark a manifest recorded, so a flush
-/// after the open is never taken for one the manifest decided.
+/// after the open is never taken for one the manifest decided; every flush
+/// the manifest decided counts as returned.
 #[test]
 fn numbers_start_above_the_recovered_watermark() {
     let seqs = FlushSeqs::after(41);
     assert_eq!(seqs.decided(), 41);
-    assert_eq!(seqs.begin(), Some(42));
+    assert_eq!(seqs.begin(), Some((42, 41)));
+}
+
+/// A flush records the highest one that returned before it began: an
+/// installed flush counts, a failed one does not. Guards against a later
+/// flush vouching for one that never returned, whose damage an open would
+/// then report as the medium's.
+#[test]
+fn only_an_installed_flush_counts_as_returned() {
+    let seqs = FlushSeqs::default();
+    let first = take(&seqs);
+    seqs.installed(first);
+    let failed = take(&seqs);
+    seqs.end(failed);
+    assert_eq!(seqs.begin(), Some((failed + 1, first)));
 }
 
 /// The last numbers are not handed out: a flush past them is written to the

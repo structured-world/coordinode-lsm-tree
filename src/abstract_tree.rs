@@ -31,6 +31,9 @@ pub(crate) type FlushToTablesResult = (
 pub struct FlushSelf {
     /// The flush's sequence number.
     pub seq: u64,
+    /// The highest flush that had returned when this one began (see
+    /// [`crate::table::meta::FlushMark::returned_through`]).
+    pub returned_through: u64,
     /// The retention floor the flush raises if it collects history below its
     /// watermark, and the stream's count of versions it collected, read once
     /// the stream is drained.
@@ -822,7 +825,7 @@ pub trait AbstractTree: sealed::Sealed {
             }
         }
         let flush_seq = self.begin_synced_flush();
-        let _give_back = flush_seq.map(|seq| GiveBack(move || self.end_synced_flush(seq)));
+        let _give_back = flush_seq.map(|(seq, _)| GiveBack(move || self.end_synced_flush(seq)));
 
         let sealed_ids = latest
             .sealed_memtables
@@ -921,8 +924,9 @@ pub trait AbstractTree: sealed::Sealed {
         // Bounded as the install bounds it, by the counter: a snapshot taken
         // after the flush sees its complete data. Read now, it is at most the
         // one the install reads, so an open restores no higher a floor.
-        let self_described = flush_seq.map(|seq| FlushSelf {
+        let self_described = flush_seq.map(|(seq, returned_through)| FlushSelf {
             seq,
+            returned_through,
             floor: gc_watermark.checked_sub(1).map(|floor| {
                 (
                     floor.min(self.tree_config().seqno.get()),
@@ -1271,8 +1275,9 @@ pub trait AbstractTree: sealed::Sealed {
     /// whose tables then describe themselves so the flush needs no manifest
     /// edit of its own; `None` when the tree's flushes are deferred. Each
     /// number taken is given back with [`Self::end_synced_flush`].
+    /// The number comes with the highest one that had returned by then.
     #[doc(hidden)]
-    fn begin_synced_flush(&self) -> Option<u64>;
+    fn begin_synced_flush(&self) -> Option<(u64, u64)>;
 
     /// The flush that took `seq` is installed, failed or was declined.
     #[doc(hidden)]

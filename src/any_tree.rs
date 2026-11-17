@@ -445,7 +445,7 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
-    fn begin_synced_flush(&self) -> Option<u64> {
+    fn begin_synced_flush(&self) -> Option<(u64, u64)> {
         forward!(self.begin_synced_flush())
     }
 

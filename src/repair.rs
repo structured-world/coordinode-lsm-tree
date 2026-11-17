@@ -4228,8 +4228,14 @@ fn sweep_superseded_by_committed_manifest(
 
     // The flushes that returned since the manifest last persisted are named
     // by their tables only: an open installs them, so they are not superseded
-    // and the sweep below must not remove them.
-    crate::Tree::adopt_synced_flushes(&mut recovery, config, tree_id)?;
+    // and the sweep below must not remove them. One that returned and does
+    // not read whole is left for the scan to salvage, beyond the sweep too.
+    let for_the_scan = crate::Tree::adopt_synced_flushes(
+        &mut recovery,
+        config,
+        tree_id,
+        crate::tree::AdoptFor::Repair,
+    )?;
 
     // The full per-table records, not just the id set: the checksum drives
     // temp-swap resolution below, and the `global_seqno` ingest offset is
@@ -4293,7 +4299,7 @@ fn sweep_superseded_by_committed_manifest(
             let Ok(id) = dirent.file_name.parse::<TableId>() else {
                 continue;
             };
-            if referenced_tables.contains_key(&id) {
+            if referenced_tables.contains_key(&id) || for_the_scan.contains(&id) {
                 continue;
             }
             // Unreferenced bare-id files are removed even though one COULD be a

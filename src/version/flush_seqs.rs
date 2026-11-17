@@ -34,6 +34,10 @@ struct State {
     /// included: a clear drops what that flush writes, so no later manifest
     /// may leave it undecided again.
     cleared: u64,
+    /// The highest number of a flush that returned (installed its tables), or
+    /// one an open decided: each flush's tables record it, so an open tells a
+    /// flush that returned from one a power loss cut short.
+    returned: u64,
 }
 
 impl FlushSeqs {
@@ -49,6 +53,7 @@ impl FlushSeqs {
             next: decided + 1,
             in_flight: None,
             cleared: decided,
+            returned: decided,
         }))
     }
 
@@ -56,25 +61,38 @@ impl FlushSeqs {
     /// `None` once they run out (only a manifest recording a watermark at the
     /// top of the range gets there): that flush is then written to the
     /// manifest by name. Flushes run one at a time, under the tree's flush
-    /// lock.
-    pub(crate) fn begin(&self) -> Option<u64> {
+    /// lock. Returns the number with the highest one that had returned by
+    /// then.
+    pub(crate) fn begin(&self) -> Option<(u64, u64)> {
         let mut state = self.0.lock();
         let seq = state.next;
         state.next = seq.checked_add(1)?;
         state.in_flight = Some(seq);
+        let returned_through = state.returned;
         drop(state);
-        Some(seq)
+        Some((seq, returned_through))
     }
 
-    /// The flush that took `seq` is installed, failed or was declined. An
-    /// install ends it under the version lock it publishes under, so no
-    /// manifest written after the publish leaves it undecided; its caller
-    /// ends it again on the way out, which then changes nothing.
+    /// The flush that took `seq` failed or was declined. Its caller ends it
+    /// on the way out, after [`Self::installed`] too, which then changes
+    /// nothing.
     pub(crate) fn end(&self, seq: u64) {
         let mut state = self.0.lock();
         if state.in_flight == Some(seq) {
             state.in_flight = None;
         }
+    }
+
+    /// The flush that took `seq` installed its tables and returns: ended
+    /// under the version lock it publishes under, so no manifest written
+    /// after the publish leaves it undecided, and recorded as returned for
+    /// the flushes after it to describe.
+    pub(crate) fn installed(&self, seq: u64) {
+        let mut state = self.0.lock();
+        if state.in_flight == Some(seq) {
+            state.in_flight = None;
+        }
+        state.returned = state.returned.max(seq);
     }
 
     /// Whether a clear decided `seq`. A clear whose manifest write failed

@@ -2369,7 +2369,7 @@ impl AbstractTree for BlobTree {
         self.index.get_flush_lock()
     }
 
-    fn begin_synced_flush(&self) -> Option<u64> {
+    fn begin_synced_flush(&self) -> Option<(u64, u64)> {
         self.index.begin_synced_flush()
     }
 
@@ -2444,7 +2444,7 @@ impl AbstractTree for BlobTree {
         .use_output_ledger(outputs.clone());
         // A synced flush's tables describe themselves (see `register_tables`).
         let table_writer = match self_described {
-            Some(flush) => table_writer.use_flush_seq(flush.seq),
+            Some(flush) => table_writer.use_flush_seq(flush.seq, flush.returned_through),
             None => table_writer,
         };
         let written = (|| -> crate::Result<_> {

@@ -259,6 +259,9 @@ pub(crate) struct MultiWriter {
     /// other writer.
     flush_seq: Option<u64>,
 
+    /// The highest synced flush that had returned when this one began.
+    flush_returned: u64,
+
     /// The place the next output takes in the flush's run.
     flush_index: u32,
 
@@ -585,6 +588,7 @@ impl MultiWriter {
             transforms_after_last_write: 0,
             owns_whole_run: false,
             flush_seq: None,
+            flush_returned: 0,
             flush_index: 0,
             flush_floor: None,
             current_writer_id: current_table_id,
@@ -1497,9 +1501,10 @@ impl MultiWriter {
     /// as part of synced flush `seq`, numbered in the order the run writes
     /// them (see [`Writer::use_flush_mark`]).
     #[must_use]
-    pub(crate) fn use_flush_seq(mut self, seq: u64) -> Self {
+    pub(crate) fn use_flush_seq(mut self, seq: u64, returned_through: u64) -> Self {
         self.flush_seq = Some(seq);
-        self.writer = self.writer.use_flush_mark(seq, 0);
+        self.flush_returned = returned_through;
+        self.writer = self.writer.use_flush_mark(seq, 0, returned_through);
         self.flush_index = 1;
         self
     }
@@ -1857,7 +1862,7 @@ impl MultiWriter {
         new_writer = new_writer.use_lineage_prev(Some(self.current_writer_id));
         self.current_writer_id = new_table_id;
         if let Some(seq) = self.flush_seq {
-            new_writer = new_writer.use_flush_mark(seq, self.flush_index);
+            new_writer = new_writer.use_flush_mark(seq, self.flush_index, self.flush_returned);
             self.flush_index = self
                 .flush_index
                 .checked_add(1)

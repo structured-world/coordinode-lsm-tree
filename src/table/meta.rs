@@ -432,6 +432,11 @@ pub struct FlushMark {
     /// The retention floor the flush raised the tree's to, when it collected
     /// history below its watermark (only beside `run_len`).
     pub floor: Option<crate::SeqNo>,
+    /// The highest synced flush that had returned when this one began, `0`
+    /// for none. Flushes run one at a time, so it is durable evidence that
+    /// every flush up to it returned: an open tells a flush that returned and
+    /// was damaged since from one a power loss cut short by it.
+    pub returned_through: u64,
 }
 
 macro_rules! read_u8 {
@@ -963,6 +968,9 @@ impl ParsedMeta {
         };
         let flush = match read_opt_u64(b"flush#seq")? {
             None => None,
+            // A flush takes a number below `u64::MAX` (see `FlushSeqs`): one
+            // at it was not written by a flush.
+            Some(u64::MAX) => return Err(crate::Error::InvalidHeader("TableMeta")),
             Some(seq) => {
                 let index = read_opt_u32(b"flush#index")?
                     .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
@@ -971,11 +979,17 @@ impl ParsedMeta {
                 if floor.is_some() && run_len.is_none() {
                     return Err(crate::Error::InvalidHeader("TableMeta"));
                 }
+                // Only flushes before this one can have returned.
+                let returned_through = read_opt_u64(b"flush#returned")?.unwrap_or(0);
+                if returned_through >= seq {
+                    return Err(crate::Error::InvalidHeader("TableMeta"));
+                }
                 Some(FlushMark {
                     seq,
                     index,
                     run_len,
                     floor,
+                    returned_through,
                 })
             }
         };

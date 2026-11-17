@@ -413,10 +413,89 @@ fn a_flush_whose_table_has_a_damaged_block_is_left_out() -> lsm_tree::Result<()>
     file.sync_all()?;
     drop(file);
 
-    let tree = config(Arc::new(crash)).open()?;
+    let tree = config(Arc::new(crash.clone())).open()?;
     assert_eq!(value(&tree, "kept")?.as_deref(), Some("1"));
     assert_eq!(value(&tree, "torn")?, None, "the damaged flush is left out");
     assert_eq!(tree.table_count(), 1);
+    assert!(
+        crash.exists(&path.with_file_name(format!("{}.torn-flush", torn[0])))?,
+        "its table is set aside, not removed"
+    );
+    Ok(())
+}
+
+/// A flush that returned and was damaged since fails the open: a later
+/// flush's tables record that it returned, so the damage is the medium's and
+/// is reported, not read as a flush a power loss cut short. Guards against an
+/// open that drops acknowledged data and serves older versions in its place.
+#[test]
+fn a_returned_flush_with_a_damaged_block_fails_the_open() -> lsm_tree::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let disk = Disk::new();
+    let tree = config(disk.fs()).open()?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let before = data_files(&disk.crash, &at(DB).join("tables"));
+    tree.insert("a", "x".repeat(512), 1);
+    tree.flush_active_memtable(0)?;
+    let returned: Vec<u64> = data_files(&disk.crash, &at(DB).join("tables"))
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect();
+    assert_eq!(returned.len(), 1, "self-check: the flush wrote one table");
+    // The flush after it records that it returned.
+    tree.insert("b", "2", 2);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+
+    let path = at(DB).join("tables").join(returned[0].to_string());
+    let mut file = crash.open(&path, &lsm_tree::fs::FsOpenOptions::new().write(true))?;
+    file.seek(SeekFrom::Start(40))?;
+    file.write_all(&[0xA5; 16])?;
+    file.sync_all()?;
+    drop(file);
+
+    assert!(
+        matches!(
+            config(Arc::new(crash.clone())).open(),
+            Err(lsm_tree::Error::Unrecoverable)
+        ),
+        "the damage to a returned flush is reported"
+    );
+    assert!(crash.exists(&path)?, "its table is kept for a repair");
+    Ok(())
+}
+
+/// A flush of several tables, with range tombstones across them, reads the
+/// same after a power loss as before: the open places its tables as the
+/// flush's install did, each a run of its own that the placement merges when
+/// disjoint.
+#[test]
+fn a_flush_of_overlapping_tables_reads_the_same_after_a_power_loss() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = config(disk.fs()).table_target_size(1_024).open()?;
+    let filler = "y".repeat(256);
+    for i in 0..64u64 {
+        tree.insert(format!("run-{i:03}"), &filler, i);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("run-010", "run-050", 100);
+    for i in 0..64u64 {
+        tree.insert(format!("run-{i:03}"), "new", 200 + i);
+    }
+    tree.remove_range("run-020", "run-030", 300);
+    tree.flush_active_memtable(0)?;
+    let expected: Vec<Option<String>> = (0..64u64)
+        .map(|i| value(&tree, &format!("run-{i:03}")))
+        .collect::<lsm_tree::Result<_>>()?;
+    let crash = disk.power_loss(tree);
+
+    let tree = config(Arc::new(crash)).table_target_size(1_024).open()?;
+    for (i, want) in (0..64u64).zip(&expected) {
+        assert_eq!(&value(&tree, &format!("run-{i:03}"))?, want, "run-{i:03}");
+    }
     Ok(())
 }
 
@@ -508,7 +587,13 @@ fn a_flush_a_repair_left_out_stays_out() -> lsm_tree::Result<()> {
     tree.major_compact(u64::MAX, 0)?;
     assert_eq!(tree.table_count(), 1);
     let crash = disk.power_loss(tree);
-    crash.remove_file(&at(DB).join("tables").join("0"))?;
+    // The earlier input is gone, whether its removal ran before the power
+    // went or not.
+    match crash.remove_file(&at(DB).join("tables").join("0")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == lsm_tree::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     assert_eq!(
         data_files(&crash, &at(DB).join("tables")),
         [1, 2],
@@ -529,8 +614,18 @@ fn a_flush_a_repair_left_out_stays_out() -> lsm_tree::Result<()> {
         )
         .on_path(later.to_str().unwrap_or_default()),
     );
-    // Its removal of the left-out input fails after the commit.
-    let _ = config(disk.fs()).repair();
+    // The repair commits its manifest, leaving the input out, and its removal
+    // of that input fails after the commit.
+    match config(disk.fs()).repair() {
+        Err(lsm_tree::Error::RepairedButUnopened { report, cause }) => {
+            assert!(
+                matches!(*cause, lsm_tree::Error::Io(_)),
+                "the failure is the removal after the commit: {cause:?}"
+            );
+            assert_eq!(report.excluded_files.len(), 1, "the input is left out");
+        }
+        other => panic!("self-check: the repair commits, then fails its cleanup: {other:?}"),
+    }
     disk.fs.injector().clear();
 
     let tree = config(disk.fs()).open()?;

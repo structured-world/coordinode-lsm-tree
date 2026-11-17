@@ -2800,13 +2800,14 @@ impl Writer {
     /// Makes the table describe itself as table `index` of synced flush `seq`
     /// (see [`Self::flush_mark`]).
     #[must_use]
-    pub(crate) fn use_flush_mark(mut self, seq: u64, index: u32) -> Self {
+    pub(crate) fn use_flush_mark(mut self, seq: u64, index: u32, returned_through: u64) -> Self {
         self.assert_not_started("use_flush_mark");
         self.flush_mark = Some(crate::table::meta::FlushMark {
             seq,
             index,
             run_len: None,
             floor: None,
+            returned_through,
         });
         self
     }
@@ -6196,6 +6197,9 @@ fn encode_meta_payload(
     if let Some(mark) = &p.flush_mark {
         meta_items.push(meta("flush#seq", &mark.seq.to_le_bytes()));
         meta_items.push(meta("flush#index", &mark.index.to_le_bytes()));
+        if mark.returned_through != 0 {
+            meta_items.push(meta("flush#returned", &mark.returned_through.to_le_bytes()));
+        }
         if let Some(run_len) = mark.run_len {
             meta_items.push(meta("flush#run_len", &run_len.to_le_bytes()));
             if let Some(floor) = mark.floor {
