@@ -585,19 +585,27 @@ fn sync_side_by_side<F: Fs + ?Sized>(fs: &F, files: &[&SyncTarget<'_>]) -> io::R
     }
     let next = core::sync::atomic::AtomicUsize::new(0);
     let failed: parking_lot::Mutex<Option<io::Error>> = parking_lot::Mutex::new(None);
-    std::thread::scope(|scope| {
-        for _ in 0..files.len().min(IN_FLIGHT) {
-            scope.spawn(|| {
-                while let Some(file) =
-                    files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
-                {
-                    if let Err(e) = file.sync_alone(fs) {
-                        failed.lock().get_or_insert(e);
-                        return;
-                    }
-                }
-            });
+    let work = || {
+        while let Some(file) = files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed)) {
+            if let Err(e) = file.sync_alone(fs) {
+                failed.lock().get_or_insert(e);
+                return;
+            }
         }
+    };
+    let work = &work;
+    std::thread::scope(|scope| {
+        // The calling thread is one of the syncers: a thread that cannot be
+        // started leaves the files to the ones that run, down to this one.
+        for _ in 1..files.len().min(IN_FLIGHT) {
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, work)
+                .is_err()
+            {
+                break;
+            }
+        }
+        work();
     });
     failed.into_inner().map_or(Ok(()), Err)
 }
