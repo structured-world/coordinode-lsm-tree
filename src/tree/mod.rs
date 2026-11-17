@@ -6612,8 +6612,10 @@ impl Tree {
                             .zip(0u32..)
                             .all(|(member, index)| member.mark.index == index)
                 });
-            // A flush that returned is taken in on what a named table is;
-            // one that did not must show every block.
+            // A flush that returned is taken in on what a named table is: a
+            // block of it damaged since fails the read that meets it on its
+            // checksum, as one of a named table does. One that did not return
+            // must show every block, and unread (without std) is set aside.
             let blocks_read = members.iter().all(|member| match member.blocks {
                 Blocks::Read => true,
                 Blocks::Damaged => false,
