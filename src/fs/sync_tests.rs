@@ -51,6 +51,69 @@ fn the_default_batch_syncs_every_target() -> crate::Result<()> {
     Ok(())
 }
 
+/// A batch of one sync on the std backend syncs that target alone, file or
+/// folder, and reports its failure. Guards against a lone sync paying for a
+/// ring or a thread.
+#[test]
+fn a_batch_of_one_on_the_std_backend_syncs_it_alone() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = super::StdFs;
+    let file = dir.path().join("1");
+    std::fs::write(&file, b"x")?;
+    let mode = SyncMode::default();
+    fs.sync_many(&[SyncTarget::FileData {
+        path: &file,
+        origin: WriteOrigin::FlushTable,
+        mode,
+    }])?;
+    fs.sync_many(&[SyncTarget::Folder {
+        path: dir.path(),
+        mode,
+    }])?;
+    assert!(
+        fs.sync_many(&[SyncTarget::FileData {
+            path: &dir.path().join("missing"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        }])
+        .is_err(),
+        "a file that cannot be opened"
+    );
+    Ok(())
+}
+
+/// The `io_uring` backend batches its syncs as the std backend does: every
+/// target is synced. Guards against its batch falling back to the trait's
+/// default, which syncs one target at a time.
+#[cfg(io_uring_fs)]
+#[test]
+fn the_io_uring_backend_syncs_a_batch() -> crate::Result<()> {
+    // A kernel without io_uring has no such backend to test.
+    let Ok(fs) = super::IoUringFs::new() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files = [dir.path().join("1"), dir.path().join("2")];
+    for file in &files {
+        std::fs::write(file, b"x")?;
+    }
+    let mode = SyncMode::default();
+    let mut targets: Vec<SyncTarget<'_>> = files
+        .iter()
+        .map(|path| SyncTarget::FileData {
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode,
+        })
+        .collect();
+    targets.push(SyncTarget::Folder {
+        path: dir.path(),
+        mode,
+    });
+    fs.sync_many(&targets)?;
+    Ok(())
+}
+
 /// A backend over [`MemFs`] that counts the batches handed to it.
 struct Batching {
     inner: MemFs,

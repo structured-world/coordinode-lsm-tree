@@ -1,8 +1,26 @@
 use super::{
-    active_scheduler, fdinfo_mount_id, listed_device, mount_source, split_device, stalls_under,
+    active_scheduler, block_device, fdinfo_mount_id, idles_between_queues, listed_device, mount_id,
+    mount_source, split_device, stalls_under,
 };
 use std::os::unix::fs::symlink;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// A folder on a file system with a device number of its own (`/proc`) is
+/// looked up through its mount, which a descriptor of it names, and that
+/// mount's source is no device node: no disk, and no BFQ. Guards against
+/// such a folder being taken for a disk, or the lookup failing on the way.
+#[test]
+fn a_folder_on_a_mount_from_no_device_names_no_disk() {
+    assert!(mount_id(Path::new("/proc")).is_some(), "a descriptor of it");
+    assert_eq!(block_device(Path::new("/proc")), None);
+    assert!(!idles_between_queues(Path::new("/proc")));
+}
+
+/// A folder that cannot be opened has no mount to name.
+#[test]
+fn a_missing_folder_has_no_mount() {
+    assert_eq!(mount_id(Path::new("/proc/no such folder")), None);
+}
 
 /// The active scheduler is the bracketed one, and a device with no
 /// scheduler of its own lists `none` alone: neither is mistaken for BFQ.
