@@ -313,33 +313,64 @@ fn prepared_dictionaries_hold_the_dictionarys_own_buffer() {
 }
 
 /// One decoder serves every dictionary: frames compressed under different
-/// dictionaries, read interleaved on one thread, each decode under their own,
-/// and a frame read under the wrong one after them is refused.
+/// dictionaries, each made of matches into its own dictionary's content, read
+/// interleaved on one thread, each decode under their own, and a frame read
+/// under the wrong one after them is refused. Guards against a decoder that
+/// takes the new dictionary's id but keeps the last one's history.
 #[test]
 fn one_thread_reads_frames_of_many_dictionaries_interleaved() {
-    let dicts: Vec<ZstdDictionary> = (0..12)
-        .map(|i| ZstdDictionary::new(format!("raw content dictionary number {i:02}").as_bytes()))
+    // Bytes no other dictionary holds and that repeat nowhere in themselves:
+    // a payload of them compresses only through its dictionary's history.
+    let content = |i: u64| -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ (i + 1);
+        (0..512)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    };
+    let contents: Vec<Vec<u8>> = (0..12).map(content).collect();
+    let dicts: Vec<ZstdDictionary> = contents.iter().map(|c| ZstdDictionary::new(c)).collect();
+    // Two stretches of the dictionary, out of order.
+    let payloads: Vec<Vec<u8>> = contents
+        .iter()
+        .map(|c| [&c[256..512], &c[0..256]].concat())
         .collect();
     let frames: Vec<Vec<u8>> = dicts
         .iter()
-        .map(|dict| ZstdProvider::compress_with_dict(PLAINTEXT, 3, dict, true).expect("compress"))
+        .zip(&payloads)
+        .map(|(dict, payload)| {
+            ZstdProvider::compress_with_dict(payload, 3, dict, true).expect("compress")
+        })
         .collect();
+    for (frame, payload) in frames.iter().zip(&payloads) {
+        let alone = ZstdProvider::compress(payload, 3, true).expect("compress alone");
+        assert!(
+            frame.len() * 4 < alone.len(),
+            "self-check: the frame reads its dictionary's history ({} vs {} bytes)",
+            frame.len(),
+            alone.len()
+        );
+    }
     for round in 0..3 {
-        for (at, (dict, frame)) in dicts.iter().zip(&frames).enumerate() {
-            let mut into = vec![0; PLAINTEXT.len()];
+        for (at, ((dict, frame), payload)) in dicts.iter().zip(&frames).zip(&payloads).enumerate() {
+            let mut into = vec![0; payload.len()];
             let written = ZstdProvider::decompress_with_dict_into(frame, dict, &mut into)
                 .expect("decompress into");
             assert_eq!(
                 &into[..written],
-                PLAINTEXT,
+                payload.as_slice(),
                 "round {round}, dictionary {at}"
             );
-            let back = ZstdProvider::decompress_with_dict(frame, dict, PLAINTEXT.len())
-                .expect("decompress");
-            assert_eq!(back, PLAINTEXT, "round {round}, dictionary {at}");
+            let back =
+                ZstdProvider::decompress_with_dict(frame, dict, payload.len()).expect("decompress");
+            assert_eq!(&back, payload, "round {round}, dictionary {at}");
         }
     }
-    assert!(ZstdProvider::decompress_with_dict(&frames[0], &dicts[1], PLAINTEXT.len()).is_err());
+    assert!(ZstdProvider::decompress_with_dict(&frames[0], &dicts[1], payloads[0].len()).is_err());
 }
 
 #[test]
