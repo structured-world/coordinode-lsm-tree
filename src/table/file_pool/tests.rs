@@ -635,6 +635,34 @@ fn a_refill_held_at_close_makes_nothing() -> crate::Result<()> {
     Ok(())
 }
 
+/// A later claim of the write that holds a refill does not start it: the
+/// batch still waits for the write's install. Guards against a flush of
+/// several tables running its refill beside its own syncs.
+#[cfg(feature = "std")]
+#[test]
+fn a_later_claim_of_the_write_leaves_its_refill_held() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(8)?;
+    // A first write makes its file and, once installed, a batch of eight.
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    // Later tables of that write leave five pooled.
+    for _ in 0..3 {
+        drop(pools.claim(&folder, &fs, None, false)?);
+    }
+    // The next write's first claim leaves half a batch and holds a refill;
+    // its second takes a pooled file, the pool not dry.
+    drop(pools.claim(&folder, &fs, None, true)?);
+    drop(pools.claim(&folder, &fs, None, false)?);
+    // That write's install never came: the held batch is never made.
+    drop(pools);
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1 + 8,
+        "the first file and the first batch alone"
+    );
+    Ok(())
+}
+
 /// A table records the files its folder is writing below it, and a file
 /// leaves that list once its claim is dropped.
 #[test]

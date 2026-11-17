@@ -346,9 +346,10 @@ impl TableFilePools {
         origin: WriteOrigin,
         refill_after_install: bool,
     ) -> crate::Result<ClaimedFile> {
-        // A refill held for a write that has not installed yet would leave a
-        // dry pool waiting on a batch nobody makes.
-        self.start_pending();
+        // A refill held for a write that has not installed stays held: a later
+        // claim of the same write would otherwise start it beside that write's
+        // syncs. Only a claim that would wait on it starts it (below).
+        //
         // Held across the refill and the open, so two claims never take one
         // file.
         let mut folders = self.pools.folders.lock();
