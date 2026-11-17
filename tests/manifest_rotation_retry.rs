@@ -45,19 +45,18 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
         let tree = open(fs)?;
         tree.insert("k0", "v0", 0);
         tree.flush_active_memtable(0)?;
+        tree.persist_flushes()?;
 
-        // The next flush writes its table into a file pooled with the first
-        // one's, so its first directory sync is the one that would install
-        // its snapshot and log: it fails. Where there is no pool (Windows) its
-        // file is made for it, and its install syncs the tables folder first.
-        injector.arm(
-            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(UNPOOLED_FOLDER_SYNCS)
-                .once(),
-        );
+        // A flush writes no manifest: the persist that names its table is the
+        // install. The flush made its table's name durable itself, pooled or
+        // not (on Windows its own sync of the tables folder), so the persist's
+        // first directory sync is the one that would install its snapshot and
+        // log: it fails.
         tree.insert("k1", "v1", 1);
+        tree.flush_active_memtable(1)?;
+        injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
         assert!(
-            tree.flush_active_memtable(1).is_err(),
+            tree.persist_flushes().is_err(),
             "the armed directory sync must fail this install"
         );
 
@@ -65,6 +64,7 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
         // on what the failed attempt left.
         tree.insert("k2", "v2", 2);
         tree.flush_active_memtable(2)?;
+        tree.persist_flushes()?;
 
         for k in ["k0", "k1", "k2"] {
             assert!(tree.get(k, 3)?.is_some(), "{k} must read after the retry");
@@ -257,6 +257,64 @@ fn a_compaction_whose_install_cannot_be_withdrawn_keeps_its_output() -> lsm_tree
     }
 
     // The snapshot stayed, naming the compaction's output.
+    let tree = open(FaultFs::new(StdFs))?;
+    for k in ["k0", "k1"] {
+        assert!(tree.get(k, 3)?.is_some(), "{k} must read after reopening");
+    }
+    Ok(())
+}
+
+/// Persisting deferred flushes after a compaction whose rotation could be
+/// neither made durable nor withdrawn installs above the snapshot that
+/// rotation left: that one names the compaction's output, which the persist
+/// supersedes and removes, so a reopen taking it would miss the file. Guards
+/// against the persist writing the current version under its own, lower id.
+#[test]
+fn a_persist_after_a_rotation_of_unknown_outcome_installs_above_it() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let snapshot = dir.path().join("v").to_string_lossy().into_owned();
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let open = |fs| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .manifest_log_rotate_bytes(0)
+        .table_file_refill_inline(true)
+        .flush_durability(lsm_tree::config::FlushDurability::Deferred)
+        .with_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(fs)?;
+        for (seqno, k) in (0u64..).zip(["k0", "k1"]) {
+            tree.insert(k, "v", seqno);
+            tree.flush_active_memtable(0)?;
+        }
+        // As above: the compaction's install can be neither made durable nor
+        // withdrawn.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(UNPOOLED_FOLDER_SYNCS)
+                .once(),
+        );
+        injector.arm(
+            FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
+                .on_path(snapshot)
+                .skip(1)
+                .once(),
+        );
+        assert!(matches!(
+            tree.major_compact(64 * 1024 * 1024, 0),
+            Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+        ));
+        injector.clear();
+        tree.persist_flushes()?;
+    }
+
     let tree = open(FaultFs::new(StdFs))?;
     for k in ["k0", "k1"] {
         assert!(tree.get(k, 3)?.is_some(), "{k} must read after reopening");

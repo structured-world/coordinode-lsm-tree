@@ -754,6 +754,7 @@ fn rebuild_manifest_over_current_bytes(dir: &std::path::Path) -> crate::Result<(
         Arc::new(crate::runtime_config::types::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Full,
+        0,
     )?;
     Ok(())
 }

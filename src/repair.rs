@@ -124,7 +124,10 @@ pub struct RepairReport {
     /// parsed, so neither the affected key range nor a seqno bound is
     /// derivable. Covers both an EXCLUDED unreadable table and a KEPT lossy
     /// salvaged copy whose source's metadata was unreadable (the copy's own
-    /// metadata only bounds what survived). Any entry here forces
+    /// metadata only bounds what survived), and a synced flush that a later
+    /// flush records as returned and of which no table was found, listed as
+    /// `synced-flush-{n}` in the tables folder, a name no table takes. Any
+    /// entry here forces
     /// [`wal_replay_scope`](Self::wal_replay_scope) to
     /// [`WalReplayScope::FullHistory`], since no bound can prove a retained
     /// record is NOT affected. Blob files are not listed: losing blob content
@@ -4132,6 +4135,11 @@ struct CommittedManifest {
     /// one the manifest named, and re-stamping a fresh checksum over the other
     /// would leave existing SST handles resolving to the wrong generation.
     blob_checksums: crate::HashMap<crate::vlog::BlobFileId, crate::Checksum>,
+    /// The synced flushes that returned and of which no table was found.
+    lost_flushes: Vec<u64>,
+    /// The flush watermark past every synced flush found, set-aside ones
+    /// included.
+    flush_watermark: u64,
 }
 
 #[cfg(feature = "std")]
@@ -4174,8 +4182,9 @@ enum ManifestRestriction {
 #[cfg(feature = "std")]
 fn sweep_superseded_by_committed_manifest(
     config: &Config,
+    tree_id: crate::tree::inner::TreeId,
 ) -> crate::Result<Option<CommittedManifest>> {
-    let recovery = match crate::version::recovery::recover(
+    let mut recovery = match crate::version::recovery::recover(
         &config.path,
         &*config.fs,
         crate::config::ManifestRecoveryMode::AbsoluteConsistency,
@@ -4224,6 +4233,20 @@ fn sweep_superseded_by_committed_manifest(
             actual: recovery.tree_type,
         });
     }
+
+    // The flushes that returned since the manifest last persisted are named
+    // by their tables only: an open installs them, so they are not superseded
+    // and the sweep below must not remove them. One that returned and does
+    // not read whole is left for the scan to salvage, beyond the sweep too.
+    let crate::tree::AdoptedFlushes {
+        for_the_scan,
+        lost: lost_flushes,
+    } = crate::Tree::adopt_synced_flushes(
+        &mut recovery,
+        config,
+        tree_id,
+        crate::tree::AdoptFor::Repair,
+    )?;
 
     // The full per-table records, not just the id set: the checksum drives
     // temp-swap resolution below, and the `global_seqno` ingest offset is
@@ -4287,7 +4310,7 @@ fn sweep_superseded_by_committed_manifest(
             let Ok(id) = dirent.file_name.parse::<TableId>() else {
                 continue;
             };
-            if referenced_tables.contains_key(&id) {
+            if referenced_tables.contains_key(&id) || for_the_scan.contains(&id) {
                 continue;
             }
             // Unreferenced bare-id files are removed even though one COULD be a
@@ -4307,7 +4330,11 @@ fn sweep_superseded_by_committed_manifest(
         }
     }
 
-    if config.kv_separation_opts.is_some() {
+    // Tables kept for the scan may refer to blob files no manifest names, and
+    // one that does not open names none it can be asked for: the blob files
+    // stay for the scan, whose own pass removes what nothing it adopts refers
+    // to.
+    if config.kv_separation_opts.is_some() && for_the_scan.is_empty() {
         let referenced_blobs: crate::HashSet<crate::vlog::BlobFileId> =
             recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
         let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
@@ -4341,6 +4368,8 @@ fn sweep_superseded_by_committed_manifest(
         restrictions: recovery.restrictions,
         blob_frontiers: recovery.blob_restrictions,
         blob_checksums: recovery.blob_file_ids.iter().copied().collect(),
+        lost_flushes,
+        flush_watermark: recovery.flush_watermark,
     }))
 }
 
@@ -4599,7 +4628,7 @@ fn repair_tree(
     // manifest-only ingest offset instead of being failed closed.
     #[cfg(feature = "std")]
     let manifest_referenced: Option<CommittedManifest> =
-        sweep_superseded_by_committed_manifest(config)?;
+        sweep_superseded_by_committed_manifest(config, first_tree_id)?;
     #[cfg(not(feature = "std"))]
     let manifest_referenced: Option<CommittedManifest> = None;
 
@@ -4762,6 +4791,10 @@ struct TableScan {
     /// Every table id the scan actually SAW on disk, joined against the
     /// committed manifest to report ids whose file is gone entirely.
     scanned_table_ids: crate::HashSet<TableId>,
+    /// The highest synced-flush number of a table that opened, kept or not:
+    /// the rebuilt manifest decides every flush the scan found, so a table
+    /// it leaves out is not installed by an open from its own description.
+    highest_flush: u64,
 }
 
 /// The tables that opened in one folder: each id with the ids below it its
@@ -4778,6 +4811,14 @@ fn note_opened(opened: &mut OpenedTables, folder: &std::path::Path, table: &Tabl
         .entry(folder.to_path_buf())
         .or_default()
         .push((table.id(), table.metadata.writing_below.clone()));
+}
+
+/// Raises `highest` to the synced-flush number `table` carries.
+#[cfg(feature = "std")]
+fn note_flush(highest: &mut u64, table: &Table) {
+    if let Some(mark) = &table.metadata.flush {
+        *highest = (*highest).max(mark.seq);
+    }
 }
 
 /// Whether one of `tables` (ids with what their folder was still writing
@@ -4855,6 +4896,10 @@ fn scan_table_folders(
     // written there either way, each telling which files below it were
     // still being written when it was finished.
     let mut opened_tables: OpenedTables = crate::HashMap::default();
+    // From the watermark taking in the synced flushes raised it to, past every
+    // flush found, a set-aside one included: the scan does not open a
+    // set-aside table, and below that watermark it no longer names a flush.
+    let mut highest_flush: u64 = manifest_referenced.map_or(0, |manifest| manifest.flush_watermark);
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
@@ -5141,7 +5186,10 @@ fn scan_table_folders(
                     // It opened as a table, so one was written into this
                     // folder, whatever the walk below finds and wherever the
                     // kept copy lives.
-                    .inspect(|table| note_opened(&mut opened_tables, &table_base_folder, table))
+                    .inspect(|table| {
+                        note_opened(&mut opened_tables, &table_base_folder, table);
+                        note_flush(&mut highest_flush, table);
+                    })
                     // The digest was recomputed from THESE bytes, so recovery
                     // can only prove the file is self-consistent — and it stops
                     // at the trailer, meta and index, leaving every lazily-read
@@ -5258,6 +5306,7 @@ fn scan_table_folders(
             // distinguish from "the key was simply never rewritten".
             if let Ok(t) = &recovered {
                 note_opened(&mut opened_tables, &table_base_folder, t);
+                note_flush(&mut highest_flush, t);
                 let range = t.metadata.key_range.clone();
                 // The bound is UNKNOWN when the table's sequence base lived in
                 // the LOST manifest: that open passes offset 0, so
@@ -5917,6 +5966,7 @@ fn scan_table_folders(
         swap_after_commit,
         live_sidecars,
         scanned_table_ids,
+        highest_flush,
     })
 }
 
@@ -5951,6 +6001,7 @@ fn rebuild_from_scan(
         mut swap_after_commit,
         live_sidecars,
         scanned_table_ids,
+        highest_flush,
     } = scan;
 
     // Collect the best copy per id, carrying each candidate's completeness so
@@ -6897,6 +6948,7 @@ fn rebuild_from_scan(
             salvaged,
             first_tree_id,
             outstanding,
+            highest_flush,
             #[cfg(zstd_any)]
             damaged_dictionaries,
         },
@@ -6939,6 +6991,9 @@ struct RepairPublication<'a> {
     /// The report of an earlier repair over the installed snapshot that never
     /// reached the caller: its losses are owed as well.
     outstanding: Option<RepairReport>,
+    /// The highest synced-flush number of a table the scan opened (see
+    /// [`TableScan::highest_flush`]).
+    highest_flush: u64,
     /// Dictionaries found damaged at the start; those still damaged when the
     /// report is assembled are set aside after the commit.
     #[cfg(zstd_any)]
@@ -6982,6 +7037,7 @@ fn publish_repaired_manifest(
         salvaged,
         first_tree_id,
         outstanding,
+        highest_flush,
         #[cfg(zstd_any)]
         damaged_dictionaries,
     } = publication;
@@ -7201,6 +7257,12 @@ fn publish_repaired_manifest(
     // the manifest records no key range for it, so the loss is unscopable.
     if let Some(referenced) = manifest_referenced {
         let primary_tables = config.path.join("tables");
+        // A synced flush that returned and of which no table was found: no
+        // file, key range or sequence number is left to scope it by. It is
+        // reported under a name no table takes.
+        for seq in &referenced.lost_flushes {
+            unknowable_losses.push(primary_tables.join(format!("synced-flush-{seq}")));
+        }
         let mut missing: Vec<TableId> = referenced
             .tables
             .into_keys()
@@ -7306,6 +7368,9 @@ fn publish_repaired_manifest(
         Arc::new(config.initial_runtime_config.clone()),
         config.encryption.clone(),
         config.sync_mode,
+        // Every flush a table the scan opened carries, kept or left out: the
+        // repair decides every table it found.
+        highest_flush,
     );
     // The guard stays ARMED until the commit is decided: every fallible
     // `persist_version` step before it installs the snapshot (manifest

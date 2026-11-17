@@ -230,6 +230,7 @@ fn a_recovered_version_registers_what_its_files_reference() -> crate::Result<()>
             tree.runtime_config.load_full(),
             tree.config.encryption.clone(),
             tree.config.sync_mode,
+            0,
         )?;
     }
 
@@ -252,6 +253,45 @@ fn a_recovered_version_registers_what_its_files_reference() -> crate::Result<()>
 
 /// A collected dictionary leaves the LIVE registry, not just the disk.
 ///
+/// A dictionary a running write's snapshot names stays referenced when the
+/// device's I/O strategy is swapped in and a policy change then moves away
+/// from the dictionary: the write holds the snapshot from before the strategy
+/// swap, not the one the policy change replaced. Guards against a collection
+/// deleting the dictionary under that write.
+#[test]
+fn a_write_snapshot_replaced_by_a_strategy_swap_keeps_its_dictionary() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let dict = ZstdDictionary::new(&training_corpus());
+    let dict_id = dict.id();
+    let tree = config(dir.path())
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::zstd_dict(
+            3, dict_id,
+        )?))
+        .zstd_dictionary(Some(Arc::new(dict)))
+        .open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        panic!("a standard tree");
+    };
+
+    // A write takes its snapshot...
+    let held = tree.0.runtime_config.load_full();
+    // ...the device's strategy is swapped in under it...
+    let flipped =
+        crate::io_policy::IoStrategy::for_scheduler(held.io == crate::io_policy::IoStrategy::NONE);
+    tree.0.runtime_config.set_io_strategy(flipped);
+    // ...and the policy moves away from the dictionary.
+    tree.update_runtime_config(|c| {
+        c.data_block_compression_policy = CompressionPolicy::all(CompressionType::None);
+    })?;
+
+    assert!(
+        tree.write_referenced_dict_ids().contains(&dict_id),
+        "the dictionary the write's snapshot names stays referenced",
+    );
+    drop(held);
+    Ok(())
+}
+
 /// The registry holds each dictionary's raw bytes and prepared decoder state, so
 /// a tree that rotates dictionaries would otherwise carry every generation it
 /// ever held for its whole life, and keep reporting ids it no longer owns.

@@ -49,6 +49,7 @@ pub(crate) struct OwnershipLedger {
 /// versions of one key, or of keys the compaction kept no row of, folded
 /// together. A pass that decides later whether the run is its own holds this
 /// in place of the versions and the blocks they lie in.
+#[cfg(feature = "std")]
 pub(crate) struct DroppedRun {
     /// The key the run is placed by: its own, or the first of those folded.
     key: UserKey,
@@ -65,6 +66,7 @@ pub(crate) struct DroppedRun {
     folded: bool,
 }
 
+#[cfg(feature = "std")]
 impl DroppedRun {
     /// A run of the versions of `key`.
     pub(crate) fn of(key: UserKey) -> Self {
@@ -131,6 +133,7 @@ impl OwnershipLedger {
     /// # Errors
     ///
     /// Returns the error of a held cell row that does not decode.
+    #[cfg(feature = "std")]
     pub(crate) fn dropped_run(&mut self, run: DroppedRun) -> crate::Result<()> {
         run.frag.merge_into(&mut self.frag);
         if !run.cell_rows {
