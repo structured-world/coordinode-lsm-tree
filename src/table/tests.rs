@@ -11049,6 +11049,65 @@ fn a_restricted_view_keeps_its_prefix_filter() -> crate::Result<()> {
     Ok(())
 }
 
+/// A partitioned filter is checked partition by partition: one that did not
+/// reach the disk fails the check, its data blocks reading whole.
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test fixture: a byte of a filter partition"
+)]
+fn a_damaged_filter_partition_fails_the_filter_check() -> crate::Result<()> {
+    use super::regions::ParsedRegions;
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_partitioned_filter()
+        .use_filter_partition_size(64);
+    for i in 0..2_000u32 {
+        writer.write(InternalValue::from_components(
+            i.to_be_bytes(),
+            b"v",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("the fixture writes entries");
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    table.verify_filter_blocks()?;
+
+    let last_partition = {
+        let mut f = std::fs::File::open(&file)?;
+        let trailer = crate::sfa::Reader::from_reader(&mut f)?;
+        let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
+        let idx = table.load_filter_index(
+            &*crate::fs::StdFs.open(&file, &crate::fs::FsOpenOptions::new().read(true))?,
+            regions
+                .filter_tli
+                .expect("self-check: the filter is partitioned"),
+        )?;
+        let handles: Vec<_> = idx
+            .iter(table.comparator.clone())
+            .map(|part| part.materialize(idx.as_slice()).into_inner())
+            .collect();
+        assert!(handles.len() > 1, "self-check: several partitions");
+        *handles.last().expect("a partition").offset()
+    };
+    let mut bytes = std::fs::read(&file)?;
+    let at = usize::try_from(last_partition).expect("offset fits usize")
+        + crate::table::block::Header::MIN_LEN
+        + 3;
+    bytes[at] ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    table.verify_data_blocks()?;
+    assert!(
+        table.verify_filter_blocks().is_err(),
+        "the damaged partition is found"
+    );
+    Ok(())
+}
+
 /// A table whose filter block did not reach the disk reads its data blocks
 /// whole, and fails the filter check an open runs on a table no manifest
 /// names. Guards against an open adopting a table whose point reads then fail

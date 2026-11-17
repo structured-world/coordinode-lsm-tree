@@ -149,6 +149,11 @@ fn a_lane_drops_what_is_queued_behind_a_failed_write() {
         ..Sink::default()
     };
     let mut out = DeferredWriter::with_capacity(8, sink, true);
+    assert_eq!(
+        out.queued_bytes(),
+        0,
+        "a writer without a lane queues nothing"
+    );
     // Workers that never run: the jobs wait in the lane until the caller
     // drains it.
     out.use_spawner_now(Arc::new(Never::default()));

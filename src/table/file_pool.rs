@@ -344,6 +344,10 @@ impl TableFilePools {
         above: Option<TableId>,
         may_refill: bool,
         origin: WriteOrigin,
+        #[cfg_attr(
+            not(feature = "std"),
+            expect(unused_variables, reason = "without std no refill is held")
+        )]
         refill_after_install: bool,
     ) -> crate::Result<ClaimedFile> {
         // A refill held for a write that has not installed stays held: a later
@@ -407,12 +411,10 @@ impl TableFilePools {
             Ok(claimed) => Ok(claimed),
             Err(made) => Pools::create(folder, fs, made, origin),
         };
+        // A refill held for the install was taken above; without std none runs
+        // off the claiming thread, held or not.
         if let Some(refill) = refill {
-            if refill_after_install {
-                self.defer(refill);
-            } else {
-                self.start(refill);
-            }
+            self.start(refill);
         }
         claimed
     }
@@ -421,12 +423,6 @@ impl TableFilePools {
     #[cfg(feature = "std")]
     fn defer(&self, refill: Refill) {
         self.pending.lock().push(refill);
-    }
-
-    /// No refill runs off the claiming thread without `std`.
-    #[cfg(not(feature = "std"))]
-    fn defer(&self, refill: Refill) {
-        self.start(refill);
     }
 
     /// Starts the refills claims reserved and held. The install of a write's

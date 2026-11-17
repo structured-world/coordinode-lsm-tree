@@ -633,6 +633,33 @@ fn a_repair_reports_a_returned_flush_missing_a_table() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Files in a tables folder that do not open, under a table's name or a
+/// set-aside one, carry no flush mark: the open passes over them and reads
+/// the flushes that are whole. Guards against an open refused by a file it
+/// cannot tie to any flush.
+#[test]
+fn files_that_do_not_open_are_passed_over() -> lsm_tree::Result<()> {
+    use std::io::Write;
+    let disk = Disk::new();
+    let tree = config(disk.fs()).open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    let tables = at(DB).join("tables");
+    for name in ["900", "901.torn-flush"] {
+        let mut file = crash.open(
+            &tables.join(name),
+            &lsm_tree::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        file.write_all(&[0x5A; 4_096])?;
+        file.sync_all()?;
+    }
+
+    let tree = config(Arc::new(crash)).open()?;
+    assert_eq!(value(&tree, "a")?.as_deref(), Some("1"));
+    Ok(())
+}
+
 /// A table set aside from a cut-short flush still names the flush before it
 /// as returned: an open retried after one that set it aside and failed reads
 /// the same evidence. Guards against a retried open or repair that no longer
