@@ -91,6 +91,27 @@ fn bfq_under_a_partition_or_a_mapped_device_is_found() -> std::io::Result<()> {
     Ok(())
 }
 
+/// A partition of a stacked device (`md0p1`) answers with the disks under
+/// that device: the partition lists none of its own, its device does. Guards
+/// against a tree on a partitioned RAID over BFQ disks answering no.
+#[test]
+fn bfq_under_a_partition_of_a_stacked_device_is_found() -> std::io::Result<()> {
+    let root = sysfs("none mq-deadline kyber [bfq]\n")?;
+    let array = root.path().join("devices/md0");
+    std::fs::create_dir_all(array.join("queue"))?;
+    std::fs::write(array.join("queue/scheduler"), "none\n")?;
+    std::fs::create_dir_all(array.join("slaves"))?;
+    symlink(
+        root.path().join("devices/sdb/sdb1"),
+        array.join("slaves/sdb1"),
+    )?;
+    std::fs::create_dir_all(array.join("md0p1"))?;
+    std::fs::write(array.join("md0p1/partition"), "1\n")?;
+    symlink(array.join("md0p1"), root.path().join("dev/259:1"))?;
+    assert!(stalls_under(&root.path().join("dev/259:1"), 0));
+    Ok(())
+}
+
 /// A device sysfs does not list answers no: the behaviour of a backend that
 /// says nothing about its scheduler.
 #[test]

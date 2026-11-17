@@ -127,7 +127,9 @@ fn stalls_under(device: &Path, depth: u8) -> bool {
     {
         return true;
     }
-    let Ok(below) = fs::read_dir(device.join("slaves")) else {
+    // A stacked device lists the disks under it; a partition of one lists
+    // none, its device does.
+    let Ok(below) = fs::read_dir(disk.join("slaves")) else {
         return false;
     };
     below
