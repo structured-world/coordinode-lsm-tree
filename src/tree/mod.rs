@@ -6428,7 +6428,7 @@ impl Tree {
         config: &Config,
         tree_id: TreeId,
         purpose: AdoptFor,
-    ) -> crate::Result<crate::HashSet<crate::TableId>> {
+    ) -> crate::Result<AdoptedFlushes> {
         use crate::version::recovery::RecoveredTable;
         use crate::{TableId, vlog::BlobFileId};
 
@@ -6542,8 +6542,12 @@ impl Tree {
                 }
                 // A power loss can keep the table's entry and trailer and lose
                 // blocks before them (a file size that runs past blocks never
-                // written back reads them as zeros).
-                let blocks_read = match table.verify_data_blocks() {
+                // written back reads them as zeros): the data blocks, and the
+                // filter blocks a point read loads only when it needs them.
+                let blocks_read = match table
+                    .verify_data_blocks()
+                    .and_then(|()| table.verify_filter_blocks())
+                {
                     Ok(()) => true,
                     Err(e) if environmental(&e) => return Err(e),
                     Err(e) => {
@@ -6582,15 +6586,20 @@ impl Tree {
         let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
         // Flushes that returned and do not read whole, and their tables. A
         // flush that returned with no table found at all is one of them.
-        let mut broken: Vec<u64> = returned
+        let lost: Vec<u64> = returned
             .iter()
             .copied()
             .filter(|seq| !flushes.contains_key(seq))
             .collect();
-        for seq in &broken {
+        for seq in &lost {
             log::error!("synced flush #{seq} returned and none of its tables is found");
         }
+        let mut broken = lost.clone();
         let mut kept: crate::HashSet<TableId> = crate::HashSet::default();
+        // The tables of flushes that never returned, set aside only once no
+        // flush failed the open: their tables are the evidence that names the
+        // flushes before them, which a retry of the open needs as this one did.
+        let mut torn: Vec<Member> = Vec::new();
         for (seq, mut members) in flushes {
             let did_return = returned.contains(&seq);
             // Whole: the table the run finishes with names its length, and
@@ -6634,9 +6643,7 @@ impl Tree {
                          ({} tables found); setting its tables aside",
                         members.len(),
                     );
-                    for member in &members {
-                        Self::set_aside_torn(&*member.fs, &member.path, member.table.id)?;
-                    }
+                    torn.extend(members);
                 }
                 continue;
             };
@@ -6710,11 +6717,17 @@ impl Tree {
                 AdoptFor::Repair => kept.extend(unreadable),
             }
         }
+        for member in torn {
+            Self::set_aside_torn(&*member.fs, &member.path, member.table.id)?;
+        }
         // Past the flushes left out too: the open records the watermark before
         // the tree flushes again, so a table of one that the sweep fails to
         // remove can never join a later flush under the same number.
         recovery.flush_watermark = highest_seen;
-        Ok(kept)
+        Ok(AdoptedFlushes {
+            for_the_scan: kept,
+            lost,
+        })
     }
 
     /// The blob files a flush's tables refer to that `recovery` does not hold,
@@ -8370,6 +8383,19 @@ mod insert_rotation_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod overlapping_runs_tests;
+
+/// What a repair learns from taking in the synced flushes no manifest names.
+#[cfg_attr(
+    not(feature = "std"),
+    expect(dead_code, reason = "only a repair reads it, and repair is std-only")
+)]
+pub(crate) struct AdoptedFlushes {
+    /// The tables left for the repair's scan.
+    pub(crate) for_the_scan: crate::HashSet<crate::TableId>,
+    /// The flushes that returned and of which no table was found: lost, with
+    /// no key range or sequence number left to scope the loss by.
+    pub(crate) lost: Vec<u64>,
+}
 
 /// Who takes synced flushes in from their tables' own description (see
 /// [`Tree::adopt_synced_flushes`]), which decides what becomes of a flush

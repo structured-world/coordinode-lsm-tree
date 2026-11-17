@@ -226,17 +226,21 @@ matching entry (and add one for a new subsystem).
   meanwhile, except a clear's, which decides it, since the clear drops what it
   writes. On open, the tables of the level-0 folder above the watermark are
   read and grouped by flush; a flush is installed when every place of its run
-  is present and every data block of it reads, and every frame of every blob
-  file its tables refer to checks, with or without `std`. Each flush's tables
-  also name the last flush that had returned when it began, so the flushes
-  above the watermark that returned are exactly the ones some table names. One
-  of those that does not read whole, or of which no table is found, was lost
-  to the medium after it returned: the open fails with `Unrecoverable`, and a
-  repair keeps its tables, and every blob file, for its scan. Any other flush
-  that does not read whole failed, or is the latest, which nothing names yet:
-  it is taken for one a power loss cut short, as a log's torn tail is, and its
-  tables are set aside as `{id}.torn-flush`. So damage to the latest flush
-  before a later one names it is not told from a cut-short flush. The open then records a
+  is present and every data and filter block of it reads, and every frame of
+  every blob file its tables refer to that the manifest does not already name
+  checks, with or without `std`. Each flush's tables also name the last flush
+  that had returned when it began, so the flushes above the watermark known to
+  have returned are the ones some table names. One of those that does not read
+  whole, or of which no table is found, was lost to the medium after it
+  returned: the open fails with `Unrecoverable`, before it renames any file,
+  and a repair keeps its tables, and every blob file, for its scan, and reports
+  a flush with no table found as an unscopable loss. Any other flush that does
+  not read whole failed, or is the latest, which returned or not, nothing names
+  yet: it is taken for one a power loss cut short, as a log's torn tail is, and
+  the tables of it that open are set aside as `{id}.torn-flush`. A table that
+  does not open carries no flush mark to tie it to a flush, and goes as any
+  file no manifest names does. So damage to the latest flush before a later
+  one names it is not told from a cut-short flush. The open then records a
   watermark past every flush it found, installed or not, before the tree
   flushes again, so a table left behind never joins a later flush. A tree
   that closes, and `persist_flushes`, name the self-described tables in the

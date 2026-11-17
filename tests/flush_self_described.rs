@@ -537,6 +537,85 @@ fn a_returned_flush_with_no_table_left_fails_the_open() -> lsm_tree::Result<()> 
     Ok(())
 }
 
+/// A repair of a store that lost a returned flush whole reports the loss as
+/// unscopable, so a caller replays its whole journal. Guards against a report
+/// that tells the caller only the tail needs replaying while the lost flush's
+/// writes lie below it.
+#[test]
+fn a_repair_reports_a_returned_flush_with_no_table_left() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = config(disk.fs()).open()?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let returned = added_by(&disk.crash, &tables, || {
+        tree.insert("a", "new", 1);
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    tree.insert("b", "2", 2);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    crash.remove_file(&tables.join(returned[0].to_string()))?;
+
+    let report = config(Arc::new(crash)).repair()?;
+    assert!(
+        !report.unknowable_losses.is_empty(),
+        "the lost flush is reported: {report:?}"
+    );
+    assert_eq!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::FullHistory
+    );
+    Ok(())
+}
+
+/// An open that fails on a damaged returned flush leaves the store as it
+/// found it: a retry fails the same way. Guards against the first open
+/// setting aside the cut-short flush whose tables named the damaged one, so a
+/// retry no longer knows it returned and opens without it.
+#[test]
+fn a_failed_open_on_a_damaged_returned_flush_fails_again() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let open = |fs| config(fs).table_target_size(1_024).open();
+    let tree = open(disk.fs())?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let damaged = added_by(&disk.crash, &tables, || {
+        tree.insert("a", "x".repeat(512), 1);
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert_eq!(damaged.len(), 1, "self-check: the flush wrote one table");
+    // The latest flush, of several tables naming the damaged one, cut short.
+    let filler = "y".repeat(256);
+    let torn = added_by(&disk.crash, &tables, || {
+        for i in 0..64u64 {
+            tree.insert(format!("k{i:03}"), &filler, 10 + i);
+        }
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert!(
+        torn.len() > 1,
+        "self-check: the latest flush wrote several tables"
+    );
+    let crash = disk.power_loss(tree);
+    damage(&crash, &tables.join(damaged[0].to_string()), 40)?;
+    crash.remove_file(&tables.join(torn[0].to_string()))?;
+
+    for attempt in ["first", "retried"] {
+        assert!(
+            matches!(
+                open(Arc::new(crash.clone())),
+                Err(lsm_tree::Error::Unrecoverable)
+            ),
+            "the {attempt} open reports the damaged returned flush"
+        );
+    }
+    Ok(())
+}
+
 /// A flush that failed, below one that returned, is a flush that never
 /// returned: the table of it a power loss kept is set aside, and the open
 /// reads the retry that did return. Guards against an open that takes every

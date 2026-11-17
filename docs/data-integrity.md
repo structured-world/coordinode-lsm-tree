@@ -228,8 +228,10 @@ them differently:
   does not read whole was damaged after it returned and fails the open with
   `Unrecoverable`, for a repair to salvage. Any other flush that is missing a
   table, or a block or blob frame that does not check, failed or is the latest
-  (which nothing names yet): it is taken for one a power loss cut short, set
-  aside as `{id}.torn-flush`, and left out in every mode. Damage to the latest
+  (which nothing names yet): it is taken for one a power loss cut short, the
+  tables of it that open are set aside as `{id}.torn-flush`, and it is left out
+  in every mode. A table that does not open at all carries no mark tying it to
+  a flush, and is removed as any file no manifest names is. Damage to the latest
   flush before a later flush or a persist names it is therefore indistinguishable
   from a cut-short flush and drops its writes, as a torn log tail does. A
   caller that drops its own journal once a flush returns is covered against a

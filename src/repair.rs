@@ -124,7 +124,10 @@ pub struct RepairReport {
     /// parsed, so neither the affected key range nor a seqno bound is
     /// derivable. Covers both an EXCLUDED unreadable table and a KEPT lossy
     /// salvaged copy whose source's metadata was unreadable (the copy's own
-    /// metadata only bounds what survived). Any entry here forces
+    /// metadata only bounds what survived), and a synced flush that a later
+    /// flush records as returned and of which no table was found, listed as
+    /// `synced-flush-{n}` in the tables folder, a name no table takes. Any
+    /// entry here forces
     /// [`wal_replay_scope`](Self::wal_replay_scope) to
     /// [`WalReplayScope::FullHistory`], since no bound can prove a retained
     /// record is NOT affected. Blob files are not listed: losing blob content
@@ -4132,6 +4135,8 @@ struct CommittedManifest {
     /// one the manifest named, and re-stamping a fresh checksum over the other
     /// would leave existing SST handles resolving to the wrong generation.
     blob_checksums: crate::HashMap<crate::vlog::BlobFileId, crate::Checksum>,
+    /// The synced flushes that returned and of which no table was found.
+    lost_flushes: Vec<u64>,
 }
 
 #[cfg(feature = "std")]
@@ -4230,7 +4235,10 @@ fn sweep_superseded_by_committed_manifest(
     // by their tables only: an open installs them, so they are not superseded
     // and the sweep below must not remove them. One that returned and does
     // not read whole is left for the scan to salvage, beyond the sweep too.
-    let for_the_scan = crate::Tree::adopt_synced_flushes(
+    let crate::tree::AdoptedFlushes {
+        for_the_scan,
+        lost: lost_flushes,
+    } = crate::Tree::adopt_synced_flushes(
         &mut recovery,
         config,
         tree_id,
@@ -4357,6 +4365,7 @@ fn sweep_superseded_by_committed_manifest(
         restrictions: recovery.restrictions,
         blob_frontiers: recovery.blob_restrictions,
         blob_checksums: recovery.blob_file_ids.iter().copied().collect(),
+        lost_flushes,
     }))
 }
 
@@ -7241,6 +7250,12 @@ fn publish_repaired_manifest(
     // the manifest records no key range for it, so the loss is unscopable.
     if let Some(referenced) = manifest_referenced {
         let primary_tables = config.path.join("tables");
+        // A synced flush that returned and of which no table was found: no
+        // file, key range or sequence number is left to scope it by. It is
+        // reported under a name no table takes.
+        for seq in &referenced.lost_flushes {
+            unknowable_losses.push(primary_tables.join(format!("synced-flush-{seq}")));
+        }
         let mut missing: Vec<TableId> = referenced
             .tables
             .into_keys()

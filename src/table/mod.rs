@@ -5147,7 +5147,6 @@ impl Table {
 
     /// The encryption / ECC context the uncompressed side sections decode
     /// under. Every reconcile section read builds the same one.
-    #[cfg(feature = "std")]
     fn section_transform(&self) -> crate::table::block::BlockTransform<'_> {
         let t = match self.encryption.as_deref() {
             Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
@@ -6083,42 +6082,10 @@ impl Table {
         let filter_transform = self.section_transform();
         // Partitioned mode: the partition index maps a key to its filter
         // block. Loaded from disk for the same reason as the filter itself.
-        let filter_index = if let Some(idx_handle) = regions.filter_tli {
-            let block = Block::from_file(
-                file,
-                idx_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: self.metadata.id,
-                    block_type: BlockType::Index,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    let t = crate::table::block::BlockTransform::from_parts(
-                        self.metadata.index_block_compression,
-                        self.encryption.as_deref(),
-                        #[cfg(zstd_any)]
-                        None,
-                    )?;
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::Index {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
-            }
-            let idx = IndexBlock::new(block);
-            idx.try_iter(self.comparator.clone())?;
-            Some(idx)
-        } else {
-            None
-        };
+        let filter_index = regions
+            .filter_tli
+            .map(|idx_handle| self.load_filter_index(file, idx_handle))
+            .transpose()?;
         let full_filter = if filter_index.is_none() {
             regions
                 .filter
@@ -6264,9 +6231,74 @@ impl Table {
         }
     }
 
+    /// Reads the filter partition index at `handle` from the already-open
+    /// file, rejecting a block that does not carry the index role or whose
+    /// entries do not decode.
+    fn load_filter_index(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        handle: BlockHandle,
+    ) -> crate::Result<IndexBlock> {
+        let transform = crate::table::block::BlockTransform::from_parts(
+            self.metadata.index_block_compression,
+            self.encryption.as_deref(),
+            #[cfg(zstd_any)]
+            None,
+        )?;
+        let transform = if let Some(ecc) = self.metadata.ecc_params {
+            transform.with_ecc(ecc)
+        } else {
+            transform
+        };
+        let block = Block::from_file(
+            file,
+            handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.metadata.id,
+                block_type: BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &transform,
+        )?;
+        if block.header.block_type != BlockType::Index {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        let idx = IndexBlock::new(block);
+        idx.try_iter(self.comparator.clone())?;
+        Ok(idx)
+    }
+
+    /// Reads every filter block of this table, the full filter or the
+    /// partition index and each partition, stopping at the first that does
+    /// not read: an open checks a table no manifest names this way beside its
+    /// data blocks, as a point read loads them only when it needs them.
+    ///
+    /// # Errors
+    ///
+    /// The first block's failure, environmental or damage.
+    pub(crate) fn verify_filter_blocks(&self) -> crate::Result<()> {
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        let transform = self.section_transform();
+        if let Some(idx_handle) = regions.filter_tli {
+            let idx = self.load_filter_index(&*file, idx_handle)?;
+            for part in idx.iter(self.comparator.clone()) {
+                let handle = part.materialize(idx.as_slice()).into_inner();
+                Self::load_filter_block(&*file, &transform, self.metadata.id, handle)?;
+            }
+        } else if let Some(handle) = regions.filter {
+            Self::load_filter_block(&*file, &transform, self.metadata.id, handle)?;
+        }
+        Ok(())
+    }
+
     /// Reads one filter block (full or partition) from the already-open file,
     /// rejecting a block that does not carry the filter role.
-    #[cfg(feature = "std")]
     fn load_filter_block(
         file: &dyn crate::fs::FsFile,
         transform: &crate::table::block::BlockTransform<'_>,
