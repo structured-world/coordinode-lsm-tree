@@ -521,6 +521,27 @@ fn a_caught_panic_on_the_callers_thread_fails_every_later_call() {
     assert_eq!(writes.load(Ordering::SeqCst), 2, "no write after the panic");
 }
 
+/// A writer whose inner writer panicked on the caller's thread, then given
+/// workers, still fails every later call: its lane inherits the failure.
+/// Guards against the lane writing to the writer that panicked and a sync
+/// then answering as if the file were whole.
+#[test]
+fn a_caught_panic_before_workers_are_taken_on_fails_the_lane() {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut out = DeferredWriter::with_capacity(8, CountsThenPanics(Arc::clone(&writes)), true);
+    let panicked = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+        for _ in 0..3 {
+            out.write_all(&[7; 6])?;
+        }
+        io::Result::Ok(())
+    }));
+    assert!(panicked.is_err());
+    out.use_spawner_now(Arc::new(Prompt));
+    let _ = out.write_all(&[1; 16]);
+    assert!(out.with_inner(|_| ()).is_err(), "the file is short");
+    assert_eq!(writes.load(Ordering::SeqCst), 2, "no write after the panic");
+}
+
 /// Workers taken on after writes on the caller's thread keep the file's
 /// order: what was buffered goes to the lane behind what was written.
 #[test]

@@ -15,6 +15,17 @@ struct Scheduled {
     volume: u64,
     idles: AtomicBool,
     asked: AtomicUsize,
+    /// When set, the answer read by the ask with this number (counted from
+    /// 1) is held until the gate opens.
+    hold: Option<(usize, std::sync::Arc<Gate>)>,
+}
+
+/// A gate one ask waits at: `entered` once it holds its answer, `open` to
+/// let it return it.
+#[derive(Default)]
+struct Gate {
+    entered: AtomicBool,
+    open: AtomicBool,
 }
 
 impl Scheduled {
@@ -24,14 +35,24 @@ impl Scheduled {
             volume,
             idles: AtomicBool::new(idles),
             asked: AtomicUsize::new(0),
+            hold: None,
         }
     }
 }
 
 impl Fs for Scheduled {
     fn idles_between_io_queues(&self, _path: &Path) -> bool {
-        self.asked.fetch_add(1, Ordering::Relaxed);
-        self.idles.load(Ordering::Relaxed)
+        let ask = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        let idles = self.idles.load(Ordering::SeqCst);
+        if let Some((held, gate)) = &self.hold
+            && *held == ask
+        {
+            gate.entered.store(true, Ordering::SeqCst);
+            while !gate.open.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+        idles
     }
     fn volume_id(&self, _path: &Path) -> Option<u64> {
         Some(self.volume)
@@ -160,6 +181,41 @@ fn a_location_without_open_trees_is_let_go() {
         2,
         "the location was asked anew, its record gone with its last tree"
     );
+}
+
+/// Of two refreshes, the trees run what the one that asked last found: a
+/// refresh that read the scheduler before another does not publish its older
+/// answer over the newer one. Guards against trees left on a stale strategy
+/// until the next refresh.
+#[test]
+fn a_refresh_that_asked_first_does_not_overwrite_a_later_one() {
+    let gate = std::sync::Arc::new(Gate::default());
+    let mut fs = Scheduled::on_volume(0xa5, true);
+    // The open asks once; the first refresh's ask is the second.
+    fs.hold = Some((2, std::sync::Arc::clone(&gate)));
+    let fs = std::sync::Arc::new(fs);
+    let tree = handle();
+    attach(&*fs, Path::new("/a"), &tree);
+
+    let first = {
+        let fs = std::sync::Arc::clone(&fs);
+        std::thread::spawn(move || refresh_io_policy(&*fs, Path::new("/a")))
+    };
+    while !gate.entered.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    // The scheduler changes, and a second refresh asks after the first did.
+    fs.idles.store(false, Ordering::SeqCst);
+    let second = {
+        let fs = std::sync::Arc::clone(&fs);
+        std::thread::spawn(move || refresh_io_policy(&*fs, Path::new("/a")))
+    };
+    // Room for the second to run to its end, where it does not wait.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    gate.open.store(true, Ordering::SeqCst);
+    assert!(first.join().is_ok_and(|idles| idles));
+    assert!(second.join().is_ok_and(|idles| !idles));
+    assert_eq!(tree.load().io, IoStrategy::NONE, "the later answer stands");
 }
 
 /// Under a scheduler that idles between queues only a flush that started

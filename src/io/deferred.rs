@@ -354,6 +354,11 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
         let Some(spawner) = self.workers.take() else {
             return;
         };
+        // A write here that panicked, which the caller caught, fails the
+        // file: the lane takes the failure with the writer.
+        if self.panicked && self.failed.is_none() {
+            self.failed = Some(Failure::of(&gone()));
+        }
         self.sink = match core::mem::replace(&mut self.sink, Sink::Gone) {
             Sink::Here(inner) => Sink::Lane(
                 Arc::new(Lane {

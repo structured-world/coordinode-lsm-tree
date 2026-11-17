@@ -103,9 +103,7 @@ pub(crate) fn attach(fs: &dyn Fs, path: &Path, handle: &Arc<RuntimeConfigHandle>
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn refresh_io_policy(fs: &dyn Fs, path: &Path) -> bool {
-    let idles = fs.idles_between_io_queues(path);
-    registry::refresh(fs, path, idles);
-    idles
+    registry::refresh(fs, path)
 }
 
 /// The locations asked about, with the trees open on each.
@@ -176,20 +174,22 @@ mod registry {
         drop(locations);
     }
 
-    /// Records what the location of `path` was found to do now, and sets the
-    /// strategy for it in every tree still open on it, under the registry's
-    /// lock.
-    pub(super) fn refresh(fs: &dyn Fs, path: &Path, idles: bool) {
+    /// Asks the location of `path` what it does now and sets the strategy for
+    /// it in every tree still open on it, both under the registry's lock: of
+    /// two refreshes, the one that asked last is the one the trees run.
+    /// Returns what the location does.
+    pub(super) fn refresh(fs: &dyn Fs, path: &Path) -> bool {
         let Some(volume) = fs.volume_id(path) else {
-            return;
+            return fs.idles_between_io_queues(path);
         };
         let backend = fs.backend_id();
         let mut locations = LOCATIONS.lock();
+        let idles = fs.idles_between_io_queues(path);
         let Some(location) = locations
             .iter_mut()
             .find(|at| at.backend == backend && at.volume == volume)
         else {
-            return;
+            return idles;
         };
         location.idles = idles;
         location.trees.retain(|tree| tree.strong_count() > 0);
@@ -198,6 +198,7 @@ mod registry {
             tree.set_io_strategy(strategy);
         }
         drop(locations);
+        idles
     }
 }
 
@@ -215,7 +216,9 @@ mod registry {
         handle.set_io_strategy(IoStrategy::for_scheduler(fs.idles_between_io_queues(path)));
     }
 
-    pub(super) const fn refresh(_fs: &dyn Fs, _path: &Path, _idles: bool) {}
+    pub(super) fn refresh(fs: &dyn Fs, path: &Path) -> bool {
+        fs.idles_between_io_queues(path)
+    }
 }
 
 #[cfg(test)]

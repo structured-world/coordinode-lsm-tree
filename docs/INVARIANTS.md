@@ -226,8 +226,17 @@ matching entry (and add one for a new subsystem).
   meanwhile, except a clear's, which decides it, since the clear drops what it
   writes. On open, the tables of the level-0 folder above the watermark are
   read and grouped by flush; a flush is installed when every place of its run
-  is present and reads, and every blob file its tables refer to reads whole,
-  and left out otherwise, as it never returned. The open then records a
+  is present and every data block of it reads, and every frame of every blob
+  file its tables refer to checks, with or without `std`. Each flush's tables
+  also name the last flush that had returned when it began, so the flushes
+  above the watermark that returned are exactly the ones some table names. One
+  of those that does not read whole, or of which no table is found, was lost
+  to the medium after it returned: the open fails with `Unrecoverable`, and a
+  repair keeps its tables, and every blob file, for its scan. Any other flush
+  that does not read whole failed, or is the latest, which nothing names yet:
+  it is taken for one a power loss cut short, as a log's torn tail is, and its
+  tables are set aside as `{id}.torn-flush`. So damage to the latest flush
+  before a later one names it is not told from a cut-short flush. The open then records a
   watermark past every flush it found, installed or not, before the tree
   flushes again, so a table left behind never joins a later flush. A tree
   that closes, and `persist_flushes`, name the self-described tables in the

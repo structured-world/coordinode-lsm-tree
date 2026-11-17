@@ -223,9 +223,15 @@ them differently:
   digest or decode fails is different: it was committed, and its bytes changed
   afterwards. A synced flush writes no record at all: its tables carry the
   flush's number and their place in its run, and an open installs every whole
-  flush above the watermark the manifest records. A flush a power loss cut
-  short (a table or blob file missing or torn) never returned, and is left out
-  in every mode.
+  flush above the watermark the manifest records. Each flush's tables name the
+  last flush that had returned before it; a flush so named that is missing or
+  does not read whole was damaged after it returned and fails the open with
+  `Unrecoverable`, for a repair to salvage. Any other flush that is missing a
+  table, or a block or blob frame that does not check, failed or is the latest
+  (which nothing names yet): it is taken for one a power loss cut short, set
+  aside as `{id}.torn-flush`, and left out in every mode. Damage to the latest
+  flush before a later flush or a persist names it is therefore indistinguishable
+  from a cut-short flush and drops its writes, as a torn log tail does.
 
 `Config::manifest_recovery_mode` decides only what happens to the first shape:
 

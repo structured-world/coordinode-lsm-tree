@@ -67,15 +67,30 @@ fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() -> lsm_tre
             "self-check: the ingestion's edit is not synced"
         );
     }
-    {
-        let tree = config().open()?;
-        assert!(
-            tree.get("key", u64::MAX)?.is_some(),
-            "self-check: the open shows the flushed key"
-        );
-    }
+    let shown = config().open()?;
+    assert!(
+        shown.get("key", u64::MAX)?.is_some(),
+        "self-check: the open shows the flushed key"
+    );
 
+    // The power goes with that tree open: its close, which persists its
+    // flushes, makes nothing durable the open did not.
     crash.crash();
+    for op in [
+        FaultOp::Open,
+        FaultOp::SyncData,
+        FaultOp::SyncAll,
+        FaultOp::SyncDirectory,
+        FaultOp::Rename,
+        FaultOp::RemoveFile,
+    ] {
+        fault.injector().arm(FaultRule::new(
+            op,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        ));
+    }
+    drop(shown);
+    fault.injector().clear();
     let tree = config().open()?;
     assert!(
         tree.get("key", u64::MAX)?.is_some(),
