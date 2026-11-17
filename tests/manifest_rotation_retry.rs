@@ -48,17 +48,13 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
         tree.persist_flushes()?;
 
         // A flush writes no manifest: the persist that names its table is the
-        // install. The table lies in a file pooled with the first one's, so
-        // the persist's first directory sync is the one that would install
-        // its snapshot and log: it fails. Where there is no pool (Windows) the
-        // install syncs the tables folder first.
+        // install. The flush made its table's name durable itself, pooled or
+        // not (on Windows its own sync of the tables folder), so the persist's
+        // first directory sync is the one that would install its snapshot and
+        // log: it fails.
         tree.insert("k1", "v1", 1);
         tree.flush_active_memtable(1)?;
-        injector.arm(
-            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(UNPOOLED_FOLDER_SYNCS)
-                .once(),
-        );
+        injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
         assert!(
             tree.persist_flushes().is_err(),
             "the armed directory sync must fail this install"
