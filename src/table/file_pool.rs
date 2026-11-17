@@ -17,8 +17,9 @@
 //! With `std` a tree's pools refill off the writer's thread: a claim that
 //! leaves half a batch reserves a refill, long before the pool runs dry, and a
 //! claim that finds the pool dry with no refill under way makes its file and
-//! reserves one. The refill starts once the write's install has synced, so it
-//! never runs beside the write's own syncs. Refilling on the writer's thread
+//! reserves one. The refill starts at once, or, on a device whose I/O
+//! scheduler idles between queues, once the write's install has synced, so it
+//! never runs beside the write's own syncs there. Refilling on the writer's thread
 //! is an option: the write that finds its pool dry makes the batch, takes its
 //! file from it, and the install of its table syncs the folder among its own
 //! syncs, which makes the whole batch durable.
@@ -329,7 +330,9 @@ impl TableFilePools {
     /// file and starts a refill, as does one that leaves half a batch.
     ///
     /// The file is opened for writing as `origin`'s; the empty files a refill
-    /// makes ahead are [`WriteOrigin::Metadata`].
+    /// makes ahead are [`WriteOrigin::Metadata`]. A refill the claim reserves
+    /// starts at once, or waits for [`Self::start_pending`] when
+    /// `refill_after_install` (see `IoStrategy::refill_after_install`).
     ///
     /// # Errors
     ///
@@ -341,6 +344,7 @@ impl TableFilePools {
         above: Option<TableId>,
         may_refill: bool,
         origin: WriteOrigin,
+        refill_after_install: bool,
     ) -> crate::Result<ClaimedFile> {
         // A refill held for a write that has not installed yet would leave a
         // dry pool waiting on a batch nobody makes.
@@ -383,11 +387,12 @@ impl TableFilePools {
             Ok(claimed) => Ok(claimed),
             Err(made) => Pools::create(folder, fs, made, origin),
         };
-        // Held until the write's install has synced what it writes (see
-        // `start_pending`): started now, the batch's files and folder sync
-        // reach the device beside the write's own syncs, from another thread.
         if let Some(refill) = refill {
-            self.defer(refill);
+            if refill_after_install {
+                self.defer(refill);
+            } else {
+                self.start(refill);
+            }
         }
         claimed
     }
@@ -430,7 +435,7 @@ impl TableFilePools {
         above: Option<TableId>,
         may_refill: bool,
     ) -> crate::Result<ClaimedFile> {
-        self.claim_as(folder, fs, above, may_refill, WriteOrigin::FlushTable)
+        self.claim_as(folder, fs, above, may_refill, WriteOrigin::FlushTable, true)
     }
 
     /// Runs `refill` off this thread. A thread that cannot be started leaves

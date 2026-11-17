@@ -1161,12 +1161,10 @@ fn an_output_opened_at_finish_counts_toward_entry_durability() -> crate::Result<
     ));
     let mut mw = super::MultiWriter::from_pool(
         base_path,
-        pools,
-        None,
+        super::TableFiles::new(pools, None, crate::fs::WriteOrigin::FlushTable, true),
         12 * 1_024,
         0,
         fs,
-        crate::fs::WriteOrigin::FlushTable,
     )?;
     mw.set_range_tombstones(
         (0..2_000usize)

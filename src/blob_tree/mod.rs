@@ -2431,12 +2431,15 @@ impl AbstractTree for BlobTree {
         let outputs = crate::compaction::output_ledger::OutputLedger::for_cleanup();
         let table_writer = MultiWriter::from_pool(
             table_folder.clone(),
-            Arc::clone(&self.index.table_files),
-            None,
+            crate::table::multi_writer::TableFiles::new(
+                Arc::clone(&self.index.table_files),
+                None,
+                crate::fs::WriteOrigin::FlushTable,
+                rc.io.refill_after_install(),
+            ),
             self.index.config.table_target_size,
             0,
             level_fs.clone(),
-            crate::fs::WriteOrigin::FlushTable,
         )?
         .use_output_ledger(outputs.clone());
         // A synced flush's tables describe themselves (see `register_tables`).

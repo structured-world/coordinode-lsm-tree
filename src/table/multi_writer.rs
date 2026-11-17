@@ -391,7 +391,7 @@ impl OutputLoad {
 
 /// Where a [`MultiWriter`]'s output files come from: its folder's pool, each
 /// id above `above` when given.
-struct TableFiles {
+pub(crate) struct TableFiles {
     pools: Arc<super::file_pool::TableFilePools>,
     above: Option<TableId>,
     /// Whether an output was opened already: only the first refills the
@@ -399,9 +399,29 @@ struct TableFiles {
     opened: bool,
     /// What the outputs are written for.
     origin: WriteOrigin,
+    /// Whether a refill an output's claim starts waits for the install.
+    refill_after_install: bool,
 }
 
 impl TableFiles {
+    /// Outputs claimed from `pools` as `origin`'s, each id above `above` when
+    /// given; a refill a claim starts waits for the write's install when
+    /// `refill_after_install`.
+    pub(crate) fn new(
+        pools: Arc<super::file_pool::TableFilePools>,
+        above: Option<TableId>,
+        origin: WriteOrigin,
+        refill_after_install: bool,
+    ) -> Self {
+        Self {
+            pools,
+            above,
+            opened: false,
+            origin,
+            refill_after_install,
+        }
+    }
+
     /// A writer for the next output in `folder`, and whether its file's
     /// directory entry is durable already.
     fn open(
@@ -412,9 +432,14 @@ impl TableFiles {
     ) -> crate::Result<(Writer, bool)> {
         let may_refill = !self.opened;
         self.opened = true;
-        let claimed = self
-            .pools
-            .claim_as(folder, fs, self.above, may_refill, self.origin)?;
+        let claimed = self.pools.claim_as(
+            folder,
+            fs,
+            self.above,
+            may_refill,
+            self.origin,
+            self.refill_after_install,
+        )?;
         let durable = claimed.durable_entry;
         Ok((Writer::into_claimed(claimed, level, fs.clone())?, durable))
     }
@@ -434,12 +459,10 @@ impl MultiWriter {
         let pools = super::file_pool::TableFilePools::new(table_id_generator, 0, SyncMode::Normal);
         Self::from_pool(
             base_path,
-            Arc::new(pools),
-            None,
+            TableFiles::new(Arc::new(pools), None, WriteOrigin::FlushTable, true),
             target_size,
             initial_level,
             fs,
-            WriteOrigin::FlushTable,
         )
     }
 
@@ -460,33 +483,22 @@ impl MultiWriter {
         );
         Self::from_pool(
             folder,
-            Arc::new(pools),
-            None,
+            TableFiles::new(Arc::new(pools), None, WriteOrigin::CompactionTable, true),
             target_size,
             initial_level,
             fs,
-            WriteOrigin::CompactionTable,
         )
     }
 
     /// Sets up a `MultiWriter` at the given tables folder, its outputs written
-    /// into files claimed from `pools` as `origin`'s, each output's id above
-    /// `above` when given.
+    /// into the files `files` claims.
     pub(crate) fn from_pool(
         base_path: PathBuf,
-        pools: Arc<super::file_pool::TableFilePools>,
-        above: Option<TableId>,
+        mut files: TableFiles,
         target_size: u64,
         initial_level: u8,
         fs: Arc<dyn Fs>,
-        origin: WriteOrigin,
     ) -> crate::Result<Self> {
-        let mut files = TableFiles {
-            pools,
-            above,
-            opened: false,
-            origin,
-        };
         // Own-id recency until `use_recency` overrides it (see the `recency`
         // field).
         let (writer, entries_durable) = files.open(&base_path, initial_level, &fs)?;

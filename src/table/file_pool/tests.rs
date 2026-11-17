@@ -518,6 +518,23 @@ fn pooled_files_are_listed_as_holding_no_table() -> crate::Result<()> {
     Ok(())
 }
 
+/// A dry pool's refill starts with the claim on a device whose scheduler does
+/// not idle between queues, and waits for the install on one that does.
+#[cfg(feature = "std")]
+#[test]
+fn a_refill_waits_for_the_install_only_when_asked() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(4)?;
+    drop(pools.claim_as(&folder, &fs, None, true, WriteOrigin::FlushTable, false)?);
+    assert!(pools.pending.lock().is_empty(), "started with the claim");
+    pools.wait_for_refills();
+
+    let (pools, _fault, fs, folder) = background_pools(4)?;
+    drop(pools.claim_as(&folder, &fs, None, true, WriteOrigin::FlushTable, true)?);
+    assert_eq!(pools.pending.lock().len(), 1, "held for the install");
+    pools.wait_for_refills();
+    Ok(())
+}
+
 /// An in-memory backend that panics on every folder sync.
 #[cfg(feature = "std")]
 struct PanicsOnFolderSync(MemFs);

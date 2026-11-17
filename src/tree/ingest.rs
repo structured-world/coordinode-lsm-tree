@@ -136,12 +136,15 @@ impl<'a> Ingestion<'a> {
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::from_pool(
             folder.clone(),
-            Arc::clone(&tree.table_files),
-            None,
+            crate::table::multi_writer::TableFiles::new(
+                Arc::clone(&tree.table_files),
+                None,
+                crate::fs::WriteOrigin::IngestTable,
+                rc.io.refill_after_install(),
+            ),
             tree.config.table_target_size,
             ingest_level,
             level_fs.clone(),
-            crate::fs::WriteOrigin::IngestTable,
         )?
         .set_comparator(tree.config.comparator.clone())
         .use_bloom_policy(bloom_policy)

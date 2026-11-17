@@ -33,13 +33,24 @@ pub(crate) struct IoStrategy {
     /// no writeback, synced them 6% faster side by side, as every flush does
     /// under a scheduler that does not idle.
     serial_after_writeback: bool,
+    /// The refill of a table file pool that a write's claim starts waits
+    /// until the write's install has synced, rather than run beside it.
+    ///
+    /// Under BFQ the batch's files and folder sync, issued from another
+    /// thread beside a new tree's first flush, took that flush to 105 ms at
+    /// p99 against 7 with the batch after it. Under `mq-deadline` the same
+    /// refill beside the flush made the flush's table name durable before
+    /// its install synced the folder: the first flush of a new tree took
+    /// 0.7 ms longer (1.4 ms with a blob file) with the batch held.
+    refill_after_install: bool,
 }
 
 impl IoStrategy {
-    /// Syncs side by side: a device whose scheduler does not idle between
-    /// queues, or one nothing is known about.
+    /// Syncs side by side and refills beside the write: a device whose
+    /// scheduler does not idle between queues, or one nothing is known about.
     pub(crate) const NONE: Self = Self {
         serial_after_writeback: false,
+        refill_after_install: false,
     };
 
     /// The strategy for a device whose I/O scheduler idles between queues
@@ -47,7 +58,14 @@ impl IoStrategy {
     pub(crate) const fn for_scheduler(idles: bool) -> Self {
         Self {
             serial_after_writeback: idles,
+            refill_after_install: idles,
         }
+    }
+
+    /// Whether a pool refill a write's claim starts waits for the write's
+    /// install.
+    pub(crate) const fn refill_after_install(self) -> bool {
+        self.refill_after_install
     }
 
     /// Whether a flush syncs its files one after another, given whether one

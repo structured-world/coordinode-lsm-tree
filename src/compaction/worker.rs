@@ -4569,6 +4569,7 @@ fn run_merge_on_read_relocation(
                 Some(source.id()),
                 true,
                 crate::fs::WriteOrigin::CompactionTable,
+                opts.runtime_config.load().io.refill_after_install(),
             )
         },
         &*level_fs,
