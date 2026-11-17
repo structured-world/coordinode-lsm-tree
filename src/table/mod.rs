@@ -2554,14 +2554,6 @@ impl Table {
     /// When the directory cannot be read or does not fill the group exactly.
     /// Without it the pages cannot be located, so the whole entry is reported
     /// rather than guessed at.
-    #[cfg_attr(
-        all(not(feature = "std"), not(feature = "columnar")),
-        expect(
-            dead_code,
-            reason = "the scrub, heal and reconcile walks that call it are std-gated; \
-                      with `columnar` the row group loader of the gate-only walk calls it"
-        )
-    )]
     pub(crate) fn data_unit_blocks(
         &self,
         entry: &BlockHandle,
@@ -2693,12 +2685,16 @@ impl Table {
     /// # Errors
     ///
     /// The first block's failure, environmental or damage.
-    #[cfg(feature = "std")]
     pub(crate) fn verify_data_blocks(&self) -> crate::Result<()> {
         for entry in self.untraced_index_walk() {
             let entry = entry?;
             for (handle, role) in self.data_unit_blocks(entry.as_ref())? {
+                // With std through the scrub's Page-ECC correction; without,
+                // the plain checked read, past the cache all the same.
+                #[cfg(feature = "std")]
                 self.scrub_unit(&handle, role)?;
+                #[cfg(not(feature = "std"))]
+                self.load_block_from_disk(&handle, role)?;
             }
         }
         Ok(())

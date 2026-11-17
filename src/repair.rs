@@ -4319,7 +4319,11 @@ fn sweep_superseded_by_committed_manifest(
         }
     }
 
-    if config.kv_separation_opts.is_some() {
+    // Tables kept for the scan may refer to blob files no manifest names, and
+    // one that does not open names none it can be asked for: the blob files
+    // stay for the scan, whose own pass removes what nothing it adopts refers
+    // to.
+    if config.kv_separation_opts.is_some() && for_the_scan.is_empty() {
         let referenced_blobs: crate::HashSet<crate::vlog::BlobFileId> =
             recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
         let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);

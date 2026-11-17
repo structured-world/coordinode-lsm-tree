@@ -120,7 +120,7 @@ fn stalls_under(device: &Path, depth: u8) -> bool {
             .parent()
             .map_or_else(|| device.clone(), Path::to_path_buf)
     } else {
-        device.clone()
+        device
     };
     if let Ok(line) = fs::read_to_string(disk.join("queue").join("scheduler"))
         && active_scheduler(&line) == Some("bfq")

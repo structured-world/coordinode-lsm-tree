@@ -631,7 +631,6 @@ fn chunk_row(
 /// # Errors
 ///
 /// The frame does not check, is not a head, or its table is malformed.
-#[cfg(feature = "std")]
 pub(crate) fn head_chunks(head: &[u8]) -> crate::Result<Vec<ChunkSpec>> {
     let (header, list) = check_frame(head)?;
     let table = head

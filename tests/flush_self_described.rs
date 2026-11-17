@@ -468,6 +468,203 @@ fn a_returned_flush_with_a_damaged_block_fails_the_open() -> lsm_tree::Result<()
     Ok(())
 }
 
+/// Bytes no compression shrinks: a blob value's frame then holds them as they
+/// are, so a byte at a known place of the file is a byte of its payload.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ seed;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+/// The data files `step` adds to `folder`.
+fn added_by(
+    fs: &dyn Fs,
+    folder: &Path,
+    step: impl FnOnce() -> lsm_tree::Result<()>,
+) -> lsm_tree::Result<Vec<u64>> {
+    let before = data_files(fs, folder);
+    step()?;
+    Ok(data_files(fs, folder)
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect())
+}
+
+/// Overwrites 16 bytes of `path` on `fs` at `offset`, durably.
+fn damage(fs: &CrashFs, path: &Path, offset: u64) -> lsm_tree::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = fs.open(path, &lsm_tree::fs::FsOpenOptions::new().write(true))?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(&[0xA5; 16])?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// A flush that returned and of which no table is found fails the open: the
+/// flush after it names it as returned, so its loss is the medium's. Guards
+/// against an open that passes without acknowledged writes.
+#[test]
+fn a_returned_flush_with_no_table_left_fails_the_open() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = config(disk.fs()).open()?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let returned = added_by(&disk.crash, &tables, || {
+        tree.insert("a", "new", 1);
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert_eq!(returned.len(), 1, "self-check: the flush wrote one table");
+    tree.insert("b", "2", 2);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+
+    crash.remove_file(&tables.join(returned[0].to_string()))?;
+    assert!(
+        matches!(
+            config(Arc::new(crash)).open(),
+            Err(lsm_tree::Error::Unrecoverable)
+        ),
+        "the loss of a returned flush is reported"
+    );
+    Ok(())
+}
+
+/// A flush that failed, below one that returned, is a flush that never
+/// returned: the table of it a power loss kept is set aside, and the open
+/// reads the retry that did return. Guards against an open that takes every
+/// number below a returned one as returned and refuses the store.
+#[test]
+fn a_failed_flush_below_a_returned_one_is_set_aside() -> lsm_tree::Result<()> {
+    use lsm_tree::io::ErrorKind;
+    let disk = Disk::new();
+    // Pooled table files: their names are durable before a flush writes
+    // them, so a table whose sync succeeded survives the power loss.
+    let open = |fs| {
+        Config::new(
+            DB,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .table_target_size(1_024)
+        .table_file_refill_inline(true)
+        .open()
+    };
+    let tree = open(disk.fs())?;
+    let filler = "y".repeat(256);
+    for i in 0..64u64 {
+        tree.insert(format!("k{i:03}"), &filler, i);
+    }
+    // One table's sync fails, so the flush fails with the others synced; its
+    // removal of them fails too.
+    let injector = disk.fs.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .skip(1)
+            .once(),
+    );
+    injector
+        .arm(FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other)).on_path("tables"));
+    assert!(
+        tree.flush_active_memtable(0).is_err(),
+        "self-check: the flush fails"
+    );
+    injector.clear();
+    // The retry returns, and the flush after it names it.
+    let lock = tree.get_flush_lock();
+    tree.flush(&lock, 0)?;
+    drop(lock);
+    tree.insert("z", "last", 100);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+
+    let tree = open(Arc::new(crash.clone()))?;
+    for i in (0..64u64).step_by(7) {
+        assert_eq!(
+            value(&tree, &format!("k{i:03}"))?.as_deref(),
+            Some(filler.as_str()),
+            "k{i:03}"
+        );
+    }
+    assert_eq!(value(&tree, "z")?.as_deref(), Some("last"));
+    Ok(())
+}
+
+/// A flush whose blob file kept its trailer and lost frames is not taken in:
+/// the latest flush, which never returned, is set aside, and the open reads
+/// without it. Guards against an open that adopts the blob file on its index
+/// and fails every read of its values after.
+#[test]
+fn a_flush_whose_blob_frames_did_not_reach_the_disk_is_left_out() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = blob_config(disk.fs()).open()?;
+    tree.insert("a", noise(8_192, 1), 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let blobs = at(DB).join("blobs");
+    let torn = added_by(&disk.crash, &blobs, || {
+        tree.insert("b", noise(8_192, 2), 1);
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert_eq!(torn.len(), 1, "self-check: the flush wrote one blob file");
+    let crash = disk.power_loss(tree);
+    // A payload byte of the value's frame, well inside it.
+    damage(&crash, &blobs.join(torn[0].to_string()), 2_048)?;
+
+    let tree = blob_config(Arc::new(crash)).open()?;
+    assert_eq!(value(&tree, "b")?, None, "the flush is left out");
+    assert!(value(&tree, "a")?.is_some());
+    Ok(())
+}
+
+/// A repair that keeps a returned flush's damaged table for its scan keeps the
+/// blob files it refers to: the rows the scan salvages read their values.
+/// Guards against a sweep that removes them before the scan runs.
+#[test]
+fn a_repair_keeps_the_blob_files_of_a_damaged_returned_flush() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = blob_config(disk.fs()).open()?;
+    tree.insert("0", "x", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let damaged = added_by(&disk.crash, &tables, || {
+        for i in 0..2_000u64 {
+            tree.insert(format!("k{i:04}"), noise(64, i), 1 + i);
+        }
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert_eq!(damaged.len(), 1, "self-check: the flush wrote one table");
+    tree.insert("z", "x", 10_000);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    // The first data block: the later rows still read.
+    damage(&crash, &tables.join(damaged[0].to_string()), 40)?;
+
+    let disk = Disk::over(crash);
+    let report = blob_config(disk.fs()).repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "self-check: the scan salvages the table"
+    );
+    let tree = blob_config(disk.fs()).open()?;
+    assert_eq!(
+        tree.get("k1999", u64::MAX)?.as_deref(),
+        Some(noise(64, 1_999).as_slice()),
+        "a salvaged row reads its value"
+    );
+    Ok(())
+}
+
 /// A flush of several tables, with range tombstones across them, reads the
 /// same after a power loss as before: the open places its tables as the
 /// flush's install did, each a run of its own that the placement merges when

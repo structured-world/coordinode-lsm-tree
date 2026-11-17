@@ -6400,15 +6400,16 @@ impl Tree {
     /// died with them in the page cache only.
     ///
     /// A flush that does not read whole is told apart by whether it returned.
-    /// Each flush's tables record the highest flush that had returned when it
-    /// began, and the manifest's watermark decides every flush up to it: a
-    /// flush at or below the highest of those returned, and its damage is the
-    /// medium's, which an open reports as [`crate::Error::Unrecoverable`] for a
-    /// repair to salvage and a repair leaves to its scan (the returned set).
-    /// Any other never returned, as a power loss cut it short; its tables are
-    /// set aside under `{id}.torn-flush`, beyond every sweep. Without `std`
-    /// the blocks are not read: a flush that returned is taken in as any
-    /// table the manifest names, one that did not is set aside.
+    /// Each flush's tables name the last flush that had returned when it
+    /// began, so the flushes that returned above the watermark are the ones
+    /// some table names. Such a flush that does not read whole, or of which no
+    /// table is found, was lost to the medium after it returned: an open
+    /// reports it as [`crate::Error::Unrecoverable`] for a repair to salvage,
+    /// and a repair leaves its tables to its scan (the returned set). Any
+    /// other flush either failed or is the latest, which nothing names yet:
+    /// not whole, it is taken for one a power loss cut short, as a log's torn
+    /// tail is, and its tables are set aside under `{id}.torn-flush`, beyond
+    /// every sweep.
     ///
     /// The watermark rises past every flush found, and the retention floor to
     /// the highest one a flush taken in raised.
@@ -6431,27 +6432,14 @@ impl Tree {
         use crate::version::recovery::RecoveredTable;
         use crate::{TableId, vlog::BlobFileId};
 
-        /// What reading a found table's data blocks showed.
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        enum Blocks {
-            /// Every block read.
-            #[cfg_attr(not(feature = "std"), expect(dead_code, reason = "only with std"))]
-            Read,
-            /// A block did not read.
-            #[cfg_attr(not(feature = "std"), expect(dead_code, reason = "only with std"))]
-            Damaged,
-            /// Not read: a build without `std` has no block scrub.
-            #[cfg_attr(feature = "std", expect(dead_code, reason = "only without std"))]
-            Unread,
-        }
-
         /// A table a synced flush wrote, as the open read it.
         struct Member {
             mark: crate::table::meta::FlushMark,
             table: RecoveredTable,
             min_key: UserKey,
             blobs: Vec<BlobFileId>,
-            blocks: Blocks,
+            /// Whether every data block read.
+            blocks_read: bool,
             /// Where the table lies, to be synced once its flush is taken in,
             /// or set aside when it never returned.
             path: crate::path::PathBuf,
@@ -6476,9 +6464,11 @@ impl Tree {
         let mut flushes: alloc::collections::BTreeMap<u64, Vec<Member>> =
             alloc::collections::BTreeMap::new();
         let mut highest_seen = recovery.flush_watermark;
-        // The highest flush known to have returned: decided by the manifest,
-        // or recorded as returned by a flush that began after it.
-        let mut returned = recovery.flush_watermark;
+        // The flushes above the watermark known to have returned: each flush's
+        // tables name the last one that returned before it began, so the
+        // flushes that returned form a chain through them. A number no table
+        // names was a flush that failed, or the latest one.
+        let mut returned: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
         // Unnamed tables that do not open, which a repair keeps for its scan
         // when a flush that returned is missing one.
         let mut unreadable: Vec<TableId> = Vec::new();
@@ -6544,30 +6534,26 @@ impl Tree {
                 let Some(mark) = table.metadata.flush else {
                     continue;
                 };
-                // Evidence from every flush table, decided ones included.
-                returned = returned.max(mark.returned_through);
                 if mark.seq <= recovery.flush_watermark {
                     continue;
+                }
+                if mark.returned_through > recovery.flush_watermark {
+                    returned.insert(mark.returned_through);
                 }
                 // A power loss can keep the table's entry and trailer and lose
                 // blocks before them (a file size that runs past blocks never
                 // written back reads them as zeros).
-                // no-std: the block scrub reads through std-only block I/O;
-                // without it the blocks stay unread (see the doc above).
-                #[cfg(feature = "std")]
-                let blocks = match table.verify_data_blocks() {
-                    Ok(()) => Blocks::Read,
+                let blocks_read = match table.verify_data_blocks() {
+                    Ok(()) => true,
                     Err(e) if environmental(&e) => return Err(e),
                     Err(e) => {
                         log::warn!(
                             "table {id} of synced flush #{} does not read whole: {e:?}",
                             mark.seq,
                         );
-                        Blocks::Damaged
+                        false
                     }
                 };
-                #[cfg(not(feature = "std"))]
-                let blocks = Blocks::Unread;
                 highest_seen = highest_seen.max(mark.seq);
                 let blobs = table
                     .list_blob_file_references()?
@@ -6585,7 +6571,7 @@ impl Tree {
                     },
                     min_key: table.metadata.key_range.min().clone(),
                     blobs,
-                    blocks,
+                    blocks_read,
                     path: entry.path,
                     fs: folder_fs.clone(),
                 });
@@ -6594,11 +6580,19 @@ impl Tree {
         }
 
         let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
-        // Flushes that returned and do not read whole, and their tables.
-        let mut broken: Vec<u64> = Vec::new();
+        // Flushes that returned and do not read whole, and their tables. A
+        // flush that returned with no table found at all is one of them.
+        let mut broken: Vec<u64> = returned
+            .iter()
+            .copied()
+            .filter(|seq| !flushes.contains_key(seq))
+            .collect();
+        for seq in &broken {
+            log::error!("synced flush #{seq} returned and none of its tables is found");
+        }
         let mut kept: crate::HashSet<TableId> = crate::HashSet::default();
         for (seq, mut members) in flushes {
-            let did_return = seq <= returned;
+            let did_return = returned.contains(&seq);
             // Whole: the table the run finishes with names its length, and
             // every place below it is taken once.
             members.sort_by_key(|member| member.mark.index);
@@ -6612,15 +6606,7 @@ impl Tree {
                             .zip(0u32..)
                             .all(|(member, index)| member.mark.index == index)
                 });
-            // A flush that returned is taken in on what a named table is: a
-            // block of it damaged since fails the read that meets it on its
-            // checksum, as one of a named table does. One that did not return
-            // must show every block, and unread (without std) is set aside.
-            let blocks_read = members.iter().all(|member| match member.blocks {
-                Blocks::Read => true,
-                Blocks::Damaged => false,
-                Blocks::Unread => did_return,
-            });
+            let blocks_read = members.iter().all(|member| member.blocks_read);
             let added_blobs = if whole && blocks_read {
                 Self::flush_blob_files(
                     recovery,
@@ -6760,10 +6746,17 @@ impl Tree {
                 Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e.into()),
             };
-            match crate::vlog::read_meta_and_frames(&mut file, id) {
-                Ok(_) => {}
+            // The trailer can reach the disk with frames that did not: every
+            // frame is checked, its payload not decoded.
+            let checked = crate::vlog::read_meta_and_frames(&mut file, id)
+                .and_then(|(_, frames)| crate::vlog::verify_frames(&*file, &frames));
+            match checked {
+                Ok(()) => {}
                 Err(e) if e.is_environmental() => return Err(e),
-                Err(_) => return Ok(None),
+                Err(e) => {
+                    log::warn!("blob file {id} of a synced flush does not read whole: {e:?}");
+                    return Ok(None);
+                }
             }
             added.push((
                 id,
