@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794967074185,
+  "lastUpdate": 1794967078591,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -114786,6 +114786,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.396841658,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2904c015fbca89d367f6c14437edf5d7c4170b10",
+          "message": "fix(repair): report a lost manifest as an unscopable loss (#1084)\n\n## Summary\n\n- A repair that read no committed manifest reports the lost manifest\nitself as an unscopable loss, so `wal_replay_scope()` answers\n`FullHistory`. Without the manifest nothing records which tables the\nstore held, so a table that is gone left no trace and the report could\nanswer `TailOnly`.\n\n## Changes\n\n- `unknowable_losses` gains one entry, `manifest` in the tree's folder,\nwhenever the committed manifest did not load; documented on\n`RepairReport::unknowable_losses` and in the external-WAL guide (section\n4).\n- Tests that asserted a narrower scope after a manifest loss assert what\nthey guard beside that entry: no loss for a pooled file, an output cut\nshort, a foreign name or a redundant damaged copy, and the source\ncoverage of a lossy salvaged copy.\n- `sst-dump repair` prints the full replay obligation after a manifest\nloss.\n\n## Testing\n\nThe full suite with all features, clippy (default and all features,\n`sst-dump` too), formatting, docs and the no-std check pass locally on\nmacOS; Linux and Windows run in CI.\n\nCloses #1083\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Repair reports now identify a missing committed manifest as an\nunknowable loss, since its contents cannot establish which tables or key\nranges may be affected.\n* When the manifest is missing, repair now requires full-history WAL\nreplay rather than a limited tail replay—even if other detected losses\nappear localized.\n* Repair results continue to report other losses, such as damaged or\nemptied table files, alongside the missing manifest.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-18T02:34:59+02:00",
+          "tree_id": "d32114ff5eaac6a478f961d8aaee4623ac37148a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2904c015fbca89d367f6c14437edf5d7c4170b10"
+        },
+        "date": 1794967077284,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 602.471,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 228.069664ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 1789.612,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 443.389599ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 9312.529,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 941.01572ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5472.409000000001,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 19894.328999999998,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.743,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.807359,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.409813494,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.479,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.232191,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.402304997,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
