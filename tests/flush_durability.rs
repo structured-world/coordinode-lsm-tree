@@ -451,6 +451,11 @@ fn a_compaction_consuming_a_failed_flush_persists_its_output() -> lsm_tree::Resu
 
     tree.major_compact(u64::MAX, 0)?;
     assert_eq!(tree.table_count(), 1);
+    assert_eq!(
+        tree.get_highest_persisted_seqno(),
+        Some(2),
+        "the compaction persists its output on its own"
+    );
     tree.insert("d", "v", 3);
     tree.flush_active_memtable(0)?;
     tree.persist_flushes()?;

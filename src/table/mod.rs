@@ -3088,6 +3088,11 @@ impl Table {
     /// deferred sync state, recording a failure there: the failed sync consumed
     /// the file's writeback error, so no later sync of it may be taken for
     /// proof that a deferred flush's data reached the disk.
+    ///
+    /// A heal after a barrier synced the table needs no more: the flush's data
+    /// was durable by then, and a failed heal sync leaves the healed block in
+    /// its prior, still-correctable state, so a manifest naming the table
+    /// names data that is on disk.
     #[cfg(feature = "page_ecc")]
     fn sync_heal_write_back(
         &self,
@@ -3095,9 +3100,13 @@ impl Table {
         sync_mode: crate::fs::SyncMode,
     ) -> crate::io::Result<()> {
         let mut failed = self.sync_failed.lock();
+        // Latched first, so a sync that panics after consuming the error
+        // leaves it set; a success restores what it was.
+        let before = *failed;
+        *failed = true;
         let synced = file.sync_data_with(sync_mode);
-        if synced.is_err() {
-            *failed = true;
+        if synced.is_ok() {
+            *failed = before;
         }
         drop(failed);
         synced

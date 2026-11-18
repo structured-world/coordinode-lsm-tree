@@ -4545,8 +4545,7 @@ fn a_failed_heal_sync_of_a_deferred_table_is_never_acknowledged() -> crate::Resu
             .block_index
             .iter()
             .next()
-            .expect("table has at least one data block")
-            .expect("block index entry decodes");
+            .expect("table has at least one data block")?;
         (
             (*table.path).clone(),
             crate::table::BlockHandle::new(keyed.offset(), keyed.size()),

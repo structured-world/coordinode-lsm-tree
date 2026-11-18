@@ -197,7 +197,9 @@ impl UnsyncedFile {
                 .write_origin(origin),
         )?;
         // The lock is held across the sync on purpose: a second sync of the
-        // file waits for this one's outcome rather than racing it.
+        // file waits for this one's outcome rather than racing it. Latched
+        // first, so a sync that panics after consuming the error leaves it set.
+        *failed = true;
         let synced = crate::fs::FsFile::sync_data_with(&*file, sync_mode);
         *failed = synced.is_err();
         drop(failed);
