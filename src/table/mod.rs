@@ -10370,6 +10370,11 @@ impl Table {
         if let Some(budget) = self.0.read_budget.get() {
             reopened.0.read_budget.get_or_init(|| Box::new(*budget));
         }
+        // The deferred-sync failure state is not carried: the view is installed
+        // by a persist that first syncs this file if a deferred flush left it
+        // unsynced (the view keeps its id), so no view of a file still waiting
+        // for its barrier sync is ever read, and a heal sync failing through
+        // it touches only data already durable.
         // The suffix keeps the share of the probe counts its data holds; the
         // slice outputs take the prefix's share from this view.
         if self.probe_stats().is_some() {
