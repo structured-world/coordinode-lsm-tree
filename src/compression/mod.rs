@@ -69,12 +69,11 @@ pub trait CompressionProvider {
         two_pass_seed: bool,
     ) -> crate::Result<Vec<u8>>;
 
-    /// Decompress a zstd frame that was compressed with a dictionary.
+    /// Decompress a zstd frame that was compressed with a dictionary, into at
+    /// most `capacity` bytes.
     ///
-    /// `dict` provides the raw dictionary bytes and a 64-bit fingerprint used
-    /// as the TLS cache key. Implementations cache the parsed decoder in
-    /// thread-local storage keyed by that fingerprint to avoid re-parsing the
-    /// dictionary on every call.
+    /// `dict` is parsed once for every thread and call; a frame naming another
+    /// dictionary is refused rather than decoded against the wrong one.
     fn decompress_with_dict(
         data: &[u8],
         dict: &ZstdDictionary,
@@ -113,15 +112,15 @@ pub type ZstdBackend = zstd_backend::ZstdProvider;
 /// ```
 #[cfg(zstd_any)]
 pub struct ZstdDictionary {
-    /// Full 64-bit xxh3 hash used as the collision-resistant cache key for the
-    /// thread-local `FrameDecoder`. The public `id() -> u32` method returns
-    /// the lower 32 bits for external consumers.
+    /// Full 64-bit xxh3 hash, the collision-resistant key of the per-thread
+    /// compressor's attached dictionary. The public `id() -> u32` method
+    /// returns the lower 32 bits for external consumers.
     id: u64,
     raw: Arc<[u8]>,
     /// Lazily-parsed shared `DictionaryHandle` (Arc-backed inside structured-zstd).
     /// Populated on first decompress call and reused across all subsequent calls
-    /// and all threads — eliminates the per-thread dictionary re-parse the TLS
-    /// `FrameDecoder` cache used to incur on every miss.
+    /// and all threads: every frame is handed it, so no thread parses the
+    /// dictionary again.
     /// `OnceBox::get_or_try_init` guarantees one successful parse across
     /// racing threads via a single CAS on the slot pointer: the winner's
     /// `Box<DictionaryHandle>` becomes the stable `&T`, racing losers drop
@@ -134,9 +133,8 @@ pub struct ZstdDictionary {
     prepared: Arc<OnceBox<structured_zstd::decoding::DictionaryHandle>>,
     /// The encoder-side twin of `prepared` (zstd's `CDict` beside the `DDict`):
     /// parsed once, with the entropy tables it seeds, and shared by every
-    /// thread's compressor as a reference-counted handle. The two sides own
-    /// their dictionary content separately by design, so this is the one
-    /// encoder copy of it for the dictionary's lifetime.
+    /// thread's compressor as a reference-counted handle. Both sides hold
+    /// their content as a reference to `raw`, so the bytes exist once.
     #[cfg(feature = "zstd")]
     encoder: Arc<OnceBox<structured_zstd::encoding::EncoderDictionary>>,
 }
@@ -246,15 +244,18 @@ impl ZstdDictionary {
     pub(crate) fn prepared_encoder(
         &self,
     ) -> crate::Result<structured_zstd::encoding::EncoderDictionary> {
-        use structured_zstd::decoding::{DICTIONARY_MAGIC, Dictionary};
+        use structured_zstd::decoding::{DICTIONARY_MAGIC, Dictionary, DictionaryBytes};
         use structured_zstd::encoding::EncoderDictionary;
 
+        // The content is this dictionary's own buffer, held by reference
+        // count: the decoder side holds the same one, so the bytes exist once.
         self.encoder
             .get_or_try_init(|| -> crate::Result<Box<EncoderDictionary>> {
+                let bytes = DictionaryBytes::shared(Arc::clone(&self.raw));
                 let dictionary = if self.raw.starts_with(&DICTIONARY_MAGIC) {
-                    EncoderDictionary::from_bytes(&self.raw)
+                    EncoderDictionary::from_serialized_or_raw_bytes(bytes)
                 } else {
-                    Dictionary::from_raw_content(self.frame_id(), self.raw.to_vec())
+                    Dictionary::from_raw_content(self.frame_id(), bytes)
                         .map(EncoderDictionary::from_dictionary)
                 }
                 .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
@@ -266,10 +267,11 @@ impl ZstdDictionary {
     /// Returns the shared pre-parsed `DictionaryHandle`, parsing on first call
     /// and reusing the cached handle on every subsequent call (across threads).
     ///
-    /// Borrowed, so a decode that only reads the dictionary pays no refcount
-    /// bump; a frame decoder that registers it via
-    /// `FrameDecoder::add_dict_handle` clones the handle, which shares the
-    /// same `Arc` rather than the underlying entropy tables.
+    /// Borrowed: a frame decoder is handed it for each frame it decodes. A
+    /// decoder keeps a reference to the dictionary it last decoded with, so a
+    /// frame under that same dictionary costs no refcount bump, and a frame
+    /// under another one costs one clone of the new handle (and the release
+    /// of the old).
     ///
     /// On the first call we attempt finalized-dict parsing (magic bytes
     /// `37 A4 30 EC`); buffers without that prefix are treated as raw-content
@@ -282,7 +284,9 @@ impl ZstdDictionary {
     pub(crate) fn prepared_handle(
         &self,
     ) -> crate::Result<&structured_zstd::decoding::DictionaryHandle> {
-        use structured_zstd::decoding::{DICTIONARY_MAGIC, Dictionary, DictionaryHandle};
+        use structured_zstd::decoding::{
+            DICTIONARY_MAGIC, Dictionary, DictionaryBytes, DictionaryHandle,
+        };
 
         // `OnceBox::get_or_try_init` is the canonical single-init-
         // across-racers primitive: the closure runs at most once
@@ -299,11 +303,14 @@ impl ZstdDictionary {
         // is what lets the type stay no-std + alloc compatible.
         self.prepared
             .get_or_try_init(|| -> crate::Result<Box<DictionaryHandle>> {
+                // The content is this dictionary's own buffer, held by
+                // reference count, as the encoder side holds it too.
+                let bytes = DictionaryBytes::shared(Arc::clone(&self.raw));
                 let handle = if self.raw.starts_with(&DICTIONARY_MAGIC) {
-                    DictionaryHandle::decode_dict(&self.raw)
+                    DictionaryHandle::decode_dict_bytes(bytes)
                         .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?
                 } else {
-                    let dict = Dictionary::from_raw_content(self.frame_id(), self.raw.to_vec())
+                    let dict = Dictionary::from_raw_content(self.frame_id(), bytes)
                         .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
                     DictionaryHandle::from_dictionary(dict)
                 };

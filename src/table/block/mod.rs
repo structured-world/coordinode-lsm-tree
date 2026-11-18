@@ -1286,19 +1286,30 @@ impl Block {
                     });
                 }
 
-                let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
+                // SAFETY: as for zstd above. The decoder is the only one with
+                // the buffer until it is frozen, and it reads back only what it
+                // wrote: a match reaching past its output is served from the
+                // dictionary's history, or refused when that is too short. The
+                // length equality below drops a short fill unread, so every
+                // byte of the frozen Slice was written. Zero-filling the buffer
+                // first would add a memset of the whole block to every read.
+                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                let mut builder =
+                    unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
+
+                let bytes_written = crate::compression::ZstdBackend::decompress_with_dict_into(
                     &payload,
                     dict,
-                    header.uncompressed_length as usize,
+                    &mut builder,
                 )
                 .map_err(|_| crate::Error::Decompress(compression))?;
-                *produced = decompressed.len();
+                *produced = bytes_written;
 
-                if decompressed.len() != header.uncompressed_length as usize {
+                if bytes_written != header.uncompressed_length as usize {
                     return Err(crate::Error::Decompress(compression));
                 }
 
-                Ok(Slice::from(decompressed))
+                Ok(builder.freeze().into())
             }
         }
     }
