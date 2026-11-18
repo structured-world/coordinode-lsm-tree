@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794945764015,
+  "lastUpdate": 1794967068708,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103558,6 +103558,90 @@ window.BENCHMARK_DATA = {
             "value": 372145.0951822578,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 11.5us | P99.9: 80.3us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2904c015fbca89d367f6c14437edf5d7c4170b10",
+          "message": "fix(repair): report a lost manifest as an unscopable loss (#1084)\n\n## Summary\n\n- A repair that read no committed manifest reports the lost manifest\nitself as an unscopable loss, so `wal_replay_scope()` answers\n`FullHistory`. Without the manifest nothing records which tables the\nstore held, so a table that is gone left no trace and the report could\nanswer `TailOnly`.\n\n## Changes\n\n- `unknowable_losses` gains one entry, `manifest` in the tree's folder,\nwhenever the committed manifest did not load; documented on\n`RepairReport::unknowable_losses` and in the external-WAL guide (section\n4).\n- Tests that asserted a narrower scope after a manifest loss assert what\nthey guard beside that entry: no loss for a pooled file, an output cut\nshort, a foreign name or a redundant damaged copy, and the source\ncoverage of a lossy salvaged copy.\n- `sst-dump repair` prints the full replay obligation after a manifest\nloss.\n\n## Testing\n\nThe full suite with all features, clippy (default and all features,\n`sst-dump` too), formatting, docs and the no-std check pass locally on\nmacOS; Linux and Windows run in CI.\n\nCloses #1083\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Repair reports now identify a missing committed manifest as an\nunknowable loss, since its contents cannot establish which tables or key\nranges may be affected.\n* When the manifest is missing, repair now requires full-history WAL\nreplay rather than a limited tail replay—even if other detected losses\nappear localized.\n* Repair results continue to report other losses, such as damaged or\nemptied table files, alongside the missing manifest.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-18T02:34:59+02:00",
+          "tree_id": "d32114ff5eaac6a478f961d8aaee4623ac37148a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2904c015fbca89d367f6c14437edf5d7c4170b10"
+        },
+        "date": 1794967067378,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 46930.97213746519,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 20.0us | P99.9: 40.4us\nthreads: 1 | elapsed: 11.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2945887.377723948,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 850363.7090620028,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 11.2us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 483332.6657300888,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.8us | P99.9: 29.1us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2208876.314246893,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 312369.71010583715,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.4us | P99.9: 23.3us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 171296.59244510648,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 10.9us | P99.9: 30.4us\nthreads: 1 | elapsed: 1.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 299025.2811955624,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.4us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.67s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1031825.5179334604,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 217454.4145825713,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 18.1us | P99.9: 213.0us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
           }
         ]
       }
