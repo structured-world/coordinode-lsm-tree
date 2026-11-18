@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795029499981,
+  "lastUpdate": 1795029504510,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -115806,6 +115806,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.402304997,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c5318e0480d7ddcc8c41eba3c7d0758fc4f34448",
+          "message": "fix(persist): never acknowledge a deferred file whose sync failed (#1086)\n\n## Summary\n\n- A failed sync of a deferred flush's file is never acknowledged by a\nlater persist. Linux reports a file's writeback error once, so a retry\nthrough a new handle could succeed with the data never on disk and write\na manifest naming the table.\n\n## Changes\n\n- Each table and blob file keeps one sync state, shared by every record\nof it: a lock held across each sync of a file a deferred flush wrote, so\nconcurrent barriers sync it one at a time, and a flag a failed sync sets\nin place. Neither a pending record nor a failure allocates. A sync\nfinding the flag set fails; so does every later persist and checkpoint\nnaming the file. A compaction that consumes the file lifts it, and a\nreopen leaves the flush out for the caller's journal to replay.\n- A Page-ECC heal's write-back sync of a table goes through the same\nlock and records its failure the same way.\n- A failure to open the file syncs nothing and is retried by the next\nbarrier, as is a failed manifest write after the files were synced.\n- `persist_flushes` and `FlushDurability::Deferred` document when a\nfailed file stops blocking persists (it leaves the tree, or the tree\nreopens) and that a drop persists only when it can.\n\n## Testing\n\nThe full suite with all features, clippy (default, all features and for\nLinux), formatting, docs and the no-std check pass locally on macOS;\nLinux and Windows run in CI.\n\nCloses #1085\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* A failed file sync is no longer treated as successful by later\npersistence attempts that include that file; those attempts continue to\nfail until the file leaves the tree or the tree is reopened.\n* Flushes remain readable after a sync failure. Compaction can persist\nits output, while flushes still pending when the tree is reopened are\nhandled as after a power loss.\n* Manifest-write failures remain retryable on a later persistence\nattempt.\n\n* **Documentation**\n* Clarified how deferred flushes are handled when persistence fails or\nthe tree is dropped.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-18T19:58:07+02:00",
+          "tree_id": "767202334839070c2d03c95cc532e1240a4e4239",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c5318e0480d7ddcc8c41eba3c7d0758fc4f34448"
+        },
+        "date": 1795029503163,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 641.974,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 173.355821ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 311.419,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 193.215866ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1305.117,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 245.641359ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5130.008,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 21254.419,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.527,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.479679,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.402265424,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.815,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 51.478527,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.395320518,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
