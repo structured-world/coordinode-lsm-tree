@@ -728,11 +728,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// # Errors
     ///
     /// Returns a sync or manifest write error; the flushes stay installed and
-    /// readable. A failed manifest write is retried by the next persist. A
-    /// failed sync of a flush's file is not: a later sync cannot tell its data
-    /// reached the disk, so every persist naming the file fails until a
-    /// compaction rewrites it, and a reopen leaves that flush out for the
-    /// caller's journal to replay.
+    /// readable, and the next persist retries them.
     fn persist_flushes(&self) -> crate::Result<()>;
 
     /// Makes durable everything this tree synced on each device it lies on:

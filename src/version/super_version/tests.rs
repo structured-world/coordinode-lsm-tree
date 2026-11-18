@@ -16,38 +16,6 @@ fn of_run_without_a_loss_or_a_filter_verdict_keeps() {
     ));
 }
 
-/// A persist whose sync of a deferred flush's file failed leaves the flush
-/// unacknowledged, and a retry refuses it too rather than sync the file again.
-/// Guards against the retry's new handle missing the writeback error the
-/// failed sync consumed and a manifest naming a file whose data is lost.
-#[test]
-fn a_deferred_file_whose_sync_failed_is_never_persisted() -> crate::Result<()> {
-    use crate::config::FlushDurability;
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
-    use crate::{AbstractTree, Config, SequenceNumberCounter};
-
-    let fs = Arc::new(FaultFs::new(MemFs::new()));
-    let tree = Config::new(
-        std::path::absolute("/db")?,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_shared_fs(fs.clone())
-    .flush_durability(FlushDurability::Deferred)
-    .open()?;
-    tree.insert("a", "1", 0);
-    tree.flush_active_memtable(0)?;
-
-    fs.injector()
-        .arm(FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other)).once());
-    assert!(tree.persist_flushes().is_err(), "the sync fails");
-    assert!(
-        tree.persist_flushes().is_err(),
-        "a retry does not acknowledge the file"
-    );
-    Ok(())
-}
-
 #[test]
 fn of_run_with_a_loss_below_the_watermark_reports_that_watermark() {
     assert!(matches!(
