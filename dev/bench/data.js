@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795044511175,
+  "lastUpdate": 1795044515422,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -116826,6 +116826,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.395320518,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5bc6b0db568fa009f17e781b7c0c1aef56968137",
+          "message": "build(deps): move to structured-zstd 0.4 (#1087)\n\n## Summary\n\n- Moves to structured-zstd 0.4: a dictionary's content exists once for\nboth sides, and a dictionary frame decodes straight into the block's\nbuffer.\n\n## Changes\n\n- The encoder and decoder sides of a dictionary hold its own buffer by\nreference count instead of a copy each.\n- A dictionary-compressed block decodes in place into an uninitialized\nbuffer of its uncompressed length, refusing a short fill; a frame naming\nanother dictionary, or an empty input, is refused rather than decoded.\n- The dictionary benchmark follows the new API.\n\n## Measurements\n\n`benches/zstd_dict`, same Linux benchmark host, `main` and this branch\nbuilt in one run, two alternating rounds each (criterion median per\nround):\n\n| case | main | this branch |\n|---|---|---|\n| `decompress_with_dict/warm` | 276.3 ns, 277.4 ns | 223.5 ns, 226.8 ns\n|\n\nA warm dictionary decode is about 19% faster. `main`'s `tls_hit` case\n(454 ns, 483 ns) measured the per-thread decoder cache this change\nremoves; the `switch` cases replace it, decoding frames of 4 and 16\ndictionaries interleaved on one thread, each frame drawing on its own\ndictionary. The host's own CPU accounting failed for this run, so the\nwindow is not qualified as free of interference; round-to-round spread\nwas within 5%.\n\n## Testing\n\nFormatting, clippy (default and all features) and the compression,\ndictionary and block tests pass locally on macOS; the full suite, Linux\nand Windows run in CI.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved handling of dictionary-compressed data, including mismatched\ndictionaries, empty input, and output buffers that are too small.\n* Decompression now checks that the output length matches the length\nrecorded in the data.\n* **Performance**\n* Reduced intermediate allocations when decompressing\ndictionary-compressed blocks and adjusted output buffers to avoid\nretaining excessive capacity.\n* Reused dictionary data across compression and decompression\noperations.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-19T00:09:02+02:00",
+          "tree_id": "720c21676cefe21a05b3c6449cbcb12fb056f2d7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5bc6b0db568fa009f17e781b7c0c1aef56968137"
+        },
+        "date": 1795044514140,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 648.197,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 152.190955ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 316.38599999999997,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 198.238608ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1427.165,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 253.919438ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5266.83,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 20346.174000000003,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.423,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 48.758783,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.398327215,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.423,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 50.855935,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.394268899,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
