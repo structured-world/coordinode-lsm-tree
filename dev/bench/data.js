@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795029504510,
+  "lastUpdate": 1795044506693,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103726,6 +103726,90 @@ window.BENCHMARK_DATA = {
             "value": 363500.0788649771,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 12.2us | P99.9: 83.3us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5bc6b0db568fa009f17e781b7c0c1aef56968137",
+          "message": "build(deps): move to structured-zstd 0.4 (#1087)\n\n## Summary\n\n- Moves to structured-zstd 0.4: a dictionary's content exists once for\nboth sides, and a dictionary frame decodes straight into the block's\nbuffer.\n\n## Changes\n\n- The encoder and decoder sides of a dictionary hold its own buffer by\nreference count instead of a copy each.\n- A dictionary-compressed block decodes in place into an uninitialized\nbuffer of its uncompressed length, refusing a short fill; a frame naming\nanother dictionary, or an empty input, is refused rather than decoded.\n- The dictionary benchmark follows the new API.\n\n## Measurements\n\n`benches/zstd_dict`, same Linux benchmark host, `main` and this branch\nbuilt in one run, two alternating rounds each (criterion median per\nround):\n\n| case | main | this branch |\n|---|---|---|\n| `decompress_with_dict/warm` | 276.3 ns, 277.4 ns | 223.5 ns, 226.8 ns\n|\n\nA warm dictionary decode is about 19% faster. `main`'s `tls_hit` case\n(454 ns, 483 ns) measured the per-thread decoder cache this change\nremoves; the `switch` cases replace it, decoding frames of 4 and 16\ndictionaries interleaved on one thread, each frame drawing on its own\ndictionary. The host's own CPU accounting failed for this run, so the\nwindow is not qualified as free of interference; round-to-round spread\nwas within 5%.\n\n## Testing\n\nFormatting, clippy (default and all features) and the compression,\ndictionary and block tests pass locally on macOS; the full suite, Linux\nand Windows run in CI.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved handling of dictionary-compressed data, including mismatched\ndictionaries, empty input, and output buffers that are too small.\n* Decompression now checks that the output length matches the length\nrecorded in the data.\n* **Performance**\n* Reduced intermediate allocations when decompressing\ndictionary-compressed blocks and adjusted output buffers to avoid\nretaining excessive capacity.\n* Reused dictionary data across compression and decompression\noperations.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-19T00:09:02+02:00",
+          "tree_id": "720c21676cefe21a05b3c6449cbcb12fb056f2d7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5bc6b0db568fa009f17e781b7c0c1aef56968137"
+        },
+        "date": 1795044505441,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 151608.88941654205,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.3us | P99.9: 26.7us\nthreads: 1 | elapsed: 3.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3039346.421377024,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 940392.5151338542,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 518756.6720213595,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.7us | P99.9: 20.0us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3132472.5131801916,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 322244.3405724901,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.3us | P99.9: 15.2us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 185689.1736277213,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 10.0us | P99.9: 21.4us\nthreads: 1 | elapsed: 1.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 877432.3906536077,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.0us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1057881.443670918,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 1.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 366994.8280593265,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 11.6us | P99.9: 84.0us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3"
           }
         ]
       }
