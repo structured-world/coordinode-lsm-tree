@@ -64,10 +64,12 @@ fn repair_rebuilds_manifest_and_db_reopens() -> Result<(), Box<dyn std::error::E
         stdout.contains("manifest rebuilt"),
         "unexpected output: {stdout}",
     );
+    // Every table survived, but without the manifest nothing says what else
+    // the store held: the obligation is the whole history, stated so an
+    // external-WAL operator never has to infer it.
     assert!(
-        stdout.contains("wal replay:    tail only"),
-        "a lossless repair must still state the replay obligation, so an \
-         external-WAL operator never has to infer it: {stdout}",
+        stdout.contains("wal replay:    REQUIRED — a loss could not be localized at all"),
+        "a repair without the manifest must state the full replay obligation: {stdout}",
     );
 
     // The DB must reopen and serve every key after the rebuild.

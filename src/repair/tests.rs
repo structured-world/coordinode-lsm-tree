@@ -22,6 +22,50 @@ fn remove_manifest(fs: &dyn crate::fs::Fs, root: &std::path::Path) -> crate::Res
     Ok(())
 }
 
+/// A repair that reads no committed manifest owes a replay of the whole
+/// history, and names the lost manifest: nothing then records that a table
+/// which is gone ever existed. Guards against such a repair answering
+/// `TailOnly` over a lost table.
+#[test]
+fn a_repair_without_a_manifest_owes_the_full_history() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, WalReplayScope};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .table_file_pool(0)
+    };
+    let lost = {
+        let AnyTree::Standard(tree) = config().open()? else {
+            panic!("a standard tree");
+        };
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        let Some(lost) = tree.current_version().iter_tables().map(Table::id).max() else {
+            panic!("the first flush's table");
+        };
+        tree.insert("b", "1", 1);
+        tree.flush_active_memtable(0)?;
+        lost
+    };
+    std::fs::remove_file(dir.path().join("tables").join(lost.to_string()))?;
+    remove_manifest(&StdFs, dir.path())?;
+
+    let report = config().repair()?;
+    assert!(
+        report
+            .unknowable_losses
+            .contains(&dir.path().join(super::LOST_MANIFEST_ENTRY)),
+        "the lost manifest is named: {report:?}"
+    );
+    assert_eq!(report.wal_replay_scope(), WalReplayScope::FullHistory);
+    Ok(())
+}
+
 /// A file one write was still filling when another, numbered above it,
 /// finished its table is no table that lost its bytes: after a power loss
 /// without a manifest the empty file is an output cut short, left out rather
@@ -94,11 +138,11 @@ fn a_repair_reports_no_loss_for_an_output_cut_short_below_a_newer_table() -> cra
     Ok(())
 }
 
-/// The same tree with nothing emptied: the output cut short alone calls for
-/// no replay past the tail.
+/// The same tree with nothing emptied: the output cut short alone is no
+/// loss; only the lost manifest is.
 #[test]
-fn a_repair_of_an_output_cut_short_alone_replays_only_the_tail() -> crate::Result<()> {
-    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, WalReplayScope};
+fn a_repair_reports_no_loss_for_an_output_cut_short_alone() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
 
     let dir = tempfile::tempdir()?;
     let config = || {
@@ -124,8 +168,12 @@ fn a_repair_of_an_output_cut_short_alone_replays_only_the_tail() -> crate::Resul
 
     let report = config().repair()?;
     assert_eq!(report.recovered, 2, "{report:?}");
-    assert!(report.unknowable_losses.is_empty(), "{report:?}");
-    assert_eq!(report.wal_replay_scope(), WalReplayScope::TailOnly);
+    assert_eq!(
+        report.unknowable_losses,
+        [dir.path().join(super::LOST_MANIFEST_ENTRY)],
+        "{report:?}"
+    );
+    assert!(report.lost_coverage.is_empty(), "{report:?}");
     Ok(())
 }
 
@@ -10773,16 +10821,16 @@ fn a_routed_duplicate_with_a_rotted_data_block_is_unreadable() -> crate::Result<
          signal: {report:?}",
     );
     // The signal must not be mistaken for a LOSS: the id's complete copy is
-    // retained, so nothing needs replaying. Counting it would answer
-    // `FullHistory` and send an external WAL over the whole keyspace.
+    // retained, so it costs no coverage. The one loss is the manifest the
+    // store was repaired without.
     assert!(
-        report.unknowable_losses.is_empty() && report.lost_coverage.is_empty(),
+        report.lost_coverage.is_empty(),
         "a redundant damaged copy costs no coverage: {report:?}",
     );
     assert_eq!(
-        report.wal_replay_scope(),
-        crate::repair::WalReplayScope::TailOnly,
-        "nothing was lost, so the usual tail replay is enough: {report:?}",
+        report.unknowable_losses,
+        [root.join(super::LOST_MANIFEST_ENTRY)],
+        "a redundant damaged copy is no unknowable loss: {report:?}",
     );
     Ok(())
 }
@@ -17135,10 +17183,10 @@ fn lossy_salvage_contributes_the_source_coverage() -> crate::Result<()> {
         Some(64),
         "the ceiling is the SOURCE's highest seqno, not the copy's",
     );
+    // The store has no manifest, the one unscopable loss beside the copy.
     assert_eq!(
-        report.wal_replay_scope(),
-        super::WalReplayScope::LostUpTo(64),
-        "the WAL must be told how deep the loss reaches",
+        report.unknowable_losses,
+        [dir.path().join(super::LOST_MANIFEST_ENTRY)],
     );
     Ok(())
 }
@@ -17194,15 +17242,15 @@ fn lossy_salvage_without_source_metadata_is_unknowable() -> crate::Result<()> {
     .repair_with_salvage(true)?;
     injector.clear();
     assert_eq!(report.salvaged, 1, "the table survives as a salvaged copy");
+    // No bound derived from survivors can scope what was lost: the copy is
+    // listed beside the manifest the store was repaired without.
     assert_eq!(
-        report.unknowable_losses.len(),
-        1,
+        report.unknowable_losses,
+        [
+            dir.path().join("tables").join("0"),
+            dir.path().join(super::LOST_MANIFEST_ENTRY),
+        ],
         "a lossy copy without source metadata cannot be scoped: {report:?}",
-    );
-    assert_eq!(
-        report.wal_replay_scope(),
-        super::WalReplayScope::FullHistory,
-        "no bound derived from survivors can scope what was lost",
     );
     Ok(())
 }
@@ -17241,15 +17289,15 @@ fn unparseable_exclusion_forces_full_history_replay() -> crate::Result<()> {
     .repair()?;
     assert_eq!(report.recovered, 1, "the healthy table is kept");
     assert_eq!(report.unreadable, 1, "{:?}", report.unreadable_files);
+    // No bound can prove a retained record unaffected: the exclusion is
+    // listed beside the manifest the store was repaired without.
     assert_eq!(
-        report.unknowable_losses.len(),
-        1,
+        report.unknowable_losses,
+        [
+            root.join("tables").join("999999"),
+            root.join(super::LOST_MANIFEST_ENTRY),
+        ],
         "the unparseable exclusion is recorded as unscopable: {report:?}",
-    );
-    assert_eq!(
-        report.wal_replay_scope(),
-        super::WalReplayScope::FullHistory,
-        "no bound can prove a retained record unaffected",
     );
     Ok(())
 }
@@ -17293,14 +17341,12 @@ fn a_foreign_name_is_neither_read_nor_reported_by_repair() -> crate::Result<()> 
         memfs.exists(&root.join("tables").join("notes.txt"))?,
         "the operator's file survives the repair untouched",
     );
-    assert!(
-        report.unknowable_losses.is_empty(),
-        "a foreign name held no table data — it is not a loss: {report:?}",
-    );
+    // The lost manifest is the one unknowable loss: a foreign name held no
+    // table data, so it is not one.
     assert_eq!(
-        report.wal_replay_scope(),
-        super::WalReplayScope::TailOnly,
-        "nothing was lost, so the WAL replays its tail as usual",
+        report.unknowable_losses,
+        [root.join(super::LOST_MANIFEST_ENTRY)],
+        "a foreign name held no table data — it is not a loss: {report:?}",
     );
     Ok(())
 }
@@ -18341,8 +18387,8 @@ fn open_or_repair_repairs_a_structural_failure_only() -> crate::Result<()> {
     assert_eq!(report.recovered, 1);
     assert_eq!(
         report.wal_replay_scope(),
-        super::WalReplayScope::TailOnly,
-        "nothing was lost, so the WAL replays its tail as usual",
+        super::WalReplayScope::FullHistory,
+        "without the manifest nothing says what else the store held",
     );
     assert_eq!(
         tree.get(b"k", u64::MAX)?.as_deref(),
@@ -18862,12 +18908,16 @@ fn repair_orders_tied_overlapping_tables_by_their_recency_keys() -> crate::Resul
     };
     let report = config().repair()?;
     assert_eq!(report.recovered, 2, "both tables are recovered");
+    // An order the recency keys settle loses nothing; the one loss is the
+    // manifest the store was repaired without.
     assert!(
-        matches!(
-            report.wal_replay_scope(),
-            crate::repair::WalReplayScope::TailOnly
-        ),
-        "an order the recency keys settle leaves nothing to replay: {report:?}",
+        report.lost_coverage.is_empty(),
+        "an order the recency keys settle loses nothing: {report:?}",
+    );
+    assert_eq!(
+        report.unknowable_losses,
+        [dir.path().join(super::LOST_MANIFEST_ENTRY)],
+        "an order the recency keys settle loses nothing: {report:?}",
     );
     let crate::AnyTree::Standard(tree) = config().open()? else {
         panic!("expected a standard tree");

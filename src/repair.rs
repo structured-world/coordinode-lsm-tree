@@ -124,7 +124,10 @@ pub struct RepairReport {
     /// parsed, so neither the affected key range nor a seqno bound is
     /// derivable. Covers both an EXCLUDED unreadable table and a KEPT lossy
     /// salvaged copy whose source's metadata was unreadable (the copy's own
-    /// metadata only bounds what survived). Any entry here forces
+    /// metadata only bounds what survived). A repair that read no committed
+    /// manifest lists `manifest` in the tree's folder: nothing then records
+    /// which tables the store held, so a table that is gone cannot be told
+    /// from one a compaction merged away. Any entry here forces
     /// [`wal_replay_scope`](Self::wal_replay_scope) to
     /// [`WalReplayScope::FullHistory`], since no bound can prove a retained
     /// record is NOT affected. Blob files are not listed: losing blob content
@@ -234,6 +237,10 @@ impl RepairReport {
         }
     }
 }
+
+/// The [`RepairReport::unknowable_losses`] entry of a repair that read no
+/// committed manifest, in the tree's folder: a name no file there takes.
+const LOST_MANIFEST_ENTRY: &str = "manifest";
 
 /// [`RepairReport::method`] of every repair.
 const REPAIR_METHOD: &str = "all-to-L0 with sequence-number ordering";
@@ -7214,6 +7221,15 @@ fn publish_repaired_manifest(
             );
             unknowable_losses.push(primary_tables.join(id.to_string()));
         }
+    } else {
+        // No committed manifest was read: nothing records which tables the
+        // store held, so a table that is gone leaves no trace. The loss is
+        // unscopable as a whole.
+        log::warn!(
+            "repair: the committed manifest did not load; what the store held \
+             beyond the files found cannot be known",
+        );
+        unknowable_losses.push(config.path.join(LOST_MANIFEST_ENTRY));
     }
 
     // The replacements are DURABLE the moment the manifest commits, so the

@@ -201,6 +201,10 @@ and lists the earlier id in `RepairReport::includes`.
    - `FullHistory` — same, with no seqno filter: a loss whose sequence base
      died with the manifest, or an excluded table whose coverage never
      parsed (`unknowable_losses`), leaves no bound that scopes the damage.
+     A repair that read no committed manifest always answers this, and lists
+     `manifest` in the tree's folder among `unknowable_losses`: nothing then
+     records which tables the store held, so a table that is gone leaves no
+     trace to scope.
      When the trigger is an UNSCOPABLE loss (`unknowable_losses` non-empty),
      there is no key range either: reconcile retained records across the
      ENTIRE keyspace in ONE pass — the survivor subtraction of step 3 runs

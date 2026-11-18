@@ -349,8 +349,9 @@ fn two_tables(folder: &Path) -> lsm_tree::Result<()> {
 }
 
 /// A repair of a tree holding pooled files finds the same tables, and reports
-/// the same losses (none), as one without them: an empty file under a table
-/// name holds no rows. It removes them as it removes every file the rebuilt
+/// the same losses (only the manifest it was run without), as one without
+/// them: an empty file under a table name holds no rows. It removes them as it
+/// removes every file the rebuilt
 /// manifest does not name, lists them among the files it left out, and the
 /// tree makes new ones.
 #[cfg(not(windows))]
@@ -366,12 +367,12 @@ fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
     let report = config(folder.path()).repair()?;
     assert_eq!(report.recovered, 2);
     assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
-    assert!(report.unknowable_losses.is_empty());
-    assert!(report.lost_coverage.is_empty());
     assert_eq!(
-        report.wal_replay_scope(),
-        lsm_tree::WalReplayScope::TailOnly
+        report.unknowable_losses,
+        [folder.path().join("manifest")],
+        "no pooled file is a loss"
     );
+    assert!(report.lost_coverage.is_empty());
     let mut excluded: Vec<u64> = report
         .excluded_files
         .iter()
@@ -412,10 +413,11 @@ fn a_repair_reports_an_emptied_table_below_the_newest_as_lost() -> lsm_tree::Res
         .iter()
         .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
         .collect();
-    assert_eq!(lost, vec![older.to_string()], "{report:?}");
-    assert_ne!(
-        report.wal_replay_scope(),
-        lsm_tree::WalReplayScope::TailOnly
+    // The emptied table, beside the manifest the repair was run without.
+    assert_eq!(
+        lost,
+        vec![older.to_string(), "manifest".to_string()],
+        "{report:?}"
     );
     Ok(())
 }
@@ -952,17 +954,20 @@ fn an_output_cut_short_below_an_installed_table_is_no_loss() -> lsm_tree::Result
 
     let report = crash_config(&fs).repair()?;
     assert_eq!(report.recovered, inputs.len() + 1, "{report:?}");
-    assert!(report.unknowable_losses.is_empty(), "{report:?}");
+    // The output cut short is no loss; the manifest the repair was run
+    // without is the only one.
+    assert_eq!(
+        report.unknowable_losses,
+        [std::path::absolute(DB)?.join("manifest")],
+        "{report:?}"
+    );
+    assert!(report.lost_coverage.is_empty(), "{report:?}");
     assert!(
         report
             .excluded_files
             .iter()
             .any(|(path, _)| *path == cut_short_path),
         "the output cut short is left out: {report:?}"
-    );
-    assert_eq!(
-        report.wal_replay_scope(),
-        lsm_tree::WalReplayScope::TailOnly
     );
     let tree = crash_config(&fs).open()?;
     for key in ["a", "b", "c", "late"] {
