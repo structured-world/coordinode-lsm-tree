@@ -14,6 +14,42 @@ fn only_an_unknown_opcode_refuses_the_ring() {
     assert!(!super::refuses_sync(libc::ENOSPC));
 }
 
+/// A sync that failed is the batch's error even when another target of the
+/// batch refused the opcode, in either order, and the refusal still turns the
+/// ring off for the thread; a refusal alone sends the batch another way.
+/// Guards against a refusal discarding a failed sync, whose retry through a
+/// new handle may not report the writeback error it consumed.
+#[test]
+fn a_failed_sync_outweighs_a_refusal_in_the_same_batch() {
+    use super::{Completions, NO_RING_SYNC, Through};
+
+    for results in [[-libc::EIO, -libc::EINVAL], [-libc::EINVAL, -libc::EIO]] {
+        NO_RING_SYNC.set(false);
+        let mut completions = Completions::default();
+        for result in results {
+            completions.note(result);
+        }
+        let Err(e) = completions.outcome() else {
+            panic!("the failed sync is reported: {results:?}");
+        };
+        let eio = crate::io::Error::from(std::io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(e.to_string(), eio.to_string(), "{results:?}");
+        assert!(NO_RING_SYNC.get(), "the ring is off: {results:?}");
+    }
+
+    NO_RING_SYNC.set(false);
+    let mut refused = Completions::default();
+    for result in [0, -libc::EOPNOTSUPP] {
+        refused.note(result);
+    }
+    assert!(matches!(refused.outcome(), Ok(Through::Refused)));
+
+    let mut synced = Completions::default();
+    synced.note(0);
+    assert!(matches!(synced.outcome(), Ok(Through::Synced)));
+    NO_RING_SYNC.set(false);
+}
+
 /// A batch of file and folder syncs goes through one ring and reports every
 /// one done: the path a synced flush takes on Linux.
 #[test]

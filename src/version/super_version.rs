@@ -86,7 +86,7 @@ fn same_device(fs: &dyn Fs, path: &Path, other_fs: &dyn Fs, other: &Path) -> boo
 /// one `step` lies on: barrier syncs there are ordered apart from `step`'s
 /// device, so the write `step` makes next could outlast them. A device whose
 /// id a backend cannot tell is flushed per folder.
-fn flush_other_devices(
+pub(crate) fn flush_other_devices(
     syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)],
     (step_fs, step_path): (&dyn Fs, &Path),
 ) -> crate::Result<()> {

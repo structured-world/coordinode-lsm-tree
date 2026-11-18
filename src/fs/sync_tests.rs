@@ -192,14 +192,14 @@ fn the_backends_batch_is_taken_only_when_scheduled() -> crate::Result<()> {
     Ok(())
 }
 
-/// A backend over [`MemFs`] on two devices, `/fast` and everything else,
-/// that records the devices it is asked to flush.
-struct TwoDevices {
-    inner: MemFs,
+/// A backend over `F` on two devices, `/fast` and everything else, that
+/// records the devices it is asked to flush.
+struct TwoDevices<F> {
+    inner: F,
     flushed: parking_lot::Mutex<Vec<String>>,
 }
 
-impl Fs for TwoDevices {
+impl<F: Fs> Fs for TwoDevices<F> {
     fn volume_id(&self, path: &Path) -> Option<u64> {
         Some(if path.starts_with("/fast") { 2 } else { 1 })
     }
@@ -285,6 +285,68 @@ fn barrier_syncs_on_another_device_are_flushed_once() -> crate::Result<()> {
         flushed(SyncMode::Barrier, "/db/blobs")?,
         ["/fast/tables"],
         "the step's own device is not flushed"
+    );
+    Ok(())
+}
+
+/// An open that takes in a flush whose tables lie on another device than the
+/// manifest flushes that device under barrier syncs before it writes the
+/// manifest naming them. Guards against that manifest outlasting, through a
+/// power loss, the tables it names.
+#[test]
+fn an_open_flushes_the_device_of_the_flushes_it_takes_in() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let fault = FaultFs::new(MemFs::new());
+    let injector = fault.injector();
+    let backend = Arc::new(TwoDevices {
+        inner: fault,
+        flushed: parking_lot::Mutex::new(Vec::new()),
+    });
+    let fs: Arc<dyn Fs> = backend.clone();
+    let open = || {
+        Config::new(
+            std::path::absolute("/db")?,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        .table_file_pool(0)
+        .sync_mode(SyncMode::Barrier)
+        .level_routes(vec![LevelRoute {
+            levels: 0..1,
+            path: std::path::absolute("/fast")?,
+            fs: Arc::clone(&fs),
+        }])
+        .open()
+    };
+
+    let tree = open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    // The process dies: nothing the closing tree does reaches the disk.
+    for op in [FaultOp::Open, FaultOp::RemoveFile, FaultOp::Rename] {
+        injector.arm(FaultRule::new(
+            op,
+            Fault::Error(crate::io::ErrorKind::Other),
+        ));
+    }
+    drop(tree);
+    injector.clear();
+    backend.flushed.lock().clear();
+
+    let tree = open()?;
+    assert_eq!(tree.get("a", u64::MAX)?.as_deref(), Some(&b"1"[..]));
+    assert!(
+        backend
+            .flushed
+            .lock()
+            .iter()
+            .any(|path| path.starts_with("/fast")),
+        "the tables' device is flushed: {:?}",
+        backend.flushed.lock()
     );
     Ok(())
 }

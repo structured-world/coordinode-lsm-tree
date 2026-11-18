@@ -54,6 +54,47 @@ const fn refuses_sync(errno: i32) -> bool {
     errno == libc::EINVAL || errno == libc::EOPNOTSUPP
 }
 
+/// What the completions of a batch's syncs say, as they are reaped.
+#[derive(Default)]
+struct Completions {
+    /// The first sync that failed: its error is the batch's, even beside a
+    /// refusal, since a sync done again through a new handle may not report
+    /// the writeback error this one consumed.
+    failed: Option<io::Error>,
+    /// Whether a completion refused the sync opcode.
+    refused: bool,
+}
+
+impl Completions {
+    /// Takes the `result` of one completion.
+    fn note(&mut self, result: i32) {
+        if result >= 0 {
+            return;
+        }
+        if refuses_sync(-result) {
+            self.refused = true;
+        } else if self.failed.is_none() {
+            self.failed = Some(io::Error::from(std::io::Error::from_raw_os_error(-result)));
+        }
+    }
+
+    /// The batch's outcome: a failed sync, else a refusal, else synced. A
+    /// refusal beside a failure still turns the ring off for this thread.
+    fn outcome(self) -> io::Result<Through> {
+        if let Some(failed) = self.failed {
+            if self.refused {
+                NO_RING_SYNC.set(true);
+            }
+            return Err(failed);
+        }
+        Ok(if self.refused {
+            Through::Refused
+        } else {
+            Through::Synced
+        })
+    }
+}
+
 /// Syncs every target of `targets` through this thread's ring and waits for
 /// all of them: `None` when no ring can be set up, for the caller to sync
 /// another way. Linux has one data sync for every [`crate::fs::SyncMode`].
@@ -120,8 +161,7 @@ fn sync_through(ring: &mut IoUring, targets: &[SyncTarget<'_>]) -> io::Result<Th
         };
         push(ring, &sync.build().user_data(at as u64))?;
     }
-    let mut first_error = None;
-    let mut refused = false;
+    let mut completions = Completions::default();
     let mut reaped = 0;
     while reaped < opened.len() {
         if let Err(e) = ring.submit_and_wait(opened.len() - reaped) {
@@ -136,20 +176,10 @@ fn sync_through(ring: &mut IoUring, targets: &[SyncTarget<'_>]) -> io::Result<Th
         }
         for done in ring.completion() {
             reaped += 1;
-            let result = done.result();
-            if result >= 0 {
-                continue;
-            }
-            refused |= refuses_sync(-result);
-            if first_error.is_none() {
-                first_error = Some(io::Error::from(std::io::Error::from_raw_os_error(-result)));
-            }
+            completions.note(done.result());
         }
     }
-    if refused {
-        return Ok(Through::Refused);
-    }
-    first_error.map_or(Ok(Through::Synced), Err)
+    completions.outcome()
 }
 
 /// Queues `entry`. The ring has an entry for every target, so a full queue

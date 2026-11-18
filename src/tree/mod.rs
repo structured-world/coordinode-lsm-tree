@@ -6696,15 +6696,18 @@ impl Tree {
             // died before the flush's sync: made durable, with their names,
             // before a manifest names them.
             {
-                use crate::fs::{SyncTarget, WriteOrigin};
+                use crate::fs::{SyncMode, SyncTarget, WriteOrigin};
+                let mut syncs: Vec<(&Arc<dyn crate::fs::Fs>, SyncTarget<'_>)> = Vec::new();
                 let mut folders: Vec<(&Arc<dyn crate::fs::Fs>, &Path)> = Vec::new();
                 for member in &members {
-                    SyncTarget::FileData {
-                        path: &member.path,
-                        origin: WriteOrigin::FlushTable,
-                        mode: config.sync_mode,
-                    }
-                    .sync_alone(&*member.fs)?;
+                    syncs.push((
+                        &member.fs,
+                        SyncTarget::FileData {
+                            path: &member.path,
+                            origin: WriteOrigin::FlushTable,
+                            mode: config.sync_mode,
+                        },
+                    ));
                     if let Some(folder) = member.path.parent()
                         && !folders
                             .iter()
@@ -6718,22 +6721,35 @@ impl Tree {
                     .map(|(id, _)| blobs_folder.join(id.to_string()))
                     .collect();
                 for path in &blob_paths {
-                    SyncTarget::FileData {
-                        path,
-                        origin: WriteOrigin::FlushBlob,
-                        mode: config.sync_mode,
-                    }
-                    .sync_alone(&*config.fs)?;
+                    syncs.push((
+                        &config.fs,
+                        SyncTarget::FileData {
+                            path,
+                            origin: WriteOrigin::FlushBlob,
+                            mode: config.sync_mode,
+                        },
+                    ));
                 }
                 if !blob_paths.is_empty() {
                     folders.push((&config.fs, &blobs_folder));
                 }
                 for (fs, folder) in folders {
-                    SyncTarget::Folder {
-                        path: folder,
-                        mode: crate::file::folder_sync_mode(&**fs, folder, config.sync_mode),
-                    }
-                    .sync_alone(&**fs)?;
+                    syncs.push((
+                        fs,
+                        SyncTarget::Folder {
+                            path: folder,
+                            mode: crate::file::folder_sync_mode(&**fs, folder, config.sync_mode),
+                        },
+                    ));
+                }
+                for (fs, target) in &syncs {
+                    target.sync_alone(&***fs)?;
+                }
+                // The manifest the open writes next names these files: under
+                // barrier syncs each other device is flushed first, or that
+                // snapshot could outlast the tables it names.
+                if config.sync_mode == SyncMode::Barrier {
+                    crate::version::flush_other_devices(&syncs, (&*config.fs, &config.path))?;
                 }
             }
             log::info!("installing synced flush #{seq} from its tables' own description");
