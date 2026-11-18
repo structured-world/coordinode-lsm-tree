@@ -29,6 +29,9 @@ use arc_swap::ArcSwap;
 // no-std: arc-swap 1.x is not no_std; spin::RwLock<Arc<_>> gives the same
 // snapshot-swap semantics (serialized writers, consistent readers) without an
 // allocator. parking_lot/arc-swap win the std hot path, so keep them there.
+// `zstd` implies `std`.
+#[cfg(zstd_any)]
+use parking_lot::Mutex;
 #[cfg(not(feature = "std"))]
 use spin::RwLock;
 
@@ -42,7 +45,7 @@ use spin::RwLock;
 /// `arc_swap::Guard` and cannot outlive the handle; callers who
 /// need an owned reference from a `Guard` can clone the inner
 /// `Arc` out of it via `Arc::clone(&*guard)`.
-pub struct RuntimeConfigHandle {
+pub(crate) struct RuntimeConfigHandle {
     /// `std`: lock-free `ArcSwap` (single atomic load on the read hot path).
     #[cfg(feature = "std")]
     inner: ArcSwap<RuntimeConfig>,
@@ -50,18 +53,56 @@ pub struct RuntimeConfigHandle {
     /// serialize. Slower than `ArcSwap` but allocator-only.
     #[cfg(not(feature = "std"))]
     inner: RwLock<Arc<RuntimeConfig>>,
+    /// Snapshots a swap replaced while something may still hold them, held
+    /// weakly.
+    ///
+    /// A flush or compaction takes a snapshot when it starts and resolves the
+    /// dictionary that snapshot's policy names from the tree's store. A swap
+    /// in between must not let a collection take that dictionary, or the
+    /// writer produces a table naming a file that is gone; so a collection
+    /// spares every dictionary a still-held snapshot here names. Every swap
+    /// records what it replaces: a policy change and a new I/O strategy alike,
+    /// since a write may hold the snapshot either one replaced. A snapshot
+    /// nothing holds any more drops out.
+    #[cfg(zstd_any)]
+    replaced: Mutex<alloc::vec::Vec<alloc::sync::Weak<RuntimeConfig>>>,
 }
 
 impl RuntimeConfigHandle {
     /// Build a handle wrapping the given initial config.
     #[must_use]
-    pub fn new(initial: RuntimeConfig) -> Self {
+    pub(crate) fn new(initial: RuntimeConfig) -> Self {
         Self {
             #[cfg(feature = "std")]
             inner: ArcSwap::from_pointee(initial),
             #[cfg(not(feature = "std"))]
             inner: RwLock::new(Arc::new(initial)),
+            #[cfg(zstd_any)]
+            replaced: Mutex::new(alloc::vec::Vec::new()),
         }
+    }
+
+    /// Records `snapshot`, which a swap is about to replace (see the
+    /// `replaced` field). Recorded before the swap publishes, so a collection
+    /// in between finds it either live or here.
+    #[cfg(zstd_any)]
+    pub(crate) fn retire(&self, snapshot: &Arc<RuntimeConfig>) {
+        let mut replaced = self.replaced.lock();
+        replaced.retain(|held| held.strong_count() > 0);
+        replaced.push(Arc::downgrade(snapshot));
+    }
+
+    /// Calls `each` with every snapshot a swap replaced that something still
+    /// holds.
+    #[cfg(zstd_any)]
+    pub(crate) fn for_each_held_replaced(&self, mut each: impl FnMut(&RuntimeConfig)) {
+        self.replaced.lock().retain(|held| {
+            let Some(held) = held.upgrade() else {
+                return false;
+            };
+            each(&held);
+            true
+        });
     }
 
     /// Load the current snapshot — lockless single atomic load under `std`
@@ -69,22 +110,48 @@ impl RuntimeConfigHandle {
     /// drop; for longer-lived references use [`Self::load_full`] which returns
     /// an owned `Arc<RuntimeConfig>`.
     #[cfg(feature = "std")]
-    pub fn load(&self) -> arc_swap::Guard<Arc<RuntimeConfig>> {
+    pub(crate) fn load(&self) -> arc_swap::Guard<Arc<RuntimeConfig>> {
         self.inner.load()
     }
 
     /// See the `std` variant. Under `no_std` the guard borrows the handle via
     /// the read lock; deref reaches `RuntimeConfig` through the inner `Arc`.
     #[cfg(not(feature = "std"))]
-    pub fn load(&self) -> spin::RwLockReadGuard<'_, Arc<RuntimeConfig>> {
+    pub(crate) fn load(&self) -> spin::RwLockReadGuard<'_, Arc<RuntimeConfig>> {
         self.inner.read()
+    }
+
+    /// Sets the flush strategy for the device under the tree (see
+    /// [`crate::io_policy`]). Swapped in by compare-and-swap, retried until
+    /// it lands on the snapshot it read: an update a caller published
+    /// meanwhile is kept, not overwritten with the snapshot before it.
+    pub(crate) fn set_io_strategy(&self, io: crate::io_policy::IoStrategy) {
+        if self.load().io == io {
+            return;
+        }
+        #[cfg(feature = "std")]
+        self.inner.rcu(|current| {
+            // Each attempt's snapshot: the one that lands is replaced.
+            #[cfg(zstd_any)]
+            self.retire(current);
+            let mut next = RuntimeConfig::clone(current);
+            next.io = io;
+            next
+        });
+        #[cfg(not(feature = "std"))]
+        {
+            let mut current = self.inner.write();
+            let mut next = RuntimeConfig::clone(&current);
+            next.io = io;
+            *current = Arc::new(next);
+        }
     }
 
     /// Load the current snapshot as an owned `Arc`.
     /// Slightly more expensive than [`Self::load`] (one atomic
     /// increment) but the result outlives the handle.
     #[must_use]
-    pub fn load_full(&self) -> Arc<RuntimeConfig> {
+    pub(crate) fn load_full(&self) -> Arc<RuntimeConfig> {
         #[cfg(feature = "std")]
         {
             self.inner.load_full()
@@ -143,7 +210,7 @@ impl RuntimeConfigHandle {
     ///   count, single-parity `ReedSolomon`), or sets
     ///   `kv_checksum_compute_point = AtInsert` with an 8-byte or
     ///   not-compiled-in algorithm.
-    pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
+    pub(crate) fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),
     {
@@ -218,13 +285,24 @@ impl RuntimeConfigHandle {
                 ));
             }
         }
+        // The flush strategy is the device's, set only by
+        // `set_io_strategy`: one a refresh published since the load above is
+        // kept rather than overwritten with the loaded one.
         #[cfg(feature = "std")]
-        {
-            self.inner.store(Arc::new(next));
-        }
+        self.inner.rcu(|current| {
+            // Each attempt's snapshot: the one that lands is replaced, and it
+            // may be one a refresh published after the load above.
+            #[cfg(zstd_any)]
+            self.retire(current);
+            let mut published = next.clone();
+            published.io = current.io;
+            published
+        });
         #[cfg(not(feature = "std"))]
         {
-            *self.inner.write() = Arc::new(next);
+            let mut current = self.inner.write();
+            next.io = current.io;
+            *current = Arc::new(next);
         }
         Ok(())
     }

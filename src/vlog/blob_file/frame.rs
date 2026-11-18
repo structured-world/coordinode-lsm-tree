@@ -631,7 +631,6 @@ fn chunk_row(
 /// # Errors
 ///
 /// The frame does not check, is not a head, or its table is malformed.
-#[cfg(feature = "std")]
 pub(crate) fn head_chunks(head: &[u8]) -> crate::Result<Vec<ChunkSpec>> {
     let (header, list) = check_frame(head)?;
     let table = head
@@ -1362,19 +1361,15 @@ pub(crate) struct EntrySpec<'k> {
     pub(crate) value_len: u32,
 }
 
-/// Encodes a frame of `kind` listing `entries` over `payload` into `out`, the
-/// payload compressed under `codec` unless that saves nothing (a head's chunk
-/// table never is).
+/// [`encode_frame_parts`] with a payload stored as it is copied into `out`.
 ///
 /// # Errors
 ///
-/// Propagates the compression; [`crate::Error::DecompressedSizeTooLarge`] for
-/// a payload past the value cap.
+/// As [`encode_frame_parts`].
 ///
 /// # Panics
 ///
-/// A key is empty or longer than `u16::MAX`, or a frame lists more than
-/// `u16::MAX` entries: the writer never builds one.
+/// As [`encode_frame_parts`].
 #[cfg(test)]
 pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
     kind: FrameKind,
@@ -1389,17 +1384,21 @@ pub(crate) fn encode_frame<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
     Ok(())
 }
 
-/// [`encode_frame`], the payload left out of `out` when it is stored as it is
-/// (`true`): the frame is `out` followed by `payload`, which a writer then
-/// writes from where it lies rather than copying it in first.
+/// Encodes a frame of `kind` listing `entries` over `payload` into `out`, the
+/// payload compressed under `codec` unless that saves nothing (a head's chunk
+/// table never is), and left out of `out` when it is stored as it is (`true`):
+/// the frame is `out` followed by `payload`, which a writer then writes from
+/// where it lies rather than copying it in first.
 ///
 /// # Errors
 ///
-/// As [`encode_frame`].
+/// Propagates the compression; [`crate::Error::DecompressedSizeTooLarge`] for
+/// a payload past the value cap.
 ///
 /// # Panics
 ///
-/// As [`encode_frame`].
+/// A key is empty or longer than `u16::MAX`, or a frame lists more than
+/// `u16::MAX` entries: the writer never builds one.
 pub(crate) fn encode_frame_parts<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
     kind: FrameKind,
     entries: impl IntoIterator<Item = E, IntoIter: ExactSizeIterator>,
@@ -1427,7 +1426,7 @@ pub(crate) fn encode_frame_parts<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
 ///
 /// # Panics
 ///
-/// As [`encode_frame`].
+/// As [`encode_frame_parts`].
 pub(crate) fn encode_frame_parts_compressed<'e, E: core::borrow::Borrow<EntrySpec<'e>>>(
     kind: FrameKind,
     entries: impl IntoIterator<Item = E, IntoIter: ExactSizeIterator>,

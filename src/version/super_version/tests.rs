@@ -56,8 +56,66 @@ fn a_barrier_holding_the_files_before_a_failed_sync_does_not_sync_them() -> crat
         .arm(FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other)).once());
     assert!(tree.persist_flushes().is_err(), "the sync fails");
     assert!(
-        SuperVersions::sync_files(&held, SyncMode::default()).is_err(),
+        SuperVersions::sync_unsynced(
+            &held,
+            SyncMode::default(),
+            crate::io_policy::SyncSchedule::SideBySide,
+            (&*fs, crate::path::Path::new("/db")),
+        )
+        .is_err(),
         "the other barrier's copy does not sync the file"
+    );
+    Ok(())
+}
+
+/// A batch of pending files in which one file's sync fails marks that file
+/// alone: the others sync and persist on the next barrier. Guards against a
+/// batch failure being pinned on every file in it, which would keep flushes
+/// whose data did reach the disk out of every persist.
+#[test]
+fn a_failed_sync_in_a_batch_marks_only_its_own_file() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io_policy::SyncSchedule;
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let tree = deferred_tree_with_a_pending_flush(&fs)?;
+    tree.insert("b", "2", 1);
+    tree.flush_active_memtable(0)?;
+    let pending = tree.version_history.read().unsynced_files();
+    let [first, second] = pending.as_slice() else {
+        panic!("two pending tables");
+    };
+    let step = (&*fs as &dyn crate::fs::Fs, crate::path::Path::new("/db"));
+
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(first.as_flush_file().location().1.to_string_lossy())
+            .once(),
+    );
+    assert!(
+        SuperVersions::sync_unsynced(&pending, SyncMode::default(), SyncSchedule::Batched, step)
+            .is_err()
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            core::slice::from_ref(second),
+            SyncMode::default(),
+            SyncSchedule::Batched,
+            step,
+        )
+        .is_ok(),
+        "the file whose sync succeeded syncs again"
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            core::slice::from_ref(first),
+            SyncMode::default(),
+            SyncSchedule::Batched,
+            step,
+        )
+        .is_err(),
+        "the file whose sync failed does not"
     );
     Ok(())
 }
@@ -129,6 +187,7 @@ fn history_at_floor(floor: SeqNo) -> SuperVersions {
         SyncMode::Normal,
         7,
         1024 * 1024,
+        Arc::default(),
     )
 }
 
@@ -229,6 +288,7 @@ fn installed_history(fs: &dyn crate::fs::Fs) -> crate::Result<SuperVersions> {
         Arc::default(),
         None,
         SyncMode::Normal,
+        0,
     )?;
     Ok(SuperVersions::new(
         version,
@@ -236,6 +296,7 @@ fn installed_history(fs: &dyn crate::fs::Fs) -> crate::Result<SuperVersions> {
         SyncMode::Normal,
         0,
         1024 * 1024,
+        Arc::default(),
     ))
 }
 

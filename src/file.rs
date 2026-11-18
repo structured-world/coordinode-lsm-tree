@@ -46,6 +46,11 @@ pub const RESTORE_MARKER_FILE: &str = "restoring";
 /// on it.
 pub const REPAIR_TMP_SUFFIX: &str = ".repair-tmp";
 
+/// Suffix of a table set aside by an open: one of a synced flush that never
+/// returned and does not read whole. The engine reads it as no table of its
+/// own, so no sweep removes it.
+pub(crate) const TORN_FLUSH_SUFFIX: &str = ".torn-flush";
+
 /// The table id a `{id}.repair-tmp` name claims, or `None` for any other name.
 ///
 /// Only the EXACT shape is owned recovery state. A foreign name that merely

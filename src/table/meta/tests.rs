@@ -489,6 +489,76 @@ fn meta_items_with(extra: InternalValue) -> Vec<InternalValue> {
     items
 }
 
+/// [`valid_meta_items`] with every item of `extras` inserted, kept sorted.
+fn meta_items_with_all(extras: Vec<InternalValue>) -> Vec<InternalValue> {
+    let mut items: Vec<_> = valid_meta_items()
+        .into_iter()
+        .filter(|iv| !extras.iter().any(|e| e.key.user_key == iv.key.user_key))
+        .collect();
+    items.extend(extras);
+    items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+    items
+}
+
+/// A synced flush's mark parses whole, and each field a flush never writes
+/// so is refused: the number at `u64::MAX`, a place of another width, a floor
+/// on a table that does not finish the run, and a returned flush at or above
+/// the table's own. Guards against an open taking a damaged or forged mark
+/// for a flush it then installs or counts as returned.
+#[test]
+fn a_flush_mark_parses_and_its_impossible_fields_are_refused() {
+    let mark = |seq: u64, index: &[u8], run_len: Option<u32>, floor: Option<u64>, returned: u64| {
+        let mut items = vec![
+            meta("flush#seq", &seq.to_le_bytes()),
+            meta("flush#index", index),
+            meta("flush#returned", &returned.to_le_bytes()),
+        ];
+        if let Some(run_len) = run_len {
+            items.push(meta("flush#run_len", &run_len.to_le_bytes()));
+        }
+        if let Some(floor) = floor {
+            items.push(meta("flush#floor", &floor.to_le_bytes()));
+        }
+        load_meta_from_items(&meta_items_with_all(items))
+    };
+
+    let parsed = mark(7, &2u32.to_le_bytes(), Some(3), Some(40), 6).unwrap();
+    let Some(flush) = parsed.flush else {
+        panic!("the mark parses");
+    };
+    assert_eq!(
+        (
+            flush.seq,
+            flush.index,
+            flush.run_len,
+            flush.floor,
+            flush.returned_through
+        ),
+        (7, 2, Some(3), Some(40), 6)
+    );
+
+    for (case, result) in [
+        (
+            "number at u64::MAX",
+            mark(u64::MAX, &0u32.to_le_bytes(), Some(1), None, 0),
+        ),
+        ("place of 3 bytes", mark(7, &[0, 0, 0], Some(1), None, 0)),
+        (
+            "floor without the run's length",
+            mark(7, &0u32.to_le_bytes(), None, Some(4), 0),
+        ),
+        (
+            "returned at its own number",
+            mark(7, &0u32.to_le_bytes(), Some(1), None, 7),
+        ),
+    ] {
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "{case}: {result:?}"
+        );
+    }
+}
+
 /// A one-byte `descriptor#bulk_ingested` parses as the provenance flag.
 #[test]
 fn load_with_handle_bulk_ingested_byte_parses_as_flag() {

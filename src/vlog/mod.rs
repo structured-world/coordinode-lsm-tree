@@ -541,6 +541,57 @@ pub(crate) fn read_meta_and_frames(
     Ok((meta, frames))
 }
 
+/// Checks every frame `frames` places in `file` as stored, without decoding a
+/// payload: each frame's header and checksum, and the chunks of each head by
+/// its table. What an open checks of a blob file no manifest names before it
+/// takes it in: its trailer can reach the disk with frames that did not.
+///
+/// # Errors
+///
+/// The first frame's failure: a read fault, or damage.
+pub(crate) fn verify_frames(
+    file: &dyn crate::fs::FsFile,
+    frames: &blob_file::writer::FrameIndex,
+) -> crate::Result<()> {
+    use blob_file::frame::{FrameKind, check_chunk, check_frame, head_chunks};
+    let bytes_of = |at: usize| -> crate::Result<crate::Slice> {
+        let (Some(&from), Some(&to)) = (frames.get(at), frames.get(at + 1)) else {
+            return Err(crate::Error::InvalidHeader("BlobFile"));
+        };
+        let len = to
+            .checked_sub(from)
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+        Ok(crate::file::read_exact(file, from, len)?)
+    };
+    // The last start is the data end, not a frame.
+    let Some(count) = frames.len().checked_sub(1) else {
+        return Err(crate::Error::InvalidHeader("BlobFile"));
+    };
+    // The last frame the latest head's table lists.
+    let mut listed_through: Option<usize> = None;
+    for at in 0..count {
+        // A chunk is checked by its head's table; one no head lists would be
+        // read by nothing, so it is refused.
+        if frames.is_chunk(at) {
+            if listed_through.is_none_or(|last| at > last) {
+                return Err(crate::Error::InvalidHeader("BlobFile"));
+            }
+            continue;
+        }
+        let bytes = bytes_of(at)?;
+        let (header, _) = check_frame(&bytes)?;
+        if header.kind == FrameKind::Head {
+            let chunks = head_chunks(&bytes)?;
+            listed_through = Some(at + chunks.len());
+            for (n, spec) in chunks.iter().enumerate() {
+                check_chunk(spec, &bytes_of(at + 1 + n)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The dictionary a blob file stores of its own, when it does: the one the
 /// codec its metadata records names, since a dictionary's id is its
 /// content's.

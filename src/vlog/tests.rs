@@ -264,6 +264,41 @@ fn a_frame_index_off_the_data_section_is_unrecoverable() -> crate::Result<()> {
     Ok(())
 }
 
+/// A frame the index marks as a chunk though no head before it lists one is
+/// refused: skipped as a chunk, it would never be read, and the check would
+/// pass a file whose frame there is damaged. Guards against an index whose
+/// marks and heads disagree reaching the open unchecked.
+#[test]
+fn a_chunk_mark_no_head_lists_fails_the_frame_check() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::one_frame_each(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"a", 1, &[b'x'; 64])?;
+    writer.write(b"b", 2, &[b'y'; 64])?;
+    writer.finish()?;
+
+    let mut file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let (_, frames) = read_meta_and_frames(&mut file, 7)?;
+    verify_frames(&*file, &frames)?;
+    drop(file);
+
+    // The second frame rots, and an index marks it as a chunk of nothing.
+    let second = usize::try_from(frames.get(1).copied().unwrap_or_default()).unwrap_or_default();
+    let mut bytes = std::fs::read(&path)?;
+    if let Some(byte) = bytes.get_mut(second + 4) {
+        *byte ^= 0xFF;
+    }
+    std::fs::write(&path, &bytes)?;
+    let orphan = blob_file::writer::FrameIndex::new(frames.to_vec(), alloc::vec![1 << 1]);
+
+    let file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    assert!(
+        verify_frames(&*file, &orphan).is_err(),
+        "a marked frame no head lists is refused"
+    );
+    Ok(())
+}
+
 /// The views a tight-space relocation restricts a blob file to one after
 /// another punch only above what the view before finished, from the aligned
 /// edge under it, instead of the whole relocated prefix on every slice.

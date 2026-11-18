@@ -155,18 +155,35 @@ fn trees_on_one_medium_share_its_set() -> lsm_tree::Result<()> {
     };
     let first = config("/a", on_medium()).open()?;
     let second = config("/b", on_medium()).open()?;
+    let opened = stats.snapshot().origin(WriteOrigin::Metadata).created;
 
     fill(&first, 100, 0);
     first.flush_active_memtable(0)?;
-    let one = stats.snapshot().origin(WriteOrigin::FlushTable);
+    // The batch each flush reserves is made off its thread after it.
+    first.wait_for_table_file_refills();
+    let one = stats.snapshot();
     fill(&second, 100, 0);
     second.flush_active_memtable(0)?;
-    let both = stats.snapshot().origin(WriteOrigin::FlushTable);
+    second.wait_for_table_file_refills();
+    let both = stats.snapshot();
 
-    assert_eq!(one.created, 1);
-    assert_eq!(both.created, 2, "a table from each tree");
-    assert_eq!(both.bytes, 2 * one.bytes, "the same data written twice");
-    assert_eq!(both.bytes, both.installed);
+    let (one_table, both_tables) = (
+        one.origin(WriteOrigin::FlushTable),
+        both.origin(WriteOrigin::FlushTable),
+    );
+    assert!(one_table.bytes > 0);
+    assert_eq!(
+        both_tables.bytes,
+        2 * one_table.bytes,
+        "the same data written twice"
+    );
+    assert_eq!(both_tables.bytes, both_tables.installed);
+    // Each flush wrote its table into a file of the batch it made ahead, and
+    // both batches are counted in the one set.
+    let one_pool = one.origin(WriteOrigin::Metadata).created - opened;
+    let both_pool = both.origin(WriteOrigin::Metadata).created - opened;
+    assert!(one_pool > 0, "the first tree's batch");
+    assert_eq!(both_pool, 2 * one_pool, "a batch from each tree");
     Ok(())
 }
 
@@ -226,9 +243,10 @@ fn a_reopen_from_a_cloned_config_keeps_counting_once() -> lsm_tree::Result<()> {
         .since(&before)
         .expect("one counter set across the reopen");
     // The table may be a file the pool made before the reopen, so it is
-    // opened, not created.
+    // opened, not created: once to write it, and once by the install that
+    // syncs it beside the manifest edit.
     let flushed = delta.origin(WriteOrigin::FlushTable);
-    assert_eq!(flushed.opened, 1);
+    assert_eq!(flushed.opened, 2);
     assert!(
         flushed.bytes > 0,
         "the reopened tree writes through the set"
@@ -387,9 +405,11 @@ fn manifest_rotation_writes_snapshots_charged_to_the_manifest() -> lsm_tree::Res
     let (fs, stats) = counted(MemFs::new());
     let tree = config("/db", fs).manifest_log_rotate_bytes(1).open()?;
     let before = stats.snapshot();
+    // A flush writes no manifest: each persist of one is an install.
     for flush in 0..8u32 {
         tree.insert(format!("key{flush}"), "value", u64::from(flush));
         tree.flush_active_memtable(0)?;
+        tree.persist_flushes()?;
     }
 
     let rotated = stats.snapshot().since(&before).expect("one counter set");

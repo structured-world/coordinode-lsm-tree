@@ -57,13 +57,15 @@
 //! [retention_floor    : u64 LE]            (appended section, see below)
 //! [dict_count         : u32 LE]            (appended section, see below)
 //!   repeat: id u32 LE
+//! [flush_watermark    : u64 LE]            (appended section, see below)
 //! ```
 //!
-//! The three bracketed sections were appended after the format shipped and are
+//! The four bracketed sections were appended after the format shipped and are
 //! written only when they carry something: the blob frontiers when the list is
 //! non-empty, the retention floor when it changed in this edit, the dictionary
-//! ids when the registered set changed. A payload that ends before any of them
-//! decodes as "absent", so older edit logs replay unchanged.
+//! ids when the registered set changed, the flush watermark on every edit the
+//! engine writes now. A payload that ends before any of them decodes as
+//! "absent", so older edit logs replay unchanged.
 //!
 //! None of the three has a presence marker of its own, so they are positional
 //! and a later one is written only with every earlier one present: an edit
@@ -92,7 +94,7 @@ use std::io::{Read, Write};
 /// One table in a run: the snapshot's per-table record minus the positional
 /// level (the enclosing [`ChangedLevel`] carries the level explicitly).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableDesc {
+pub(crate) struct TableDesc {
     /// Table id.
     pub id: u64,
     /// XXH3-128 checksum of the table file.
@@ -109,7 +111,7 @@ pub struct TableDesc {
 /// the same order the snapshot persists it. An empty `runs` means the edit
 /// empties the level (e.g. a compaction drained it).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangedLevel {
+pub(crate) struct ChangedLevel {
     /// LSM level this layout replaces.
     pub level: u8,
     /// New run layout of the level: `runs[r]` is the tables of run `r`, in
@@ -119,7 +121,7 @@ pub struct ChangedLevel {
 
 /// A blob file added by an edit. Mirrors the snapshot's per-blob record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AddedBlobFile {
+pub(crate) struct AddedBlobFile {
     /// Blob file id.
     pub id: u64,
     /// XXH3-128 checksum of the blob file.
@@ -129,7 +131,7 @@ pub struct AddedBlobFile {
 /// The delta between two consecutive versions: what one flush / compaction
 /// changed. Applied in order on top of a snapshot during recovery.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VersionEdit {
+pub(crate) struct VersionEdit {
     /// Version id this edit produces (the prior version id + 1).
     pub new_version_id: u64,
     /// Levels this edit changed, each carrying its full new run layout.
@@ -171,6 +173,10 @@ pub struct VersionEdit {
     /// exactly as the restriction sets above: an edit that drops a dictionary
     /// has to be able to say the id is gone.
     pub dicts: Option<Vec<crate::file::DictId>>,
+    /// The highest synced-flush number the version decides (see
+    /// [`super::FlushSeqs`]), or `None` on an edit written before synced
+    /// flushes described themselves. Absolute, as the floor.
+    pub flush_watermark: Option<u64>,
 }
 
 /// `checksum_type` byte written for XXH3-128 (matches the snapshot encoder).
@@ -190,6 +196,13 @@ impl VersionEdit {
         if self.dicts.is_some() && self.retention_floor.is_none() {
             return Err(crate::Error::InvalidHeader(
                 "VersionEdit: dictionary ids without a retention floor",
+            ));
+        }
+        // The watermark is the fourth appended section, after the dictionary
+        // ids, so an edit carrying it states the floor and the set in full.
+        if self.flush_watermark.is_some() && self.dicts.is_none() {
+            return Err(crate::Error::InvalidHeader(
+                "VersionEdit: flush watermark without its dictionary ids",
             ));
         }
 
@@ -288,6 +301,9 @@ impl VersionEdit {
                 out.write_u32::<LittleEndian>(*id)?;
             }
         }
+        if let Some(watermark) = self.flush_watermark {
+            out.write_u64::<LittleEndian>(watermark)?;
+        }
         Ok(())
     }
 
@@ -298,7 +314,7 @@ impl VersionEdit {
     ///
     /// Returns an error if the edit carries dictionary ids without a retention
     /// floor (the positional sections cannot express that).
-    pub fn encode(&self, out: &mut Vec<u8>) -> crate::Result<()> {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) -> crate::Result<()> {
         out.clear();
         self.encode_payload(out)
     }
@@ -313,7 +329,11 @@ impl VersionEdit {
     /// payload is assembled before any of it reaches `writer`, so a refused
     /// edit emits no record.
     #[cfg(test)]
-    pub fn append_to<W: Write>(&self, writer: &mut W, scratch: &mut Vec<u8>) -> crate::Result<()> {
+    pub(crate) fn append_to<W: Write>(
+        &self,
+        writer: &mut W,
+        scratch: &mut Vec<u8>,
+    ) -> crate::Result<()> {
         self.encode(scratch)?;
         framing::write_frame(writer, scratch)
     }
@@ -326,7 +346,7 @@ impl VersionEdit {
     /// Returns [`crate::Error::InvalidHeader`] if the payload is truncated or a
     /// count exceeds the remaining bytes (a corrupt edit must surface, never
     /// silently mis-apply).
-    pub fn decode_payload(mut bytes: &[u8]) -> crate::Result<Self> {
+    pub(crate) fn decode_payload(mut bytes: &[u8]) -> crate::Result<Self> {
         const ERR: crate::Error = crate::Error::InvalidHeader("VersionEdit");
         let r = &mut bytes;
 
@@ -444,6 +464,19 @@ impl VersionEdit {
             Some(ids)
         };
 
+        // The flush watermark is the fourth appended section, under the same
+        // positional rule: written only after the dictionary ids. `u64::MAX`
+        // is no number a flush takes.
+        let flush_watermark = if r.is_empty() {
+            None
+        } else {
+            let watermark = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+            if watermark == u64::MAX {
+                return Err(ERR);
+            }
+            Some(watermark)
+        };
+
         // A well-formed edit consumes its payload exactly. Trailing bytes mean a
         // corrupt / mis-encoded record (format drift, not power loss — the
         // framing checksum already passed), so reject rather than silently
@@ -462,6 +495,7 @@ impl VersionEdit {
             blob_restrictions,
             retention_floor,
             dicts,
+            flush_watermark,
         })
     }
 }
@@ -516,7 +550,7 @@ fn tail_defect_kind(outcome: &framing::FramedRecordOutcome) -> &'static str {
 /// checksum-valid record fails to decode, or
 /// [`crate::Error::TornManifestEditLog`] when the trailing record is
 /// torn / bit-rotted / mis-framed and `mode` does not tolerate that defect.
-pub fn replay_edits<R: Read>(
+pub(crate) fn replay_edits<R: Read>(
     reader: &mut R,
     mode: crate::config::ManifestRecoveryMode,
 ) -> crate::Result<Vec<VersionEdit>> {

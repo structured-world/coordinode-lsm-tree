@@ -1,0 +1,268 @@
+use super::sync_on_ring;
+use crate::fs::{Fs, StdFs, SyncMode, SyncTarget, WriteOrigin};
+use std::io::Write;
+
+/// A ring that answers the sync opcode as unknown (`EINVAL`, `EOPNOTSUPP`:
+/// a partial `io_uring`) refuses the batch, for it to go another way; any
+/// other failure is the sync's own. Guards against every batch failing on a
+/// runtime that sets rings up and syncs nothing through them.
+#[test]
+fn only_an_unknown_opcode_refuses_the_ring() {
+    assert!(super::refuses_sync(libc::EINVAL));
+    assert!(super::refuses_sync(libc::EOPNOTSUPP));
+    assert!(!super::refuses_sync(libc::EIO));
+    assert!(!super::refuses_sync(libc::ENOSPC));
+}
+
+/// A sync that failed is the batch's error even when another target of the
+/// batch refused the opcode, in either order, and the refusal still turns the
+/// ring off for the thread; a refusal alone sends the batch another way.
+/// Guards against a refusal discarding a failed sync, whose retry through a
+/// new handle may not report the writeback error it consumed.
+#[test]
+fn a_failed_sync_outweighs_a_refusal_in_the_same_batch() {
+    use super::{Completions, NO_RING_SYNC, Through};
+
+    for results in [[-libc::EIO, -libc::EINVAL], [-libc::EINVAL, -libc::EIO]] {
+        NO_RING_SYNC.set(false);
+        let mut completions = Completions::default();
+        for (at, result) in results.into_iter().enumerate() {
+            completions.note(at, result);
+        }
+        let Err(e) = completions.outcome() else {
+            panic!("the failed sync is reported: {results:?}");
+        };
+        let eio = crate::io::Error::from(std::io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(e.error.to_string(), eio.to_string(), "{results:?}");
+        let failed_at = results
+            .iter()
+            .position(|&result| result == -libc::EIO)
+            .unwrap_or(usize::MAX);
+        assert_eq!(
+            e.spent,
+            [failed_at],
+            "only the failed sync is spent: {results:?}"
+        );
+        assert!(NO_RING_SYNC.get(), "the ring is off: {results:?}");
+    }
+
+    NO_RING_SYNC.set(false);
+    let mut refused = Completions::default();
+    for (at, result) in [0, -libc::EOPNOTSUPP].into_iter().enumerate() {
+        refused.note(at, result);
+    }
+    assert!(matches!(refused.outcome(), Ok(Through::Refused)));
+
+    let mut synced = Completions::default();
+    synced.note(0, 0);
+    assert!(matches!(synced.outcome(), Ok(Through::Synced)));
+    NO_RING_SYNC.set(false);
+}
+
+/// A batch of file and folder syncs goes through one ring and reports every
+/// one done: the path a synced flush takes on Linux.
+#[test]
+fn a_batch_of_files_and_folders_syncs_through_one_ring() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut paths = Vec::new();
+    for name in ["a", "b", "c"] {
+        let path = dir.path().join(name);
+        std::fs::File::create(&path)?.write_all(name.as_bytes())?;
+        paths.push(path);
+    }
+    let mut targets: Vec<SyncTarget<'_>> = paths
+        .iter()
+        .map(|path| SyncTarget::FileData {
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        })
+        .collect();
+    targets.push(SyncTarget::Folder {
+        path: dir.path(),
+        mode: SyncMode::Normal,
+    });
+    let Some(result) = sync_on_ring(&targets) else {
+        // A kernel that refuses io_uring has nothing to test here; the batch
+        // is synced on threads instead (see the next test).
+        return Ok(());
+    };
+    result?;
+    // The same batch through the backend, whichever way it syncs.
+    StdFs.sync_many(&targets)?;
+    Ok(())
+}
+
+/// A target that cannot be opened fails the batch with its own error, before
+/// anything is submitted: a missing file is reported missing, not synced.
+#[test]
+fn a_missing_file_fails_the_batch_with_not_found() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let present = dir.path().join("present");
+    std::fs::File::create(&present)?;
+    let missing = dir.path().join("missing");
+    let targets = [
+        SyncTarget::FileData {
+            path: &present,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        },
+        SyncTarget::FileData {
+            path: &missing,
+            origin: WriteOrigin::FlushBlob,
+            mode: SyncMode::Normal,
+        },
+    ];
+    let Some(result) = sync_on_ring(&targets) else {
+        return Ok(());
+    };
+    let Err(e) = result else {
+        panic!("a missing file was reported synced");
+    };
+    assert_eq!(e.error.kind(), crate::io::ErrorKind::NotFound);
+    assert!(e.spent.is_empty(), "nothing was synced");
+    Ok(())
+}
+
+/// Batches on one thread share its ring, a larger batch than the ring holds
+/// gets a larger one, and a batch after a failed one syncs on a ring that
+/// holds nothing of the failure: each reports its own result.
+#[test]
+fn batches_after_a_failure_and_a_larger_batch_still_sync() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<std::path::PathBuf> =
+        (0..20).map(|i| dir.path().join(format!("f{i}"))).collect();
+    for path in &paths {
+        std::fs::File::create(path)?.write_all(b"x")?;
+    }
+    fn target(path: &std::path::PathBuf) -> SyncTarget<'_> {
+        SyncTarget::FileData {
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        }
+    }
+    let small: Vec<SyncTarget<'_>> = paths.iter().take(2).map(target).collect();
+    let Some(first) = sync_on_ring(&small) else {
+        return Ok(());
+    };
+    first?;
+    let missing = dir.path().join("missing");
+    let present = dir.path().join("f0");
+    let failing = [target(&present), target(&missing)];
+    // A target that does not open was not synced: no sync is spent.
+    assert!(matches!(
+        sync_on_ring(&failing),
+        Some(Err(failure)) if failure.spent.is_empty()
+    ));
+    let large: Vec<SyncTarget<'_>> = paths.iter().map(target).collect();
+    assert!(matches!(sync_on_ring(&large), Some(Ok(()))));
+    assert!(matches!(sync_on_ring(&small), Some(Ok(()))));
+    Ok(())
+}
+
+/// A batch of more files than the process may hold open syncs: it goes to
+/// the ring in bounded chunks. Guards against a persist of many deferred
+/// flushes failing with `EMFILE` on every retry.
+#[test]
+fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
+    const FILES: usize = 400;
+    // The limit is the process's, and a harness may run other tests on its
+    // threads: the test lowers it only in a child of its own.
+    const CHILD: &str = "LSM_TREE_DESCRIPTOR_LIMIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = "fs::std_fs::ring_sync::tests::a_batch_larger_than_the_descriptor_limit_syncs";
+        let child = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", name])
+            .env(CHILD, "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "the child ran the test and it passed: {stdout}{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<std::path::PathBuf> = (0..FILES)
+        .map(|i| dir.path().join(format!("f{i}")))
+        .collect();
+    for path in &paths {
+        std::fs::File::create(path)?.write_all(b"x")?;
+    }
+    let targets: Vec<SyncTarget<'_>> = paths
+        .iter()
+        .map(|path| SyncTarget::FileData {
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        })
+        .collect();
+    // Room for what this process holds open and a chunk, not for the batch.
+    let open_now = std::fs::read_dir("/proc/self/fd")?.count() as u64;
+    let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
+    rlimit::setrlimit(rlimit::Resource::NOFILE, open_now + 128, hard)?;
+    let result = sync_on_ring(&targets);
+    rlimit::setrlimit(rlimit::Resource::NOFILE, soft, hard)?;
+    let Some(result) = result else {
+        return Ok(());
+    };
+    result?;
+    Ok(())
+}
+
+/// A sync the kernel refuses fails the batch with its own error, once every
+/// entry of the batch is reaped: `/dev/null` takes no data sync.
+#[test]
+fn a_sync_the_kernel_refuses_fails_the_batch() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("f");
+    std::fs::File::create(&file)?.write_all(b"x")?;
+    let null = std::path::Path::new("/dev/null");
+    let targets = [
+        SyncTarget::FileData {
+            path: &file,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        },
+        SyncTarget::FileData {
+            path: null,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        },
+    ];
+    let Some(result) = sync_on_ring(&targets) else {
+        return Ok(());
+    };
+    assert!(result.is_err(), "the refused sync is reported");
+    Ok(())
+}
+
+/// A folder target that names a file is refused, as
+/// `StdFs::sync_directory_with` refuses it: the ring path does not sync a
+/// file in place of the folder a caller meant to make durable.
+#[test]
+fn a_folder_target_naming_a_file_is_refused() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("file");
+    std::fs::File::create(&file)?;
+    let targets = [
+        SyncTarget::Folder {
+            path: &file,
+            mode: SyncMode::Normal,
+        },
+        SyncTarget::Folder {
+            path: dir.path(),
+            mode: SyncMode::Normal,
+        },
+    ];
+    let Some(result) = sync_on_ring(&targets) else {
+        return Ok(());
+    };
+    let Err(e) = result else {
+        panic!("a file was synced as a folder");
+    };
+    assert_eq!(e.error.kind(), crate::io::ErrorKind::InvalidInput);
+    Ok(())
+}
