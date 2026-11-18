@@ -991,14 +991,13 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
 pub(crate) struct Writeback {
     /// The bytes written between two requests, `0` for no requests.
     pub(crate) bytes: u64,
-    /// Set by a refused request, which may run on a worker; made with the
-    /// first request, so a writer that makes none allocates nothing.
-    #[cfg(feature = "std")]
-    refused: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
-    /// Set by a refused request: without `std` the writer makes each request
-    /// on the calling thread, so the flag needs no sharing.
-    #[cfg(not(feature = "std"))]
+    /// Set by a refused request made on the calling thread.
     refused: bool,
+    /// Set by a refused request made on a worker: made once the writer hands
+    /// its buffers to workers, so a writer that writes on its own thread
+    /// allocates nothing and touches no atomic.
+    #[cfg(feature = "std")]
+    refused_on_worker: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
 }
 
 impl Writeback {
@@ -1006,10 +1005,9 @@ impl Writeback {
     pub(crate) const fn every(bytes: u64) -> Self {
         Self {
             bytes,
-            #[cfg(feature = "std")]
-            refused: None,
-            #[cfg(not(feature = "std"))]
             refused: false,
+            #[cfg(feature = "std")]
+            refused_on_worker: None,
         }
     }
 
@@ -1036,8 +1034,26 @@ impl Writeback {
     ) -> crate::Result<()> {
         use core::sync::atomic::Ordering::Relaxed;
 
-        let refused = self.refused.get_or_insert_with(alloc::sync::Arc::default);
+        if self.refused {
+            self.bytes = 0;
+            return Ok(());
+        }
+        if writer.writes_here() {
+            // Made here, once what was written before it reached the file.
+            let refused = writer.with_inner(|file| file.start_writeback(offset, len))?;
+            if let Err(error) = refused {
+                log::warn!(
+                    "writeback hint refused, the file is written back by its final sync: {error}"
+                );
+                self.refused = true;
+            }
+            return Ok(());
+        }
+        let refused = self
+            .refused_on_worker
+            .get_or_insert_with(alloc::sync::Arc::default);
         if refused.load(Relaxed) {
+            self.refused = true;
             self.bytes = 0;
             return Ok(());
         }

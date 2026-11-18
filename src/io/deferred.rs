@@ -544,6 +544,13 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
         }
     }
 
+    /// Whether the writer writes on the caller's thread: [`Self::after_writes`]
+    /// then runs its job before it returns. Once it has taken on workers it
+    /// never writes here again.
+    pub(crate) const fn writes_here(&self) -> bool {
+        matches!(self.sink, Sink::Here(_))
+    }
+
     /// The bytes the lane holds, `0` for a writer without one.
     #[cfg(test)]
     fn queued_bytes(&self) -> usize {
