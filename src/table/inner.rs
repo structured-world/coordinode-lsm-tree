@@ -97,8 +97,8 @@ pub struct Inner {
     /// Held across each sync of a file a deferred flush wrote, so syncs of it
     /// run one at a time, and set once one failed. A sync through a new handle
     /// may not report the writeback error a failed one consumed (Linux reports
-    /// it once per file), so its success would prove nothing: the file is
-    /// never synced again. Kept with the file, which every record of it
+    /// it once per file), so its success would prove nothing: no later persist
+    /// barrier syncs or names the file. Kept with the file, which every record of it
     /// shares, so neither a record nor a failure allocates.
     pub(crate) sync_failed: SyncFailed,
 

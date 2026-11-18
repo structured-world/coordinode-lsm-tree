@@ -785,8 +785,8 @@ impl SuperVersions {
     ) -> crate::Result<()> {
         let persisted = self.persisted.clone();
         if !self.unsynced.is_empty() {
-            // Kept until the persist succeeds. A file whose sync failed is
-            // never synced again (see `UnsyncedFile::sync`).
+            // Kept until the persist succeeds. A file whose sync failed fails
+            // every later persist naming it (see `UnsyncedFile::sync`).
             Self::sync_files(&self.unsynced_named_by(next), self.sync_mode)?;
         }
         sync_new_table_directories(&persisted, next, tree_path, fs, self.sync_mode)?;
