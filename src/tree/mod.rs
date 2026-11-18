@@ -1493,13 +1493,13 @@ impl AbstractTree for Tree {
                 tables
                     .iter()
                     .cloned()
-                    .map(crate::version::UnsyncedFile::table)
+                    .map(crate::version::UnsyncedFile::Table)
                     .chain(
                         blob_files
                             .unwrap_or(&[])
                             .iter()
                             .cloned()
-                            .map(crate::version::UnsyncedFile::blob),
+                            .map(crate::version::UnsyncedFile::Blob),
                     )
                     .collect()
             });

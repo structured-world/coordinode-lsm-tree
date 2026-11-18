@@ -26,6 +26,7 @@ mod inner;
 pub(crate) use inner::PUNCH_ALIGN;
 #[cfg(test)]
 pub(crate) use inner::PUNCH_CHUNK;
+pub(crate) use inner::SyncFailed;
 pub(crate) mod iter;
 #[cfg(feature = "zstd")]
 pub(crate) mod lazy_block;
@@ -10122,6 +10123,7 @@ impl Table {
 
                 is_deleted: AtomicBool::default(),
                 entry_durable: AtomicBool::default(),
+                sync_failed: SyncFailed::new(false),
                 punch_on_drop: AtomicU64::new(u64::MAX),
                 punched_through: once_cell::race::OnceBox::new(),
 

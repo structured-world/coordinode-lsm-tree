@@ -144,30 +144,12 @@ use arc_swap::ArcSwap;
 
 use crate::path::Path;
 
-#[cfg(feature = "std")]
-use parking_lot::Mutex as SyncLock;
-#[cfg(not(feature = "std"))]
-use spin::Mutex as SyncLock;
-
 /// A file a deferred flush wrote and no sync has made durable yet: the
 /// install that persists the version naming it syncs it first. Held only
 /// until that install, which is also the one that drops a file a compaction
 /// consumed, so holding it keeps no file on disk longer.
 #[derive(Clone)]
-pub(crate) struct UnsyncedFile {
-    file: DeferredFile,
-    /// Held across each sync of the file, so syncs of it run one at a time,
-    /// and set once one failed. A sync through a new handle may not report
-    /// the writeback error a failed one consumed (Linux reports it once per
-    /// file), so its success would prove nothing: the file is never synced
-    /// again. Shared by every copy of this record, and made with it, so a
-    /// failure is recorded without allocating.
-    sync_failed: Arc<SyncLock<bool>>,
-}
-
-/// The file an [`UnsyncedFile`] names.
-#[derive(Clone)]
-enum DeferredFile {
+pub(crate) enum UnsyncedFile {
     /// A table.
     Table(crate::Table),
     /// A blob file.
@@ -175,34 +157,12 @@ enum DeferredFile {
 }
 
 impl UnsyncedFile {
-    /// A table a deferred flush wrote.
-    pub(crate) fn table(table: crate::Table) -> Self {
-        Self::of(DeferredFile::Table(table))
-    }
-
-    /// A blob file a deferred flush wrote.
-    pub(crate) fn blob(blob_file: crate::vlog::BlobFile) -> Self {
-        Self::of(DeferredFile::Blob(blob_file))
-    }
-
-    fn of(file: DeferredFile) -> Self {
-        Self {
-            file,
-            sync_failed: Arc::new(SyncLock::new(false)),
-        }
-    }
-
     /// The file's backend and path.
     fn location(&self) -> (&Arc<dyn Fs>, &Path) {
-        match &self.file {
-            DeferredFile::Table(table) => (&table.fs, &table.path),
-            DeferredFile::Blob(blob_file) => (&blob_file.0.fs, &blob_file.0.path),
+        match self {
+            Self::Table(table) => (&table.fs, &table.path),
+            Self::Blob(blob_file) => (&blob_file.0.fs, &blob_file.0.path),
         }
-    }
-
-    /// Whether the file is a blob file.
-    const fn is_blob(&self) -> bool {
-        matches!(self.file, DeferredFile::Blob(_))
     }
 
     /// Syncs the file's data and size, all a read of it needs.
@@ -210,13 +170,14 @@ impl UnsyncedFile {
     /// # Errors
     ///
     /// The error of the open or the sync. A failed sync fails every later
-    /// one of the file too; a failed open does not, as nothing was synced.
+    /// one of the file too (see `table::Inner::sync_failed`); a failed open
+    /// does not, as nothing was synced.
     fn sync(&self, sync_mode: SyncMode) -> crate::Result<()> {
-        let origin = match self.file {
-            DeferredFile::Table(_) => crate::fs::WriteOrigin::FlushTable,
-            DeferredFile::Blob(_) => crate::fs::WriteOrigin::FlushBlob,
+        let (origin, sync_failed) = match self {
+            Self::Table(table) => (crate::fs::WriteOrigin::FlushTable, &table.sync_failed),
+            Self::Blob(blob_file) => (crate::fs::WriteOrigin::FlushBlob, &blob_file.0.sync_failed),
         };
-        let mut failed = self.sync_failed.lock();
+        let mut failed = sync_failed.lock();
         if *failed {
             return Err(crate::Error::Io(crate::io::Error::other(
                 "a file a deferred flush wrote failed to sync, so no persist \
@@ -241,9 +202,9 @@ impl UnsyncedFile {
 
     /// Whether `other` is the same file.
     fn same(&self, other: &Self) -> bool {
-        match (&self.file, &other.file) {
-            (DeferredFile::Table(a), DeferredFile::Table(b)) => a.id() == b.id(),
-            (DeferredFile::Blob(a), DeferredFile::Blob(b)) => a.id() == b.id(),
+        match (self, other) {
+            (Self::Table(a), Self::Table(b)) => a.id() == b.id(),
+            (Self::Blob(a), Self::Blob(b)) => a.id() == b.id(),
             _ => false,
         }
     }
@@ -251,9 +212,9 @@ impl UnsyncedFile {
     /// Whether a version naming the tables `tables` and its blob files still
     /// names the file.
     fn named_by(&self, tables: &crate::HashSet<crate::TableId>, version: &Version) -> bool {
-        match &self.file {
-            DeferredFile::Table(table) => tables.contains(&table.id()),
-            DeferredFile::Blob(blob_file) => version.blob_files.get(blob_file.id()).is_some(),
+        match self {
+            Self::Table(table) => tables.contains(&table.id()),
+            Self::Blob(blob_file) => version.blob_files.get(blob_file.id()).is_some(),
         }
     }
 }
@@ -855,7 +816,7 @@ impl SuperVersions {
         let mut blob_folders: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
         for file in files {
             let (file_fs, path) = file.location();
-            if file.is_blob()
+            if matches!(file, UnsyncedFile::Blob(_))
                 && let Some(folder) = path.parent()
                 && !blob_folders
                     .iter()

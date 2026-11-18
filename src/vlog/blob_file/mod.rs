@@ -101,6 +101,10 @@ pub(crate) struct Inner {
     /// rest of the tree.
     pub(crate) fs: Arc<dyn Fs>,
 
+    /// Held across each sync of a file a deferred flush wrote, and set once
+    /// one failed. See `table::Inner::sync_failed`.
+    pub(crate) sync_failed: crate::table::SyncFailed,
+
     /// Tree-wide file-deletion gate. Installed once by
     /// [`BlobFile::install_deletion_pause`] after the file is registered
     /// with a tree. When `Some` and active, the [`Drop`] impl defers the

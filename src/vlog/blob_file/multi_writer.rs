@@ -996,6 +996,7 @@ impl MultiWriter {
                     lifetime_class: metadata.lifetime_class,
                 },
                 fs: fs.clone(),
+                sync_failed: crate::table::SyncFailed::new(false),
                 deletion_pause: once_cell::race::OnceBox::new(),
 
                 #[cfg(feature = "std")]

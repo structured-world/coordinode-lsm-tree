@@ -295,6 +295,7 @@ pub(crate) fn recover_blob_files(
                 file_accessor,
                 tree_id,
                 fs: fs.clone(),
+                sync_failed: crate::table::SyncFailed::new(false),
                 deletion_pause: once_cell::race::OnceBox::new(),
 
                 #[cfg(feature = "std")]
@@ -489,6 +490,7 @@ pub(crate) fn recover_blob_file_cached(
         file_accessor,
         tree_id,
         fs: fs.clone(),
+        sync_failed: crate::table::SyncFailed::new(false),
         deletion_pause: once_cell::race::OnceBox::new(),
 
         #[cfg(feature = "std")]
