@@ -4498,3 +4498,77 @@ fn tree_open_skips_a_lingering_heal_attestation() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// A heal whose write-back sync fails on a table a deferred flush wrote and no
+/// barrier synced yet keeps that table from being persisted. The failed sync
+/// consumed the file's writeback error (Linux reports it once per file), so a
+/// later barrier's sync through a new handle would succeed and name a table
+/// whose data may never have reached the disk.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn a_failed_heal_sync_of_a_deferred_table_is_never_acknowledged() -> crate::Result<()> {
+    use crate::config::FlushDurability;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let fault = std::sync::Arc::new(FaultFs::new(crate::fs::StdFs));
+    let injector = fault.injector();
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .flush_durability(FlushDurability::Deferred)
+    .with_shared_fs(fault)
+    .open()?
+    else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    for i in 0u64..2_000 {
+        tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+    }
+    tree.flush_active_memtable(2_000)?;
+    let (sst_path, block) = {
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        let keyed = table
+            .block_index
+            .iter()
+            .next()
+            .expect("table has at least one data block")
+            .expect("block index entry decodes");
+        (
+            (*table.path).clone(),
+            crate::table::BlockHandle::new(keyed.offset(), keyed.size()),
+        )
+    };
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+
+    injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+    assert!(
+        format!("{report:?}").contains("in-place parity rebuild sync"),
+        "the heal's write-back sync failed: {report:?}",
+    );
+
+    assert!(
+        tree.persist_flushes().is_err(),
+        "no barrier acknowledges a table whose heal sync failed",
+    );
+    Ok(())
+}

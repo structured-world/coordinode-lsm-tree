@@ -3084,6 +3084,25 @@ impl Table {
         Ok(tmp)
     }
 
+    /// Syncs a heal's write-back into this table's file under the lock of its
+    /// deferred sync state, recording a failure there: the failed sync consumed
+    /// the file's writeback error, so no later sync of it may be taken for
+    /// proof that a deferred flush's data reached the disk.
+    #[cfg(feature = "page_ecc")]
+    fn sync_heal_write_back(
+        &self,
+        file: &(impl crate::fs::FsFile + ?Sized),
+        sync_mode: crate::fs::SyncMode,
+    ) -> crate::io::Result<()> {
+        let mut failed = self.sync_failed.lock();
+        let synced = file.sync_data_with(sync_mode);
+        if synced.is_err() {
+            *failed = true;
+        }
+        drop(failed);
+        synced
+    }
+
     /// In-place ECC autoheal: like [`Self::scrub_data_blocks`], but PERSISTS each
     /// correction by writing the corrected block back at its existing offset
     /// (size-preserving) instead of scheduling a full-file healing rewrite.
@@ -3646,8 +3665,8 @@ impl Table {
                                 // later failure does not drop the attestation.
                                 write_attempted = true;
                                 let durable = match write_back {
-                                    Ok(()) => file
-                                        .sync_data_with(sync_mode)
+                                    Ok(()) => self
+                                        .sync_heal_write_back(&*file, sync_mode)
                                         .map_err(|e| alloc::format!("sync: {e}")),
                                     Err(e) => Err(alloc::format!("write: {e}")),
                                 };
@@ -3768,8 +3787,8 @@ impl Table {
                         // see `crate::scrub`'s marker-based reconcile.
                         write_attempted = true;
                         let durable = match write_back {
-                            Ok(()) => file
-                                .sync_data_with(sync_mode)
+                            Ok(()) => self
+                                .sync_heal_write_back(&*file, sync_mode)
                                 .map_err(|e| alloc::format!("sync: {e}")),
                             Err(e) => Err(alloc::format!("write: {e}")),
                         };

@@ -427,6 +427,42 @@ fn a_failed_table_sync_is_never_acknowledged() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A compaction that consumes a flush whose table failed to sync writes its
+/// output from what the tree reads, so it persists and survives a power loss,
+/// and later barriers succeed again. Guards against a sync failure blocking
+/// the tree for good rather than only the installs naming the failed file.
+#[test]
+fn a_compaction_consuming_a_failed_flush_persists_its_output() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = open(deferred(disk.fs()));
+    for (seqno, key) in [(0, "a"), (1, "b"), (2, "c")] {
+        tree.insert(key, "v", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    disk.fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncData,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path("tables")
+        .once(),
+    );
+    assert!(tree.persist_flushes().is_err(), "the barrier fails");
+
+    tree.major_compact(u64::MAX, 0)?;
+    assert_eq!(tree.table_count(), 1);
+    tree.insert("d", "v", 3);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let crash = disk.power_loss(tree);
+
+    let tree = open(deferred(Arc::new(crash)));
+    for key in ["a", "b", "c", "d"] {
+        assert_eq!(value(&tree, key).as_deref(), Some("v"), "{key}");
+    }
+    Ok(())
+}
+
 /// A compaction is durable on its own and persists the deferred flushes with
 /// it: one that consumed them leaves after a power loss its output and no
 /// trace of its inputs. Guards against a compaction edit written from the

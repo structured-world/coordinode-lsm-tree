@@ -171,7 +171,11 @@ impl UnsyncedFile {
     ///
     /// The error of the open or the sync. A failed sync fails every later
     /// one of the file too (see `table::Inner::sync_failed`); a failed open
-    /// does not, as nothing was synced.
+    /// does not, as nothing was synced. Every install whose version still
+    /// names the file therefore fails, a tight-space slice of the table
+    /// included: the slice keeps the table's id, so its restricted suffix is
+    /// the same unacknowledged data and reclaims nothing until a compaction
+    /// consumes the table or the tree reopens.
     fn sync(&self, sync_mode: SyncMode) -> crate::Result<()> {
         let (origin, sync_failed) = match self {
             Self::Table(table) => (crate::fs::WriteOrigin::FlushTable, &table.sync_failed),
