@@ -166,20 +166,44 @@ impl UnsyncedFile {
     }
 
     /// Syncs the file's data and size, all a read of it needs.
+    ///
+    /// # Errors
+    ///
+    /// The error of the open or the sync. A failed sync fails every later
+    /// one of the file too (see `table::Inner::sync_failed`); a failed open
+    /// does not, as nothing was synced. Every install whose version still
+    /// names the file therefore fails, a tight-space slice of the table
+    /// included: the slice keeps the table's id, so its restricted suffix is
+    /// the same unacknowledged data and reclaims nothing until a compaction
+    /// consumes the table or the tree reopens.
     fn sync(&self, sync_mode: SyncMode) -> crate::Result<()> {
-        let origin = match self {
-            Self::Table(_) => crate::fs::WriteOrigin::FlushTable,
-            Self::Blob(_) => crate::fs::WriteOrigin::FlushBlob,
+        let (origin, sync_failed) = match self {
+            Self::Table(table) => (crate::fs::WriteOrigin::FlushTable, &table.sync_failed),
+            Self::Blob(blob_file) => (crate::fs::WriteOrigin::FlushBlob, &blob_file.0.sync_failed),
         };
+        let mut failed = sync_failed.lock();
+        if *failed {
+            return Err(crate::Error::Io(crate::io::Error::other(
+                "a file a deferred flush wrote failed to sync, so no persist \
+                 can name it",
+            )));
+        }
         let (fs, path) = self.location();
+        // A failed open synced nothing: the file stays to sync again.
         let file = fs.open(
             path,
             &crate::fs::FsOpenOptions::new()
                 .write(true)
                 .write_origin(origin),
         )?;
-        crate::fs::FsFile::sync_data_with(&*file, sync_mode)?;
-        Ok(())
+        // The lock is held across the sync on purpose: a second sync of the
+        // file waits for this one's outcome rather than racing it. Latched
+        // first, so a sync that panics after consuming the error leaves it set.
+        *failed = true;
+        let synced = crate::fs::FsFile::sync_data_with(&*file, sync_mode);
+        *failed = synced.is_err();
+        drop(failed);
+        Ok(synced?)
     }
 
     /// Whether `other` is the same file.
@@ -761,8 +785,8 @@ impl SuperVersions {
     ) -> crate::Result<()> {
         let persisted = self.persisted.clone();
         if !self.unsynced.is_empty() {
-            // Kept until the persist succeeds: a failure leaves them for the
-            // next one to sync again.
+            // Kept until the persist succeeds. A file whose sync failed fails
+            // every later persist naming it (see `UnsyncedFile::sync`).
             Self::sync_files(&self.unsynced_named_by(next), self.sync_mode)?;
         }
         sync_new_table_directories(&persisted, next, tree_path, fs, self.sync_mode)?;

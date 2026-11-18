@@ -30,6 +30,15 @@ use core::sync::atomic::AtomicBool;
 use crate::path::PathBuf;
 use portable_atomic::AtomicU64;
 
+/// Whether a sync of a file a deferred flush wrote failed, locked across each
+/// sync of it.
+#[cfg(feature = "std")]
+pub(crate) type SyncFailed = parking_lot::Mutex<bool>;
+/// Whether a sync of a file a deferred flush wrote failed, locked across each
+/// sync of it.
+#[cfg(not(feature = "std"))]
+pub(crate) type SyncFailed = spin::Mutex<bool>;
+
 pub struct Inner {
     pub path: Arc<PathBuf>,
 
@@ -84,6 +93,14 @@ pub struct Inner {
     /// table was written into it (a pooled file), so the install that first
     /// names the table need not sync its folder.
     pub(crate) entry_durable: AtomicBool,
+
+    /// Held across each sync of a file a deferred flush wrote, so syncs of it
+    /// run one at a time, and set once one failed. A sync through a new handle
+    /// may not report the writeback error a failed one consumed (Linux reports
+    /// it once per file), so its success would prove nothing: no later persist
+    /// barrier syncs or names the file. Kept with the file, which every record of it
+    /// shares, so neither a record nor a failure allocates.
+    pub(crate) sync_failed: SyncFailed,
 
     /// Tight-space punch-on-drop offset, or [`u64::MAX`] (the default) for "no
     /// punch". When a tight-space compaction restricts a table to `[K, hi)`, the

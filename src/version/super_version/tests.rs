@@ -16,6 +16,74 @@ fn of_run_without_a_loss_or_a_filter_verdict_keeps() {
     ));
 }
 
+/// A deferred tree on a fault-injecting backend with one flush pending.
+fn deferred_tree_with_a_pending_flush(
+    fs: &Arc<crate::fs::FaultFs<crate::fs::MemFs>>,
+) -> crate::Result<crate::Tree> {
+    use crate::config::FlushDurability;
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+
+    let AnyTree::Standard(tree) = Config::new(
+        std::path::absolute("/db")?,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .flush_durability(FlushDurability::Deferred)
+    .open()?
+    else {
+        panic!("a standard tree");
+    };
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    Ok(tree)
+}
+
+/// A barrier that took the pending files before another one's sync of them
+/// failed does not acknowledge them by a sync of its own. Guards against
+/// concurrent barriers, each holding its copy of the list, one failing and
+/// the other then naming the file in a manifest through a new handle.
+#[test]
+fn a_barrier_holding_the_files_before_a_failed_sync_does_not_sync_them() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let tree = deferred_tree_with_a_pending_flush(&fs)?;
+    let held = tree.version_history.read().unsynced_files();
+
+    fs.injector()
+        .arm(FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other)).once());
+    assert!(tree.persist_flushes().is_err(), "the sync fails");
+    assert!(
+        SuperVersions::sync_files(&held, SyncMode::default()).is_err(),
+        "the other barrier's copy does not sync the file"
+    );
+    Ok(())
+}
+
+/// A barrier that could not open a pending file synced nothing, so the next
+/// one syncs and persists it. Guards against a transient failure to open
+/// (descriptors run out) being taken for a failed sync, which no retry
+/// could ever clear.
+#[test]
+fn a_file_that_could_not_be_opened_is_synced_by_the_next_barrier() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let tree = deferred_tree_with_a_pending_flush(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    assert!(tree.persist_flushes().is_err(), "the open fails");
+    tree.persist_flushes()?;
+    assert_eq!(tree.get_highest_persisted_seqno(), Some(0));
+    Ok(())
+}
+
 #[test]
 fn of_run_with_a_loss_below_the_watermark_reports_that_watermark() {
     assert!(matches!(

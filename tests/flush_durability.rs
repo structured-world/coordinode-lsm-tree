@@ -366,11 +366,11 @@ fn the_highest_seqno_never_goes_back_across_a_flush() -> lsm_tree::Result<()> {
     })
 }
 
-/// A barrier that fails leaves its flushes installed and pending, whether it
-/// fails syncing a table or writing the manifest after the tables are synced,
-/// and the next barrier persists them. Guards against a failed barrier
-/// forgetting a file it was to make durable, which a later barrier would then
-/// name in the manifest without syncing it.
+/// A barrier that fails writing the manifest after the tables are synced
+/// leaves its flushes installed and pending, and the next barrier persists
+/// them. Guards against a failed barrier forgetting a file it was to make
+/// durable, which a later barrier would then name in the manifest without
+/// syncing it.
 #[test]
 fn a_failed_barrier_leaves_its_flushes_for_the_next() -> lsm_tree::Result<()> {
     let disk = Disk::new();
@@ -378,25 +378,93 @@ fn a_failed_barrier_leaves_its_flushes_for_the_next() -> lsm_tree::Result<()> {
     tree.insert("a", "1", 0);
     tree.flush_active_memtable(0)?;
 
-    for (op, path) in [(FaultOp::SyncData, "tables"), (FaultOp::Write, "edits-")] {
-        disk.fs.injector().arm(
-            FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other))
-                .on_path(path)
-                .once(),
-        );
-        assert!(
-            tree.persist_flushes().is_err(),
-            "the barrier fails on {op:?}"
-        );
-        assert_eq!(value(&tree, "a").as_deref(), Some("1"), "still readable");
-        assert_eq!(tree.get_highest_persisted_seqno(), None, "still pending");
-    }
+    disk.fs.injector().arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(lsm_tree::io::ErrorKind::Other))
+            .on_path("edits-")
+            .once(),
+    );
+    assert!(tree.persist_flushes().is_err(), "the barrier fails");
+    assert_eq!(value(&tree, "a").as_deref(), Some("1"), "still readable");
+    assert_eq!(tree.get_highest_persisted_seqno(), None, "still pending");
     tree.persist_flushes()?;
     assert_eq!(tree.get_highest_persisted_seqno(), Some(0));
 
     let crash = disk.power_loss(tree);
     let tree = open(deferred(Arc::new(crash)));
     assert_eq!(value(&tree, "a").as_deref(), Some("1"));
+    Ok(())
+}
+
+/// A barrier that fails syncing a table leaves its flush installed and
+/// readable, and no later barrier acknowledges it: a sync through a new handle
+/// may not report the writeback error the failed one consumed. After a power
+/// loss the flush is gone, for the caller's journal to replay. Guards against
+/// a retry naming in the manifest a table whose data may never have reached
+/// the disk.
+#[test]
+fn a_failed_table_sync_is_never_acknowledged() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = open(deferred(disk.fs()));
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+
+    disk.fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncData,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path("tables")
+        .once(),
+    );
+    assert!(tree.persist_flushes().is_err(), "the barrier fails");
+    assert_eq!(value(&tree, "a").as_deref(), Some("1"), "still readable");
+    assert!(tree.persist_flushes().is_err(), "a retry fails too");
+    assert_eq!(tree.get_highest_persisted_seqno(), None, "never persisted");
+
+    let crash = disk.power_loss(tree);
+    let tree = open(deferred(Arc::new(crash)));
+    assert_eq!(value(&tree, "a"), None, "left to the caller's journal");
+    Ok(())
+}
+
+/// A compaction that consumes a flush whose table failed to sync writes its
+/// output from what the tree reads, so it persists and survives a power loss,
+/// and later barriers succeed again. Guards against a sync failure blocking
+/// the tree for good rather than only the installs naming the failed file.
+#[test]
+fn a_compaction_consuming_a_failed_flush_persists_its_output() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = open(deferred(disk.fs()));
+    for (seqno, key) in [(0, "a"), (1, "b"), (2, "c")] {
+        tree.insert(key, "v", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    disk.fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncData,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path("tables")
+        .once(),
+    );
+    assert!(tree.persist_flushes().is_err(), "the barrier fails");
+
+    tree.major_compact(u64::MAX, 0)?;
+    assert_eq!(tree.table_count(), 1);
+    assert_eq!(
+        tree.get_highest_persisted_seqno(),
+        Some(2),
+        "the compaction persists its output on its own"
+    );
+    tree.insert("d", "v", 3);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let crash = disk.power_loss(tree);
+
+    let tree = open(deferred(Arc::new(crash)));
+    for key in ["a", "b", "c", "d"] {
+        assert_eq!(value(&tree, key).as_deref(), Some("v"), "{key}");
+    }
     Ok(())
 }
 

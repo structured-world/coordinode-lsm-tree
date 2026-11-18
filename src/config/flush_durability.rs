@@ -21,7 +21,9 @@ pub enum FlushDurability {
     /// durable, so the syncs a flush would issue buy nothing until the caller
     /// wants to drop that part of its log. Every other install (a compaction,
     /// an ingestion, a drop) stays durable and persists the deferred flushes
-    /// with it, and so does a checkpoint and a tree that is dropped.
+    /// with it, and so does a checkpoint. A tree that is dropped persists them
+    /// when it can: a failure there is logged, not returned, and the flushes
+    /// it left out reopen as after a power loss.
     ///
     /// After a power loss the tree opens at the last persisted state: the
     /// tables of later flushes are named by no manifest and are removed on

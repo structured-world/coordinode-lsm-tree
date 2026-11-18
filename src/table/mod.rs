@@ -26,6 +26,7 @@ mod inner;
 pub(crate) use inner::PUNCH_ALIGN;
 #[cfg(test)]
 pub(crate) use inner::PUNCH_CHUNK;
+pub(crate) use inner::SyncFailed;
 pub(crate) mod iter;
 #[cfg(feature = "zstd")]
 pub(crate) mod lazy_block;
@@ -3083,6 +3084,34 @@ impl Table {
         Ok(tmp)
     }
 
+    /// Syncs a heal's write-back into this table's file under the lock of its
+    /// deferred sync state, recording a failure there: the failed sync consumed
+    /// the file's writeback error, so no later sync of it may be taken for
+    /// proof that a deferred flush's data reached the disk.
+    ///
+    /// A heal after a barrier synced the table needs no more: the flush's data
+    /// was durable by then, and a failed heal sync leaves the healed block in
+    /// its prior, still-correctable state, so a manifest naming the table
+    /// names data that is on disk.
+    #[cfg(feature = "page_ecc")]
+    fn sync_heal_write_back(
+        &self,
+        file: &(impl crate::fs::FsFile + ?Sized),
+        sync_mode: crate::fs::SyncMode,
+    ) -> crate::io::Result<()> {
+        let mut failed = self.sync_failed.lock();
+        // Latched first, so a sync that panics after consuming the error
+        // leaves it set; a success restores what it was.
+        let before = *failed;
+        *failed = true;
+        let synced = file.sync_data_with(sync_mode);
+        if synced.is_ok() {
+            *failed = before;
+        }
+        drop(failed);
+        synced
+    }
+
     /// In-place ECC autoheal: like [`Self::scrub_data_blocks`], but PERSISTS each
     /// correction by writing the corrected block back at its existing offset
     /// (size-preserving) instead of scheduling a full-file healing rewrite.
@@ -3645,8 +3674,8 @@ impl Table {
                                 // later failure does not drop the attestation.
                                 write_attempted = true;
                                 let durable = match write_back {
-                                    Ok(()) => file
-                                        .sync_data_with(sync_mode)
+                                    Ok(()) => self
+                                        .sync_heal_write_back(&*file, sync_mode)
                                         .map_err(|e| alloc::format!("sync: {e}")),
                                     Err(e) => Err(alloc::format!("write: {e}")),
                                 };
@@ -3767,8 +3796,8 @@ impl Table {
                         // see `crate::scrub`'s marker-based reconcile.
                         write_attempted = true;
                         let durable = match write_back {
-                            Ok(()) => file
-                                .sync_data_with(sync_mode)
+                            Ok(()) => self
+                                .sync_heal_write_back(&*file, sync_mode)
                                 .map_err(|e| alloc::format!("sync: {e}")),
                             Err(e) => Err(alloc::format!("write: {e}")),
                         };
@@ -10122,6 +10151,7 @@ impl Table {
 
                 is_deleted: AtomicBool::default(),
                 entry_durable: AtomicBool::default(),
+                sync_failed: SyncFailed::new(false),
                 punch_on_drop: AtomicU64::new(u64::MAX),
                 punched_through: once_cell::race::OnceBox::new(),
 
@@ -10340,6 +10370,11 @@ impl Table {
         if let Some(budget) = self.0.read_budget.get() {
             reopened.0.read_budget.get_or_init(|| Box::new(*budget));
         }
+        // The deferred-sync failure state is not carried: the view is installed
+        // by a persist that first syncs this file if a deferred flush left it
+        // unsynced (the view keeps its id), so no view of a file still waiting
+        // for its barrier sync is ever read, and a heal sync failing through
+        // it touches only data already durable.
         // The suffix keeps the share of the probe counts its data holds; the
         // slice outputs take the prefix's share from this view.
         if self.probe_stats().is_some() {
