@@ -549,7 +549,10 @@ pub(crate) fn copy_metadata(
     // A repair report the source still owes describes losses in the data
     // just linked, so the checkpoint owes it too: it rides in the version.
     // The checkpoint holds only the tables its version names: no flush above
-    // the ones they carry has a table in it.
+    // the ones they carry has a table in it. A watermark of 0 leaves no flush
+    // undecided either: an open starts its flush numbers above the highest one
+    // a table of its version carries, so the first manifest it writes decides
+    // every copied flush.
     crate::version::persist_version(
         target_root,
         version,
