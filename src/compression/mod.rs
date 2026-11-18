@@ -267,8 +267,11 @@ impl ZstdDictionary {
     /// Returns the shared pre-parsed `DictionaryHandle`, parsing on first call
     /// and reusing the cached handle on every subsequent call (across threads).
     ///
-    /// Borrowed: a frame decoder is handed it for each frame it decodes, which
-    /// costs no refcount bump.
+    /// Borrowed: a frame decoder is handed it for each frame it decodes. A
+    /// decoder keeps a reference to the dictionary it last decoded with, so a
+    /// frame under that same dictionary costs no refcount bump, and a frame
+    /// under another one costs one clone of the new handle (and the release
+    /// of the old).
     ///
     /// On the first call we attempt finalized-dict parsing (magic bytes
     /// `37 A4 30 EC`); buffers without that prefix are treated as raw-content

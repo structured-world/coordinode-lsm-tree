@@ -78,28 +78,33 @@ fn bench_decompress_with_dict(c: &mut Criterion) {
     });
 
     // Dictionary switches: each read decodes under another dictionary than
-    // the read before it, all parsed before timing starts.
-    let plaintext = b"hello world hello world hello world";
+    // the read before it, all parsed before timing starts. Each frame holds
+    // its own dictionary's content, so it decodes only from that history.
     for count in [4usize, 16] {
-        let pairs: Vec<(ZstdDictionary, Vec<u8>)> = (0..count)
+        let triples: Vec<(ZstdDictionary, Vec<u8>, usize)> = (0..count)
             .map(|i| {
-                let dict = ZstdDictionary::new(
-                    format!("raw content dictionary {i:02}: hello world").as_bytes(),
-                );
-                let frame = Backend::compress_with_dict(plaintext, 3, &dict, true)
+                let content = format!("raw content dictionary {i:02}: hello world").into_bytes();
+                let dict = ZstdDictionary::new(&content);
+                let frame = Backend::compress_with_dict(&content, 3, &dict, true)
                     .expect("compression failed");
-                Backend::decompress_with_dict(&frame, &dict, PLAINTEXT_LEN)
+                let plain = Backend::compress(&content, 3, true).expect("plain compression failed");
+                assert!(
+                    frame.len() < plain.len(),
+                    "frame {i} must draw on its dictionary"
+                );
+                let back = Backend::decompress_with_dict(&frame, &dict, content.len())
                     .expect("pre-warm decompression failed");
-                (dict, frame)
+                assert_eq!(back, content, "frame {i} must decode to its content");
+                (dict, frame, content.len())
             })
             .collect();
-        let mut next = pairs.iter().cycle();
+        let mut next = triples.iter().cycle();
         let mut read = || {
-            let (dict, frame) = next.next().expect("a cycle never ends");
+            let (dict, frame, len) = next.next().expect("a cycle never ends");
             Backend::decompress_with_dict(
                 std::hint::black_box(frame),
                 std::hint::black_box(dict),
-                PLAINTEXT_LEN,
+                *len,
             )
             .expect("decompression failed")
         };
@@ -111,7 +116,12 @@ fn bench_decompress_with_dict(c: &mut Criterion) {
             ran = true;
             b.iter(&mut read);
         });
-        if ran {
+        // Criterion measures only under `--bench` (what `cargo bench` passes)
+        // without `--test`; otherwise each routine runs once as a smoke test,
+        // which the tail-latency pass would turn into a million reads.
+        let measuring = std::env::args().any(|arg| arg == "--bench")
+            && !std::env::args().any(|arg| arg == "--test");
+        if ran && measuring {
             // Run once Criterion is done with the arm, so the samples are the
             // steady state it measured and not its warm-up.
             let samples = (0..PCT_SAMPLES)

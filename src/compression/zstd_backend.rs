@@ -354,6 +354,12 @@ impl CompressionProvider for ZstdProvider {
         let mut output = vec![0; capacity];
         let written = Self::decompress_with_dict_into(data, dict, &mut output)?;
         output.truncate(written);
+        // `capacity` is a limit, not a size: a frame far below it gives the
+        // rest back, so the result holds no more than a Vec grown to it would.
+        // A limit near the frame's size keeps its buffer without a realloc.
+        if output.capacity() / 2 > written {
+            output.shrink_to_fit();
+        }
         Ok(output)
     }
 }
@@ -396,6 +402,15 @@ impl ZstdProvider {
         dict: &crate::compression::ZstdDictionary,
         dest: &mut [u8],
     ) -> crate::Result<usize> {
+        // No bytes are no frame: the whole-input decode would take them for
+        // zero frames and return nothing, where even an empty plaintext's
+        // frame has a header.
+        if data.is_empty() {
+            return Err(crate::Error::Decompress(crate::CompressionType::ZstdDict {
+                level: 0,
+                dict_id: dict.frame_id(),
+            }));
+        }
         let handle = dict.prepared_handle()?;
         // A raw-content dictionary's frames carry the synthetic id it was
         // compressed under; a finalized one's carry the id of its header,

@@ -672,6 +672,79 @@ fn decompress_with_dict_into_a_buffer_too_small_returns_error() {
     );
 }
 
+/// A frame of `PLAINTEXT` in one raw block, naming `dict`'s frame id and
+/// declaring no content size: only the block it decodes tells its length.
+fn raw_block_frame_without_content_size(dict: &ZstdDictionary) -> Vec<u8> {
+    let block_size = u32::try_from(PLAINTEXT.len()).expect("small plaintext");
+    // Last block, raw, `PLAINTEXT.len()` bytes.
+    let block_header = (block_size << 3) | 1;
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
+    // No content size, not single-segment, no checksum, a 4-byte dictionary
+    // id; then the smallest window (1 KiB).
+    frame.extend_from_slice(&[0x03, 0x00]);
+    frame.extend_from_slice(&dict.frame_id().to_le_bytes());
+    frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    frame.extend_from_slice(PLAINTEXT);
+    frame
+}
+
+#[test]
+fn decompress_with_dict_into_undeclared_size_outgrowing_dest_returns_error() {
+    // The frame declares no content size, so the header cannot refuse the
+    // destination: the limit has to hold while its block decodes.
+    let dict = ZstdDictionary::new(b"raw content dict for an undeclared frame size");
+    let frame = raw_block_frame_without_content_size(&dict);
+
+    let mut fits = vec![0u8; PLAINTEXT.len()];
+    let written = ZstdProvider::decompress_with_dict_into(&frame, &dict, &mut fits)
+        .expect("the frame decodes into a buffer of its size");
+    assert_eq!(&fits[..written], PLAINTEXT);
+
+    let mut too_small = [0u8; 5];
+    let result = ZstdProvider::decompress_with_dict_into(&frame, &dict, &mut too_small);
+    assert!(
+        matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
+        "a block outgrowing the destination must be refused; got {result:?}",
+    );
+}
+
+#[test]
+fn decompress_with_dict_small_frame_under_large_limit_keeps_no_slack() {
+    // The limit bounds the output, it does not size the result: a 35-byte
+    // frame decoded under a 1 MiB limit must not hand back a 1 MiB buffer.
+    let dict = ZstdDictionary::new(b"raw content dict for a large decode limit");
+    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict, true).expect("compress");
+
+    let out = ZstdProvider::decompress_with_dict(&compressed, &dict, 1 << 20).expect("decompress");
+    assert_eq!(out, PLAINTEXT);
+    assert!(
+        out.capacity() <= 2 * PLAINTEXT.len(),
+        "result keeps {} bytes for {} of output",
+        out.capacity(),
+        PLAINTEXT.len(),
+    );
+}
+
+#[test]
+fn decompress_with_dict_empty_input_returns_error() {
+    // No bytes hold no frame, so there is nothing to decode: an empty input
+    // is refused like a truncated header, not taken for an empty plaintext
+    // (whose frame is not empty).
+    let dict = ZstdDictionary::new(b"raw content dict for an empty input");
+
+    let result = ZstdProvider::decompress_with_dict(&[], &dict, 0);
+    assert!(
+        result.is_err(),
+        "empty input must be refused; got {result:?}"
+    );
+
+    let result = ZstdProvider::decompress_with_dict_into(&[], &dict, &mut []);
+    assert!(
+        result.is_err(),
+        "empty input must be refused; got {result:?}"
+    );
+}
+
 #[test]
 fn decompress_into_rejects_frame_larger_than_dest() {
     let raw = vec![7u8; 4096];
