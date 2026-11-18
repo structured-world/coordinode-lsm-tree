@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794967078591,
+  "lastUpdate": 1795029494909,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103642,6 +103642,90 @@ window.BENCHMARK_DATA = {
             "value": 217454.4145825713,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 18.1us | P99.9: 213.0us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c5318e0480d7ddcc8c41eba3c7d0758fc4f34448",
+          "message": "fix(persist): never acknowledge a deferred file whose sync failed (#1086)\n\n## Summary\n\n- A failed sync of a deferred flush's file is never acknowledged by a\nlater persist. Linux reports a file's writeback error once, so a retry\nthrough a new handle could succeed with the data never on disk and write\na manifest naming the table.\n\n## Changes\n\n- Each table and blob file keeps one sync state, shared by every record\nof it: a lock held across each sync of a file a deferred flush wrote, so\nconcurrent barriers sync it one at a time, and a flag a failed sync sets\nin place. Neither a pending record nor a failure allocates. A sync\nfinding the flag set fails; so does every later persist and checkpoint\nnaming the file. A compaction that consumes the file lifts it, and a\nreopen leaves the flush out for the caller's journal to replay.\n- A Page-ECC heal's write-back sync of a table goes through the same\nlock and records its failure the same way.\n- A failure to open the file syncs nothing and is retried by the next\nbarrier, as is a failed manifest write after the files were synced.\n- `persist_flushes` and `FlushDurability::Deferred` document when a\nfailed file stops blocking persists (it leaves the tree, or the tree\nreopens) and that a drop persists only when it can.\n\n## Testing\n\nThe full suite with all features, clippy (default, all features and for\nLinux), formatting, docs and the no-std check pass locally on macOS;\nLinux and Windows run in CI.\n\nCloses #1085\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* A failed file sync is no longer treated as successful by later\npersistence attempts that include that file; those attempts continue to\nfail until the file leaves the tree or the tree is reopened.\n* Flushes remain readable after a sync failure. Compaction can persist\nits output, while flushes still pending when the tree is reopened are\nhandled as after a power loss.\n* Manifest-write failures remain retryable on a later persistence\nattempt.\n\n* **Documentation**\n* Clarified how deferred flushes are handled when persistence fails or\nthe tree is dropped.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-18T19:58:07+02:00",
+          "tree_id": "767202334839070c2d03c95cc532e1240a4e4239",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c5318e0480d7ddcc8c41eba3c7d0758fc4f34448"
+        },
+        "date": 1795029493377,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 143852.1709899997,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 19.3us | P99.9: 36.8us\nthreads: 1 | elapsed: 3.72s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3058715.297670579,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 920094.7149179915,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 499305.6730206826,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.6us | P99.9: 22.6us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2748334.337620506,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 12.4us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 325267.7158626795,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 8.1us | P99.9: 21.4us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 192985.0004444396,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.9us | P99.9: 21.0us\nthreads: 1 | elapsed: 1.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 892611.9495273823,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.1us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1045932.064787877,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 1.6us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 363500.0788649771,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 12.2us | P99.9: 83.3us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
           }
         ]
       }
