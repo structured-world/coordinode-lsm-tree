@@ -779,9 +779,12 @@ pub(crate) fn run_checkpoint<T: AbstractTree>(
     // fragile bytes: they are synced first. Read with the version, so a flush
     // installed in between cannot be named and missed, and a compaction that
     // consumes one later cannot take it off the list before the sync.
-    let (version, unsynced) = params.source.current_version_and_unsynced();
-    if !unsynced.is_empty() {
-        crate::version::SuperVersions::sync_files(&unsynced, sync_mode)?;
+    let (version, unsynced) = params.source.current_version_and_unsynced()?;
+    if !unsynced.is_empty()
+        && let Err(e) = crate::version::SuperVersions::sync_files(&unsynced, sync_mode)
+    {
+        params.source.mark_sync_failed(&unsynced);
+        return Err(e);
     }
 
     // Reflink the snapshot files when the live config opts in (default) and

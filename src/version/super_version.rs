@@ -335,6 +335,12 @@ pub struct SuperVersions {
     /// has made durable: the persist that next names them syncs them first.
     unsynced: Vec<UnsyncedFile>,
 
+    /// The files of `unsynced` a sync failed on. A later sync through a new
+    /// handle may not report the writeback error the failed one consumed
+    /// (Linux reports it once per file), so its success proves nothing: no
+    /// persist names them again.
+    sync_failed: Vec<UnsyncedFile>,
+
     /// Stable comparator identity persisted in every version file.
     comparator_name: Arc<str>,
 
@@ -469,6 +475,7 @@ impl SuperVersions {
             current: initial,
             persisted: version,
             unsynced: Vec::new(),
+            sync_failed: Vec::new(),
             comparator_name,
             sync_mode,
             snapshot_id,
@@ -761,9 +768,14 @@ impl SuperVersions {
     ) -> crate::Result<()> {
         let persisted = self.persisted.clone();
         if !self.unsynced.is_empty() {
-            // Kept until the persist succeeds: a failure leaves them for the
-            // next one to sync again.
-            Self::sync_files(&self.unsynced_named_by(next), self.sync_mode)?;
+            // Kept until the persist succeeds. A failed sync leaves them
+            // unacknowledged for good: no later sync can vouch for them.
+            let named = self.unsynced_named_by(next);
+            self.refuse_sync_failed(&named)?;
+            if let Err(e) = Self::sync_files(&named, self.sync_mode) {
+                self.mark_sync_failed(&named);
+                return Err(e);
+            }
         }
         sync_new_table_directories(&persisted, next, tree_path, fs, self.sync_mode)?;
         // Outputs are kept only while the next persist rotates, which removes
@@ -786,6 +798,8 @@ impl SuperVersions {
             manifest_mode,
         )?;
         self.unsynced.clear();
+        // The failed files left are named by no version on disk from here.
+        self.sync_failed.clear();
         self.persisted = next.clone();
         Ok(())
     }
@@ -881,6 +895,33 @@ impl SuperVersions {
             .filter(|file| file.named_by(&tables, version))
             .cloned()
             .collect()
+    }
+
+    /// Records that a sync of `files` failed: no persist names them after it.
+    pub(crate) fn mark_sync_failed(&mut self, files: &[UnsyncedFile]) {
+        for file in files {
+            if !self.sync_failed.iter().any(|failed| failed.same(file)) {
+                self.sync_failed.push(file.clone());
+            }
+        }
+    }
+
+    /// Refuses `files` when a sync failed on one of them.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error naming the failed sync.
+    pub(crate) fn refuse_sync_failed(&self, files: &[UnsyncedFile]) -> crate::Result<()> {
+        if files
+            .iter()
+            .any(|file| self.sync_failed.iter().any(|failed| failed.same(file)))
+        {
+            return Err(crate::Error::Io(crate::io::Error::other(
+                "a file a deferred flush wrote failed to sync, so no persist \
+                 can name it",
+            )));
+        }
+        Ok(())
     }
 
     /// Takes `synced`, which [`Self::sync_files`] made durable, off the files
