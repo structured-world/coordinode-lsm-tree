@@ -1286,10 +1286,13 @@ impl Block {
                     });
                 }
 
-                // SAFETY: as for zstd above: the decoder refuses an offset
-                // reaching past what it wrote and the dictionary's history, so
-                // it never reads an unwritten position; the length equality
-                // below rejects a short fill.
+                // SAFETY: as for zstd above. The decoder is the only one with
+                // the buffer until it is frozen, and it reads back only what it
+                // wrote: a match reaching past its output is served from the
+                // dictionary's history, or refused when that is too short. The
+                // length equality below drops a short fill unread, so every
+                // byte of the frozen Slice was written. Zero-filling the buffer
+                // first would add a memset of the whole block to every read.
                 #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                 let mut builder =
                     unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
