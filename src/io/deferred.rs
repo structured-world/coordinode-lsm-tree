@@ -141,39 +141,41 @@ impl<W: Write> Lane<W> {
         };
         state.draining = true;
         let mut panicked = false;
+        // What is queued behind a failure is not run: the file is the
+        // caller's to remove. It is dropped once the lane is released, as the
+        // writer after a panic is below.
+        let mut discarded = VecDeque::new();
         loop {
+            if state.failed.is_some() {
+                discarded = core::mem::take(&mut state.queue);
+                state.queued_bytes = 0;
+                break;
+            }
             let Some(job) = state.queue.pop_front() else {
                 break;
             };
-            let failed = state.failed.is_some();
             if let Job::Write(buf) = &job {
                 state.queued_bytes -= buf.len();
             }
             drop(state);
             self.progress.notify_all();
-            // What is queued behind a failure is dropped: the file is the
-            // caller's to remove.
             let mut emptied = None;
-            let result = if failed {
-                Ok(())
-            } else {
-                std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| match job {
-                    Job::Write(mut buf) => {
-                        let result = inner.write_all(&buf);
-                        buf.clear();
-                        emptied = Some(buf);
-                        result
-                    }
-                    Job::Run(run) => {
-                        run(&mut inner);
-                        Ok(())
-                    }
-                }))
-                .unwrap_or_else(|_| {
-                    panicked = true;
-                    Err(io::Error::other("the file's writer panicked"))
-                })
-            };
+            let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| match job {
+                Job::Write(mut buf) => {
+                    let result = inner.write_all(&buf);
+                    buf.clear();
+                    emptied = Some(buf);
+                    result
+                }
+                Job::Run(run) => {
+                    run(&mut inner);
+                    Ok(())
+                }
+            }))
+            .unwrap_or_else(|_| {
+                panicked = true;
+                Err(io::Error::other("the file's writer panicked"))
+            });
             state = self.lock();
             if let Err(e) = result
                 && state.failed.is_none()
@@ -186,29 +188,31 @@ impl<W: Write> Lane<W> {
             {
                 state.spare.push(buf);
             }
-            if panicked {
-                state.queue.clear();
-                state.queued_bytes = 0;
-                break;
-            }
         }
         // A writer that panicked is called no more, not even to be dropped
-        // under the lock. The lane is released before it is dropped, and a
-        // panic of its drop stays here: a drain left marked would hold every
-        // later call waiting on a drainer that is gone.
-        if panicked {
-            state.draining = false;
-            drop(state);
-            self.progress.notify_all();
-            if std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| drop(inner))).is_err() {
-                log::warn!("a file's writer panicked again when dropped");
-            }
-            return;
-        }
-        state.inner = Some(inner);
+        // under the lock. The lane is released before it and the discarded
+        // jobs are dropped, and a panic of either drop stays here: a drain
+        // left marked would hold every later call waiting on a drainer that
+        // is gone.
+        let inner = if panicked {
+            Some(inner)
+        } else {
+            state.inner = Some(inner);
+            None
+        };
         state.draining = false;
         drop(state);
         self.progress.notify_all();
+        if let Some(inner) = inner
+            && std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| drop(inner))).is_err()
+        {
+            log::warn!("a file's writer panicked again when dropped");
+        }
+        if !discarded.is_empty()
+            && std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| drop(discarded))).is_err()
+        {
+            log::warn!("a job a failed file's writer did not run panicked when dropped");
+        }
     }
 
     /// Waits until the lane is empty and no thread drains it, draining it
@@ -408,6 +412,9 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
             return Err(failed.error());
         }
         *panicked = true;
+        // `write_all`, not `write` with the accepted count: a failure latches
+        // and every later call returns it, so a prefix the inner writer took
+        // is never continued and reporting it would change nothing.
         let result = inner.write_all(data);
         *panicked = false;
         if let Err(e) = &result {

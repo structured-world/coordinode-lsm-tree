@@ -609,6 +609,55 @@ fn a_writer_panicking_again_when_dropped_leaves_the_lane_idle() {
     assert!(failed, "the file stays failed");
 }
 
+/// A job a failed lane drops without running whose drop panics leaves the
+/// lane released: a later call returns the failure. Guards against a drop of
+/// a discarded job unwinding out of a drain still marked, which holds every
+/// later call waiting on a drainer that is gone. Both ways a lane discards a
+/// job: behind a failed write, and behind a job that panicked.
+#[test]
+fn a_discarded_job_whose_drop_panics_leaves_the_lane_released() {
+    /// Panics when dropped.
+    struct Bomb;
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("a discarded job's capture panics when dropped");
+        }
+    }
+
+    for behind_a_panic in [false, true] {
+        let sink = Sink {
+            fail_past: (!behind_a_panic).then_some(0),
+            ..Sink::default()
+        };
+        let mut out = DeferredWriter::with_capacity(8, sink, true);
+        // Workers that never run: the caller's next call drains the lane.
+        out.use_spawner_now(Arc::new(Never::default()));
+        drop(out.write_all(&[7; 8]));
+        if behind_a_panic {
+            drop(out.after_writes(|_| panic!("a job panics")));
+        }
+        let bomb = Bomb;
+        drop(out.after_writes(move |_| {
+            core::hint::black_box(&bomb);
+        }));
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let first =
+                std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.with_inner(|_| ())));
+            let second = out.with_inner(|_| ());
+            let _ = finished.send((first.is_ok(), second.is_err()));
+        });
+        let Ok((returned, failed)) = done.recv_timeout(Duration::from_secs(10)) else {
+            panic!("the lane hangs after a discarded job's drop panicked: {behind_a_panic}");
+        };
+        assert!(
+            returned,
+            "the drop's panic stays in the drain: {behind_a_panic}"
+        );
+        assert!(failed, "the file stays failed: {behind_a_panic}");
+    }
+}
+
 /// A panic of a call on the inner writer (a flush, a seek), which the caller
 /// caught, fails the file wherever the writer is: no later call reaches the
 /// writer and answers as if the file were whole.
