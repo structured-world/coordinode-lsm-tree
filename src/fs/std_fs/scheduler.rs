@@ -54,6 +54,10 @@ fn block_device(folder: &Path) -> Option<u64> {
     // As bytes: a mount point anywhere in the table may hold a byte that is
     // not UTF-8, which proc(5) writes as it is.
     let mountinfo = read_bytes(Path::new("/proc/self/mountinfo"))?;
+    // The one device the mount names. A file system over several (Btrfs
+    // names one member, bcachefs lists them joined by `:`) is judged by that
+    // one or answers no: schedulers mixed inside one file system are rare,
+    // and a wrong no only leaves the batch policy off, never data at risk.
     let source = mount_source(&mountinfo, mount)?;
     Some(fs::metadata(source).ok()?.rdev())
 }
