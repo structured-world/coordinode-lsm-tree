@@ -21,6 +21,7 @@ pub(crate) mod edit_log;
 // not increase", and adding a feature gate here increases it. So
 // gating `framing` only pays off once its callers no longer need
 // `std::io` either.
+mod flush_seqs;
 mod framing;
 // std-only: a shard per thread needs `thread_local!`.
 // no-std: inserts keep the version-history read lock (`Tree::append_entry`).
@@ -35,11 +36,14 @@ mod super_version;
 mod tests;
 
 pub(crate) use blob_file_list::BlobFileList;
+pub(crate) use flush_seqs::FlushSeqs;
 pub(crate) use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
 pub(crate) use run::Run;
 pub(crate) use super_version::RetentionEffect;
 pub(crate) use super_version::SnapshotRef;
-pub(crate) use super_version::{SuperVersion, SuperVersions, UnsyncedFile};
+pub(crate) use super_version::{
+    FlushFile, NewFiles, SuperVersion, SuperVersions, UnsyncedFile, flush_other_devices,
+};
 
 use crate::TreeType;
 use crate::blob_tree::{FragmentationEntry, FragmentationMap};
@@ -1498,10 +1502,20 @@ impl Version {
 }
 
 impl Version {
+    /// The highest synced-flush number a table of this version carries
+    /// (`0` when none does).
+    pub(crate) fn highest_flush_seq(&self) -> u64 {
+        self.iter_tables()
+            .filter_map(|table| table.metadata.flush.map(|mark| mark.seq))
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(crate) fn encode_into(
         &self,
         writer: &mut crate::manifest_blocks::writer::ManifestArchiveWriter,
         comparator_name: &str,
+        flush_watermark: u64,
     ) -> Result<(), crate::Error> {
         use crate::FormatVersion;
         #[cfg(not(feature = "std"))]
@@ -1694,6 +1708,12 @@ impl Version {
             writer.start("repair_report")?;
             writer.write_all(report)?;
         }
+
+        // The highest synced-flush number this snapshot decides, never below
+        // one its tables carry: an open installs the self-described tables of
+        // the flushes above it, so one a table left behind could revive.
+        writer.start("flush_watermark")?;
+        writer.write_u64::<LittleEndian>(flush_watermark.max(self.highest_flush_seq()))?;
 
         Ok(())
     }

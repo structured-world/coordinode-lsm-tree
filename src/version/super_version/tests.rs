@@ -56,8 +56,196 @@ fn a_barrier_holding_the_files_before_a_failed_sync_does_not_sync_them() -> crat
         .arm(FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other)).once());
     assert!(tree.persist_flushes().is_err(), "the sync fails");
     assert!(
-        SuperVersions::sync_files(&held, SyncMode::default()).is_err(),
+        SuperVersions::sync_unsynced(
+            &held,
+            SyncMode::default(),
+            crate::io_policy::SyncSchedule::SideBySide,
+            (&*fs, crate::path::Path::new("/db")),
+        )
+        .is_err(),
         "the other barrier's copy does not sync the file"
+    );
+    Ok(())
+}
+
+/// A batch of pending files in which one file's sync fails marks that file
+/// alone: the others sync and persist on the next barrier. Guards against a
+/// batch failure being pinned on every file in it, which would keep flushes
+/// whose data did reach the disk out of every persist.
+#[test]
+fn a_failed_sync_in_a_batch_marks_only_its_own_file() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io_policy::SyncSchedule;
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let tree = deferred_tree_with_a_pending_flush(&fs)?;
+    tree.insert("b", "2", 1);
+    tree.flush_active_memtable(0)?;
+    let pending = tree.version_history.read().unsynced_files();
+    let [first, second] = pending.as_slice() else {
+        panic!("two pending tables");
+    };
+    let step = (&*fs as &dyn crate::fs::Fs, crate::path::Path::new("/db"));
+
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(first.as_flush_file().location().1.to_string_lossy())
+            .once(),
+    );
+    assert!(
+        SuperVersions::sync_unsynced(&pending, SyncMode::default(), SyncSchedule::Batched, step)
+            .is_err()
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            core::slice::from_ref(second),
+            SyncMode::default(),
+            SyncSchedule::Batched,
+            step,
+        )
+        .is_ok(),
+        "the file whose sync succeeded syncs again"
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            core::slice::from_ref(first),
+            SyncMode::default(),
+            SyncSchedule::Batched,
+            step,
+        )
+        .is_err(),
+        "the file whose sync failed does not"
+    );
+    Ok(())
+}
+
+/// Synced one at a time, a failed sync marks its own file alone too, by its
+/// place in the batch: the file before it synced and syncs again, the failed
+/// one does not. Guards against the one-at-a-time schedule pinning a failure
+/// on the first file of the batch.
+#[test]
+fn one_at_a_time_a_failed_sync_marks_only_its_own_file() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io_policy::SyncSchedule;
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let tree = deferred_tree_with_a_pending_flush(&fs)?;
+    tree.insert("b", "2", 1);
+    tree.flush_active_memtable(0)?;
+    let pending = tree.version_history.read().unsynced_files();
+    let [first, second] = pending.as_slice() else {
+        panic!("two pending tables");
+    };
+    let step = (&*fs as &dyn crate::fs::Fs, crate::path::Path::new("/db"));
+
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(second.as_flush_file().location().1.to_string_lossy())
+            .once(),
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            &pending,
+            SyncMode::default(),
+            SyncSchedule::OneAtATime,
+            step
+        )
+        .is_err()
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            core::slice::from_ref(first),
+            SyncMode::default(),
+            SyncSchedule::OneAtATime,
+            step,
+        )
+        .is_ok(),
+        "the file synced before the failure syncs again"
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            core::slice::from_ref(second),
+            SyncMode::default(),
+            SyncSchedule::OneAtATime,
+            step,
+        )
+        .is_err(),
+        "the file whose sync failed does not"
+    );
+    Ok(())
+}
+
+/// Under barrier syncs, a device whose cache did not flush leaves the files
+/// synced to it unproven: they are marked as failed, and a later barrier
+/// does not take a sync of its own for proof. Guards against a failed flush
+/// of a table's device clearing the table for the next persist to name.
+#[test]
+fn a_failed_device_flush_marks_the_files_on_that_device() -> crate::Result<()> {
+    use crate::config::FlushDurability;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io_policy::SyncSchedule;
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let AnyTree::Standard(tree) = Config::new(
+        std::path::absolute("/db")?,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .sync_mode(SyncMode::Barrier)
+    .flush_durability(FlushDurability::Deferred)
+    .open()?
+    else {
+        panic!("a standard tree");
+    };
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    let pending = tree.version_history.read().unsynced_files();
+    let step = (&*fs as &dyn crate::fs::Fs, crate::path::Path::new("/db"));
+
+    // The tables' device is not provably the manifest's: its cache is
+    // flushed on its own, and the flush fails once.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::VolumeId, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("tables"),
+    );
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDevice,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .once(),
+    );
+    let flushed = |syncs: Vec<(crate::path::PathBuf, crate::fs::SyncKind)>| {
+        syncs
+            .iter()
+            .filter(|(_, kind)| *kind == crate::fs::SyncKind::Device)
+            .count()
+    };
+    // The flush's own syncs, before what is counted.
+    let _ = fs.injector().take_syncs();
+    assert!(
+        SuperVersions::sync_unsynced(&pending, SyncMode::Barrier, SyncSchedule::SideBySide, step)
+            .is_err(),
+        "the device flush fails"
+    );
+    assert_eq!(
+        flushed(fs.injector().take_syncs()),
+        1,
+        "the failure is the device flush's"
+    );
+    assert!(
+        SuperVersions::sync_unsynced(&pending, SyncMode::Barrier, SyncSchedule::SideBySide, step)
+            .is_err(),
+        "the table synced to that device is not taken as durable"
+    );
+    assert_eq!(
+        flushed(fs.injector().take_syncs()),
+        0,
+        "the retry fails on the marked file, before any device flush"
     );
     Ok(())
 }
@@ -129,6 +317,7 @@ fn history_at_floor(floor: SeqNo) -> SuperVersions {
         SyncMode::Normal,
         7,
         1024 * 1024,
+        Arc::default(),
     )
 }
 
@@ -229,6 +418,7 @@ fn installed_history(fs: &dyn crate::fs::Fs) -> crate::Result<SuperVersions> {
         Arc::default(),
         None,
         SyncMode::Normal,
+        0,
     )?;
     Ok(SuperVersions::new(
         version,
@@ -236,6 +426,7 @@ fn installed_history(fs: &dyn crate::fs::Fs) -> crate::Result<SuperVersions> {
         SyncMode::Normal,
         0,
         1024 * 1024,
+        Arc::default(),
     ))
 }
 

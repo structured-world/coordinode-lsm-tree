@@ -118,6 +118,9 @@ impl Version {
             blob_restrictions,
             retention_floor,
             dicts,
+            // The history that appends the edit knows it (see
+            // `SuperVersions::persist_change`).
+            flush_watermark: None,
         })
     }
 }

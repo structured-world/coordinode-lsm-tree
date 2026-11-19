@@ -47,11 +47,13 @@ impl<'a> Arm<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     /// Time each arm runs untimed before the rounds start, and from which its
-    /// iterations per sample are sized.
+    /// iterations per sample are sized. Wall time, setup included.
     pub warm_up: Duration,
-    /// Shortest sample: an arm runs as many iterations per sample as fit.
+    /// Shortest sample, in wall time: an arm runs as many iterations per
+    /// sample as fit, at least one.
     pub sample_target: Duration,
-    /// Time the rounds of one group and key count aim to take.
+    /// Wall time the rounds of one group and key count aim to take, setup
+    /// included.
     pub budget: Duration,
     /// Rounds run however long they take.
     pub min_rounds: usize,
@@ -103,13 +105,21 @@ pub fn run(
     assert!(n > 0, "{group}: a routine covers at least one operation");
     assert!(!arms.is_empty(), "{group}: a group has at least one arm");
 
-    // Untimed warm-up, which also measures one iteration of each arm.
+    // Untimed warm-up, which also measures what one iteration of each arm
+    // costs. The cost is the whole call, not only the part the routine times:
+    // an arm that copies a starting state and syncs the host before every
+    // timed write spends most of its wall time outside the clock, and a run
+    // sized by the timed part alone would take many times its budget. A
+    // routine whose timed part exceeds the call (a fixed report) is costed
+    // by what it reports.
     let per_iter: Vec<Duration> = arms
         .iter_mut()
         .map(|arm| {
             let (mut spent, mut iters) = (Duration::ZERO, 0_u32);
             while iters == 0 || spent < settings.warm_up {
-                spent += (arm.routine)(1);
+                let start = std::time::Instant::now();
+                let timed = (arm.routine)(1);
+                spent += start.elapsed().max(timed);
                 iters += 1;
             }
             spent / iters
@@ -117,7 +127,7 @@ pub fn run(
         .collect();
 
     // Iterations per sample: enough to fill the sample target, at least one.
-    // An iteration takes at least a nanosecond, so a sample target of seconds
+    // An iteration costs at least a nanosecond, so a sample target of seconds
     // asks for well under `u32::MAX` of them.
     let iters: Vec<u32> = per_iter
         .iter()

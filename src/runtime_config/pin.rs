@@ -23,11 +23,15 @@ use alloc::sync::Arc;
 /// when the tree sizes its filters by probe load: dropped before the install,
 /// the budget would hand that room to another rewrite while the files that
 /// take it are about to join the tree.
+///
+/// And the table file pool refills the write's claims reserved, when they
+/// wait for its install: dropped, the pin starts them.
 #[derive(Default)]
 #[must_use = "dropping the pin before the files are installed lets a collection take their dictionary"]
 pub struct WritePin {
     snapshot: Option<Arc<RuntimeConfig>>,
     filter_sizing: Option<crate::filter_budget::FilterPlan>,
+    refills: Option<crate::table::file_pool::RefillHold>,
 }
 
 impl WritePin {
@@ -42,6 +46,7 @@ impl WritePin {
                 .next()
                 .map(|_| Arc::clone(snapshot)),
             filter_sizing: None,
+            refills: None,
         }
     }
 
@@ -60,6 +65,15 @@ impl WritePin {
         self.filter_sizing = sizing;
         self
     }
+
+    /// Also holds the refills the write's claims reserved until the install.
+    pub(crate) fn with_refills(
+        mut self,
+        refills: Option<crate::table::file_pool::RefillHold>,
+    ) -> Self {
+        self.refills = refills;
+        self
+    }
 }
 
 impl core::fmt::Debug for WritePin {
@@ -67,6 +81,7 @@ impl core::fmt::Debug for WritePin {
         f.debug_struct("WritePin")
             .field("holds", &self.snapshot.is_some())
             .field("filter_budget", &self.filter_sizing.is_some())
+            .field("refills", &self.refills.is_some())
             .finish()
     }
 }

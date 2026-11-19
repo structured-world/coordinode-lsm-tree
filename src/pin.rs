@@ -290,8 +290,12 @@ impl PinnedVersion {
             self.encryption.clone(),
             SyncMode::Normal,
         )?;
+        // The layout names only its version's tables: no flush above the ones
+        // they carry has a table in it, and an open starts its flush numbers
+        // above the highest one they carry, so a watermark of 0 leaves no
+        // copied flush undecided.
         self.version
-            .encode_into(&mut writer, &self.comparator_name)?;
+            .encode_into(&mut writer, &self.comparator_name, 0)?;
         writer.finish()?;
 
         // Named and versioned first, so a restore refuses a layout of another

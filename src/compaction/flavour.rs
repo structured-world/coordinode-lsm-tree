@@ -388,12 +388,15 @@ pub(super) fn prepare_table_writer(
     let above = payload.table_ids.iter().copied().max();
     let table_writer = MultiWriter::from_pool(
         table_base_folder,
-        alloc::sync::Arc::clone(&opts.table_files),
-        above,
+        crate::table::multi_writer::TableFiles::new(
+            alloc::sync::Arc::clone(&opts.table_files),
+            above,
+            crate::fs::WriteOrigin::CompactionTable,
+            opts.refills_held_for,
+        ),
         payload.target_size,
         payload.dest_level,
         level_fs,
-        crate::fs::WriteOrigin::CompactionTable,
     )?
     .use_output_ledger(opts.outputs.clone());
     let mut table_writer = configure_table_writer(
@@ -440,7 +443,7 @@ pub(super) fn prepare_table_writer(
 
 /// A writer with every setting a compaction of `payload` writes its outputs
 /// with, its file in memory: what bounds the bytes those outputs take before
-/// any is written (see [`MultiWriter::rewrite_bound`]). The plan the
+/// any is written (see [`BoundProbe::rewrite_bound`](crate::table::multi_writer::BoundProbe::rewrite_bound)). The plan the
 /// compaction draws its filter widths from may build wider filters than the
 /// level's policy, so its widest choice is taken.
 ///

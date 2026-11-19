@@ -75,6 +75,41 @@ fn each_rotated_table_links_its_blob_file_over_its_own_keys() -> crate::Result<(
     Ok(())
 }
 
+/// A synced flush cut into more tables than [`crate::fs::KEEP_OPEN_LIMIT`]
+/// keeps only that many writing handles open for its install: the rest close
+/// at their rotation, so a flush of thousands of tables does not hold a
+/// descriptor for each and fail at the process's limit on every retry.
+#[test]
+fn a_flush_of_many_tables_keeps_a_bounded_number_of_files_open() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        1,
+        0,
+        fs,
+    )?
+    .use_durability(crate::config::FlushDurability::Deferred)
+    .use_keep_open(true);
+    let tables = 3 * crate::fs::KEEP_OPEN_LIMIT;
+    for i in 0..tables {
+        mw.write(InternalValue::from_components(
+            UserKey::from(format!("key{i:05}").into_bytes()),
+            vec![0u8; 4_096],
+            0,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let written = mw.finish()?;
+    assert_eq!(written.tables.len(), tables, "one table per key");
+    assert_eq!(written.kept.len(), crate::fs::KEEP_OPEN_LIMIT);
+    Ok(())
+}
+
 /// The blob files a table links are handed to its writer only when it
 /// rotates, and it writes them at `finish`: the table is full once they no
 /// longer fit its target, before they reach the writer.
@@ -1153,20 +1188,29 @@ fn an_output_opened_at_finish_counts_toward_entry_durability() -> crate::Result<
     let folder = tempfile::tempdir()?;
     let base_path = folder.path().to_path_buf();
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
-    // One pooled file: the first output takes it, every later one is made.
+    // A batch of three made ahead, its first file taken by another write: the
+    // writer's first output and one more take pooled files, durable by name,
+    // and every later one is made. Only the outputs `finish` opens then make
+    // the writer's entries not durable.
     let pools = Arc::new(TableFilePools::new(
         SequenceNumberCounter::default(),
-        1,
+        3,
         SyncMode::Normal,
     ));
+    drop(pools.claim_as(
+        &base_path,
+        &fs,
+        None,
+        true,
+        crate::fs::WriteOrigin::FlushTable,
+        None,
+    )?);
     let mut mw = super::MultiWriter::from_pool(
         base_path,
-        pools,
-        None,
+        super::TableFiles::new(pools, None, crate::fs::WriteOrigin::FlushTable, None),
         12 * 1_024,
         0,
         fs,
-        crate::fs::WriteOrigin::FlushTable,
     )?;
     mw.set_range_tombstones(
         (0..2_000usize)

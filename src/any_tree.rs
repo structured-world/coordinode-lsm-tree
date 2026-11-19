@@ -432,8 +432,26 @@ impl AbstractTree for AnyTree {
         keys: u64,
         hashes: u64,
         overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
+        self_described: Option<&crate::abstract_tree::FlushSelf>,
     ) -> crate::Result<Option<FlushToTablesResult>> {
-        forward!(self.flush_to_tables_with_rt(stream, range_tombstones, keys, hashes, overwritten))
+        forward!(self.flush_to_tables_with_rt(
+            stream,
+            range_tombstones,
+            keys,
+            hashes,
+            overwritten,
+            self_described
+        ))
+    }
+
+    #[inline]
+    fn begin_synced_flush(&self) -> Option<(u64, u64)> {
+        forward!(self.begin_synced_flush())
+    }
+
+    #[inline]
+    fn end_synced_flush(&self, seq: u64) {
+        forward!(self.end_synced_flush(seq));
     }
 
     #[inline]
@@ -445,6 +463,7 @@ impl AbstractTree for AnyTree {
         sealed_memtables_to_delete: &[crate::tree::inner::MemtableId],
         gc_watermark: SeqNo,
         collected_below_watermark: bool,
+        kept: &crate::abstract_tree::KeptFiles,
     ) -> crate::Result<()> {
         forward!(self.register_tables(
             tables,
@@ -452,7 +471,8 @@ impl AbstractTree for AnyTree {
             frag_map,
             sealed_memtables_to_delete,
             gc_watermark,
-            collected_below_watermark
+            collected_below_watermark,
+            kept
         ))
     }
 

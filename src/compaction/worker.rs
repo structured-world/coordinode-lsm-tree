@@ -62,6 +62,10 @@ pub(crate) struct Options {
     /// The tree's pooled table files, which the outputs are written into.
     pub(crate) table_files: Arc<crate::table::file_pool::TableFilePools>,
 
+    /// The run a refill its claims reserve is held for, if any: set per run
+    /// by [`do_compaction`], which holds it until the run returns.
+    pub(crate) refills_held_for: Option<crate::table::file_pool::HoldId>,
+
     pub blob_file_id_generator: SequenceNumberCounter,
 
     /// Configuration of tree.
@@ -153,6 +157,7 @@ impl Options {
             visible_seqno: tree.config.visible_seqno.clone(),
             tree_id: tree.id,
             table_files: Arc::clone(&tree.table_files),
+            refills_held_for: None,
             blob_file_id_generator: tree.blob_file_id_counter.clone(),
             config: tree.config.clone(),
             version_history: tree.version_history.clone(),
@@ -185,14 +190,27 @@ impl Options {
 ///
 /// This will block until the compactor is fully finished.
 pub(crate) fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
-    // Ledgers of this run's own: the caller may share its options with runs
-    // that overlap this one, and their outputs and work are theirs.
+    // Held until the run's syncs are done: a pool refill one of its claims
+    // reserved runs then, never beside them, nor beside another write's.
+    let refills = opts
+        .runtime_config
+        .load()
+        .io
+        .refill_after_install()
+        .then(|| opts.table_files.hold());
+    // Ledgers and a hold of this run's own: the caller may share its options
+    // with runs that overlap this one, and their outputs, work and refills
+    // are theirs.
     let opts = &Options {
         outputs: super::output_ledger::OutputLedger::default(),
         work: Arc::default(),
+        refills_held_for: refills
+            .as_ref()
+            .map(crate::table::file_pool::RefillHold::id),
         ..opts.clone()
     };
     let result = run_compaction(opts);
+    drop(refills);
     // A run its room stopped declined, as one the gate skips does: its
     // inputs are as they were, and only its outputs go, below.
     let result = match result {
@@ -4566,6 +4584,7 @@ fn run_merge_on_read_relocation(
                 Some(source.id()),
                 true,
                 crate::fs::WriteOrigin::CompactionTable,
+                opts.refills_held_for,
             )
         },
         &*level_fs,

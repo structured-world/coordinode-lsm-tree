@@ -936,6 +936,18 @@ impl AbstractTree for Tree {
         self.flush_lock.lock()
     }
 
+    fn begin_synced_flush(&self) -> Option<(u64, u64)> {
+        if self.config.flush_durability == crate::config::FlushDurability::Synced {
+            self.flush_seqs.begin()
+        } else {
+            None
+        }
+    }
+
+    fn end_synced_flush(&self, seq: u64) {
+        self.flush_seqs.end(seq);
+    }
+
     #[cfg(feature = "metrics")]
     fn metrics(&self) -> &Arc<crate::Metrics> {
         &self.0.metrics
@@ -1048,6 +1060,13 @@ impl AbstractTree for Tree {
         versions.upgrade_version(
             &config.path,
             |v| {
+                // Under the history's lock, which a flush takes to read the
+                // memtables it writes: every flush holding memtables this
+                // clear drops has taken its number. Its tables describe
+                // themselves, and an open after a power loss would install
+                // them, with the cleared data, unless this manifest decides
+                // that number.
+                self.flush_seqs.decide_taken();
                 let mut copy = v.clone();
                 copy.active_memtable = Arc::new(Memtable::new(
                     self.memtable_id_counter.next(),
@@ -1172,13 +1191,8 @@ impl AbstractTree for Tree {
         hashes: u64,
         // A standard tree separates no values, so it has nothing to place.
         _overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
-    ) -> crate::Result<
-        Option<(
-            Vec<Table>,
-            Option<Vec<BlobFile>>,
-            crate::runtime_config::WritePin,
-        )>,
-    > {
+        self_described: Option<&crate::abstract_tree::FlushSelf>,
+    ) -> crate::Result<Option<crate::abstract_tree::FlushToTablesResult>> {
         use crate::table::multi_writer::MultiWriter;
         use crate::time::Instant;
 
@@ -1217,16 +1231,32 @@ impl AbstractTree for Tree {
         // flush that fails removes them before it returns, as a compaction
         // does, rather than leave them to the orphan sweep of the next open.
         let outputs = crate::compaction::output_ledger::OutputLedger::for_cleanup();
+        // Carried in the write pin to the install, which drops it once the
+        // flush's syncs are done.
+        let refills = rc
+            .io
+            .refill_after_install()
+            .then(|| self.table_files.hold());
         let table_writer = MultiWriter::from_pool(
             folder.clone(),
-            Arc::clone(&self.table_files),
-            None,
+            crate::table::multi_writer::TableFiles::new(
+                Arc::clone(&self.table_files),
+                None,
+                crate::fs::WriteOrigin::FlushTable,
+                refills
+                    .as_ref()
+                    .map(crate::table::file_pool::RefillHold::id),
+            ),
             self.config.table_target_size,
             0,
             level_fs.clone(),
-            crate::fs::WriteOrigin::FlushTable,
         )?
         .use_output_ledger(outputs.clone());
+        // A synced flush's tables describe themselves (see `register_tables`).
+        let table_writer = match self_described {
+            Some(flush) => table_writer.use_flush_seq(flush.seq, flush.returned_through),
+            None => table_writer,
+        };
         let written = (move || -> crate::Result<_> {
             // The flush's L0 recency, taken once its first file is: flushes are
             // serialized, so it is above every table already flushed and below
@@ -1294,9 +1324,19 @@ impl AbstractTree for Tree {
             // / `kv_checksums` below), so a flush after a scheme change writes the
             // SST with the current scheme rather than the startup one.
             table_writer = table_writer.use_page_ecc(self.config.page_ecc, rc.ecc_scheme);
+            // Whatever the tree's flush durability, the install syncs a flush's
+            // tables (see `register_tables`), so the writer leaves them unsynced.
+            // The install syncs through a handle of its own, which still sees a
+            // writeback error raised before it opened: Linux reports an error
+            // no sync has seen yet to a handle opened after it (`errseq`, since
+            // 4.16), the writer's handle closes without a sync, and the tree's
+            // read handle keeps the inode, and so its error, in memory.
             table_writer = table_writer
                 .use_sync_mode(self.config.sync_mode)
-                .use_durability(self.config.flush_durability)
+                .use_durability(crate::config::FlushDurability::Deferred)
+                .use_keep_open(
+                    self.config.flush_durability == crate::config::FlushDurability::Synced,
+                )
                 .use_writeback_bytes(self.config.writeback_bytes);
 
             table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
@@ -1324,8 +1364,9 @@ impl AbstractTree for Tree {
                     )
                     .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
             }
-            let write_pin =
-                crate::runtime_config::WritePin::new(&rc).with_filter_sizing(filter_sizing);
+            let write_pin = crate::runtime_config::WritePin::new(&rc)
+                .with_filter_sizing(filter_sizing)
+                .with_refills(refills);
 
             // Parallel block compression for the flush writer, on the same pool the
             // compaction writers use. Engaged only when the per-block transform does
@@ -1343,6 +1384,14 @@ impl AbstractTree for Tree {
                 if transform_does_work {
                     table_writer =
                         table_writer.use_parallel_compression(self.config.parallel_compression());
+                } else {
+                    // The pool has no blocks of this flush to prepare: its
+                    // workers write the table's buffers.
+                    table_writer = table_writer.use_file_workers(
+                        self.config
+                            .parallel_compression()
+                            .map(|parallel| parallel.spawner),
+                    );
                 }
             }
 
@@ -1354,9 +1403,17 @@ impl AbstractTree for Tree {
             for item in stream {
                 table_writer.write(item?)?;
             }
+            // The stream is drained: whether it collected history is known.
+            if let Some(flush) = self_described {
+                table_writer.set_flush_floor(flush.raised_floor());
+            }
 
             let written = table_writer.finish()?;
             let entries_durable = written.entries_durable;
+            let kept = crate::abstract_tree::KeptFiles {
+                tables: written.kept,
+                blobs: Vec::new(),
+            };
 
             log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
 
@@ -1401,7 +1458,7 @@ impl AbstractTree for Tree {
                     Ok(table)
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
-            Ok((tables, write_pin))
+            Ok((tables, write_pin, kept))
         })();
 
         match written {
@@ -1409,9 +1466,9 @@ impl AbstractTree for Tree {
             // caller (AbstractTree::flush) handles empty tables by
             // re-inserting RTs into the active memtable and still needs to
             // delete sealed memtables.
-            Ok((tables, write_pin)) => {
+            Ok((tables, write_pin, kept)) => {
                 outputs.hand_over();
-                Ok(Some((tables, None, write_pin)))
+                Ok(Some((tables, None, write_pin, kept)))
             }
             Err(e) => {
                 outputs.remove_uninstalled(self.id, self.config.descriptor_table.as_deref());
@@ -1420,7 +1477,6 @@ impl AbstractTree for Tree {
         }
     }
 
-    #[expect(clippy::significant_drop_tightening)]
     fn register_tables(
         &self,
         tables: &[Table],
@@ -1429,6 +1485,7 @@ impl AbstractTree for Tree {
         sealed_memtables_to_delete: &[crate::tree::inner::MemtableId],
         gc_watermark: SeqNo,
         collected_below_watermark: bool,
+        kept: &crate::abstract_tree::KeptFiles,
     ) -> crate::Result<()> {
         log::trace!(
             "Registering {} tables, {} blob files",
@@ -1462,6 +1519,107 @@ impl AbstractTree for Tree {
             crate::fs::WriteOrigin::FlushBlob,
         )?;
 
+        // A flush writes its files unsynced. Deferred, the version is
+        // installed in memory only and the next persist syncs them. Synced,
+        // they are synced here, before the version lock: a flush whose tables
+        // describe themselves is then installed in memory only, as an open
+        // finds those tables by their description until the next persist
+        // names them; any other is written to the manifest.
+        // The snapshot the install below takes, loaded once: it carries the
+        // flush strategy for the device under the tree too.
+        let runtime = self.0.runtime_config.load_full();
+        let files = match self.config.flush_durability {
+            // Kept, each with a handle of its own, until the persist that
+            // syncs them.
+            crate::config::FlushDurability::Deferred => crate::version::NewFiles::Deferred(
+                tables
+                    .iter()
+                    .cloned()
+                    .map(crate::version::UnsyncedFile::Table)
+                    .chain(
+                        blob_files
+                            .unwrap_or(&[])
+                            .iter()
+                            .cloned()
+                            .map(crate::version::UnsyncedFile::Blob),
+                    )
+                    .collect(),
+            ),
+            crate::config::FlushDurability::Synced => {
+                // A file this size or more had writeback started while it was
+                // written (the writers start it every `writeback_bytes`).
+                let wb = self.config.writeback_bytes;
+                let started_writeback = wb != 0
+                    && (tables.iter().any(|table| table.file_size() >= wb)
+                        || blob_files
+                            .unwrap_or(&[])
+                            .iter()
+                            .any(|blob| blob.meta().total_compressed_bytes >= wb));
+                let backend_serial = self
+                    .version_history
+                    .write()
+                    .serial_syncs(&*self.config.fs, &self.config.path);
+                let schedule = runtime.io.sync_schedule(started_writeback, backend_serial);
+                let self_described =
+                    !tables.is_empty() && tables.iter().all(|table| table.metadata.flush.is_some());
+                // A self-described flush owes no later persist: its tables'
+                // names are made durable here too, each folder on the backend
+                // holding it (a routed level lies on another one than the
+                // tree folder), in the batch that syncs the files.
+                let folders: Vec<(&Arc<dyn crate::fs::Fs>, &Path)> = if self_described {
+                    tables
+                        .iter()
+                        .filter(|table| !table.entry_durable())
+                        .filter_map(|table| Some((&table.fs, table.path.parent()?)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // What depends on these files next: the flush's own tables,
+                // which a later flush names as returned, or else the manifest.
+                let step: (&dyn crate::fs::Fs, &Path) = match tables.first() {
+                    Some(table) if self_described => {
+                        (&*table.fs, crate::file::entry_directory(&table.path))
+                    }
+                    _ => (&*self.config.fs, &self.config.path),
+                };
+                // Each file through the handle it was written through, when
+                // its writer kept it open for this sync.
+                crate::version::SuperVersions::sync_files(
+                    tables
+                        .iter()
+                        .map(|table| {
+                            crate::version::FlushFile::Table(table, kept.table(table.id()))
+                        })
+                        .chain(blob_files.unwrap_or(&[]).iter().map(|blob| {
+                            crate::version::FlushFile::Blob(blob, kept.blob(blob.id()))
+                        })),
+                    &folders,
+                    self.config.sync_mode,
+                    schedule,
+                    step,
+                )?;
+                if self_described {
+                    for table in tables.iter().filter(|table| !table.entry_durable()) {
+                        if let Some(folder) = table.path.parent() {
+                            self.table_files.synced_with(folder, &table.fs, table.id());
+                        }
+                        table.mark_entry_durable();
+                    }
+                }
+                if self_described {
+                    crate::version::NewFiles::SelfDescribed
+                } else {
+                    crate::version::NewFiles::Synced
+                }
+            }
+        };
+
+        // With the files durable: a self-described flush is what an open
+        // would install from here on.
+        #[cfg(all(test, feature = "std"))]
+        self.config.fire_before_output_install();
+
         let mut _compaction_state = self.compaction_state.lock();
         let mut version_lock = self.version_history.write();
 
@@ -1486,26 +1644,26 @@ impl AbstractTree for Tree {
             return Ok(());
         }
 
-        // A deferred flush wrote its files unsynced: installed in memory only,
-        // they are synced and written to the manifest by the next persist.
-        let deferred = (self.config.flush_durability == crate::config::FlushDurability::Deferred)
-            .then(|| {
-                tables
-                    .iter()
-                    .cloned()
-                    .map(crate::version::UnsyncedFile::Table)
-                    .chain(
-                        blob_files
-                            .unwrap_or(&[])
-                            .iter()
-                            .cloned()
-                            .map(crate::version::UnsyncedFile::Blob),
-                    )
-                    .collect()
-            });
+        // The number of a self-described flush, decided under this lock.
+        let flush_seq = match files {
+            crate::version::NewFiles::SelfDescribed => tables
+                .first()
+                .and_then(|table| table.metadata.flush.as_ref())
+                .map(|mark| mark.seq),
+            _ => None,
+        };
+        // A clear that failed after deciding this flush's number may have put
+        // its record on disk: an open would then leave the tables out, though
+        // the clear dropped nothing and the flush returns. Named in the
+        // manifest instead, they come back after that record either way.
+        let files = match flush_seq {
+            Some(seq) if self.flush_seqs.cleared(seq) => crate::version::NewFiles::Synced,
+            _ => files,
+        };
+
         // A failed install leaves the files with the caller's handles: the
         // caller may register them again, or remove them.
-        version_lock.upgrade_version_deferring(
+        version_lock.upgrade_version_adding(
             &self.config.path,
             |current| {
                 let mut copy = current.clone();
@@ -1528,7 +1686,7 @@ impl AbstractTree for Tree {
             &self.config.seqno,
             &self.config.visible_seqno,
             &*self.config.fs,
-            self.0.runtime_config.load_full(),
+            runtime,
             self.0.config.encryption.clone(),
             // A flush adds a run, but it does not only add: `AbstractTree::flush`
             // feeds the sealed memtables through the same `CompactionStream`
@@ -1541,9 +1699,15 @@ impl AbstractTree for Tree {
             // `false` for the filter: the flush stream carries no user
             // compaction filter, so `DropsData` is unreachable here.
             crate::version::RetentionEffect::of_run(false, collected_below_watermark, gc_watermark),
-            deferred,
+            files,
         )?;
+        // Decided before another install can take the lock: a manifest a
+        // compaction of these tables writes then covers this flush.
+        if let Some(seq) = flush_seq {
+            self.flush_seqs.installed(seq);
+        }
         installed.charge();
+        drop(version_lock);
 
         Ok(())
     }
@@ -1551,6 +1715,9 @@ impl AbstractTree for Tree {
     fn clear_active_memtable(&self) {
         use crate::tree::sealed::SealedMemtables;
 
+        // After a flush in progress, as `clear` (see there): the sealed
+        // memtables it drops may be the ones being flushed.
+        let _flush = self.get_flush_lock();
         let mut version_history_lock = self.version_history.write();
         let super_version = version_history_lock.latest_version();
 
@@ -2048,15 +2215,10 @@ impl AbstractTree for Tree {
     }
 
     fn get_highest_persisted_seqno(&self) -> Option<SeqNo> {
-        // The version on disk, not the current one: a deferred flush is not
-        // persisted until a persist writes it, and a caller trimming its log
-        // by this seqno must keep what such a flush holds.
-        self.version_history
-            .read()
-            .persisted_version()
-            .iter_tables()
-            .map(Table::get_highest_seqno)
-            .max()
+        // The version a power loss keeps, not the current one: a deferred
+        // flush is not durable until a persist syncs it, and a caller trimming
+        // its log by this seqno must keep what such a flush holds.
+        self.version_history.read().durable_highest_seqno()
     }
 
     fn oldest_retained_seqno(&self) -> SeqNo {
@@ -2484,7 +2646,7 @@ impl Tree {
 
     /// The dictionary ids new files may still be written against: every one
     /// the live snapshot's policies name, and every one a replaced snapshot a
-    /// writer still holds names (see `TreeInner::retired_write_snapshots`).
+    /// writer still holds names (see `RuntimeConfigHandle::retire`).
     #[cfg(zstd_any)]
     pub(crate) fn write_referenced_dict_ids(&self) -> Vec<crate::file::DictId> {
         let kv_separated = self.config.kv_separation_opts.is_some();
@@ -2494,13 +2656,9 @@ impl Tree {
             .load()
             .write_dict_ids(kv_separated)
             .collect();
-        self.0.retired_write_snapshots.lock().retain(|snapshot| {
-            let Some(held) = snapshot.upgrade() else {
-                return false;
-            };
-            ids.extend(held.write_dict_ids(kv_separated));
-            true
-        });
+        self.0
+            .runtime_config
+            .for_each_held_replaced(|held| ids.extend(held.write_dict_ids(kv_separated)));
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -3365,11 +3523,6 @@ impl Tree {
             self.config.kv_separation_opts.is_some(),
             &self.config.current_zstd_dictionaries(),
         )?;
-        // What the swap below replaces, read under the lock every update takes,
-        // so it is the snapshot a writer may still hold, not the one the
-        // mutator started from.
-        #[cfg(zstd_any)]
-        let replaced = self.0.runtime_config.load_full();
         // The heal gate below follows exactly the config THIS call commits,
         // rather than a separate `load_full()` that could observe a different
         // concurrent update's value. Concurrent `update_runtime_config` calls
@@ -3383,19 +3536,8 @@ impl Tree {
         // update time, not silently swallowed at the next manifest write.
         self.0.runtime_config.try_update(|c| *c = next)?;
 
-        // A writer that took `replaced` before this swap may still be about to
-        // resolve the dictionary it names; see `retired_write_snapshots`.
         #[cfg(zstd_any)]
-        {
-            let kv_separated = self.config.kv_separation_opts.is_some();
-            if replaced.write_dict_ids(kv_separated).next().is_some() {
-                let mut retired = self.0.retired_write_snapshots.lock();
-                retired.retain(|snapshot| snapshot.strong_count() > 0);
-                retired.push(Arc::downgrade(&replaced));
-            }
-            drop(replaced);
-            drop(version_lock);
-        }
+        drop(version_lock);
         self.0.heal_hints.set_enabled(auto_heal);
         // Mirror the insert-time digest gate for the write hot path (see
         // `TreeInner::kv_digest_at_insert`). Relaxed: a toggle taking effect
@@ -5144,6 +5286,13 @@ impl Tree {
             return Err(e);
         }
 
+        // What its flushes do on the device under it, from the device's I/O
+        // scheduler, asked once per location by the config's policy and
+        // followed on it by `IoPolicy::refresh`.
+        tree.config
+            .io_policy
+            .attach(&*tree.config.fs, &tree.config.path, &tree.0.runtime_config);
+
         Ok((tree, creation))
     }
 
@@ -5873,7 +6022,7 @@ impl Tree {
         #[cfg(feature = "metrics")]
         let metrics = Arc::new(Metrics::default());
 
-        let (version, pooled) = Self::recover_levels(
+        let (version, pooled, flush_watermark) = Self::recover_levels(
             &config.path,
             tree_id,
             &config,
@@ -5956,14 +6105,19 @@ impl Tree {
         #[cfg(feature = "std")]
         stop_signal.wake_on_stop(&compaction_rate_limiter);
         let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
-        // The open installed the recovered state as its own snapshot.
+        // The open installed the recovered state as its own snapshot, which
+        // decides every flush up to the watermark it recorded.
         let snapshot_id = version.id();
+        let flush_seqs = Arc::new(crate::version::FlushSeqs::after(
+            flush_watermark.max(version.highest_flush_seq()),
+        ));
         let mut super_versions = SuperVersions::new(
             version,
             &comparator,
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
+            Arc::clone(&flush_seqs),
         );
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
@@ -5995,6 +6149,7 @@ impl Tree {
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
+            flush_seqs,
             #[cfg(feature = "std")]
             directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
@@ -6013,8 +6168,6 @@ impl Tree {
                 initial_runtime,
             )),
             admission_used_cache: Mutex::new(None),
-            #[cfg(zstd_any)]
-            retired_write_snapshots: Mutex::new(Vec::new()),
 
             #[cfg(feature = "metrics")]
             metrics,
@@ -6247,6 +6400,566 @@ impl Tree {
         }
     }
 
+    /// Adds to `recovery` the synced flushes above its watermark: a synced
+    /// flush returns once its files are synced, with no manifest edit naming
+    /// them, and its tables describe themselves instead (see
+    /// [`crate::version::FlushSeqs`]). A flush is added whole or not at all,
+    /// each of its tables as a run of its own as its install placed them:
+    /// every table of its run lies in a tables folder and every data block of
+    /// it reads, and every blob file its tables refer to that the manifest
+    /// does not hold reads whole. A flush taken in has its files and their
+    /// folders synced before any manifest names them: the process may have
+    /// died with them in the page cache only.
+    ///
+    /// A flush that does not read whole is told apart by whether it returned.
+    /// Each flush's tables name the last flush that had returned when it
+    /// began, so the flushes that returned above the watermark are the ones
+    /// some table names. Such a flush that does not read whole, or of which no
+    /// table is found, was lost to the medium after it returned, and a repair
+    /// leaves its tables to its scan (the returned set). An open reports it
+    /// as [`crate::Error::DamagedFlush`] when the bytes prove the damage (a
+    /// table missing beside ones found, a read that fails on the bytes, a
+    /// blob file of it that does not read), which `open_or_repair` repairs;
+    /// as [`crate::Error::Unrecoverable`] when no table of it is found or a
+    /// read failed for a reason the configuration may explain, left to an
+    /// explicit repair once the configuration is checked. Any
+    /// other flush either failed or is the latest, which nothing names yet:
+    /// not whole, it is taken for one a power loss cut short, as a log's torn
+    /// tail is, and its tables are set aside under `{id}.torn-flush`, beyond
+    /// every sweep. Flushes run one at a time, so one that a later flush began
+    /// after without counting it as returned failed, and is set aside whole or
+    /// not: its memtables were written again.
+    ///
+    /// The watermark rises past every flush found, and the retention floor to
+    /// the highest one a flush taken in raised.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an environmental fault reading the folders, and, when
+    /// `purpose` is an open, [`crate::Error::DamagedFlush`] or
+    /// [`crate::Error::Unrecoverable`] for a flush that returned and does not
+    /// read whole, as above.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one pass over the folders, then one decision per flush"
+    )]
+    pub(crate) fn adopt_synced_flushes(
+        recovery: &mut crate::version::recovery::Recovery,
+        config: &Config,
+        tree_id: TreeId,
+        purpose: AdoptFor,
+    ) -> crate::Result<AdoptedFlushes> {
+        use crate::version::recovery::RecoveredTable;
+        use crate::{TableId, vlog::BlobFileId};
+
+        /// A table a synced flush wrote, as the open read it.
+        struct Member {
+            mark: crate::table::meta::FlushMark,
+            table: RecoveredTable,
+            min_key: UserKey,
+            blobs: Vec<BlobFileId>,
+            /// Whether every data block read.
+            blocks_read: bool,
+            /// Whether a read that failed failed on its bytes alone, which a
+            /// configuration cannot explain (see
+            /// [`crate::Error::is_repairable_structural`]).
+            damage_proven: bool,
+            /// Where the table lies, to be synced once its flush is taken in,
+            /// or set aside when it never returned.
+            path: crate::path::PathBuf,
+            fs: Arc<dyn crate::fs::Fs>,
+        }
+
+        // The manifest's tables, which no copy found below stands for.
+        let named: crate::HashSet<TableId> = recovery
+            .table_ids
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|table| table.id)
+            .collect();
+
+        // Each flush table found, one copy per id: one that reads whole, or
+        // else the last found. A table moved between folders by a compaction
+        // the power cut short lies in both, and a damaged copy must not stand
+        // in for an intact one.
+        let mut found: crate::HashMap<TableId, Member> = crate::HashMap::default();
+        let mut highest_seen = recovery.flush_watermark;
+        // The flushes above the watermark known to have returned: each flush's
+        // tables name the last one that returned before it began, so the
+        // flushes that returned form a chain through them. A number no table
+        // names was a flush that failed, or the latest one.
+        let mut returned: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
+        // Each table's flush with the last one that had returned when it
+        // began. Flushes run one at a time, so a flush that a later one began
+        // after without counting it as returned had ended without returning:
+        // it failed, whole or not, and its memtables were written again.
+        let mut begun: Vec<(u64, u64)> = Vec::new();
+        // Unnamed tables that do not open, which a repair keeps for its scan
+        // when a flush that returned is missing one.
+        let mut unreadable: Vec<TableId> = Vec::new();
+        // Every folder tables are recovered from: level 0 may have been routed
+        // elsewhere since the flush wrote its tables.
+        for (folder, folder_fs) in config.all_tables_folders() {
+            let entries = match folder_fs.read_dir(&folder) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for entry in entries {
+                if entry.is_dir {
+                    continue;
+                }
+                // A table set aside earlier is read for the flushes it names
+                // as returned only: an open or a repair that failed after
+                // setting it aside must find the same evidence when retried.
+                // Once one succeeds, the watermark is past every flush it
+                // names.
+                let (id, set_aside) = match crate::file::TableDirEntry::classify(&entry.file_name) {
+                    crate::file::TableDirEntry::Table(id) => (id, false),
+                    _ => match entry
+                        .file_name
+                        .strip_suffix(crate::file::TORN_FLUSH_SUFFIX)
+                        .and_then(|id| id.parse::<TableId>().ok())
+                    {
+                        Some(id) => (id, true),
+                        None => continue,
+                    },
+                };
+                // A pooled file holds nothing yet.
+                if named.contains(&id)
+                    || found.get(&id).is_some_and(|member| member.blocks_read)
+                    || folder_fs.metadata(&entry.path)?.len == 0
+                {
+                    continue;
+                }
+                let checksum = match crate::file::checksum_from_with_overrides(
+                    &*folder_fs,
+                    &entry.path,
+                    0,
+                    &[],
+                ) {
+                    Ok(digest) => Checksum::from_raw(digest),
+                    // A set-aside table is read only for what it names; a
+                    // dictionary of its data is not needed for that.
+                    Err(e)
+                        if fails_adoption(&e)
+                            || (!set_aside && needs_a_held_dictionary(&e, &recovery.dicts)) =>
+                    {
+                        return Err(e);
+                    }
+                    Err(_) if set_aside => continue,
+                    Err(_) => {
+                        unreadable.push(id);
+                        continue;
+                    }
+                };
+                let mut params = crate::table::RecoverParams::new(
+                    entry.path.clone(),
+                    checksum,
+                    id,
+                    folder_fs.clone(),
+                    config.comparator.clone(),
+                    config.cache.clone(),
+                );
+                params.tree_id = tree_id;
+                params.encryption.clone_from(&config.encryption);
+                params.prefix_extractor.clone_from(&config.prefix_extractor);
+                #[cfg(zstd_any)]
+                {
+                    params.zstd_dictionaries = config.current_zstd_dictionaries();
+                }
+                // A table whose trailer did not reach the disk does not open;
+                // the flush it belonged to is then not whole.
+                let table = match Table::recover(params) {
+                    Ok(table) => table,
+                    Err(e)
+                        if fails_adoption(&e)
+                            || (!set_aside && needs_a_held_dictionary(&e, &recovery.dicts)) =>
+                    {
+                        return Err(e);
+                    }
+                    Err(_) if set_aside => continue,
+                    Err(_) => {
+                        unreadable.push(id);
+                        continue;
+                    }
+                };
+                let Some(mark) = table.metadata.flush else {
+                    continue;
+                };
+                if mark.seq <= recovery.flush_watermark {
+                    continue;
+                }
+                if mark.returned_through > recovery.flush_watermark {
+                    returned.insert(mark.returned_through);
+                }
+                begun.push((mark.seq, mark.returned_through));
+                if set_aside {
+                    // Its number stays taken: no later flush shares it.
+                    highest_seen = highest_seen.max(mark.seq);
+                    continue;
+                }
+                // A power loss can keep the table's entry and trailer and lose
+                // blocks before them (a file size that runs past blocks never
+                // written back reads them as zeros): the data blocks, and the
+                // filter blocks a point read loads only when it needs them.
+                // The blob files the table links decide which blob files the
+                // open keeps, and their section has no checksum: it is checked
+                // against the table's entries, or a link rotted into another
+                // file's id would leave the table's own file to be deleted.
+                let mut damage_proven = true;
+                let mut blocks_read = match table
+                    .verify_data_blocks()
+                    .and_then(|()| table.verify_filter_blocks())
+                    .and_then(|()| table.verify_blob_links())
+                {
+                    Ok(()) => true,
+                    Err(e)
+                        if fails_adoption(&e) || needs_a_held_dictionary(&e, &recovery.dicts) =>
+                    {
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "table {id} of synced flush #{} does not read whole: {e:?}",
+                            mark.seq,
+                        );
+                        damage_proven = e.is_repairable_structural();
+                        false
+                    }
+                };
+                highest_seen = highest_seen.max(mark.seq);
+                // A section that does not parse is a table that does not read
+                // whole, as a block that does not is.
+                let blobs = match table.list_blob_file_references() {
+                    Ok(links) => links
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|linked| linked.blob_file_id)
+                        .collect(),
+                    Err(e) if fails_adoption(&e) => return Err(e),
+                    Err(e) => {
+                        blocks_read = false;
+                        damage_proven &= e.is_repairable_structural();
+                        Vec::new()
+                    }
+                };
+                found.insert(
+                    id,
+                    Member {
+                        mark,
+                        table: RecoveredTable {
+                            id,
+                            checksum,
+                            global_seqno: 0,
+                            recency: table.metadata.recency,
+                        },
+                        min_key: table.metadata.key_range.min().clone(),
+                        blobs,
+                        blocks_read,
+                        damage_proven,
+                        path: entry.path,
+                        fs: folder_fs.clone(),
+                    },
+                );
+            }
+        }
+        let mut flushes: alloc::collections::BTreeMap<u64, Vec<Member>> =
+            alloc::collections::BTreeMap::new();
+        for member in found.into_values() {
+            flushes.entry(member.mark.seq).or_default().push(member);
+        }
+
+        let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
+        // Flushes that returned and do not read whole, and their tables. A
+        // flush that returned with no table found at all is one of them.
+        let mut lost: Vec<u64> = returned
+            .iter()
+            .copied()
+            .filter(|seq| !flushes.contains_key(seq))
+            .collect();
+        for seq in &lost {
+            log::error!("synced flush #{seq} returned and none of its tables is found");
+        }
+        let mut broken = lost.clone();
+        // Whether a broken flush's damage is not proven by the bytes: none of
+        // its tables found (a level route left out hides them all the same),
+        // or a table kept from reading by what the configuration may explain.
+        let mut unproven = !lost.is_empty();
+        let mut kept: crate::HashSet<TableId> = crate::HashSet::default();
+        // The tables of flushes that never returned, set aside only once no
+        // flush failed the open: their tables are the evidence that names the
+        // flushes before them, which a retry of the open needs as this one did.
+        let mut torn: Vec<Member> = Vec::new();
+        for (seq, mut members) in flushes {
+            let did_return = returned.contains(&seq);
+            if !did_return
+                && begun
+                    .iter()
+                    .any(|&(later, through)| later > seq && through < seq)
+            {
+                // Taken in, it would hold its memtables' entries a second
+                // time beside the retry that wrote them again.
+                log::warn!(
+                    "synced flush #{seq} failed, a later flush began without it; \
+                     setting its tables aside",
+                );
+                torn.extend(members);
+                continue;
+            }
+            // Whole: the table the run finishes with names its length, and
+            // every place below it is taken once.
+            members.sort_by_key(|member| member.mark.index);
+            let whole = members
+                .iter()
+                .find_map(|member| member.mark.run_len)
+                .is_some_and(|run_len| {
+                    members.len() == run_len as usize
+                        && members
+                            .iter()
+                            .zip(0u32..)
+                            .all(|(member, index)| member.mark.index == index)
+                });
+            let blocks_read = members.iter().all(|member| member.blocks_read);
+            // Whether what keeps the flush out is proven by the bytes: a table
+            // missing beside ones found (a flush writes its whole run into one
+            // folder), a read failing on a table's bytes, a blob file missing
+            // from the tree's own folder or failing on its bytes.
+            let (added_blobs, blobs_proven) = if whole && blocks_read {
+                match Self::flush_blob_files(
+                    recovery,
+                    config,
+                    &blobs_folder,
+                    members
+                        .iter()
+                        .flat_map(|member| member.blobs.iter().copied()),
+                )? {
+                    FlushBlobs::Held(added) => (Some(added), true),
+                    FlushBlobs::Unread { proven } => (None, proven),
+                }
+            } else {
+                (None, true)
+            };
+            let Some(added_blobs) = added_blobs else {
+                if did_return {
+                    log::error!(
+                        "synced flush #{seq} returned and does not read whole \
+                         ({} tables found); the medium lost or damaged it",
+                        members.len(),
+                    );
+                    broken.push(seq);
+                    unproven |= !blobs_proven
+                        || !members
+                            .iter()
+                            .all(|member| member.blocks_read || member.damage_proven);
+                    // A table missing from its run leaves no key range or
+                    // sequence number to scope its loss by.
+                    if !whole {
+                        lost.push(seq);
+                    }
+                    kept.extend(members.iter().map(|member| member.table.id));
+                } else {
+                    log::warn!(
+                        "synced flush #{seq} never returned and does not read whole \
+                         ({} tables found); setting its tables aside",
+                        members.len(),
+                    );
+                    torn.extend(members);
+                }
+                continue;
+            };
+            // The files may be whole in the page cache only, when the process
+            // died before the flush's sync: made durable, with their names,
+            // before a manifest names them.
+            {
+                use crate::fs::{SyncMode, SyncTarget, WriteOrigin};
+                let mut syncs: Vec<(&Arc<dyn crate::fs::Fs>, SyncTarget<'_>)> = Vec::new();
+                let mut folders: Vec<(&Arc<dyn crate::fs::Fs>, &Path)> = Vec::new();
+                for member in &members {
+                    syncs.push((
+                        &member.fs,
+                        SyncTarget::FileData {
+                            path: &member.path,
+                            origin: WriteOrigin::FlushTable,
+                            mode: config.sync_mode,
+                        },
+                    ));
+                    if let Some(folder) = member.path.parent()
+                        && !folders
+                            .iter()
+                            .any(|(fs, at)| Arc::ptr_eq(fs, &member.fs) && *at == folder)
+                    {
+                        folders.push((&member.fs, folder));
+                    }
+                }
+                let blob_paths: Vec<crate::path::PathBuf> = added_blobs
+                    .iter()
+                    .map(|(id, _)| blobs_folder.join(id.to_string()))
+                    .collect();
+                for path in &blob_paths {
+                    syncs.push((
+                        &config.fs,
+                        SyncTarget::FileData {
+                            path,
+                            origin: WriteOrigin::FlushBlob,
+                            mode: config.sync_mode,
+                        },
+                    ));
+                }
+                if !blob_paths.is_empty() {
+                    folders.push((&config.fs, &blobs_folder));
+                }
+                for (fs, folder) in folders {
+                    syncs.push((
+                        fs,
+                        SyncTarget::Folder {
+                            path: folder,
+                            mode: crate::file::folder_sync_mode(&**fs, folder, config.sync_mode),
+                        },
+                    ));
+                }
+                for (fs, target) in &syncs {
+                    target.sync_alone(&***fs)?;
+                }
+                // The manifest the open writes next names these files: under
+                // barrier syncs each other device is flushed first, or that
+                // snapshot could outlast the tables it names.
+                if config.sync_mode == SyncMode::Barrier {
+                    crate::version::flush_other_devices(&syncs, (&*config.fs, &config.path))
+                        .map_err(|(error, _)| error)?;
+                }
+            }
+            log::info!("installing synced flush #{seq} from its tables' own description");
+            if let Some(floor) = members.iter().find_map(|member| member.mark.floor) {
+                recovery.retention_floor = recovery.retention_floor.max(floor);
+            }
+            // Each table a run of its own, as the flush's install placed
+            // them: range tombstones can make a flush's tables overlap, which
+            // one run may not hold. The tree's placement merges disjoint
+            // ones as it does any other.
+            members.sort_by(|a, b| config.comparator.compare(&a.min_key, &b.min_key));
+            if recovery.table_ids.is_empty() {
+                recovery.table_ids.push(Vec::new());
+            }
+            if let Some(level_zero) = recovery.table_ids.first_mut() {
+                level_zero.extend(members.into_iter().map(|member| vec![member.table]));
+            }
+            recovery.blob_file_ids.extend(added_blobs);
+            recovery.blob_file_ids.sort_by_key(|(id, _)| *id);
+        }
+        if let Some(&flush) = broken.first() {
+            match purpose {
+                AdoptFor::Open if unproven => return Err(crate::Error::Unrecoverable),
+                AdoptFor::Open => return Err(crate::Error::DamagedFlush { flush }),
+                // The scan salvages what reads of them, and of the tables
+                // that do not open, one of which may be a missing member.
+                AdoptFor::Repair => kept.extend(unreadable),
+            }
+        }
+        for member in torn {
+            Self::set_aside_torn(&*member.fs, &member.path, member.table.id)?;
+        }
+        // Past the flushes left out too: the open records the watermark before
+        // the tree flushes again, so a table of one that the sweep fails to
+        // remove can never join a later flush under the same number.
+        recovery.flush_watermark = highest_seen;
+        Ok(AdoptedFlushes {
+            for_the_scan: kept,
+            lost,
+        })
+    }
+
+    /// The blob files a flush's tables refer to that `recovery` does not hold,
+    /// with their checksums, or why one of them is not taken.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an environmental fault reading them.
+    fn flush_blob_files(
+        recovery: &crate::version::recovery::Recovery,
+        config: &Config,
+        blobs_folder: &Path,
+        referred: impl Iterator<Item = crate::vlog::BlobFileId>,
+    ) -> crate::Result<FlushBlobs> {
+        let mut added: Vec<(crate::vlog::BlobFileId, Checksum)> = Vec::new();
+        for id in referred {
+            if recovery.blob_file_ids.iter().any(|(held, _)| *held == id)
+                || added.iter().any(|(known, _)| *known == id)
+            {
+                continue;
+            }
+            let path = blobs_folder.join(id.to_string());
+            let mut file = match config
+                .fs
+                .open(&path, &crate::fs::FsOpenOptions::new().read(true))
+            {
+                Ok(file) => file,
+                // The blob folder is the tree's own, under every route: a
+                // file missing from it is lost, not a folder left unscanned.
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {
+                    return Ok(FlushBlobs::Unread { proven: true });
+                }
+                Err(e) => return Err(e.into()),
+            };
+            // The trailer can reach the disk with frames that did not: every
+            // frame is checked, its payload not decoded, and the dictionary
+            // the file stores of its own, which the recovery of the blob files
+            // reads next.
+            let checked =
+                crate::vlog::read_meta_and_frames(&mut file, id).and_then(|(meta, frames)| {
+                    crate::vlog::verify_frames(&*file, &frames)?;
+                    #[cfg(zstd_any)]
+                    crate::vlog::read_file_dictionary(&mut file, &meta)?;
+                    #[cfg(not(zstd_any))]
+                    let _ = meta;
+                    Ok(())
+                });
+            match checked {
+                Ok(()) => {}
+                Err(e) if e.is_environmental() => return Err(e),
+                Err(e) => {
+                    log::warn!("blob file {id} of a synced flush does not read whole: {e:?}");
+                    return Ok(FlushBlobs::Unread {
+                        proven: e.is_repairable_structural(),
+                    });
+                }
+            }
+            added.push((
+                id,
+                Checksum::from_raw(crate::file::checksum_from_with_overrides(
+                    &*config.fs,
+                    &path,
+                    0,
+                    &[],
+                )?),
+            ));
+        }
+        Ok(FlushBlobs::Held(added))
+    }
+
+    /// Sets aside table `id` at `path`, of a synced flush that never returned
+    /// and does not read whole, under a name no sweep removes and no open
+    /// reads as a table: what reads of it stays for an operator.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failure renaming it.
+    fn set_aside_torn(
+        fs: &dyn crate::fs::Fs,
+        path: &Path,
+        id: crate::TableId,
+    ) -> crate::Result<()> {
+        let Some(folder) = path.parent() else {
+            return Ok(());
+        };
+        fs.rename(
+            path,
+            &folder.join(alloc::format!("{id}{}", crate::file::TORN_FLUSH_SUFFIX)),
+        )?;
+        Ok(())
+    }
+
     /// Recovers the level manifest, loading all tables from disk.
     ///
     /// When [`level_routes`](Config::level_routes) is configured, all
@@ -6261,17 +6974,32 @@ impl Tree {
         tree_id: TreeId,
         config: &Config,
         #[cfg(feature = "metrics")] metrics: &Arc<Metrics>,
-    ) -> crate::Result<(Version, PooledFiles)> {
+    ) -> crate::Result<(Version, PooledFiles, u64)> {
         use crate::{TableId, file::fsync_directory};
 
         let tree_path = tree_path.as_ref();
 
-        let recovery = recover(
+        let mut recovery = recover(
             tree_path,
             &*config.fs,
             config.manifest_recovery_mode,
             config.encryption.clone(),
         )?;
+        // A restore opens the folder with its marker in place, and only a
+        // restore does. A flush found there is an interrupted attempt's, of
+        // the pinned memtable contents this restore writes again: taken in, it
+        // would hold every entry twice (merge operands applied twice). Left
+        // out, the sweep below removes its files.
+        #[cfg(feature = "std")]
+        let restore = config
+            .fs
+            .exists(&tree_path.join(crate::file::RESTORE_MARKER_FILE))?;
+        #[cfg(not(feature = "std"))]
+        let restore = false;
+        if !restore {
+            Self::adopt_synced_flushes(&mut recovery, config, tree_id, AdoptFor::Open)?;
+        }
+        let flush_watermark = recovery.flush_watermark;
 
         // The installed on-disk snapshot: the generation orphan cleanup
         // must preserve. Intermediate versions live only in the edit log, so the
@@ -7011,6 +7739,7 @@ impl Tree {
             Arc::new(config.initial_runtime_config.clone()),
             config.encryption.clone(),
             config.sync_mode,
+            flush_watermark,
         )?;
         if renumbered {
             Self::remove_manifests_but(tree_path, version.id(), &config.fs, config.sync_mode)?;
@@ -7069,7 +7798,7 @@ impl Tree {
         }
 
         sweep.finish()?;
-        Ok((version, pooled))
+        Ok((version, pooled, flush_watermark))
     }
 
     /// Writes the `.restrict-bound` sidecar of every restricted table in
@@ -7821,3 +8550,62 @@ mod insert_rotation_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod overlapping_runs_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[cfg_attr(zstd_any, expect(clippy::expect_used, reason = "test code"))]
+mod adoption_tests;
+
+/// Whether a failure to read a table of a synced flush fails the open rather
+/// than tell that the flush does not read whole: a failure that says nothing
+/// about the bytes. A feature this build lacks says nothing about them
+/// either: setting the flush aside would lose it for good, its watermark
+/// raised past it. A missing dictionary does say something, about a table the
+/// manifest does not name.
+fn fails_adoption(e: &crate::Error) -> bool {
+    matches!(e, crate::Error::FeatureUnsupported(_))
+        || (e.is_environmental() && !matches!(e, crate::Error::ZstdDictMismatch { .. }))
+}
+
+/// Whether `e` says a table of a synced flush needs a dictionary the manifest
+/// references and the tree does not hold. That table is whole, its
+/// dictionary's file is what is gone, so the open fails on it: passed over as
+/// a table that does not open, it would be left to the sweep.
+fn needs_a_held_dictionary(e: &crate::Error, dicts: &[crate::file::DictId]) -> bool {
+    matches!(e, crate::Error::ZstdDictMismatch { expected, .. } if dicts.contains(expected))
+}
+
+/// The blob files a synced flush added, as an open finds them.
+enum FlushBlobs {
+    /// Each reads whole: the ones the manifest does not hold, with their
+    /// checksums.
+    Held(Vec<(crate::vlog::BlobFileId, Checksum)>),
+    /// One is missing or does not read whole; `proven` when its bytes decide
+    /// that (see [`crate::Error::is_repairable_structural`]).
+    Unread { proven: bool },
+}
+
+/// What a repair learns from taking in the synced flushes no manifest names.
+#[cfg_attr(
+    not(feature = "std"),
+    expect(dead_code, reason = "only a repair reads it, and repair is std-only")
+)]
+pub(crate) struct AdoptedFlushes {
+    /// The tables left for the repair's scan.
+    pub(crate) for_the_scan: crate::HashSet<crate::TableId>,
+    /// The flushes that returned and of which a table, or every table, was
+    /// not found: lost, with no key range or sequence number left to scope
+    /// the loss by.
+    pub(crate) lost: Vec<u64>,
+}
+
+/// Who takes synced flushes in from their tables' own description (see
+/// [`Tree::adopt_synced_flushes`]), which decides what becomes of a flush
+/// that returned and does not read whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdoptFor {
+    /// An open: such a flush fails it, for a repair to salvage.
+    Open,
+    /// A repair: such a flush's tables are left for its scan.
+    #[cfg_attr(not(feature = "std"), expect(dead_code, reason = "repair is std-only"))]
+    Repair,
+}

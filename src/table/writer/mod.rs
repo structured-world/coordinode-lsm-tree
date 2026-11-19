@@ -43,7 +43,6 @@ use alloc::sync::Arc;
 use alloc::{boxed::Box, vec::Vec};
 use index::BlockIndexWriter;
 
-use crate::io::BufWriter;
 use crate::path::PathBuf;
 
 #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
@@ -506,11 +505,18 @@ impl LinkedFile {
     }
 }
 
+/// The buffering writer a table's file is written through.
+type TableFile = crate::io::FileWriter<Box<dyn FsFile>>;
+
+/// A finished table: its id, its checksum and, when kept, the file it was
+/// written through (see [`Writer::use_keep_open`]).
+pub(crate) type Finished = (TableId, Checksum, Option<Box<dyn FsFile>>);
+
 /// Serializes and compresses values into blocks and writes them to disk as a table.
 ///
 /// `BlockIndexWriter` / `FilterWriter` are generic over a writer `W: Write + Seek`.
 /// `Fs::open()` returns `Box<dyn FsFile>` which implements `Write + Seek`,
-/// so `BufWriter<Box<dyn FsFile>>` satisfies the required trait bounds.
+/// so the buffering writer over it satisfies the required trait bounds.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is an independent on-disk format toggle (bulk-ingest \
@@ -573,15 +579,15 @@ pub struct Writer {
 
     /// File writer
     #[expect(clippy::struct_field_names)]
-    file_writer: crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    file_writer: crate::sfa::Writer<ChecksummedWriter<TableFile>>,
 
     /// Writer of index blocks
     #[expect(clippy::struct_field_names)]
-    index_writer: Box<dyn BlockIndexWriter<BufWriter<Box<dyn FsFile>>>>,
+    index_writer: Box<dyn BlockIndexWriter<TableFile>>,
 
     /// Writer of filter
     #[expect(clippy::struct_field_names)]
-    filter_writer: Box<dyn FilterWriter<BufWriter<Box<dyn FsFile>>>>,
+    filter_writer: Box<dyn FilterWriter<TableFile>>,
 
     /// Buffer of KVs
     chunk: Vec<InternalValue>,
@@ -778,9 +784,14 @@ pub struct Writer {
     /// install that persists it. Set via [`Self::use_durability`].
     durability: crate::config::FlushDurability,
 
+    /// Whether an unsynced file is handed back open at finish, for the
+    /// install that syncs it at once to sync it through this handle. Set via
+    /// [`Self::use_keep_open`].
+    keep_open: bool,
+
     /// Bytes gathered between writebacks the writer starts while writing; `0`
     /// starts none. Set via [`Self::use_writeback_bytes`].
-    writeback_bytes: u64,
+    writeback_bytes: crate::fs::Writeback,
 
     /// Where the last writeback ended: every byte before it was handed over.
     written_back: u64,
@@ -895,6 +906,11 @@ pub struct Writer {
     /// annihilated weak deletes, filter removals), not lost. Persisted as
     /// the marker key `lineage_last`, only alongside `lineage`.
     lineage_last: bool,
+
+    /// What a synced flush writes about itself into the table (the `flush#`
+    /// properties), so an open can install it with no manifest edit naming
+    /// it; `None` for every other table.
+    flush_mark: Option<crate::table::meta::FlushMark>,
 
     /// This table's place among the files its folder is writing, when its
     /// file came from the folder's pool: the ids below it still being written
@@ -1280,7 +1296,10 @@ impl Writer {
         fs: Arc<dyn Fs>,
         file: Box<dyn FsFile>,
     ) -> crate::Result<Self> {
-        let writer = BufWriter::with_capacity(u16::MAX.into(), file);
+        // Not filled to the byte: a table's blocks of a few KiB lose nothing
+        // to a buffer cut where the next one stopped fitting, and buffers cut
+        // at an exact size cost a merge's writes more than they saved.
+        let writer = TableFile::for_file(u16::MAX.into(), file, false);
         let writer = ChecksummedWriter::new(writer);
         let mut writer = crate::sfa::Writer::from_writer(writer);
         if let Err(e) = writer.start("data") {
@@ -1398,7 +1417,8 @@ impl Writer {
             ecc: None,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
-            writeback_bytes: 0,
+            keep_open: false,
+            writeback_bytes: crate::fs::Writeback::every(0),
             written_back: 0,
 
             kv_checksum: None,
@@ -1413,6 +1433,7 @@ impl Writer {
             lineage_prev: None,
             lineage_transformed: false,
             lineage_last: false,
+            flush_mark: None,
             writing: None,
             created_at: None,
             clock: None,
@@ -1753,6 +1774,7 @@ impl Writer {
             lineage_prev: self.lineage_prev,
             lineage_transformed: self.lineage_transformed,
             lineage_last: self.lineage_last,
+            flush_mark: self.flush_mark,
             writing_below: self
                 .writing
                 .as_ref()
@@ -1803,6 +1825,11 @@ impl Writer {
         let has_lineage = params.lineage.is_some();
         params.lineage_transformed |= has_lineage;
         params.lineage_last |= has_lineage;
+        // From above: a flush's last table carries the run's length and a floor.
+        if let Some(mark) = &mut params.flush_mark {
+            mark.run_len = Some(u32::MAX);
+            mark.floor = Some(crate::SeqNo::MAX);
+        }
         // From above: as many files written below this one as are recorded.
         if self.writing.is_some() {
             params.writing_below =
@@ -2045,6 +2072,18 @@ impl Writer {
         self.parallel_cap = (parallel.threads * 2).max(1);
         self.filter_writer = self.filter_writer.use_parallel(Some(parallel.clone()));
         self.parallel_settings = Some(parallel);
+        self
+    }
+
+    /// Writes the file's buffers on the workers of `spawner`, the writer's
+    /// thread going on into the next one. For a table whose blocks no worker
+    /// prepares: measured on a flush, buffers written on the pool that also
+    /// compresses cost the flush 3 to 12%, and a quarter less of its time
+    /// where the pool has nothing else to do.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn use_file_workers(mut self, spawner: Arc<dyn CompactionSpawner>) -> Self {
+        self.file_writer.get_mut().settings().use_spawner(spawner);
         self
     }
 
@@ -2534,12 +2573,23 @@ impl Writer {
         self
     }
 
+    /// Hands an unsynced file back open at finish
+    /// ([`Self::finish_keeping_file`]), for an install that syncs it right
+    /// after: a handle open since the write reports every writeback error of
+    /// the file, which one opened later reports only while the kernel keeps
+    /// the file's inode in memory.
+    #[must_use]
+    pub(crate) fn use_keep_open(mut self, keep_open: bool) -> Self {
+        self.keep_open = keep_open;
+        self
+    }
+
     /// Starts writing back every `bytes` the table gathers while it is
     /// written ([`FsFile::start_writeback`]), so its final sync is short;
     /// `0` starts none.
     #[must_use]
     pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
-        self.writeback_bytes = bytes;
+        self.writeback_bytes = crate::fs::Writeback::every(bytes);
         self
     }
 
@@ -2548,22 +2598,15 @@ impl Writer {
     fn writeback_if_due(&mut self) -> crate::Result<()> {
         // `written_back` only ever takes a value of `file_pos`, which grows.
         let pending = *self.meta.file_pos - self.written_back;
-        if self.writeback_bytes == 0 || pending < self.writeback_bytes {
+        if self.writeback_bytes.bytes == 0 || pending < self.writeback_bytes.bytes {
             return Ok(());
         }
-        #[cfg(not(feature = "std"))]
-        use crate::io::Write;
-        #[cfg(feature = "std")]
-        use std::io::Write;
-        // The range is in the buffer until it is flushed to the file.
-        let checksummed = self.file_writer.get_mut();
-        checksummed.flush()?;
-        crate::fs::hint_writeback(
-            &**checksummed.get_ref().get_ref(),
+        // Asked behind the range's bytes, which may still be buffered.
+        self.writeback_bytes.hint(
+            self.file_writer.get_mut().settings(),
             self.written_back,
             pending,
-            &mut self.writeback_bytes,
-        );
+        )?;
         self.written_back = *self.meta.file_pos;
         Ok(())
     }
@@ -2773,6 +2816,31 @@ impl Writer {
     /// [`Self::lineage_last`]).
     pub(crate) fn mark_lineage_last(&mut self) {
         self.lineage_last = true;
+    }
+
+    /// Makes the table describe itself as table `index` of synced flush `seq`
+    /// (see [`Self::flush_mark`]).
+    #[must_use]
+    pub(crate) fn use_flush_mark(mut self, seq: u64, index: u32, returned_through: u64) -> Self {
+        self.assert_not_started("use_flush_mark");
+        self.flush_mark = Some(crate::table::meta::FlushMark {
+            seq,
+            index,
+            run_len: None,
+            floor: None,
+            returned_through,
+        });
+        self
+    }
+
+    /// Marks the table as the one its flush's run of `run_len` tables
+    /// finishes with, with the retention floor the flush raised (callable at
+    /// finish time; see [`Self::flush_mark`]).
+    pub(crate) fn mark_flush_end(&mut self, run_len: u32, floor: Option<crate::SeqNo>) {
+        if let Some(mark) = &mut self.flush_mark {
+            mark.run_len = Some(run_len);
+            mark.floor = floor;
+        }
     }
 
     /// Sets the last-output marker at build time (see [`Self::lineage_last`]);
@@ -4926,12 +4994,24 @@ impl Writer {
     /// age-based policy (FIFO's TTL and drop order) sees the same data as old
     /// after a compaction as before it. Without `ages` (a flush, an ingest, a
     /// salvage copy) the clock is read.
-    // TODO: split meta writing into new function
-    #[expect(clippy::too_many_lines)]
     pub(crate) fn finish_deferring_dir_sync(
-        mut self,
+        self,
         ages: Option<&mut AgeSweep>,
     ) -> crate::Result<Option<(TableId, Checksum)>> {
+        Ok(self
+            .finish_keeping_file(ages)?
+            .map(|(table_id, checksum, _)| (table_id, checksum)))
+    }
+
+    /// [`Self::finish_deferring_dir_sync`], handing the file back open when
+    /// the writer leaves it unsynced and was asked to
+    /// ([`Self::use_keep_open`]).
+    // TODO: split meta writing into new function
+    #[expect(clippy::too_many_lines)]
+    pub(crate) fn finish_keeping_file(
+        mut self,
+        ages: Option<&mut AgeSweep>,
+    ) -> crate::Result<Option<Finished>> {
         #[cfg(not(feature = "std"))]
         use crate::io::Write;
         #[cfg(feature = "std")]
@@ -5630,14 +5710,17 @@ impl Writer {
         // are all a read of it needs (POSIX synchronized I/O data integrity
         // completion), so `sync_data`; its name is the directory sync's. A
         // deferred table is synced by the install that persists it.
-        let checksum = self.file_writer.into_inner()?;
-        {
-            let file = checksum.get_ref().get_ref();
-            if self.durability == crate::config::FlushDurability::Synced {
-                FsFile::sync_data_with(&**file, self.sync_mode)?;
-            }
-        }
-        let checksum = checksum.checksum();
+        let checksummed = self.file_writer.into_inner()?;
+        let checksum = checksummed.checksum();
+        let kept = if self.durability == crate::config::FlushDurability::Synced {
+            let sync_mode = self.sync_mode;
+            checksummed
+                .into_inner()
+                .with_inner(|file| FsFile::sync_data_with(&**file, sync_mode))??;
+            None
+        } else {
+            crate::io::kept_open(self.keep_open, checksummed.into_inner())?
+        };
 
         // The folder is not synced here; see `finish`.
 
@@ -5649,16 +5732,16 @@ impl Writer {
             *self.meta.file_pos / 1_024 / 1_024,
         );
 
-        Ok(Some((self.table_id, checksum)))
+        Ok(Some((self.table_id, checksum, kept)))
     }
 }
 
 /// Starts the section `name` of a table's tail on `file_writer`, first
 /// writing back what was written before it ([`write_back_tail`]).
 fn start_section(
-    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<TableFile>>,
     written_back: &mut u64,
-    writeback_bytes: &mut u64,
+    writeback_bytes: &mut crate::fs::Writeback,
     name: &str,
 ) -> crate::Result<()> {
     write_back_tail(file_writer, written_back, writeback_bytes)?;
@@ -5671,28 +5754,18 @@ fn start_section(
 /// Free-standing so `finish` can call it while it borrows other fields of the
 /// writer.
 fn write_back_tail(
-    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<TableFile>>,
     written_back: &mut u64,
-    writeback_bytes: &mut u64,
+    writeback_bytes: &mut crate::fs::Writeback,
 ) -> crate::Result<()> {
-    if *writeback_bytes > 0 {
-        #[cfg(not(feature = "std"))]
-        use crate::io::Write;
-        #[cfg(feature = "std")]
-        use std::io::Write;
+    if writeback_bytes.bytes > 0 {
         let checksummed = file_writer.get_mut();
         let position = checksummed.position();
         // `written_back` is a position the file already reached.
         let pending = position - *written_back;
-        if pending >= *writeback_bytes {
-            // The range is in the buffer until it is flushed to the file.
-            checksummed.flush()?;
-            crate::fs::hint_writeback(
-                &**checksummed.get_ref().get_ref(),
-                *written_back,
-                pending,
-                writeback_bytes,
-            );
+        if pending >= writeback_bytes.bytes {
+            // Asked behind the range's bytes, which may still be buffered.
+            writeback_bytes.hint(checksummed.settings(), *written_back, pending)?;
             *written_back = position;
         }
     }
@@ -5802,6 +5875,8 @@ struct MetaSectionParams<'a> {
     /// `true` writes the `lineage_last` marker (only alongside `lineage`):
     /// this output closed its compaction run.
     lineage_last: bool,
+    /// A synced flush's self-description: written as the `flush#` properties.
+    flush_mark: Option<crate::table::meta::FlushMark>,
     /// The ids below this table's of the files its folder was still writing
     /// when it finished: written as `writing_below` when any.
     writing_below: Vec<TableId>,
@@ -6149,6 +6224,23 @@ fn encode_meta_payload(
         }
         if p.lineage_last {
             meta_items.push(meta("lineage_last", &[]));
+        }
+    }
+
+    // A synced flush's self-description: the flush and the table's place in
+    // its run, the run's length and the raised floor on the table the run
+    // finishes with.
+    if let Some(mark) = &p.flush_mark {
+        meta_items.push(meta("flush#seq", &mark.seq.to_le_bytes()));
+        meta_items.push(meta("flush#index", &mark.index.to_le_bytes()));
+        if mark.returned_through != 0 {
+            meta_items.push(meta("flush#returned", &mark.returned_through.to_le_bytes()));
+        }
+        if let Some(run_len) = mark.run_len {
+            meta_items.push(meta("flush#run_len", &run_len.to_le_bytes()));
+            if let Some(floor) = mark.floor {
+                meta_items.push(meta("flush#floor", &floor.to_le_bytes()));
+            }
         }
     }
 

@@ -61,7 +61,53 @@ fn sample() -> VersionEdit {
         // appended section as well.
         retention_floor: Some(77),
         dicts: None,
+        flush_watermark: None,
     }
+}
+
+/// The flush watermark round-trips, and an edit written before it existed
+/// decodes as carrying none, which leaves the recovered watermark as it was.
+#[test]
+fn the_flush_watermark_roundtrips_and_defaults_to_none() {
+    let mut edit = sample();
+    edit.dicts = Some(vec![5]);
+    edit.flush_watermark = Some(42);
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+    assert_eq!(VersionEdit::decode_payload(&payload).expect("decode"), edit);
+
+    edit.flush_watermark = None;
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+    let decoded = VersionEdit::decode_payload(&payload).expect("decode");
+    assert_eq!(decoded.flush_watermark, None);
+    assert_eq!(decoded, edit);
+}
+
+/// The section is positional after the dictionary ids; without them it would
+/// be read as a dictionary count, so the encoder refuses that edit.
+#[test]
+fn a_flush_watermark_without_dictionary_ids_is_refused_by_the_encoder() {
+    let mut edit = sample();
+    edit.dicts = None;
+    edit.flush_watermark = Some(1);
+    let mut payload = Vec::new();
+    assert!(edit.encode_payload(&mut payload).is_err());
+}
+
+/// `u64::MAX` is no number a flush takes, so an edit naming it is mis-encoded:
+/// the counter that starts above the watermark would overflow on its first
+/// flush.
+#[test]
+fn a_flush_watermark_at_u64_max_fails_to_decode() {
+    let mut edit = sample();
+    edit.dicts = Some(vec![]);
+    edit.flush_watermark = Some(0);
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+    let at = payload.len() - 8;
+    payload[at..].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(VersionEdit::decode_payload(&payload).is_err());
 }
 
 #[test]

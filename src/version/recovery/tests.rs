@@ -20,7 +20,50 @@ fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> R
         retention_floor: 0,
         dicts: Vec::new(),
         repair_report: None,
+        flush_watermark: 0,
     }
+}
+
+/// A snapshot's flush watermark is exactly eight bytes and below `u64::MAX`:
+/// trailing bytes, a short section and the top value are refused. Guards
+/// against a watermark misread low, which would install a flush the manifest
+/// dropped.
+#[test]
+fn a_flush_watermark_section_is_read_strictly() {
+    assert!(matches!(
+        parse_flush_watermark_section(&7u64.to_le_bytes()),
+        Ok(7)
+    ));
+    let mut long = 7u64.to_le_bytes().to_vec();
+    long.push(0);
+    for bad in [
+        long.as_slice(),
+        &7u64.to_le_bytes()[..7],
+        &u64::MAX.to_le_bytes(),
+    ] {
+        assert!(parse_flush_watermark_section(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// The flush watermark an edit carries replaces the recovered one, as an
+/// absolute value; an edit without one leaves it as it was.
+#[test]
+fn apply_edit_overwrites_the_flush_watermark_only_when_carried() {
+    let mut rec = recovery_with(1, vec![]);
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 2,
+        flush_watermark: Some(9),
+        ..Default::default()
+    })
+    .expect("apply");
+    assert_eq!(rec.flush_watermark, 9);
+
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 3,
+        ..Default::default()
+    })
+    .expect("apply");
+    assert_eq!(rec.flush_watermark, 9);
 }
 
 /// An edit that raised the retention floor carries the new absolute value;
@@ -1343,6 +1386,7 @@ fn a_tree_at_version(fs: &std::sync::Arc<MemFs>, id: u64) -> crate::Result<crate
         alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
+        0,
     )?;
     Ok(folder)
 }

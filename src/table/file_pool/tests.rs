@@ -34,25 +34,38 @@ fn exists(fs: &Arc<dyn Fs>, folder: &Path, id: TableId) -> crate::Result<bool> {
     Ok(fs.exists(&folder.join(id.to_string()))?)
 }
 
-/// The first claim makes a batch with one folder sync and hands out its
-/// lowest id, durable by name; the claims after it use the batch, syncing
-/// nothing, until it runs out.
+/// The first claim makes a batch without syncing its folder and hands out its
+/// lowest id with the entry not yet durable: the install of its table syncs
+/// the folder among its own syncs, on the writer's thread. The next claim
+/// syncs the folder once (the batch may have no install behind it yet) and
+/// hands out durable entries; the claims after it sync nothing until the
+/// batch runs out. One folder sync per batch on the claims, none on a thread
+/// of the pool's own.
 #[test]
 fn claims_use_one_folder_sync_per_batch() -> crate::Result<()> {
     let (pools, fault, fs, folder) = pools(3)?;
 
+    let claimed = pools.claim(&folder, &fs, None, true)?;
+    assert_eq!(claimed.id, 0, "the batch's lowest id");
+    assert!(
+        !claimed.durable_entry,
+        "the claim that made the batch leaves its folder to the install"
+    );
+    assert_eq!(directory_syncs(&fault), 0, "making the batch syncs nothing");
+
     let mut ids = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         let claimed = pools.claim(&folder, &fs, None, true)?;
         assert!(claimed.durable_entry, "a pooled file's entry is durable");
         ids.push(claimed.id);
     }
-    assert_eq!(ids, vec![0, 1, 2], "ascending, in the order made");
+    assert_eq!(ids, vec![1, 2], "ascending, in the order made");
     assert_eq!(directory_syncs(&fault), 1, "one sync for the batch");
 
     let claimed = pools.claim(&folder, &fs, None, true)?;
     assert_eq!(claimed.id, 3);
-    assert_eq!(directory_syncs(&fault), 1, "a new batch, synced once");
+    assert!(!claimed.durable_entry, "a new batch, left to its install");
+    assert_eq!(directory_syncs(&fault), 0, "a new batch syncs nothing");
     for id in 4..6 {
         assert!(exists(&fs, &folder, id)?, "the rest of the batch is pooled");
     }
@@ -85,8 +98,15 @@ fn a_claim_above_every_pooled_id_makes_a_new_batch() -> crate::Result<()> {
 
     let claimed = pools.claim(&folder, &fs, Some(1), true)?;
     assert_eq!(claimed.id, 2, "the new batch's first id");
-    assert!(claimed.durable_entry);
-    assert_eq!(directory_syncs(&fault), 1, "the new batch's sync");
+    assert!(
+        !claimed.durable_entry,
+        "the new batch's folder is the install's to sync"
+    );
+    assert_eq!(
+        directory_syncs(&fault),
+        0,
+        "making the new batch syncs nothing"
+    );
     Ok(())
 }
 
@@ -498,6 +518,27 @@ fn pooled_files_are_listed_as_holding_no_table() -> crate::Result<()> {
     Ok(())
 }
 
+/// A dry pool's refill starts with the claim on a device whose scheduler does
+/// not idle between queues, and waits for the install on one that does.
+#[cfg(feature = "std")]
+#[test]
+fn a_refill_waits_for_the_install_only_when_asked() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(4)?;
+    drop(pools.claim(&folder, &fs, None, true)?);
+    assert!(pools.pending.lock().is_empty(), "started with the claim");
+    pools.wait_for_refills();
+
+    let (pools, _fault, fs, folder) = background_pools(4)?;
+    let pools = Arc::new(pools);
+    let hold = pools.hold();
+    drop(pools.claim_held(&folder, &fs, true, &hold)?);
+    assert_eq!(pools.pending.lock().len(), 1, "held for the install");
+    drop(hold);
+    assert!(pools.pending.lock().is_empty(), "the hold started it");
+    pools.wait_for_refills();
+    Ok(())
+}
+
 /// An in-memory backend that panics on every folder sync.
 #[cfg(feature = "std")]
 struct PanicsOnFolderSync(MemFs);
@@ -559,18 +600,169 @@ fn a_refill_that_panics_leaves_no_claim_waiting() -> crate::Result<()> {
 }
 
 /// Pools that go wait for their refills: no file is made in a folder after
-/// its tree is closed.
+/// its tree is closed. A refill its write's hold started finishes its batch.
 #[cfg(feature = "std")]
 #[test]
 fn closing_the_pools_waits_for_their_refills() -> crate::Result<()> {
     let (pools, _fault, fs, folder) = background_pools(8)?;
-    drop(pools.claim(&folder, &fs, None, true)?);
+    let pools = Arc::new(pools);
+    let hold = pools.hold();
+    drop(pools.claim_held(&folder, &fs, true, &hold)?);
+    // What the install of the claim's table does once its syncs are done.
+    drop(hold);
     drop(pools);
     assert_eq!(
         empty_files(&fs, &folder)?.len(),
         1 + 8,
         "the claim's file and the whole batch"
     );
+    Ok(())
+}
+
+/// A refill a claim reserved is held until its write drops its hold, once
+/// the write's install has synced, so it never runs beside that write's
+/// syncs.
+#[cfg(feature = "std")]
+#[test]
+fn a_held_refill_waits_for_its_writes_hold() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(8)?;
+    let pools = Arc::new(pools);
+    let hold = pools.hold();
+    drop(pools.claim_held(&folder, &fs, true, &hold)?);
+    pools.join_refills();
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1,
+        "the batch waits for the install of the claim's write"
+    );
+    drop(hold);
+    pools.join_refills();
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1 + 8,
+        "the claim's file and the batch its hold started"
+    );
+    Ok(())
+}
+
+/// A later claim of the write that holds a refill does not start it: the
+/// batch still waits for the write's install. Guards against a flush of
+/// several tables running its refill beside its own syncs.
+#[cfg(feature = "std")]
+#[test]
+fn a_later_claim_of_the_write_leaves_its_refill_held() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(8)?;
+    let pools = Arc::new(pools);
+    // A first write makes its file and a batch of eight.
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    // Later tables of that write leave five pooled.
+    for _ in 0..3 {
+        drop(pools.claim(&folder, &fs, None, false)?);
+    }
+    // The next write's first claim leaves half a batch and holds a refill;
+    // its second takes a pooled file, the pool not dry.
+    let hold = pools.hold();
+    drop(pools.claim_held(&folder, &fs, true, &hold)?);
+    drop(pools.claim_held(&folder, &fs, false, &hold)?);
+    pools.join_refills();
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1 + 8,
+        "the first file and the first batch alone"
+    );
+    drop(hold);
+    Ok(())
+}
+
+/// Waiting for the refills starts the ones still held for a write: a tree
+/// that closes leaves no batch reserved and never made. Guards against a
+/// close waiting on a refill that only an install it will not see starts.
+#[cfg(feature = "std")]
+#[test]
+fn waiting_for_the_refills_starts_one_still_held() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(8)?;
+    let pools = Arc::new(pools);
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    for _ in 0..3 {
+        drop(pools.claim(&folder, &fs, None, false)?);
+    }
+    // Five pooled: the write's first claim leaves half a batch and holds it.
+    let hold = pools.hold();
+    drop(pools.claim_held(&folder, &fs, true, &hold)?);
+    pools.wait_for_refills();
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1 + 8 + 8,
+        "the held refill made its batch"
+    );
+    drop(hold);
+    Ok(())
+}
+
+/// The install of one write starts only the refills held for it: one another
+/// write's claim reserved stays held while that write may still be syncing,
+/// until it drops its own hold. Two writes share a tree's pools whenever a
+/// flush overlaps a compaction.
+#[cfg(feature = "std")]
+#[test]
+fn a_writes_install_leaves_another_writes_refill_held() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(8)?;
+    let pools = Arc::new(pools);
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    for _ in 0..3 {
+        drop(pools.claim(&folder, &fs, None, false)?);
+    }
+    // Five pooled. The compaction's first claim leaves half a batch and holds
+    // the refill; the flush's first claim finds one under way.
+    let (compaction, flush) = (pools.hold(), pools.hold());
+    drop(pools.claim_held(&folder, &fs, true, &compaction)?);
+    drop(pools.claim_held(&folder, &fs, true, &flush)?);
+    // The flush installs first.
+    drop(flush);
+    pools.join_refills();
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1 + 8,
+        "the compaction's refill waits for the compaction"
+    );
+    drop(compaction);
+    pools.join_refills();
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1 + 8 + 8,
+        "the compaction's install started it"
+    );
+    Ok(())
+}
+
+/// A claim that finds its pool dry while the refill filling it is held for
+/// another write starts that refill and takes a file from its batch, rather
+/// than wait for an install that may itself wait on this claim.
+#[cfg(feature = "std")]
+#[test]
+fn a_dry_pool_starts_the_refill_another_write_holds() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(4)?;
+    let pools = Arc::new(pools);
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    // Four pooled: two later tables leave two, and a write's first claim
+    // leaves one and holds the refill.
+    for _ in 0..2 {
+        drop(pools.claim(&folder, &fs, None, false)?);
+    }
+    let holder = pools.hold();
+    let held = pools.claim_held(&folder, &fs, true, &holder)?;
+    drop(pools.claim(&folder, &fs, None, false)?);
+    // Dry, the refill held for `holder`, which has not installed.
+    let other = pools.hold();
+    let claimed = pools.claim_held(&folder, &fs, true, &other)?;
+    assert!(claimed.durable_entry, "a file of the started batch");
+    assert!(claimed.id > held.id, "{} above {}", claimed.id, held.id);
+    drop((holder, other));
+    pools.wait_for_refills();
     Ok(())
 }
 
@@ -732,16 +924,23 @@ fn a_write_that_runs_the_pool_dry_makes_its_further_files() -> crate::Result<()>
     for may_refill in [true, false, false, false] {
         durable.push(pools.claim(&folder, &fs, None, may_refill)?.durable_entry);
     }
-    assert_eq!(durable, vec![true, true, false, false]);
+    assert_eq!(
+        durable,
+        vec![false, true, false, false],
+        "the batch's first file is its install's to sync, the second synced by its claim"
+    );
     assert_eq!(directory_syncs(&fault), 1, "the first batch alone");
     Ok(())
 }
 
-/// A batch whose folder sync fails stays pooled, its entries not known
-/// durable: the next claim syncs the folder before handing one out.
+/// A folder sync a claim makes for a batch that fails leaves the batch
+/// pooled, its entries not known durable: the next claim syncs the folder
+/// again before handing one out.
 #[test]
 fn a_batch_whose_sync_failed_is_synced_by_the_next_claim() -> crate::Result<()> {
-    let (pools, fault, fs, folder) = pools(2)?;
+    let (pools, fault, fs, folder) = pools(3)?;
+    let made = pools.claim(&folder, &fs, None, true)?;
+    assert!(!made.durable_entry, "the batch is not synced when made");
     fault.injector().arm(
         FaultRule::new(
             FaultOp::SyncDirectory,
@@ -753,7 +952,7 @@ fn a_batch_whose_sync_failed_is_synced_by_the_next_claim() -> crate::Result<()> 
     directory_syncs(&fault);
 
     let claimed = pools.claim(&folder, &fs, None, true)?;
-    assert_eq!(claimed.id, 0, "the batch made before the failure");
+    assert_eq!(claimed.id, 1, "the batch made before the failure");
     assert!(claimed.durable_entry);
     assert_eq!(directory_syncs(&fault), 1, "synced before it is used");
     Ok(())

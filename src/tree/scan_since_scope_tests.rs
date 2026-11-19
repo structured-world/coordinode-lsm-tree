@@ -54,7 +54,15 @@ fn scoped_scan_tombstone_past_table_key_range_returns_range_tombstone() -> crate
         b"b",
         "premise: the tombstone reaches past the key range"
     );
-    tree.register_tables(&[table], None, None, &[], 0, false)?;
+    tree.register_tables(
+        &[table],
+        None,
+        None,
+        &[],
+        0,
+        false,
+        &crate::abstract_tree::KeptFiles::default(),
+    )?;
 
     let got: Vec<ScanSinceEvent> = tree
         .scan_since_seqno_in_range(0, b"n".as_slice()..=b"o".as_slice())?

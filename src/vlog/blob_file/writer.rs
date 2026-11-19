@@ -10,7 +10,7 @@ use super::frame::{
     encode_frame_parts_compressed, head_payload,
 };
 use super::meta::{META_VERSION, Metadata};
-use crate::io::FillingBufWriter;
+use crate::io::FileWriter;
 #[cfg(not(feature = "std"))]
 use crate::io::Write;
 use crate::path::{Path, PathBuf};
@@ -212,6 +212,15 @@ pub(crate) fn encode_frame_index(starts: &[u64], end: u64) -> Vec<u8> {
     encode_frame_index_marked(starts, end, &[])
 }
 
+/// A finished blob file: its metadata, its checksum, its frame index and,
+/// when kept, the file it was written through.
+pub(crate) type FinishedFile = (
+    Metadata,
+    Checksum,
+    FrameIndex,
+    Option<alloc::boxed::Box<dyn FsFile>>,
+);
+
 /// A blob file's frame index as a reader holds it: where each frame starts,
 /// then where the data ends (it reads as that slice), and which frames are
 /// chunks. Cloning it shares both.
@@ -296,7 +305,7 @@ pub(crate) struct Writer {
     pub(crate) blob_file_id: BlobFileId,
 
     #[expect(clippy::struct_field_names)]
-    writer: crate::sfa::Writer<ChecksummedWriter<FillingBufWriter<Box<dyn FsFile>>>>,
+    writer: crate::sfa::Writer<ChecksummedWriter<FileWriter<Box<dyn FsFile>>>>,
 
     offset: u64,
 
@@ -332,9 +341,14 @@ pub(crate) struct Writer {
     /// install that persists it.
     pub(crate) durability: crate::config::FlushDurability,
 
+    /// Whether an unsynced file is handed back open at finish, for the
+    /// install that syncs it right after (see
+    /// [`super::multi_writer::MultiWriter::use_keep_open`]).
+    pub(crate) keep_open: bool,
+
     /// Bytes gathered between writebacks the writer starts while writing; `0`
     /// starts none. Set via [`Self::use_writeback_bytes`].
-    writeback_bytes: u64,
+    writeback_bytes: crate::fs::Writeback,
 
     /// Where the last writeback ended: every byte before it was handed over.
     written_back: u64,
@@ -585,8 +599,10 @@ impl Writer {
         // error: an open failure above created nothing, so caller-side
         // cleanup would race a concurrent creator and delete a file it does
         // not own.
+        // Filled to the byte: frames of tens of KiB would otherwise go down
+        // two or three to a write.
         let mut writer = crate::sfa::Writer::from_writer(ChecksummedWriter::new(
-            FillingBufWriter::with_capacity(u16::MAX.into(), file),
+            FileWriter::for_file(u16::MAX.into(), file, true),
         ));
         if let Err(e) = writer.start("data") {
             drop(writer);
@@ -625,7 +641,8 @@ impl Writer {
             clock: None,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
-            writeback_bytes: 0,
+            keep_open: false,
+            writeback_bytes: crate::fs::Writeback::every(0),
             written_back: 0,
 
             #[cfg(zstd_any)]
@@ -663,6 +680,16 @@ impl Writer {
     ) -> Self {
         self.parallel = parallel;
         self
+    }
+
+    /// Writes the file's buffers on the workers of `spawner` (see
+    /// [`super::multi_writer::MultiWriter::use_file_workers`]).
+    #[cfg(feature = "std")]
+    pub(crate) fn use_file_workers(
+        &mut self,
+        spawner: alloc::sync::Arc<dyn crate::table::writer::CompactionSpawner>,
+    ) {
+        self.writer.get_mut().settings().use_spawner(spawner);
     }
 
     pub(crate) fn use_compression(mut self, compressor: CompressionType) -> Self {
@@ -707,7 +734,7 @@ impl Writer {
     /// none.
     #[must_use]
     pub(crate) fn use_writeback_bytes(mut self, bytes: u64) -> Self {
-        self.writeback_bytes = bytes;
+        self.writeback_bytes = crate::fs::Writeback::every(bytes);
         self
     }
 
@@ -723,8 +750,13 @@ impl Writer {
     ) {
         self.lifetime_class = class;
         if let Some(lifetime) = lifetime {
-            let file = self.writer.get_mut().get_ref().get_ref();
-            if let Err(error) = file.set_write_lifetime(lifetime) {
+            let hinted = self
+                .writer
+                .get_mut()
+                .settings()
+                .with_inner(|file| file.set_write_lifetime(lifetime));
+            // A write that failed before it comes back on the next write.
+            if let Ok(Err(error)) = hinted {
                 log::debug!(
                     "write lifetime hint refused for {}: {error}",
                     self.path.display()
@@ -740,18 +772,12 @@ impl Writer {
     fn writeback_if_due(&mut self) -> crate::Result<()> {
         // `written_back` only ever takes a value of `offset`, which grows.
         let pending = self.offset - self.written_back;
-        if self.writeback_bytes == 0 || pending < self.writeback_bytes {
+        if self.writeback_bytes.bytes == 0 || pending < self.writeback_bytes.bytes {
             return Ok(());
         }
-        // The range is in the buffer until it is flushed to the file.
-        let checksummed = self.writer.get_mut();
-        checksummed.flush()?;
-        crate::fs::hint_writeback(
-            &**checksummed.get_ref().get_ref(),
-            self.written_back,
-            pending,
-            &mut self.writeback_bytes,
-        );
+        // Asked behind the range's bytes, which may still be buffered.
+        self.writeback_bytes
+            .hint(self.writer.get_mut().settings(), self.written_back, pending)?;
         self.written_back = self.offset;
         Ok(())
     }
@@ -1642,7 +1668,19 @@ impl Writer {
     /// # Errors
     ///
     /// Any IO error.
-    pub(crate) fn finish(mut self) -> crate::Result<(Metadata, Checksum, FrameIndex)> {
+    #[cfg(any(test, feature = "std"))]
+    pub(crate) fn finish(self) -> crate::Result<(Metadata, Checksum, FrameIndex)> {
+        let (metadata, checksum, frames, _) = self.finish_keeping_file()?;
+        Ok((metadata, checksum, frames))
+    }
+
+    /// [`Self::finish`], handing the file back open when the writer leaves it
+    /// unsynced and was asked to (`keep_open`).
+    ///
+    /// # Errors
+    ///
+    /// Any IO error.
+    pub(crate) fn finish_keeping_file(mut self) -> crate::Result<FinishedFile> {
         self.close_block()?;
 
         // The file's own dictionary, which its reader decodes with: what the
@@ -1690,15 +1728,21 @@ impl Writer {
         };
         metadata.encode_into(&mut self.writer)?;
 
-        let checksum = self.writer.into_inner()?;
+        let checksummed = self.writer.into_inner()?;
+        let checksum = checksummed.checksum();
         // Data and size are all a read of the file needs, so `sync_data`. A
         // deferred file is synced by the install that persists it.
-        if self.durability == crate::config::FlushDurability::Synced {
-            FsFile::sync_data_with(&**checksum.get_ref().get_ref(), self.sync_mode)?;
-        }
-        let checksum = checksum.checksum();
+        let kept = if self.durability == crate::config::FlushDurability::Synced {
+            let sync_mode = self.sync_mode;
+            checksummed
+                .into_inner()
+                .with_inner(|file| FsFile::sync_data_with(&**file, sync_mode))??;
+            None
+        } else {
+            crate::io::kept_open(self.keep_open, checksummed.into_inner())?
+        };
 
-        Ok((metadata, checksum, frames))
+        Ok((metadata, checksum, frames, kept))
     }
 }
 

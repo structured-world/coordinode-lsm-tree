@@ -27,6 +27,13 @@ fn table_files(folder: &std::path::Path) -> std::io::Result<Vec<std::path::PathB
     Ok(tables)
 }
 
+/// The only table file in `folder` holding data, after a tree's first flush.
+fn earliest_table(folder: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let tables = table_files(folder)?;
+    assert_eq!(tables.len(), 1, "one flush, one table: {tables:?}");
+    Ok(tables.into_iter().next().expect("one table"))
+}
+
 /// Helper: create a 3-tier config (hot L0-L1 / warm L2-L4 / cold L5-L6).
 fn three_tier_config(base: &std::path::Path) -> Config {
     let hot = base.join("hot");
@@ -724,15 +731,18 @@ fn missing_table_without_routes_returns_unrecoverable() -> lsm_tree::Result<()> 
         tree.insert("a", "value_a", 0);
         tree.insert("b", "value_b", 1);
         tree.flush_active_memtable(0)?;
-    }
+        // A later flush: the deleted table is not one the log's last edit
+        // added, which recovery takes back when its file is not on disk.
+        let first = earliest_table(&dir.path().join("primary").join("tables"))?;
+        tree.insert("c", "value_c", 2);
+        tree.flush_active_memtable(0)?;
+        // Named in the manifest, so the deleted file is one it expects.
+        tree.persist_flushes()?;
 
-    // Phase 2: delete a table file to simulate corruption
-    let tables_dir = dir.path().join("primary").join("tables");
-    let table = table_files(&tables_dir)?
-        .into_iter()
-        .next()
-        .expect("expected to delete at least one table file");
-    std::fs::remove_file(table)?;
+        // Phase 2: delete a table file to simulate corruption
+        drop(tree);
+        std::fs::remove_file(first)?;
+    }
 
     // Phase 3: reopen without routes — should get Unrecoverable, not RouteMismatch
     {
@@ -764,15 +774,18 @@ fn deleted_sst_with_routes_configured_returns_unrecoverable() -> lsm_tree::Resul
         tree.insert("a", "value_a", 0);
         tree.insert("b", "value_b", 1);
         tree.flush_active_memtable(0)?;
-    }
+        // A later flush: the deleted table is not one the log's last edit
+        // added, which recovery takes back when its file is not on disk.
+        let first = earliest_table(&dir.path().join("hot").join("tables"))?;
+        tree.insert("c", "value_c", 2);
+        tree.flush_active_memtable(0)?;
+        // Named in the manifest, so the deleted file is one it expects.
+        tree.persist_flushes()?;
 
-    // Phase 2: delete a table file from the hot tier (simulates corruption)
-    let hot_tables_dir = dir.path().join("hot").join("tables");
-    let table = table_files(&hot_tables_dir)?
-        .into_iter()
-        .next()
-        .expect("expected to delete at least one table file from hot tier");
-    std::fs::remove_file(table)?;
+        // Phase 2: delete a table file from the hot tier (simulates corruption)
+        drop(tree);
+        std::fs::remove_file(first)?;
+    }
 
     // Phase 3: reopen WITH THE SAME routes — L0 is covered by hot route,
     // so the missing table is corruption, NOT a route mismatch
@@ -921,16 +934,19 @@ fn open_or_repair_propagates_a_routed_missing_table() -> lsm_tree::Result<()> {
         let tree = three_tier_config(dir.path()).open()?;
         tree.insert("a", "value_a", 1);
         tree.flush_active_memtable(0)?;
-    }
+        // A later flush: the lost table is not one the log's last edit added,
+        // which recovery takes back when its file is not on disk.
+        let first = earliest_table(&dir.path().join("hot").join("tables"))?;
+        tree.insert("b", "value_b", 2);
+        tree.flush_active_memtable(0)?;
+        // Named in the manifest, so the lost file is one it expects.
+        tree.persist_flushes()?;
 
-    // The hot tier "loses" its table — indistinguishable from the tier being
-    // remounted elsewhere or the route path having changed.
-    let hot_tables_dir = dir.path().join("hot").join("tables");
-    let table = table_files(&hot_tables_dir)?
-        .into_iter()
-        .next()
-        .expect("expected to delete a hot-tier table file");
-    std::fs::remove_file(table)?;
+        // The hot tier "loses" its table, indistinguishable from the tier being
+        // remounted elsewhere or the route path having changed.
+        drop(tree);
+        std::fs::remove_file(first)?;
+    }
 
     let manifest_names = || -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir.path().join("primary"))

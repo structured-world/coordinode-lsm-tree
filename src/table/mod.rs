@@ -858,7 +858,6 @@ impl Table {
 
     /// [`Self::list_blob_file_references`] for verification: the descriptor is
     /// taken without promoting or caching it, so the check leaves no trace.
-    #[cfg(feature = "std")]
     fn untraced_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
         self.read_blob_file_references(|| {
             Ok(self
@@ -1030,17 +1029,17 @@ impl Table {
         self.0.l0_recency
     }
 
-    /// Records that the directory entry naming this table's file was durable
-    /// before the table was written into it.
+    /// Records that the directory entry naming this table's file is durable:
+    /// it was before the table was written into it, or the install that wrote
+    /// it synced the folder.
     pub(crate) fn mark_entry_durable(&self) {
         self.0
             .entry_durable
             .store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether the directory entry naming this table's file was durable before
-    /// the table was written into it, so the install that names it need not
-    /// sync its folder.
+    /// Whether the directory entry naming this table's file is known durable,
+    /// so an install that names it need not sync its folder.
     #[must_use]
     pub(crate) fn entry_durable(&self) -> bool {
         self.0
@@ -2555,14 +2554,6 @@ impl Table {
     /// When the directory cannot be read or does not fill the group exactly.
     /// Without it the pages cannot be located, so the whole entry is reported
     /// rather than guessed at.
-    #[cfg_attr(
-        all(not(feature = "std"), not(feature = "columnar")),
-        expect(
-            dead_code,
-            reason = "the scrub, heal and reconcile walks that call it are std-gated; \
-                      with `columnar` the row group loader of the gate-only walk calls it"
-        )
-    )]
     pub(crate) fn data_unit_blocks(
         &self,
         entry: &BlockHandle,
@@ -2662,6 +2653,53 @@ impl Table {
         Ok(blocks)
     }
 
+    /// Reads one block of a data unit as the patrol scrub does: past the
+    /// caches, through Page-ECC correction.
+    #[cfg(feature = "std")]
+    fn scrub_unit(
+        &self,
+        handle: &BlockHandle,
+        role: BlockType,
+    ) -> crate::Result<crate::table::util::BlockScrubOutcome> {
+        crate::table::util::scrub_block(
+            self.global_id(),
+            &self.path,
+            &self.file_accessor,
+            handle,
+            role,
+            self.compression_for_role(role),
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.dictionary_for_role(role),
+            self.heal_hints.get().map(AsRef::as_ref),
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        )
+    }
+
+    /// Reads every data block of this table, stopping at the first that does
+    /// not read: an open checks a table no manifest names this way before it
+    /// takes it in.
+    ///
+    /// # Errors
+    ///
+    /// The first block's failure, environmental or damage.
+    pub(crate) fn verify_data_blocks(&self) -> crate::Result<()> {
+        for entry in self.untraced_index_walk() {
+            let entry = entry?;
+            for (handle, role) in self.data_unit_blocks(entry.as_ref())? {
+                // With std through the scrub's Page-ECC correction; without,
+                // the plain checked read, past the cache all the same.
+                #[cfg(feature = "std")]
+                self.scrub_unit(&handle, role)?;
+                #[cfg(not(feature = "std"))]
+                self.load_block_from_disk(&handle, role)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Patrol-scrubs every data block of this table: a cache-bypassing read that
     /// runs the Page-ECC verify+correct path, recording a heal hint (when
     /// `auto_heal` is on) on a confirmed-persistent correction.
@@ -2675,7 +2713,7 @@ impl Table {
     #[cfg(feature = "std")]
     pub(crate) fn scrub_data_blocks(&self) -> crate::scrub::PatrolScrubReport {
         use crate::scrub::{PatrolScrubReport, ScrubError};
-        use crate::table::util::{BlockScrubOutcome, scrub_block};
+        use crate::table::util::BlockScrubOutcome;
 
         let mut report = PatrolScrubReport {
             sst_files_scanned: 1,
@@ -2727,21 +2765,7 @@ impl Table {
 
             for (handle, role) in blocks {
                 report.blocks_scanned += 1;
-                match scrub_block(
-                    self.global_id(),
-                    &self.path,
-                    &self.file_accessor,
-                    &handle,
-                    role,
-                    self.compression_for_role(role),
-                    self.encryption.as_deref(),
-                    self.metadata.ecc_params,
-                    #[cfg(zstd_any)]
-                    self.dictionary_for_role(role),
-                    self.heal_hints.get().map(AsRef::as_ref),
-                    #[cfg(feature = "metrics")]
-                    &self.metrics,
-                ) {
+                match self.scrub_unit(&handle, role) {
                     Ok(BlockScrubOutcome::Clean) => {}
                     Ok(BlockScrubOutcome::Corrected { scheduled }) => {
                         report.corrections_applied += 1;
@@ -4211,7 +4235,6 @@ impl Table {
     ///
     /// [`crate::Error::InvalidHeader`] when the recorded records disagree
     /// with the derived ones; any I/O / decode error from the full scan.
-    #[cfg(feature = "std")]
     pub(crate) fn verify_blob_links(&self) -> crate::Result<()> {
         use crate::coding::Decode;
         use alloc::collections::BTreeMap;
@@ -4287,7 +4310,11 @@ impl Table {
             // Like `scan`, the walk is verification: uncounted, and it leaves
             // the workload's block cache as it found it.
             if restricted {
-                for kv in self.range_iter(..).untraced() {
+                let live = self.range_iter(..);
+                // Without std the iterator has no untraced mode.
+                #[cfg(feature = "std")]
+                let live = live.untraced();
+                for kv in live {
                     accumulate(kv?)?;
                 }
             } else {
@@ -4395,7 +4422,6 @@ impl Table {
     ///
     /// [`crate::Error::InvalidHeader`] when the section disagrees, and any
     /// error reading it.
-    #[cfg(feature = "std")]
     fn verify_owned_blob_objects(
         &self,
         mut derived: Vec<(crate::vlog::BlobFileId, u64)>,
@@ -5151,7 +5177,6 @@ impl Table {
 
     /// The encryption / ECC context the uncompressed side sections decode
     /// under. Every reconcile section read builds the same one.
-    #[cfg(feature = "std")]
     fn section_transform(&self) -> crate::table::block::BlockTransform<'_> {
         let t = match self.encryption.as_deref() {
             Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
@@ -6087,42 +6112,10 @@ impl Table {
         let filter_transform = self.section_transform();
         // Partitioned mode: the partition index maps a key to its filter
         // block. Loaded from disk for the same reason as the filter itself.
-        let filter_index = if let Some(idx_handle) = regions.filter_tli {
-            let block = Block::from_file(
-                file,
-                idx_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: self.metadata.id,
-                    block_type: BlockType::Index,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    let t = crate::table::block::BlockTransform::from_parts(
-                        self.metadata.index_block_compression,
-                        self.encryption.as_deref(),
-                        #[cfg(zstd_any)]
-                        None,
-                    )?;
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::Index {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
-            }
-            let idx = IndexBlock::new(block);
-            idx.try_iter(self.comparator.clone())?;
-            Some(idx)
-        } else {
-            None
-        };
+        let filter_index = regions
+            .filter_tli
+            .map(|idx_handle| self.load_filter_index(file, idx_handle))
+            .transpose()?;
         let full_filter = if filter_index.is_none() {
             regions
                 .filter
@@ -6268,9 +6261,77 @@ impl Table {
         }
     }
 
+    /// Reads the filter partition index at `handle` from the already-open
+    /// file, rejecting a block that does not carry the index role or whose
+    /// entries do not decode.
+    fn load_filter_index(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        handle: BlockHandle,
+    ) -> crate::Result<IndexBlock> {
+        let transform = crate::table::block::BlockTransform::from_parts(
+            self.metadata.index_block_compression,
+            self.encryption.as_deref(),
+            #[cfg(zstd_any)]
+            None,
+        )?;
+        let transform = if let Some(ecc) = self.metadata.ecc_params {
+            transform.with_ecc(ecc)
+        } else {
+            transform
+        };
+        let block = Block::from_file(
+            file,
+            handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.metadata.id,
+                block_type: BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &transform,
+        )?;
+        if block.header.block_type != BlockType::Index {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        let idx = IndexBlock::new(block);
+        idx.try_iter(self.comparator.clone())?;
+        Ok(idx)
+    }
+
+    /// Reads every filter block of this table, the full filter or the
+    /// partition index and each partition, stopping at the first that does
+    /// not read: an open checks a table no manifest names this way beside its
+    /// data blocks, as a point read loads them only when it needs them.
+    ///
+    /// # Errors
+    ///
+    /// The first block's failure, environmental or damage.
+    // The payload is not probed: the block's checksum covers it, so a torn
+    // write or a power loss fails the load, and no damage leaves a block that
+    // checks with a filter prefix that does not parse.
+    pub(crate) fn verify_filter_blocks(&self) -> crate::Result<()> {
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        let transform = self.section_transform();
+        if let Some(idx_handle) = regions.filter_tli {
+            let idx = self.load_filter_index(&*file, idx_handle)?;
+            for part in idx.iter(self.comparator.clone()) {
+                let handle = part.materialize(idx.as_slice()).into_inner();
+                Self::load_filter_block(&*file, &transform, self.metadata.id, handle)?;
+            }
+        } else if let Some(handle) = regions.filter {
+            Self::load_filter_block(&*file, &transform, self.metadata.id, handle)?;
+        }
+        Ok(())
+    }
+
     /// Reads one filter block (full or partition) from the already-open file,
     /// rejecting a block that does not carry the filter role.
-    #[cfg(feature = "std")]
     fn load_filter_block(
         file: &dyn crate::fs::FsFile,
         transform: &crate::table::block::BlockTransform<'_>,
