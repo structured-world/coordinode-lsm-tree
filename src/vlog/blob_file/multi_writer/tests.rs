@@ -32,10 +32,12 @@ fn whole_block_copies_are_held_to_a_bounded_number_of_sources() -> crate::Result
 #[test]
 fn a_flush_of_many_blob_files_keeps_a_bounded_number_of_files_open() -> crate::Result<()> {
     use super::*;
-    use crate::fs::StdFs;
+    use crate::fs::{FaultFs, StdFs, SyncKind};
 
     let folder = tempfile::tempdir()?;
-    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let faulty = FaultFs::new(StdFs);
+    let injector = faulty.injector();
+    let fs: Arc<dyn Fs> = Arc::new(faulty);
     let mut writer =
         MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?
             .use_target_size(1)
@@ -49,6 +51,14 @@ fn a_flush_of_many_blob_files_keeps_a_bounded_number_of_files_open() -> crate::R
     let (written, kept) = writer.finish_keeping_files()?;
     assert_eq!(written.len(), files, "one file per value");
     assert_eq!(kept.len(), crate::fs::KEEP_OPEN_LIMIT);
+    // Each file past the limit is synced through its handle before it
+    // closes; the kept ones are left to the install.
+    let synced = injector
+        .take_syncs()
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, SyncKind::File | SyncKind::FileData))
+        .count();
+    assert_eq!(synced, files - crate::fs::KEEP_OPEN_LIMIT);
     Ok(())
 }
 

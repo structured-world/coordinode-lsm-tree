@@ -1083,13 +1083,9 @@ impl SuperVersions {
         // The files come first in `syncs`, so an index of a sync below their
         // count is the file's.
         if schedule == crate::io_policy::SyncSchedule::OneAtATime {
+            // Each target synced on its own, with no batch built around it.
             for (at, (fs, target)) in syncs.iter().enumerate() {
-                crate::fs::sync_each_target(&***fs, core::slice::from_ref(target)).map_err(
-                    |mut failure| {
-                        failure.spent.iter_mut().for_each(|spent| *spent = at);
-                        failure
-                    },
-                )?;
+                target.sync_at(&***fs, at)?;
             }
         } else {
             // One batch per backend, in the order the backends are first named.

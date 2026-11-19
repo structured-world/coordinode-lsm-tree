@@ -118,13 +118,13 @@ fn the_default_batch_syncs_every_target() -> crate::Result<()> {
     Ok(())
 }
 
-/// A handle whose sync fails at once, or waits until `failed` is set and
-/// records that it synced.
+/// A handle whose sync fails at once, or records that it synced and then
+/// waits until the batch has recorded more failures than `recorded_before`.
 struct Gated {
     inner: Box<dyn super::FsFile>,
     at: usize,
     fails: bool,
-    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recorded_before: usize,
     synced: std::sync::Arc<parking_lot::Mutex<Vec<usize>>>,
 }
 
@@ -156,15 +156,18 @@ impl super::FsFile for Gated {
     fn sync_data(&self) -> crate::io::Result<()> {
         use std::sync::atomic::Ordering;
         if self.fails {
-            self.failed.store(true, Ordering::SeqCst);
             return Err(crate::io::Error::other("the first sync fails"));
         }
         self.synced.lock().push(self.at);
-        while !self.failed.load(Ordering::SeqCst) {
+        // Ends only once the failure is recorded and the batch's stop flag
+        // set, bounded so a batch that never records one fails the test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while super::FAILURES_RECORDED.load(Ordering::SeqCst) <= self.recorded_before {
+            if std::time::Instant::now() > deadline {
+                return Err(crate::io::Error::other("the failure was never recorded"));
+            }
             std::thread::yield_now();
         }
-        // Room for the failing sync's worker to record its failure.
-        std::thread::sleep(std::time::Duration::from_millis(50));
         Ok(())
     }
     fn metadata(&self) -> crate::io::Result<super::FsMetadata> {
@@ -188,12 +191,11 @@ impl super::FsFile for Gated {
 #[test]
 fn no_file_sync_starts_after_a_failure() -> crate::Result<()> {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     const FILES: usize = 18;
     let memory = MemFs::new();
     memory.create_dir_all(Path::new("/db"))?;
-    let failed = Arc::new(AtomicBool::new(false));
+    let recorded_before = super::FAILURES_RECORDED.load(std::sync::atomic::Ordering::SeqCst);
     let synced = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let paths: Vec<std::path::PathBuf> = (0..FILES)
         .map(|at| std::path::PathBuf::from(format!("/db/{at}")))
@@ -204,7 +206,7 @@ fn no_file_sync_starts_after_a_failure() -> crate::Result<()> {
             inner: memory.open(path, &FsOpenOptions::new().write(true).create_new(true))?,
             at,
             fails: at == 0,
-            failed: Arc::clone(&failed),
+            recorded_before,
             synced: Arc::clone(&synced),
         });
     }

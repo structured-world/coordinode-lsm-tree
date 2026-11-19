@@ -1385,12 +1385,19 @@ impl MultiWriter {
         kept: &mut Vec<(TableId, alloc::boxed::Box<dyn crate::fs::FsFile>)>,
         outputs: Option<&crate::compaction::output_ledger::OutputLedger>,
         fs: &dyn Fs,
+        sync_mode: crate::fs::SyncMode,
     ) -> crate::Result<()> {
         let path = writer.path.clone();
         if let Some((table_id, checksum, file)) = writer.finish_keeping_file(ages)? {
             results.push((table_id, checksum));
-            if let Some(file) = file {
-                crate::fs::keep_open(kept, table_id, file);
+            // A table past the limit is synced through the handle it was
+            // written with before it closes: nothing else holds its inode
+            // until the install opens it, and a handle opened after the inode
+            // left memory would not report its writeback error.
+            if let Some(file) = file
+                && let Some(closing) = crate::fs::keep_open(kept, table_id, file)
+            {
+                closing.sync_data_with(sync_mode)?;
             }
             // Before the next output takes more room.
             if let Some(outputs) = outputs {
@@ -1837,6 +1844,7 @@ impl MultiWriter {
             &mut self.kept,
             self.outputs.as_ref(),
             &*self.fs,
+            self.sync_mode,
         )
     }
 
@@ -1988,6 +1996,7 @@ impl MultiWriter {
             &mut self.kept,
             self.outputs.as_ref(),
             &*self.fs,
+            self.sync_mode,
         )
     }
 
@@ -2945,6 +2954,7 @@ impl MultiWriter {
             &mut self.kept,
             self.outputs.as_ref(),
             &*self.fs,
+            self.sync_mode,
         )?;
 
         Ok(Written {

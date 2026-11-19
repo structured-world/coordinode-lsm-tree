@@ -912,8 +912,14 @@ impl MultiWriter {
             outputs.landed(&*self.fs, blob_file.path())?;
             self.landed += 1;
         }
-        if let Some(file) = kept {
-            crate::fs::keep_open(&mut self.kept, blob_file.id(), file);
+        // A file past the limit is synced through the handle it was written
+        // with before it closes: with a descriptor cache nothing else need
+        // hold its inode until the install, and a handle opened after the
+        // inode left memory would not report its writeback error.
+        if let Some(file) = kept
+            && let Some(closing) = crate::fs::keep_open(&mut self.kept, blob_file.id(), file)
+        {
+            closing.sync_data_with(self.sync_mode)?;
         }
         self.results.push(blob_file);
 
@@ -1254,7 +1260,7 @@ impl MultiWriter {
                     .map(|(codec, _, _, _, writer)| (codec, writer)),
             );
         while let Some((passthrough, writer)) = writers.next() {
-            match Self::consume_writer(
+            let consumed = match Self::consume_writer(
                 writer,
                 passthrough,
                 self.descriptor_table.clone(),
@@ -1262,13 +1268,23 @@ impl MultiWriter {
                 #[cfg(zstd_any)]
                 &self.zstd_dictionaries,
             ) {
-                Ok(None) => {}
+                Ok(None) => Ok(()),
                 Ok(Some((blob_file, kept))) => {
-                    if let Some(file) = kept {
-                        crate::fs::keep_open(&mut self.kept, blob_file.id(), file);
-                    }
+                    let closing = kept.and_then(|file| {
+                        crate::fs::keep_open(&mut self.kept, blob_file.id(), file)
+                    });
                     self.results.push(blob_file);
+                    // Synced before it closes, as in `land`.
+                    closing.map_or(Ok(()), |closing| {
+                        closing
+                            .sync_data_with(self.sync_mode)
+                            .map_err(crate::Error::from)
+                    })
                 }
+                Err(e) => Err(e),
+            };
+            match consumed {
+                Ok(()) => {}
                 Err(e) => {
                     // The write as a whole failed, so no version will ever name
                     // the files finished so far: marked deleted, their handles'

@@ -605,6 +605,16 @@ impl<'a> SyncTarget<'a> {
         self.sync_noting(fs).map_err(|(error, _)| error)
     }
 
+    /// [`Self::sync_alone`], failing as a batch whose target at `at` is this
+    /// one fails (see [`SyncFailure`]): spent when its sync ran, not when its
+    /// open failed.
+    pub(crate) fn sync_at<F: Fs + ?Sized>(&self, fs: &F, at: usize) -> Result<(), SyncFailure> {
+        self.sync_noting(fs).map_err(|(error, ran)| SyncFailure {
+            error,
+            spent: if ran { alloc::vec![at] } else { Vec::new() },
+        })
+    }
+
     /// [`Self::sync_alone`], with whether a failure came from the sync
     /// itself (`true`) rather than from the open before it.
     fn sync_noting<F: Fs + ?Sized>(&self, fs: &F) -> Result<(), (io::Error, bool)> {
@@ -681,15 +691,20 @@ pub(crate) type Kept<Id> = (Id, alloc::boxed::Box<dyn FsFile>);
 pub(crate) const KEEP_OPEN_LIMIT: usize = 16;
 
 /// Keeps `file`, which holds `id`, in `kept` for the install that syncs it,
-/// unless `kept` already holds [`KEEP_OPEN_LIMIT`] files: `file` closes then.
+/// unless `kept` already holds [`KEEP_OPEN_LIMIT`] files: `file` is handed
+/// back then, for the caller to close, synced first where nothing else holds
+/// its inode in memory.
+#[must_use = "a file not kept is handed back to be synced or closed"]
 pub(crate) fn keep_open<Id>(
     kept: &mut alloc::vec::Vec<Kept<Id>>,
     id: Id,
     file: alloc::boxed::Box<dyn FsFile>,
-) {
+) -> Option<alloc::boxed::Box<dyn FsFile>> {
     if kept.len() < KEEP_OPEN_LIMIT {
         kept.push((id, file));
+        return None;
     }
+    Some(file)
 }
 
 /// [`Fs::sync_many`] by one call per target: the files side by side on
@@ -709,13 +724,16 @@ pub(crate) fn sync_each_target<F: Fs + ?Sized>(
         .partition(|(_, target)| !matches!(target, SyncTarget::Folder { .. }));
     sync_side_by_side(fs, &files)?;
     for (at, folder) in folders {
-        folder.sync_noting(fs).map_err(|(error, ran)| SyncFailure {
-            error,
-            spent: if ran { alloc::vec![at] } else { Vec::new() },
-        })?;
+        folder.sync_at(fs, at)?;
     }
     Ok(())
 }
+
+/// How many failures [`sync_side_by_side`] recorded, each counted once its
+/// stop flag is set: what a test waits on to order a sync after it.
+#[cfg(all(test, feature = "std"))]
+pub(crate) static FAILURES_RECORDED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Syncs `files`, each with its index in the batch, on threads of their own,
 /// at most a few at once.
@@ -729,10 +747,7 @@ fn sync_side_by_side<F: Fs + ?Sized>(
     const IN_FLIGHT: usize = 16;
 
     if let [(at, file)] = files {
-        return file.sync_noting(fs).map_err(|(error, ran)| SyncFailure {
-            error,
-            spent: if ran { alloc::vec![*at] } else { Vec::new() },
-        });
+        return file.sync_at(fs, *at);
     }
     let next = core::sync::atomic::AtomicUsize::new(0);
     let failed: parking_lot::Mutex<Option<SyncFailure>> = parking_lot::Mutex::new(None);
@@ -754,6 +769,8 @@ fn sync_side_by_side<F: Fs + ?Sized>(
                     failure.spent.push(*at);
                 }
                 stop.store(true, core::sync::atomic::Ordering::Release);
+                #[cfg(test)]
+                FAILURES_RECORDED.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                 drop(failed);
                 return;
             }
@@ -783,10 +800,7 @@ fn sync_side_by_side<F: Fs + ?Sized>(
     files: &[(usize, &SyncTarget<'_>)],
 ) -> Result<(), SyncFailure> {
     for (at, file) in files {
-        file.sync_noting(fs).map_err(|(error, ran)| SyncFailure {
-            error,
-            spent: if ran { alloc::vec![*at] } else { Vec::new() },
-        })?;
+        file.sync_at(fs, *at)?;
     }
     Ok(())
 }
