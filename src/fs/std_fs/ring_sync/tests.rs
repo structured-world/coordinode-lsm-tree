@@ -231,7 +231,10 @@ fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
         let name = "fs::std_fs::ring_sync::tests::a_batch_larger_than_the_descriptor_limit_syncs";
         // The child runs the way cargo ran this test: through the target's
         // runner when one is set (an emulator for a cross build, whose
-        // binary the host cannot exec), directly otherwise.
+        // binary the host cannot exec), directly otherwise. A cross image
+        // sets exactly one such variable, its target's; a runner a cargo
+        // config names reaches no process cargo starts, and none is named in
+        // this repository's.
         let runner = std::env::vars()
             .find(|(key, _)| key.starts_with("CARGO_TARGET_") && key.ends_with("_RUNNER"))
             .map(|(_, value)| value);
