@@ -105,6 +105,25 @@ impl Completions {
         }
         self.failed.map_or(Ok(Through::Synced), Err)
     }
+
+    /// The failure of a batch whose wait failed with `error` before every
+    /// sync was reaped: each sync reaped as failed or refused, then each one
+    /// in `unreaped`, which may have run and failed. A refusal is a failure
+    /// here, since syncs that ran are not reaped yet.
+    fn cut_short(
+        mut self,
+        error: std::io::Error,
+        unreaped: impl Iterator<Item = usize>,
+    ) -> SyncFailure {
+        for (at, errno) in core::mem::take(&mut self.refused) {
+            self.fail(at, errno);
+        }
+        let mut failure = self
+            .failed
+            .unwrap_or_else(|| SyncFailure::unspent(io::Error::from(error)));
+        failure.spent.extend(unreaped);
+        failure
+    }
 }
 
 /// Syncs every target of `targets` through this thread's ring and waits for
@@ -232,17 +251,14 @@ fn sync_through(
                 // dropped, and the kernel finishes its entries before freeing
                 // it. Each sync not reaped may have run and failed, so it is
                 // spent with those that did fail.
-                let mut failure = completions
-                    .failed
-                    .unwrap_or_else(|| SyncFailure::unspent(io::Error::from(e)));
-                failure.spent.extend(
+                return Err(completions.cut_short(
+                    e,
                     reaped
                         .iter()
                         .enumerate()
                         .filter(|(_, done)| !**done)
                         .map(|(at, _)| base + at),
-                );
-                return Err(failure);
+                ));
             }
         }
         for done in ring.completion() {

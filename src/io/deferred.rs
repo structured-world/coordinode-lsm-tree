@@ -75,6 +75,21 @@ enum Job<W> {
     Run(Box<dyn FnOnce(&mut W) + Send>),
 }
 
+/// Drops `value` with a panic of its drop kept here, and answers whether it
+/// dropped without one. A drain must not unwind with its lane marked, or
+/// every later call waits on a drainer that is gone.
+fn drop_contained<T>(value: T) -> bool {
+    std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| drop(value)))
+        .map_err(forget_payload)
+        .is_ok()
+}
+
+/// Leaks a caught panic's payload: its own drop may panic, outside any catch.
+/// Only a panic of the file's writer or of something it handed back pays it.
+fn forget_payload(payload: Box<dyn core::any::Any + Send>) {
+    core::mem::forget(payload);
+}
+
 /// A failed write, kept to be returned again.
 struct Failure {
     kind: io::ErrorKind,
@@ -86,7 +101,10 @@ impl Failure {
         // A backend's error payload is formatted while the lane is held: a
         // panic there must not leave the drain marked, as a write's may not.
         let message = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| error.to_string()))
-            .unwrap_or_else(|_| String::from("the file's writer failed with an unprintable error"));
+            .unwrap_or_else(|payload| {
+                forget_payload(payload);
+                String::from("the file's writer failed with an unprintable error")
+            });
         Self {
             kind: error.kind(),
             message,
@@ -172,15 +190,18 @@ impl<W: Write> Lane<W> {
                     Ok(())
                 }
             }))
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|payload| {
+                forget_payload(payload);
                 panicked = true;
                 Err(io::Error::other("the file's writer panicked"))
             });
             state = self.lock();
-            if let Err(e) = result
-                && state.failed.is_none()
-            {
-                state.failed = Some(Failure::of(&e));
+            if let Err(e) = result {
+                if state.failed.is_none() {
+                    state.failed = Some(Failure::of(&e));
+                }
+                // The writer's error carries its payload, whose drop may panic.
+                drop_contained(e);
             }
             if let Some(buf) = emptied
                 && state.spare.len() < SPARE_BUFFERS_MAX
@@ -190,28 +211,27 @@ impl<W: Write> Lane<W> {
             }
         }
         // A writer that panicked is called no more, not even to be dropped
-        // under the lock. The lane is released before it and the discarded
-        // jobs are dropped, and a panic of either drop stays here: a drain
-        // left marked would hold every later call waiting on a drainer that
-        // is gone.
-        let inner = if panicked {
-            Some(inner)
+        // under the lock. It is closed before the lane is released, so its
+        // owner, waiting to settle the lane, finds the file closed when it
+        // goes on to remove it.
+        if panicked {
+            drop(state);
+            if !drop_contained(inner) {
+                log::warn!("a file's writer panicked again when dropped");
+            }
+            state = self.lock();
         } else {
             state.inner = Some(inner);
-            None
-        };
+        }
         state.draining = false;
         drop(state);
         self.progress.notify_all();
-        if let Some(inner) = inner
-            && std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| drop(inner))).is_err()
-        {
-            log::warn!("a file's writer panicked again when dropped");
-        }
-        if !discarded.is_empty()
-            && std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| drop(discarded))).is_err()
-        {
-            log::warn!("a job a failed file's writer did not run panicked when dropped");
+        // One at a time: a second panicking drop while the first unwinds
+        // would abort the process.
+        for job in discarded {
+            if !drop_contained(job) {
+                log::warn!("a job a failed file's writer did not run panicked when dropped");
+            }
         }
     }
 

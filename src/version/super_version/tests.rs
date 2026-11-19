@@ -219,15 +219,33 @@ fn a_failed_device_flush_marks_the_files_on_that_device() -> crate::Result<()> {
         )
         .once(),
     );
+    let flushed = |syncs: Vec<(crate::path::PathBuf, crate::fs::SyncKind)>| {
+        syncs
+            .iter()
+            .filter(|(_, kind)| *kind == crate::fs::SyncKind::Device)
+            .count()
+    };
+    // The flush's own syncs, before what is counted.
+    let _ = fs.injector().take_syncs();
     assert!(
         SuperVersions::sync_unsynced(&pending, SyncMode::Barrier, SyncSchedule::SideBySide, step)
             .is_err(),
         "the device flush fails"
     );
+    assert_eq!(
+        flushed(fs.injector().take_syncs()),
+        1,
+        "the failure is the device flush's"
+    );
     assert!(
         SuperVersions::sync_unsynced(&pending, SyncMode::Barrier, SyncSchedule::SideBySide, step)
             .is_err(),
         "the table synced to that device is not taken as durable"
+    );
+    assert_eq!(
+        flushed(fs.injector().take_syncs()),
+        0,
+        "the retry fails on the marked file, before any device flush"
     );
     Ok(())
 }

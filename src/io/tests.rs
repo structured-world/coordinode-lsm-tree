@@ -526,6 +526,47 @@ fn buf_writer_refuses_a_hand_off_after_a_panicking_write() {
     assert_eq!(inner.calls, 2, "nor written to again");
 }
 
+/// A flush or seek of the inner writer that panics, caught by the caller,
+/// fails the file: the backend may have moved its cursor or state before the
+/// panic, so the next hand-off is refused. Guards against a later write or
+/// sync reaching a backend the panic left changed.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_refuses_a_hand_off_after_a_panicking_flush_or_seek() {
+    /// Panics in its flush and its seek, having changed nothing visible.
+    struct PanicsOnFlushAndSeek;
+    impl std::io::Write for PanicsOnFlushAndSeek {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("the backend's flush");
+        }
+    }
+    impl std::io::Seek for PanicsOnFlushAndSeek {
+        fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+            panic!("the backend's seek");
+        }
+    }
+
+    for seek in [false, true] {
+        let mut out = FillingBufWriter::with_capacity(4, PanicsOnFlushAndSeek);
+        let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            if seek {
+                let _ = std::io::Seek::seek(&mut out, std::io::SeekFrom::Start(0));
+            } else {
+                let _ = std::io::Write::flush(&mut out);
+            }
+        }))
+        .is_err();
+        assert!(caught, "the injected panic surfaces: seek {seek}");
+        assert!(
+            out.with_inner(|_| ()).is_err(),
+            "the next hand-off fails: seek {seek}"
+        );
+    }
+}
+
 /// A hand-off whose closure panics, caught by the caller, fails the file
 /// too: the closure may have left the inner writer half changed, so the next
 /// hand-off is refused. Guards against a sync after a caught panic reporting

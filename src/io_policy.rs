@@ -292,6 +292,9 @@ mod registry {
         let Some(volume) = fs.volume_id(path) else {
             return fs.idles_between_io_queues(path);
         };
+        // Two custom backends that both name no backend and report the same
+        // volume share one entry, as they do on attach: the answer only picks
+        // a write batching policy, so a wrong one costs speed, never data.
         let location = location(locations, fs.backend_id(), volume);
         let mut state = location.state.lock();
         let idles = fs.idles_between_io_queues(path);

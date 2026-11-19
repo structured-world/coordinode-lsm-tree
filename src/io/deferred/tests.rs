@@ -609,21 +609,47 @@ fn a_writer_panicking_again_when_dropped_leaves_the_lane_idle() {
     assert!(failed, "the file stays failed");
 }
 
-/// A job a failed lane drops without running whose drop panics leaves the
-/// lane released: a later call returns the failure. Guards against a drop of
-/// a discarded job unwinding out of a drain still marked, which holds every
-/// later call waiting on a drainer that is gone. Both ways a lane discards a
-/// job: behind a failed write, and behind a job that panicked.
-#[test]
-fn a_discarded_job_whose_drop_panics_leaves_the_lane_released() {
-    /// Panics when dropped.
-    struct Bomb;
-    impl Drop for Bomb {
-        fn drop(&mut self) {
-            panic!("a discarded job's capture panics when dropped");
-        }
-    }
+/// Panics when dropped.
+#[derive(Debug)]
+struct Bomb;
 
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("a value panics when dropped");
+    }
+}
+
+impl core::fmt::Display for Bomb {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("a bomb")
+    }
+}
+
+impl std::error::Error for Bomb {}
+
+/// Runs `call` twice on `out` on a thread of its own and answers whether the
+/// first returned an I/O error without unwinding and the second one too, or
+/// `None` when the lane hangs.
+fn call_twice<W: Write + Send + 'static>(mut out: DeferredWriter<W>) -> Option<(bool, bool)> {
+    let (finished, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let first =
+            std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.with_inner(|_| ())));
+        let second = out.with_inner(|_| ());
+        let _ = finished.send((matches!(first, Ok(Err(_))), second.is_err()));
+    });
+    done.recv_timeout(Duration::from_secs(10)).ok()
+}
+
+/// Jobs a failed lane drops without running, each of whose drops panics,
+/// leave the lane released: the next calls return the failure. Guards against
+/// a drop of a discarded job unwinding out of a drain still marked, which
+/// holds every later call waiting on a drainer that is gone, and against a
+/// second such panic while the first unwinds aborting the process. Both ways
+/// a lane discards a job: behind a failed write, and behind a job that
+/// panicked.
+#[test]
+fn discarded_jobs_whose_drops_panic_leave_the_lane_released() {
     for behind_a_panic in [false, true] {
         let sink = Sink {
             fail_past: (!behind_a_panic).then_some(0),
@@ -636,26 +662,107 @@ fn a_discarded_job_whose_drop_panics_leaves_the_lane_released() {
         if behind_a_panic {
             drop(out.after_writes(|_| panic!("a job panics")));
         }
-        let bomb = Bomb;
-        drop(out.after_writes(move |_| {
-            core::hint::black_box(&bomb);
-        }));
-        let (finished, done) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let first =
-                std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| out.with_inner(|_| ())));
-            let second = out.with_inner(|_| ());
-            let _ = finished.send((first.is_ok(), second.is_err()));
-        });
-        let Ok((returned, failed)) = done.recv_timeout(Duration::from_secs(10)) else {
+        for _ in 0..2 {
+            let bomb = Bomb;
+            drop(out.after_writes(move |_| {
+                core::hint::black_box(&bomb);
+            }));
+        }
+        let Some((first, second)) = call_twice(out) else {
             panic!("the lane hangs after a discarded job's drop panicked: {behind_a_panic}");
         };
         assert!(
-            returned,
-            "the drop's panic stays in the drain: {behind_a_panic}"
+            first,
+            "the first call returns the failure: {behind_a_panic}"
         );
-        assert!(failed, "the file stays failed: {behind_a_panic}");
+        assert!(second, "the file stays failed: {behind_a_panic}");
     }
+}
+
+/// A writer that panics with a payload whose drop panics too leaves the lane
+/// released. Guards against the payload dropped outside the catch unwinding
+/// out of the drain with it still marked.
+#[test]
+fn a_panic_whose_payload_panics_when_dropped_leaves_the_lane_released() {
+    let mut out = DeferredWriter::with_capacity(8, Sink::default(), true);
+    out.use_spawner_now(Arc::new(Never::default()));
+    drop(out.after_writes(|_| std::panic::panic_any(Bomb)));
+    let Some((first, second)) = call_twice(out) else {
+        panic!("the lane hangs after the payload's drop panicked");
+    };
+    assert!(first, "the first call returns the failure");
+    assert!(second, "the file stays failed");
+}
+
+/// A sink whose every write fails with an error whose payload panics when
+/// dropped.
+struct FailsWithABomb;
+
+impl Write for FailsWithABomb {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other(Bomb))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A write that fails with an error whose payload panics when dropped leaves
+/// the lane released. Guards against the error, kept as a failure and then
+/// dropped under the lane, unwinding out of the drain with it still marked.
+#[test]
+fn a_failure_whose_error_panics_when_dropped_leaves_the_lane_released() {
+    let mut out = DeferredWriter::with_capacity(8, FailsWithABomb, true);
+    out.use_spawner_now(Arc::new(Never::default()));
+    drop(out.write_all(&[7; 8]));
+    drop(out.after_writes(|_| ()));
+    let Some((first, second)) = call_twice(out) else {
+        panic!("the lane hangs after the error's drop panicked");
+    };
+    assert!(first, "the first call returns the failure");
+    assert!(second, "the file stays failed");
+}
+
+/// A sink that panics in its first write, a while into it, and takes a while
+/// to close.
+struct ClosesSlowly(Arc<AtomicBool>);
+
+impl Write for ClosesSlowly {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(200));
+        panic!("the sink's write");
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ClosesSlowly {
+    fn drop(&mut self) {
+        std::thread::sleep(Duration::from_millis(200));
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A writer that panicked on a worker is closed before the writer's owner
+/// sees the lane settled. Guards against the owner returning, and starting
+/// to remove the file, while the worker still holds it open.
+#[test]
+fn a_writer_that_panicked_is_closed_before_the_lane_settles() {
+    let closed = Arc::new(AtomicBool::new(false));
+    let mut out = DeferredWriter::with_capacity(8, ClosesSlowly(Arc::clone(&closed)), true);
+    out.use_spawner_now(Arc::new(Threads));
+    drop(out.write_all(&[7; 64]));
+    // The worker is inside the write by now, so this call waits on it rather
+    // than drain the lane itself.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(out.with_inner(|_| ()).is_err(), "the panic fails the file");
+    assert!(
+        closed.load(Ordering::SeqCst),
+        "the writer is closed once the lane settles"
+    );
 }
 
 /// A panic of a call on the inner writer (a flush, a seek), which the caller

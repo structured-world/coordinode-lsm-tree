@@ -1009,6 +1009,84 @@ fn open_or_repair_refuses_a_returned_flush_without_its_dictionary() -> lsm_tree:
     Ok(())
 }
 
+/// A table set aside as a cut-short flush's, needing a dictionary the tree no
+/// longer holds, does not fail the open: no flush it names is above the
+/// watermark that needs it read. Guards against the open requiring every
+/// dictionary a table in the folder names, set aside or not.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_set_aside_table_without_its_dictionary_does_not_fail_the_open() -> lsm_tree::Result<()> {
+    use lsm_tree::config::CompressionPolicy;
+    use lsm_tree::{CompressionType, ZstdDictionary};
+
+    let mut samples = Vec::new();
+    for i in 0u32..500 {
+        samples.extend_from_slice(format!("key-{i:05}value-{i:05}-padding").as_bytes());
+    }
+    let id = ZstdDictionary::new(&samples).id();
+    let disk = Disk::new();
+    let tree = config(disk.fs())
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::zstd_dict(3, id)?))
+        .zstd_dictionary(Some(Arc::new(ZstdDictionary::new(&samples))))
+        .open()?;
+    let tables = at(DB).join("tables");
+    let torn = added_by(&disk.crash, &tables, || {
+        for i in 0u32..100 {
+            tree.insert(
+                format!("key-{i:05}"),
+                format!("value-{i:05}-padding"),
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    let crash = disk.power_loss(tree);
+    crash.rename(
+        &tables.join(torn[0].to_string()),
+        &tables.join(format!("{}.torn-flush", torn[0])),
+    )?;
+    crash.remove_file(&at(DB).join("dicts").join(id.to_string()))?;
+
+    config(Arc::new(crash)).open()?;
+    Ok(())
+}
+
+/// A returned flush whose blob file cannot be read for a reason that is not
+/// its bytes' is not reported as damaged: `open_or_repair` would repair it
+/// and the repair drop a blob file a retry could read. Guards against any
+/// failed blob read grading the flush as damage the bytes prove.
+#[test]
+fn a_blob_read_failing_for_no_reason_of_its_bytes_is_not_damage() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = blob_config(disk.fs()).open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    // A later flush, whose tables name the first as returned.
+    tree.insert("b", "2", 1);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    let blobs = data_files(&crash, &at(DB).join("blobs"));
+    let Some(first) = blobs.first() else {
+        panic!("self-check: the flush wrote a blob file");
+    };
+    let blob = at(DB).join("blobs").join(first.to_string());
+
+    let disk = Disk::over(crash);
+    for op in [FaultOp::Read, FaultOp::ReadAt] {
+        disk.fs.injector().arm(
+            FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other))
+                .on_path(blob.to_str().unwrap_or_default()),
+        );
+    }
+    let result = blob_config(disk.fs()).open();
+    assert!(
+        !matches!(result, Ok(_) | Err(lsm_tree::Error::DamagedFlush { .. })),
+        "the open neither succeeds nor reports damage: {:?}",
+        result.err()
+    );
+    Ok(())
+}
+
 /// A repair that keeps a damaged returned flush for its scan removes a blob
 /// file no table references and no manifest names without reading it. Guards
 /// against such a file, unreadable but removable, failing every repair once

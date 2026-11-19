@@ -238,6 +238,20 @@ fn a_backend_without_volumes_is_asked_each_time() {
     assert_eq!(fs.asked.load(Ordering::SeqCst), 2);
 }
 
+/// Waits until a held ask entered `gate`. A refresh that never reaches the
+/// ask fails the test instead of spinning, with the gate opened for a late
+/// one to finish.
+fn wait_entered(gate: &Gate) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !gate.entered.load(Ordering::SeqCst) {
+        if std::time::Instant::now() > deadline {
+            gate.open.store(true, Ordering::SeqCst);
+            panic!("the refresh never asked the scheduler");
+        }
+        std::thread::yield_now();
+    }
+}
+
 /// Of two refreshes, the trees run what the one that asked last found: a
 /// refresh that read the scheduler before another does not publish its older
 /// answer over the newer one. Guards against trees left on a stale strategy
@@ -257,9 +271,7 @@ fn a_refresh_that_asked_first_does_not_overwrite_a_later_one() {
         let (fs, policy) = (std::sync::Arc::clone(&fs), Arc::clone(&policy));
         std::thread::spawn(move || policy.refresh(&*fs, Path::new("/a")))
     };
-    while !gate.entered.load(Ordering::SeqCst) {
-        std::thread::yield_now();
-    }
+    wait_entered(&gate);
     // The scheduler changes, and a second refresh asks after the first did.
     fs.idles.store(false, Ordering::SeqCst);
     let second = {
@@ -290,9 +302,7 @@ fn a_refresh_racing_the_first_attach_reaches_its_tree() {
         let (fs, policy) = (std::sync::Arc::clone(&fs), Arc::clone(&policy));
         std::thread::spawn(move || policy.refresh(&*fs, Path::new("/a")))
     };
-    while !gate.entered.load(Ordering::SeqCst) {
-        std::thread::yield_now();
-    }
+    wait_entered(&gate);
     // A tree opens while the refresh holds its answer; an ask of its own
     // would read another one.
     fs.idles.store(false, Ordering::SeqCst);

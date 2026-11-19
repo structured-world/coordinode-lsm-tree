@@ -1565,6 +1565,16 @@ impl<W: Write> FillingBufWriter<W> {
         &self.inner
     }
 
+    /// Does `call` with the inner writer, latching a panic of it: the inner
+    /// writer may be half changed (a cursor moved, state flushed), so a caller
+    /// that catches the panic is refused the file from then on.
+    fn latched<R>(&mut self, call: impl FnOnce(&mut W) -> R) -> R {
+        self.panicked = true;
+        let value = call(&mut self.inner);
+        self.panicked = false;
+        value
+    }
+
     /// Hands the buffer down. What the inner writer took leaves the buffer
     /// even when a later write of the flush fails or panics, so a retry does
     /// not put it down again.
@@ -1681,7 +1691,7 @@ impl<W: Write> std::io::Write for FillingBufWriter<W> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.flush_buf()?;
-        self.inner.flush()
+        self.latched(std::io::Write::flush)
     }
 }
 
@@ -1693,7 +1703,7 @@ impl<W: Write> Write for FillingBufWriter<W> {
 
     fn flush(&mut self) -> Result<()> {
         self.flush_buf()?;
-        self.inner.flush()
+        self.latched(Write::flush)
     }
 }
 
@@ -1702,7 +1712,7 @@ impl<W: Write + Seek> std::io::Seek for FillingBufWriter<W> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         // Buffered bytes belong before the seek target.
         self.flush_buf()?;
-        self.inner.seek(pos)
+        self.latched(|inner| inner.seek(pos))
     }
 }
 
@@ -1712,7 +1722,7 @@ impl<W: Write + Seek> Seek for FillingBufWriter<W> {
         // Buffered bytes belong before the seek target, so flush them out
         // before moving the inner cursor (matches std::io::BufWriter).
         self.flush_buf()?;
-        self.inner.seek(pos)
+        self.latched(|inner| inner.seek(pos))
     }
 }
 

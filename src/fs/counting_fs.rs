@@ -715,17 +715,20 @@ impl Fs for CountingFs {
         // A file kept open since it was written is synced through that
         // handle, this wrapper's own, which counts its sync: the wrapped
         // backend could not reach the counting handle through it.
+        // They are synced side by side, as the default batch does.
         let (open, rest): (Vec<_>, Vec<_>) = targets
             .iter()
             .enumerate()
             .partition(|(_, target)| matches!(target, super::SyncTarget::OpenFile { .. }));
-        for &(at, target) in &open {
-            target
-                .sync_alone(self)
-                .map_err(|error| super::SyncFailure {
-                    error,
-                    spent: alloc::vec![at],
-                })?;
+        if !open.is_empty() {
+            let (open_at, open): (Vec<usize>, Vec<super::SyncTarget<'_>>) =
+                open.into_iter().map(|(at, target)| (at, *target)).unzip();
+            super::sync_each_target(self, &open).map_err(|mut failure| {
+                for index in &mut failure.spent {
+                    *index = open_at.get(*index).copied().unwrap_or(*index);
+                }
+                failure
+            })?;
         }
         // The wrapped backend's batch of the rest, as the tree chose it; each
         // target is counted as its own sync would be. A batch that failed

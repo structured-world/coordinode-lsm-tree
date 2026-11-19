@@ -14,6 +14,25 @@ fn only_an_unknown_opcode_refuses_the_ring() {
     assert!(!super::refuses_sync(libc::ENOSPC));
 }
 
+/// A wait that fails before every sync is reaped spends each sync reaped as
+/// failed, each reaped as refused, and each not reaped. Guards against a
+/// target whose sync answered `EINVAL` in an earlier, interrupted wait being
+/// left out of the failure, and a later persist naming its file.
+#[test]
+fn a_batch_cut_short_spends_its_refused_syncs_too() {
+    use super::Completions;
+
+    let mut completions = Completions::default();
+    completions.note(0, 0);
+    completions.note(1, -libc::EINVAL);
+    completions.note(2, -libc::EIO);
+    let failure =
+        completions.cut_short(std::io::Error::other("the wait failed"), [3, 4].into_iter());
+    let mut spent = failure.spent;
+    spent.sort_unstable();
+    assert_eq!(spent, [1, 2, 3, 4], "every sync not known synced is spent");
+}
+
 /// Only a batch whose every sync answered as an unknown opcode would is
 /// refused. Beside a sync that ran, in either order and whether it failed or
 /// not, that answer is its target's own (a `/dev/null` has no sync): the batch

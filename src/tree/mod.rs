@@ -6540,8 +6540,11 @@ impl Tree {
                     &[],
                 ) {
                     Ok(digest) => Checksum::from_raw(digest),
+                    // A set-aside table is read only for what it names; a
+                    // dictionary of its data is not needed for that.
                     Err(e)
-                        if fails_adoption(&e) || needs_a_held_dictionary(&e, &recovery.dicts) =>
+                        if fails_adoption(&e)
+                            || (!set_aside && needs_a_held_dictionary(&e, &recovery.dicts)) =>
                     {
                         return Err(e);
                     }
@@ -6571,7 +6574,8 @@ impl Tree {
                 let table = match Table::recover(params) {
                     Ok(table) => table,
                     Err(e)
-                        if fails_adoption(&e) || needs_a_held_dictionary(&e, &recovery.dicts) =>
+                        if fails_adoption(&e)
+                            || (!set_aside && needs_a_held_dictionary(&e, &recovery.dicts)) =>
                     {
                         return Err(e);
                     }
@@ -6718,17 +6722,24 @@ impl Tree {
                             .all(|(member, index)| member.mark.index == index)
                 });
             let blocks_read = members.iter().all(|member| member.blocks_read);
-            let added_blobs = if whole && blocks_read {
-                Self::flush_blob_files(
+            // Whether what keeps the flush out is proven by the bytes: a table
+            // missing beside ones found (a flush writes its whole run into one
+            // folder), a read failing on a table's bytes, a blob file missing
+            // from the tree's own folder or failing on its bytes.
+            let (added_blobs, blobs_proven) = if whole && blocks_read {
+                match Self::flush_blob_files(
                     recovery,
                     config,
                     &blobs_folder,
                     members
                         .iter()
                         .flat_map(|member| member.blobs.iter().copied()),
-                )?
+                )? {
+                    FlushBlobs::Held(added) => (Some(added), true),
+                    FlushBlobs::Unread { proven } => (None, proven),
+                }
             } else {
-                None
+                (None, true)
             };
             let Some(added_blobs) = added_blobs else {
                 if did_return {
@@ -6738,12 +6749,10 @@ impl Tree {
                         members.len(),
                     );
                     broken.push(seq);
-                    // A table missing beside ones found is damage: a flush
-                    // writes its whole run into one folder. So is a blob file
-                    // it added that does not read, under the tree's own folder.
-                    unproven |= !members
-                        .iter()
-                        .all(|member| member.blocks_read || member.damage_proven);
+                    unproven |= !blobs_proven
+                        || !members
+                            .iter()
+                            .all(|member| member.blocks_read || member.damage_proven);
                     // A table missing from its run leaves no key range or
                     // sequence number to scope its loss by.
                     if !whole {
@@ -6862,8 +6871,7 @@ impl Tree {
     }
 
     /// The blob files a flush's tables refer to that `recovery` does not hold,
-    /// with their checksums; `None` when one is missing or does not read
-    /// whole.
+    /// with their checksums, or why one of them is not taken.
     ///
     /// # Errors
     ///
@@ -6873,7 +6881,7 @@ impl Tree {
         config: &Config,
         blobs_folder: &Path,
         referred: impl Iterator<Item = crate::vlog::BlobFileId>,
-    ) -> crate::Result<Option<Vec<(crate::vlog::BlobFileId, Checksum)>>> {
+    ) -> crate::Result<FlushBlobs> {
         let mut added: Vec<(crate::vlog::BlobFileId, Checksum)> = Vec::new();
         for id in referred {
             if recovery.blob_file_ids.iter().any(|(held, _)| *held == id)
@@ -6887,7 +6895,11 @@ impl Tree {
                 .open(&path, &crate::fs::FsOpenOptions::new().read(true))
             {
                 Ok(file) => file,
-                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
+                // The blob folder is the tree's own, under every route: a
+                // file missing from it is lost, not a folder left unscanned.
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {
+                    return Ok(FlushBlobs::Unread { proven: true });
+                }
                 Err(e) => return Err(e.into()),
             };
             // The trailer can reach the disk with frames that did not: every
@@ -6908,7 +6920,9 @@ impl Tree {
                 Err(e) if e.is_environmental() => return Err(e),
                 Err(e) => {
                     log::warn!("blob file {id} of a synced flush does not read whole: {e:?}");
-                    return Ok(None);
+                    return Ok(FlushBlobs::Unread {
+                        proven: e.is_repairable_structural(),
+                    });
                 }
             }
             added.push((
@@ -6921,7 +6935,7 @@ impl Tree {
                 )?),
             ));
         }
-        Ok(Some(added))
+        Ok(FlushBlobs::Held(added))
     }
 
     /// Sets aside table `id` at `path`, of a synced flush that never returned
@@ -8558,6 +8572,16 @@ fn fails_adoption(e: &crate::Error) -> bool {
 /// a table that does not open, it would be left to the sweep.
 fn needs_a_held_dictionary(e: &crate::Error, dicts: &[crate::file::DictId]) -> bool {
     matches!(e, crate::Error::ZstdDictMismatch { expected, .. } if dicts.contains(expected))
+}
+
+/// The blob files a synced flush added, as an open finds them.
+enum FlushBlobs {
+    /// Each reads whole: the ones the manifest does not hold, with their
+    /// checksums.
+    Held(Vec<(crate::vlog::BlobFileId, Checksum)>),
+    /// One is missing or does not read whole; `proven` when its bytes decide
+    /// that (see [`crate::Error::is_repairable_structural`]).
+    Unread { proven: bool },
 }
 
 /// What a repair learns from taking in the synced flushes no manifest names.
