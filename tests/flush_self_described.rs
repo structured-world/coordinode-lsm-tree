@@ -460,7 +460,7 @@ fn a_returned_flush_with_a_damaged_block_fails_the_open() -> lsm_tree::Result<()
     assert!(
         matches!(
             config(Arc::new(crash.clone())).open(),
-            Err(lsm_tree::Error::Unrecoverable)
+            Err(lsm_tree::Error::DamagedFlush { .. })
         ),
         "the damage to a returned flush is reported"
     );
@@ -840,11 +840,172 @@ fn a_failed_open_on_a_damaged_returned_flush_fails_again() -> lsm_tree::Result<(
         assert!(
             matches!(
                 open(Arc::new(crash.clone())),
-                Err(lsm_tree::Error::Unrecoverable)
+                Err(lsm_tree::Error::DamagedFlush { .. })
             ),
             "the {attempt} open reports the damaged returned flush"
         );
     }
+    Ok(())
+}
+
+/// An open that meets a returned flush damaged on disk, one of whose tables
+/// does not read whole, is answered by a repair in the one-call path. Guards
+/// against `open_or_repair` returning the open's error for damage a repair
+/// salvages, as it does for a damaged table the manifest names.
+#[test]
+fn open_or_repair_repairs_a_damaged_returned_flush() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let open = |fs| config(fs).table_target_size(1_024);
+    let tree = open(disk.fs()).open()?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let damaged = added_by(&disk.crash, &tables, || {
+        tree.insert("a", "x".repeat(512), 1);
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert_eq!(damaged.len(), 1, "self-check: the flush wrote one table");
+    // A later flush, whose tables name the damaged one as returned.
+    tree.insert("b", "2", 2);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    damage(&crash, &tables.join(damaged[0].to_string()), 40)?;
+
+    let (tree, report) = open(Arc::new(crash)).open_or_repair(lsm_tree::RepairPolicy::default())?;
+    assert!(report.is_some(), "the open is answered by a repair");
+    assert_eq!(value(&tree, "b")?.as_deref(), Some("2"));
+    Ok(())
+}
+
+/// A returned flush missing one of its tables while the others are found is
+/// damage, not a folder the configuration left out: one flush writes all its
+/// tables into one folder. The one-call path repairs it. Guards against such a
+/// flush being refused like one of which no table is found.
+#[test]
+fn open_or_repair_repairs_a_returned_flush_missing_a_table() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let open = |fs| config(fs).table_target_size(1_024);
+    let tree = open(disk.fs()).open()?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let filler = "y".repeat(256);
+    let returned = added_by(&disk.crash, &tables, || {
+        for i in 0..64u64 {
+            tree.insert(format!("k{i:03}"), &filler, 1 + i);
+        }
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert!(
+        returned.len() > 1,
+        "self-check: the flush wrote several tables"
+    );
+    tree.insert("z", "2", 100);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    crash.remove_file(&tables.join(returned[0].to_string()))?;
+
+    let (tree, report) = open(Arc::new(crash)).open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let Some(report) = report else {
+        panic!("the open is answered by a repair");
+    };
+    assert_eq!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::FullHistory,
+        "the missing table is reported: {report:?}"
+    );
+    assert_eq!(value(&tree, "z")?.as_deref(), Some("2"));
+    Ok(())
+}
+
+/// A returned flush of which no table is found is not repaired in the
+/// one-call path: a store opened without the level route its tables lie on
+/// looks the same, and a repair there would drop them. Guards against the
+/// automatic repair of a damaged flush reaching this case too.
+#[test]
+fn open_or_repair_refuses_a_returned_flush_with_no_table_left() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = config(disk.fs()).open()?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let returned = added_by(&disk.crash, &tables, || {
+        tree.insert("a", "new", 1);
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    tree.insert("b", "2", 2);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    crash.remove_file(&tables.join(returned[0].to_string()))?;
+
+    assert!(
+        matches!(
+            config(Arc::new(crash)).open_or_repair(lsm_tree::RepairPolicy::default()),
+            Err(lsm_tree::Error::Unrecoverable)
+        ),
+        "the open's error is returned, nothing repaired"
+    );
+    Ok(())
+}
+
+/// Flushes whose tables need a dictionary the manifest references and the
+/// tree no longer holds fail the open, with nothing repaired and nothing
+/// removed: the tables are whole. Guards against such tables being passed
+/// over as ones that do not open, which left them to the sweep, and against
+/// the automatic repair of a damaged flush reaching a failure that is not the
+/// tables' bytes.
+#[cfg(feature = "zstd")]
+#[test]
+fn open_or_repair_refuses_a_returned_flush_without_its_dictionary() -> lsm_tree::Result<()> {
+    use lsm_tree::config::CompressionPolicy;
+    use lsm_tree::{CompressionType, ZstdDictionary};
+
+    let mut samples = Vec::new();
+    for i in 0u32..500 {
+        samples.extend_from_slice(format!("key-{i:05}value-{i:05}-padding").as_bytes());
+    }
+    let dictionary = ZstdDictionary::new(&samples);
+    let id = dictionary.id();
+    let compressed = |fs| -> lsm_tree::Result<Config> {
+        Ok(config(fs)
+            .data_block_compression_policy(CompressionPolicy::all(CompressionType::zstd_dict(
+                3, id,
+            )?))
+            .zstd_dictionary(Some(Arc::new(ZstdDictionary::new(&samples)))))
+    };
+    let disk = Disk::new();
+    // No flush persisted: no table the manifest names needs the dictionary,
+    // so only the flushes' own tables meet its absence.
+    let tree = compressed(disk.fs())?.open()?;
+    for i in 0u32..100 {
+        tree.insert(
+            format!("key-{i:05}"),
+            format!("value-{i:05}-padding"),
+            1 + u64::from(i),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    // A later flush, whose tables name the one above as returned.
+    tree.insert("b", "2", 200);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    crash.remove_file(&at(DB).join("dicts").join(id.to_string()))?;
+
+    let before = data_files(&crash, &at(DB).join("tables"));
+    let result = config(Arc::new(crash.clone())).open_or_repair(lsm_tree::RepairPolicy::default());
+    assert!(
+        matches!(result, Err(lsm_tree::Error::ZstdDictMismatch { .. })),
+        "the open's error is returned, nothing repaired: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        data_files(&crash, &at(DB).join("tables")),
+        before,
+        "the flushes' tables stay where they are"
+    );
     Ok(())
 }
 

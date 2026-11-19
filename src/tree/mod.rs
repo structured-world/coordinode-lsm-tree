@@ -6415,9 +6415,14 @@ impl Tree {
     /// Each flush's tables name the last flush that had returned when it
     /// began, so the flushes that returned above the watermark are the ones
     /// some table names. Such a flush that does not read whole, or of which no
-    /// table is found, was lost to the medium after it returned: an open
-    /// reports it as [`crate::Error::Unrecoverable`] for a repair to salvage,
-    /// and a repair leaves its tables to its scan (the returned set). Any
+    /// table is found, was lost to the medium after it returned, and a repair
+    /// leaves its tables to its scan (the returned set). An open reports it
+    /// as [`crate::Error::DamagedFlush`] when the bytes prove the damage (a
+    /// table missing beside ones found, a read that fails on the bytes, a
+    /// blob file of it that does not read), which `open_or_repair` repairs;
+    /// as [`crate::Error::Unrecoverable`] when no table of it is found or a
+    /// read failed for a reason the configuration may explain, left to an
+    /// explicit repair once the configuration is checked. Any
     /// other flush either failed or is the latest, which nothing names yet:
     /// not whole, it is taken for one a power loss cut short, as a log's torn
     /// tail is, and its tables are set aside under `{id}.torn-flush`, beyond
@@ -6430,9 +6435,10 @@ impl Tree {
     ///
     /// # Errors
     ///
-    /// Propagates an environmental fault reading the folders, and
+    /// Propagates an environmental fault reading the folders, and, when
+    /// `purpose` is an open, [`crate::Error::DamagedFlush`] or
     /// [`crate::Error::Unrecoverable`] for a flush that returned and does not
-    /// read whole, when `purpose` is an open.
+    /// read whole, as above.
     #[expect(
         clippy::too_many_lines,
         reason = "one pass over the folders, then one decision per flush"
@@ -6454,6 +6460,10 @@ impl Tree {
             blobs: Vec<BlobFileId>,
             /// Whether every data block read.
             blocks_read: bool,
+            /// Whether a read that failed failed on its bytes alone, which a
+            /// configuration cannot explain (see
+            /// [`crate::Error::is_repairable_structural`]).
+            damage_proven: bool,
             /// Where the table lies, to be synced once its flush is taken in,
             /// or set aside when it never returned.
             path: crate::path::PathBuf,
@@ -6530,7 +6540,11 @@ impl Tree {
                     &[],
                 ) {
                     Ok(digest) => Checksum::from_raw(digest),
-                    Err(e) if fails_adoption(&e) => return Err(e),
+                    Err(e)
+                        if fails_adoption(&e) || needs_a_held_dictionary(&e, &recovery.dicts) =>
+                    {
+                        return Err(e);
+                    }
                     Err(_) if set_aside => continue,
                     Err(_) => {
                         unreadable.push(id);
@@ -6556,7 +6570,11 @@ impl Tree {
                 // the flush it belonged to is then not whole.
                 let table = match Table::recover(params) {
                     Ok(table) => table,
-                    Err(e) if fails_adoption(&e) => return Err(e),
+                    Err(e)
+                        if fails_adoption(&e) || needs_a_held_dictionary(&e, &recovery.dicts) =>
+                    {
+                        return Err(e);
+                    }
                     Err(_) if set_aside => continue,
                     Err(_) => {
                         unreadable.push(id);
@@ -6586,18 +6604,24 @@ impl Tree {
                 // open keeps, and their section has no checksum: it is checked
                 // against the table's entries, or a link rotted into another
                 // file's id would leave the table's own file to be deleted.
+                let mut damage_proven = true;
                 let mut blocks_read = match table
                     .verify_data_blocks()
                     .and_then(|()| table.verify_filter_blocks())
                     .and_then(|()| table.verify_blob_links())
                 {
                     Ok(()) => true,
-                    Err(e) if fails_adoption(&e) => return Err(e),
+                    Err(e)
+                        if fails_adoption(&e) || needs_a_held_dictionary(&e, &recovery.dicts) =>
+                    {
+                        return Err(e);
+                    }
                     Err(e) => {
                         log::warn!(
                             "table {id} of synced flush #{} does not read whole: {e:?}",
                             mark.seq,
                         );
+                        damage_proven = e.is_repairable_structural();
                         false
                     }
                 };
@@ -6611,8 +6635,9 @@ impl Tree {
                         .map(|linked| linked.blob_file_id)
                         .collect(),
                     Err(e) if fails_adoption(&e) => return Err(e),
-                    Err(_) => {
+                    Err(e) => {
                         blocks_read = false;
+                        damage_proven &= e.is_repairable_structural();
                         Vec::new()
                     }
                 };
@@ -6629,6 +6654,7 @@ impl Tree {
                         min_key: table.metadata.key_range.min().clone(),
                         blobs,
                         blocks_read,
+                        damage_proven,
                         path: entry.path,
                         fs: folder_fs.clone(),
                     },
@@ -6653,6 +6679,10 @@ impl Tree {
             log::error!("synced flush #{seq} returned and none of its tables is found");
         }
         let mut broken = lost.clone();
+        // Whether a broken flush's damage is not proven by the bytes: none of
+        // its tables found (a level route left out hides them all the same),
+        // or a table kept from reading by what the configuration may explain.
+        let mut unproven = !lost.is_empty();
         let mut kept: crate::HashSet<TableId> = crate::HashSet::default();
         // The tables of flushes that never returned, set aside only once no
         // flush failed the open: their tables are the evidence that names the
@@ -6708,6 +6738,12 @@ impl Tree {
                         members.len(),
                     );
                     broken.push(seq);
+                    // A table missing beside ones found is damage: a flush
+                    // writes its whole run into one folder. So is a blob file
+                    // it added that does not read, under the tree's own folder.
+                    unproven |= !members
+                        .iter()
+                        .all(|member| member.blocks_read || member.damage_proven);
                     // A table missing from its run leaves no key range or
                     // sequence number to scope its loss by.
                     if !whole {
@@ -6803,9 +6839,10 @@ impl Tree {
             recovery.blob_file_ids.extend(added_blobs);
             recovery.blob_file_ids.sort_by_key(|(id, _)| *id);
         }
-        if !broken.is_empty() {
+        if let Some(&flush) = broken.first() {
             match purpose {
-                AdoptFor::Open => return Err(crate::Error::Unrecoverable),
+                AdoptFor::Open if unproven => return Err(crate::Error::Unrecoverable),
+                AdoptFor::Open => return Err(crate::Error::DamagedFlush { flush }),
                 // The scan salvages what reads of them, and of the tables
                 // that do not open, one of which may be a missing member.
                 AdoptFor::Repair => kept.extend(unreadable),
@@ -8513,6 +8550,14 @@ mod adoption_tests;
 fn fails_adoption(e: &crate::Error) -> bool {
     matches!(e, crate::Error::FeatureUnsupported(_))
         || (e.is_environmental() && !matches!(e, crate::Error::ZstdDictMismatch { .. }))
+}
+
+/// Whether `e` says a table of a synced flush needs a dictionary the manifest
+/// references and the tree does not hold. That table is whole, its
+/// dictionary's file is what is gone, so the open fails on it: passed over as
+/// a table that does not open, it would be left to the sweep.
+fn needs_a_held_dictionary(e: &crate::Error, dicts: &[crate::file::DictId]) -> bool {
+    matches!(e, crate::Error::ZstdDictMismatch { expected, .. } if dicts.contains(expected))
 }
 
 /// What a repair learns from taking in the synced flushes no manifest names.

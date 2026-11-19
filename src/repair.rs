@@ -4053,52 +4053,10 @@ fn owed_report(tree: &crate::AnyTree, path: &std::path::Path) -> Option<RepairRe
 /// and can drop — perfectly healthy data (e.g. re-ordering SSTs under a
 /// mistyped comparator, or salvage discarding every block it cannot decrypt
 /// with the wrong key). Fail closed: an unlisted (including future) error is
-/// NOT repaired.
+/// NOT repaired. An operator who has verified the configuration can still
+/// invoke `repair` explicitly.
 fn is_repairable_structural(e: &crate::Error) -> bool {
-    use crate::Error;
-    match e {
-        // Data-shape I/O kinds are structural: a missing file (the manifest
-        // itself, or a file it names), malformed bytes (the manifest-loss
-        // open surfaces "current missing but artifacts present" as
-        // InvalidData), or a truncated read. Any other I/O kind is
-        // environment, and transient kinds are retried by the caller.
-        Error::Io(io) => matches!(
-            io.kind(),
-            crate::io::ErrorKind::NotFound
-                | crate::io::ErrorKind::InvalidData
-                | crate::io::ErrorKind::UnexpectedEof
-        ),
-        // `Unrecoverable` is deliberately ABSENT: it is the catch-all for
-        // "cannot classify", the opposite of positive evidence of a structural
-        // defect. Repairing on it rebuilds the manifest from whatever the
-        // current configuration happens to scan, and since route provenance
-        // is not persisted, a routed store reopened with its `level_routes`
-        // omitted presents exactly that way, so the rebuild would drop every
-        // SST on the unscanned tiers. An operator who has verified the
-        // configuration can still invoke `repair` explicitly.
-        Error::Decompress(_)
-        | Error::Excised { .. }
-        | Error::ChecksumMismatch { .. }
-        | Error::HeaderCrcMismatch { .. }
-        | Error::InvalidTag(_)
-        | Error::InvalidTrailer
-        | Error::InvalidHeader(_)
-        | Error::DecompressedSizeTooLarge { .. }
-        | Error::ManifestFrameChecksumMismatch { .. }
-        | Error::ManifestFooterInvalid(_)
-        | Error::ManifestSectionInvalid(_)
-        | Error::TornManifestEditLog { .. }
-        | Error::RangeTombstoneDecode { .. }
-        | Error::PageEccUnrecoverable { .. }
-        // A stored dictionary disagreeing with its own name is the bytes: the
-        // name is their hash. The one configuration that reads the same way,
-        // an encrypted file opened without its key, never gets here, because
-        // `Tree::open` verifies the manifest under the configured provider
-        // before it reads a dictionary. The repair sets the file aside, or
-        // stops on a table that still needs it.
-        | Error::ZstdDictCorrupt { .. } => true,
-        _ => false,
-    }
+    e.is_repairable_structural()
 }
 
 /// Which repair capabilities [`Config::open_or_repair`] may engage.
