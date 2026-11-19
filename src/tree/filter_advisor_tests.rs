@@ -592,11 +592,11 @@ fn a_caller_flushed_stream_is_sized_and_registered() -> crate::Result<()> {
             crate::ValueType::Value,
         ))
     });
-    let Some((tables, _, pin)) = tree.flush_to_tables(entries)? else {
+    let Some((tables, _, pin, kept)) = tree.flush_to_tables(entries)? else {
         panic!("the stream writes tables");
     };
     assert!(tables.iter().all(|table| table.filter_size() > 0));
-    tree.register_tables(&tables, None, None, &[], 0, false)?;
+    tree.register_tables(&tables, None, None, &[], 0, false, &kept)?;
 
     assert!(tree.get(key("k", 2), SeqNo::MAX)?.is_some());
     let AnyTree::Standard(standard) = &tree else {

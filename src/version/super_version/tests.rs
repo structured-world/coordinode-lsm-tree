@@ -177,6 +177,61 @@ fn one_at_a_time_a_failed_sync_marks_only_its_own_file() -> crate::Result<()> {
     Ok(())
 }
 
+/// Under barrier syncs, a device whose cache did not flush leaves the files
+/// synced to it unproven: they are marked as failed, and a later barrier
+/// does not take a sync of its own for proof. Guards against a failed flush
+/// of a table's device clearing the table for the next persist to name.
+#[test]
+fn a_failed_device_flush_marks_the_files_on_that_device() -> crate::Result<()> {
+    use crate::config::FlushDurability;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io_policy::SyncSchedule;
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let AnyTree::Standard(tree) = Config::new(
+        std::path::absolute("/db")?,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .sync_mode(SyncMode::Barrier)
+    .flush_durability(FlushDurability::Deferred)
+    .open()?
+    else {
+        panic!("a standard tree");
+    };
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    let pending = tree.version_history.read().unsynced_files();
+    let step = (&*fs as &dyn crate::fs::Fs, crate::path::Path::new("/db"));
+
+    // The tables' device is not provably the manifest's: its cache is
+    // flushed on its own, and the flush fails once.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::VolumeId, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("tables"),
+    );
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDevice,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .once(),
+    );
+    assert!(
+        SuperVersions::sync_unsynced(&pending, SyncMode::Barrier, SyncSchedule::SideBySide, step)
+            .is_err(),
+        "the device flush fails"
+    );
+    assert!(
+        SuperVersions::sync_unsynced(&pending, SyncMode::Barrier, SyncSchedule::SideBySide, step)
+            .is_err(),
+        "the table synced to that device is not taken as durable"
+    );
+    Ok(())
+}
+
 /// A barrier that could not open a pending file synced nothing, so the next
 /// one syncs and persists it. Guards against a transient failure to open
 /// (descriptors run out) being taken for a failed sync, which no retry

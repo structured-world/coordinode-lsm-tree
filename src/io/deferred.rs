@@ -477,12 +477,11 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
     }
 
     /// Writes out what is buffered and queued and hands back the inner
-    /// writer.
+    /// writer: a file kept open for its sync once every byte reached it.
     ///
     /// # Errors
     ///
     /// Returns the first failure of a write.
-    #[cfg(test)]
     pub(crate) fn finish(mut self) -> io::Result<W> {
         self.hand_over()?;
         match core::mem::replace(&mut self.sink, Sink::Gone) {

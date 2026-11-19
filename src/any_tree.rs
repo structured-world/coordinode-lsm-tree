@@ -463,6 +463,7 @@ impl AbstractTree for AnyTree {
         sealed_memtables_to_delete: &[crate::tree::inner::MemtableId],
         gc_watermark: SeqNo,
         collected_below_watermark: bool,
+        kept: &crate::abstract_tree::KeptFiles,
     ) -> crate::Result<()> {
         forward!(self.register_tables(
             tables,
@@ -470,7 +471,8 @@ impl AbstractTree for AnyTree {
             frag_map,
             sealed_memtables_to_delete,
             gc_watermark,
-            collected_below_watermark
+            collected_below_watermark,
+            kept
         ))
     }
 

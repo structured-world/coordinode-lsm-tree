@@ -192,19 +192,34 @@ fn a_lane_drops_what_is_queued_behind_a_failed_write() {
     );
 }
 
-/// A writer already on a lane takes a new spawner for its later buffers and
-/// keeps the file's order.
+/// A writer already on a lane takes a new spawner for its later buffers, the
+/// new one getting the work, and keeps the file's order.
 #[test]
 fn a_writer_on_a_lane_takes_a_new_spawner() -> io::Result<()> {
+    /// Runs each task on a thread of its own, counting them.
+    #[derive(Default)]
+    struct Counted(AtomicUsize);
+    impl CompactionSpawner for Counted {
+        fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(task);
+        }
+    }
+
     let data = pattern(4_096);
     let mut out = DeferredWriter::with_capacity(256, Sink::default(), true);
     out.use_spawner_now(Arc::new(Prompt));
     let (first, second) = data.split_at(2_048);
     write_in(&mut out, first, 100)?;
-    out.use_spawner(Arc::new(Threads));
+    let replacement = Arc::new(Counted::default());
+    out.use_spawner(replacement.clone());
     write_in(&mut out, second, 100)?;
     let sink = out.finish()?;
     assert_eq!(sink.bytes, data);
+    assert!(
+        replacement.0.load(Ordering::SeqCst) > 0,
+        "the new spawner gets the later buffers"
+    );
     Ok(())
 }
 

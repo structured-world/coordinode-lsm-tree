@@ -47,6 +47,7 @@ fn a_mount_id_gives_its_source() {
 41 40 0:46 / /var/lib\\040db rw - xfs /dev/my\\040disk rw
 42 22 0:5 / /proc rw - proc proc rw
 ";
+    let mountinfo = mountinfo.as_bytes();
     assert_eq!(
         mount_source(mountinfo, 40),
         Some(PathBuf::from("/dev/mapper/vg-data"))
@@ -65,6 +66,26 @@ fn a_mount_id_gives_its_source() {
     assert_eq!(mount_source(mountinfo, 4), None);
 }
 
+/// A byte that is not UTF-8, in another mount's line or in the source itself,
+/// does not hide the source: proc(5) writes a path's bytes as they are.
+/// Guards against one such mount point anywhere on the host turning the
+/// probe off for every tree.
+#[test]
+fn a_byte_that_is_not_utf8_does_not_hide_the_source() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut mountinfo = b"30 22 0:50 / /media/\xff rw - vfat /dev/sdb1 rw\n".to_vec();
+    mountinfo.extend_from_slice(b"31 22 8:2 / /data rw - ext4 /dev/disk\xfe rw\n");
+    mountinfo.extend_from_slice(b"32 22 8:3 / /srv rw - xfs /dev/sdc1 rw\n");
+    assert_eq!(
+        mount_source(&mountinfo, 32),
+        Some(PathBuf::from("/dev/sdc1"))
+    );
+    let Some(odd) = mount_source(&mountinfo, 31) else {
+        panic!("a source that is not UTF-8 is found");
+    };
+    assert_eq!(odd.as_os_str().as_bytes(), b"/dev/disk\xfe");
+}
+
 /// Lines of `/proc/self/mountinfo` that are cut short are skipped, and a
 /// backslash that starts no octal escape is kept as it is.
 #[test]
@@ -76,6 +97,7 @@ no separator in this line
 x 22 8:3 / /data rw - ext4 /dev/sdz1 rw
 26 22 8:5 / /odd rw - xfs /dev/sde\\x1 rw
 ";
+    let mountinfo = mountinfo.as_bytes();
     assert_eq!(mount_source(mountinfo, 24), None, "a line without a source");
     assert_eq!(
         mount_source(mountinfo, 26),

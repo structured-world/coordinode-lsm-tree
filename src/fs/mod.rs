@@ -514,7 +514,7 @@ pub enum SyncMode {
 
 /// One sync of a batch [`Fs::sync_many`] makes.
 // no-std: pure data type - borrowed paths, no allocator needed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub enum SyncTarget<'a> {
     /// The data and size of the file at `path`, opened for writing as
     /// `origin`'s, synced as [`FsFile::sync_data_with`] syncs them.
@@ -522,6 +522,20 @@ pub enum SyncTarget<'a> {
         /// The file.
         path: &'a Path,
         /// What the file is written for, as its open names it.
+        origin: WriteOrigin,
+        /// The durability the sync reaches.
+        mode: SyncMode,
+    },
+    /// The data and size of the file at `path`, synced through `file`, a
+    /// handle open since the file was written: it reports every writeback
+    /// error of the file, which a handle opened later reports only while the
+    /// kernel keeps the file's inode in memory.
+    OpenFile {
+        /// The handle the file was written through.
+        file: &'a dyn FsFile,
+        /// The file's path, which names its folder and device.
+        path: &'a Path,
+        /// What the file is written for.
         origin: WriteOrigin,
         /// The durability the sync reaches.
         mode: SyncMode,
@@ -536,7 +550,52 @@ pub enum SyncTarget<'a> {
     },
 }
 
-impl SyncTarget<'_> {
+impl core::fmt::Debug for SyncTarget<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::FileData { path, origin, mode } => f
+                .debug_struct("FileData")
+                .field("path", path)
+                .field("origin", origin)
+                .field("mode", mode)
+                .finish(),
+            Self::OpenFile {
+                path, origin, mode, ..
+            } => f
+                .debug_struct("OpenFile")
+                .field("path", path)
+                .field("origin", origin)
+                .field("mode", mode)
+                .finish_non_exhaustive(),
+            Self::Folder { path, mode } => f
+                .debug_struct("Folder")
+                .field("path", path)
+                .field("mode", mode)
+                .finish(),
+        }
+    }
+}
+
+impl<'a> SyncTarget<'a> {
+    /// The path of the file or folder this target syncs.
+    #[must_use]
+    pub const fn path(&self) -> &'a Path {
+        match *self {
+            Self::FileData { path, .. }
+            | Self::OpenFile { path, .. }
+            | Self::Folder { path, .. } => path,
+        }
+    }
+
+    /// What the file this target syncs is written for; `None` for a folder.
+    #[must_use]
+    pub const fn origin(&self) -> Option<WriteOrigin> {
+        match *self {
+            Self::FileData { origin, .. } | Self::OpenFile { origin, .. } => Some(origin),
+            Self::Folder { .. } => None,
+        }
+    }
+
     /// Syncs this target alone through `fs`.
     ///
     /// # Errors
@@ -556,6 +615,7 @@ impl SyncTarget<'_> {
                     .map_err(|e| (e, false))?;
                 file.sync_data_with(mode).map_err(|e| (e, true))
             }
+            Self::OpenFile { file, mode, .. } => file.sync_data_with(mode).map_err(|e| (e, true)),
             Self::Folder { path, mode } => {
                 fs.sync_directory_with(path, mode).map_err(|e| (e, true))
             }
@@ -606,6 +666,10 @@ impl From<SyncFailure> for crate::Error {
 /// A target of a batch with its index in it.
 type Indexed<'t, 'p> = (usize, &'t SyncTarget<'p>);
 
+/// A file a writer kept open for the install that syncs it, by the id of
+/// what it holds.
+pub(crate) type Kept<Id> = (Id, alloc::boxed::Box<dyn FsFile>);
+
 /// [`Fs::sync_many`] by one call per target: the files side by side on
 /// threads of their own (one after another without `std`), then the folders.
 ///
@@ -620,7 +684,7 @@ pub(crate) fn sync_each_target<F: Fs + ?Sized>(
     let (files, folders): (Vec<Indexed<'_, '_>>, Vec<Indexed<'_, '_>>) = targets
         .iter()
         .enumerate()
-        .partition(|(_, target)| matches!(target, SyncTarget::FileData { .. }));
+        .partition(|(_, target)| !matches!(target, SyncTarget::Folder { .. }));
     sync_side_by_side(fs, &files)?;
     for (at, folder) in folders {
         folder.sync_noting(fs).map_err(|(error, ran)| SyncFailure {

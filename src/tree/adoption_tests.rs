@@ -445,11 +445,13 @@ fn a_table_the_host_will_not_read_fails_the_open_and_drops_nothing() -> crate::R
     crash.crash();
     drop(tree);
 
+    // The table's whole path: a bare id would match the manifest's files too.
+    let table_path = tables.join(&table).to_string_lossy().into_owned();
     let refused = Arc::new(FaultFs::new(crash.clone()));
     for op in [FaultOp::Read, FaultOp::ReadAt] {
         refused.injector().arm(
             FaultRule::new(op, Fault::Error(crate::io::ErrorKind::PermissionDenied))
-                .on_path(table.clone()),
+                .on_path(table_path.clone()),
         );
     }
     let Err(crate::Error::Io(e)) = open(refused) else {

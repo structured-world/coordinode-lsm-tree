@@ -1087,9 +1087,10 @@ fn an_open_syncs_the_flushes_it_installs() -> lsm_tree::Result<()> {
     drop(tree);
     disk.fs.injector().clear();
 
+    // Power is lost right after the open: only what the open synced stays,
+    // with no later persist to make the table durable for it.
     let tree = config(disk.fs()).open()?;
     assert_eq!(value(&tree, "a")?.as_deref(), Some("1"));
-    tree.persist_flushes()?;
     let crash = disk.power_loss(tree);
 
     let tree = config(Arc::new(crash)).open()?;

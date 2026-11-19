@@ -526,6 +526,28 @@ fn buf_writer_refuses_a_hand_off_after_a_panicking_write() {
     assert_eq!(inner.calls, 2, "nor written to again");
 }
 
+/// A hand-off whose closure panics, caught by the caller, fails the file
+/// too: the closure may have left the inner writer half changed, so the next
+/// hand-off is refused. Guards against a sync after a caught panic reporting
+/// a file the panic cut short.
+#[cfg(feature = "std")]
+#[test]
+fn buf_writer_refuses_a_hand_off_after_a_panicking_hand_off() {
+    for in_job in [false, true] {
+        let mut out = FillingBufWriter::with_capacity(4, Vec::<u8>::new());
+        let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            if in_job {
+                let _ = out.after_writes(|_| panic!("injected"));
+            } else {
+                let _ = out.with_inner(|_| panic!("injected"));
+            }
+        }))
+        .is_err();
+        assert!(caught, "the injected panic surfaces");
+        assert!(out.with_inner(|_| ()).is_err(), "the next hand-off fails");
+    }
+}
+
 /// A write that panics, caught by the caller, fails the file for good: a
 /// later write that would reach the inner writer whole is refused, and so is
 /// the hand-off after it. Guards against a write that goes through clearing

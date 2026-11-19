@@ -1739,6 +1739,38 @@ pub(crate) type FileWriter<W> = deferred::DeferredWriter<W>;
 #[cfg(not(feature = "std"))]
 pub(crate) type FileWriter<W> = FillingBufWriter<W>;
 
+/// The unsynced file `file` writes, open, when `keep` asks for it, once every
+/// byte written reached it: an install that syncs it right after syncs it
+/// through this handle.
+///
+/// # Errors
+///
+/// The failure of an earlier write of `file`.
+#[cfg(feature = "std")]
+pub(crate) fn kept_open(
+    keep: bool,
+    file: FileWriter<alloc::boxed::Box<dyn crate::fs::FsFile>>,
+) -> crate::Result<Option<alloc::boxed::Box<dyn crate::fs::FsFile>>> {
+    Ok(if keep { Some(file.finish()?) } else { None })
+}
+
+/// Without std an install syncs a file by its path: none is kept open.
+///
+/// # Errors
+///
+/// None: the signature is the std build's.
+#[cfg(not(feature = "std"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as the std build's"
+)]
+pub(crate) fn kept_open(
+    _keep: bool,
+    _file: FileWriter<alloc::boxed::Box<dyn crate::fs::FsFile>>,
+) -> crate::Result<Option<alloc::boxed::Box<dyn crate::fs::FsFile>>> {
+    Ok(None)
+}
+
 #[cfg(not(feature = "std"))]
 impl<W: Write> FillingBufWriter<W> {
     /// Wraps `inner` with a `capacity`-byte buffer. `fill` is the choice the
@@ -1763,7 +1795,11 @@ impl<W: Write> FillingBufWriter<W> {
     pub(crate) fn after_writes(&mut self, run: impl FnOnce(&mut W)) -> BufResult<()> {
         // Refuses after a panicked write, with nothing buffered too.
         self.flush_buf()?;
+        // A panic of `run`, which the caller catches, leaves it set: the
+        // inner writer may be half changed.
+        self.panicked = true;
         run(&mut self.inner);
+        self.panicked = false;
         Ok(())
     }
 
@@ -1775,7 +1811,11 @@ impl<W: Write> FillingBufWriter<W> {
     /// As [`Self::after_writes`].
     pub(crate) fn with_inner<R>(&mut self, read: impl FnOnce(&mut W) -> R) -> BufResult<R> {
         self.flush_buf()?;
-        Ok(read(&mut self.inner))
+        // As in `after_writes`.
+        self.panicked = true;
+        let value = read(&mut self.inner);
+        self.panicked = false;
+        Ok(value)
     }
 }
 

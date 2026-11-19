@@ -21,7 +21,40 @@ pub(crate) type FlushToTablesResult = (
     Vec<Table>,
     Option<Vec<BlobFile>>,
     crate::runtime_config::WritePin,
+    KeptFiles,
 );
+
+/// The files a synced flush wrote, each through a handle kept open for the
+/// install that syncs it right after.
+///
+/// An internal extension hook type of the crate's sealed tree types, hidden
+/// from generated documentation.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct KeptFiles {
+    /// The tables', by id.
+    pub(crate) tables: Vec<(TableId, Box<dyn crate::fs::FsFile>)>,
+    /// The blob files', by id.
+    pub(crate) blobs: Vec<(crate::vlog::BlobFileId, Box<dyn crate::fs::FsFile>)>,
+}
+
+impl KeptFiles {
+    /// The handle the table `id` was written through, if kept.
+    pub(crate) fn table(&self, id: TableId) -> Option<&dyn crate::fs::FsFile> {
+        self.tables
+            .iter()
+            .find(|(kept, _)| *kept == id)
+            .map(|(_, file)| &**file)
+    }
+
+    /// The handle the blob file `id` was written through, if kept.
+    pub(crate) fn blob(&self, id: crate::vlog::BlobFileId) -> Option<&dyn crate::fs::FsFile> {
+        self.blobs
+            .iter()
+            .find(|(kept, _)| *kept == id)
+            .map(|(_, file)| &**file)
+    }
+}
 
 /// A synced flush's self-description, handed to the writer of its tables.
 ///
@@ -962,7 +995,7 @@ pub trait AbstractTree: sealed::Sealed {
         let install_watermark = gc_watermark.min(counter + 1);
 
         let has_range_tombstones = !range_tombstones.is_empty();
-        if let Some((tables, blob_files, write_pin)) = self.flush_to_tables_with_rt(
+        if let Some((tables, blob_files, write_pin, kept)) = self.flush_to_tables_with_rt(
             stream,
             range_tombstones,
             flushed.keys,
@@ -977,14 +1010,18 @@ pub trait AbstractTree: sealed::Sealed {
                 "a flush of range tombstones wrote no table"
             );
 
-            if let Err(e) = self.register_tables(
+            let registered = self.register_tables(
                 &tables,
                 blob_files.as_deref(),
                 None,
                 &sealed_ids,
                 install_watermark,
                 gc_balance.load(core::sync::atomic::Ordering::Relaxed) > 0,
-            ) {
+                &kept,
+            );
+            // Synced or failed: the handles have served the sync.
+            drop(kept);
+            if let Err(e) = registered {
                 let outputs = crate::compaction::output_ledger::OutputLedger::of(
                     &tables,
                     blob_files.as_deref().unwrap_or(&[]),
@@ -1320,8 +1357,17 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
+    /// A synced flush syncs each file through the handle `kept` holds for
+    /// it, the one it was written through, and the others by their paths.
+    ///
+    /// # Errors
+    ///
     /// Will return `Err` if an IO error occurs. The files of an install that
     /// failed stay with the caller's handles, which may register them again.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the install's inputs, each its own"
+    )]
     fn register_tables(
         &self,
         tables: &[Table],
@@ -1330,6 +1376,7 @@ pub trait AbstractTree: sealed::Sealed {
         sealed_memtables_to_delete: &[crate::tree::inner::MemtableId],
         gc_watermark: SeqNo,
         collected_below_watermark: bool,
+        kept: &KeptFiles,
     ) -> crate::Result<()>;
 
     /// Clears the active memtable atomically.

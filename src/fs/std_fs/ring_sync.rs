@@ -58,48 +58,52 @@ const fn refuses_sync(errno: i32) -> bool {
 #[derive(Default)]
 struct Completions {
     /// The first sync that failed, with every target a sync failed on: its
-    /// error is the batch's, even beside a refusal, since a sync done again
-    /// through a new handle may not report the writeback error this one
-    /// consumed.
+    /// error is the batch's, since a sync done again through a new handle may
+    /// not report the writeback error this one consumed.
     failed: Option<SyncFailure>,
-    /// Whether a completion refused the sync opcode.
-    refused: bool,
+    /// The targets whose completion answered as a ring that does not run the
+    /// opcode would, with the first such error.
+    refused: Vec<(usize, i32)>,
+    /// How many completions were taken.
+    reaped: usize,
 }
 
 impl Completions {
     /// Takes the `result` of the completion of target `at`.
     fn note(&mut self, at: usize, result: i32) {
+        self.reaped += 1;
         if result >= 0 {
             return;
         }
         if refuses_sync(-result) {
-            self.refused = true;
+            self.refused.push((at, -result));
         } else {
-            self.failed
-                .get_or_insert_with(|| {
-                    SyncFailure::unspent(io::Error::from(std::io::Error::from_raw_os_error(
-                        -result,
-                    )))
-                })
-                .spent
-                .push(at);
+            self.fail(at, -result);
         }
     }
 
-    /// The batch's outcome: a failed sync, else a refusal, else synced. A
-    /// refusal beside a failure still turns the ring off for this thread.
-    fn outcome(self) -> Result<Through, SyncFailure> {
-        if let Some(failed) = self.failed {
-            if self.refused {
-                NO_RING_SYNC.set(true);
-            }
-            return Err(failed);
+    /// Records the sync of target `at` as failed with `errno`.
+    fn fail(&mut self, at: usize, errno: i32) {
+        self.failed
+            .get_or_insert_with(|| {
+                SyncFailure::unspent(io::Error::from(std::io::Error::from_raw_os_error(errno)))
+            })
+            .spent
+            .push(at);
+    }
+
+    /// The batch's outcome. A ring that does not run the opcode answers every
+    /// sync alike, so only a batch whose every sync answered so is refused;
+    /// beside a sync that ran, the same `errno` is that target's own (a
+    /// `/dev/null` has no sync) and fails the batch like any other.
+    fn outcome(mut self) -> Result<Through, SyncFailure> {
+        if self.failed.is_none() && !self.refused.is_empty() && self.refused.len() == self.reaped {
+            return Ok(Through::Refused);
         }
-        Ok(if self.refused {
-            Through::Refused
-        } else {
-            Through::Synced
-        })
+        for (at, errno) in core::mem::take(&mut self.refused) {
+            self.fail(at, errno);
+        }
+        self.failed.map_or(Ok(Through::Synced), Err)
     }
 }
 
@@ -166,16 +170,39 @@ fn sync_through(
     base: usize,
     targets: &[SyncTarget<'_>],
 ) -> Result<Through, SyncFailure> {
-    // Held open until every sync is reaped. A failed open syncs nothing.
-    let opened: Vec<File> = targets
+    // Held open until every sync is reaped. A failed open syncs nothing; one
+    // the descriptors ran out for is tried again in halves, the opened ones
+    // closed first, so a process near its limit still gets the batch synced.
+    let opened: Vec<Handle> = match targets.iter().map(open).collect::<io::Result<_>>() {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == io::ErrorKind::TooManyOpenFiles && targets.len() > 1 => {
+            let (first, second) = targets.split_at(targets.len() / 2);
+            return match sync_through(ring, base, first)? {
+                Through::Synced => sync_through(ring, base + first.len(), second),
+                Through::Refused => Ok(Through::Refused),
+            };
+        }
+        Err(e) => return Err(SyncFailure::unspent(e)),
+    };
+    // A handle kept open with no descriptor of the kernel behind it cannot be
+    // synced here: the batch goes the way that syncs through the handle.
+    let fds: Option<Vec<i32>> = opened
         .iter()
-        .map(open)
-        .collect::<io::Result<_>>()
-        .map_err(SyncFailure::unspent)?;
-    for (at, (file, target)) in opened.iter().zip(targets).enumerate() {
-        let sync = opcode::Fsync::new(types::Fd(file.as_raw_fd()));
+        .map(|handle| match handle {
+            Handle::Opened(file) => Some(file.as_raw_fd()),
+            Handle::Kept(fd) => Some(*fd),
+            Handle::Unreachable => None,
+        })
+        .collect();
+    let Some(fds) = fds else {
+        return Ok(Through::Refused);
+    };
+    for (at, (&fd, target)) in fds.iter().zip(targets).enumerate() {
+        let sync = opcode::Fsync::new(types::Fd(fd));
         let sync = match target {
-            SyncTarget::FileData { .. } => sync.flags(types::FsyncFlags::DATASYNC),
+            SyncTarget::FileData { .. } | SyncTarget::OpenFile { .. } => {
+                sync.flags(types::FsyncFlags::DATASYNC)
+            }
             // A folder's entries are its data and its size alike: `fsync`, as
             // `StdFs::sync_directory_with` issues.
             SyncTarget::Folder { .. } => sync,
@@ -196,6 +223,11 @@ fn sync_through(
             // Interrupted: the submitted entries stay in flight, and the next
             // wait collects them.
             if e.kind() != std::io::ErrorKind::Interrupted {
+                // A submission the kernel took none of (a sandbox refusing
+                // `io_uring_enter`) ran no sync: the batch goes another way.
+                if completions.reaped == 0 && ring.submission().len() == opened.len() {
+                    return Ok(Through::Refused);
+                }
                 // Whatever was submitted is not waited out here; the ring is
                 // dropped, and the kernel finishes its entries before freeing
                 // it. Each sync not reaped may have run and failed, so it is
@@ -233,16 +265,32 @@ fn sync_through(
 /// is no state a batch reaches; it is reported, not assumed away.
 fn push(ring: &mut IoUring, entry: &squeue::Entry) -> io::Result<()> {
     // SAFETY: the entry names a descriptor of `opened` in `sync_through`, open
-    // until every entry is reaped (or the ring that holds them is dropped), and
-    // carries no buffer.
+    // until every entry is reaped (or the ring that holds them is dropped), or
+    // one of a handle the caller holds across the batch; the kernel takes its
+    // own reference to the file at submission. The entry carries no buffer.
     let pushed = unsafe { ring.submission().push(entry) };
     pushed.map_err(|_| io::Error::other("io_uring submission queue full"))
 }
 
+/// What a target is synced through.
+enum Handle {
+    /// A file or folder opened for the sync.
+    Opened(File),
+    /// The descriptor of a handle the caller keeps open across the batch.
+    Kept(i32),
+    /// A handle the caller keeps open with no descriptor behind it.
+    Unreachable,
+}
+
 /// The file or folder `target` names, open for its sync.
-fn open(target: &SyncTarget<'_>) -> io::Result<File> {
+fn open(target: &SyncTarget<'_>) -> io::Result<Handle> {
     match *target {
-        SyncTarget::FileData { path, .. } => Ok(OpenOptions::new().write(true).open(path)?),
+        SyncTarget::FileData { path, .. } => {
+            Ok(Handle::Opened(OpenOptions::new().write(true).open(path)?))
+        }
+        SyncTarget::OpenFile { file, .. } => {
+            Ok(file.backing_fd().map_or(Handle::Unreachable, Handle::Kept))
+        }
         SyncTarget::Folder { path, .. } => {
             let folder = File::open(path)?;
             if !folder.metadata()?.is_dir() {
@@ -251,7 +299,7 @@ fn open(target: &SyncTarget<'_>) -> io::Result<File> {
                     "sync_directory: path is not a directory",
                 ));
             }
-            Ok(folder)
+            Ok(Handle::Opened(folder))
         }
     }
 }

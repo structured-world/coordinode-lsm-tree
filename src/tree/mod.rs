@@ -1192,13 +1192,7 @@ impl AbstractTree for Tree {
         // A standard tree separates no values, so it has nothing to place.
         _overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
         self_described: Option<&crate::abstract_tree::FlushSelf>,
-    ) -> crate::Result<
-        Option<(
-            Vec<Table>,
-            Option<Vec<BlobFile>>,
-            crate::runtime_config::WritePin,
-        )>,
-    > {
+    ) -> crate::Result<Option<crate::abstract_tree::FlushToTablesResult>> {
         use crate::table::multi_writer::MultiWriter;
         use crate::time::Instant;
 
@@ -1340,6 +1334,9 @@ impl AbstractTree for Tree {
             table_writer = table_writer
                 .use_sync_mode(self.config.sync_mode)
                 .use_durability(crate::config::FlushDurability::Deferred)
+                .use_keep_open(
+                    self.config.flush_durability == crate::config::FlushDurability::Synced,
+                )
                 .use_writeback_bytes(self.config.writeback_bytes);
 
             table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
@@ -1413,6 +1410,10 @@ impl AbstractTree for Tree {
 
             let written = table_writer.finish()?;
             let entries_durable = written.entries_durable;
+            let kept = crate::abstract_tree::KeptFiles {
+                tables: written.kept,
+                blobs: Vec::new(),
+            };
 
             log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
 
@@ -1457,7 +1458,7 @@ impl AbstractTree for Tree {
                     Ok(table)
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
-            Ok((tables, write_pin))
+            Ok((tables, write_pin, kept))
         })();
 
         match written {
@@ -1465,9 +1466,9 @@ impl AbstractTree for Tree {
             // caller (AbstractTree::flush) handles empty tables by
             // re-inserting RTs into the active memtable and still needs to
             // delete sealed memtables.
-            Ok((tables, write_pin)) => {
+            Ok((tables, write_pin, kept)) => {
                 outputs.hand_over();
-                Ok(Some((tables, None, write_pin)))
+                Ok(Some((tables, None, write_pin, kept)))
             }
             Err(e) => {
                 outputs.remove_uninstalled(self.id, self.config.descriptor_table.as_deref());
@@ -1484,6 +1485,7 @@ impl AbstractTree for Tree {
         sealed_memtables_to_delete: &[crate::tree::inner::MemtableId],
         gc_watermark: SeqNo,
         collected_below_watermark: bool,
+        kept: &crate::abstract_tree::KeptFiles,
     ) -> crate::Result<()> {
         log::trace!(
             "Registering {} tables, {} blob files",
@@ -1581,13 +1583,17 @@ impl AbstractTree for Tree {
                     }
                     _ => (&*self.config.fs, &self.config.path),
                 };
+                // Each file through the handle it was written through, when
+                // its writer kept it open for this sync.
                 crate::version::SuperVersions::sync_files(
-                    tables.iter().map(crate::version::FlushFile::Table).chain(
-                        blob_files
-                            .unwrap_or(&[])
-                            .iter()
-                            .map(crate::version::FlushFile::Blob),
-                    ),
+                    tables
+                        .iter()
+                        .map(|table| {
+                            crate::version::FlushFile::Table(table, kept.table(table.id()))
+                        })
+                        .chain(blob_files.unwrap_or(&[]).iter().map(|blob| {
+                            crate::version::FlushFile::Blob(blob, kept.blob(blob.id()))
+                        })),
                     &folders,
                     self.config.sync_mode,
                     schedule,
@@ -6775,7 +6781,8 @@ impl Tree {
                 // barrier syncs each other device is flushed first, or that
                 // snapshot could outlast the tables it names.
                 if config.sync_mode == SyncMode::Barrier {
-                    crate::version::flush_other_devices(&syncs, (&*config.fs, &config.path))?;
+                    crate::version::flush_other_devices(&syncs, (&*config.fs, &config.path))
+                        .map_err(|(error, _)| error)?;
                 }
             }
             log::info!("installing synced flush #{seq} from its tables' own description");

@@ -212,6 +212,15 @@ pub(crate) fn encode_frame_index(starts: &[u64], end: u64) -> Vec<u8> {
     encode_frame_index_marked(starts, end, &[])
 }
 
+/// A finished blob file: its metadata, its checksum, its frame index and,
+/// when kept, the file it was written through.
+pub(crate) type FinishedFile = (
+    Metadata,
+    Checksum,
+    FrameIndex,
+    Option<alloc::boxed::Box<dyn FsFile>>,
+);
+
 /// A blob file's frame index as a reader holds it: where each frame starts,
 /// then where the data ends (it reads as that slice), and which frames are
 /// chunks. Cloning it shares both.
@@ -331,6 +340,11 @@ pub(crate) struct Writer {
     /// Whether `finish` syncs the file; a deferred one is synced by the
     /// install that persists it.
     pub(crate) durability: crate::config::FlushDurability,
+
+    /// Whether an unsynced file is handed back open at finish, for the
+    /// install that syncs it right after (see
+    /// [`super::multi_writer::MultiWriter::use_keep_open`]).
+    pub(crate) keep_open: bool,
 
     /// Bytes gathered between writebacks the writer starts while writing; `0`
     /// starts none. Set via [`Self::use_writeback_bytes`].
@@ -627,6 +641,7 @@ impl Writer {
             clock: None,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
+            keep_open: false,
             writeback_bytes: crate::fs::Writeback::every(0),
             written_back: 0,
 
@@ -1653,7 +1668,19 @@ impl Writer {
     /// # Errors
     ///
     /// Any IO error.
-    pub(crate) fn finish(mut self) -> crate::Result<(Metadata, Checksum, FrameIndex)> {
+    #[cfg(any(test, feature = "std"))]
+    pub(crate) fn finish(self) -> crate::Result<(Metadata, Checksum, FrameIndex)> {
+        let (metadata, checksum, frames, _) = self.finish_keeping_file()?;
+        Ok((metadata, checksum, frames))
+    }
+
+    /// [`Self::finish`], handing the file back open when the writer leaves it
+    /// unsynced and was asked to (`keep_open`).
+    ///
+    /// # Errors
+    ///
+    /// Any IO error.
+    pub(crate) fn finish_keeping_file(mut self) -> crate::Result<FinishedFile> {
         self.close_block()?;
 
         // The file's own dictionary, which its reader decodes with: what the
@@ -1705,14 +1732,17 @@ impl Writer {
         let checksum = checksummed.checksum();
         // Data and size are all a read of the file needs, so `sync_data`. A
         // deferred file is synced by the install that persists it.
-        if self.durability == crate::config::FlushDurability::Synced {
+        let kept = if self.durability == crate::config::FlushDurability::Synced {
             let sync_mode = self.sync_mode;
             checksummed
                 .into_inner()
                 .with_inner(|file| FsFile::sync_data_with(&**file, sync_mode))??;
-        }
+            None
+        } else {
+            crate::io::kept_open(self.keep_open, checksummed.into_inner())?
+        };
 
-        Ok((metadata, checksum, frames))
+        Ok((metadata, checksum, frames, kept))
     }
 }
 

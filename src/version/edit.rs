@@ -67,7 +67,7 @@
 //! engine writes now. A payload that ends before any of them decodes as
 //! "absent", so older edit logs replay unchanged.
 //!
-//! None of the three has a presence marker of its own, so they are positional
+//! None of the four has a presence marker of its own, so they are positional
 //! and a later one is written only with every earlier one present: an edit
 //! carrying a retention floor writes the blob section first (a zero count when
 //! empty), and one carrying dictionary ids writes both (the floor re-stated at
@@ -251,34 +251,18 @@ impl VersionEdit {
             out.write_all(key)?;
         }
 
-        // Omit the appended blob-frontier section entirely when there is nothing
-        // to record, so the overwhelmingly common edit stays byte-identical to
-        // what earlier writers produced (and decodes on them too).
+        // The appended sections are positional, each with no presence marker
+        // of its own: whenever a later one is written every earlier one is
+        // too (a zero blob count, the floor re-stated, the dictionary set),
+        // so the decoder never mistakes one for another.
         //
-        // Deliberately NOT behind a bumped edit/manifest format version. A
-        // non-empty list is written only once a blob file's prefix has been
-        // physically hole-punched, and a binary without blob-restriction
-        // support cannot serve such a database anyway (it would read the
-        // punched region as zeros); its trailing-data rejection on this edit
-        // is the fail-fast that stops it from opening a store it cannot
-        // handle. Rolling back a binary stays possible for every database
-        // that never used tight-space blob reclaim — exactly the databases a
-        // rollback could still serve.
-        //
-        // The retention floor is the section AFTER this one and has no presence
-        // marker either, so whenever it is written the blob section is written
-        // too (a zero count when empty): the decoder reads "blob section, then
-        // floor" positionally and must not mistake a floor for a blob count.
-        //
-        // The DICTIONARY section, third in the chain, is under the same
-        // decision, and for the same reason: it appears only once a tree has
-        // registered a dictionary, and a binary without dictionary support
-        // cannot serve such a tree at all — every dictionary-compressed table
-        // in it names an id that binary has no way to resolve. So the trailing
-        // bytes it rejects are the fail-fast, exactly as above, and a rollback
-        // stays possible for every tree that never registered one. Deliberate,
-        // not an omission: the manifest layout version is unchanged for all
-        // three sections.
+        // The flush watermark, last in the chain, is written on every edit,
+        // so every edit carries all four. A binary that predates one of them
+        // rejects such an edit as trailing data: after the first edit this
+        // binary writes, an older one no longer opens the tree. That refusal
+        // is the fail-fast, not a format version: those binaries cannot tell
+        // which flushes a manifest decides, and an open by one would take in
+        // or drop flushes against what the tree returned.
         if !self.blob_restrictions.is_empty()
             || self.retention_floor.is_some()
             || self.dicts.is_some()

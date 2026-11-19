@@ -243,10 +243,10 @@ fn a_reopen_from_a_cloned_config_keeps_counting_once() -> lsm_tree::Result<()> {
         .since(&before)
         .expect("one counter set across the reopen");
     // The table may be a file the pool made before the reopen, so it is
-    // opened, not created: once to write it, and once by the install that
-    // syncs it beside the manifest edit.
+    // opened, not created: once, to write it, and the install syncs it
+    // through that same handle.
     let flushed = delta.origin(WriteOrigin::FlushTable);
-    assert_eq!(flushed.opened, 2);
+    assert_eq!(flushed.opened, 1);
     assert!(
         flushed.bytes > 0,
         "the reopened tree writes through the set"

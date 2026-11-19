@@ -508,6 +508,10 @@ impl LinkedFile {
 /// The buffering writer a table's file is written through.
 type TableFile = crate::io::FileWriter<Box<dyn FsFile>>;
 
+/// A finished table: its id, its checksum and, when kept, the file it was
+/// written through (see [`Writer::use_keep_open`]).
+pub(crate) type Finished = (TableId, Checksum, Option<Box<dyn FsFile>>);
+
 /// Serializes and compresses values into blocks and writes them to disk as a table.
 ///
 /// `BlockIndexWriter` / `FilterWriter` are generic over a writer `W: Write + Seek`.
@@ -779,6 +783,11 @@ pub struct Writer {
     /// Whether `finish` syncs the file; a deferred one is synced by the
     /// install that persists it. Set via [`Self::use_durability`].
     durability: crate::config::FlushDurability,
+
+    /// Whether an unsynced file is handed back open at finish, for the
+    /// install that syncs it at once to sync it through this handle. Set via
+    /// [`Self::use_keep_open`].
+    keep_open: bool,
 
     /// Bytes gathered between writebacks the writer starts while writing; `0`
     /// starts none. Set via [`Self::use_writeback_bytes`].
@@ -1408,6 +1417,7 @@ impl Writer {
             ecc: None,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
+            keep_open: false,
             writeback_bytes: crate::fs::Writeback::every(0),
             written_back: 0,
 
@@ -2560,6 +2570,17 @@ impl Writer {
     #[must_use]
     pub(crate) fn use_durability(mut self, durability: crate::config::FlushDurability) -> Self {
         self.durability = durability;
+        self
+    }
+
+    /// Hands an unsynced file back open at finish
+    /// ([`Self::finish_keeping_file`]), for an install that syncs it right
+    /// after: a handle open since the write reports every writeback error of
+    /// the file, which one opened later reports only while the kernel keeps
+    /// the file's inode in memory.
+    #[must_use]
+    pub(crate) fn use_keep_open(mut self, keep_open: bool) -> Self {
+        self.keep_open = keep_open;
         self
     }
 
@@ -4973,12 +4994,24 @@ impl Writer {
     /// age-based policy (FIFO's TTL and drop order) sees the same data as old
     /// after a compaction as before it. Without `ages` (a flush, an ingest, a
     /// salvage copy) the clock is read.
-    // TODO: split meta writing into new function
-    #[expect(clippy::too_many_lines)]
     pub(crate) fn finish_deferring_dir_sync(
-        mut self,
+        self,
         ages: Option<&mut AgeSweep>,
     ) -> crate::Result<Option<(TableId, Checksum)>> {
+        Ok(self
+            .finish_keeping_file(ages)?
+            .map(|(table_id, checksum, _)| (table_id, checksum)))
+    }
+
+    /// [`Self::finish_deferring_dir_sync`], handing the file back open when
+    /// the writer leaves it unsynced and was asked to
+    /// ([`Self::use_keep_open`]).
+    // TODO: split meta writing into new function
+    #[expect(clippy::too_many_lines)]
+    pub(crate) fn finish_keeping_file(
+        mut self,
+        ages: Option<&mut AgeSweep>,
+    ) -> crate::Result<Option<Finished>> {
         #[cfg(not(feature = "std"))]
         use crate::io::Write;
         #[cfg(feature = "std")]
@@ -5679,12 +5712,15 @@ impl Writer {
         // deferred table is synced by the install that persists it.
         let checksummed = self.file_writer.into_inner()?;
         let checksum = checksummed.checksum();
-        if self.durability == crate::config::FlushDurability::Synced {
+        let kept = if self.durability == crate::config::FlushDurability::Synced {
             let sync_mode = self.sync_mode;
             checksummed
                 .into_inner()
                 .with_inner(|file| FsFile::sync_data_with(&**file, sync_mode))??;
-        }
+            None
+        } else {
+            crate::io::kept_open(self.keep_open, checksummed.into_inner())?
+        };
 
         // The folder is not synced here; see `finish`.
 
@@ -5696,7 +5732,7 @@ impl Writer {
             *self.meta.file_pos / 1_024 / 1_024,
         );
 
-        Ok(Some((self.table_id, checksum)))
+        Ok(Some((self.table_id, checksum, kept)))
     }
 }
 

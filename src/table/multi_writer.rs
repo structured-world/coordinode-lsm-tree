@@ -172,6 +172,14 @@ pub(crate) struct MultiWriter {
     /// Whether every successor [`Writer`] syncs its file at finish.
     durability: crate::config::FlushDurability,
 
+    /// Whether every successor [`Writer`] hands its unsynced file back open,
+    /// for the install that syncs it right after (see
+    /// [`Writer::use_keep_open`]).
+    keep_open: bool,
+
+    /// The files the finished tables were written through, kept open, by id.
+    kept: Vec<(TableId, alloc::boxed::Box<dyn crate::fs::FsFile>)>,
+
     /// `Config::writeback_bytes`, preserved for every successor [`Writer`].
     writeback_bytes: u64,
 
@@ -569,6 +577,8 @@ impl MultiWriter {
             ecc: None,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
+            keep_open: false,
+            kept: Vec::new(),
             writeback_bytes: 0,
 
             kv_checksum: None,
@@ -1356,6 +1366,39 @@ impl MultiWriter {
         self
     }
 
+    /// Hands every unsynced table back open with [`Written::kept`], for an
+    /// install that syncs them right after (see [`Writer::use_keep_open`]).
+    #[must_use]
+    pub(crate) fn use_keep_open(mut self, keep_open: bool) -> Self {
+        self.keep_open = keep_open;
+        self.writer = self.writer.use_keep_open(keep_open);
+        self
+    }
+
+    /// Finishes `writer`, recording its table in `results` and the file it
+    /// kept open in `kept`; the ledger of `outputs` learns it landed.
+    fn finish_output(
+        writer: Writer,
+        ages: Option<&mut super::writer::AgeSweep>,
+        results: &mut Vec<(TableId, Checksum)>,
+        kept: &mut Vec<(TableId, alloc::boxed::Box<dyn crate::fs::FsFile>)>,
+        outputs: Option<&crate::compaction::output_ledger::OutputLedger>,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        let path = writer.path.clone();
+        if let Some((table_id, checksum, file)) = writer.finish_keeping_file(ages)? {
+            results.push((table_id, checksum));
+            if let Some(file) = file {
+                kept.push((table_id, file));
+            }
+            // Before the next output takes more room.
+            if let Some(outputs) = outputs {
+                outputs.landed(fs, &path)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Wires the tree's `Config::writeback_bytes` through to the inner
     /// [`Writer`] and every successor.
     #[must_use]
@@ -1782,18 +1825,18 @@ impl MultiWriter {
         if closes_run && self.owns_whole_run {
             writer.mark_lineage_last();
         }
-        let path = writer.path.clone();
         // Its age is its own, not the inputs': these outputs fall outside the
         // key order the age sweep takes the others in, and a table of
         // tombstones aged as of now is dropped by age no sooner than the rows
         // it deletes.
-        if let Some((table_id, checksum)) = writer.finish_deferring_dir_sync(None)? {
-            self.results.push((table_id, checksum));
-            if let Some(outputs) = &self.outputs {
-                outputs.landed(&*self.fs, &path)?;
-            }
-        }
-        Ok(())
+        Self::finish_output(
+            writer,
+            None,
+            &mut self.results,
+            &mut self.kept,
+            self.outputs.as_ref(),
+            &*self.fs,
+        )
     }
 
     /// A writer for the output after the current one, configured as this
@@ -1840,6 +1883,7 @@ impl MultiWriter {
         new_writer = new_writer
             .use_sync_mode(self.sync_mode)
             .use_durability(self.durability)
+            .use_keep_open(self.keep_open)
             .use_writeback_bytes(self.writeback_bytes);
         if let Some((policy, algo)) = self.kv_checksum {
             new_writer = new_writer.use_kv_checksums(policy, algo);
@@ -1936,18 +1980,14 @@ impl MultiWriter {
         old_writer.own_blob_objects(core::mem::take(&mut self.owned_objects));
 
         // The install that names the tables syncs their folder once.
-        let path = old_writer.path.clone();
-        if let Some((table_id, checksum)) =
-            old_writer.finish_deferring_dir_sync(self.inherited_age.as_mut())?
-        {
-            self.results.push((table_id, checksum));
-            // Before the next output takes more room.
-            if let Some(outputs) = &self.outputs {
-                outputs.landed(&*self.fs, &path)?;
-            }
-        }
-
-        Ok(())
+        Self::finish_output(
+            old_writer,
+            self.inherited_age.as_mut(),
+            &mut self.results,
+            &mut self.kept,
+            self.outputs.as_ref(),
+            &*self.fs,
+        )
     }
 
     /// The current table reached its target: by its bytes, counting what
@@ -2897,20 +2937,19 @@ impl MultiWriter {
             self.writer
                 .mark_flush_end(self.flush_index, self.flush_floor);
         }
-        let path = self.writer.path.clone();
-        if let Some((table_id, checksum)) = self
-            .writer
-            .finish_deferring_dir_sync(self.inherited_age.as_mut())?
-        {
-            self.results.push((table_id, checksum));
-            if let Some(outputs) = &self.outputs {
-                outputs.landed(&*self.fs, &path)?;
-            }
-        }
+        Self::finish_output(
+            self.writer,
+            self.inherited_age.as_mut(),
+            &mut self.results,
+            &mut self.kept,
+            self.outputs.as_ref(),
+            &*self.fs,
+        )?;
 
         Ok(Written {
             tables: self.results,
             entries_durable: self.entries_durable,
+            kept: self.kept,
         })
     }
 }
@@ -2922,6 +2961,9 @@ pub(crate) struct Written {
     /// written, so the install naming them syncs no folder for them (see
     /// [`super::Table::mark_entry_durable`]).
     pub entries_durable: bool,
+    /// The files of the tables written through a handle kept open for their
+    /// sync (see [`MultiWriter::use_keep_open`]), by id.
+    pub kept: Vec<(TableId, alloc::boxed::Box<dyn crate::fs::FsFile>)>,
 }
 
 /// A writer of the settings a rewrite's outputs are written with, which

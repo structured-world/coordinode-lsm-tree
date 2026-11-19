@@ -243,7 +243,7 @@ fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()>
             ValueType::Value,
         ))
     });
-    let Some((tables, blob_files, pin)) = f.tree.flush_to_tables(stream)? else {
+    let Some((tables, blob_files, pin, kept)) = f.tree.flush_to_tables(stream)? else {
         panic!("the stream holds keys");
     };
     f.injector.arm(
@@ -253,7 +253,7 @@ fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()>
     );
     assert!(matches!(
         f.tree
-            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false),
+            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false, &kept),
         Err(lsm_tree::Error::InstallOutcomeUnknown(_))
     ));
     f.injector.clear();
@@ -261,7 +261,7 @@ fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()>
     // The retry rotates, superseding the failed edit, and names the same
     // files.
     f.tree
-        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false)?;
+        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false, &kept)?;
     drop(pin);
     drop(tables);
     let installed = files(&f.dir.path().join("tables"))?;
@@ -306,7 +306,7 @@ fn a_failed_retry_of_a_registration_keeps_the_tables_it_may_name() -> lsm_tree::
             ValueType::Value,
         ))
     });
-    let Some((tables, blob_files, pin)) = f.tree.flush_to_tables(stream)? else {
+    let Some((tables, blob_files, pin, kept)) = f.tree.flush_to_tables(stream)? else {
         panic!("the stream holds keys");
     };
     f.injector.arm(
@@ -316,7 +316,7 @@ fn a_failed_retry_of_a_registration_keeps_the_tables_it_may_name() -> lsm_tree::
     );
     assert!(matches!(
         f.tree
-            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false),
+            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false, &kept),
         Err(lsm_tree::Error::InstallOutcomeUnknown(_))
     ));
     f.injector.clear();
@@ -327,7 +327,7 @@ fn a_failed_retry_of_a_registration_keeps_the_tables_it_may_name() -> lsm_tree::
         .arm(FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path(".tmp"));
     let retry = f
         .tree
-        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false);
+        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false, &kept);
     f.injector.clear();
     assert!(
         matches!(&retry, Err(e) if !matches!(e, lsm_tree::Error::InstallOutcomeUnknown(_))),

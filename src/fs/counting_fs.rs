@@ -712,28 +712,60 @@ impl Fs for CountingFs {
     }
 
     fn sync_many(&self, targets: &[super::SyncTarget<'_>]) -> Result<(), super::SyncFailure> {
-        // The wrapped backend's batch, as the tree chose it; each target is
-        // counted as its own sync would be. A target counts a failure when
-        // its sync failed, or every one does when the batch failed before
-        // any sync did (an open), as it does not say which.
-        let result = self.inner.sync_many(targets);
-        for (at, target) in targets.iter().enumerate() {
+        // A file kept open since it was written is synced through that
+        // handle, this wrapper's own, which counts its sync: the wrapped
+        // backend could not reach the counting handle through it.
+        let (open, rest): (Vec<_>, Vec<_>) = targets
+            .iter()
+            .enumerate()
+            .partition(|(_, target)| matches!(target, super::SyncTarget::OpenFile { .. }));
+        for &(at, target) in &open {
+            target
+                .sync_alone(self)
+                .map_err(|error| super::SyncFailure {
+                    error,
+                    spent: alloc::vec![at],
+                })?;
+        }
+        // The wrapped backend's batch of the rest, as the tree chose it; each
+        // target is counted as its own sync would be. A batch that failed
+        // names only the syncs that failed, so those count a failure and the
+        // others, run or not, are not counted; one that failed before any
+        // sync (an open) counts one failure, on its first target.
+        let (at, rest): (Vec<usize>, Vec<super::SyncTarget<'_>>) =
+            rest.into_iter().map(|(at, target)| (at, *target)).unzip();
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let result = self.inner.sync_many(&rest);
+        for (index, target) in rest.iter().enumerate() {
             let counted: io::Result<()> = match &result {
-                Err(failure) if failure.spent.is_empty() || failure.spent.contains(&at) => Err(
-                    io::Error::new(failure.error.kind(), "a sync of the batch failed"),
-                ),
-                _ => Ok(()),
+                Ok(()) => Ok(()),
+                Err(failure)
+                    if failure.spent.contains(&index) || failure.spent.is_empty() && index == 0 =>
+                {
+                    Err(io::Error::new(
+                        failure.error.kind(),
+                        "a sync of the batch failed",
+                    ))
+                }
+                Err(_) => continue,
             };
-            match *target {
-                super::SyncTarget::FileData { origin, .. } => {
+            match target.origin() {
+                Some(origin) => {
                     if let Some(counters) = self.stats.slot(Some(origin)) {
                         counters.synced(&counted);
                     }
                 }
-                super::SyncTarget::Folder { .. } => self.directory_synced(&counted),
+                None => self.directory_synced(&counted),
             }
         }
-        result
+        result.map_err(|mut failure| {
+            for spent in &mut failure.spent {
+                *spent = at.get(*spent).copied().unwrap_or(usize::MAX);
+            }
+            failure
+        })
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {

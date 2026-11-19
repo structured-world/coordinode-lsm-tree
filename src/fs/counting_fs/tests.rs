@@ -207,10 +207,11 @@ fn a_batch_of_syncs_reaches_the_backend_as_one_and_is_counted() -> crate::io::Re
     Ok(())
 }
 
-/// A failed batch counts a failure for the sync that failed alone, and for
-/// every target when it failed before any sync ran (an open), as it then
-/// does not say which. Guards against a batch failure counted on files whose
-/// syncs succeeded, or on none.
+/// A failed batch counts a failure for the sync that failed alone, and one
+/// failure when it failed before any sync ran (an open); a target whose
+/// outcome the batch does not tell is not counted, neither as synced nor as
+/// failed. Guards against a batch failure counted on files whose syncs
+/// succeeded, or a target never synced counted as synced.
 #[test]
 fn a_failed_batch_counts_the_failure_where_it_was() -> crate::io::Result<()> {
     let faulty = FaultFs::new(MemFs::new());
@@ -242,7 +243,7 @@ fn a_failed_batch_counts_the_failure_where_it_was() -> crate::io::Result<()> {
     );
     assert!(fs.sync_many(&batch).is_err());
     let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
-    assert_eq!((flush.syncs, flush.sync_errors), (2, 1), "the failed sync");
+    assert_eq!((flush.syncs, flush.sync_errors), (1, 1), "the failed sync");
 
     injector.arm(
         FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::Other))
@@ -253,8 +254,8 @@ fn a_failed_batch_counts_the_failure_where_it_was() -> crate::io::Result<()> {
     let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
     assert_eq!(
         (flush.syncs, flush.sync_errors),
-        (4, 3),
-        "a batch failed before any sync counts every target"
+        (2, 2),
+        "a batch failed before any sync counts one failure"
     );
     Ok(())
 }

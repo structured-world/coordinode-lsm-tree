@@ -231,13 +231,27 @@ mod registry {
         trees: Vec<Weak<RuntimeConfigHandle>>,
     }
 
-    /// The location `backend` names `volume`, if a tree was opened on it.
-    fn find(locations: &Locations, backend: Option<u64>, volume: u64) -> Option<Arc<Location>> {
-        locations
-            .lock()
+    /// The location `backend` names `volume`, made when none was before: an
+    /// attach and a refresh of one location meet at one entry and its lock.
+    fn location(locations: &Locations, backend: Option<u64>, volume: u64) -> Arc<Location> {
+        let mut held = locations.lock();
+        if let Some(known) = held
             .iter()
             .find(|at| at.backend == backend && at.volume == volume)
-            .cloned()
+        {
+            return Arc::clone(known);
+        }
+        let location = Arc::new(Location {
+            backend,
+            volume,
+            state: parking_lot::Mutex::new(State {
+                idles: None,
+                trees: Vec::new(),
+            }),
+        });
+        held.push(Arc::clone(&location));
+        drop(held);
+        location
     }
 
     /// Sets in `handle` the strategy for the location of `path`, asking it
@@ -256,28 +270,7 @@ mod registry {
             handle.set_io_strategy(IoStrategy::for_scheduler(fs.idles_between_io_queues(path)));
             return;
         };
-        let backend = fs.backend_id();
-        let mut held = locations.lock();
-        let known = held
-            .iter()
-            .find(|at| at.backend == backend && at.volume == volume)
-            .cloned();
-        let location = if let Some(known) = known {
-            drop(held);
-            known
-        } else {
-            let location = Arc::new(Location {
-                backend,
-                volume,
-                state: parking_lot::Mutex::new(State {
-                    idles: None,
-                    trees: Vec::new(),
-                }),
-            });
-            held.push(Arc::clone(&location));
-            drop(held);
-            location
-        };
+        let location = location(locations, fs.backend_id(), volume);
         let mut state = location.state.lock();
         state.trees.retain(|tree| tree.strong_count() > 0);
         state.trees.push(Arc::downgrade(handle));
@@ -292,15 +285,14 @@ mod registry {
 
     /// Asks the location of `path` what it does now and sets the strategy for
     /// it in every tree still open on it, both under the location's lock: of
-    /// two refreshes, the one that asked last is the one the trees run.
-    /// Returns what the location does.
+    /// two refreshes, the one that asked last is the one the trees run, and a
+    /// tree attaching meanwhile takes the answer of whichever asks after the
+    /// other. Returns what the location does.
     pub(super) fn refresh(locations: &Locations, fs: &dyn Fs, path: &Path) -> bool {
-        let location = fs
-            .volume_id(path)
-            .and_then(|volume| find(locations, fs.backend_id(), volume));
-        let Some(location) = location else {
+        let Some(volume) = fs.volume_id(path) else {
             return fs.idles_between_io_queues(path);
         };
+        let location = location(locations, fs.backend_id(), volume);
         let mut state = location.state.lock();
         let idles = fs.idles_between_io_queues(path);
         state.idles = Some(idles);

@@ -274,6 +274,50 @@ fn a_refresh_that_asked_first_does_not_overwrite_a_later_one() {
     assert_eq!(tree.load().io, IoStrategy::NONE, "the later answer stands");
 }
 
+/// A refresh of a location no tree opened on yet and a tree opening there
+/// meanwhile meet at one entry: the tree runs what the location records,
+/// which is what the refresh returns. Guards against the refresh returning
+/// one answer while the tree it raced keeps the strategy of an older ask.
+#[test]
+fn a_refresh_racing_the_first_attach_reaches_its_tree() {
+    let gate = std::sync::Arc::new(Gate::default());
+    let mut fs = Scheduled::on_volume(0xa8, true);
+    // The refresh asks first, and is held with its answer.
+    fs.hold = Some((1, std::sync::Arc::clone(&gate)));
+    let fs = std::sync::Arc::new(fs);
+    let policy = Arc::new(IoPolicy::new());
+    let refresh = {
+        let (fs, policy) = (std::sync::Arc::clone(&fs), Arc::clone(&policy));
+        std::thread::spawn(move || policy.refresh(&*fs, Path::new("/a")))
+    };
+    while !gate.entered.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    // A tree opens while the refresh holds its answer; an ask of its own
+    // would read another one.
+    fs.idles.store(false, Ordering::SeqCst);
+    let tree = handle();
+    let attach = {
+        let (fs, policy, tree) = (
+            std::sync::Arc::clone(&fs),
+            Arc::clone(&policy),
+            Arc::clone(&tree),
+        );
+        std::thread::spawn(move || policy.attach(&*fs, Path::new("/a"), &tree))
+    };
+    // Room for the open to run to its end where it does not wait.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    gate.open.store(true, Ordering::SeqCst);
+    let returned = refresh.join().is_ok_and(|idles| idles);
+    assert!(attach.join().is_ok());
+    assert!(returned, "the refresh found the scheduler idling");
+    assert_eq!(
+        tree.load().io,
+        IoStrategy::for_scheduler(returned),
+        "the tree runs what the refresh returned"
+    );
+}
+
 /// A location whose scheduler is slow to answer holds up only the trees on
 /// it: a tree opening on another location takes its strategy meanwhile.
 /// Guards against one device's query stalling every open in the process.

@@ -51,7 +51,9 @@ fn block_device(folder: &Path) -> Option<u64> {
         return Some(device);
     }
     let mount = mount_id(existing)?;
-    let mountinfo = read_text(Path::new("/proc/self/mountinfo"))?;
+    // As bytes: a mount point anywhere in the table may hold a byte that is
+    // not UTF-8, which proc(5) writes as it is.
+    let mountinfo = read_bytes(Path::new("/proc/self/mountinfo"))?;
     let source = mount_source(&mountinfo, mount)?;
     Some(fs::metadata(source).ok()?.rdev())
 }
@@ -85,10 +87,15 @@ fn mount_id(path: &Path) -> Option<u64> {
 /// they report no size, and a read that starts from none probes them a few
 /// bytes at a time, a call each.
 fn read_text(path: &Path) -> Option<String> {
+    String::from_utf8(read_bytes(path)?).ok()
+}
+
+/// The bytes of a file of `/proc` or sysfs, read as [`read_text`] reads.
+fn read_bytes(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
-    let mut text = String::with_capacity(16 * 1024);
-    fs::File::open(path).ok()?.read_to_string(&mut text).ok()?;
-    Some(text)
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    fs::File::open(path).ok()?.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// The `mnt_id` line of a descriptor's `fdinfo` text.
@@ -101,37 +108,44 @@ fn fdinfo_mount_id(info: &str) -> Option<u64> {
 /// The source of mount `id`, from the text of `/proc/self/mountinfo`, when it
 /// is a device node (proc(5): the mount id is field 1, the source the second
 /// field after the ` - ` separator).
-fn mount_source(mountinfo: &str, id: u64) -> Option<PathBuf> {
-    let source = mountinfo.lines().find_map(|line| {
-        let (head, tail) = line.split_once(" - ")?;
-        if head.split(' ').next()?.parse::<u64>().ok()? != id {
+fn mount_source(mountinfo: &[u8], id: u64) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let source = mountinfo.split(|&b| b == b'\n').find_map(|line| {
+        let at = line.windows(3).position(|sep| sep == b" - ")?;
+        let (head, tail) = (line.get(..at)?, line.get(at + 3..)?);
+        let first = head.split(|&b| b == b' ').next()?;
+        if core::str::from_utf8(first).ok()?.parse::<u64>().ok()? != id {
             return None;
         }
-        tail.split(' ').nth(1)
+        tail.split(|&b| b == b' ').nth(1)
     })?;
     let source = unescape(source);
-    source.starts_with("/dev/").then(|| PathBuf::from(source))
+    source
+        .starts_with(b"/dev/")
+        .then(|| PathBuf::from(std::ffi::OsString::from_vec(source)))
 }
 
 /// Undoes the octal escapes proc(5) writes for a space, tab, newline and
 /// backslash in a path.
-fn unescape(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
+fn unescape(field: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(field.len());
     let mut rest = field;
-    while let Some((before, after)) = rest.split_once('\\') {
-        out.push_str(before);
+    while let Some(at) = rest.iter().position(|&b| b == b'\\') {
+        out.extend_from_slice(rest.get(..at).unwrap_or_default());
+        let after = rest.get(at + 1..).unwrap_or_default();
         let escaped = after
             .get(..3)
+            .and_then(|digits| core::str::from_utf8(digits).ok())
             .and_then(|digits| u8::from_str_radix(digits, 8).ok());
         if let (Some(byte), Some(tail)) = (escaped, after.get(3..)) {
-            out.push(char::from(byte));
+            out.push(byte);
             rest = tail;
         } else {
-            out.push('\\');
+            out.push(b'\\');
             rest = after;
         }
     }
-    out.push_str(rest);
+    out.extend_from_slice(rest);
     out
 }
 

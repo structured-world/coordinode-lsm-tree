@@ -8,6 +8,97 @@ use super::{
 use std::io::Write as _;
 use std::path::Path;
 
+/// A backend over [`MemFs`] that records each path opened for writing.
+struct WriteOpens {
+    inner: MemFs,
+    opened: parking_lot::Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl Fs for WriteOpens {
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn super::FsFile>> {
+        if opts.write {
+            self.opened.lock().push(path.to_path_buf());
+        }
+        self.inner.open(path, opts)
+    }
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<super::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn metadata(&self, path: &Path) -> crate::io::Result<super::FsMetadata> {
+        self.inner.metadata(path)
+    }
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        self.inner.exists(path)
+    }
+}
+
+/// A synced flush syncs each file it wrote through the handle it was written
+/// through, which reports every writeback error of the file, and opens no
+/// new one for the sync: a table and a blob file are each opened for writing
+/// once. Guards against the sync going through a handle opened after the
+/// write, which reports a writeback error only while the kernel keeps the
+/// file's inode in memory.
+#[test]
+fn a_synced_flush_syncs_through_the_handles_it_wrote_with() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    for separated in [false, true] {
+        let backend = Arc::new(WriteOpens {
+            inner: MemFs::new(),
+            opened: parking_lot::Mutex::new(Vec::new()),
+        });
+        let fs: Arc<dyn Fs> = backend.clone();
+        let config = Config::new(
+            std::path::absolute("/db")?,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .table_file_pool(0);
+        let config = if separated {
+            config.with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+        } else {
+            config
+        };
+        let tree = config.open()?;
+        backend.opened.lock().clear();
+        tree.insert("a", "a value that goes to a blob file", 0);
+        tree.flush_active_memtable(0)?;
+
+        let opened = core::mem::take(&mut *backend.opened.lock());
+        for folder in ["tables", "blobs"] {
+            if folder == "blobs" && !separated {
+                continue;
+            }
+            let files = opened
+                .iter()
+                .filter(|path| path.parent().is_some_and(|parent| parent.ends_with(folder)))
+                .count();
+            assert_eq!(
+                files, 1,
+                "one write open of the flush's file in {folder}: {opened:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A backend that keeps the default batch syncs every target of it, files
 /// side by side and then the folders, and reports the first failure.
 #[test]
@@ -193,13 +284,16 @@ fn the_backends_batch_is_taken_only_when_scheduled() -> crate::Result<()> {
 }
 
 /// A backend over `F` on two devices, `fast` and everything else, that
-/// records the devices it is asked to flush.
+/// records the devices it is asked to flush, and in one log with them the
+/// renames that publish files.
 struct TwoDevices<F> {
     inner: F,
     /// The root of the second device, as the paths it is asked about name it
     /// (drive-qualified on Windows once a config made it absolute).
     fast: std::path::PathBuf,
     flushed: parking_lot::Mutex<Vec<std::path::PathBuf>>,
+    /// Each device flush (`true`) and rename (`false`), by its path, in order.
+    events: parking_lot::Mutex<Vec<(bool, std::path::PathBuf)>>,
 }
 
 impl<F: Fs> Fs for TwoDevices<F> {
@@ -208,6 +302,7 @@ impl<F: Fs> Fs for TwoDevices<F> {
     }
     fn sync_device(&self, path: &Path) -> crate::io::Result<()> {
         self.flushed.lock().push(path.to_path_buf());
+        self.events.lock().push((true, path.to_path_buf()));
         Ok(())
     }
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn super::FsFile>> {
@@ -226,7 +321,9 @@ impl<F: Fs> Fs for TwoDevices<F> {
         self.inner.remove_dir_all(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
-        self.inner.rename(from, to)
+        self.inner.rename(from, to)?;
+        self.events.lock().push((false, to.to_path_buf()));
+        Ok(())
     }
     fn metadata(&self, path: &Path) -> crate::io::Result<super::FsMetadata> {
         self.inner.metadata(path)
@@ -251,6 +348,7 @@ fn barrier_syncs_on_another_device_are_flushed_once() -> crate::Result<()> {
         inner: MemFs::new(),
         fast: std::path::PathBuf::from("/fast"),
         flushed: parking_lot::Mutex::new(Vec::new()),
+        events: parking_lot::Mutex::new(Vec::new()),
     });
     for folder in ["/db", "/db/blobs", "/fast/tables", "/fast/more"] {
         backend.create_dir_all(Path::new(folder))?;
@@ -312,6 +410,7 @@ fn an_open_flushes_the_device_of_the_flushes_it_takes_in() -> crate::Result<()> 
         inner: fault,
         fast: fast.clone(),
         flushed: parking_lot::Mutex::new(Vec::new()),
+        events: parking_lot::Mutex::new(Vec::new()),
     });
     let fs: Arc<dyn Fs> = backend.clone();
     let open = || {
@@ -343,18 +442,23 @@ fn an_open_flushes_the_device_of_the_flushes_it_takes_in() -> crate::Result<()> 
     }
     drop(tree);
     injector.clear();
-    backend.flushed.lock().clear();
+    backend.events.lock().clear();
 
     let tree = open()?;
     assert_eq!(tree.get("a", u64::MAX)?.as_deref(), Some(&b"1"[..]));
+    let events = core::mem::take(&mut *backend.events.lock());
+    let flushed = events
+        .iter()
+        .position(|(flush, path)| *flush && path.starts_with(&fast));
+    let published = events
+        .iter()
+        .position(|(flush, path)| !*flush && !path.starts_with(&fast));
+    let (Some(flushed), Some(published)) = (flushed, published) else {
+        panic!("the tables' device is flushed and a manifest published: {events:?}");
+    };
     assert!(
-        backend
-            .flushed
-            .lock()
-            .iter()
-            .any(|path| path.starts_with(&fast)),
-        "the tables' device is flushed: {:?}",
-        backend.flushed.lock()
+        flushed < published,
+        "the tables' device is flushed before the manifest naming them: {events:?}"
     );
     Ok(())
 }
@@ -404,41 +508,74 @@ fn a_sync_failure_converts_to_its_error() {
 }
 
 /// A writeback request a worker makes, refused, turns the requests off too:
-/// one queued behind it is not made, and the next request is not queued.
-/// Guards against a hint failing a write of a file written on workers.
+/// one queued behind it before the worker ran is not made, and the request
+/// after that is not queued. Guards against a hint failing a write of a file
+/// written on workers, or hints going on after one was refused.
 #[test]
 fn a_writeback_request_refused_on_a_worker_turns_the_requests_off() -> crate::Result<()> {
-    /// Runs each task on a thread of its own and returns once it ran.
-    struct Prompt;
-    impl crate::table::writer::CompactionSpawner for Prompt {
+    use crate::fs::{CountingFs, WriteOrigin};
+
+    /// Holds each task until the test runs it.
+    #[derive(Default)]
+    struct Held(parking_lot::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>);
+    impl crate::table::writer::CompactionSpawner for Held {
         fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
-            assert!(
-                std::thread::spawn(task).join().is_ok(),
-                "the lane's task panicked"
-            );
+            self.0.lock().push(task);
+        }
+    }
+    impl Held {
+        fn run(&self) {
+            loop {
+                let tasks = core::mem::take(&mut *self.0.lock());
+                if tasks.is_empty() {
+                    return;
+                }
+                for task in tasks {
+                    task();
+                }
+            }
         }
     }
 
-    let fs = FaultFs::new(MemFs::new());
-    let injector = fs.injector();
+    let faulty = FaultFs::new(MemFs::new());
+    let injector = faulty.injector();
+    let fs = CountingFs::new(std::sync::Arc::new(faulty));
     fs.create_dir_all(Path::new("/db"))?;
     let file = fs.open(
         Path::new("/db/1"),
-        &FsOpenOptions::new().write(true).create_new(true),
+        &FsOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .write_origin(WriteOrigin::FlushTable),
     )?;
+    let workers = std::sync::Arc::new(Held::default());
     let mut writer = crate::io::FileWriter::for_file(4, file, true);
-    writer.use_spawner_now(std::sync::Arc::new(Prompt));
+    writer.use_spawner_now(workers.clone());
     let mut writeback = Writeback::every(4);
 
-    injector.arm(FaultRule::new(
-        FaultOp::StartWriteback,
-        Fault::Error(crate::io::ErrorKind::Unsupported),
-    ));
+    // The first request is refused; a second one made would go through.
+    injector.arm(
+        FaultRule::new(
+            FaultOp::StartWriteback,
+            Fault::Error(crate::io::ErrorKind::Unsupported),
+        )
+        .once(),
+    );
     writer.write_all(b"abcd")?;
     writeback.hint(&mut writer, 0, 4)?;
     writer.write_all(b"efgh")?;
     writeback.hint(&mut writer, 4, 4)?;
+    // Both are queued; the worker runs them now.
+    workers.run();
+    writer.write_all(b"ijkl")?;
+    writeback.hint(&mut writer, 8, 4)?;
     assert_eq!(writeback.bytes, 0, "the requests are off");
+    workers.run();
     writer.flush()?;
+    let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
+    assert_eq!(
+        flush.writebacks, 0,
+        "no request after the refused one was made"
+    );
     Ok(())
 }

@@ -183,7 +183,9 @@ impl Fs for SkipSyncFs {
             .copied()
             .enumerate()
             .filter(|(_, target)| match target {
-                SyncTarget::FileData { origin, .. } => !self.skip.file(Some(*origin)),
+                SyncTarget::FileData { origin, .. } | SyncTarget::OpenFile { origin, .. } => {
+                    !self.skip.file(Some(*origin))
+                }
                 SyncTarget::Folder { .. } => !self.skip.directories,
             })
             .unzip();

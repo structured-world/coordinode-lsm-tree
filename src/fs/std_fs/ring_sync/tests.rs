@@ -14,41 +14,47 @@ fn only_an_unknown_opcode_refuses_the_ring() {
     assert!(!super::refuses_sync(libc::ENOSPC));
 }
 
-/// A sync that failed is the batch's error even when another target of the
-/// batch refused the opcode, in either order, and the refusal still turns the
-/// ring off for the thread; a refusal alone sends the batch another way.
-/// Guards against a refusal discarding a failed sync, whose retry through a
-/// new handle may not report the writeback error it consumed.
+/// Only a batch whose every sync answered as an unknown opcode would is
+/// refused. Beside a sync that ran, in either order and whether it failed or
+/// not, that answer is its target's own (a `/dev/null` has no sync): the batch
+/// fails with each failed target spent, and the ring stays on. Guards against
+/// one target that cannot be synced turning the ring off for the thread and
+/// its sync being retried through a new handle.
 #[test]
-fn a_failed_sync_outweighs_a_refusal_in_the_same_batch() {
+fn only_a_batch_every_sync_refused_is_refused() {
     use super::{Completions, NO_RING_SYNC, Through};
 
+    NO_RING_SYNC.set(false);
     for results in [[-libc::EIO, -libc::EINVAL], [-libc::EINVAL, -libc::EIO]] {
-        NO_RING_SYNC.set(false);
         let mut completions = Completions::default();
         for (at, result) in results.into_iter().enumerate() {
             completions.note(at, result);
         }
         let Err(e) = completions.outcome() else {
-            panic!("the failed sync is reported: {results:?}");
+            panic!("the failed syncs are reported: {results:?}");
         };
-        let eio = crate::io::Error::from(std::io::Error::from_raw_os_error(libc::EIO));
-        assert_eq!(e.error.to_string(), eio.to_string(), "{results:?}");
-        let failed_at = results
-            .iter()
-            .position(|&result| result == -libc::EIO)
-            .unwrap_or(usize::MAX);
-        assert_eq!(
-            e.spent,
-            [failed_at],
-            "only the failed sync is spent: {results:?}"
-        );
-        assert!(NO_RING_SYNC.get(), "the ring is off: {results:?}");
+        let mut spent = e.spent;
+        spent.sort_unstable();
+        assert_eq!(spent, [0, 1], "both syncs failed: {results:?}");
     }
+    for results in [[0, -libc::EINVAL], [-libc::EOPNOTSUPP, 0]] {
+        let mut completions = Completions::default();
+        for (at, result) in results.into_iter().enumerate() {
+            completions.note(at, result);
+        }
+        let Err(e) = completions.outcome() else {
+            panic!("a target that has no sync fails the batch: {results:?}");
+        };
+        let refused_at = results
+            .iter()
+            .position(|&result| result != 0)
+            .unwrap_or(usize::MAX);
+        assert_eq!(e.spent, [refused_at], "{results:?}");
+    }
+    assert!(!NO_RING_SYNC.get(), "the ring stays on");
 
-    NO_RING_SYNC.set(false);
     let mut refused = Completions::default();
-    for (at, result) in [0, -libc::EOPNOTSUPP].into_iter().enumerate() {
+    for (at, result) in [-libc::EINVAL, -libc::EOPNOTSUPP].into_iter().enumerate() {
         refused.note(at, result);
     }
     assert!(matches!(refused.outcome(), Ok(Through::Refused)));
@@ -56,7 +62,6 @@ fn a_failed_sync_outweighs_a_refusal_in_the_same_batch() {
     let mut synced = Completions::default();
     synced.note(0, 0);
     assert!(matches!(synced.outcome(), Ok(Through::Synced)));
-    NO_RING_SYNC.set(false);
 }
 
 /// Once a ring refused the opcode on a thread, its batches go another way
@@ -213,8 +218,9 @@ fn batches_after_a_failure_and_a_larger_batch_still_sync() -> crate::Result<()> 
 }
 
 /// A batch of more files than the process may hold open syncs: it goes to
-/// the ring in bounded chunks. Guards against a persist of many deferred
-/// flushes failing with `EMFILE` on every retry.
+/// the ring in bounded chunks, and a chunk the descriptors run out for goes
+/// in halves. Guards against a persist of many deferred flushes failing with
+/// `EMFILE` on every retry.
 #[test]
 fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
     const FILES: usize = 400;
@@ -262,10 +268,12 @@ fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
             mode: SyncMode::Normal,
         })
         .collect();
-    // Room for what this process holds open and a chunk, not for the batch.
+    // Room for what this process holds open and a quarter of a chunk, not for
+    // the batch nor a whole chunk: the chunks run out of descriptors and are
+    // synced in halves.
     let open_now = std::fs::read_dir("/proc/self/fd")?.count() as u64;
     let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
-    rlimit::setrlimit(rlimit::Resource::NOFILE, open_now + 128, hard)?;
+    rlimit::setrlimit(rlimit::Resource::NOFILE, open_now + 24, hard)?;
     let result = sync_on_ring(&targets);
     rlimit::setrlimit(rlimit::Resource::NOFILE, soft, hard)?;
     let Some(result) = result else {
@@ -275,30 +283,42 @@ fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
     Ok(())
 }
 
-/// A sync the kernel refuses fails the batch with its own error, once every
-/// entry of the batch is reaped: `/dev/null` takes no data sync.
+/// A sync the kernel refuses for its target fails the batch with that target
+/// spent, once every entry of the batch is reaped, and leaves the ring on:
+/// `/dev/null` takes no data sync. Guards against one such target being taken
+/// for a ring that runs no sync.
 #[test]
 fn a_sync_the_kernel_refuses_fails_the_batch() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("f");
     std::fs::File::create(&file)?.write_all(b"x")?;
     let null = std::path::Path::new("/dev/null");
+    let regular = SyncTarget::FileData {
+        path: &file,
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    };
+    // The ring is known to sync a regular file, or there is nothing to test.
+    let Some(alone) = sync_on_ring(core::slice::from_ref(&regular)) else {
+        return Ok(());
+    };
+    alone?;
     let targets = [
-        SyncTarget::FileData {
-            path: &file,
-            origin: WriteOrigin::FlushTable,
-            mode: SyncMode::Normal,
-        },
+        regular,
         SyncTarget::FileData {
             path: null,
             origin: WriteOrigin::FlushTable,
             mode: SyncMode::Normal,
         },
     ];
-    let Some(result) = sync_on_ring(&targets) else {
-        return Ok(());
+    let Some(Err(failure)) = sync_on_ring(&targets) else {
+        panic!("the refused sync fails the batch through the ring");
     };
-    assert!(result.is_err(), "the refused sync is reported");
+    assert_eq!(failure.spent, [1], "the target that has no sync is spent");
+    assert!(
+        matches!(sync_on_ring(core::slice::from_ref(&regular)), Some(Ok(()))),
+        "the ring still syncs"
+    );
     Ok(())
 }
 

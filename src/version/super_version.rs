@@ -82,31 +82,58 @@ fn same_device(fs: &dyn Fs, path: &Path, other_fs: &dyn Fs, other: &Path) -> boo
     )
 }
 
+/// The folder whose device a sync of `target` reaches.
+fn device_folder<'a>(target: &crate::fs::SyncTarget<'a>) -> &'a Path {
+    match *target {
+        crate::fs::SyncTarget::Folder { path, .. } => path,
+        crate::fs::SyncTarget::FileData { path, .. }
+        | crate::fs::SyncTarget::OpenFile { path, .. } => crate::file::entry_directory(path),
+    }
+}
+
+/// Whether the sync at `at` in `syncs` went to the device the sync at `of`
+/// went to, as [`flush_other_devices`] groups them.
+fn same_flushed_device(
+    syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)],
+    at: usize,
+    of: usize,
+) -> bool {
+    let (Some((fs, target)), Some((of_fs, of_target))) = (syncs.get(at), syncs.get(of)) else {
+        return false;
+    };
+    let (folder, of_folder) = (device_folder(target), device_folder(of_target));
+    let volume = fs.volume_id(folder);
+    Arc::ptr_eq(fs, of_fs)
+        && (volume.is_some() && volume == of_fs.volume_id(of_folder) || folder == of_folder)
+}
+
 /// Flushes, once each, every device `syncs` reached that is not provably the
 /// one `step` lies on: barrier syncs there are ordered apart from `step`'s
 /// device, so the write `step` makes next could outlast them. A device whose
 /// id a backend cannot tell is flushed per folder.
+///
+/// # Errors
+///
+/// The error of a flush, with the index in `syncs` of the sync whose device
+/// it was: every sync to that device is then unproven.
 pub(crate) fn flush_other_devices(
     syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)],
     (step_fs, step_path): (&dyn Fs, &Path),
-) -> crate::io::Result<()> {
+) -> Result<(), (crate::io::Error, usize)> {
     let step_volume = step_fs.volume_id(step_path);
     let mut flushed: Vec<(&Arc<dyn Fs>, Option<u64>, &Path)> = Vec::new();
-    for (fs, target) in syncs {
-        let folder = match *target {
-            crate::fs::SyncTarget::FileData { path, .. } => crate::file::entry_directory(path),
-            crate::fs::SyncTarget::Folder { path, .. } => path,
-        };
+    for (at, (fs, target)) in syncs.iter().enumerate() {
+        let folder = device_folder(target);
         let volume = fs.volume_id(folder);
         if volume.is_some() && volume == step_volume {
             continue;
         }
-        if flushed.iter().any(|&(on, known, at)| {
-            Arc::ptr_eq(on, fs) && (volume.is_some() && known == volume || at == folder)
+        if flushed.iter().any(|&(on, known, seen)| {
+            Arc::ptr_eq(on, fs) && (volume.is_some() && known == volume || seen == folder)
         }) {
             continue;
         }
-        fs.sync_device(folder)?;
+        fs.sync_device(folder).map_err(|e| (e, at))?;
         flushed.push((fs, volume, folder));
     }
     Ok(())
@@ -186,40 +213,48 @@ pub(crate) enum UnsyncedFile {
     Blob(crate::vlog::BlobFile),
 }
 
-/// A file a flush wrote, borrowed: what syncing it takes, without a handle of
-/// its own to it.
+/// A file a flush wrote, borrowed: what syncing it takes, with the handle it
+/// was written through when the writer kept it open for the sync.
 #[derive(Clone, Copy)]
 pub(crate) enum FlushFile<'a> {
     /// A table.
-    Table(&'a crate::Table),
+    Table(&'a crate::Table, Option<&'a dyn crate::fs::FsFile>),
     /// A blob file.
-    Blob(&'a crate::vlog::BlobFile),
+    Blob(&'a crate::vlog::BlobFile, Option<&'a dyn crate::fs::FsFile>),
 }
 
 impl<'a> FlushFile<'a> {
     /// The file's backend and path.
     fn location(self) -> (&'a Arc<dyn Fs>, &'a Path) {
         match self {
-            Self::Table(table) => (&table.fs, &table.path),
-            Self::Blob(blob_file) => (&blob_file.0.fs, &blob_file.0.path),
+            Self::Table(table, _) => (&table.fs, &table.path),
+            Self::Blob(blob_file, _) => (&blob_file.0.fs, &blob_file.0.path),
         }
     }
 
     /// What the file was written for, as the open that syncs it names it.
     const fn origin(self) -> crate::fs::WriteOrigin {
         match self {
-            Self::Table(_) => crate::fs::WriteOrigin::FlushTable,
-            Self::Blob(_) => crate::fs::WriteOrigin::FlushBlob,
+            Self::Table(..) => crate::fs::WriteOrigin::FlushTable,
+            Self::Blob(..) => crate::fs::WriteOrigin::FlushBlob,
+        }
+    }
+
+    /// The handle the file was written through, kept open for its sync.
+    const fn open(self) -> Option<&'a dyn crate::fs::FsFile> {
+        match self {
+            Self::Table(_, open) | Self::Blob(_, open) => open,
         }
     }
 }
 
 impl UnsyncedFile {
-    /// The file, borrowed.
+    /// The file, borrowed: a deferred flush keeps no handle open for the
+    /// persist that syncs it, which may come much later.
     pub(crate) const fn as_flush_file(&self) -> FlushFile<'_> {
         match self {
-            Self::Table(table) => FlushFile::Table(table),
-            Self::Blob(blob_file) => FlushFile::Blob(blob_file),
+            Self::Table(table) => FlushFile::Table(table, None),
+            Self::Blob(blob_file) => FlushFile::Blob(blob_file, None),
         }
     }
 
@@ -933,15 +968,27 @@ impl SuperVersions {
         let mut named_folders: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
         for file in files {
             let (file_fs, path) = file.location();
+            let origin = file.origin();
             syncs.push((
                 file_fs,
-                crate::fs::SyncTarget::FileData {
-                    path,
-                    origin: file.origin(),
-                    mode: sync_mode,
+                match file.open() {
+                    // The handle open since the write reports every writeback
+                    // error; a new one would only while the inode stays in
+                    // memory, and costs an open.
+                    Some(open) => crate::fs::SyncTarget::OpenFile {
+                        file: open,
+                        path,
+                        origin,
+                        mode: sync_mode,
+                    },
+                    None => crate::fs::SyncTarget::FileData {
+                        path,
+                        origin,
+                        mode: sync_mode,
+                    },
                 },
             ));
-            if matches!(file, FlushFile::Blob(_))
+            if matches!(file, FlushFile::Blob(..))
                 && let Some(folder) = path.parent()
             {
                 named_folders.push((file_fs, folder));
@@ -1004,7 +1051,21 @@ impl SuperVersions {
             }
         }
         if sync_mode == SyncMode::Barrier {
-            flush_other_devices(&syncs, step).map_err(crate::fs::SyncFailure::unspent)?;
+            // A device whose cache did not flush leaves every barrier sync to
+            // it unproven, the files' as well: each is marked as a failed one.
+            flush_other_devices(&syncs, step).map_err(|(error, failed_at)| {
+                crate::fs::SyncFailure {
+                    error,
+                    spent: (0..syncs.len())
+                        .filter(|&at| {
+                            syncs
+                                .get(at)
+                                .is_some_and(|(_, target)| target.origin().is_some())
+                                && same_flushed_device(&syncs, at, failed_at)
+                        })
+                        .collect(),
+                }
+            })?;
         }
         Ok(())
     }

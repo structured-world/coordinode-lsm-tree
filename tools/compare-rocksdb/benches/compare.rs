@@ -3615,6 +3615,14 @@ fn baseline_of(label: &str) -> &'static str {
     if label == "ours-deferred-wal" {
         return Engine::SurrealKv.label();
     }
+    // An `overwrite_parts` arm against the arm it differs from in one part
+    // (see `PARTS`).
+    if label == "no-sync-no-filter" {
+        return "no-sync";
+    }
+    if PARTS.iter().any(|&(part, _)| part == label) {
+        return "full";
+    }
     blob_codec_of(label)
         .map_or(Engine::RocksDb, Engine::RocksDbBlob)
         .label()
