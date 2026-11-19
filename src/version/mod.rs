@@ -1716,6 +1716,11 @@ impl Version {
         // The highest synced-flush number this snapshot decides, never below
         // one its tables carry: an open installs the self-described tables of
         // the flushes above it, so one a table left behind could revive.
+        //
+        // No format bump for this section either: a binary that predates it
+        // would take the tables of flushes above the watermark for orphans,
+        // but opening a tree with such a binary is a downgrade, outside the
+        // support contract stated for `restrictions` above.
         writer.start("flush_watermark")?;
         writer.write_u64::<LittleEndian>(flush_watermark.max(self.highest_flush_seq()))?;
 
