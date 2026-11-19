@@ -398,6 +398,70 @@ fn a_flush_keeps_its_floor_across_a_power_loss() -> crate::Result<()> {
     Ok(())
 }
 
+/// A flush's table the open cannot read for a reason of the host (here a
+/// refused permission) fails the open with that error, and the next open,
+/// with the table readable, takes the flush in. Guards against such a table
+/// being taken for a cut-short flush and its data dropped for good.
+#[test]
+fn a_table_the_host_will_not_read_fails_the_open_and_drops_nothing() -> crate::Result<()> {
+    use crate::fs::{CrashFs, Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use alloc::sync::Arc;
+
+    let root = std::path::absolute("/db")?;
+    let open = |fs: Arc<dyn Fs>| {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .table_file_pool(0)
+        .open()
+    };
+
+    let crash = CrashFs::new(MemFs::new());
+    let fault = Arc::new(FaultFs::new(crash.clone()));
+    let tree = open(fault.clone())?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    let tables = root.join(crate::file::TABLES_FOLDER);
+    let Some(table) = crash
+        .read_dir(&tables)?
+        .into_iter()
+        .map(|entry| entry.file_name)
+        .find(|name| name.parse::<u64>().is_ok())
+    else {
+        panic!("self-check: the flush wrote a table");
+    };
+
+    // The power goes: nothing the closing tree does reaches the disk.
+    for op in [FaultOp::Open, FaultOp::RemoveFile, FaultOp::Rename] {
+        fault.injector().arm(FaultRule::new(
+            op,
+            Fault::Error(crate::io::ErrorKind::Other),
+        ));
+    }
+    crash.crash();
+    drop(tree);
+
+    let refused = Arc::new(FaultFs::new(crash.clone()));
+    for op in [FaultOp::Read, FaultOp::ReadAt] {
+        refused.injector().arm(
+            FaultRule::new(op, Fault::Error(crate::io::ErrorKind::PermissionDenied))
+                .on_path(table.clone()),
+        );
+    }
+    let Err(crate::Error::Io(e)) = open(refused) else {
+        panic!("an open that cannot read a flush's table fails");
+    };
+    assert_eq!(e.kind(), crate::io::ErrorKind::PermissionDenied);
+
+    let tree = open(Arc::new(crash))?;
+    assert_eq!(tree.get("a", u64::MAX)?.as_deref(), Some(&b"1"[..]));
+    Ok(())
+}
+
 /// A table this build cannot read for lack of a feature (a columnar table
 /// opened without `columnar`) fails the open: its bytes are whole. Guards
 /// against such a table being taken for a cut-short flush, its tables set

@@ -1191,6 +1191,17 @@ impl MultiWriter {
         self.written(at, size)
     }
 
+    /// Whether any value went to a file: without one, finishing only removes
+    /// the empty files, with no frame left to compress.
+    pub(crate) fn holds_values(&self) -> bool {
+        !self.results.is_empty()
+            || self.active_writer.item_count > 0
+            || self
+                .parked
+                .iter()
+                .any(|(_, _, _, _, writer)| writer.item_count > 0)
+    }
+
     pub(crate) fn finish(mut self) -> crate::Result<Vec<BlobFile>> {
         let mut writers = core::iter::once((self.passthrough_compression, self.active_writer))
             .chain(

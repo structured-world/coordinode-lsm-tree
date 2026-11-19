@@ -107,6 +107,24 @@ fn without_workers_buffers_go_down_on_the_callers_thread() -> io::Result<()> {
     Ok(())
 }
 
+/// A writer whose inner writer is gone refuses every call that needs it with
+/// an error, whatever was buffered: a write past the buffer, a job run after
+/// the writes, a read of the inner writer and a flush. Guards against a call
+/// on such a writer panicking or answering as if the file were whole.
+#[test]
+fn a_writer_whose_inner_writer_is_gone_refuses_every_call() {
+    let mut out = DeferredWriter::with_capacity(8, Sink::default(), true);
+    out.sink = super::Sink::Gone;
+    assert!(out.write(&pattern(16)).is_err(), "a write past the buffer");
+    assert!(out.write(&pattern(4)).is_ok(), "a write the buffer takes");
+    assert!(out.flush().is_err(), "a flush of what was buffered");
+    assert!(out.after_writes(|_| {}).is_err(), "a job after the writes");
+    assert!(
+        out.with_inner(|_| ()).is_err(),
+        "a read of the inner writer"
+    );
+}
+
 /// A writer without workers counts what it wrote on the caller's thread no
 /// further than the threshold, through buffered and passed-through writes.
 /// Guards against the count overflowing a 32-bit `usize` on a file past

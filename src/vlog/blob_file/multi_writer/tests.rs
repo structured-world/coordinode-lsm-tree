@@ -26,6 +26,33 @@ fn whole_block_copies_are_held_to_a_bounded_number_of_sources() -> crate::Result
     Ok(())
 }
 
+/// A writer holds values once one is written, in any class, and still after
+/// the class switch that parks the file holding it: a flush finishes it on a
+/// thread of its own only then.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_writer_holds_values_once_any_class_was_written() -> crate::Result<()> {
+    use super::*;
+    use crate::fs::StdFs;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let mut writer =
+        MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?
+            .use_target_size(u64::MAX)
+            .use_lifetime_groups(crate::config::LifetimeGroups::new(2).expect("two groups"));
+    assert!(!writer.holds_values(), "nothing written yet");
+    writer.write_fresh(b"a", 0, b"value", CompressionType::None, 0)?;
+    assert!(writer.holds_values(), "a value in the active file");
+    writer.select_output(CompressionType::None, 1)?;
+    assert!(writer.holds_values(), "the value's file is parked");
+    assert!(
+        writer.finish()?.len() == 1,
+        "the one file holding the value"
+    );
+    Ok(())
+}
+
 /// Values of two key domains, in two lifetime classes, land in blob files of
 /// one domain each: the file a class switch parks is closed at the domain's
 /// end with the active one, so expiring a domain leaves its files wholly dead.

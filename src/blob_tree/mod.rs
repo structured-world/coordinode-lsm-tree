@@ -232,6 +232,11 @@ fn finish_flush(
     crate::Result<Vec<BlobFile>>,
     crate::Result<crate::table::multi_writer::Written>,
 ) {
+    // With no value in a blob file there is nothing to compress beside the
+    // table's finish, and a thread would cost more than the empty finish.
+    if !blob_writer.holds_values() {
+        return (blob_writer.finish(), table_writer.finish());
+    }
     #[cfg(feature = "std")]
     {
         std::thread::scope(|scope| {
@@ -2523,7 +2528,9 @@ impl AbstractTree for BlobTree {
             // per-KV checksums, locator policy, sync mode, and CoW disable.
             table_writer = table_writer.use_page_ecc(self.index.config.page_ecc, rc.ecc_scheme);
             // The install syncs a flush's files, whatever the tree's flush
-            // durability (see the index tree's `register_tables`).
+            // durability (see the index tree's `register_tables`), through
+            // handles of its own that still see a writeback error raised
+            // before they opened (see the index tree's flush writer).
             table_writer = table_writer
                 .use_sync_mode(self.index.config.sync_mode)
                 .use_durability(crate::config::FlushDurability::Deferred)

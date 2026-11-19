@@ -207,6 +207,58 @@ fn a_batch_of_syncs_reaches_the_backend_as_one_and_is_counted() -> crate::io::Re
     Ok(())
 }
 
+/// A failed batch counts a failure for the sync that failed alone, and for
+/// every target when it failed before any sync ran (an open), as it then
+/// does not say which. Guards against a batch failure counted on files whose
+/// syncs succeeded, or on none.
+#[test]
+fn a_failed_batch_counts_the_failure_where_it_was() -> crate::io::Result<()> {
+    let faulty = FaultFs::new(MemFs::new());
+    let injector = faulty.injector();
+    let fs = CountingFs::new(Arc::new(faulty));
+    fs.create_dir_all(Path::new("/db"))?;
+    for name in ["/db/1", "/db/2"] {
+        fs.open(Path::new(name), &writable(Some(WriteOrigin::FlushTable)))?
+            .write_all(b"x")?;
+    }
+    let mode = crate::fs::SyncMode::default();
+    let batch = [
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/1"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/2"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+    ];
+
+    injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("/db/2")
+            .once(),
+    );
+    assert!(fs.sync_many(&batch).is_err());
+    let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
+    assert_eq!((flush.syncs, flush.sync_errors), (2, 1), "the failed sync");
+
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("/db/1")
+            .once(),
+    );
+    assert!(fs.sync_many(&batch).is_err());
+    let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
+    assert_eq!(
+        (flush.syncs, flush.sync_errors),
+        (4, 3),
+        "a batch failed before any sync counts every target"
+    );
+    Ok(())
+}
+
 /// A writeback started ahead of a sync is counted apart from the syncs: it is
 /// no durability point and writes no byte the writes did not.
 #[test]

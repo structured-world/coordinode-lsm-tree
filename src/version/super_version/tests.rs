@@ -120,6 +120,63 @@ fn a_failed_sync_in_a_batch_marks_only_its_own_file() -> crate::Result<()> {
     Ok(())
 }
 
+/// Synced one at a time, a failed sync marks its own file alone too, by its
+/// place in the batch: the file before it synced and syncs again, the failed
+/// one does not. Guards against the one-at-a-time schedule pinning a failure
+/// on the first file of the batch.
+#[test]
+fn one_at_a_time_a_failed_sync_marks_only_its_own_file() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io_policy::SyncSchedule;
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let tree = deferred_tree_with_a_pending_flush(&fs)?;
+    tree.insert("b", "2", 1);
+    tree.flush_active_memtable(0)?;
+    let pending = tree.version_history.read().unsynced_files();
+    let [first, second] = pending.as_slice() else {
+        panic!("two pending tables");
+    };
+    let step = (&*fs as &dyn crate::fs::Fs, crate::path::Path::new("/db"));
+
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(second.as_flush_file().location().1.to_string_lossy())
+            .once(),
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            &pending,
+            SyncMode::default(),
+            SyncSchedule::OneAtATime,
+            step
+        )
+        .is_err()
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            core::slice::from_ref(first),
+            SyncMode::default(),
+            SyncSchedule::OneAtATime,
+            step,
+        )
+        .is_ok(),
+        "the file synced before the failure syncs again"
+    );
+    assert!(
+        SuperVersions::sync_unsynced(
+            core::slice::from_ref(second),
+            SyncMode::default(),
+            SyncSchedule::OneAtATime,
+            step,
+        )
+        .is_err(),
+        "the file whose sync failed does not"
+    );
+    Ok(())
+}
+
 /// A barrier that could not open a pending file synced nothing, so the next
 /// one syncs and persists it. Guards against a transient failure to open
 /// (descriptors run out) being taken for a failed sync, which no retry

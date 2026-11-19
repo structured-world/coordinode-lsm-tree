@@ -59,6 +59,57 @@ fn a_failed_sync_outweighs_a_refusal_in_the_same_batch() {
     NO_RING_SYNC.set(false);
 }
 
+/// Once a ring refused the opcode on a thread, its batches go another way
+/// without setting a ring up again. Guards against every batch paying a ring
+/// that syncs nothing.
+#[test]
+fn a_thread_whose_ring_refused_the_opcode_asks_no_ring_again() -> crate::Result<()> {
+    use super::NO_RING_SYNC;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("a");
+    std::fs::File::create(&path)?;
+    let targets = [SyncTarget::FileData {
+        path: &path,
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    }];
+    NO_RING_SYNC.set(true);
+    let through_ring = sync_on_ring(&targets);
+    NO_RING_SYNC.set(false);
+    assert!(through_ring.is_none(), "the batch goes another way");
+    Ok(())
+}
+
+/// A sync the queue has no room for fails the batch, and every sync queued
+/// before it is spent with the batch's own index: they may run. Guards
+/// against a full queue reporting the queued syncs as never started.
+#[test]
+fn a_full_submission_queue_fails_the_batch_and_spends_what_was_queued() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let paths = [dir.path().join("a"), dir.path().join("b")];
+    for path in &paths {
+        std::fs::File::create(path)?;
+    }
+    let targets: Vec<SyncTarget<'_>> = paths
+        .iter()
+        .map(|path| SyncTarget::FileData {
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        })
+        .collect();
+    // One entry for two syncs.
+    let Ok(mut ring) = io_uring::IoUring::new(1) else {
+        return Ok(());
+    };
+    let Err(failure) = super::sync_through(&mut ring, 5, &targets) else {
+        panic!("two syncs fit a queue of one");
+    };
+    assert_eq!(failure.spent, [5], "the queued sync is spent at its index");
+    Ok(())
+}
+
 /// A batch of file and folder syncs goes through one ring and reports every
 /// one done: the path a synced flush takes on Linux.
 #[test]
@@ -172,10 +223,22 @@ fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
     const CHILD: &str = "LSM_TREE_DESCRIPTOR_LIMIT_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let name = "fs::std_fs::ring_sync::tests::a_batch_larger_than_the_descriptor_limit_syncs";
-        let child = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", name])
-            .env(CHILD, "1")
-            .output()?;
+        // The child runs the way cargo ran this test: through the target's
+        // runner when one is set (an emulator for a cross build, whose
+        // binary the host cannot exec), directly otherwise.
+        let runner = std::env::vars()
+            .find(|(key, _)| key.starts_with("CARGO_TARGET_") && key.ends_with("_RUNNER"))
+            .map(|(_, value)| value);
+        let mut runner_words = runner.iter().flat_map(|value| value.split_whitespace());
+        let mut command = match runner_words.next() {
+            Some(program) => {
+                let mut command = std::process::Command::new(program);
+                command.args(runner_words).arg(std::env::current_exe()?);
+                command
+            }
+            None => std::process::Command::new(std::env::current_exe()?),
+        };
+        let child = command.args(["--exact", name]).env(CHILD, "1").output()?;
         let stdout = String::from_utf8_lossy(&child.stdout);
         assert!(
             child.status.success() && stdout.contains("1 passed"),

@@ -675,6 +675,32 @@ fn a_later_claim_of_the_write_leaves_its_refill_held() -> crate::Result<()> {
     Ok(())
 }
 
+/// Waiting for the refills starts the ones still held for a write: a tree
+/// that closes leaves no batch reserved and never made. Guards against a
+/// close waiting on a refill that only an install it will not see starts.
+#[cfg(feature = "std")]
+#[test]
+fn waiting_for_the_refills_starts_one_still_held() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(8)?;
+    let pools = Arc::new(pools);
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    for _ in 0..3 {
+        drop(pools.claim(&folder, &fs, None, false)?);
+    }
+    // Five pooled: the write's first claim leaves half a batch and holds it.
+    let hold = pools.hold();
+    drop(pools.claim_held(&folder, &fs, true, &hold)?);
+    pools.wait_for_refills();
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1 + 8 + 8,
+        "the held refill made its batch"
+    );
+    drop(hold);
+    Ok(())
+}
+
 /// The install of one write starts only the refills held for it: one another
 /// write's claim reserved stays held while that write may still be syncing,
 /// until it drops its own hold. Two writes share a tree's pools whenever a

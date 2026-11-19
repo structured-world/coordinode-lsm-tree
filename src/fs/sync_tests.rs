@@ -386,3 +386,59 @@ fn a_refused_writeback_request_turns_the_requests_off() -> crate::Result<()> {
     writer.flush()?;
     Ok(())
 }
+
+/// A failed batch converts to the error of the sync that failed, whichever
+/// error type its caller returns.
+#[test]
+fn a_sync_failure_converts_to_its_error() {
+    let failure = || super::SyncFailure {
+        error: crate::io::Error::new(crate::io::ErrorKind::StorageFull, "full"),
+        spent: vec![0],
+    };
+    let io: crate::io::Error = failure().into();
+    assert_eq!(io.kind(), crate::io::ErrorKind::StorageFull);
+    let crate::Error::Io(error) = crate::Error::from(failure()) else {
+        panic!("a sync failure is an I/O error");
+    };
+    assert_eq!(error.kind(), crate::io::ErrorKind::StorageFull);
+}
+
+/// A writeback request a worker makes, refused, turns the requests off too:
+/// one queued behind it is not made, and the next request is not queued.
+/// Guards against a hint failing a write of a file written on workers.
+#[test]
+fn a_writeback_request_refused_on_a_worker_turns_the_requests_off() -> crate::Result<()> {
+    /// Runs each task on a thread of its own and returns once it ran.
+    struct Prompt;
+    impl crate::table::writer::CompactionSpawner for Prompt {
+        fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
+            assert!(
+                std::thread::spawn(task).join().is_ok(),
+                "the lane's task panicked"
+            );
+        }
+    }
+
+    let fs = FaultFs::new(MemFs::new());
+    let injector = fs.injector();
+    fs.create_dir_all(Path::new("/db"))?;
+    let file = fs.open(
+        Path::new("/db/1"),
+        &FsOpenOptions::new().write(true).create_new(true),
+    )?;
+    let mut writer = crate::io::FileWriter::for_file(4, file, true);
+    writer.use_spawner_now(std::sync::Arc::new(Prompt));
+    let mut writeback = Writeback::every(4);
+
+    injector.arm(FaultRule::new(
+        FaultOp::StartWriteback,
+        Fault::Error(crate::io::ErrorKind::Unsupported),
+    ));
+    writer.write_all(b"abcd")?;
+    writeback.hint(&mut writer, 0, 4)?;
+    writer.write_all(b"efgh")?;
+    writeback.hint(&mut writer, 4, 4)?;
+    assert_eq!(writeback.bytes, 0, "the requests are off");
+    writer.flush()?;
+    Ok(())
+}

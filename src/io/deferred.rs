@@ -358,7 +358,7 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
 
     /// Hands the buffers filled from here on to the workers at once.
     #[cfg(test)]
-    fn use_spawner_now(&mut self, spawner: Arc<dyn CompactionSpawner>) {
+    pub(crate) fn use_spawner_now(&mut self, spawner: Arc<dyn CompactionSpawner>) {
         self.written_here = WORKERS_AFTER_BYTES;
         self.use_spawner(spawner);
     }
@@ -377,8 +377,9 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
         if self.panicked && self.failed.is_none() {
             self.failed = Some(Failure::of(&gone()));
         }
-        self.sink = match core::mem::replace(&mut self.sink, Sink::Gone) {
-            Sink::Here(inner) => Sink::Lane(
+        // The writer writes here (checked above): its inner writer moves.
+        if let Sink::Here(inner) = core::mem::replace(&mut self.sink, Sink::Gone) {
+            self.sink = Sink::Lane(
                 Arc::new(Lane {
                     state: Mutex::new(State {
                         inner: Some(inner),
@@ -393,10 +394,8 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
                     progress: Condvar::new(),
                 }),
                 spawner,
-            ),
-            Sink::Lane(lane, _) => Sink::Lane(lane, spawner),
-            Sink::Gone => Sink::Gone,
-        };
+            );
+        }
     }
 
     /// Writes `data` to `inner` on the calling thread.

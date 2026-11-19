@@ -94,6 +94,13 @@ fn handle() -> Arc<RuntimeConfigHandle> {
     Arc::new(RuntimeConfigHandle::new(RuntimeConfig::default()))
 }
 
+/// The policy prints as itself, without the trees and locations it holds:
+/// a config that carries it prints without walking them.
+#[test]
+fn a_policy_prints_without_what_it_holds() {
+    assert_eq!(format!("{:?}", IoPolicy::new()), "IoPolicy { .. }");
+}
+
 /// A tree opening on a device whose scheduler idles between queues takes the
 /// strategy for it, and a second tree on the same location takes it without
 /// the device being asked again: the scheduler is read once per location.

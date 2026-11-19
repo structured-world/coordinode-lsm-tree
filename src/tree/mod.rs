@@ -1332,6 +1332,11 @@ impl AbstractTree for Tree {
             table_writer = table_writer.use_page_ecc(self.config.page_ecc, rc.ecc_scheme);
             // Whatever the tree's flush durability, the install syncs a flush's
             // tables (see `register_tables`), so the writer leaves them unsynced.
+            // The install syncs through a handle of its own, which still sees a
+            // writeback error raised before it opened: Linux reports an error
+            // no sync has seen yet to a handle opened after it (`errseq`, since
+            // 4.16), the writer's handle closes without a sync, and the tree's
+            // read handle keeps the inode, and so its error, in memory.
             table_writer = table_writer
                 .use_sync_mode(self.config.sync_mode)
                 .use_durability(crate::config::FlushDurability::Deferred)
