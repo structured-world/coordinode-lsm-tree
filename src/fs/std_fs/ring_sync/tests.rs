@@ -33,6 +33,25 @@ fn a_batch_cut_short_spends_its_refused_syncs_too() {
     assert_eq!(spent, [1, 2, 3, 4], "every sync not known synced is spent");
 }
 
+/// A wait that fails after the kernel took part of the queue spends only the
+/// syncs it took and did not complete; those still queued never ran and stay
+/// to be synced again. Guards against a target whose sync never reached the
+/// kernel being marked failed, and every later persist naming its file
+/// failing before it is retried.
+#[test]
+fn a_batch_cut_short_leaves_what_the_kernel_never_took() {
+    // Four pushed: the first reaped, the second taken and not reaped, the
+    // last two still queued.
+    let spent: Vec<usize> = super::submitted_unreaped(&[true, false, false, false], 2).collect();
+    assert_eq!(spent, [1], "only the sync the kernel took is spent");
+    let all: Vec<usize> = super::submitted_unreaped(&[true, false, false], 0).collect();
+    assert_eq!(
+        all,
+        [1, 2],
+        "with nothing queued, every unreaped sync is spent"
+    );
+}
+
 /// Only a batch whose every sync answered as an unknown opcode would is
 /// refused. Beside a sync that ran, in either order and whether it failed or
 /// not, that answer is its target's own (a `/dev/null` has no sync): the batch
@@ -168,6 +187,96 @@ fn a_batch_of_files_and_folders_syncs_through_one_ring() -> crate::Result<()> {
     Ok(())
 }
 
+/// Files kept open since their writes sync through the ring by the
+/// descriptors their std handles hold, the batch a synced flush makes on
+/// Linux. Guards against those batches leaving the ring for threads, and
+/// turning it off for the thread.
+#[test]
+fn files_kept_open_sync_through_the_ring() -> crate::Result<()> {
+    use super::NO_RING_SYNC;
+    use crate::fs::FsOpenOptions;
+
+    NO_RING_SYNC.set(false);
+    let dir = tempfile::tempdir()?;
+    let paths = [dir.path().join("a"), dir.path().join("b")];
+    let mut files = Vec::new();
+    for path in &paths {
+        let mut file = StdFs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
+        file.write_all(b"x")?;
+        files.push(file);
+    }
+    let targets: Vec<SyncTarget<'_>> = files
+        .iter()
+        .zip(&paths)
+        .map(|(file, path)| SyncTarget::OpenFile {
+            file: &**file,
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        })
+        .collect();
+    let regular = SyncTarget::FileData {
+        path: &paths[0],
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    };
+    // A kernel that refuses io_uring has nothing to test here.
+    if sync_on_ring(core::slice::from_ref(&regular)).is_none() {
+        return Ok(());
+    }
+    assert!(
+        matches!(sync_on_ring(&targets), Some(Ok(()))),
+        "the kept files sync through the ring"
+    );
+    assert!(!NO_RING_SYNC.get(), "the ring stays on");
+    Ok(())
+}
+
+/// A handle kept open with no descriptor behind it sends its batch another
+/// way, and only that batch: the next batch of files with descriptors still
+/// syncs through the ring. Guards against one such handle turning the ring
+/// off for every later batch of the thread.
+#[test]
+fn a_kept_handle_without_a_descriptor_leaves_the_ring_on() -> crate::Result<()> {
+    use super::NO_RING_SYNC;
+    use crate::fs::{FsOpenOptions, MemFs};
+
+    NO_RING_SYNC.set(false);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("a");
+    std::fs::File::create(&path)?.write_all(b"x")?;
+    let regular = SyncTarget::FileData {
+        path: &path,
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    };
+    if sync_on_ring(core::slice::from_ref(&regular)).is_none() {
+        return Ok(());
+    }
+    let memory = MemFs::new();
+    let in_memory = std::path::Path::new("/m");
+    let file = memory.open(
+        in_memory,
+        &FsOpenOptions::new().write(true).create_new(true),
+    )?;
+    let descriptorless = SyncTarget::OpenFile {
+        file: &*file,
+        path: in_memory,
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    };
+    assert!(
+        sync_on_ring(&[regular, descriptorless]).is_none(),
+        "the batch goes another way"
+    );
+    assert!(!NO_RING_SYNC.get(), "the ring stays on for the thread");
+    assert!(
+        matches!(sync_on_ring(core::slice::from_ref(&regular)), Some(Ok(()))),
+        "the next batch syncs through the ring"
+    );
+    Ok(())
+}
+
 /// A target that cannot be opened fails the batch with its own error, before
 /// anything is submitted: a missing file is reported missing, not synced.
 #[test]
@@ -250,12 +359,26 @@ fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
         let name = "fs::std_fs::ring_sync::tests::a_batch_larger_than_the_descriptor_limit_syncs";
         // The child runs the way cargo ran this test: through the target's
         // runner when one is set (an emulator for a cross build, whose
-        // binary the host cannot exec), directly otherwise. A cross image
-        // sets exactly one such variable, its target's; a runner a cargo
-        // config names reaches no process cargo starts, and none is named in
-        // this repository's.
+        // binary the host cannot exec), directly otherwise. The variable
+        // names the target's triple, whose architecture and system are this
+        // binary's own; a runner a cargo config names reaches no process
+        // cargo starts, and none is named in this repository's.
+        // A triple spells 32-bit x86 by the processor (`i686`), the
+        // architecture constant as `x86`.
+        let arches: Vec<String> = match std::env::consts::ARCH {
+            "x86" => vec!["I386".into(), "I586".into(), "I686".into()],
+            arch => vec![arch.to_ascii_uppercase()],
+        };
+        let os = std::env::consts::OS.to_ascii_uppercase();
         let runner = std::env::vars()
-            .find(|(key, _)| key.starts_with("CARGO_TARGET_") && key.ends_with("_RUNNER"))
+            .find(|(key, _)| {
+                key.strip_prefix("CARGO_TARGET_")
+                    .and_then(|key| key.strip_suffix("_RUNNER"))
+                    .is_some_and(|triple| {
+                        arches.iter().any(|arch| triple.starts_with(arch.as_str()))
+                            && triple.contains(&os)
+                    })
+            })
             .map(|(_, value)| value);
         let mut runner_words = runner.iter().flat_map(|value| value.split_whitespace());
         let mut command = match runner_words.next() {

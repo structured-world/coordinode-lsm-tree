@@ -133,6 +133,14 @@ pub(super) fn sync_on_ring(targets: &[SyncTarget<'_>]) -> Option<Result<(), Sync
     if NO_RING_SYNC.get() {
         return None;
     }
+    // A handle kept open with no descriptor of the kernel behind it is synced
+    // through its own calls: this batch goes that way, and says nothing of
+    // what the ring runs, so the next batch may come here again.
+    if targets.iter().any(
+        |target| matches!(target, SyncTarget::OpenFile { file, .. } if file.backing_fd().is_none()),
+    ) {
+        return None;
+    }
     let entries = u32::try_from(targets.len().min(MAX_IN_FLIGHT))
         .ok()?
         .next_power_of_two()
@@ -203,19 +211,13 @@ fn sync_through(
         }
         Err(e) => return Err(SyncFailure::unspent(e)),
     };
-    // A handle kept open with no descriptor of the kernel behind it cannot be
-    // synced here: the batch goes the way that syncs through the handle.
-    let fds: Option<Vec<i32>> = opened
+    let fds: Vec<i32> = opened
         .iter()
         .map(|handle| match handle {
-            Handle::Opened(file) => Some(file.as_raw_fd()),
-            Handle::Kept(fd) => Some(*fd),
-            Handle::Unreachable => None,
+            Handle::Opened(file) => file.as_raw_fd(),
+            Handle::Kept(fd) => *fd,
         })
         .collect();
-    let Some(fds) = fds else {
-        return Ok(Through::Refused);
-    };
     for (at, (&fd, target)) in fds.iter().zip(targets).enumerate() {
         let sync = opcode::Fsync::new(types::Fd(fd));
         let sync = match target {
@@ -249,15 +251,13 @@ fn sync_through(
                 }
                 // Whatever was submitted is not waited out here; the ring is
                 // dropped, and the kernel finishes its entries before freeing
-                // it. Each sync not reaped may have run and failed, so it is
-                // spent with those that did fail.
+                // it. Each sync submitted and not reaped may have run and
+                // failed, so it is spent with those that did fail; one still
+                // in the submission queue never reaches the kernel.
+                let unsubmitted = ring.submission().len();
                 return Err(completions.cut_short(
                     e,
-                    reaped
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, done)| !**done)
-                        .map(|(at, _)| base + at),
+                    submitted_unreaped(&reaped, unsubmitted).map(|at| base + at),
                 ));
             }
         }
@@ -277,6 +277,22 @@ fn sync_through(
     completions.outcome()
 }
 
+/// The indices of the syncs the kernel took from the submission queue and
+/// whose completion was not reaped: the queue hands entries over in the order
+/// they were pushed, so the last `unsubmitted` of `reaped` never left it.
+fn submitted_unreaped(reaped: &[bool], unsubmitted: usize) -> impl Iterator<Item = usize> + '_ {
+    // The queue holds only this batch's entries: a batch before it was reaped
+    // whole, or its ring dropped.
+    debug_assert!(unsubmitted <= reaped.len());
+    let submitted = reaped.len() - unsubmitted;
+    reaped
+        .iter()
+        .take(submitted)
+        .enumerate()
+        .filter(|(_, done)| !**done)
+        .map(|(at, _)| at)
+}
+
 /// Queues `entry`. The ring has an entry for every target, so a full queue
 /// is no state a batch reaches; it is reported, not assumed away.
 fn push(ring: &mut IoUring, entry: &squeue::Entry) -> io::Result<()> {
@@ -294,19 +310,19 @@ enum Handle {
     Opened(File),
     /// The descriptor of a handle the caller keeps open across the batch.
     Kept(i32),
-    /// A handle the caller keeps open with no descriptor behind it.
-    Unreachable,
 }
 
-/// The file or folder `target` names, open for its sync.
+/// The file or folder `target` names, open for its sync. A kept handle
+/// without a descriptor never gets here (see [`sync_on_ring`]).
 fn open(target: &SyncTarget<'_>) -> io::Result<Handle> {
     match *target {
         SyncTarget::FileData { path, .. } => {
             Ok(Handle::Opened(OpenOptions::new().write(true).open(path)?))
         }
-        SyncTarget::OpenFile { file, .. } => {
-            Ok(file.backing_fd().map_or(Handle::Unreachable, Handle::Kept))
-        }
+        SyncTarget::OpenFile { file, .. } => file
+            .backing_fd()
+            .map(Handle::Kept)
+            .ok_or_else(|| io::Error::other("a kept handle has no descriptor")),
         SyncTarget::Folder { path, .. } => {
             let folder = File::open(path)?;
             if !folder.metadata()?.is_dir() {

@@ -5,7 +5,8 @@
 //! their place in its run and the run's length, and it returns once they and
 //! their folders are synced. The open installs every whole flush above the
 //! manifest's watermark from the tables themselves, and leaves out a flush a
-//! power loss cut short, which never returned.
+//! power loss cut short, which never returned, and a failed one whose
+//! memtables a later flush wrote again, whole or not.
 
 use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
 use lsm_tree::{AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter};
@@ -103,23 +104,19 @@ fn value(tree: &AnyTree, key: &str) -> lsm_tree::Result<Option<String>> {
 }
 
 /// The files in `folder` on `fs` named like tables or blob files and holding
-/// data.
-fn data_files(fs: &dyn Fs, folder: &Path) -> Vec<u64> {
-    let mut ids: Vec<u64> = fs
-        .read_dir(folder)
-        .map(|entries| {
-            entries
-                .into_iter()
-                .filter_map(|entry| {
-                    let id = entry.file_name.parse::<u64>().ok()?;
-                    let len = fs.metadata(&folder.join(&entry.file_name)).ok()?.len;
-                    (len > 0).then_some(id)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+/// data. A folder or file that cannot be read fails the inventory.
+fn data_files(fs: &dyn Fs, folder: &Path) -> lsm_tree::Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for entry in fs.read_dir(folder)? {
+        let Ok(id) = entry.file_name.parse::<u64>() else {
+            continue;
+        };
+        if fs.metadata(&folder.join(&entry.file_name))?.len > 0 {
+            ids.push(id);
+        }
+    }
     ids.sort_unstable();
-    ids
+    Ok(ids)
 }
 
 /// The bytes the manifest's edit logs at [`DB`] hold, all generations.
@@ -210,7 +207,7 @@ fn a_flush_whose_table_did_not_reach_the_disk_is_gone() -> lsm_tree::Result<()> 
     assert_eq!(value(&tree, "lost")?, None);
     assert_eq!(tree.table_count(), 2);
     assert_eq!(
-        data_files(&crash, &at(DB).join("tables")).len(),
+        data_files(&crash, &at(DB).join("tables"))?.len(),
         2,
         "no table of the lost flush is left on disk"
     );
@@ -276,14 +273,14 @@ fn a_flush_missing_a_table_of_its_run_is_left_out_whole() -> lsm_tree::Result<()
     let tree = config(disk.fs()).table_target_size(1_024).open()?;
     tree.insert("kept", "1", 0);
     tree.flush_active_memtable(0)?;
-    let before = data_files(&disk.crash, &at(DB).join("tables"));
+    let before = data_files(&disk.crash, &at(DB).join("tables"))?;
 
     let filler = "y".repeat(256);
     for i in 0..64u64 {
         tree.insert(format!("run-{i:03}"), &filler, 1 + i);
     }
     tree.flush_active_memtable(0)?;
-    let run: Vec<u64> = data_files(&disk.crash, &at(DB).join("tables"))
+    let run: Vec<u64> = data_files(&disk.crash, &at(DB).join("tables"))?
         .into_iter()
         .filter(|id| !before.contains(id))
         .collect();
@@ -395,10 +392,10 @@ fn a_flush_whose_table_has_a_damaged_block_is_left_out() -> lsm_tree::Result<()>
     let tree = config(disk.fs()).open()?;
     tree.insert("kept", "1", 0);
     tree.flush_active_memtable(0)?;
-    let before = data_files(&disk.crash, &at(DB).join("tables"));
+    let before = data_files(&disk.crash, &at(DB).join("tables"))?;
     tree.insert("torn", "x".repeat(512), 1);
     tree.flush_active_memtable(0)?;
-    let torn: Vec<u64> = data_files(&disk.crash, &at(DB).join("tables"))
+    let torn: Vec<u64> = data_files(&disk.crash, &at(DB).join("tables"))?
         .into_iter()
         .filter(|id| !before.contains(id))
         .collect();
@@ -437,10 +434,10 @@ fn a_returned_flush_with_a_damaged_block_fails_the_open() -> lsm_tree::Result<()
     tree.insert("a", "old", 0);
     tree.flush_active_memtable(0)?;
     tree.persist_flushes()?;
-    let before = data_files(&disk.crash, &at(DB).join("tables"));
+    let before = data_files(&disk.crash, &at(DB).join("tables"))?;
     tree.insert("a", "x".repeat(512), 1);
     tree.flush_active_memtable(0)?;
-    let returned: Vec<u64> = data_files(&disk.crash, &at(DB).join("tables"))
+    let returned: Vec<u64> = data_files(&disk.crash, &at(DB).join("tables"))?
         .into_iter()
         .filter(|id| !before.contains(id))
         .collect();
@@ -488,9 +485,9 @@ fn added_by(
     folder: &Path,
     step: impl FnOnce() -> lsm_tree::Result<()>,
 ) -> lsm_tree::Result<Vec<u64>> {
-    let before = data_files(fs, folder);
+    let before = data_files(fs, folder)?;
     step()?;
-    Ok(data_files(fs, folder)
+    Ok(data_files(fs, folder)?
         .into_iter()
         .filter(|id| !before.contains(id))
         .collect())
@@ -706,9 +703,15 @@ fn a_blob_flush_of_several_tables_takes_its_blob_file_in_once() -> lsm_tree::Res
         tree.table_count() > 1,
         "self-check: the flush wrote several tables"
     );
+    assert_eq!(
+        tree.blob_file_count(),
+        1,
+        "self-check: the tables share one blob file"
+    );
     let crash = disk.power_loss(tree);
 
     let tree = open(Arc::new(crash))?;
+    assert_eq!(tree.blob_file_count(), 1, "the blob file is taken in once");
     for i in (0..2_000u64).step_by(97) {
         assert_eq!(
             tree.get(format!("k{i:04}"), u64::MAX)?.as_deref(),
@@ -994,7 +997,8 @@ fn open_or_repair_refuses_a_returned_flush_without_its_dictionary() -> lsm_tree:
     let crash = disk.power_loss(tree);
     crash.remove_file(&at(DB).join("dicts").join(id.to_string()))?;
 
-    let before = data_files(&crash, &at(DB).join("tables"));
+    let before = data_files(&crash, &at(DB).join("tables"))?;
+    assert!(!before.is_empty(), "self-check: the flushes' tables");
     let result = config(Arc::new(crash.clone())).open_or_repair(lsm_tree::RepairPolicy::default());
     assert!(
         matches!(result, Err(lsm_tree::Error::ZstdDictMismatch { .. })),
@@ -1002,7 +1006,7 @@ fn open_or_repair_refuses_a_returned_flush_without_its_dictionary() -> lsm_tree:
         result.err()
     );
     assert_eq!(
-        data_files(&crash, &at(DB).join("tables")),
+        data_files(&crash, &at(DB).join("tables"))?,
         before,
         "the flushes' tables stay where they are"
     );
@@ -1065,7 +1069,7 @@ fn a_blob_read_failing_for_no_reason_of_its_bytes_is_not_damage() -> lsm_tree::R
     tree.insert("b", "2", 1);
     tree.flush_active_memtable(0)?;
     let crash = disk.power_loss(tree);
-    let blobs = data_files(&crash, &at(DB).join("blobs"));
+    let blobs = data_files(&crash, &at(DB).join("blobs"))?;
     let Some(first) = blobs.first() else {
         panic!("self-check: the flush wrote a blob file");
     };
@@ -1183,6 +1187,15 @@ fn a_failed_flush_below_a_returned_one_is_set_aside() -> lsm_tree::Result<()> {
     tree.insert("z", "last", 100);
     tree.flush_active_memtable(0)?;
     let crash = disk.power_loss(tree);
+    let tables = at(DB).join("tables");
+    let set_aside = |crash: &CrashFs| -> lsm_tree::Result<usize> {
+        Ok(crash
+            .read_dir(&tables)?
+            .iter()
+            .filter(|entry| entry.file_name.ends_with(".torn-flush"))
+            .count())
+    };
+    assert_eq!(set_aside(&crash)?, 0, "self-check: nothing set aside yet");
 
     let tree = open(Arc::new(crash.clone()))?;
     for i in (0..64u64).step_by(7) {
@@ -1193,6 +1206,12 @@ fn a_failed_flush_below_a_returned_one_is_set_aside() -> lsm_tree::Result<()> {
         );
     }
     assert_eq!(value(&tree, "z")?.as_deref(), Some("last"));
+    // The values above are all the retry's: the failed flush's tables that
+    // survived are set aside under their own names, not taken in.
+    assert!(
+        set_aside(&crash)? > 0,
+        "the failed flush's surviving tables are set aside"
+    );
     Ok(())
 }
 
@@ -1235,6 +1254,13 @@ fn a_whole_failed_flush_is_not_taken_in_beside_its_retry() -> lsm_tree::Result<(
     }
     drop(tree);
     let crash = disk.crash.clone();
+    // The first flush's table, the failed attempt's and the retry's all
+    // reach the reopen.
+    assert_eq!(
+        data_files(&crash, &at(DB).join("tables"))?.len(),
+        3,
+        "self-check: both attempts' tables are on the disk"
+    );
 
     let tree = config(Arc::new(crash)).open()?;
     assert_eq!(value(&tree, "b")?.as_deref(), Some("2"));
@@ -1440,7 +1466,7 @@ fn a_flush_a_repair_left_out_stays_out() -> lsm_tree::Result<()> {
         Err(e) => return Err(e.into()),
     }
     assert_eq!(
-        data_files(&crash, &at(DB).join("tables")),
+        data_files(&crash, &at(DB).join("tables"))?,
         [1, 2],
         "self-check: the later input stayed beside the output"
     );

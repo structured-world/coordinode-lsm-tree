@@ -8,61 +8,20 @@ use super::{
 use std::io::Write as _;
 use std::path::Path;
 
-/// A backend over [`MemFs`] that records each path opened for writing.
-struct WriteOpens {
-    inner: MemFs,
-    opened: parking_lot::Mutex<Vec<std::path::PathBuf>>,
-}
-
-impl Fs for WriteOpens {
-    fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn super::FsFile>> {
-        if opts.write {
-            self.opened.lock().push(path.to_path_buf());
-        }
-        self.inner.open(path, opts)
-    }
-    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
-        self.inner.create_dir_all(path)
-    }
-    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<super::FsDirEntry>> {
-        self.inner.read_dir(path)
-    }
-    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
-        self.inner.remove_file(path)
-    }
-    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
-        self.inner.remove_dir_all(path)
-    }
-    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
-        self.inner.rename(from, to)
-    }
-    fn metadata(&self, path: &Path) -> crate::io::Result<super::FsMetadata> {
-        self.inner.metadata(path)
-    }
-    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
-        self.inner.sync_directory(path)
-    }
-    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
-        self.inner.exists(path)
-    }
-}
-
 /// A synced flush syncs each file it wrote through the handle it was written
 /// through, which reports every writeback error of the file, and opens no
 /// new one for the sync: a table and a blob file are each opened for writing
-/// once. Guards against the sync going through a handle opened after the
-/// write, which reports a writeback error only while the kernel keeps the
-/// file's inode in memory.
+/// once, and synced once, so the sync went through that one handle. Guards
+/// against the sync going through a handle opened after the write, which
+/// reports a writeback error only while the kernel keeps the file's inode in
+/// memory, and against a flush that skips the sync.
 #[test]
 fn a_synced_flush_syncs_through_the_handles_it_wrote_with() -> crate::Result<()> {
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
     use std::sync::Arc;
 
     for separated in [false, true] {
-        let backend = Arc::new(WriteOpens {
-            inner: MemFs::new(),
-            opened: parking_lot::Mutex::new(Vec::new()),
-        });
+        let backend = Arc::new(super::CountingFs::new(Arc::new(MemFs::new())));
         let fs: Arc<dyn Fs> = backend.clone();
         let config = Config::new(
             std::path::absolute("/db")?,
@@ -77,22 +36,23 @@ fn a_synced_flush_syncs_through_the_handles_it_wrote_with() -> crate::Result<()>
             config
         };
         let tree = config.open()?;
-        backend.opened.lock().clear();
+        let before = backend.stats().snapshot();
         tree.insert("a", "a value that goes to a blob file", 0);
         tree.flush_active_memtable(0)?;
 
-        let opened = core::mem::take(&mut *backend.opened.lock());
-        for folder in ["tables", "blobs"] {
-            if folder == "blobs" && !separated {
-                continue;
-            }
-            let files = opened
-                .iter()
-                .filter(|path| path.parent().is_some_and(|parent| parent.ends_with(folder)))
-                .count();
+        let Some(flush) = backend.stats().snapshot().since(&before) else {
+            panic!("the counters only grow");
+        };
+        let mut origins = vec![WriteOrigin::FlushTable];
+        if separated {
+            origins.push(WriteOrigin::FlushBlob);
+        }
+        for origin in origins {
+            let files = flush.origin(origin);
             assert_eq!(
-                files, 1,
-                "one write open of the flush's file in {folder}: {opened:?}"
+                (files.opened, files.syncs),
+                (1, 1),
+                "{origin:?}: one write open, and one sync, of the flush's file"
             );
         }
     }
@@ -129,7 +89,23 @@ fn the_default_batch_syncs_every_target() -> crate::Result<()> {
             mode,
         },
     ];
+    drop(fs.injector().take_syncs());
     fs.sync_many(&targets)?;
+    let synced: Vec<std::path::PathBuf> = fs
+        .injector()
+        .take_syncs()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    let (files, folder) = synced.split_at(synced.len().saturating_sub(1));
+    let mut files = files.to_vec();
+    files.sort();
+    assert_eq!(
+        files,
+        [Path::new("/db/1"), Path::new("/db/2")],
+        "both files are synced, in either order: {synced:?}"
+    );
+    assert_eq!(folder, [Path::new("/db")], "then the folder: {synced:?}");
 
     fs.injector().arm(
         FaultRule::new(
@@ -139,6 +115,117 @@ fn the_default_batch_syncs_every_target() -> crate::Result<()> {
         .once(),
     );
     assert!(fs.sync_many(&targets).is_err(), "the folder's failure");
+    Ok(())
+}
+
+/// A handle whose sync fails at once, or waits until `failed` is set and
+/// records that it synced.
+struct Gated {
+    inner: Box<dyn super::FsFile>,
+    at: usize,
+    fails: bool,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    synced: std::sync::Arc<parking_lot::Mutex<Vec<usize>>>,
+}
+
+impl std::io::Read for Gated {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for Gated {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for Gated {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl super::FsFile for Gated {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.sync_data()
+    }
+    fn sync_data(&self) -> crate::io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.fails {
+            self.failed.store(true, Ordering::SeqCst);
+            return Err(crate::io::Error::other("the first sync fails"));
+        }
+        self.synced.lock().push(self.at);
+        while !self.failed.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Room for the failing sync's worker to record its failure.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        Ok(())
+    }
+    fn metadata(&self) -> crate::io::Result<super::FsMetadata> {
+        self.inner.metadata()
+    }
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.inner.set_len(size)
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+}
+
+/// Once a sync of the batch failed, no file sync starts: the syncs under way
+/// end, and the files no worker had claimed yet are left unsynced. Guards
+/// against a worker that finishes its sync after the failure claiming the
+/// next file and syncing it, against the batch's contract.
+#[test]
+fn no_file_sync_starts_after_a_failure() -> crate::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    const FILES: usize = 18;
+    let memory = MemFs::new();
+    memory.create_dir_all(Path::new("/db"))?;
+    let failed = Arc::new(AtomicBool::new(false));
+    let synced = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let paths: Vec<std::path::PathBuf> = (0..FILES)
+        .map(|at| std::path::PathBuf::from(format!("/db/{at}")))
+        .collect();
+    let mut files = Vec::new();
+    for (at, path) in paths.iter().enumerate() {
+        files.push(Gated {
+            inner: memory.open(path, &FsOpenOptions::new().write(true).create_new(true))?,
+            at,
+            fails: at == 0,
+            failed: Arc::clone(&failed),
+            synced: Arc::clone(&synced),
+        });
+    }
+    let targets: Vec<SyncTarget<'_>> = files
+        .iter()
+        .zip(&paths)
+        .map(|(file, path)| SyncTarget::OpenFile {
+            file,
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::default(),
+        })
+        .collect();
+    assert!(super::sync_each_target(&memory, &targets).is_err());
+    let synced = core::mem::take(&mut *synced.lock());
+    // The workers each claimed one of the first files; the last two were
+    // claimed only after the failure, by a worker done with its sync.
+    assert!(
+        synced.iter().all(|&at| at < FILES - 2),
+        "no sync started after the failure: {synced:?}"
+    );
     Ok(())
 }
 
@@ -294,6 +381,9 @@ struct TwoDevices<F> {
     flushed: parking_lot::Mutex<Vec<std::path::PathBuf>>,
     /// Each device flush (`true`) and rename (`false`), by its path, in order.
     events: parking_lot::Mutex<Vec<(bool, std::path::PathBuf)>>,
+    /// When set, the next device flush fails before it begins: its folder
+    /// does not open.
+    unopened: std::sync::atomic::AtomicBool,
 }
 
 impl<F: Fs> Fs for TwoDevices<F> {
@@ -304,6 +394,18 @@ impl<F: Fs> Fs for TwoDevices<F> {
         self.flushed.lock().push(path.to_path_buf());
         self.events.lock().push((true, path.to_path_buf()));
         Ok(())
+    }
+    fn sync_device_noting(&self, path: &Path) -> Result<(), (crate::io::Error, bool)> {
+        if self
+            .unopened
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err((
+                crate::io::Error::other("the device's folder did not open"),
+                false,
+            ));
+        }
+        self.sync_device(path).map_err(|error| (error, true))
     }
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn super::FsFile>> {
         self.inner.open(path, opts)
@@ -349,6 +451,7 @@ fn barrier_syncs_on_another_device_are_flushed_once() -> crate::Result<()> {
         fast: std::path::PathBuf::from("/fast"),
         flushed: parking_lot::Mutex::new(Vec::new()),
         events: parking_lot::Mutex::new(Vec::new()),
+        unopened: std::sync::atomic::AtomicBool::new(false),
     });
     for folder in ["/db", "/db/blobs", "/fast/tables", "/fast/more"] {
         backend.create_dir_all(Path::new(folder))?;
@@ -411,6 +514,7 @@ fn an_open_flushes_the_device_of_the_flushes_it_takes_in() -> crate::Result<()> 
         fast: fast.clone(),
         flushed: parking_lot::Mutex::new(Vec::new()),
         events: parking_lot::Mutex::new(Vec::new()),
+        unopened: std::sync::atomic::AtomicBool::new(false),
     });
     let fs: Arc<dyn Fs> = backend.clone();
     let open = || {
@@ -459,6 +563,65 @@ fn an_open_flushes_the_device_of_the_flushes_it_takes_in() -> crate::Result<()> 
     assert!(
         flushed < published,
         "the tables' device is flushed before the manifest naming them: {events:?}"
+    );
+    Ok(())
+}
+
+/// A persist of a deferred flush whose tables lie on another device, under
+/// barrier syncs, whose flush of that device fails before it begins (its
+/// folder does not open), leaves the tables to be synced again: the next
+/// persist syncs them, flushes the device and succeeds. Guards against the
+/// tables marked as failed syncs, which fails every persist naming them until
+/// the tree reopens, though no sync of theirs failed.
+#[test]
+fn a_device_flush_that_never_began_leaves_the_files_to_sync_again() -> crate::Result<()> {
+    use crate::config::{FlushDurability, LevelRoute};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let fast = std::path::absolute("/fast")?;
+    let backend = Arc::new(TwoDevices {
+        inner: MemFs::new(),
+        fast: fast.clone(),
+        flushed: parking_lot::Mutex::new(Vec::new()),
+        events: parking_lot::Mutex::new(Vec::new()),
+        unopened: std::sync::atomic::AtomicBool::new(false),
+    });
+    let fs: Arc<dyn Fs> = backend.clone();
+    let tree = Config::new(
+        std::path::absolute("/db")?,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&fs))
+    .table_file_pool(0)
+    .sync_mode(SyncMode::Barrier)
+    .flush_durability(FlushDurability::Deferred)
+    .level_routes(vec![LevelRoute {
+        levels: 0..1,
+        path: fast.clone(),
+        fs: Arc::clone(&fs),
+    }])
+    .open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+
+    backend
+        .unopened
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        tree.persist_flushes().is_err(),
+        "the device's flush did not begin"
+    );
+    backend.flushed.lock().clear();
+    tree.persist_flushes()?;
+    assert!(
+        backend
+            .flushed
+            .lock()
+            .iter()
+            .any(|path| path.starts_with(&fast)),
+        "the retry flushed the tables' device"
     );
     Ok(())
 }
@@ -572,6 +735,13 @@ fn a_writeback_request_refused_on_a_worker_turns_the_requests_off() -> crate::Re
     assert_eq!(writeback.bytes, 0, "the requests are off");
     workers.run();
     writer.flush()?;
+    // The backend's own log, refused requests included: only the first was
+    // made, so the refusal fell on it and no later one followed.
+    assert_eq!(
+        injector.writebacks_for("/db/1"),
+        [(0, 4)],
+        "the first request reached the backend, and no other"
+    );
     let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
     assert_eq!(
         flush.writebacks, 0,

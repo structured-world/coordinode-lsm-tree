@@ -22,6 +22,17 @@ fn a_missing_folder_has_no_mount() {
     assert_eq!(mount_id(Path::new("/proc/no such folder")), None);
 }
 
+/// A relative folder not made yet lies on the working folder's device, as the
+/// same folder spelled from `./` does. Guards against a tree created at a
+/// relative path asking an empty path, which names no device, and opening
+/// without the strategy its disk calls for.
+#[test]
+fn a_missing_relative_folder_lies_on_the_working_folders_device() {
+    let here = block_device(Path::new("."));
+    assert_eq!(block_device(Path::new("no such folder here")), here);
+    assert_eq!(block_device(Path::new("./no such folder here")), here);
+}
+
 /// The active scheduler is the bracketed one, and a device with no
 /// scheduler of its own lists `none` alone: neither is mistaken for BFQ.
 #[test]

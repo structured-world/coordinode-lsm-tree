@@ -550,9 +550,10 @@ pub(crate) fn copy_metadata(
     // just linked, so the checkpoint owes it too: it rides in the version.
     // The checkpoint holds only the tables its version names: no flush above
     // the ones they carry has a table in it. A watermark of 0 leaves no flush
-    // undecided either: an open starts its flush numbers above the highest one
-    // a table of its version carries, so the first manifest it writes decides
-    // every copied flush.
+    // undecided either: the snapshot is written with its watermark raised to
+    // the highest flush a table of its version carries (`Version::encode_into`),
+    // so an open reads every copied flush as decided, and a flush after it
+    // that names one as returned names one at or below the watermark.
     crate::version::persist_version(
         target_root,
         version,

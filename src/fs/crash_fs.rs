@@ -1291,8 +1291,12 @@ impl Fs for CrashFs {
     }
 
     fn sync_device(&self, path: &Path) -> io::Result<()> {
+        self.sync_device_noting(path).map_err(|(error, _)| error)
+    }
+
+    fn sync_device_noting(&self, path: &Path) -> Result<(), (io::Error, bool)> {
         let _namespace = self.namespace.lock();
-        self.inner.sync_device(path)?;
+        self.inner.sync_device_noting(path)?;
         self.state.lock().settle_all();
         Ok(())
     }

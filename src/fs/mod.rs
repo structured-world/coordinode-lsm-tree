@@ -736,16 +736,24 @@ fn sync_side_by_side<F: Fs + ?Sized>(
     }
     let next = core::sync::atomic::AtomicUsize::new(0);
     let failed: parking_lot::Mutex<Option<SyncFailure>> = parking_lot::Mutex::new(None);
+    // Set once a failure is recorded: no sync starts after it.
+    let stop = core::sync::atomic::AtomicBool::new(false);
     let work = || {
         while let Some((at, file)) =
             files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
         {
+            // Checked once the file is claimed, right before its sync: a file
+            // claimed and not synced is left unspent, for the next batch.
+            if stop.load(core::sync::atomic::Ordering::Acquire) {
+                return;
+            }
             if let Err((error, ran)) = file.sync_noting(fs) {
                 let mut failed = failed.lock();
                 let failure = failed.get_or_insert_with(|| SyncFailure::unspent(error));
                 if ran {
                     failure.spent.push(*at);
                 }
+                stop.store(true, core::sync::atomic::Ordering::Release);
                 drop(failed);
                 return;
             }
@@ -970,8 +978,9 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     ///
     /// `None` for backends with no descriptor (in-memory) or where it is not
     /// meaningful. [`Fs::read_blocks_batched`] uses it to submit reads across
-    /// several files to one shared `io_uring` ring; a handle returning `None`
-    /// is read serially instead.
+    /// several files to one shared `io_uring` ring, and [`Fs::sync_many`] to
+    /// sync handles kept open since their writes through one; a handle
+    /// returning `None` is read and synced through its own calls instead.
     fn backing_fd(&self) -> Option<i32> {
         None
     }
@@ -2068,6 +2077,19 @@ pub trait Fs: Send + Sync + 'static {
     fn sync_device(&self, path: &Path) -> io::Result<()> {
         let _ = path;
         Ok(())
+    }
+
+    /// [`Self::sync_device`], telling whether a failure came after the flush
+    /// began: one before it (`path` did not open) flushed nothing and leaves
+    /// what was synced to the device as it was, for a later flush to prove.
+    ///
+    /// The default takes every failure for one of the flush itself.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`Self::sync_device`], with whether the flush began.
+    fn sync_device_noting(&self, path: &Path) -> Result<(), (io::Error, bool)> {
+        self.sync_device(path).map_err(|error| (error, true))
     }
 
     /// Makes every target of `targets` durable, as one call per target would

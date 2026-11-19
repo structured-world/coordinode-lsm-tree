@@ -186,6 +186,10 @@ fn a_flush_a_failed_clear_raced_survives_a_power_loss() -> crate::Result<()> {
 
         let target = tree.clone();
         let injector = fs.clone();
+        // A manifest written while the flush is in flight, its outcome taken
+        // back once the flush returns.
+        let persisted = Arc::new(parking_lot::Mutex::new(None));
+        let outcome = Arc::clone(&persisted);
         tree.tree_config().arm_before_output_install(move || {
             injector.injector().arm(
                 FaultRule::new(FaultOp::Write, Fault::Error(crate::io::ErrorKind::Other))
@@ -193,11 +197,13 @@ fn a_flush_a_failed_clear_raced_survives_a_power_loss() -> crate::Result<()> {
                     .once(),
             );
             assert!(target.clear().is_err(), "self-check: the clear fails");
-            target
-                .persist_flushes()
-                .expect("a manifest written while the flush is in flight");
+            *outcome.lock() = Some(target.persist_flushes());
         });
         tree.flush_active_memtable(0)?;
+        let Some(persisted) = persisted.lock().take() else {
+            panic!("the hook ran before the flush's install");
+        };
+        persisted?;
         assert_eq!(tree.get("b", SeqNo::MAX)?.as_deref(), Some(b"2".as_slice()));
         // The power goes now: the tree, dropped after it, writes nothing more.
         for op in [
@@ -226,6 +232,80 @@ fn a_flush_a_failed_clear_raced_survives_a_power_loss() -> crate::Result<()> {
             "the flush that returned is gone, blob: {blob}"
         );
     }
+    Ok(())
+}
+
+/// A synced flush after a `clear` whose manifest append failed rotates the
+/// manifest before it returns: the record that append left at the end of the
+/// edit log may reach the disk torn, which an open in the default recovery
+/// mode refuses the store over. Guards against the flush returning with only
+/// its tables to describe it, and the open after a power loss refusing the
+/// store it was acknowledged in.
+#[test]
+fn a_flush_after_a_failed_manifest_append_survives_a_power_loss() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs as _, FsOpenOptions};
+    let crash = crate::fs::CrashFs::new(crate::fs::MemFs::new());
+    let config = |fs: Arc<dyn crate::fs::Fs>| {
+        Config::new(
+            "/db",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+    };
+    let fs = Arc::new(FaultFs::new(crash.clone()));
+    let tree = config(fs.clone()).open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+
+    // The clear's append writes its record and fails to sync it.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("edits")
+            .once(),
+    );
+    assert!(tree.clear().is_err(), "self-check: the clear fails");
+    // The kernel writes part of that record back on its own: the log ends
+    // torn on the disk.
+    let log = crash
+        .read_dir(std::path::Path::new("/db"))?
+        .into_iter()
+        .find(|entry| entry.file_name.starts_with("edits-"))
+        .map(|entry| entry.path);
+    let Some(log) = log else {
+        panic!("the manifest has an edit log");
+    };
+    let file = crash.open(&log, &FsOpenOptions::new().write(true))?;
+    let len = file.metadata()?.len;
+    assert!(len > 2, "self-check: the record was written");
+    file.set_len(len - 2)?;
+    file.sync_data()?;
+    drop(file);
+
+    tree.insert("b", "2", 1);
+    tree.flush_active_memtable(0)?;
+    // The power goes now: the tree, dropped after it, writes nothing more.
+    for op in [
+        FaultOp::Open,
+        FaultOp::Write,
+        FaultOp::Rename,
+        FaultOp::SyncDirectory,
+    ] {
+        fs.injector().arm(FaultRule::new(
+            op,
+            Fault::Error(crate::io::ErrorKind::Other),
+        ));
+    }
+    crash.crash();
+    drop(tree);
+
+    let tree = config(Arc::new(crash)).open()?;
+    assert_eq!(tree.get("a", SeqNo::MAX)?.as_deref(), Some(b"1".as_slice()));
+    assert_eq!(
+        tree.get("b", SeqNo::MAX)?.as_deref(),
+        Some(b"2".as_slice()),
+        "the flush that returned"
+    );
     Ok(())
 }
 

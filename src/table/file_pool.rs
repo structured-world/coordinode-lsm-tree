@@ -184,9 +184,13 @@ struct Pools {
 /// Where a table file pool is refilled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RefillOn {
-    /// Off the thread of the write that claims from it, once that write's
-    /// install has synced: no write waits on a batch, and none syncs beside
-    /// one. The default.
+    /// Off the thread of the write that claims from it. Under a scheduler
+    /// that idles for each queue's next request (BFQ) a write holds the
+    /// refill its claim reserves until its install has synced, so none syncs
+    /// beside a batch; elsewhere the refill starts at once. A claim that finds
+    /// the pool dry while a refill fills it starts that refill if it is held,
+    /// its own write's included, and waits for it: a write needing another
+    /// file before its install still gets one. The default.
     #[default]
     Background,
     /// On that thread: the write that starts a batch makes its files, and the
@@ -265,7 +269,7 @@ impl TableFilePools {
         Self::with(ids, batch, sync_mode, false, None)
     }
 
-    /// Pools that refill off the claiming thread: no claim waits on a batch.
+    /// Pools that refill off the claiming thread.
     #[cfg(all(test, feature = "std"))]
     pub(crate) fn refilling_in_background(
         ids: SequenceNumberCounter,

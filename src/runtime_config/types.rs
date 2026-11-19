@@ -1009,7 +1009,10 @@ pub struct RuntimeConfig {
     /// What a flush does on the device under the tree, set from its I/O
     /// scheduler when the tree opens and by
     /// [`crate::IoPolicy::refresh`] when the scheduler changes. A property of
-    /// the host, not of the tree: never written to the manifest.
+    /// the host, not of the tree: never written to the manifest. One per tree,
+    /// from the tree's own folder: a level routed to a volume under another
+    /// scheduler flushes by the tree folder's, which picks only how syncs are
+    /// batched and when a file pool refills, a matter of speed, never of data.
     pub(crate) io: crate::io_policy::IoStrategy,
 }
 

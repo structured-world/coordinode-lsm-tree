@@ -15,6 +15,9 @@ struct Scheduled {
     volume: u64,
     idles: AtomicBool,
     asked: AtomicUsize,
+    /// How often an attach or a refresh asked which backend it is, the last
+    /// call each makes before it takes its location's lock.
+    located: AtomicUsize,
     /// When set, the answer read by the ask with this number (counted from
     /// 1) is held until the gate opens.
     hold: Option<(usize, std::sync::Arc<Gate>)>,
@@ -35,6 +38,7 @@ impl Scheduled {
             volume,
             idles: AtomicBool::new(idles),
             asked: AtomicUsize::new(0),
+            located: AtomicUsize::new(0),
             hold: None,
         }
     }
@@ -59,6 +63,7 @@ impl Fs for Scheduled {
         (self.volume != 0).then_some(self.volume)
     }
     fn backend_id(&self) -> Option<u64> {
+        self.located.fetch_add(1, Ordering::SeqCst);
         Some(0x5c_4ed)
     }
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn FsFile>> {
@@ -252,6 +257,20 @@ fn wait_entered(gate: &Gate) {
     }
 }
 
+/// Waits until attaches and refreshes of `fs` reached their location's lock
+/// `times` times in all, failing the test after a bound, with `gate` opened
+/// for a held ask to finish.
+fn wait_located(fs: &Scheduled, times: usize, gate: &Gate) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fs.located.load(Ordering::SeqCst) < times {
+        if std::time::Instant::now() > deadline {
+            gate.open.store(true, Ordering::SeqCst);
+            panic!("the call never reached its location");
+        }
+        std::thread::yield_now();
+    }
+}
+
 /// Of two refreshes, the trees run what the one that asked last found: a
 /// refresh that read the scheduler before another does not publish its older
 /// answer over the newer one. Guards against trees left on a stale strategy
@@ -278,7 +297,10 @@ fn a_refresh_that_asked_first_does_not_overwrite_a_later_one() {
         let (fs, policy) = (std::sync::Arc::clone(&fs), Arc::clone(&policy));
         std::thread::spawn(move || policy.refresh(&*fs, Path::new("/a")))
     };
-    // Room for the second to run to its end, where it does not wait.
+    // The second has reached the location's lock (the open, the first and
+    // the second refresh each reach it once), and is given room to run to its
+    // end where it does not wait there.
+    wait_located(&fs, 3, &gate);
     std::thread::sleep(std::time::Duration::from_millis(100));
     gate.open.store(true, Ordering::SeqCst);
     assert!(first.join().is_ok_and(|idles| idles));
@@ -315,7 +337,9 @@ fn a_refresh_racing_the_first_attach_reaches_its_tree() {
         );
         std::thread::spawn(move || policy.attach(&*fs, Path::new("/a"), &tree))
     };
-    // Room for the open to run to its end where it does not wait.
+    // The open has reached the location's lock (after the refresh), and is
+    // given room to run to its end where it does not wait there.
+    wait_located(&fs, 2, &gate);
     std::thread::sleep(std::time::Duration::from_millis(100));
     gate.open.store(true, Ordering::SeqCst);
     let returned = refresh.join().is_ok_and(|idles| idles);
@@ -345,9 +369,7 @@ fn a_slow_location_does_not_hold_up_another() {
         let (slow, policy) = (std::sync::Arc::clone(&slow), Arc::clone(&policy));
         std::thread::spawn(move || policy.refresh(&*slow, Path::new("/a")))
     };
-    while !gate.entered.load(Ordering::SeqCst) {
-        std::thread::yield_now();
-    }
+    wait_entered(&gate);
 
     let opened = std::sync::Arc::new(AtomicBool::new(false));
     let other = {

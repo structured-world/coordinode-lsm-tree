@@ -518,10 +518,16 @@ impl<W: Write + Send + 'static> DeferredWriter<W> {
             },
             Sink::Lane(lane, _) => {
                 let mut state = lane.settle();
+                let inner = state.inner.take();
                 if let Some(failed) = &state.failed {
-                    return Err(failed.error());
+                    let error = failed.error();
+                    // Closed here, not by a task still holding the lane: the
+                    // caller may remove the file once this returns.
+                    drop(state);
+                    drop(inner);
+                    return Err(error);
                 }
-                state.inner.take().ok_or_else(gone)
+                inner.ok_or_else(gone)
             }
             Sink::Gone => Err(gone()),
         }
@@ -645,9 +651,11 @@ impl<W: Write + Send + 'static> Drop for DeferredWriter<W> {
     fn drop(&mut self) {
         // As std's buffering writer, what is buffered is written, and a
         // failure has no one to go to; a writer whose write panicked is not
-        // called again. A lane is left idle, so the inner writer is dropped
+        // called again, and none is called while a panic unwinds through the
+        // owner (a second panic there would abort): the file is given up with
+        // the operation. A lane is left idle, so the inner writer is dropped
         // here and not later by a worker, and the caller may remove the file.
-        if !self.panicked {
+        if !self.panicked && !std::thread::panicking() {
             drop(self.hand_over());
         }
         if let Sink::Lane(lane, _) = &self.sink {

@@ -621,14 +621,41 @@ fn fs_read_blocks_batched_short_read_at_eof_errors() -> io::Result<()> {
     Ok(())
 }
 
+/// A std handle shows the descriptor it holds: a batch of syncs through
+/// handles kept open since their writes reaches the ring by it. Guards
+/// against every synced flush on Linux syncing its files on threads of their
+/// own, each an I/O context of its own that BFQ idles between.
 #[test]
-fn fs_file_backing_fd_default_is_none() -> io::Result<()> {
-    // StdFs handles use the trait's default backing_fd (no shared io_uring ring),
-    // so read_blocks_batched reads them serially rather than via a ring.
+#[cfg(unix)]
+fn a_std_file_shows_its_descriptor() -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let dir = tempfile::tempdir()?;
-    let fs = StdFs;
+    let path = dir.path().join("fd.bin");
     let opts = FsOpenOptions::new().write(true).create(true).read(true);
-    let file = fs.open(&dir.path().join("nofd.bin"), &opts)?;
+    let file = StdFs.open(&path, &opts)?;
+    let Some(fd) = file.backing_fd() else {
+        panic!("a std handle holds a descriptor");
+    };
+    // The descriptor names the file the handle opened.
+    let mut stat = core::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fd` is open for the lifetime of `file`; `fstat` writes `stat`.
+    #[expect(unsafe_code, reason = "see safety")]
+    let stat = unsafe {
+        assert_eq!(libc::fstat(fd, stat.as_mut_ptr()), 0);
+        stat.assume_init()
+    };
+    assert_eq!(stat.st_ino as u64, std::fs::metadata(&path)?.ino());
+    Ok(())
+}
+
+/// Off unix a std handle has no descriptor to show.
+#[test]
+#[cfg(not(unix))]
+fn a_std_file_off_unix_shows_no_descriptor() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let file = StdFs.open(&dir.path().join("nofd.bin"), &opts)?;
     assert_eq!(file.backing_fd(), None);
     Ok(())
 }

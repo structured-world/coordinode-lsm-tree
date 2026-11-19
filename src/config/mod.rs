@@ -1207,9 +1207,9 @@ pub struct Config {
     /// [`Config::table_file_pool`].
     pub(crate) table_file_pool: usize,
 
-    /// Where a table file pool refills: off the claiming write's thread once
-    /// its install has synced (the default), or on it, as it does without
-    /// `std`. Set via
+    /// Where a table file pool refills: off the claiming write's thread (the
+    /// default; under BFQ once the write's install has synced, elsewhere at
+    /// once), or on it, as it does without `std`. Set via
     /// [`Config::table_file_refill_inline`].
     pub(crate) table_file_refill: crate::table::file_pool::RefillOn,
 
@@ -3169,8 +3169,9 @@ impl Config {
     }
 
     /// Refills a table file pool on the thread of the write that claims from
-    /// it (`true`), or off it once that write's install has synced (`false`,
-    /// the default). On it, the write that starts a batch makes its files and
+    /// it (`true`), or off it (`false`, the default): under a scheduler that
+    /// idles between queues (BFQ) once that write's install has synced,
+    /// elsewhere at once. On it, the write that starts a batch makes its files and
     /// the install of its table syncs their folder among its own syncs; every
     /// sync the pool issues falls inside one write, so a test that counts an
     /// operation's syncs, or fails one of them, sees the same ones every run.

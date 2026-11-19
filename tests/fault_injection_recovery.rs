@@ -1,12 +1,11 @@
-//! End-to-end crash-recovery test driving the engine through a torn manifest
-//! commit with the fault-injection + crash-simulator backends.
+//! End-to-end crash-recovery test driving the engine through a flush whose
+//! table sync failed, with the fault-injection + crash-simulator backends.
 //!
 //! `FaultFs` makes the table `fsync` of one flush fail; `CrashFs` then
 //! discards what that failed `fsync` never made durable, modelling a power
 //! loss at that instant. Reopening the engine on the post-crash store must
 //! recover to the last durable state: the writes whose flush returned survive,
-//! the one whose flush failed is gone, and recovery itself does not error on
-//! the torn table the failed flush left.
+//! and the one whose flush failed is gone.
 
 use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultOp, FaultRule, MemFs};
 use lsm_tree::io::ErrorKind;
@@ -15,7 +14,7 @@ use std::sync::Arc;
 use test_log::test;
 
 #[test]
-fn flush_with_torn_manifest_commit_recovers_to_last_durable_state() -> lsm_tree::Result<()> {
+fn a_flush_whose_table_sync_failed_recovers_to_last_durable_state() -> lsm_tree::Result<()> {
     // FaultFs (error injection) over CrashFs (durability tracking) over MemFs.
     // The CrashFs handle is cloned so we keep one to trigger crash()/inner()
     // while the tree owns its own (state- and store-sharing) clone.
@@ -50,8 +49,7 @@ fn flush_with_torn_manifest_commit_recovers_to_last_durable_state() -> lsm_tree:
         );
         tree.insert("c", "3", 2);
         // Assert the failure is the ARMED table fsync, not an earlier error:
-        // otherwise the torn-table recovery path below would never be
-        // exercised.
+        // otherwise the recovery below would not follow a failed table sync.
         match tree.flush_active_memtable(0) {
             Ok(_) => panic!("the injected table-sync fault must fail the flush"),
             Err(e) => assert!(

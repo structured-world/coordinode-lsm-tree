@@ -6570,7 +6570,11 @@ impl Tree {
                     params.zstd_dictionaries = config.current_zstd_dictionaries();
                 }
                 // A table whose trailer did not reach the disk does not open;
-                // the flush it belonged to is then not whole.
+                // the flush it belonged to is then not whole. A dictionary it
+                // needs and the open does not hold fails the open on the first
+                // copy found: copies of one id are the same bytes, and the
+                // dictionary is named in checksummed metadata, so every copy
+                // answers alike, and one that differs fails its checksum.
                 let table = match Table::recover(params) {
                     Ok(table) => table,
                     Err(e)
@@ -6827,7 +6831,7 @@ impl Tree {
                 // snapshot could outlast the tables it names.
                 if config.sync_mode == SyncMode::Barrier {
                     crate::version::flush_other_devices(&syncs, (&*config.fs, &config.path))
-                        .map_err(|(error, _)| error)?;
+                        .map_err(|(error, ..)| error)?;
                 }
             }
             log::info!("installing synced flush #{seq} from its tables' own description");

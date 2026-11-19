@@ -1749,19 +1749,21 @@ pub(crate) type FileWriter<W> = deferred::DeferredWriter<W>;
 #[cfg(not(feature = "std"))]
 pub(crate) type FileWriter<W> = FillingBufWriter<W>;
 
-/// The unsynced file `file` writes, open, when `keep` asks for it, once every
-/// byte written reached it: an install that syncs it right after syncs it
-/// through this handle.
+/// The unsynced file `file` writes, once every byte written reached it: open,
+/// when `keep` asks for it, for an install that syncs it right after to sync
+/// it through this handle; closed otherwise.
 ///
 /// # Errors
 ///
-/// The failure of an earlier write of `file`.
+/// The failure of an earlier write of `file`, kept open or not: a file short
+/// of a write is never handed to an install as written.
 #[cfg(feature = "std")]
 pub(crate) fn kept_open(
     keep: bool,
     file: FileWriter<alloc::boxed::Box<dyn crate::fs::FsFile>>,
 ) -> crate::Result<Option<alloc::boxed::Box<dyn crate::fs::FsFile>>> {
-    Ok(if keep { Some(file.finish()?) } else { None })
+    let file = file.finish()?;
+    Ok(keep.then_some(file))
 }
 
 /// Without std an install syncs a file by its path: none is kept open.

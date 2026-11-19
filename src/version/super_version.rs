@@ -115,11 +115,13 @@ fn same_flushed_device(
 /// # Errors
 ///
 /// The error of a flush, with the index in `syncs` of the sync whose device
-/// it was: every sync to that device is then unproven.
+/// it was, and whether the flush began (see [`Fs::sync_device_noting`]): every
+/// sync to a device whose flush began and failed is unproven, while one that
+/// never began left them to a later flush.
 pub(crate) fn flush_other_devices(
     syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)],
     (step_fs, step_path): (&dyn Fs, &Path),
-) -> Result<(), (crate::io::Error, usize)> {
+) -> Result<(), (crate::io::Error, usize, bool)> {
     let step_volume = step_fs.volume_id(step_path);
     let mut flushed: Vec<(&Arc<dyn Fs>, Option<u64>, &Path)> = Vec::new();
     for (at, (fs, target)) in syncs.iter().enumerate() {
@@ -133,7 +135,8 @@ pub(crate) fn flush_other_devices(
         }) {
             continue;
         }
-        fs.sync_device(folder).map_err(|e| (e, at))?;
+        fs.sync_device_noting(folder)
+            .map_err(|(error, began)| (error, at, began))?;
         flushed.push((fs, volume, folder));
     }
     Ok(())
@@ -845,6 +848,13 @@ impl SuperVersions {
             // The floor rides in the version too: lost with it in a crash,
             // together with the flush whose collection raised it.
             NewFiles::Deferred(files) => self.unsynced.extend(files),
+            // An append that failed may have left a torn record at the end of
+            // the edit log, which an open in the default recovery mode refuses
+            // the store over: the flush rotates past it before it returns, as
+            // a manifest-writing install would.
+            NewFiles::SelfDescribed if self.rotation_pending => {
+                self.persist_version(tree_path, &next_version.version, fs, runtime, encryption)?;
+            }
             // The floor rides in the tables' description as well, which an
             // open reads back with them.
             NewFiles::SelfDescribed => {}
@@ -926,7 +936,10 @@ impl SuperVersions {
     }
 
     /// Whether the backend syncs files one at a time (see
-    /// [`Self::serial_syncs`] field), asked once per tree.
+    /// [`Self::serial_syncs`] field), asked once per tree, of its own folder:
+    /// a level routed to a mount that answers otherwise is synced as the tree
+    /// folder's mount asks, which changes how fast the syncs go, not what
+    /// they make durable.
     pub(crate) fn serial_syncs(&mut self, fs: &dyn Fs, tree_path: &Path) -> bool {
         *self
             .serial_syncs
@@ -1051,16 +1064,20 @@ impl SuperVersions {
             }
         }
         if sync_mode == SyncMode::Barrier {
-            // A device whose cache did not flush leaves every barrier sync to
-            // it unproven, the files' as well: each is marked as a failed one.
-            flush_other_devices(&syncs, step).map_err(|(error, failed_at)| {
+            // A device whose cache failed to flush leaves every barrier sync
+            // to it unproven, the files' as well: each is marked as a failed
+            // one. A flush that never began (its folder did not open) asked
+            // the device nothing: the files' syncs consumed no error, and a
+            // later persist syncs them and flushes the device again.
+            flush_other_devices(&syncs, step).map_err(|(error, failed_at, began)| {
                 crate::fs::SyncFailure {
                     error,
                     spent: (0..syncs.len())
                         .filter(|&at| {
-                            syncs
-                                .get(at)
-                                .is_some_and(|(_, target)| target.origin().is_some())
+                            began
+                                && syncs
+                                    .get(at)
+                                    .is_some_and(|(_, target)| target.origin().is_some())
                                 && same_flushed_device(&syncs, at, failed_at)
                         })
                         .collect(),

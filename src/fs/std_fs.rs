@@ -208,6 +208,14 @@ impl FsFile for File {
         super::read_buf::read_each(self, regions)
     }
 
+    /// The descriptor the handle holds: a batch of syncs through handles kept
+    /// open since their writes (a synced flush's) reaches one ring by it.
+    #[cfg(unix)]
+    fn backing_fd(&self) -> Option<i32> {
+        use std::os::unix::io::AsRawFd as _;
+        Some(self.as_raw_fd())
+    }
+
     fn lock_exclusive(&self) -> io::Result<()> {
         sys::lock_exclusive(self).map_err(io::Error::from)
     }
@@ -527,11 +535,18 @@ impl Fs for StdFs {
     }
 
     fn sync_device(&self, path: &Path) -> io::Result<()> {
+        self.sync_device_noting(path).map_err(|(error, _)| error)
+    }
+
+    fn sync_device_noting(&self, path: &Path) -> Result<(), (io::Error, bool)> {
         // `F_FULLFSYNC` flushes the whole drive cache, whatever descriptor of
         // the device it is issued on.
         #[cfg(target_os = "macos")]
         {
-            File::open(path)?.sync_all().map_err(io::Error::from)
+            let device = File::open(path).map_err(|error| (io::Error::from(error), false))?;
+            device
+                .sync_all()
+                .map_err(|error| (io::Error::from(error), true))
         }
         #[cfg(not(target_os = "macos"))]
         {

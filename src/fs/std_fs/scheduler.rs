@@ -44,9 +44,15 @@ pub(super) fn idles_between_queues(folder: &Path) -> bool {
 fn block_device(folder: &Path) -> Option<u64> {
     // A tree being created has no folder yet: its nearest existing ancestor
     // lies on the same mount.
-    let (existing, meta) = folder
-        .ancestors()
-        .find_map(|at| fs::metadata(at).ok().map(|meta| (at, meta)))?;
+    let (existing, meta) = folder.ancestors().find_map(|at| {
+        // The last ancestor of a relative path is empty: the working folder.
+        let at = if at.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            at
+        };
+        fs::metadata(at).ok().map(|meta| (at, meta))
+    })?;
     if let Some(device) = listed_device(meta.dev(), Path::new("/sys/dev/block")) {
         return Some(device);
     }

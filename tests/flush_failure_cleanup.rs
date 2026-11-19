@@ -223,7 +223,12 @@ fn a_flush_whose_table_sync_fails_leaves_none_of_its_tables() -> lsm_tree::Resul
     assert_flush_fails_cleanly(
         &f,
         [FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other)).on_path("tables")],
-        |e| !matches!(e, lsm_tree::Error::InstallOutcomeUnknown(_)),
+        // The armed table sync, and no earlier failure: an injected fault is
+        // the only one, and only a sync of a table is armed.
+        |e| {
+            matches!(e, lsm_tree::Error::Io(io)
+                if io.kind() == ErrorKind::Other && io.to_string().contains("injected fault"))
+        },
     )
 }
 
@@ -350,7 +355,8 @@ fn a_compaction_of_unknown_install_outcome_keeps_its_tables_until_superseded()
     assert_unknown_outcome_keeps_until_superseded(&open(|c| c)?)
 }
 
-/// The same for a blob tree, its blob files with its tables.
+/// The same for a blob tree's tables: the compaction rewrites them and keeps
+/// the blob files they refer to, which it does not rewrite.
 #[test]
 fn a_blob_compaction_of_unknown_install_outcome_keeps_its_files_until_superseded()
 -> lsm_tree::Result<()> {

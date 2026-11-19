@@ -1235,11 +1235,16 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn sync_device(&self, path: &Path) -> io::Result<()> {
+        self.sync_device_noting(path).map_err(|(error, _)| error)
+    }
+
+    /// An injected failure is one of the flush itself.
+    fn sync_device_noting(&self, path: &Path) -> Result<(), (io::Error, bool)> {
         self.injector.note_sync(path, SyncKind::Device);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncDevice, Some(path)) {
-            return Err(fault_error(kind, FaultOp::SyncDevice));
+            return Err((fault_error(kind, FaultOp::SyncDevice), true));
         }
-        self.inner.sync_device(path)
+        self.inner.sync_device_noting(path)
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {

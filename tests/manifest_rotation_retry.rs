@@ -307,12 +307,33 @@ fn a_persist_after_a_rotation_of_unknown_outcome_installs_above_it() -> lsm_tree
                 .skip(1)
                 .once(),
         );
+        let before = table_names(dir.path())?;
         assert!(matches!(
             tree.major_compact(64 * 1024 * 1024, 0),
             Err(lsm_tree::Error::InstallOutcomeUnknown(_))
         ));
         injector.clear();
+        let output: Vec<String> = table_names(dir.path())?
+            .into_iter()
+            .filter(|name| !before.contains(name))
+            .collect();
+        assert!(
+            !output.is_empty(),
+            "self-check: the compaction wrote output"
+        );
         tree.persist_flushes()?;
+        // The persist superseded the uncertain snapshot and removed the
+        // compaction's output it names: a reopen that took that snapshot
+        // would miss a table, so the reads below prove the persist's version
+        // is the one installed.
+        let left: Vec<&String> = output
+            .iter()
+            .filter(|name| dir.path().join("tables").join(name).exists())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "the compaction's output is removed: {left:?}"
+        );
     }
 
     let tree = open(FaultFs::new(StdFs))?;

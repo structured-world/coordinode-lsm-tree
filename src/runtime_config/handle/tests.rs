@@ -20,12 +20,14 @@ fn load_returns_initial_config() {
 #[test]
 fn an_update_keeps_a_strategy_set_while_it_ran() -> crate::Result<()> {
     let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+    let healing = handle.load().auto_heal;
     let bfq = crate::io_policy::IoStrategy::for_scheduler(true);
     handle.try_update(|config| {
         handle.set_io_strategy(bfq);
         config.auto_heal = !config.auto_heal;
     })?;
     assert_eq!(handle.load().io, bfq);
+    assert_eq!(handle.load().auto_heal, !healing, "the caller's edit too");
     Ok(())
 }
 
@@ -36,6 +38,7 @@ fn an_update_keeps_a_strategy_set_while_it_ran() -> crate::Result<()> {
 #[test]
 fn an_update_records_the_snapshot_a_refresh_published_while_it_ran() -> crate::Result<()> {
     let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+    let healing = handle.load().auto_heal;
     let mut held = None;
     handle.try_update(|config| {
         handle.set_io_strategy(crate::io_policy::IoStrategy::for_scheduler(true));
@@ -51,6 +54,11 @@ fn an_update_records_the_snapshot_a_refresh_published_while_it_ran() -> crate::R
         recorded |= core::ptr::eq(snapshot, &raw const *held);
     });
     assert!(recorded, "the write's snapshot is recorded as replaced");
+    assert_eq!(
+        handle.load().auto_heal,
+        !healing,
+        "the caller's edit stands"
+    );
     Ok(())
 }
 

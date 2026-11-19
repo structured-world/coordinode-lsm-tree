@@ -202,15 +202,23 @@ fn a_batch_of_syncs_reaches_the_backend_as_one_and_is_counted() -> crate::io::Re
         "the backend got the batch"
     );
     let snapshot = fs.stats().snapshot();
-    assert_eq!(snapshot.origin(WriteOrigin::FlushTable).syncs, 2);
+    let flush = snapshot.origin(WriteOrigin::FlushTable);
+    assert_eq!(flush.syncs, 2);
+    // Each file was opened for writing twice: once to write it, once by the
+    // backend to sync it by its path.
+    assert_eq!(
+        flush.opened, 4,
+        "the backend's opens for the syncs are counted"
+    );
     assert_eq!(snapshot.directory.syncs, 1);
     Ok(())
 }
 
-/// A failed batch counts a failure for the sync that failed alone, and one
-/// failure when it failed before any sync ran (an open); a target whose
-/// outcome the batch does not tell is not counted, neither as synced nor as
-/// failed. Guards against a batch failure counted on files whose syncs
+/// A failed batch counts a failure for the sync that failed alone; a target
+/// whose outcome the batch does not tell is not counted, neither as synced
+/// nor as failed, and a batch that failed on an open, before any sync ran,
+/// counts no sync at all, as a failed open through the wrapper counts
+/// nothing. Guards against a batch failure counted on files whose syncs
 /// succeeded, or a target never synced counted as synced.
 #[test]
 fn a_failed_batch_counts_the_failure_where_it_was() -> crate::io::Result<()> {
@@ -254,8 +262,8 @@ fn a_failed_batch_counts_the_failure_where_it_was() -> crate::io::Result<()> {
     let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
     assert_eq!(
         (flush.syncs, flush.sync_errors),
-        (2, 2),
-        "a batch failed before any sync counts one failure"
+        (1, 1),
+        "a batch failed on an open counts no sync"
     );
     Ok(())
 }

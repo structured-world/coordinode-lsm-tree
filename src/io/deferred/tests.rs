@@ -725,11 +725,15 @@ fn a_failure_whose_error_panics_when_dropped_leaves_the_lane_released() {
 }
 
 /// A sink that panics in its first write, a while into it, and takes a while
-/// to close.
-struct ClosesSlowly(Arc<AtomicBool>);
+/// to close; `entered` is set once a write starts.
+struct ClosesSlowly {
+    closed: Arc<AtomicBool>,
+    entered: Arc<AtomicBool>,
+}
 
 impl Write for ClosesSlowly {
     fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        self.entered.store(true, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(200));
         panic!("the sink's write");
     }
@@ -742,7 +746,7 @@ impl Write for ClosesSlowly {
 impl Drop for ClosesSlowly {
     fn drop(&mut self) {
         std::thread::sleep(Duration::from_millis(200));
-        self.0.store(true, Ordering::SeqCst);
+        self.closed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -752,17 +756,114 @@ impl Drop for ClosesSlowly {
 #[test]
 fn a_writer_that_panicked_is_closed_before_the_lane_settles() {
     let closed = Arc::new(AtomicBool::new(false));
-    let mut out = DeferredWriter::with_capacity(8, ClosesSlowly(Arc::clone(&closed)), true);
+    let entered = Arc::new(AtomicBool::new(false));
+    let sink = ClosesSlowly {
+        closed: Arc::clone(&closed),
+        entered: Arc::clone(&entered),
+    };
+    let mut out = DeferredWriter::with_capacity(8, sink, true);
     out.use_spawner_now(Arc::new(Threads));
     drop(out.write_all(&[7; 64]));
-    // The worker is inside the write by now, so this call waits on it rather
+    // The worker is inside the write, so the call below waits on it rather
     // than drain the lane itself.
-    std::thread::sleep(Duration::from_millis(50));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never wrote"
+        );
+        std::thread::yield_now();
+    }
     assert!(out.with_inner(|_| ()).is_err(), "the panic fails the file");
     assert!(
         closed.load(Ordering::SeqCst),
         "the writer is closed once the lane settles"
     );
+}
+
+/// A sink whose every write fails, recording when it is closed.
+struct FailsAndCloses(Arc<AtomicBool>);
+
+impl Write for FailsAndCloses {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "the sink is full",
+        ))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for FailsAndCloses {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A finish that returns a write's failure has closed the writer, even when
+/// a task holding the lane has not run yet. Guards against the owner removing
+/// the output while the writer is still open, held by that task.
+#[test]
+fn a_failed_finish_closes_the_writer_before_it_returns() {
+    let closed = Arc::new(AtomicBool::new(false));
+    let workers = Arc::new(Never::default());
+    let mut out = DeferredWriter::with_capacity(8, FailsAndCloses(Arc::clone(&closed)), true);
+    out.use_spawner_now(workers.clone());
+    drop(out.write_all(&[7; 16]));
+    assert!(out.finish().is_err(), "the failed write");
+    assert!(
+        closed.load(Ordering::SeqCst),
+        "the writer is closed once finish returns"
+    );
+    drop(workers);
+}
+
+/// A file not kept open still reports a failure of its last write: what was
+/// buffered goes down before it is closed, and its failure is returned.
+/// Guards against a deferred flush taking a table short of its tail for
+/// written, which the install then syncs by its path and registers.
+#[test]
+fn a_file_not_kept_open_reports_its_failed_write() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, FsOpenOptions, MemFs};
+    use std::path::Path;
+
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    let file = fs.open(
+        Path::new("/db/1"),
+        &FsOpenOptions::new().write(true).create_new(true),
+    )?;
+    let mut out = crate::io::FileWriter::for_file(8, file, true);
+    // Held in the buffer, for the hand-off that closing it makes.
+    out.write_all(&[7; 4])?;
+    fs.injector().arm(FaultRule::new(
+        FaultOp::Write,
+        Fault::Error(crate::io::ErrorKind::StorageFull),
+    ));
+    assert!(
+        crate::io::kept_open(false, out).is_err(),
+        "the failed write is reported"
+    );
+    Ok(())
+}
+
+/// A writer dropped while a panic unwinds through its owner writes nothing
+/// more: a write that panicked too would abort the process. Guards against
+/// the drop handing its buffer to a writer whose write panics.
+#[test]
+fn a_writer_dropped_while_unwinding_writes_nothing() {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let unwound = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+        let mut out = DeferredWriter::with_capacity(8, CountsThenPanics(Arc::clone(&writes)), true);
+        // Held in the buffer, for the drop to hand over, when the owner fails
+        // (the write succeeds, so the assertion panics with it buffered).
+        assert!(out.write_all(&[7; 4]).is_err(), "the owner's own failure");
+    }));
+    assert!(unwound.is_err(), "the owner's panic");
+    assert_eq!(writes.load(Ordering::SeqCst), 0, "nothing was written");
 }
 
 /// A panic of a call on the inner writer (a flush, a seek), which the caller

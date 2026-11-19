@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! A backend that reports [`FsCapabilities::serial_syncs`] gets a flush's
-//! syncs one after another: the files it wrote and the manifest edit naming
-//! them are never synced at the same time. A backend that does not report it
-//! gets them side by side.
+//! A backend that reports [`FsCapabilities::serial_syncs`] gets a synced
+//! flush's file syncs one after another: its table and its blob file are
+//! never synced at the same time. A backend that does not report it gets them
+//! side by side. A synced flush writes no manifest edit, and folder syncs are
+//! not counted here.
 
 use lsm_tree::fs::{Fs, FsCapabilities, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, MemFs};
 use lsm_tree::io;
@@ -189,9 +190,8 @@ impl FsFile for WatchedFile {
     }
 }
 
-/// The most syncs in flight at once during one synced flush of a blob tree
-/// (a blob file, a table and the manifest edit naming them) on a backend
-/// reporting `serial`.
+/// The most file syncs in flight at once during one synced flush of a blob
+/// tree (its blob file and its table) on a backend reporting `serial`.
 fn most_syncs_in_one_flush(serial: bool) -> lsm_tree::Result<usize> {
     let syncs = Arc::new(InFlight {
         meet: !serial,
@@ -224,18 +224,18 @@ fn most_syncs_in_one_flush(serial: bool) -> lsm_tree::Result<usize> {
 }
 
 /// On a backend whose concurrent syncs cost more than serial ones (NTFS), a
-/// flush that synced its files beside its edit took about 20 ms where one
-/// after another took under 1 ms.
+/// flush that synced its files side by side took about 20 ms where one after
+/// another took under 1 ms.
 #[test]
 fn a_flush_syncs_one_file_at_a_time_where_the_backend_asks_for_it() -> lsm_tree::Result<()> {
     assert_eq!(most_syncs_in_one_flush(true)?, 1);
     Ok(())
 }
 
-/// The twin: elsewhere the files and the edit are synced side by side, which
-/// also shows the count above can see two syncs at once.
+/// The twin: elsewhere the table and the blob file are synced side by side,
+/// which also shows the count above can see two syncs at once.
 #[test]
-fn a_flush_syncs_its_files_beside_its_edit_elsewhere() -> lsm_tree::Result<()> {
+fn a_flush_syncs_its_table_and_blob_file_side_by_side_elsewhere() -> lsm_tree::Result<()> {
     assert!(most_syncs_in_one_flush(false)? >= 2);
     Ok(())
 }

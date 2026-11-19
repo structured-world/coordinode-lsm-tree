@@ -562,6 +562,10 @@ pub(crate) fn verify_frames(
             .checked_sub(from)
             .and_then(|len| usize::try_from(len).ok())
             .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+        // A span past the file's end fails its read. The frame index that
+        // names it passed its checksum, so only a file crafted with its
+        // checksums recomputed names one, and the store's own folder is no
+        // boundary an untrusted file crosses.
         Ok(crate::file::read_exact(file, from, len)?)
     };
     // The last start is the data end, not a frame.
