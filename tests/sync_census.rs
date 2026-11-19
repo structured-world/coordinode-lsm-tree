@@ -251,9 +251,15 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
             "dropping the tables a tombstone spans (blob: {blob})"
         );
 
+        // The close appends the edit saying every flush is in the manifest.
+        drop(tree);
+        assert_eq!(
+            census.take(),
+            vec![(Synced::EditLog, SyncKind::FileData)],
+            "closing (blob: {blob})"
+        );
         // A reopen installs what it recovered as a fresh snapshot, so what it
         // serves is durable whatever the syncs before it reported.
-        drop(tree);
         let tree = open(&base, &fs, blob, None);
         assert_eq!(
             census.take(),

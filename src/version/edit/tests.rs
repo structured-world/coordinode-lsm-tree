@@ -62,7 +62,36 @@ fn sample() -> VersionEdit {
         retention_floor: Some(77),
         dicts: None,
         flush_watermark: None,
+        clean_close: false,
     }
+}
+
+/// The clean-close mark round-trips after the watermark, an edit without it
+/// decodes as no clean close, and one claiming it without the watermark it
+/// follows is refused. Guards against an open reading an ordinary edit as a
+/// clean close and skipping the route check after a crash.
+#[test]
+fn the_clean_close_mark_roundtrips_after_the_watermark() {
+    let mut edit = sample();
+    edit.dicts = Some(vec![5]);
+    edit.flush_watermark = Some(42);
+    edit.clean_close = true;
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+    assert_eq!(VersionEdit::decode_payload(&payload).expect("decode"), edit);
+
+    edit.clean_close = false;
+    payload.clear();
+    edit.encode_payload(&mut payload).expect("encode");
+    assert!(
+        !VersionEdit::decode_payload(&payload)
+            .expect("decode")
+            .clean_close
+    );
+
+    edit.flush_watermark = None;
+    edit.clean_close = true;
+    assert!(edit.encode_payload(&mut Vec::new()).is_err());
 }
 
 /// The flush watermark round-trips, and an edit written before it existed

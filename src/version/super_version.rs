@@ -8,7 +8,7 @@ use crate::{
     fs::{Fs, SyncMode},
     memtable::Memtable,
     tree::sealed::SealedMemtables,
-    version::{Version, VersionId, edit_log, persist_version},
+    version::{Version, VersionId, edit_log},
 };
 
 /// Removes `path`, treating an already-absent file as success — a prior crash
@@ -543,6 +543,10 @@ pub struct SuperVersions {
     /// installs record under its write lock.
     released: Arc<crate::blob_tree::released::ReleasedObjects>,
 
+    /// The tree's level routes, as every snapshot a rotation writes records
+    /// them (see [`super::routes`]).
+    routes: Vec<alloc::string::String>,
+
     /// Fired by an install after its seqno is taken and before the version is
     /// persisted, so a test can act inside that window.
     #[cfg(test)]
@@ -605,8 +609,59 @@ impl SuperVersions {
             edit_scratch: Vec::new(),
             filter_budget: None,
             released: Arc::default(),
+            routes: Vec::new(),
             #[cfg(test)]
             before_persist: None,
+        }
+    }
+
+    /// Records `routes`, the tree's level routes as [`super::routes::of`]
+    /// names them, in every snapshot a rotation writes.
+    #[must_use]
+    pub(crate) fn with_routes(mut self, routes: Vec<alloc::string::String>) -> Self {
+        self.routes = routes;
+        self
+    }
+
+    /// Appends the edit a clean close writes once every flush is in the
+    /// manifest: an open whose log ends with it finds no flush beyond what the
+    /// manifest names (see [`super::routes`]). Nothing when the current
+    /// version is not the persisted one, or a rotation is due (the log may end
+    /// in a torn record): that close is not clean.
+    ///
+    /// # Errors
+    ///
+    /// The error of the append; the close then reads as unclean, which only
+    /// makes the next open check its routes.
+    pub(crate) fn record_clean_close(
+        &mut self,
+        tree_path: &Path,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        if self.persisted.id() != self.current.version.id() || self.rotation_pending {
+            return Ok(());
+        }
+        let persisted = &self.persisted;
+        let mut edit = persisted.diff(persisted)?;
+        edit.flush_watermark = Some(self.flush_seqs.decided());
+        edit.retention_floor = Some(persisted.retention_floor());
+        edit.dicts = Some(persisted.dicts().to_vec());
+        edit.clean_close = true;
+        let log_path = edit_log::log_path(tree_path, self.snapshot_id);
+        match edit_log::append_edit(fs, &log_path, &edit, &mut self.edit_scratch, self.sync_mode) {
+            Ok(Some(appended)) => {
+                if let Some(bytes) = &mut self.log_bytes {
+                    *bytes += appended;
+                }
+                Ok(())
+            }
+            // An edit with no change always fits a record.
+            Ok(None) => Ok(()),
+            Err(e) => {
+                self.log_bytes = None;
+                self.rotation_pending = true;
+                Err(e)
+            }
         }
     }
 
@@ -1330,7 +1385,7 @@ impl SuperVersions {
 
         // Rotation: write `next` as a fresh full snapshot and install it.
         let old_snapshot = self.snapshot_id;
-        if let Err(e) = persist_version(
+        if let Err(e) = super::persist_version_with(
             tree_path,
             next,
             &self.comparator_name,
@@ -1339,6 +1394,7 @@ impl SuperVersions {
             encryption,
             sync_mode,
             self.flush_seqs.decided(),
+            &self.routes,
         ) {
             self.rotation_pending = true;
             return Err(e);

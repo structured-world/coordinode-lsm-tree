@@ -294,8 +294,9 @@ impl PinnedVersion {
         // they carry has a table in it, and an open starts its flush numbers
         // above the highest one they carry, so a watermark of 0 leaves no
         // copied flush undecided.
+        // No routes: the open of a restore records its own.
         self.version
-            .encode_into(&mut writer, &self.comparator_name, 0)?;
+            .encode_into(&mut writer, &self.comparator_name, 0, &[])?;
         writer.finish()?;
 
         // Named and versioned first, so a restore refuses a layout of another

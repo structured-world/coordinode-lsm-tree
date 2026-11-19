@@ -7368,7 +7368,7 @@ fn publish_repaired_manifest(
     // metadata to settings it never used. The last live runtime config died with
     // the lost manifest; the config supplied to `repair` is the authoritative
     // replacement.
-    let persisted = crate::version::persist_version(
+    let persisted = crate::version::persist_version_with(
         &config.path,
         &version,
         config.comparator.name(),
@@ -7379,6 +7379,9 @@ fn publish_repaired_manifest(
         // Every flush a table the scan opened carries, kept or left out: the
         // repair decides every table it found.
         highest_flush,
+        // The routes it scanned: every table it found is named, and an open
+        // after it finds no flush elsewhere either way.
+        &crate::version::routes::of(config),
     );
     // The guard stays ARMED until the commit is decided: every fallible
     // `persist_version` step before it installs the snapshot (manifest

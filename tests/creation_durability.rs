@@ -536,11 +536,10 @@ fn an_open_without_a_snapshot_refuses_a_rotated_generations_empty_log() {
         if entry.file_name.starts_with('v') {
             mem.remove_file(&entry.path).expect("lose the snapshot");
         } else if entry.file_name.starts_with("edits-") && entry.file_name != "edits-0" {
-            assert_eq!(
-                mem.metadata(&entry.path).expect("log").len,
-                0,
-                "self-check: the rotated log is empty"
-            );
+            // The close appended its mark; a tree killed before its close
+            // leaves the log empty, as here.
+            mem.truncate_file(&entry.path)
+                .expect("empty the rotated log");
             rotated_logs += 1;
         }
     }

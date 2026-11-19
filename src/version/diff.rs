@@ -121,6 +121,8 @@ impl Version {
             // The history that appends the edit knows it (see
             // `SuperVersions::persist_change`).
             flush_watermark: None,
+            // Only a clean close says it (see `SuperVersions::record_clean_close`).
+            clean_close: false,
         })
     }
 }

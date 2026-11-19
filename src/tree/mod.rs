@@ -6118,7 +6118,8 @@ impl Tree {
             snapshot_id,
             config.manifest_log_rotate_bytes,
             Arc::clone(&flush_seqs),
-        );
+        )
+        .with_routes(crate::version::routes::of(&config));
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
         }
@@ -7000,6 +7001,10 @@ impl Tree {
             .exists(&tree_path.join(crate::file::RESTORE_MARKER_FILE))?;
         #[cfg(not(feature = "std"))]
         let restore = false;
+        // Before any folder is scanned or made: after an unclean shutdown a
+        // flush whose tables lie in a route this open leaves out, or whose
+        // folder is missing, would go unseen and be dropped.
+        crate::version::routes::check(&recovery.routes, recovery.closed_cleanly, config)?;
         if !restore {
             Self::adopt_synced_flushes(&mut recovery, config, tree_id, AdoptFor::Open)?;
         }
@@ -7735,7 +7740,7 @@ impl Tree {
             Self::remove_manifests_but(tree_path, snapshot_id, &config.fs, config.sync_mode)?;
         }
         let version = version.reinstalled();
-        crate::version::persist_version(
+        crate::version::persist_version_with(
             tree_path,
             &version,
             config.comparator.name(),
@@ -7744,6 +7749,7 @@ impl Tree {
             config.encryption.clone(),
             config.sync_mode,
             flush_watermark,
+            &crate::version::routes::of(config),
         )?;
         if renumbered {
             Self::remove_manifests_but(tree_path, version.id(), &config.fs, config.sync_mode)?;

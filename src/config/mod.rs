@@ -2072,8 +2072,8 @@ impl Config {
     ///
     /// # Reopen contract
     ///
-    /// The route configuration is **not persisted** in the manifest.
-    /// On reopen, the [`Config`] must specify `level_routes` such that
+    /// The backends are not persisted: on reopen, the [`Config`] must specify
+    /// `level_routes` such that
     /// [`all_tables_folders`](Self::all_tables_folders) includes every
     /// directory and filesystem pair that may contain existing SST files
     /// for this tree.
@@ -2085,6 +2085,15 @@ impl Config {
     /// tables are on uncovered levels) or
     /// [`Unrecoverable`](crate::Error::Unrecoverable) (when some missing
     /// tables are on levels that are still covered).
+    ///
+    /// Every manifest snapshot records the routes' tables folders, relative
+    /// to the tree's folder, and a clean close records that the manifest
+    /// names every flush. A synced flush is named by no manifest until then,
+    /// so after a crash an open refuses with
+    /// [`MissingRoute`](crate::Error::MissingRoute) while a recorded route is
+    /// not configured or its folder is missing (a volume not mounted): its
+    /// tables could hold a flush that returned. Once the tree closed cleanly,
+    /// a route can be removed.
     ///
     /// # Panics
     ///

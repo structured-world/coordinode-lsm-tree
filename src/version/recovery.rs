@@ -380,6 +380,31 @@ pub(crate) fn parse_flush_watermark_section(mut bytes: &[u8]) -> crate::Result<u
 /// Read strictly, like the sections above: a lost id is a dictionary the tree
 /// stops accounting for, so the tables written against it would fail to open
 /// while its file is left behind as an orphan.
+/// Parses the `routes` section: a `u32` count, then each route as a `u32`
+/// length and that many bytes of UTF-8.
+fn parse_routes_section(mut bytes: &[u8]) -> crate::Result<Vec<alloc::string::String>> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("routes section");
+    let r = &mut bytes;
+    let count = r.read_u32::<LittleEndian>().map_err(|_| ERR)? as usize;
+    // Each route takes at least its length: a count past what the bytes can
+    // hold is refused before anything is reserved for it.
+    if count > r.len() / size_of::<u32>() {
+        return Err(ERR);
+    }
+    let mut routes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = r.read_u32::<LittleEndian>().map_err(|_| ERR)? as usize;
+        let (route, rest) = r.split_at_checked(len).ok_or(ERR)?;
+        let route = core::str::from_utf8(route).map_err(|_| ERR)?;
+        routes.push(route.into());
+        *r = rest;
+    }
+    if !r.is_empty() {
+        return Err(ERR);
+    }
+    Ok(routes)
+}
+
 fn parse_dicts_section(mut bytes: &[u8]) -> crate::Result<Vec<crate::file::DictId>> {
     const ERR: crate::Error = crate::Error::InvalidHeader("dicts section");
     let r = &mut bytes;
@@ -707,6 +732,13 @@ pub(crate) struct Recovery {
     /// names its tables, gone if not. From the snapshot's `flush_watermark`
     /// section (`0` when absent) and overwritten by each edit that carries one.
     pub flush_watermark: u64,
+    /// The level routes of the open that wrote the snapshot, each as its
+    /// tables folder relative to the tree's folder (see
+    /// [`super::routes`]); empty when the snapshot records none.
+    pub routes: Vec<alloc::string::String>,
+    /// Whether the log ends with the edit a clean close appends: every flush
+    /// is in the manifest then, wherever its tables lie.
+    pub closed_cleanly: bool,
 }
 
 impl Recovery {
@@ -809,6 +841,10 @@ impl Recovery {
         if let Some(watermark) = edit.flush_watermark {
             self.flush_watermark = watermark;
         }
+
+        // Only the last edit says it: one after a clean close would be a
+        // flush or a compaction of the tree opened again.
+        self.closed_cleanly = edit.clean_close;
 
         self.curr_version_id = edit.new_version_id;
         Ok(())
@@ -938,6 +974,16 @@ pub(crate) fn recover(
         } else {
             0
         },
+        // Absent from a snapshot of a tree with no routes, or written before
+        // routes were recorded: nothing to check them against.
+        routes: if archive.section("routes").is_some() {
+            parse_routes_section(&archive.read_section("routes")?)?
+        } else {
+            Vec::new()
+        },
+        // A snapshot is written by an open, a rotation or a repair, with the
+        // tree in use; only a clean close's edit after it says otherwise.
+        closed_cleanly: false,
     };
 
     // Replay the incremental edit log layered on top of the snapshot. The log

@@ -30,6 +30,7 @@ pub(crate) mod insert_gate;
 mod optimize;
 mod persist;
 pub(crate) mod recovery;
+pub(crate) mod routes;
 pub(crate) mod run;
 mod super_version;
 #[cfg(test)]
@@ -37,7 +38,9 @@ mod tests;
 
 pub(crate) use blob_file_list::BlobFileList;
 pub(crate) use flush_seqs::FlushSeqs;
-pub(crate) use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
+#[cfg(feature = "std")]
+pub(crate) use persist::persist_version;
+pub(crate) use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version_with};
 pub(crate) use run::Run;
 pub(crate) use super_version::RetentionEffect;
 pub(crate) use super_version::SnapshotRef;
@@ -1516,6 +1519,7 @@ impl Version {
         writer: &mut crate::manifest_blocks::writer::ManifestArchiveWriter,
         comparator_name: &str,
         flush_watermark: u64,
+        routes: &[alloc::string::String],
     ) -> Result<(), crate::Error> {
         use crate::FormatVersion;
         #[cfg(not(feature = "std"))]
@@ -1714,6 +1718,22 @@ impl Version {
         // the flushes above it, so one a table left behind could revive.
         writer.start("flush_watermark")?;
         writer.write_u64::<LittleEndian>(flush_watermark.max(self.highest_flush_seq()))?;
+
+        // The level routes of the open that writes this snapshot, each as its
+        // tables folder relative to the tree's folder (see `routes`): written
+        // only when there are any, so a tree with none encodes as before.
+        if !routes.is_empty() {
+            writer.start("routes")?;
+            writer.write_u32::<LittleEndian>(
+                u32::try_from(routes.len()).map_err(|_| crate::Error::Unrecoverable)?,
+            )?;
+            for route in routes {
+                writer.write_u32::<LittleEndian>(
+                    u32::try_from(route.len()).map_err(|_| crate::Error::Unrecoverable)?,
+                )?;
+                writer.write_all(route.as_bytes())?;
+            }
+        }
 
         Ok(())
     }

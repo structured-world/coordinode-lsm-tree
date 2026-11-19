@@ -21,6 +21,8 @@ fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> R
         dicts: Vec::new(),
         repair_report: None,
         flush_watermark: 0,
+        routes: Vec::new(),
+        closed_cleanly: false,
     }
 }
 

@@ -58,16 +58,18 @@
 //! [dict_count         : u32 LE]            (appended section, see below)
 //!   repeat: id u32 LE
 //! [flush_watermark    : u64 LE]            (appended section, see below)
+//! [clean_close        : u8 = 1]            (appended section, see below)
 //! ```
 //!
-//! The four bracketed sections were appended after the format shipped and are
+//! The five bracketed sections were appended after the format shipped and are
 //! written only when they carry something: the blob frontiers when the list is
 //! non-empty, the retention floor when it changed in this edit, the dictionary
 //! ids when the registered set changed, the flush watermark on every edit the
-//! engine writes now. A payload that ends before any of them decodes as
-//! "absent", so older edit logs replay unchanged.
+//! engine writes now, the clean-close mark on the edit a clean close appends.
+//! A payload that ends before any of them decodes as "absent", so older edit
+//! logs replay unchanged.
 //!
-//! None of the four has a presence marker of its own, so they are positional
+//! None of them has a presence marker of its own, so they are positional
 //! and a later one is written only with every earlier one present: an edit
 //! carrying a retention floor writes the blob section first (a zero count when
 //! empty), and one carrying dictionary ids writes both (the floor re-stated at
@@ -177,10 +179,17 @@ pub(crate) struct VersionEdit {
     /// [`super::FlushSeqs`]), or `None` on an edit written before synced
     /// flushes described themselves. Absolute, as the floor.
     pub flush_watermark: Option<u64>,
+    /// Whether this edit is the one a clean close appends once every flush is
+    /// in the manifest: an open whose log ends with it has no flush to find
+    /// beyond what the manifest names (see [`super::routes`]).
+    pub clean_close: bool,
 }
 
 /// `checksum_type` byte written for XXH3-128 (matches the snapshot encoder).
 const CHECKSUM_TYPE_XXH3: u8 = 0;
+
+/// The byte of the clean-close mark, the fifth appended section.
+const CLEAN_CLOSE: u8 = 1;
 
 impl VersionEdit {
     /// Serializes the edit payload (without the framing header) into `out`.
@@ -203,6 +212,12 @@ impl VersionEdit {
         if self.flush_watermark.is_some() && self.dicts.is_none() {
             return Err(crate::Error::InvalidHeader(
                 "VersionEdit: flush watermark without its dictionary ids",
+            ));
+        }
+        // The clean-close mark is the fifth, after the watermark.
+        if self.clean_close && self.flush_watermark.is_none() {
+            return Err(crate::Error::InvalidHeader(
+                "VersionEdit: clean close without its flush watermark",
             ));
         }
 
@@ -287,6 +302,9 @@ impl VersionEdit {
         }
         if let Some(watermark) = self.flush_watermark {
             out.write_u64::<LittleEndian>(watermark)?;
+        }
+        if self.clean_close {
+            out.write_u8(CLEAN_CLOSE)?;
         }
         Ok(())
     }
@@ -461,6 +479,17 @@ impl VersionEdit {
             Some(watermark)
         };
 
+        // The clean-close mark is the fifth, written only after the
+        // watermark, and only by the edit a clean close appends.
+        let clean_close = if r.is_empty() {
+            false
+        } else {
+            if r.read_u8().map_err(|_| ERR)? != CLEAN_CLOSE {
+                return Err(ERR);
+            }
+            true
+        };
+
         // A well-formed edit consumes its payload exactly. Trailing bytes mean a
         // corrupt / mis-encoded record (format drift, not power loss — the
         // framing checksum already passed), so reject rather than silently
@@ -480,6 +509,7 @@ impl VersionEdit {
             retention_floor,
             dicts,
             flush_watermark,
+            clean_close,
         })
     }
 }

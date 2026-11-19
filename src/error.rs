@@ -392,6 +392,24 @@ pub enum Error {
         found: usize,
     },
 
+    /// After the tree was not closed cleanly, a level route the manifest
+    /// records is not configured, or its tables folder is missing (a volume
+    /// left unmounted).
+    ///
+    /// A synced flush returns with no manifest edit naming its tables, so
+    /// after a crash only the tables describe it: an open without the folder
+    /// they lie in would not see them, and would drop acknowledged data.
+    /// A configuration error, not damage, so
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair) does not
+    /// repair it: configure the route (or mount its volume) and reopen. A
+    /// clean close records every flush in the manifest, after which a route
+    /// can be removed.
+    MissingRoute {
+        /// The route's tables folder, relative to the tree's folder, as the
+        /// manifest records it.
+        folder: String,
+    },
+
     /// Valid configuration / on-disk layout that this build does not
     /// yet know how to process, or constructor input that violates a
     /// documented invariant (e.g. `CompressionType::None` passed to

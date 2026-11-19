@@ -9,7 +9,7 @@ use crate::{
     deletion_pause::DeletionPause,
     runtime_config::handle::RuntimeConfigHandle,
     stop_signal::StopSignal,
-    version::{SuperVersions, Version, persist_version},
+    version::{SuperVersions, Version},
 };
 use alloc::sync::Arc;
 use portable_atomic::AtomicU64;
@@ -385,7 +385,8 @@ impl TreeInner {
         // the Tree's `RuntimeConfigHandle` so the on-disk manifest
         // bytes and the live runtime handle agree on byte zero.
         let initial_runtime = Arc::new(config.initial_runtime_config.clone());
-        persist_version(
+        let routes = crate::version::routes::of(&config);
+        crate::version::persist_version_with(
             &config.path,
             &version,
             config.comparator.name(),
@@ -394,6 +395,7 @@ impl TreeInner {
             config.encryption.clone(),
             config.sync_mode,
             0,
+            &routes,
         )?;
 
         let comparator = config.comparator.clone();
@@ -432,7 +434,8 @@ impl TreeInner {
             snapshot_id,
             config.manifest_log_rotate_bytes,
             Arc::clone(&flush_seqs),
-        );
+        )
+        .with_routes(routes);
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
         }
@@ -541,8 +544,20 @@ impl Drop for TreeInner {
         // it for a flush that never returned. A failure loses nothing: what a
         // deferred flush held is still in the caller's log, and a
         // self-described flush is durable without the manifest.
-        if let Err(e) = self.persist_flushes() {
-            log::warn!("closing tree: could not persist its flushes: {e}");
+        // Once the manifest names every flush, the close says so, and the next
+        // open needs no route of this one to find a flush (see
+        // `version::routes`).
+        match self.persist_flushes() {
+            Ok(()) => {
+                let recorded = self
+                    .version_history
+                    .write()
+                    .record_clean_close(&self.config.path, &*self.config.fs);
+                if let Err(e) = recorded {
+                    log::warn!("closing tree: could not record the clean close: {e}");
+                }
+            }
+            Err(e) => log::warn!("closing tree: could not persist its flushes: {e}"),
         }
 
         // A pool shared by trees that come and go would keep every one's

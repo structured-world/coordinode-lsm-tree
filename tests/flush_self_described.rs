@@ -171,6 +171,89 @@ fn flushes_that_returned_survive_a_power_loss_without_an_edit() -> lsm_tree::Res
     Ok(())
 }
 
+/// [`config`] with level 0 routed to `/fast` on `fs`, or with no route.
+fn routed(fs: Arc<dyn Fs>, route: bool) -> Config {
+    let config = config(fs.clone());
+    if route {
+        config.level_routes(vec![lsm_tree::config::LevelRoute {
+            levels: 0..1,
+            path: at("/fast"),
+            fs,
+        }])
+    } else {
+        config
+    }
+}
+
+/// After a power loss, an open without a level route the tree had refuses,
+/// for a flush that returned may lie there with no manifest naming it; with
+/// the route back, the open takes the flush in. Guards against an open that
+/// does not see a route's tables installing a tree without the data the
+/// flush acknowledged.
+#[test]
+fn an_unclean_open_without_a_route_the_tree_had_refuses() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = routed(disk.fs(), true).open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+
+    let result = routed(Arc::new(crash.clone()), false).open();
+    assert!(
+        matches!(result, Err(lsm_tree::Error::MissingRoute { ref folder }) if folder == "../fast/tables"),
+        "the open without the route refuses: {:?}",
+        result.err()
+    );
+    let tree = routed(Arc::new(crash), true).open()?;
+    assert_eq!(value(&tree, "a")?.as_deref(), Some("1"));
+    Ok(())
+}
+
+/// After a power loss, an open whose route's folder is gone (its volume not
+/// mounted) refuses rather than make the folder anew and miss the flush that
+/// lies there. Guards against a boot that starts the store before its volume
+/// is mounted dropping acknowledged data.
+#[test]
+fn an_unclean_open_with_a_route_folder_missing_refuses() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = routed(disk.fs(), true).open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+
+    // The volume is not mounted: its folder is not there.
+    crash.remove_dir_all(&at("/fast"))?;
+    let result = routed(Arc::new(crash), true).open();
+    assert!(
+        matches!(result, Err(lsm_tree::Error::MissingRoute { .. })),
+        "the open with the route's folder missing refuses: {:?}",
+        result.err()
+    );
+    Ok(())
+}
+
+/// After a clean close the manifest names every flush, so the tree opens
+/// without a route it had. Guards against the route check refusing a tree
+/// that can lose nothing by it.
+#[test]
+fn a_clean_close_lets_a_route_go() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = routed(disk.fs(), true).open()?;
+    drop(tree);
+    let tree = routed(disk.fs(), false).open()?;
+    drop(tree);
+
+    // The same tree after a power loss instead keeps asking for it.
+    let disk = Disk::new();
+    let tree = routed(disk.fs(), true).open()?;
+    let crash = disk.power_loss(tree);
+    assert!(matches!(
+        routed(Arc::new(crash), false).open(),
+        Err(lsm_tree::Error::MissingRoute { .. })
+    ));
+    Ok(())
+}
+
 /// A flush whose table sync fails never returned, and is gone after a power
 /// loss; the flush before it stays, and a later one survives the next power
 /// loss. Guards against an open that serves a table that never reached the
