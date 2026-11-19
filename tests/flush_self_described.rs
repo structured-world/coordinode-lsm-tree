@@ -254,6 +254,83 @@ fn a_clean_close_lets_a_route_go() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// After a power loss a repair run without a route the tree had refuses, as
+/// an open does, and leaves the store as it was. Guards against a repair that
+/// scans only the folders it is given publishing a manifest without the flush
+/// that lies in the route, and without reporting it lost.
+#[test]
+fn an_unclean_repair_without_a_route_the_tree_had_refuses() -> lsm_tree::Result<()> {
+    let disk = Disk::new();
+    let tree = routed(disk.fs(), true).open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+
+    let result = routed(Arc::new(crash.clone()), false).repair();
+    assert!(
+        matches!(result, Err(lsm_tree::Error::MissingRoute { ref folder }) if folder == "../fast/tables"),
+        "the repair without the route refuses: {:?}",
+        result.err()
+    );
+    let tree = routed(Arc::new(crash), true).open()?;
+    assert_eq!(value(&tree, "a")?.as_deref(), Some("1"));
+    Ok(())
+}
+
+/// A repair of a manifest that does not load still refuses while a route its
+/// snapshot records is left out. Guards against a damaged edit log turning
+/// the repair into a rebuild from the configured folders alone, which drops
+/// the flushes that lie in the route.
+#[test]
+fn a_repair_of_a_damaged_manifest_without_a_route_refuses() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::FsOpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let disk = Disk::new();
+    let tree = routed(disk.fs(), true).open()?;
+    tree.insert("a", "1", 0);
+    tree.flush_active_memtable(0)?;
+    // An edit in the log, so there is a committed record to damage.
+    tree.persist_flushes()?;
+    tree.insert("b", "2", 1);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+
+    let log = crash
+        .read_dir(&at(DB))?
+        .into_iter()
+        .find(|entry| entry.file_name.starts_with("edits-"))
+        .map(|entry| at(DB).join(entry.file_name))
+        .expect("an edit log");
+    let len = crash.metadata(&log)?.len;
+    assert!(len > 0, "the edit log holds the edit");
+    let mut file = crash.open(&log, &FsOpenOptions::new().read(true).write(true))?;
+    let at_byte = len / 2;
+    let mut byte = [0u8];
+    file.read_at(&mut byte, at_byte)?;
+    file.seek(SeekFrom::Start(at_byte))?;
+    file.write_all(&[byte[0] ^ 0xFF])?;
+    file.sync_all()?;
+    drop(file);
+    assert!(
+        routed(Arc::new(crash.clone()), true).open().is_err(),
+        "the damaged edit fails the open"
+    );
+
+    let result = routed(Arc::new(crash.clone()), false).repair();
+    assert!(
+        matches!(result, Err(lsm_tree::Error::MissingRoute { ref folder }) if folder == "../fast/tables"),
+        "the repair without the route refuses: {:?}",
+        result.err()
+    );
+    // With the route the repair rebuilds both flushes.
+    routed(Arc::new(crash.clone()), true).repair()?;
+    let tree = routed(Arc::new(crash), true).open()?;
+    assert_eq!(value(&tree, "a")?.as_deref(), Some("1"));
+    assert_eq!(value(&tree, "b")?.as_deref(), Some("2"));
+    Ok(())
+}
+
 /// A flush whose table sync fails never returned, and is gone after a power
 /// loss; the flush before it stays, and a later one survives the next power
 /// loss. Guards against an open that serves a table that never reached the

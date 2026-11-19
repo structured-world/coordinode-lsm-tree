@@ -4203,8 +4203,20 @@ fn sweep_superseded_by_committed_manifest(
         Err(e @ crate::Error::InvalidVersion(_)) => return Err(e),
         // A manifest that does not load cleanly is exactly the case repair
         // exists for: nothing committed to consult, the scan rebuilds from
-        // everything.
-        Err(_) => return Ok(None),
+        // everything. Everything is what the configured folders hold, so a
+        // route the snapshot still records must be among them first: a flush
+        // that returned may lie there. Whether the tree closed cleanly is in
+        // the manifest that does not load, so it is taken as not.
+        Err(_) => {
+            if let Some(routes) = crate::version::recovery::recorded_routes(
+                &config.path,
+                &*config.fs,
+                config.encryption.clone(),
+            )? {
+                crate::version::routes::check(&routes, false, config)?;
+            }
+            return Ok(None);
+        }
     };
 
     // BEFORE anything is removed: a clean manifest's tree type is the
@@ -4231,6 +4243,11 @@ fn sweep_superseded_by_committed_manifest(
             actual: recovery.tree_type,
         });
     }
+
+    // Still before anything is removed, as an open checks it: a flush whose
+    // tables lie in a route this repair leaves out would be neither installed
+    // nor reported lost.
+    crate::version::routes::check(&recovery.routes, recovery.closed_cleanly, config)?;
 
     // The flushes that returned since the manifest last persisted are named
     // by their tables only: an open installs them, so they are not superseded

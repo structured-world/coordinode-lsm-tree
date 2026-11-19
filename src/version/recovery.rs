@@ -545,6 +545,47 @@ pub(crate) fn owed_repair_report(
     }
 }
 
+/// The level routes the installed snapshot of the tree in `folder` records,
+/// read from that one section, so damage elsewhere in the snapshot does not
+/// hide them; `None` when there is no snapshot or the section does not read.
+///
+/// # Errors
+///
+/// Propagates a failure to list the folder, and an environmental failure to
+/// read the snapshot.
+#[cfg(feature = "std")]
+pub(crate) fn recorded_routes(
+    folder: &Path,
+    fs: &dyn Fs,
+    encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+) -> crate::Result<Option<Vec<alloc::string::String>>> {
+    let Some(id) = installed_snapshot(folder, fs)? else {
+        return Ok(None);
+    };
+    let unreadable = |e: crate::Error| {
+        if e.is_environmental() {
+            Err(e)
+        } else {
+            log::warn!("snapshot v{id} cannot say which level routes it records: {e}");
+            Ok(None)
+        }
+    };
+    let mut archive = match open_snapshot(folder, id, fs, encryption) {
+        Ok(archive) => archive,
+        Err(e) => return unreadable(e),
+    };
+    if archive.section("routes").is_none() {
+        return Ok(Some(Vec::new()));
+    }
+    match archive
+        .read_section("routes")
+        .and_then(|bytes| parse_routes_section(&bytes))
+    {
+        Ok(routes) => Ok(Some(routes)),
+        Err(e) => unreadable(e),
+    }
+}
+
 /// A repair report the installed snapshot owes.
 #[cfg(feature = "std")]
 #[derive(Clone, Debug, PartialEq, Eq)]

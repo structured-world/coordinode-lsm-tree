@@ -729,11 +729,16 @@ pub(crate) fn sync_each_target<F: Fs + ?Sized>(
     Ok(())
 }
 
-/// How many failures [`sync_side_by_side`] recorded, each counted once its
-/// stop flag is set: what a test waits on to order a sync after it.
 #[cfg(all(test, feature = "std"))]
-pub(crate) static FAILURES_RECORDED: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    /// The flag a batch [`sync_side_by_side`] runs from this thread sets once
+    /// it recorded a failure and set its stop flag: what a test waits on to
+    /// order a sync after it. Per calling thread, so a batch another test
+    /// runs at the same time does not set it.
+    pub(crate) static FAILURE_RECORDED: core::cell::RefCell<
+        Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+    > = const { core::cell::RefCell::new(None) };
+}
 
 /// Syncs `files`, each with its index in the batch, on threads of their own,
 /// at most a few at once.
@@ -753,6 +758,8 @@ fn sync_side_by_side<F: Fs + ?Sized>(
     let failed: parking_lot::Mutex<Option<SyncFailure>> = parking_lot::Mutex::new(None);
     // Set once a failure is recorded: no sync starts after it.
     let stop = core::sync::atomic::AtomicBool::new(false);
+    #[cfg(test)]
+    let recorded = FAILURE_RECORDED.with_borrow(Clone::clone);
     let work = || {
         while let Some((at, file)) =
             files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
@@ -770,7 +777,9 @@ fn sync_side_by_side<F: Fs + ?Sized>(
                 }
                 stop.store(true, core::sync::atomic::Ordering::Release);
                 #[cfg(test)]
-                FAILURES_RECORDED.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                if let Some(recorded) = &recorded {
+                    recorded.store(true, core::sync::atomic::Ordering::SeqCst);
+                }
                 drop(failed);
                 return;
             }

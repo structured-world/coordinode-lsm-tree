@@ -32,9 +32,18 @@ fn text(path: &Path) -> Cow<'_, str> {
     Cow::Borrowed(path.as_ref())
 }
 
-/// The named parts of `text`, split at either separator.
+/// The separators of a path on this platform: off Windows a backslash is a
+/// character of a name.
+#[cfg(windows)]
+const SEPARATORS: &[char] = &['/', '\\'];
+/// The separators of a path on this platform: off Windows a backslash is a
+/// character of a name.
+#[cfg(not(windows))]
+const SEPARATORS: &[char] = &['/'];
+
+/// The named parts of `text`, split at this platform's separators.
 fn parts(text: &str) -> Vec<&str> {
-    text.split(['/', '\\'])
+    text.split(SEPARATORS)
         .filter(|part| !part.is_empty() && *part != ".")
         .collect()
 }

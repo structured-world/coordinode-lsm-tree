@@ -844,7 +844,7 @@ fn a_file_not_kept_open_reports_its_failed_write() -> crate::Result<()> {
         Fault::Error(crate::io::ErrorKind::StorageFull),
     ));
     assert!(
-        crate::io::kept_open(false, out).is_err(),
+        crate::io::kept_open(false, out, crate::fs::SyncMode::default()).is_err(),
         "the failed write is reported"
     );
     Ok(())

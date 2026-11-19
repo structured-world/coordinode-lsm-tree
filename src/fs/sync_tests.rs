@@ -119,12 +119,12 @@ fn the_default_batch_syncs_every_target() -> crate::Result<()> {
 }
 
 /// A handle whose sync fails at once, or records that it synced and then
-/// waits until the batch has recorded more failures than `recorded_before`.
+/// waits until the batch has recorded the failure (`recorded`).
 struct Gated {
     inner: Box<dyn super::FsFile>,
     at: usize,
     fails: bool,
-    recorded_before: usize,
+    recorded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     synced: std::sync::Arc<parking_lot::Mutex<Vec<usize>>>,
 }
 
@@ -162,7 +162,7 @@ impl super::FsFile for Gated {
         // Ends only once the failure is recorded and the batch's stop flag
         // set, bounded so a batch that never records one fails the test.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while super::FAILURES_RECORDED.load(Ordering::SeqCst) <= self.recorded_before {
+        while !self.recorded.load(Ordering::SeqCst) {
             if std::time::Instant::now() > deadline {
                 return Err(crate::io::Error::other("the failure was never recorded"));
             }
@@ -195,7 +195,8 @@ fn no_file_sync_starts_after_a_failure() -> crate::Result<()> {
     const FILES: usize = 18;
     let memory = MemFs::new();
     memory.create_dir_all(Path::new("/db"))?;
-    let recorded_before = super::FAILURES_RECORDED.load(std::sync::atomic::Ordering::SeqCst);
+    let recorded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    super::FAILURE_RECORDED.set(Some(Arc::clone(&recorded)));
     let synced = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let paths: Vec<std::path::PathBuf> = (0..FILES)
         .map(|at| std::path::PathBuf::from(format!("/db/{at}")))
@@ -206,7 +207,7 @@ fn no_file_sync_starts_after_a_failure() -> crate::Result<()> {
             inner: memory.open(path, &FsOpenOptions::new().write(true).create_new(true))?,
             at,
             fails: at == 0,
-            recorded_before,
+            recorded: Arc::clone(&recorded),
             synced: Arc::clone(&synced),
         });
     }
@@ -220,7 +221,9 @@ fn no_file_sync_starts_after_a_failure() -> crate::Result<()> {
             mode: SyncMode::default(),
         })
         .collect();
-    assert!(super::sync_each_target(&memory, &targets).is_err());
+    let result = super::sync_each_target(&memory, &targets);
+    super::FAILURE_RECORDED.set(None);
+    assert!(result.is_err());
     let synced = core::mem::take(&mut *synced.lock());
     // The workers each claimed one of the first files; the last two were
     // claimed only after the failure, by a worker done with its sync.

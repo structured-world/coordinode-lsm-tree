@@ -5719,7 +5719,7 @@ impl Writer {
                 .with_inner(|file| FsFile::sync_data_with(&**file, sync_mode))??;
             None
         } else {
-            crate::io::kept_open(self.keep_open, checksummed.into_inner())?
+            crate::io::kept_open(self.keep_open, checksummed.into_inner(), self.sync_mode)?
         };
 
         // The folder is not synced here; see `finish`.

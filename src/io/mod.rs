@@ -1761,25 +1761,27 @@ pub(crate) type FileWriter<W> = FillingBufWriter<W>;
 pub(crate) fn kept_open(
     keep: bool,
     file: FileWriter<alloc::boxed::Box<dyn crate::fs::FsFile>>,
+    _sync_mode: crate::fs::SyncMode,
 ) -> crate::Result<Option<alloc::boxed::Box<dyn crate::fs::FsFile>>> {
     let file = file.finish()?;
     Ok(keep.then_some(file))
 }
 
-/// Without std an install syncs a file by its path: none is kept open.
+/// Without std the buffering writer cannot hand its file over, so `file` is
+/// synced through its own handle in `sync_mode` before it closes, and none is
+/// kept open: the install's later sync by path opens a new handle, which does
+/// not report a writeback error of an inode evicted in between.
 ///
 /// # Errors
 ///
-/// None: the signature is the std build's.
+/// The failure of an earlier write of `file`, or of its sync.
 #[cfg(not(feature = "std"))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the same signature as the std build's"
-)]
 pub(crate) fn kept_open(
     _keep: bool,
-    _file: FileWriter<alloc::boxed::Box<dyn crate::fs::FsFile>>,
+    mut file: FileWriter<alloc::boxed::Box<dyn crate::fs::FsFile>>,
+    sync_mode: crate::fs::SyncMode,
 ) -> crate::Result<Option<alloc::boxed::Box<dyn crate::fs::FsFile>>> {
+    file.with_inner(|file| crate::fs::FsFile::sync_data_with(&**file, sync_mode))??;
     Ok(None)
 }
 

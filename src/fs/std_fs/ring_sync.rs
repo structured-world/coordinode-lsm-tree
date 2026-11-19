@@ -33,9 +33,11 @@ std::thread_local! {
     /// work a flush would otherwise pay each time.
     // no-std: unreachable without std (the kernel backend is std-only).
     static RING: RefCell<Option<IoUring>> = const { RefCell::new(None) };
-    /// Whether a ring refused the sync opcode on this thread: a partial
-    /// `io_uring` (a sandboxing runtime) that sets rings up and syncs nothing
-    /// through them. The batches then go another way without asking again.
+    /// Whether this thread gets no ring that syncs: setting one up failed for
+    /// good ([`refuses_setup`]), or a ring refused the sync opcode (a partial
+    /// `io_uring` of a sandboxing runtime, which sets rings up and syncs
+    /// nothing through them). The batches then go another way without asking
+    /// again.
     static NO_RING_SYNC: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
@@ -52,6 +54,14 @@ enum Through {
 /// at all, rather than that the sync failed.
 const fn refuses_sync(errno: i32) -> bool {
     errno == libc::EINVAL || errno == libc::EOPNOTSUPP
+}
+
+/// Whether setting a ring up failed for good on this process: a kernel
+/// without `io_uring` (`ENOSYS`), or one a seccomp filter or the
+/// `kernel.io_uring_disabled` sysctl keeps from it (`EPERM`). Short memory or
+/// descriptors may pass, so they do not count.
+const fn refuses_setup(errno: i32) -> bool {
+    errno == libc::ENOSYS || errno == libc::EPERM
 }
 
 /// What the completions of a batch's syncs say, as they are reaped.
@@ -154,6 +164,11 @@ pub(super) fn sync_on_ring(targets: &[SyncTarget<'_>]) -> Option<Result<(), Sync
                 Ok(ring) => *slot = Some(ring),
                 Err(e) => {
                     log::debug!("no io_uring for a batch of syncs, syncing on threads: {e}");
+                    // The next batch does not ask the kernel again for what
+                    // it will not give.
+                    if e.raw_os_error().is_some_and(refuses_setup) {
+                        NO_RING_SYNC.set(true);
+                    }
                     return None;
                 }
             }
