@@ -3173,6 +3173,39 @@ fn recover_blob_files(
         }
     };
 
+    // A file no recovered table references and no committed manifest names
+    // holds nothing the rebuilt tree can reach, and the reference filter
+    // below drops it whatever it holds. It goes to the post-commit sweep
+    // unread: opening it buys nothing, and a read the environment refuses
+    // (a denied open, a key that is not this tree's) would fail every retry
+    // over a file that can still be removed.
+    let candidates = {
+        let mut kept = Vec::with_capacity(candidates.len());
+        let mut counted: Option<crate::vlog::BlobFileId> = None;
+        for candidate in candidates {
+            let blob_id = candidate.0;
+            if referenced.contains(&blob_id)
+                || committed_checksums.is_some_and(|m| m.contains_key(&blob_id))
+            {
+                kept.push(candidate);
+                continue;
+            }
+            if counted != Some(blob_id) {
+                counted = Some(blob_id);
+                if let Some(p) = &config.recovery_progress {
+                    p.blob_file_discovered();
+                }
+            }
+            discard.push((
+                candidate.1,
+                "referenced by no recovered table and named by no committed manifest; \
+                 removed unread"
+                    .to_string(),
+            ));
+        }
+        kept
+    };
+
     // Sightings of one id are contiguous (the sort keys on id first) and the
     // CANONICAL spelling leads each group. That order is wrong when the leader
     // is damaged: the loop below would salvage it into a fresh id, record that

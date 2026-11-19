@@ -848,6 +848,53 @@ fn a_failed_open_on_a_damaged_returned_flush_fails_again() -> lsm_tree::Result<(
     Ok(())
 }
 
+/// A repair that keeps a damaged returned flush for its scan removes a blob
+/// file no table references and no manifest names without reading it. Guards
+/// against such a file, unreadable but removable, failing every repair once
+/// the sweep that used to remove it unread is skipped for the scan.
+#[test]
+fn a_repair_removes_an_unreadable_orphan_blob_unread() -> lsm_tree::Result<()> {
+    use lsm_tree::io::ErrorKind;
+    use std::io::Write;
+    let disk = Disk::new();
+    let open = |fs| blob_config(fs).table_target_size(1_024);
+    let tree = open(disk.fs()).open()?;
+    tree.insert("a", "old", 0);
+    tree.flush_active_memtable(0)?;
+    tree.persist_flushes()?;
+    let tables = at(DB).join("tables");
+    let damaged = added_by(&disk.crash, &tables, || {
+        tree.insert("a", "x".repeat(512), 1);
+        tree.flush_active_memtable(0).map(drop)
+    })?;
+    assert_eq!(damaged.len(), 1, "self-check: the flush wrote one table");
+    // A later flush, whose tables name the damaged one as returned.
+    tree.insert("b", "2", 2);
+    tree.flush_active_memtable(0)?;
+    let crash = disk.power_loss(tree);
+    damage(&crash, &tables.join(damaged[0].to_string()), 40)?;
+    let orphan = at(DB).join("blobs").join("900");
+    let mut file = crash.open(
+        &orphan,
+        &lsm_tree::fs::FsOpenOptions::new().write(true).create(true),
+    )?;
+    file.write_all(&[0x5A; 4_096])?;
+    file.sync_all()?;
+    drop(file);
+
+    let disk = Disk::over(crash);
+    disk.fs.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path(orphan.to_str().unwrap_or_default()),
+    );
+    open(disk.fs()).repair()?;
+    assert!(
+        !disk.crash.exists(&orphan)?,
+        "the orphan blob file is removed"
+    );
+    Ok(())
+}
+
 /// A flush that failed, below one that returned, is a flush that never
 /// returned: the table of it a power loss kept is set aside, and the open
 /// reads the retry that did return. Guards against an open that takes every
