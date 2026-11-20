@@ -14,9 +14,6 @@ use super::block::{
     decoder::read_leb128, hash_index::Reader as HashIndexReader,
 };
 use crate::io::Cursor;
-#[cfg(not(feature = "std"))]
-use crate::io::VarintWriter;
-use crate::io::WriteBytesExt;
 use crate::io::{LittleEndian, ReadBytesExt};
 use crate::key::InternalKey;
 use crate::table::block::hash_index::{MARKER_CONFLICT, MARKER_FREE};
@@ -24,8 +21,6 @@ use crate::table::util::{SliceIndexes, compare_prefixed_slice};
 use crate::{InternalValue, SeqNo, Slice, ValueType};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use varint_rs::VarintWriter;
 
 impl Decodable<DataBlockParsedItem> for InternalValue {
     fn parse_restart_key<'a>(
@@ -317,6 +312,73 @@ fn block_uses_deltas(items: &[InternalValue], restart_interval: u8) -> bool {
 /// A non-head entry's seqno as stored: the zigzag-encoded wrapping difference
 /// from its restart head's, small in either direction (a later key written
 /// later, an older version of the head's key).
+/// Most bytes an entry's head takes: the type byte, a u64 LEB128 (10 bytes)
+/// and two u16 LEB128s (3 bytes each).
+const ENTRY_HEAD_MAX: usize = 1 + 10 + 3 + 3;
+
+/// An entry's fixed fields, LEB128-encoded on the stack and written to the
+/// block in one call rather than byte by byte.
+struct EntryHead {
+    buf: [u8; ENTRY_HEAD_MAX],
+    len: usize,
+}
+
+impl EntryHead {
+    #[inline]
+    fn new(type_byte: u8) -> Self {
+        let mut buf = [0; ENTRY_HEAD_MAX];
+        buf[0] = type_byte;
+        Self { buf, len: 1 }
+    }
+
+    /// Appends `value` as LEB128. The callers put one u64 and at most two
+    /// u16 values, which `ENTRY_HEAD_MAX` holds.
+    #[inline]
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        reason = "len stays below ENTRY_HEAD_MAX for the fields the callers put; the low 7 bits are kept on purpose"
+    )]
+    fn put(&mut self, mut value: u64) {
+        while value >= 0x80 {
+            self.buf[self.len] = (value as u8) | 0x80;
+            value >>= 7;
+            self.len += 1;
+        }
+        self.buf[self.len] = value as u8;
+        self.len += 1;
+    }
+
+    #[inline]
+    #[expect(clippy::indexing_slicing, reason = "len <= ENTRY_HEAD_MAX")]
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// Writes a value's LEB128 length and its bytes.
+#[inline]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "a u32 takes at most 5 LEB128 bytes; the low 7 bits are kept on purpose"
+)]
+fn write_value<W: crate::io::Write>(writer: &mut W, value: &[u8]) -> crate::Result<()> {
+    #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
+    let mut len = u64::from(value.len() as u32);
+    let mut buf = [0u8; 5];
+    let mut n = 0;
+    while len >= 0x80 {
+        buf[n] = (len as u8) | 0x80;
+        len >>= 7;
+        n += 1;
+    }
+    buf[n] = len as u8;
+    writer.write_all(&buf[..=n])?;
+    writer.write_all(value)?;
+    Ok(())
+}
+
 #[inline]
 fn seqno_delta(seqno: SeqNo, head_seqno: SeqNo) -> u64 {
     #[expect(
@@ -367,19 +429,18 @@ impl Encodable<SeqnoCoding> for InternalValue {
         } else {
             0
         };
-        writer.write_u8(u8::from(self.key.value_type) | flag)?; // 1
-        writer.write_u64_varint(self.key.seqno)?; // 2
+        let mut head = EntryHead::new(u8::from(self.key.value_type) | flag); // 1
+        head.put(self.key.seqno); // 2
         coding.head = self.key.seqno;
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
-        writer.write_u16_varint(self.key.user_key.len() as u16)?; // 3
+        head.put(u64::from(self.key.user_key.len() as u16)); // 3
+        writer.write_all(head.bytes())?;
         writer.write_all(&self.key.user_key)?; // 4
 
         // NOTE: Only write value len + value if we are actually a value
         if !self.is_tombstone() {
-            #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
-            writer.write_u32_varint(self.value.len() as u32)?; // 5
-            writer.write_all(&self.value)?; // 6
+            write_value(writer, &self.value)?; // 5, 6
         }
 
         Ok(())
@@ -395,23 +456,24 @@ impl Encodable<SeqnoCoding> for InternalValue {
         // [value type] [seqno or delta] [shared prefix len] [rest key len] [rest key] [value len] [value]
         // 1            2                3                   4              5          6?          7?
 
-        writer.write_u8(u8::from(self.key.value_type))?; // 1
+        let mut head = EntryHead::new(u8::from(self.key.value_type)); // 1
         let seqno = if coding.deltas {
             seqno_delta(self.key.seqno, coding.head)
         } else {
             self.key.seqno
         };
-        writer.write_u64_varint(seqno)?; // 2
+        head.put(seqno); // 2
 
         // TODO: maybe we can skip this varint altogether if prefix truncation = false
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
-        writer.write_u16_varint(shared_len as u16)?; // 3
+        head.put(u64::from(shared_len as u16)); // 3
 
         let rest_len = self.key().len() - shared_len;
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
-        writer.write_u16_varint(rest_len as u16)?; // 4
+        head.put(u64::from(rest_len as u16)); // 4
+        writer.write_all(head.bytes())?;
 
         #[expect(
             clippy::expect_used,
@@ -427,9 +489,7 @@ impl Encodable<SeqnoCoding> for InternalValue {
 
         // NOTE: Only write value len + value if we are actually a value
         if !self.is_tombstone() {
-            #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
-            writer.write_u32_varint(self.value.len() as u32)?; // 6
-            writer.write_all(&self.value)?; // 7
+            write_value(writer, &self.value)?; // 6, 7
         }
 
         Ok(())
