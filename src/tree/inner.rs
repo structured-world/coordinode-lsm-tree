@@ -178,6 +178,10 @@ pub struct TreeInner {
     /// history, which records in every manifest how far they are decided.
     pub(crate) flush_seqs: Arc<crate::version::FlushSeqs>,
 
+    /// Whether the backend syncs files one at a time, shared with the version
+    /// history and read here without its lock.
+    pub(crate) serial_syncs: Arc<crate::version::SerialSyncs>,
+
     /// Holds the cross-process exclusive directory lock for this tree's
     /// lifetime: the locked `LOCK` file handle acquired by `Config::open` (via
     /// `acquire_directory_lock`). Dropping it on tree close releases the OS
@@ -335,7 +339,7 @@ impl TreeInner {
                 self.config.sync_mode,
                 self.runtime_config.load().io.sync_schedule(
                     false,
-                    self.config.fs.capabilities(&self.config.path).serial_syncs,
+                    self.serial_syncs.get(&*self.config.fs, &self.config.path),
                 ),
                 (&*self.config.fs, &self.config.path),
             )?;
@@ -444,6 +448,7 @@ impl TreeInner {
         #[cfg(feature = "std")]
         let insert_gate = super_versions.insert_gate_handle();
         let l0_runs = super_versions.l0_runs_handle();
+        let serial_syncs = super_versions.serial_syncs();
         #[cfg(feature = "std")]
         if let Some(budget) = &config.write_buffer_budget {
             budget.register(Arc::downgrade(&latest_super_version));
@@ -474,6 +479,7 @@ impl TreeInner {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             flush_seqs,
+            serial_syncs,
             #[cfg(feature = "std")]
             directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),

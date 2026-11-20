@@ -216,14 +216,42 @@ pub(crate) enum UnsyncedFile {
     Blob(crate::vlog::BlobFile),
 }
 
-/// A file a flush wrote, borrowed: what syncing it takes, with the handle it
-/// was written through when the writer kept it open for the sync.
+/// Whether a tree's backend syncs files one at a time
+/// ([`FsCapabilities::serial_syncs`](crate::fs::FsCapabilities::serial_syncs)),
+/// asked once, of the tree's own folder, and read without a lock after: the
+/// backend does not change under a tree. A level routed to a mount that
+/// answers otherwise is synced as the tree folder's mount asks, which changes
+/// how fast the syncs go, not what they make durable.
+#[derive(Default)]
+pub(crate) struct SerialSyncs(once_cell::race::OnceBool);
+
+impl SerialSyncs {
+    /// The answer, asked of `fs` at `tree_path` the first time.
+    pub(crate) fn get(&self, fs: &dyn Fs, tree_path: &Path) -> bool {
+        self.0
+            .get_or_init(|| fs.capabilities(tree_path).serial_syncs)
+    }
+}
+
+/// What the install that syncs a file a flush wrote has of it.
+#[derive(Clone, Copy)]
+pub(crate) enum Written<'a> {
+    /// Nothing: the file closed unsynced and is synced through a new handle.
+    Closed,
+    /// The handle it was written through, kept open for its sync.
+    Open(&'a dyn crate::fs::FsFile),
+    /// Its data, synced through that handle before it closed.
+    Synced,
+}
+
+/// A file a flush wrote, borrowed: what syncing it takes, with what the
+/// install has of it.
 #[derive(Clone, Copy)]
 pub(crate) enum FlushFile<'a> {
     /// A table.
-    Table(&'a crate::Table, Option<&'a dyn crate::fs::FsFile>),
+    Table(&'a crate::Table, Written<'a>),
     /// A blob file.
-    Blob(&'a crate::vlog::BlobFile, Option<&'a dyn crate::fs::FsFile>),
+    Blob(&'a crate::vlog::BlobFile, Written<'a>),
 }
 
 impl<'a> FlushFile<'a> {
@@ -243,10 +271,10 @@ impl<'a> FlushFile<'a> {
         }
     }
 
-    /// The handle the file was written through, kept open for its sync.
-    const fn open(self) -> Option<&'a dyn crate::fs::FsFile> {
+    /// What the install has of the file.
+    const fn written(self) -> Written<'a> {
         match self {
-            Self::Table(_, open) | Self::Blob(_, open) => open,
+            Self::Table(_, written) | Self::Blob(_, written) => written,
         }
     }
 }
@@ -256,8 +284,8 @@ impl UnsyncedFile {
     /// persist that syncs it, which may come much later.
     pub(crate) const fn as_flush_file(&self) -> FlushFile<'_> {
         match self {
-            Self::Table(table) => FlushFile::Table(table, None),
-            Self::Blob(blob_file) => FlushFile::Blob(blob_file, None),
+            Self::Table(table) => FlushFile::Table(table, Written::Closed),
+            Self::Blob(blob_file) => FlushFile::Blob(blob_file, Written::Closed),
         }
     }
 
@@ -456,10 +484,9 @@ pub struct SuperVersions {
     /// version persist this history performs. Immutable for the tree's life.
     sync_mode: SyncMode,
 
-    /// Whether the backend syncs files one at a time
-    /// ([`FsCapabilities::serial_syncs`](crate::fs::FsCapabilities::serial_syncs)),
-    /// asked at the first persist: the backend does not change under a tree.
-    serial_syncs: Option<bool>,
+    /// Whether the backend syncs files one at a time, shared with the tree,
+    /// which reads it without this history's lock.
+    serial_syncs: Arc<SerialSyncs>,
 
     /// The tree's synced-flush numbers: every manifest this history writes
     /// records the highest it decides.
@@ -599,7 +626,7 @@ impl SuperVersions {
             unsynced: Vec::new(),
             comparator_name,
             sync_mode,
-            serial_syncs: None,
+            serial_syncs: Arc::default(),
             flush_seqs,
             snapshot_id,
             log_rotate_bytes,
@@ -950,7 +977,7 @@ impl SuperVersions {
         if !self.unsynced.is_empty() {
             let schedule = runtime
                 .io
-                .sync_schedule(false, self.serial_syncs(fs, tree_path));
+                .sync_schedule(false, self.serial_syncs.get(fs, tree_path));
             // Kept until the persist succeeds. A file whose sync failed fails
             // every later persist naming it (see `Self::sync_unsynced`).
             Self::sync_unsynced(
@@ -990,15 +1017,10 @@ impl SuperVersions {
         Ok(())
     }
 
-    /// Whether the backend syncs files one at a time (see
-    /// [`Self::serial_syncs`] field), asked once per tree, of its own folder:
-    /// a level routed to a mount that answers otherwise is synced as the tree
-    /// folder's mount asks, which changes how fast the syncs go, not what
-    /// they make durable.
-    pub(crate) fn serial_syncs(&mut self, fs: &dyn Fs, tree_path: &Path) -> bool {
-        *self
-            .serial_syncs
-            .get_or_insert_with(|| fs.capabilities(tree_path).serial_syncs)
+    /// The tree's answer to whether its backend syncs files one at a time,
+    /// for the tree to read without this history's lock.
+    pub(crate) fn serial_syncs(&self) -> Arc<SerialSyncs> {
+        Arc::clone(&self.serial_syncs)
     }
 
     /// Syncs `files`, each folder their blob files lie in, and `folders`
@@ -1031,31 +1053,34 @@ impl SuperVersions {
         schedule: crate::io_policy::SyncSchedule,
         step: (&dyn Fs, &Path),
     ) -> Result<(), crate::fs::SyncFailure> {
-        // Every sync, with the backend it goes to.
+        // Every sync, with the backend it goes to. A file whose data was
+        // synced before it closed keeps its place, for the device flush below
+        // and the indices of a failure, but is not synced again.
         let mut syncs: Vec<(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)> = Vec::new();
+        // Whether each sync in `syncs` already ran, by its place.
+        let mut presynced: Vec<bool> = Vec::new();
         let mut named_folders: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
         for file in files {
             let (file_fs, path) = file.location();
             let origin = file.origin();
-            syncs.push((
-                file_fs,
-                match file.open() {
-                    // The handle open since the write reports every writeback
-                    // error; a new one would only while the inode stays in
-                    // memory, and costs an open.
-                    Some(open) => crate::fs::SyncTarget::OpenFile {
-                        file: open,
-                        path,
-                        origin,
-                        mode: sync_mode,
-                    },
-                    None => crate::fs::SyncTarget::FileData {
-                        path,
-                        origin,
-                        mode: sync_mode,
-                    },
+            let target = match file.written() {
+                // The handle open since the write reports every writeback
+                // error; a new one would only while the inode stays in
+                // memory, and costs an open.
+                Written::Open(open) => crate::fs::SyncTarget::OpenFile {
+                    file: open,
+                    path,
+                    origin,
+                    mode: sync_mode,
                 },
-            ));
+                Written::Closed | Written::Synced => crate::fs::SyncTarget::FileData {
+                    path,
+                    origin,
+                    mode: sync_mode,
+                },
+            };
+            presynced.push(matches!(file.written(), Written::Synced));
+            syncs.push((file_fs, target));
             if matches!(file, FlushFile::Blob(..))
                 && let Some(folder) = path.parent()
             {
@@ -1072,6 +1097,7 @@ impl SuperVersions {
                 continue;
             }
             synced_folders.push((fs, folder));
+            presynced.push(false);
             syncs.push((
                 fs,
                 crate::fs::SyncTarget::Folder {
@@ -1084,8 +1110,10 @@ impl SuperVersions {
         // count is the file's.
         if schedule == crate::io_policy::SyncSchedule::OneAtATime {
             // Each target synced on its own, with no batch built around it.
-            for (at, (fs, target)) in syncs.iter().enumerate() {
-                target.sync_at(&***fs, at)?;
+            for (at, ((fs, target), &ran)) in syncs.iter().zip(&presynced).enumerate() {
+                if !ran {
+                    target.sync_at(&***fs, at)?;
+                }
             }
         } else {
             // One batch per backend, in the order the backends are first named.
@@ -1097,10 +1125,14 @@ impl SuperVersions {
                 done.push(fs);
                 let (members, targets): (Vec<usize>, Vec<crate::fs::SyncTarget<'_>>) = syncs
                     .iter()
+                    .zip(&presynced)
                     .enumerate()
-                    .filter(|(_, (on, _))| Arc::ptr_eq(on, fs))
-                    .map(|(at, (_, target))| (at, *target))
+                    .filter(|(_, ((on, _), ran))| Arc::ptr_eq(on, fs) && !**ran)
+                    .map(|(at, ((_, target), _))| (at, *target))
                     .unzip();
+                if targets.is_empty() {
+                    continue;
+                }
                 let synced = if schedule == crate::io_policy::SyncSchedule::Batched {
                     fs.sync_many(&targets)
                 } else {

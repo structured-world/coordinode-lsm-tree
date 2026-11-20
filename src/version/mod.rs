@@ -45,7 +45,8 @@ pub(crate) use run::Run;
 pub(crate) use super_version::RetentionEffect;
 pub(crate) use super_version::SnapshotRef;
 pub(crate) use super_version::{
-    FlushFile, NewFiles, SuperVersion, SuperVersions, UnsyncedFile, flush_other_devices,
+    FlushFile, NewFiles, SerialSyncs, SuperVersion, SuperVersions, UnsyncedFile, Written,
+    flush_other_devices,
 };
 
 use crate::TreeType;

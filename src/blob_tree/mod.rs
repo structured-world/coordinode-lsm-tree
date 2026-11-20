@@ -2756,6 +2756,8 @@ impl AbstractTree for BlobTree {
             let kept = crate::abstract_tree::KeptFiles {
                 tables: written.kept,
                 blobs: kept_blobs,
+                // Each writer kept open, it syncs every file it closes.
+                rest_synced: keep_open,
             };
 
             log::debug!("Flushed memtable(s) in {:?}", start.elapsed());

@@ -266,9 +266,10 @@ fn a_flush_after_a_failed_manifest_append_survives_a_power_loss() -> crate::Resu
     );
     assert!(tree.clear().is_err(), "self-check: the clear fails");
     // The kernel writes part of that record back on its own: the log ends
-    // torn on the disk.
+    // torn on the disk. The folder as the config holds it, which a platform
+    // may have made absolute.
     let log = crash
-        .read_dir(std::path::Path::new("/db"))?
+        .read_dir(&tree.tree_config().path)?
         .into_iter()
         .find(|entry| entry.file_name.starts_with("edits-"))
         .map(|entry| entry.path);

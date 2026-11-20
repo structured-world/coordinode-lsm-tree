@@ -292,6 +292,63 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
     }
 }
 
+/// A synced flush cut into more files than its writers keep open syncs each
+/// file once: a file past the limit is synced through its writing handle
+/// before it closes, and the install does not sync it again. Guards against
+/// the install reopening and syncing every such file a second time.
+#[test]
+fn a_flush_of_many_files_syncs_each_once() {
+    use lsm_tree::fs::Fs as _;
+    for blob in [false, true] {
+        let base = PathBuf::from("/census").join(if blob { "blob" } else { "standard" });
+        let fs = Arc::new(FaultFs::new(MemFs::new()));
+        fs.create_dir_all(&std::path::absolute("/census").expect("absolute path"))
+            .expect("the tree's parent");
+        let config = Config::new(
+            &base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+        .table_file_refill_inline(true)
+        .table_target_size(4 * 1024);
+        let config = if blob {
+            config.with_kv_separation(Some(
+                KvSeparationOptions::default()
+                    .separation_threshold(64)
+                    .file_target_size(4 * 1024),
+            ))
+        } else {
+            config
+        };
+        let tree = config.open().expect("open");
+        let census = Census::new(&base, None, fs.injector());
+        // Enough keys that even a KV-separated index, a few bytes a key, is
+        // cut into more tables than the writers keep open.
+        for i in 0..10_000u64 {
+            tree.insert(format!("key{i:08}"), vec![1u8; 200], i);
+        }
+        census.take();
+        tree.flush_active_memtable(0).expect("flush");
+        let syncs = census.take();
+
+        let tables = tree.table_count();
+        assert!(tables > 16, "self-check: {tables} tables, past the limit");
+        let count = |of: Synced| {
+            syncs
+                .iter()
+                .filter(|(synced, kind)| *synced == of && *kind == SyncKind::FileData)
+                .count()
+        };
+        assert_eq!(count(Synced::Table), tables, "table syncs (blob: {blob})");
+        if blob {
+            let blobs = tree.blob_file_count();
+            assert!(blobs > 16, "self-check: {blobs} blob files, past the limit");
+            assert_eq!(count(Synced::Blob), blobs, "blob file syncs");
+        }
+    }
+}
+
 /// Over a run of flushes the default pool, refilled off the flushing thread
 /// once the flush's install has synced, syncs the tables folder once per
 /// batch, where 33 flushes without a pool sync it 33 times. The first flush

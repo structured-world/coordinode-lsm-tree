@@ -1413,6 +1413,8 @@ impl AbstractTree for Tree {
             let kept = crate::abstract_tree::KeptFiles {
                 tables: written.kept,
                 blobs: Vec::new(),
+                // A writer keeping files open syncs every file it closes.
+                rest_synced: self.config.flush_durability == crate::config::FlushDurability::Synced,
             };
 
             log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
@@ -1555,10 +1557,7 @@ impl AbstractTree for Tree {
                             .unwrap_or(&[])
                             .iter()
                             .any(|blob| blob.meta().total_compressed_bytes >= wb));
-                let backend_serial = self
-                    .version_history
-                    .write()
-                    .serial_syncs(&*self.config.fs, &self.config.path);
+                let backend_serial = self.serial_syncs.get(&*self.config.fs, &self.config.path);
                 let schedule = runtime.io.sync_schedule(started_writeback, backend_serial);
                 let self_described =
                     !tables.is_empty() && tables.iter().all(|table| table.metadata.flush.is_some());
@@ -6128,6 +6127,7 @@ impl Tree {
         #[cfg(feature = "std")]
         let insert_gate = super_versions.insert_gate_handle();
         let l0_runs = super_versions.l0_runs_handle();
+        let serial_syncs = super_versions.serial_syncs();
         #[cfg(feature = "std")]
         if let Some(budget) = &config.write_buffer_budget {
             budget.register(Arc::downgrade(&latest_super_version));
@@ -6151,6 +6151,7 @@ impl Tree {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             flush_seqs,
+            serial_syncs,
             #[cfg(feature = "std")]
             directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),

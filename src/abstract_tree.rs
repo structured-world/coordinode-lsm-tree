@@ -36,23 +36,41 @@ pub struct KeptFiles {
     pub(crate) tables: Vec<(TableId, Box<dyn crate::fs::FsFile>)>,
     /// The blob files', by id.
     pub(crate) blobs: Vec<(crate::vlog::BlobFileId, Box<dyn crate::fs::FsFile>)>,
+    /// Whether every file not kept was synced through the handle it was
+    /// written with before it closed: the writers of a synced flush do so for
+    /// each file past [`crate::fs::KEEP_OPEN_LIMIT`], and without std for
+    /// every file.
+    pub(crate) rest_synced: bool,
 }
 
 impl KeptFiles {
-    /// The handle the table `id` was written through, if kept.
-    pub(crate) fn table(&self, id: TableId) -> Option<&dyn crate::fs::FsFile> {
-        self.tables
-            .iter()
-            .find(|(kept, _)| *kept == id)
-            .map(|(_, file)| &**file)
+    /// What the install has of the table `id`.
+    pub(crate) fn table(&self, id: TableId) -> crate::version::Written<'_> {
+        self.state(
+            self.tables
+                .iter()
+                .find(|(kept, _)| *kept == id)
+                .map(|(_, file)| &**file),
+        )
     }
 
-    /// The handle the blob file `id` was written through, if kept.
-    pub(crate) fn blob(&self, id: crate::vlog::BlobFileId) -> Option<&dyn crate::fs::FsFile> {
-        self.blobs
-            .iter()
-            .find(|(kept, _)| *kept == id)
-            .map(|(_, file)| &**file)
+    /// What the install has of the blob file `id`.
+    pub(crate) fn blob(&self, id: crate::vlog::BlobFileId) -> crate::version::Written<'_> {
+        self.state(
+            self.blobs
+                .iter()
+                .find(|(kept, _)| *kept == id)
+                .map(|(_, file)| &**file),
+        )
+    }
+
+    /// `kept`, the handle of a file if kept, as what the install has of it.
+    fn state<'a>(&self, kept: Option<&'a dyn crate::fs::FsFile>) -> crate::version::Written<'a> {
+        match kept {
+            Some(file) => crate::version::Written::Open(file),
+            None if self.rest_synced => crate::version::Written::Synced,
+            None => crate::version::Written::Closed,
+        }
     }
 }
 
