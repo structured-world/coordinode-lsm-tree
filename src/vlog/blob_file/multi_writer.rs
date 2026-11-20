@@ -11,10 +11,11 @@ use crate::{
     file_accessor::FileAccessor,
     fs::{Fs, SyncMode, WriteOrigin},
     vlog::{
-        ValueHandle,
+        BlobFileId, ValueHandle,
         blob_file::{Inner as BlobFileInner, Metadata},
     },
 };
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::ToString, vec::Vec};
@@ -85,12 +86,25 @@ pub(crate) struct MultiWriter {
     /// every rotated blob writer.
     durability: crate::config::FlushDurability,
 
+    /// Whether every blob writer hands its unsynced file back open, stamped
+    /// on every rotated one.
+    keep_open: bool,
+
+    /// The files the finished blob files were written through, kept open,
+    /// by id.
+    kept: Vec<crate::fs::Kept<BlobFileId>>,
+
     /// `Config::writeback_bytes`, stamped on every rotated blob writer.
     writeback_bytes: u64,
 
     /// Where every file's large values compress their chunks.
     #[cfg(feature = "std")]
     parallel: Option<crate::table::writer::ParallelCompression>,
+
+    /// The workers that write every file's buffers, for a writer that asked
+    /// for them (see [`Self::use_file_workers`]).
+    #[cfg(feature = "std")]
+    file_workers: Option<alloc::sync::Arc<dyn crate::table::writer::CompactionSpawner>>,
 
     /// Dictionary for `ZstdDict` compression, shared across all rotated writers.
     #[cfg(zstd_any)]
@@ -157,6 +171,9 @@ type OwnDictionary = alloc::sync::Arc<crate::compression::ZstdDictionary>;
 #[cfg(not(zstd_any))]
 #[derive(Clone)]
 struct OwnDictionary(core::convert::Infallible);
+
+/// A finished blob file and, when kept, the file it was written through.
+type Landed = (BlobFile, Option<Box<dyn FsFile>>);
 
 /// A parked output: its codec, class, the source of the blocks it copies,
 /// the dictionary of its own it holds, and its writer.
@@ -285,9 +302,13 @@ impl MultiWriter {
             dictionary_classes: crate::config::DictionaryClasses::DEFAULT,
             sync_mode: SyncMode::Normal,
             durability: crate::config::FlushDurability::Synced,
+            keep_open: false,
+            kept: Vec::new(),
             writeback_bytes: 0,
             #[cfg(feature = "std")]
             parallel: None,
+            #[cfg(feature = "std")]
+            file_workers: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -378,6 +399,17 @@ impl MultiWriter {
         self
     }
 
+    /// Hands unsynced blob files back open with
+    /// [`Self::finish_keeping_files`], for an install that syncs them right
+    /// after through those handles: the first [`crate::fs::KEEP_OPEN_LIMIT`],
+    /// the rest closed.
+    #[must_use]
+    pub(crate) fn use_keep_open(mut self, keep_open: bool) -> Self {
+        self.keep_open = keep_open;
+        self.active_writer.keep_open = keep_open;
+        self
+    }
+
     /// Reads the time on the tree's `clock` in every blob file written.
     #[must_use]
     pub(crate) fn use_clock(mut self, clock: Option<Arc<dyn crate::Clock>>) -> Self {
@@ -407,6 +439,26 @@ impl MultiWriter {
             .active_writer
             .use_parallel_compression(parallel.clone());
         self.parallel = parallel;
+        self
+    }
+
+    /// Writes the buffers of every file this writer writes (active +
+    /// rotated) on the workers of `spawner`, the writer's thread going on
+    /// into the next one. For files whose values no worker compresses:
+    /// measured on a flush, buffers written on the pool that also compresses
+    /// cost the flush 3 to 12%, and a quarter less of its time where the
+    /// pool has nothing else to do. No-op when `spawner` is `None`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn use_file_workers(
+        mut self,
+        spawner: Option<alloc::sync::Arc<dyn crate::table::writer::CompactionSpawner>>,
+    ) -> Self {
+        if let Some(spawner) = &spawner {
+            self.active_writer
+                .use_file_workers(alloc::sync::Arc::clone(spawner));
+        }
+        self.file_workers = spawner;
         self
     }
 
@@ -753,8 +805,13 @@ impl MultiWriter {
             .use_writeback_bytes(self.writeback_bytes)
             .use_clock(self.clock.clone());
         w.durability = self.durability;
+        w.keep_open = self.keep_open;
         #[cfg(feature = "std")]
         let mut w = w.use_parallel_compression(self.parallel.clone());
+        #[cfg(feature = "std")]
+        if let Some(spawner) = &self.file_workers {
+            w.use_file_workers(alloc::sync::Arc::clone(spawner));
+        }
         w.set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
         #[cfg(zstd_any)]
         let mut w = w
@@ -839,7 +896,7 @@ impl MultiWriter {
 
     /// Finishes `writer`, whose file records `passthrough`, into the results.
     fn land(&mut self, writer: Writer, passthrough: CompressionType) -> crate::Result<()> {
-        let blob_file = Self::consume_writer(
+        let finished = Self::consume_writer(
             writer,
             passthrough,
             self.descriptor_table.clone(),
@@ -847,12 +904,38 @@ impl MultiWriter {
             #[cfg(zstd_any)]
             &self.zstd_dictionaries,
         )?;
+        let Some((blob_file, kept)) = finished else {
+            return Ok(());
+        };
+        // A file this fails is named by no version: marked deleted, its
+        // handle's drop unlinks it and evicts its descriptor, as a write that
+        // fails at its finish does for the files it finished. Its writing
+        // handle is closed first: an open one keeps the unlink from going
+        // through on Windows.
         // Before the next file takes more room.
-        if let (Some(outputs), Some(file)) = (&self.outputs, &blob_file) {
-            outputs.landed(&*self.fs, file.path())?;
+        if let Some(outputs) = &self.outputs {
+            if let Err(e) = outputs.landed(&*self.fs, blob_file.path()) {
+                drop(kept);
+                blob_file.mark_as_deleted();
+                return Err(e);
+            }
             self.landed += 1;
         }
-        self.results.extend(blob_file);
+        // A file past the limit is synced through the handle it was written
+        // with before it closes: with a descriptor cache nothing else need
+        // hold its inode until the install, and a handle opened after the
+        // inode left memory would not report its writeback error.
+        if let Some(file) = kept
+            && let Some(closing) = crate::fs::keep_open(&mut self.kept, blob_file.id(), file)
+        {
+            let synced = closing.sync_data_with(self.sync_mode);
+            drop(closing);
+            if let Err(e) = synced {
+                blob_file.mark_as_deleted();
+                return Err(e.into());
+            }
+        }
+        self.results.push(blob_file);
 
         Ok(())
     }
@@ -863,7 +946,7 @@ impl MultiWriter {
         descriptor_table: Option<Arc<DescriptorTable>>,
         fs: &Arc<dyn Fs>,
         #[cfg(zstd_any)] zstd_dictionaries: &crate::compression::ZstdDictionaries,
-    ) -> crate::Result<Option<BlobFile>> {
+    ) -> crate::Result<Option<Landed>> {
         if writer.item_count > 0 {
             let blob_file_id = writer.blob_file_id;
             let path = writer.path.clone();
@@ -883,7 +966,7 @@ impl MultiWriter {
 
             // A failed finish (the last block's compression, a write, the
             // sync) leaves a partial file no handle will ever own.
-            let (metadata, checksum, frames) = match writer.finish() {
+            let (metadata, checksum, frames, kept) = match writer.finish_keeping_file() {
                 Ok(finished) => finished,
                 Err(e) => {
                     if let Err(remove) = fs.remove_file(&path) {
@@ -1003,7 +1086,7 @@ impl MultiWriter {
                 background_deleter: once_cell::race::OnceBox::new(),
             }));
 
-            Ok(Some(blob_file))
+            Ok(Some((blob_file, kept)))
         } else {
             log::debug!(
                 "Blob file writer at {} has written no data, deleting empty blob file",
@@ -1160,7 +1243,30 @@ impl MultiWriter {
         self.written(at, size)
     }
 
-    pub(crate) fn finish(mut self) -> crate::Result<Vec<BlobFile>> {
+    /// Whether any value went to a file: without one, finishing only removes
+    /// the empty files, with no frame left to compress.
+    pub(crate) fn holds_values(&self) -> bool {
+        !self.results.is_empty()
+            || self.active_writer.item_count > 0
+            || self
+                .parked
+                .iter()
+                .any(|(_, _, _, _, writer)| writer.item_count > 0)
+    }
+
+    pub(crate) fn finish(self) -> crate::Result<Vec<BlobFile>> {
+        Ok(self.finish_keeping_files()?.0)
+    }
+
+    /// [`Self::finish`], with the files written through a handle kept open
+    /// for their sync (see [`Self::use_keep_open`]), by id.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::finish`].
+    pub(crate) fn finish_keeping_files(
+        mut self,
+    ) -> crate::Result<(Vec<BlobFile>, Vec<crate::fs::Kept<BlobFileId>>)> {
         let mut writers = core::iter::once((self.passthrough_compression, self.active_writer))
             .chain(
                 self.parked
@@ -1168,7 +1274,7 @@ impl MultiWriter {
                     .map(|(codec, _, _, _, writer)| (codec, writer)),
             );
         while let Some((passthrough, writer)) = writers.next() {
-            match Self::consume_writer(
+            let consumed = match Self::consume_writer(
                 writer,
                 passthrough,
                 self.descriptor_table.clone(),
@@ -1176,7 +1282,23 @@ impl MultiWriter {
                 #[cfg(zstd_any)]
                 &self.zstd_dictionaries,
             ) {
-                Ok(blob_file) => self.results.extend(blob_file),
+                Ok(None) => Ok(()),
+                Ok(Some((blob_file, kept))) => {
+                    let closing = kept.and_then(|file| {
+                        crate::fs::keep_open(&mut self.kept, blob_file.id(), file)
+                    });
+                    self.results.push(blob_file);
+                    // Synced before it closes, as in `land`.
+                    closing.map_or(Ok(()), |closing| {
+                        closing
+                            .sync_data_with(self.sync_mode)
+                            .map_err(crate::Error::from)
+                    })
+                }
+                Err(e) => Err(e),
+            };
+            match consumed {
+                Ok(()) => {}
                 Err(e) => {
                     // The write as a whole failed, so no version will ever name
                     // the files finished so far: marked deleted, their handles'
@@ -1224,6 +1346,6 @@ impl MultiWriter {
                 outputs.landed(&*self.fs, file.path())?;
             }
         }
-        Ok(self.results)
+        Ok((self.results, self.kept))
     }
 }

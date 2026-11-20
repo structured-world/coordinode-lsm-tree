@@ -213,6 +213,57 @@ matching entry (and add one for a new subsystem).
   `src/version/super_version.rs` (tests `tests/table_file_pool.rs`,
   `tests/sync_census.rs`).
 
+- **A synced flush writes no manifest edit: its tables describe themselves,
+  and an open installs every whole flush the manifest has not decided.**
+  A synced flush takes a number, writes it into each of its tables with the
+  table's place in the run (the last one also the run's length, and the
+  retention floor the flush raised, if any), and returns once its tables, its
+  blob files and their folders are synced; it is then installed in memory
+  only. Every manifest snapshot and edit records the flush watermark, the
+  highest number whose outcome it decides: a flush up to it is in the tree if
+  the manifest names its tables, gone if not (a compaction consumed it, a clear
+  dropped it). The flush being written stays above every watermark written
+  meanwhile, except a clear's, which decides it, since the clear drops what it
+  writes. On open, the tables of the level-0 folder above the watermark are
+  read and grouped by flush; a flush is installed when every place of its run
+  is present and every data and filter block of it reads, and every frame of
+  every blob file its tables refer to that the manifest does not already name
+  checks, with or without `std`. Each flush's tables also name the last flush
+  that had returned when it began, so the flushes above the watermark known to
+  have returned are the ones some table names. One of those that does not read
+  whole, or of which no table is found, was lost to the medium after it
+  returned, and the open fails before it renames any file: with `DamagedFlush`,
+  which `open_or_repair` repairs, when the bytes prove the damage (a table of
+  its run missing beside others found, a table or blob file that does not read
+  for a reason its bytes decide), and with `Unrecoverable` when no table of it
+  is found or a dictionary the tree does not hold keeps one from reading, since
+  the configuration may be what is wrong. A repair keeps its tables, and every
+  blob file, for its scan, and reports
+  a flush with no table found as an unscopable loss. Any other flush that does
+  not read whole failed, or is the latest, which returned or not, nothing names
+  yet: it is taken for one a power loss cut short, as a log's torn tail is, and
+  the tables of it that open are set aside as `{id}.torn-flush`, which an open
+  still reads for the flushes they name as returned, so an open or repair
+  retried after one that failed finds the same evidence. Flushes run one at a
+  time, so a flush that a later one began after without naming it as returned
+  failed: it is set aside even when whole, since a retry wrote its memtables
+  again and taking both in would hold their entries twice. A table that
+  does not open carries no flush mark to tie it to a flush, and goes as any
+  file no manifest names does. So damage to the latest flush before a later
+  one names it is not told from a cut-short flush. The open then records a
+  watermark past every flush it found, installed or not, before the tree
+  flushes again, so a table left behind never joins a later flush. A tree
+  that closes, and `persist_flushes`, name the self-described tables in the
+  manifest, so a reopen that misses one refuses it. A persist after a rotation
+  that failed installs under the id that rotation took, so the snapshot it may
+  have left never sits above the one written. A backend reporting
+  `FsCapabilities::serial_syncs` (Windows, where two syncs at once cost more
+  than one after another) syncs a flush's files one at a time. Enforced in
+  `src/tree/mod.rs`, `src/version/flush_seqs.rs` and
+  `src/version/super_version.rs` (tests `tests/flush_self_described.rs`,
+  `tests/serial_syncs.rs`, `src/tree/clear_race_tests.rs`,
+  `tests/manifest_rotation_retry.rs`).
+
 - **Every file the engine opens for writing names what it is written for.**
   The open options carry a `WriteOrigin`, so a counting backend the caller
   gives the tree charges each byte, write call and sync to one origin and none

@@ -264,6 +264,95 @@ fn a_frame_index_off_the_data_section_is_unrecoverable() -> crate::Result<()> {
     Ok(())
 }
 
+/// A frame the index marks as a chunk though no head before it lists one is
+/// refused: skipped as a chunk, it would never be read, and the check would
+/// pass a file whose frame there is damaged. Guards against an index whose
+/// marks and heads disagree reaching the open unchecked.
+#[test]
+fn a_chunk_mark_no_head_lists_fails_the_frame_check() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::one_frame_each(&path, 7, 0, &crate::fs::StdFs)?;
+    writer.write(b"a", 1, &[b'x'; 64])?;
+    writer.write(b"b", 2, &[b'y'; 64])?;
+    writer.finish()?;
+
+    let mut file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let (_, frames) = read_meta_and_frames(&mut file, 7)?;
+    verify_frames(&*file, &frames)?;
+    drop(file);
+
+    // The second frame stays whole, and an index marks it as a chunk of
+    // nothing: only the mark can fail the check.
+    let orphan = blob_file::writer::FrameIndex::new(frames.to_vec(), alloc::vec![1 << 1]);
+
+    let file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    assert!(
+        verify_frames(&*file, &orphan).is_err(),
+        "a marked frame no head lists is refused"
+    );
+    Ok(())
+}
+
+/// An index that holds no frame, or that ends before the chunks its head
+/// lists, is refused rather than checked as far as it goes. Guards against a
+/// head whose chunks the index lost passing the frame check unread.
+#[test]
+fn an_index_short_of_its_frames_fails_the_frame_check() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("7");
+    let mut writer = blob_file::writer::Writer::one_frame_each(&path, 7, 0, &crate::fs::StdFs)?;
+    // Past the default chunk size: a head and its chunks.
+    writer.write(b"a", 1, &alloc::vec![b'x'; 600 * 1024])?;
+    writer.finish()?;
+
+    let mut file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let (_, frames) = read_meta_and_frames(&mut file, 7)?;
+    verify_frames(&*file, &frames)?;
+    let [head, first_chunk, ..] = frames[..] else {
+        panic!("self-check: a head and its chunks");
+    };
+
+    let empty = blob_file::writer::FrameIndex::new(Vec::new(), Vec::new());
+    assert!(
+        matches!(
+            verify_frames(&*file, &empty),
+            Err(crate::Error::InvalidHeader("BlobFile"))
+        ),
+        "an index without a frame"
+    );
+    let Some(&end) = frames.last() else {
+        panic!("self-check: the data end");
+    };
+    let sentinel_only = blob_file::writer::FrameIndex::new(alloc::vec![end], Vec::new());
+    assert!(
+        matches!(
+            verify_frames(&*file, &sentinel_only),
+            Err(crate::Error::InvalidHeader("BlobFile"))
+        ),
+        "an index of the data end alone"
+    );
+    // The head's first chunk not marked as one: a reader would take it for a
+    // frame of its own.
+    let unmarked = blob_file::writer::FrameIndex::new(frames.to_vec(), Vec::new());
+    assert!(
+        matches!(
+            verify_frames(&*file, &unmarked),
+            Err(crate::Error::InvalidHeader("BlobFile"))
+        ),
+        "a listed chunk the index does not mark"
+    );
+    let headless = blob_file::writer::FrameIndex::new(alloc::vec![head, first_chunk], Vec::new());
+    assert!(
+        matches!(
+            verify_frames(&*file, &headless),
+            Err(crate::Error::InvalidHeader("BlobFile"))
+        ),
+        "an index ending before the head's chunks"
+    );
+    Ok(())
+}
+
 /// The views a tight-space relocation restricts a blob file to one after
 /// another punch only above what the view before finished, from the aligned
 /// edge under it, instead of the whole relocated prefix on every slice.

@@ -1097,6 +1097,16 @@ fn fail_next_commit(injector: &lsm_tree::fs::FaultInjector) {
     );
 }
 
+/// Fails the next flush before its table is durable, as a power loss right
+/// after it would: a flush writes no manifest commit of its own.
+fn fail_next_flush(injector: &lsm_tree::fs::FaultInjector) {
+    injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+}
+
 /// A crash between publishing a borrowed reference and dropping its owner, at
 /// either end, loses no object and leaks none: reachability is what the
 /// durable tables say, and the accounting rebuilt from them still charges the
@@ -1120,7 +1130,7 @@ fn an_interrupted_publication_loses_and_leaks_no_object() -> lsm_tree::Result<()
             1,
         )?;
         drop(row);
-        fail_next_commit(&injector);
+        fail_next_flush(&injector);
         assert!(tree.flush_active_memtable(0).is_err());
     }
     crash.crash();

@@ -215,15 +215,20 @@ fn a_blob_flush_failing_on_its_tables_leaves_its_blob_files_neither() -> lsm_tre
     assert_flush_fails_cleanly(&f, [full_after("tables", 2)], storage_full)
 }
 
-/// Every table is written and finished, and the install fails writing its
-/// edit: the finished tables go too.
+/// Every table is written and finished, and syncing them fails before the
+/// flush installs them: the finished tables go too.
 #[test]
-fn a_flush_whose_install_fails_leaves_none_of_its_tables() -> lsm_tree::Result<()> {
+fn a_flush_whose_table_sync_fails_leaves_none_of_its_tables() -> lsm_tree::Result<()> {
     let f = open(|c| c)?;
     assert_flush_fails_cleanly(
         &f,
-        [FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path("edits-")],
-        |e| !matches!(e, lsm_tree::Error::InstallOutcomeUnknown(_)),
+        [FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other)).on_path("tables")],
+        // The armed table sync, and no earlier failure: an injected fault is
+        // the only one, and only a sync of a table is armed.
+        |e| {
+            matches!(e, lsm_tree::Error::Io(io)
+                if io.kind() == ErrorKind::Other && io.to_string().contains("injected fault"))
+        },
     )
 }
 
@@ -243,7 +248,7 @@ fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()>
             ValueType::Value,
         ))
     });
-    let Some((tables, blob_files, pin)) = f.tree.flush_to_tables(stream)? else {
+    let Some((tables, blob_files, pin, kept)) = f.tree.flush_to_tables(stream)? else {
         panic!("the stream holds keys");
     };
     f.injector.arm(
@@ -253,7 +258,7 @@ fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()>
     );
     assert!(matches!(
         f.tree
-            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false),
+            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false, &kept),
         Err(lsm_tree::Error::InstallOutcomeUnknown(_))
     ));
     f.injector.clear();
@@ -261,7 +266,7 @@ fn a_retried_registration_keeps_the_tables_it_installs() -> lsm_tree::Result<()>
     // The retry rotates, superseding the failed edit, and names the same
     // files.
     f.tree
-        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false)?;
+        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false, &kept)?;
     drop(pin);
     drop(tables);
     let installed = files(&f.dir.path().join("tables"))?;
@@ -306,7 +311,7 @@ fn a_failed_retry_of_a_registration_keeps_the_tables_it_may_name() -> lsm_tree::
             ValueType::Value,
         ))
     });
-    let Some((tables, blob_files, pin)) = f.tree.flush_to_tables(stream)? else {
+    let Some((tables, blob_files, pin, kept)) = f.tree.flush_to_tables(stream)? else {
         panic!("the stream holds keys");
     };
     f.injector.arm(
@@ -316,7 +321,7 @@ fn a_failed_retry_of_a_registration_keeps_the_tables_it_may_name() -> lsm_tree::
     );
     assert!(matches!(
         f.tree
-            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false),
+            .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false, &kept),
         Err(lsm_tree::Error::InstallOutcomeUnknown(_))
     ));
     f.injector.clear();
@@ -327,7 +332,7 @@ fn a_failed_retry_of_a_registration_keeps_the_tables_it_may_name() -> lsm_tree::
         .arm(FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path(".tmp"));
     let retry = f
         .tree
-        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false);
+        .register_tables(&tables, blob_files.as_deref(), None, &[], 0, false, &kept);
     f.injector.clear();
     assert!(
         matches!(&retry, Err(e) if !matches!(e, lsm_tree::Error::InstallOutcomeUnknown(_))),
@@ -340,19 +345,92 @@ fn a_failed_retry_of_a_registration_keeps_the_tables_it_may_name() -> lsm_tree::
     Ok(())
 }
 
-/// A flush whose install may have happened keeps its files, since a reopen
-/// after a power loss may find them named; they go once a later install
-/// supersedes the unknown one.
+/// A compaction whose install may have happened keeps its outputs, since a
+/// reopen after a power loss may find them named; they go once a later
+/// install supersedes the unknown one. A synced flush writes no edit, so its
+/// install has no unknown outcome: the compaction after it does.
 #[test]
-fn a_flush_of_unknown_install_outcome_keeps_its_tables_until_superseded() -> lsm_tree::Result<()> {
+fn a_compaction_of_unknown_install_outcome_keeps_its_tables_until_superseded()
+-> lsm_tree::Result<()> {
     assert_unknown_outcome_keeps_until_superseded(&open(|c| c)?)
 }
 
-/// The same for a blob tree's flush, its blob files with its tables.
+/// The same for a blob tree's tables: the compaction rewrites them and keeps
+/// the blob files they refer to, which it does not rewrite.
 #[test]
-fn a_blob_flush_of_unknown_install_outcome_keeps_its_files_until_superseded() -> lsm_tree::Result<()>
-{
+fn a_blob_compaction_of_unknown_install_outcome_keeps_its_files_until_superseded()
+-> lsm_tree::Result<()> {
     assert_unknown_outcome_keeps_until_superseded(&open(blob_tree)?)
+}
+
+/// A compaction that relocates live values into blob files of its own, whose
+/// install may have happened, keeps those new blob files with its tables
+/// until a later install supersedes it. Guards against a blob file written by
+/// such a compaction going at the failure, which a reopen after a power loss
+/// that kept the install would find its tables referring to.
+#[test]
+fn a_relocating_compaction_of_unknown_install_outcome_keeps_its_blob_files_until_superseded()
+-> lsm_tree::Result<()> {
+    let f = open(|c| {
+        c.with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(64)
+                .age_cutoff(1.0)
+                .staleness_threshold(0.1)
+                .file_target_size(16 * 1024),
+        ))
+    })?;
+    for i in 0..KEYS {
+        f.tree.insert(key(i), value(i), i);
+    }
+    f.tree.flush_active_memtable(0)?;
+    // Half of the first generation goes stale. The first merge drops it and
+    // records the dead half, so the next one relocates the rest.
+    for i in (0..KEYS).step_by(2) {
+        f.tree.insert(key(i), value(i), KEYS + i);
+    }
+    f.tree.flush_active_memtable(0)?;
+    let past_every_version = 2 * KEYS;
+    f.tree.major_compact(u64::MAX, past_every_version)?;
+
+    let before = on_disk(f.dir.path())?;
+    f.injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .once(),
+    );
+    assert!(matches!(
+        f.tree.major_compact(u64::MAX, past_every_version),
+        Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+    ));
+    f.injector.clear();
+    let kept: BTreeSet<String> = on_disk(f.dir.path())?
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(
+        kept.iter().any(|name| name.starts_with("blobs/")),
+        "the relocation's new blob files stay past the failure: {kept:?}"
+    );
+
+    // The retry compacts again; its install rotates, superseding the failed
+    // edit.
+    f.tree.major_compact(u64::MAX, past_every_version)?;
+    let now = on_disk(f.dir.path())?;
+    for name in &kept {
+        assert!(
+            !now.contains(name),
+            "the kept file {name} goes once superseded"
+        );
+    }
+    for i in 0..KEYS {
+        assert_eq!(
+            f.tree.get(key(i), MAX_SEQNO)?.as_deref(),
+            Some(value(i).as_slice()),
+            "key {i} after the retry",
+        );
+    }
+    Ok(())
 }
 
 /// The tables are written and finished, and loading one of them fails: none
@@ -471,26 +549,16 @@ fn a_flush_of_cell_rows_the_volume_fills_under_leaves_none_of_its_files() -> lsm
 #[test]
 fn a_clear_after_an_install_of_unknown_outcome_removes_the_kept_files() -> lsm_tree::Result<()> {
     let f = open(blob_tree)?;
-    for i in 0..KEYS {
-        f.tree.insert(key(i), value(i), i);
-    }
-    f.injector.arm(
-        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
-            .on_path("edits-")
-            .once(),
-    );
-    assert!(matches!(
-        f.tree.flush_active_memtable(0),
-        Err(lsm_tree::Error::InstallOutcomeUnknown(_))
-    ));
-    f.injector.clear();
-    assert!(
-        !on_disk(f.dir.path())?.is_empty(),
-        "the flush keeps its files"
-    );
+    let kept = compaction_of_unknown_outcome(&f)?;
+    assert!(!kept.is_empty(), "the compaction keeps its outputs");
 
+    // The live files the clear drops go once their last reader does; the
+    // kept ones have no reader and go with the install.
     f.tree.clear()?;
-    let left = on_disk(f.dir.path())?;
+    let left: BTreeSet<String> = on_disk(f.dir.path())?
+        .intersection(&kept)
+        .cloned()
+        .collect();
     assert!(
         left.is_empty(),
         "the clear supersedes the unknown install, and its files go: {left:?}"
@@ -503,10 +571,14 @@ fn read_error(folder: &str) -> FaultRule {
     FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).on_path(folder)
 }
 
-fn assert_unknown_outcome_keeps_until_superseded(f: &Fixture) -> lsm_tree::Result<()> {
+/// Flushes every key, then compacts the tree failing the sync of the edit
+/// that installs the compaction: an install of unknown outcome. Returns the
+/// files it added, which the tree keeps.
+fn compaction_of_unknown_outcome(f: &Fixture) -> lsm_tree::Result<BTreeSet<String>> {
     for i in 0..KEYS {
         f.tree.insert(key(i), value(i), i);
     }
+    f.tree.flush_active_memtable(0)?;
     let before = on_disk(f.dir.path())?;
     f.injector.arm(
         FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
@@ -514,26 +586,23 @@ fn assert_unknown_outcome_keeps_until_superseded(f: &Fixture) -> lsm_tree::Resul
             .once(),
     );
     assert!(matches!(
-        f.tree.flush_active_memtable(0),
+        f.tree.major_compact(u64::MAX, 0),
         Err(lsm_tree::Error::InstallOutcomeUnknown(_))
     ));
     f.injector.clear();
-    let kept: BTreeSet<String> = on_disk(f.dir.path())?
+    Ok(on_disk(f.dir.path())?
         .difference(&before)
         .cloned()
-        .collect();
-    assert!(!kept.is_empty(), "the flush keeps its tables");
-    assert_eq!(
-        f.tree.sealed_memtable_count(),
-        1,
-        "the memtable stays sealed for a retry"
-    );
+        .collect())
+}
 
-    // The retry writes the memtable again; its install rotates, superseding
-    // the failed edit.
-    let lock = f.tree.get_flush_lock();
-    f.tree.flush(&lock, 0)?;
-    drop(lock);
+fn assert_unknown_outcome_keeps_until_superseded(f: &Fixture) -> lsm_tree::Result<()> {
+    let kept = compaction_of_unknown_outcome(f)?;
+    assert!(!kept.is_empty(), "the compaction keeps its outputs");
+
+    // The retry compacts again; its install rotates, superseding the failed
+    // edit.
+    f.tree.major_compact(u64::MAX, 0)?;
     let now = on_disk(f.dir.path())?;
     for name in &kept {
         assert!(
@@ -541,7 +610,16 @@ fn assert_unknown_outcome_keeps_until_superseded(f: &Fixture) -> lsm_tree::Resul
             "the kept table {name} goes once superseded"
         );
     }
-    let tables = files(&f.dir.path().join("tables"))?;
+    // The retired inputs leave through the background deleter: wait for it,
+    // bounded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let tables = loop {
+        let tables = files(&f.dir.path().join("tables"))?;
+        if tables.len() == f.tree.table_count() || std::time::Instant::now() >= deadline {
+            break tables;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(
         tables.len(),
         f.tree.table_count(),

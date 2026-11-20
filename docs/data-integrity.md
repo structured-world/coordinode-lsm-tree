@@ -221,7 +221,29 @@ them differently:
   (length + XXH3-64) per version edit. A power loss mid-append leaves a record
   the writer never finished and never acknowledged. A fully framed record whose
   digest or decode fails is different: it was committed, and its bytes changed
-  afterwards.
+  afterwards. A synced flush writes no record at all: its tables carry the
+  flush's number and their place in its run, and an open installs every whole
+  flush above the watermark the manifest records. Each flush's tables name the
+  last flush that had returned before it; a flush so named that is missing or
+  does not read whole was damaged after it returned and fails the open, for a
+  repair to salvage: with `DamagedFlush`, which `open_or_repair` repairs, when
+  its bytes prove the damage, and with `Unrecoverable` when none of its tables
+  is found or a dictionary the tree does not hold keeps one from reading, since
+  the configuration may be what is wrong. Any other flush that is missing a
+  table, or a block or blob frame that does not check, failed or is the latest
+  (which nothing names yet): it is taken for one a power loss cut short, the
+  tables of it that open are set aside as `{id}.torn-flush`, and it is left out
+  in every mode. A flush that a later flush began after without naming it as
+  returned failed, and is set aside whole or not: a retry wrote its memtables
+  again. A table that does not open at all carries no mark tying it to
+  a flush, and is removed as any file no manifest names is. Damage to the latest
+  flush before a later flush or a persist names it is therefore indistinguishable
+  from a cut-short flush and drops its writes, as a torn log tail does. A
+  caller that drops its own journal once a flush returns is covered against a
+  power loss; to be covered against that damage too, it calls
+  `persist_flushes` (one manifest write and sync) before dropping the journal.
+  After an open, `get_highest_persisted_seqno` marks where the tree's contents
+  end, and a caller that kept its journal replays from there.
 
 `Config::manifest_recovery_mode` decides only what happens to the first shape:
 

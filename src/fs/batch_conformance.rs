@@ -52,12 +52,14 @@ macro_rules! batched_read_conformance {
             }
 
             /// Wraps a file handle, passing its descriptor through so the
-            /// backend still reads it by descriptor, and counts the serial
-            /// `read_at` calls made against it. A count above zero says the
-            /// request took the serial path.
+            /// backend still reads it by descriptor (unless built by
+            /// `undescribed`), and counts the serial `read_at` calls made
+            /// against it. A count above zero says the request took the serial
+            /// path.
             struct CountingFile {
                 inner: Box<dyn FsFile>,
                 read_at_calls: core::sync::atomic::AtomicUsize,
+                descriptor: bool,
             }
 
             impl CountingFile {
@@ -65,6 +67,7 @@ macro_rules! batched_read_conformance {
                     Self {
                         inner,
                         read_at_calls: core::sync::atomic::AtomicUsize::new(0),
+                        descriptor: true,
                     }
                 }
 
@@ -120,12 +123,22 @@ macro_rules! batched_read_conformance {
                 }
 
                 fn backing_fd(&self) -> Option<i32> {
-                    self.inner.backing_fd()
+                    self.inner.backing_fd().filter(|_| self.descriptor)
                 }
 
                 fn lock_exclusive(&self) -> $crate::io::Result<()> {
                     self.inner.lock_exclusive()
                 }
+            }
+
+            /// A `StdFs` handle with its descriptor hidden: the serial half of
+            /// a mixed batch. A plain `StdFs` handle shows its descriptor on
+            /// unix, so a backend would read it by descriptor too.
+            fn undescribed(dir: &Path, name: &str) -> $crate::io::Result<Box<dyn FsFile>> {
+                let opts = FsOpenOptions::new().write(true).create(true).read(true);
+                let mut file = CountingFile::new(StdFs.open(&dir.join(name), &opts)?);
+                file.descriptor = false;
+                Ok(Box::new(file))
             }
 
             #[test_log::test]
@@ -457,7 +470,7 @@ macro_rules! batched_read_conformance {
                 ring_file.write_all(&(1..=64u8).collect::<Vec<_>>())?;
                 ring_file.sync_all()?;
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 std_file.write_all(&[0u8; 10])?;
                 std_file.sync_all()?;
 
@@ -503,7 +516,7 @@ macro_rules! batched_read_conformance {
                 // descriptor or through the serial `read_at` path.
                 let counted = CountingFile::new(ring_file);
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 let rev: Vec<u8> = (0..=255u8).rev().collect();
                 std_file.write_all(&rev)?;
                 std_file.sync_all()?;
@@ -593,7 +606,7 @@ macro_rules! batched_read_conformance {
                 ring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 ring_file.sync_all()?;
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 let rev: Vec<u8> = (0..=255u8).rev().collect();
                 std_file.write_all(&rev)?;
                 std_file.sync_all()?;
@@ -637,9 +650,8 @@ macro_rules! batched_read_conformance {
                     return Ok(());
                 };
                 let dir = tempfile::tempdir()?;
-                let opts = FsOpenOptions::new().write(true).create(true).read(true);
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 std_file.sync_all()?;
 
@@ -680,7 +692,7 @@ macro_rules! batched_read_conformance {
                 ring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 ring_file.sync_all()?;
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 std_file.write_all(&[1, 2, 3, 4])?;
                 std_file.sync_all()?;
 
@@ -722,7 +734,7 @@ macro_rules! batched_read_conformance {
                 ring_file.write_all(&[1, 2, 3, 4])?;
                 ring_file.sync_all()?;
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 std_file.sync_all()?;
 
@@ -763,7 +775,7 @@ macro_rules! batched_read_conformance {
                 ring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 ring_file.sync_all()?;
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 let rev: Vec<u8> = (0..=255u8).rev().collect();
                 std_file.write_all(&rev)?;
                 std_file.sync_all()?;
@@ -809,7 +821,7 @@ macro_rules! batched_read_conformance {
                 ring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 ring_file.sync_all()?;
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 let rev: Vec<u8> = (0..=255u8).rev().collect();
                 std_file.write_all(&rev)?;
                 std_file.sync_all()?;
@@ -867,7 +879,7 @@ macro_rules! batched_read_conformance {
                 let mut ring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
                 ring_file.write_all(&[1, 2, 3, 4])?;
                 ring_file.sync_all()?;
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 std_file.write_all(&[1, 2, 3, 4])?;
                 std_file.sync_all()?;
 
@@ -915,7 +927,7 @@ macro_rules! batched_read_conformance {
                 let mut ring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
                 ring_file.write_all(&[1, 2, 3, 4])?;
                 ring_file.sync_all()?;
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 std_file.write_all(&[1, 2, 3, 4])?;
                 std_file.sync_all()?;
 
@@ -993,7 +1005,7 @@ macro_rules! batched_read_conformance {
                 ring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 ring_file.sync_all()?;
 
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 std_file.sync_all()?;
 
@@ -1088,7 +1100,7 @@ macro_rules! batched_read_conformance {
                 let mut ring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
                 ring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
                 ring_file.sync_all()?;
-                let mut std_file = StdFs.open(&dir.path().join("s.bin"), &opts)?;
+                let mut std_file = undescribed(dir.path(), "s.bin")?;
                 std_file.write_all(&[1, 2, 3, 4])?;
                 std_file.sync_all()?;
 

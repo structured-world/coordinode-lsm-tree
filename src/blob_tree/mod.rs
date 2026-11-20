@@ -210,35 +210,6 @@ fn write_ahead(
     Ok(true)
 }
 
-/// Finishes a flush's blob and table outputs. Nothing orders the syncs of the
-/// two against each other, only both against the manifest edit that names them,
-/// so a synced flush runs them side by side.
-#[cfg_attr(
-    not(feature = "std"),
-    expect(unused_variables, reason = "without threads the two run in turn")
-)]
-fn finish_flush(
-    blob_writer: BlobFileWriter,
-    table_writer: crate::table::multi_writer::MultiWriter,
-    durability: crate::config::FlushDurability,
-) -> (
-    crate::Result<Vec<BlobFile>>,
-    crate::Result<crate::table::multi_writer::Written>,
-) {
-    #[cfg(feature = "std")]
-    if durability == crate::config::FlushDurability::Synced {
-        return std::thread::scope(|scope| {
-            let blob = scope.spawn(|| blob_writer.finish());
-            let table = table_writer.finish();
-            let blob = blob
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (blob, table)
-        });
-    }
-    (blob_writer.finish(), table_writer.finish())
-}
-
 /// The value `prefetched` holds for `vhandle`: read ahead for this very item,
 /// under its key, so its place and declared size are what identify it.
 fn prefetched_value(
@@ -250,6 +221,48 @@ fn prefetched_value(
         .find(|(held, _)| held == vhandle)
         .map(|(_, value)| value.clone())
 }
+
+/// Finishes a flush's blob and table outputs side by side. Neither syncs (the
+/// install does), but a blob writer's finish still compresses its last frames,
+/// which is work the table's finish need not wait for.
+fn finish_flush(
+    blob_writer: BlobFileWriter,
+    table_writer: crate::table::multi_writer::MultiWriter,
+) -> (
+    crate::Result<FinishedBlobs>,
+    crate::Result<crate::table::multi_writer::Written>,
+) {
+    // With no value in a blob file there is nothing to compress beside the
+    // table's finish, and a thread would cost more than the empty finish.
+    if !blob_writer.holds_values() {
+        return (blob_writer.finish_keeping_files(), table_writer.finish());
+    }
+    #[cfg(feature = "std")]
+    {
+        std::thread::scope(|scope| {
+            let blob = scope.spawn(|| blob_writer.finish_keeping_files());
+            let table = table_writer.finish();
+            let blob = blob
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (blob, table)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        (blob_writer.finish_keeping_files(), table_writer.finish())
+    }
+}
+
+/// A flush's blob files, with those written through a handle kept open for
+/// the install's sync, by id.
+type FinishedBlobs = (
+    Vec<BlobFile>,
+    Vec<(
+        crate::vlog::BlobFileId,
+        alloc::boxed::Box<dyn crate::fs::FsFile>,
+    )>,
+);
 
 pub(crate) fn resolve_value_handle(
     tree_id: TreeId,
@@ -2233,6 +2246,13 @@ impl AbstractTree for BlobTree {
         versions.upgrade_version(
             &config.path,
             |v| {
+                // Under the history's lock, which a flush takes to read the
+                // memtables it writes: every flush holding memtables this
+                // clear drops has taken its number. Its tables describe
+                // themselves, and an open after a power loss would install
+                // them, with the cleared data, unless this manifest decides
+                // that number.
+                self.index.flush_seqs.decide_taken();
                 let mut copy = v.clone();
                 copy.active_memtable = Arc::new(Memtable::new(
                     self.index.memtable_id_counter.next(),
@@ -2364,6 +2384,14 @@ impl AbstractTree for BlobTree {
         self.index.get_flush_lock()
     }
 
+    fn begin_synced_flush(&self) -> Option<(u64, u64)> {
+        self.index.begin_synced_flush()
+    }
+
+    fn end_synced_flush(&self, seq: u64) {
+        self.index.end_synced_flush(seq);
+    }
+
     #[expect(clippy::too_many_lines, reason = "flush logic is inherently complex")]
     fn flush_to_tables_with_rt(
         &self,
@@ -2372,13 +2400,8 @@ impl AbstractTree for BlobTree {
         keys: u64,
         hashes: u64,
         overwritten: Option<&overwritten::OverwrittenKeys>,
-    ) -> crate::Result<
-        Option<(
-            Vec<Table>,
-            Option<Vec<BlobFile>>,
-            crate::runtime_config::WritePin,
-        )>,
-    > {
+        self_described: Option<&crate::abstract_tree::FlushSelf>,
+    ) -> crate::Result<Option<crate::abstract_tree::FlushToTablesResult>> {
         use crate::{file::BLOBS_FOLDER, table::multi_writer::MultiWriter};
 
         let start = crate::time::Instant::now();
@@ -2415,16 +2438,31 @@ impl AbstractTree for BlobTree {
         // Every table and blob file the flush makes, until it hands them over:
         // a flush that fails removes them, as the standard tree's does.
         let outputs = crate::compaction::output_ledger::OutputLedger::for_cleanup();
+        // Carried in the write pin to the install, as the standard tree's.
+        let refills = rc
+            .io
+            .refill_after_install()
+            .then(|| self.index.table_files.hold());
         let table_writer = MultiWriter::from_pool(
             table_folder.clone(),
-            Arc::clone(&self.index.table_files),
-            None,
+            crate::table::multi_writer::TableFiles::new(
+                Arc::clone(&self.index.table_files),
+                None,
+                crate::fs::WriteOrigin::FlushTable,
+                refills
+                    .as_ref()
+                    .map(crate::table::file_pool::RefillHold::id),
+            ),
             self.index.config.table_target_size,
             0,
             level_fs.clone(),
-            crate::fs::WriteOrigin::FlushTable,
         )?
         .use_output_ledger(outputs.clone());
+        // A synced flush's tables describe themselves (see `register_tables`).
+        let table_writer = match self_described {
+            Some(flush) => table_writer.use_flush_seq(flush.seq, flush.returned_through),
+            None => table_writer,
+        };
         let written = (|| -> crate::Result<_> {
             // The flush's L0 recency, taken as the standard tree's flush takes
             // it: a pooled file's id says nothing about when it was written, a
@@ -2493,9 +2531,15 @@ impl AbstractTree for BlobTree {
             // blob tree's index honors columnar, zone maps, ECC, seqno-in-index,
             // per-KV checksums, locator policy, sync mode, and CoW disable.
             table_writer = table_writer.use_page_ecc(self.index.config.page_ecc, rc.ecc_scheme);
+            // The install syncs a flush's files, whatever the tree's flush
+            // durability (see the index tree's `register_tables`); a synced
+            // flush through the handles they were written through.
+            let keep_open =
+                self.index.config.flush_durability == crate::config::FlushDurability::Synced;
             table_writer = table_writer
                 .use_sync_mode(self.index.config.sync_mode)
-                .use_durability(self.index.config.flush_durability)
+                .use_durability(crate::config::FlushDurability::Deferred)
+                .use_keep_open(keep_open)
                 .use_writeback_bytes(self.index.config.writeback_bytes);
             table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
             table_writer = table_writer.use_zone_map(rc.zone_map);
@@ -2516,8 +2560,9 @@ impl AbstractTree for BlobTree {
                     .use_zstd_dictionary(dicts.for_compression(data_block_compression)?)
                     .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
             }
-            let write_pin =
-                crate::runtime_config::WritePin::new(&rc).with_filter_sizing(filter_sizing);
+            let write_pin = crate::runtime_config::WritePin::new(&rc)
+                .with_filter_sizing(filter_sizing)
+                .with_refills(refills);
 
             // Parallel block compression for the flush writer, mirroring the
             // standard tree's flush: engaged only when the per-block transform does
@@ -2532,6 +2577,23 @@ impl AbstractTree for BlobTree {
             if table_on_pool {
                 table_writer =
                     table_writer.use_parallel_compression(self.index.config.parallel_compression());
+            }
+            // The workers write the buffers of the flush's files when they have
+            // nothing of it to compress, table blocks or values: beside either,
+            // the writes cost the flush more than they save.
+            #[cfg(feature = "std")]
+            let file_workers =
+                if !table_on_pool && rc.blob_compression == crate::CompressionType::None {
+                    self.index
+                        .config
+                        .parallel_compression()
+                        .map(|parallel| parallel.spawner)
+                } else {
+                    None
+                };
+            #[cfg(feature = "std")]
+            {
+                table_writer = table_writer.use_file_workers(file_workers.clone());
             }
 
             #[expect(
@@ -2557,7 +2619,8 @@ impl AbstractTree for BlobTree {
                 .use_target_size(kv_opts.file_target_size)
                 .use_compression(rc.blob_compression)
                 .use_sync_mode(self.index.config.sync_mode)
-                .use_durability(self.index.config.flush_durability)
+                .use_durability(crate::config::FlushDurability::Deferred)
+                .use_keep_open(keep_open)
                 .use_writeback_bytes(self.index.config.writeback_bytes)
                 .use_lifetime_groups(kv_opts.lifetime_groups)
                 .use_frame_sizes(kv_opts.frame_sizes())
@@ -2574,7 +2637,9 @@ impl AbstractTree for BlobTree {
                     .use_zstd_dictionaries(dicts)
                     .use_file_dictionary(kv_opts.file_dictionary);
                 #[cfg(feature = "std")]
-                let w = w.use_parallel_compression(self.index.config.parallel_compression());
+                let w = w
+                    .use_parallel_compression(self.index.config.parallel_compression())
+                    .use_file_workers(file_workers);
                 w.use_output_ledger(outputs.clone())
             };
 
@@ -2679,15 +2744,21 @@ impl AbstractTree for BlobTree {
             if let Some(ahead) = &mut ahead {
                 while write_ahead(ahead, &mut blob_writer, &mut table_writer)? {}
             }
+            // The stream is drained: whether it collected history is known.
+            if let Some(flush) = self_described {
+                table_writer.set_flush_floor(flush.raised_floor());
+            }
 
-            let (blob_files, written) = finish_flush(
-                blob_writer,
-                table_writer,
-                self.index.config.flush_durability,
-            );
-            let blob_files = blob_files?;
+            let (blobs, written) = finish_flush(blob_writer, table_writer);
+            let (blob_files, kept_blobs) = blobs?;
             let written = written?;
             let entries_durable = written.entries_durable;
+            let kept = crate::abstract_tree::KeptFiles {
+                tables: written.kept,
+                blobs: kept_blobs,
+                // Each writer kept open, it syncs every file it closes.
+                rest_synced: keep_open,
+            };
 
             log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
 
@@ -2732,7 +2803,7 @@ impl AbstractTree for BlobTree {
                     Ok(table)
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
-            Ok((tables, blob_files, write_pin))
+            Ok((tables, blob_files, write_pin, kept))
         })();
 
         match written {
@@ -2740,9 +2811,9 @@ impl AbstractTree for BlobTree {
             // caller (AbstractTree::flush) handles empty tables by
             // re-inserting RTs into the active memtable and still needs to
             // delete sealed memtables.
-            Ok((tables, blob_files, write_pin)) => {
+            Ok((tables, blob_files, write_pin, kept)) => {
                 outputs.hand_over();
-                Ok(Some((tables, Some(blob_files), write_pin)))
+                Ok(Some((tables, Some(blob_files), write_pin, kept)))
             }
             Err(e) => {
                 outputs.remove_uninstalled(
@@ -2762,6 +2833,7 @@ impl AbstractTree for BlobTree {
         sealed_memtables_to_delete: &[MemtableId],
         gc_watermark: SeqNo,
         collected_below_watermark: bool,
+        kept: &crate::abstract_tree::KeptFiles,
     ) -> crate::Result<()> {
         self.index.register_tables(
             tables,
@@ -2770,6 +2842,7 @@ impl AbstractTree for BlobTree {
             sealed_memtables_to_delete,
             gc_watermark,
             collected_below_watermark,
+            kept,
         )
     }
 

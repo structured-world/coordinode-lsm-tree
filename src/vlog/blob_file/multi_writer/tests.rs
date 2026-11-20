@@ -26,6 +26,131 @@ fn whole_block_copies_are_held_to_a_bounded_number_of_sources() -> crate::Result
     Ok(())
 }
 
+/// A synced flush cut into more blob files than
+/// [`crate::fs::KEEP_OPEN_LIMIT`] keeps only that many writing handles open
+/// for its install: the rest close at their rotation.
+#[test]
+fn a_flush_of_many_blob_files_keeps_a_bounded_number_of_files_open() -> crate::Result<()> {
+    use super::*;
+    use crate::fs::{FaultFs, StdFs, SyncKind};
+
+    let folder = tempfile::tempdir()?;
+    let faulty = FaultFs::new(StdFs);
+    let injector = faulty.injector();
+    let fs: Arc<dyn Fs> = Arc::new(faulty);
+    let mut writer =
+        MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?
+            .use_target_size(1)
+            .use_durability(crate::config::FlushDurability::Deferred)
+            .use_keep_open(true);
+    let files = 3 * crate::fs::KEEP_OPEN_LIMIT;
+    for i in 0..files {
+        let key = format!("key{i:05}");
+        writer.write_fresh(key.as_bytes(), 0, b"value", CompressionType::None, 0)?;
+    }
+    let (written, kept) = writer.finish_keeping_files()?;
+    assert_eq!(written.len(), files, "one file per value");
+    assert_eq!(kept.len(), crate::fs::KEEP_OPEN_LIMIT);
+    // Each file past the limit is synced through its handle before it
+    // closes, once; the kept ones are left to the install.
+    let kept_ids: Vec<BlobFileId> = kept.iter().map(|(id, _)| *id).collect();
+    let mut expected: Vec<std::path::PathBuf> = written
+        .iter()
+        .filter(|file| !kept_ids.contains(&file.id()))
+        .map(|file| file.path().to_path_buf())
+        .collect();
+    expected.sort();
+    let mut synced: Vec<std::path::PathBuf> = injector
+        .take_syncs()
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, SyncKind::File | SyncKind::FileData))
+        .map(|(path, _)| path)
+        .collect();
+    synced.sort();
+    assert_eq!(expected.len(), files - crate::fs::KEEP_OPEN_LIMIT);
+    assert_eq!(synced, expected, "each excess file synced once");
+    Ok(())
+}
+
+/// A file past the keep-open limit whose sync at its rotation fails is
+/// removed, its handle given up: no version will name it. Guards against the
+/// file's handle dropping unmarked, which leaves its descriptor in the shared
+/// table and the file on disk.
+#[test]
+fn a_file_whose_sync_at_rotation_fails_is_removed() -> crate::Result<()> {
+    use super::*;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs, SyncKind};
+
+    let folder = tempfile::tempdir()?;
+    let faulty = FaultFs::new(StdFs);
+    let injector = faulty.injector();
+    let fs: Arc<dyn Fs> = Arc::new(faulty);
+    let mut writer =
+        MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?
+            .use_target_size(1)
+            .use_durability(crate::config::FlushDurability::Deferred)
+            .use_keep_open(true);
+    // The kept files take no sync: the first one is the first file past the
+    // limit, at the rotation that closes it.
+    injector
+        .arm(FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other)).once());
+    let mut failed = false;
+    for i in 0..2 * crate::fs::KEEP_OPEN_LIMIT {
+        let key = format!("key{i:05}");
+        if writer
+            .write_fresh(key.as_bytes(), 0, b"value", CompressionType::None, 0)
+            .is_err()
+        {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "the sync at a rotation failed the write");
+    let synced: Vec<std::path::PathBuf> = injector
+        .take_syncs()
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, SyncKind::FileData))
+        .map(|(path, _)| path)
+        .collect();
+    let [failed_file] = synced.as_slice() else {
+        panic!("one file sync, the failed one: {synced:?}");
+    };
+    assert!(
+        !failed_file.exists(),
+        "the file whose sync failed is removed: {}",
+        failed_file.display()
+    );
+    drop(writer);
+    Ok(())
+}
+
+/// A writer holds values once one is written, in any class, and still after
+/// the class switch that parks the file holding it: a flush finishes it on a
+/// thread of its own only then.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_writer_holds_values_once_any_class_was_written() -> crate::Result<()> {
+    use super::*;
+    use crate::fs::StdFs;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let mut writer =
+        MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?
+            .use_target_size(u64::MAX)
+            .use_lifetime_groups(crate::config::LifetimeGroups::new(2).expect("two groups"));
+    assert!(!writer.holds_values(), "nothing written yet");
+    writer.write_fresh(b"a", 0, b"value", CompressionType::None, 0)?;
+    assert!(writer.holds_values(), "a value in the active file");
+    writer.select_output(CompressionType::None, 1)?;
+    assert!(writer.holds_values(), "the value's file is parked");
+    assert!(
+        writer.finish()?.len() == 1,
+        "the one file holding the value"
+    );
+    Ok(())
+}
+
 /// Values of two key domains, in two lifetime classes, land in blob files of
 /// one domain each: the file a class switch parks is closed at the domain's
 /// end with the active one, so expiring a domain leaves its files wholly dead.

@@ -290,6 +290,24 @@ pub enum Error {
         got: Option<u32>,
     },
 
+    /// A synced flush that returned is damaged on disk: a table of its run is
+    /// missing while others of it are found, one does not read whole for a
+    /// reason its bytes decide, or a blob file it added is missing or does
+    /// not read whole.
+    ///
+    /// Damage rather than configuration: a flush writes every table of its
+    /// run into one folder, so a level route left out of the configuration
+    /// hides all of them, never some. A returned flush of which no table is
+    /// found, or one a dictionary the tree does not hold keeps from reading,
+    /// is reported as [`Self::Unrecoverable`] instead, since the
+    /// configuration may be what is wrong. A repair salvages what of the
+    /// flush reads, and [`Config::open_or_repair`](crate::Config::open_or_repair)
+    /// engages one.
+    DamagedFlush {
+        /// The flush's number.
+        flush: u64,
+    },
+
     /// Per-record XXH3-64 mismatch inside a framed manifest section
     /// (`tables` / `blob_files`). Distinct from
     /// [`Error::ChecksumMismatch`] — same XXH3 family but a
@@ -372,6 +390,24 @@ pub enum Error {
 
         /// Number of tables actually found across all configured routes.
         found: usize,
+    },
+
+    /// After the tree was not closed cleanly, a level route the manifest
+    /// records is not configured, or its tables folder is missing (a volume
+    /// left unmounted).
+    ///
+    /// A synced flush returns with no manifest edit naming its tables, so
+    /// after a crash only the tables describe it: an open without the folder
+    /// they lie in would not see them, and would drop acknowledged data.
+    /// A configuration error, not damage, so
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair) does not
+    /// repair it: configure the route (or mount its volume) and reopen. A
+    /// clean close records every flush in the manifest, after which a route
+    /// can be removed.
+    MissingRoute {
+        /// The route's tables folder, relative to the tree's folder, as the
+        /// manifest records it.
+        folder: String,
     },
 
     /// Valid configuration / on-disk layout that this build does not
@@ -786,6 +822,63 @@ impl Error {
             // are not implicated.
             Self::SalvageOutput(_) => true,
             Self::InstallOutcomeUnknown(cause) => cause.is_environmental(),
+            _ => false,
+        }
+    }
+
+    /// Whether the error positively identifies damage on disk that a repair
+    /// rebuilds around, decided by the bytes alone.
+    ///
+    /// Everything else is outside it: transient I/O (a retry could still read
+    /// the files a repair would rebuild around), a held directory lock, an
+    /// unsupported format version (it needs offline conversion or a matching
+    /// binary), and every configuration mismatch (a wrong comparator, level
+    /// route, zstd dictionary, tree type, or an encryption key surfacing as a
+    /// decrypt failure). Those are reversible by fixing the call, while a
+    /// repair under the wrong configuration rebuilds, and can drop, healthy
+    /// data. An unlisted, including a future, error is outside it.
+    #[must_use]
+    pub(crate) fn is_repairable_structural(&self) -> bool {
+        match self {
+            // Data-shape I/O kinds are structural: a missing file (the manifest
+            // itself, or a file it names), malformed bytes (the manifest-loss
+            // open surfaces "current missing but artifacts present" as
+            // InvalidData), or a truncated read. Any other I/O kind is
+            // environment, and transient kinds are retried by the caller.
+            Self::Io(io) => matches!(
+                io.kind(),
+                crate::io::ErrorKind::NotFound
+                    | crate::io::ErrorKind::InvalidData
+                    | crate::io::ErrorKind::UnexpectedEof
+            ),
+            // `Unrecoverable` is deliberately ABSENT: it is the catch-all for
+            // "cannot classify", the opposite of positive evidence of a
+            // structural defect. Repairing on it rebuilds the manifest from
+            // whatever the current configuration happens to scan, and since
+            // route provenance is not persisted, a routed store reopened with
+            // its `level_routes` omitted presents exactly that way, so the
+            // rebuild would drop every SST on the unscanned tiers.
+            Self::Decompress(_)
+            | Self::Excised { .. }
+            | Self::ChecksumMismatch { .. }
+            | Self::HeaderCrcMismatch { .. }
+            | Self::InvalidTag(_)
+            | Self::InvalidTrailer
+            | Self::InvalidHeader(_)
+            | Self::DecompressedSizeTooLarge { .. }
+            | Self::ManifestFrameChecksumMismatch { .. }
+            | Self::ManifestFooterInvalid(_)
+            | Self::ManifestSectionInvalid(_)
+            | Self::TornManifestEditLog { .. }
+            | Self::RangeTombstoneDecode { .. }
+            | Self::PageEccUnrecoverable { .. }
+            // A stored dictionary disagreeing with its own name is the bytes:
+            // the name is their hash. The one configuration that reads the
+            // same way, an encrypted file opened without its key, never gets
+            // here, because `Tree::open` verifies the manifest under the
+            // configured provider before it reads a dictionary.
+            | Self::ZstdDictCorrupt { .. }
+            | Self::DamagedFlush { .. } => true,
             _ => false,
         }
     }

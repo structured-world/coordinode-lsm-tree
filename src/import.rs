@@ -672,6 +672,14 @@ pub struct ManifestImage {
     pub dicts: Vec<u32>,
     /// The name of the comparator the tree is written under.
     pub comparator_name: &'static str,
+    /// The level routes the tree will be opened with, other than its own
+    /// folder, each written by [`route`]. Until an open records its own, a
+    /// repair of a manifest that does not load reads them, and refuses while
+    /// one is not configured rather than rebuild a manifest without the tables
+    /// it holds. Given rather than taken from where the tables are written: a
+    /// caller that builds the tree elsewhere and moves it into place records
+    /// where they will be.
+    pub routes: Vec<String>,
 }
 
 /// What an imported table records, read back from its file as an open reads
@@ -780,6 +788,19 @@ impl RecordedTable {
     }
 }
 
+/// A level route as a manifest snapshot records it.
+///
+/// `tables`, the tables folder the route puts its levels in, relative to
+/// `tree`, the folder the tree is opened at, each made absolute from the
+/// working directory as an open configured with them makes it.
+#[must_use]
+pub fn route(tree: &Path, tables: &Path) -> String {
+    crate::version::routes::relative(
+        &crate::path::absolute_path(tree),
+        &crate::path::absolute_path(tables),
+    )
+}
+
 /// Writes the manifest of the tree in `folder` from `image`, whose tables are
 /// already written, each level's to the folder `tables_folder` names for it,
 /// and installs it.
@@ -787,7 +808,8 @@ impl RecordedTable {
 /// Every table is opened the way an open opens it before the manifest is
 /// written, so a manifest is never written over a table that does not read,
 /// and a restricted table gets the sidecar holding its bound. Returns what
-/// each table records, in the order `image` places them.
+/// each table records, in the order `image` places them. The snapshot records
+/// the image's routes.
 ///
 /// # Errors
 ///
@@ -922,6 +944,11 @@ pub fn install_manifest(
         dicts: image.dicts.clone(),
         // An imported tree owes no repair report.
         repair_report: None,
+        // The snapshot written below raises it to what its tables carry.
+        flush_watermark: 0,
+        // The snapshot is written with the image's routes.
+        routes: Vec::new(),
+        closed_cleanly: false,
     };
     let version = crate::version::Version::from_recovery(
         recovery,
@@ -948,7 +975,7 @@ pub fn install_manifest(
                 .and_then(RecordedTable::of)
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    crate::version::persist_version(
+    crate::version::persist_version_with(
         folder,
         &version,
         image.comparator_name,
@@ -956,6 +983,8 @@ pub fn install_manifest(
         Arc::new(crate::runtime_config::RuntimeConfig::default()),
         encryption.clone(),
         crate::fs::SyncMode::default(),
+        0,
+        &image.routes,
     )?;
     // The manifest just written reads back under the strictest mode.
     crate::version::recovery::recover(

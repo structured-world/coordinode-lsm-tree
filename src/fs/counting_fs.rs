@@ -700,7 +700,11 @@ impl Fs for CountingFs {
     }
 
     fn sync_device(&self, path: &Path) -> io::Result<()> {
-        let result = self.inner.sync_device(path);
+        self.sync_device_noting(path).map_err(|(error, _)| error)
+    }
+
+    fn sync_device_noting(&self, path: &Path) -> Result<(), (io::Error, bool)> {
+        let result = self.inner.sync_device_noting(path);
         self.stats.directory.device_syncs.fetch_add(1, Relaxed);
         if result.is_err() {
             self.stats
@@ -709,6 +713,73 @@ impl Fs for CountingFs {
                 .fetch_add(1, Relaxed);
         }
         result
+    }
+
+    fn sync_many(&self, targets: &[super::SyncTarget<'_>]) -> Result<(), super::SyncFailure> {
+        // A file kept open since it was written is synced through that
+        // handle, this wrapper's own, which counts its sync: the wrapped
+        // backend could not reach the counting handle through it.
+        // They are synced side by side, as the default batch does. Handed to
+        // the wrapped batch instead, a ring would sync them by descriptor,
+        // past the count, and a batch on threads through the handle, counted
+        // twice; counting is the caller's choice, and these threads are its
+        // price on a backend that batches.
+        let (open, rest): (Vec<_>, Vec<_>) = targets
+            .iter()
+            .enumerate()
+            .partition(|(_, target)| matches!(target, super::SyncTarget::OpenFile { .. }));
+        if !open.is_empty() {
+            let (open_at, open): (Vec<usize>, Vec<super::SyncTarget<'_>>) =
+                open.into_iter().map(|(at, target)| (at, *target)).unzip();
+            super::sync_each_target(self, &open).map_err(|mut failure| {
+                for index in &mut failure.spent {
+                    *index = open_at.get(*index).copied().unwrap_or(*index);
+                }
+                failure
+            })?;
+        }
+        // The wrapped backend's batch of the rest, as the tree chose it; each
+        // target is counted as its own open and sync would be, where the
+        // outcome is known. A batch that succeeded synced every target; one
+        // that failed names the syncs that ran and failed, each counted a
+        // failure. Its other targets may have synced or not, and one whose
+        // open failed ran no sync, as an open through this wrapper that fails
+        // counts nothing: none of them is counted.
+        let (at, rest): (Vec<usize>, Vec<super::SyncTarget<'_>>) =
+            rest.into_iter().map(|(at, target)| (at, *target)).unzip();
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let result = self.inner.sync_many(&rest);
+        for (index, target) in rest.iter().enumerate() {
+            let counted: io::Result<()> = match &result {
+                Ok(()) => Ok(()),
+                Err(failure) if failure.spent.contains(&index) => Err(io::Error::new(
+                    failure.error.kind(),
+                    "a sync of the batch failed",
+                )),
+                Err(_) => continue,
+            };
+            match target.origin() {
+                Some(origin) => {
+                    if let Some(counters) = self.stats.slot(Some(origin)) {
+                        // The backend opened the file for writing by its
+                        // path to sync it, an open this wrapper did not see.
+                        if matches!(target, super::SyncTarget::FileData { .. }) {
+                            counters.opened.fetch_add(1, Relaxed);
+                        }
+                        counters.synced(&counted);
+                    }
+                }
+                None => self.directory_synced(&counted),
+            }
+        }
+        result.map_err(|mut failure| {
+            for spent in &mut failure.spent {
+                *spent = at.get(*spent).copied().unwrap_or(usize::MAX);
+            }
+            failure
+        })
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
@@ -729,6 +800,10 @@ impl Fs for CountingFs {
 
     fn capabilities(&self, path: &Path) -> FsCapabilities {
         self.inner.capabilities(path)
+    }
+
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        self.inner.idles_between_io_queues(path)
     }
 
     fn try_disable_cow(&self, path: &Path) -> io::Result<()> {

@@ -547,6 +547,95 @@ fn an_interrupted_restore_is_refused_and_resumed() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A restore that flushed the pinned memtable contents and then failed to
+/// remove its marker is resumed without the tables that flush wrote: the
+/// resumed restore writes those contents again, and a second copy would hold
+/// every entry twice. Guards against the open of the resumed restore taking
+/// the first attempt's flush in from its tables' own description.
+#[test]
+fn a_resumed_restore_leaves_out_the_first_attempts_flush() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    let expected = read_at(&tree, pin.seqno())?;
+    let layout = pin.layout()?;
+    let restore = |dst: &Path, fs: Option<FaultFs<StdFs>>| {
+        let config = Config::new(
+            dst,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        );
+        let config = match fs {
+            Some(fs) => config.with_fs(fs),
+            None => config,
+        };
+        config.restore_pinned(
+            &layout,
+            pin.memtable_entries(),
+            pin.memtable_range_tombstones(),
+        )
+    };
+
+    let clean = tempfile::tempdir()?;
+    ship(&pin, clean.path())?;
+    let tables = restore(clean.path(), None)?.table_count();
+
+    let dst = tempfile::tempdir()?;
+    ship(&pin, dst.path())?;
+    // The tables holding data, by name.
+    let tables_with_data = |root: &Path| -> std::io::Result<Vec<std::ffi::OsString>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(root.join("tables"))? {
+            let entry = entry?;
+            if entry.metadata()?.len() > 0 {
+                names.push(entry.file_name());
+            }
+        }
+        Ok(names)
+    };
+    let shipped = tables_with_data(dst.path())?;
+    let injector = Arc::new(FaultInjector::new());
+    // Everything lands but the marker's removal.
+    injector.arm(
+        FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
+            .on_path(lsm_tree::file::RESTORE_MARKER_FILE),
+    );
+    let interrupted = restore(
+        dst.path(),
+        Some(FaultFs::with_injector(StdFs, Arc::clone(&injector))),
+    );
+    let Err(stopped) = interrupted else {
+        panic!("the fault stopped the restore");
+    };
+    assert!(
+        stopped.to_string().contains("RemoveFile"),
+        "self-check: the marker's removal failed, after the flush: {stopped}"
+    );
+    assert!(
+        dst.path()
+            .join(lsm_tree::file::RESTORE_MARKER_FILE)
+            .exists(),
+        "self-check: the marker stays"
+    );
+    assert!(
+        tables_with_data(dst.path())?
+            .iter()
+            .any(|name| !shipped.contains(name)),
+        "self-check: the first attempt flushed a table beyond the shipped ones"
+    );
+
+    let restored = restore(dst.path(), None)?;
+    assert_eq!(
+        restored.table_count(),
+        tables,
+        "the first attempt's flush is not taken in beside the second's"
+    );
+    assert_eq!(read_at(&restored, pin.seqno())?, expected);
+    Ok(())
+}
+
 /// A pinned file describes itself: a table has a level, a blob file none, the
 /// size and the bytes read through the pin are the file's, and a table's heal
 /// attestation is reported when one lies beside it.

@@ -114,6 +114,241 @@ fn failed_writes_and_syncs_are_counted_as_failures() -> crate::io::Result<()> {
     Ok(())
 }
 
+/// A backend over [`MemFs`] that counts the batches handed to it.
+struct Batching {
+    inner: MemFs,
+    batches: std::sync::atomic::AtomicUsize,
+}
+
+impl Fs for Batching {
+    fn sync_many(
+        &self,
+        targets: &[crate::fs::SyncTarget<'_>],
+    ) -> Result<(), crate::fs::SyncFailure> {
+        self.batches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::fs::sync_each_target(&self.inner, targets)
+    }
+    fn open(
+        &self,
+        path: &Path,
+        opts: &FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        self.inner.open(path, opts)
+    }
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn metadata(&self, path: &Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata(path)
+    }
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        self.inner.exists(path)
+    }
+}
+
+/// A batch of syncs goes to the wrapped backend as one batch, and each of its
+/// targets is counted as its own sync would be. Guards against the wrapper
+/// syncing them one by one on threads, which drops the batch the backend
+/// submits from one thread under a scheduler that idles between queues.
+#[test]
+fn a_batch_of_syncs_reaches_the_backend_as_one_and_is_counted() -> crate::io::Result<()> {
+    let inner = Arc::new(Batching {
+        inner: MemFs::new(),
+        batches: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let fs = CountingFs::new(inner.clone());
+    fs.create_dir_all(Path::new("/db"))?;
+    for name in ["/db/1", "/db/2"] {
+        fs.open(Path::new(name), &writable(Some(WriteOrigin::FlushTable)))?
+            .write_all(b"x")?;
+    }
+    let mode = crate::fs::SyncMode::default();
+    fs.sync_many(&[
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/1"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/2"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+        crate::fs::SyncTarget::Folder {
+            path: Path::new("/db"),
+            mode,
+        },
+    ])?;
+
+    assert_eq!(
+        inner.batches.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the backend got the batch"
+    );
+    let snapshot = fs.stats().snapshot();
+    let flush = snapshot.origin(WriteOrigin::FlushTable);
+    assert_eq!(flush.syncs, 2);
+    // Each file was opened for writing twice: once to write it, once by the
+    // backend to sync it by its path.
+    assert_eq!(
+        flush.opened, 4,
+        "the backend's opens for the syncs are counted"
+    );
+    assert_eq!(snapshot.directory.syncs, 1);
+    Ok(())
+}
+
+/// Files kept open since their writes are synced through the counting
+/// handles, each counted once, and a batch of nothing else hands the wrapped
+/// backend no batch. Guards against such syncs passing the count, or being
+/// counted twice.
+#[test]
+fn kept_handles_in_a_batch_sync_through_the_counting_handles() -> crate::io::Result<()> {
+    let inner = Arc::new(Batching {
+        inner: MemFs::new(),
+        batches: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let fs = CountingFs::new(inner.clone());
+    fs.create_dir_all(Path::new("/db"))?;
+    let mut kept = Vec::new();
+    for name in ["/db/1", "/db/2"] {
+        let mut file = fs.open(Path::new(name), &writable(Some(WriteOrigin::FlushTable)))?;
+        file.write_all(b"x")?;
+        kept.push(file);
+    }
+    let mode = crate::fs::SyncMode::default();
+    let targets: Vec<crate::fs::SyncTarget<'_>> = kept
+        .iter()
+        .zip(["/db/1", "/db/2"])
+        .map(|(file, name)| crate::fs::SyncTarget::OpenFile {
+            file: &**file,
+            path: Path::new(name),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        })
+        .collect();
+    fs.sync_many(&targets)?;
+
+    assert_eq!(
+        inner.batches.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "nothing was left for the backend's batch"
+    );
+    let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
+    assert_eq!(flush.syncs, 2, "each kept file synced once, and counted");
+    assert_eq!(flush.opened, 2, "no open beyond the writes'");
+    Ok(())
+}
+
+/// A kept file whose sync fails fails the batch with its own place in the
+/// batch, not its place among the kept files. Guards against a persist
+/// marking another file as the one that failed.
+#[test]
+fn a_failed_kept_sync_is_reported_at_its_place_in_the_batch() -> crate::io::Result<()> {
+    let faulty = FaultFs::new(MemFs::new());
+    let injector = faulty.injector();
+    let fs = CountingFs::new(Arc::new(faulty));
+    fs.create_dir_all(Path::new("/db"))?;
+    fs.open(Path::new("/db/1"), &writable(Some(WriteOrigin::FlushTable)))?
+        .write_all(b"x")?;
+    let mut kept = fs.open(Path::new("/db/2"), &writable(Some(WriteOrigin::FlushTable)))?;
+    kept.write_all(b"x")?;
+    let mode = crate::fs::SyncMode::default();
+    let batch = [
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/1"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+        crate::fs::SyncTarget::OpenFile {
+            file: &*kept,
+            path: Path::new("/db/2"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+    ];
+    injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("/db/2")
+            .once(),
+    );
+    let Err(failure) = fs.sync_many(&batch) else {
+        panic!("the kept file's sync failed");
+    };
+    assert_eq!(failure.spent, [1], "the kept file's place in the batch");
+    Ok(())
+}
+
+/// A failed batch counts a failure for the sync that failed alone; a target
+/// whose outcome the batch does not tell is not counted, neither as synced
+/// nor as failed, and a batch that failed on an open, before any sync ran,
+/// counts no sync at all, as a failed open through the wrapper counts
+/// nothing. Guards against a batch failure counted on files whose syncs
+/// succeeded, or a target never synced counted as synced.
+#[test]
+fn a_failed_batch_counts_the_failure_where_it_was() -> crate::io::Result<()> {
+    let faulty = FaultFs::new(MemFs::new());
+    let injector = faulty.injector();
+    let fs = CountingFs::new(Arc::new(faulty));
+    fs.create_dir_all(Path::new("/db"))?;
+    for name in ["/db/1", "/db/2"] {
+        fs.open(Path::new(name), &writable(Some(WriteOrigin::FlushTable)))?
+            .write_all(b"x")?;
+    }
+    let mode = crate::fs::SyncMode::default();
+    let batch = [
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/1"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+        crate::fs::SyncTarget::FileData {
+            path: Path::new("/db/2"),
+            origin: WriteOrigin::FlushTable,
+            mode,
+        },
+    ];
+
+    injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("/db/2")
+            .once(),
+    );
+    assert!(fs.sync_many(&batch).is_err());
+    let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
+    assert_eq!((flush.syncs, flush.sync_errors), (1, 1), "the failed sync");
+
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("/db/1")
+            .once(),
+    );
+    assert!(fs.sync_many(&batch).is_err());
+    let flush = fs.stats().snapshot().origin(WriteOrigin::FlushTable);
+    assert_eq!(
+        (flush.syncs, flush.sync_errors),
+        (1, 1),
+        "a batch failed on an open counts no sync"
+    );
+    Ok(())
+}
+
 /// A writeback started ahead of a sync is counted apart from the syncs: it is
 /// no durability point and writes no byte the writes did not.
 #[test]

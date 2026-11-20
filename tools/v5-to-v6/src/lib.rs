@@ -570,6 +570,13 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
         levels.push(runs);
     }
 
+    // Where the switch puts each route's tables, relative to the store's
+    // folder, as the converted store is opened: not the staging folders they
+    // are built in. A route resolving to the store's own folder is no route.
+    let routes = sites
+        .iter()
+        .map(|site| lsm6::import::route(folder, &site.join(lsm6::file::TABLES_FOLDER)))
+        .collect();
     let image = lsm6::import::ManifestImage {
         tree_type,
         version_id: state.version_id,
@@ -583,6 +590,7 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
         retention_floor: state.retention_floor,
         dicts: state.dicts.clone(),
         comparator_name: "default",
+        routes,
     };
     let recorded = lsm6::import::install_manifest(
         &staging,
