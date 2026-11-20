@@ -94,6 +94,7 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
             retention_floor: 0,
             dicts: Vec::new(),
             comparator_name: "default",
+            routes: Vec::new(),
         },
         &fs,
         &comparator,
@@ -141,12 +142,12 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
 }
 
 /// An import that writes a level's tables to a folder of their own records
-/// that folder as a route in the snapshot it installs, once, and the tree's
-/// own folder not at all. Guards against a manifest that stops loading before
+/// the route it is given for that folder in the snapshot it installs, relative
+/// to the tree's folder. Guards against a manifest that stops loading before
 /// the first open leaving a repair, configured without that route, to rebuild
 /// a manifest without the tables there instead of refusing.
 #[test]
-fn an_import_records_the_routes_it_wrote_to() -> crate::Result<()> {
+fn an_import_records_the_routes_it_is_given() -> crate::Result<()> {
     let folder = crate::get_tmp_folder();
     let fs: Arc<dyn Fs> = Arc::new(crate::fs::StdFs);
     let own = folder.path().join(crate::file::TABLES_FOLDER);
@@ -192,6 +193,7 @@ fn an_import_records_the_routes_it_wrote_to() -> crate::Result<()> {
             retention_floor: 0,
             dicts: Vec::new(),
             comparator_name: "default",
+            routes: vec![route(folder.path(), &cold)],
         },
         &fs,
         &comparator,
@@ -289,6 +291,7 @@ fn an_imported_blob_tree_records_its_links_and_stale_bytes() -> crate::Result<()
             retention_floor: 0,
             dicts: Vec::new(),
             comparator_name: "default",
+            routes: Vec::new(),
         },
         &fs,
         &comparator,
