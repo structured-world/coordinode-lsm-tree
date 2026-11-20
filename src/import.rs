@@ -922,6 +922,12 @@ pub fn install_manifest(
         dicts: image.dicts.clone(),
         // An imported tree owes no repair report.
         repair_report: None,
+        // The snapshot written below raises it to what its tables carry.
+        flush_watermark: 0,
+        // The import names every table it writes; the open after it records
+        // its own routes.
+        routes: Vec::new(),
+        closed_cleanly: false,
     };
     let version = crate::version::Version::from_recovery(
         recovery,
@@ -956,6 +962,7 @@ pub fn install_manifest(
         Arc::new(crate::runtime_config::RuntimeConfig::default()),
         encryption.clone(),
         crate::fs::SyncMode::default(),
+        0,
     )?;
     // The manifest just written reads back under the strictest mode.
     crate::version::recovery::recover(

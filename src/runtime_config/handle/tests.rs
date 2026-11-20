@@ -14,6 +14,54 @@ fn load_returns_initial_config() {
     assert_eq!(snap.block_checksum_algo, ChecksumAlgorithm::Xxh3_64);
 }
 
+/// A caller's update keeps a flush strategy a refresh set after the update
+/// loaded its snapshot. Guards against the update publishing the strategy it
+/// loaded, which leaves the tree on the old one until the next refresh.
+#[test]
+fn an_update_keeps_a_strategy_set_while_it_ran() -> crate::Result<()> {
+    let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+    let healing = handle.load().auto_heal;
+    let bfq = crate::io_policy::IoStrategy::for_scheduler(true);
+    handle.try_update(|config| {
+        handle.set_io_strategy(bfq);
+        config.auto_heal = !config.auto_heal;
+    })?;
+    assert_eq!(handle.load().io, bfq);
+    assert_eq!(handle.load().auto_heal, !healing, "the caller's edit too");
+    Ok(())
+}
+
+/// A snapshot a refresh published while an update ran, and a write took, is
+/// recorded as replaced when the update publishes over it. Guards against a
+/// collection missing the dictionary that write's snapshot names.
+#[cfg(zstd_any)]
+#[test]
+fn an_update_records_the_snapshot_a_refresh_published_while_it_ran() -> crate::Result<()> {
+    let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+    let healing = handle.load().auto_heal;
+    let mut held = None;
+    handle.try_update(|config| {
+        handle.set_io_strategy(crate::io_policy::IoStrategy::for_scheduler(true));
+        // A write takes the snapshot the refresh published.
+        held = Some(handle.load_full());
+        config.auto_heal = !config.auto_heal;
+    })?;
+    let Some(held) = held else {
+        panic!("the mutator ran");
+    };
+    let mut recorded = false;
+    handle.for_each_held_replaced(|snapshot| {
+        recorded |= core::ptr::eq(snapshot, &raw const *held);
+    });
+    assert!(recorded, "the write's snapshot is recorded as replaced");
+    assert_eq!(
+        handle.load().auto_heal,
+        !healing,
+        "the caller's edit stands"
+    );
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "page_ecc")]
 fn try_update_accepts_ecc_on_with_secded_and_shard_schemes() {

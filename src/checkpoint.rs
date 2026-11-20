@@ -548,6 +548,12 @@ pub(crate) fn copy_metadata(
     //
     // A repair report the source still owes describes losses in the data
     // just linked, so the checkpoint owes it too: it rides in the version.
+    // The checkpoint holds only the tables its version names: no flush above
+    // the ones they carry has a table in it. A watermark of 0 leaves no flush
+    // undecided either: the snapshot is written with its watermark raised to
+    // the highest flush a table of its version carries (`Version::encode_into`),
+    // so an open reads every copied flush as decided, and a flush after it
+    // that names one as returned names one at or below the watermark.
     crate::version::persist_version(
         target_root,
         version,
@@ -556,6 +562,7 @@ pub(crate) fn copy_metadata(
         runtime,
         encryption,
         sync_mode,
+        0,
     )?;
     Ok(())
 }
@@ -781,7 +788,17 @@ pub(crate) fn run_checkpoint<T: AbstractTree>(
     // consumes one later cannot take it off the list before the sync.
     let (version, unsynced) = params.source.current_version_and_unsynced();
     if !unsynced.is_empty() {
-        crate::version::SuperVersions::sync_files(&unsynced, sync_mode)?;
+        let config = tree.tree_config();
+        crate::version::SuperVersions::sync_unsynced(
+            &unsynced,
+            sync_mode,
+            params
+                .runtime_config
+                .io
+                .sync_schedule(false, config.fs.capabilities(&config.path).serial_syncs),
+            // The snapshot's manifest, written next, names them.
+            (&**target_fs, target_root),
+        )?;
     }
 
     // Reflink the snapshot files when the live config opts in (default) and

@@ -966,6 +966,10 @@ pub struct Config {
     #[doc(hidden)]
     pub cache: Arc<Cache>,
 
+    /// The I/O schedulers of the devices the tree opens on (see
+    /// [`Self::use_io_policy`]).
+    pub(crate) io_policy: Arc<crate::io_policy::IoPolicy>,
+
     /// Descriptor table to use
     #[doc(hidden)]
     pub descriptor_table: Option<Arc<DescriptorTable>>,
@@ -1203,8 +1207,9 @@ pub struct Config {
     /// [`Config::table_file_pool`].
     pub(crate) table_file_pool: usize,
 
-    /// Where a table file pool refills: off the claiming write's thread, or
-    /// on it, as it does without `std`. Set via
+    /// Where a table file pool refills: off the claiming write's thread (the
+    /// default; under BFQ once the write's install has synced, elsewhere at
+    /// once), or on it, as it does without `std`. Set via
     /// [`Config::table_file_refill_inline`].
     pub(crate) table_file_refill: crate::table::file_pool::RefillOn,
 
@@ -1407,6 +1412,7 @@ impl Default for Config {
             cache: Arc::new(Cache::with_capacity_bytes(
                 /* 16 MiB */ 16 * 1_024 * 1_024,
             )),
+            io_policy: Arc::default(),
 
             data_block_restart_interval_policy: RestartIntervalPolicy::all(16),
             index_block_restart_interval_policy: RestartIntervalPolicy::all(1),
@@ -1497,7 +1503,7 @@ impl Default for Config {
             recovery_progress: None,
             manifest_log_rotate_bytes: 1024 * 1024,
             table_file_pool: crate::table::file_pool::DEFAULT_TABLE_FILE_POOL,
-            table_file_refill: crate::table::file_pool::RefillOn::Background,
+            table_file_refill: crate::table::file_pool::RefillOn::default(),
             repair_retention_floor: 0,
             compaction_rate_limit: 0,
             compaction_rate_limiter: None,
@@ -2066,8 +2072,8 @@ impl Config {
     ///
     /// # Reopen contract
     ///
-    /// The route configuration is **not persisted** in the manifest.
-    /// On reopen, the [`Config`] must specify `level_routes` such that
+    /// The backends are not persisted: on reopen, the [`Config`] must specify
+    /// `level_routes` such that
     /// [`all_tables_folders`](Self::all_tables_folders) includes every
     /// directory and filesystem pair that may contain existing SST files
     /// for this tree.
@@ -2079,6 +2085,15 @@ impl Config {
     /// tables are on uncovered levels) or
     /// [`Unrecoverable`](crate::Error::Unrecoverable) (when some missing
     /// tables are on levels that are still covered).
+    ///
+    /// Every manifest snapshot records the routes' tables folders, relative
+    /// to the tree's folder, and a clean close records that the manifest
+    /// names every flush. A synced flush is named by no manifest until then,
+    /// so after a crash an open refuses with
+    /// [`MissingRoute`](crate::Error::MissingRoute) while a recorded route is
+    /// not configured or its folder is missing (a volume not mounted): its
+    /// tables could hold a flush that returned. Once the tree closed cleanly,
+    /// a route can be removed.
     ///
     /// # Panics
     ///
@@ -2149,6 +2164,21 @@ impl Config {
     #[must_use]
     pub fn use_cache(mut self, cache: Arc<Cache>) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// Sets the record of the devices' I/O schedulers the tree's flushes
+    /// follow (see [`IoPolicy`](crate::IoPolicy)).
+    ///
+    /// Share one between the trees a process opens: a device is then asked
+    /// once for all of them, and [`IoPolicy::refresh`](crate::IoPolicy::refresh)
+    /// switches every one of them on it.
+    ///
+    /// Defaults to one *per tree*, which asks the device each time the tree
+    /// opens.
+    #[must_use]
+    pub fn use_io_policy(mut self, io_policy: Arc<crate::IoPolicy>) -> Self {
+        self.io_policy = io_policy;
         self
     }
 
@@ -3148,10 +3178,12 @@ impl Config {
     }
 
     /// Refills a table file pool on the thread of the write that claims from
-    /// it, rather than off it (default `false`). A write then waits on the
-    /// batch it starts, and every sync the pool issues falls inside one: a
-    /// test that counts an operation's syncs, or fails one of them, sees the
-    /// same ones on every run.
+    /// it (`true`), or off it (`false`, the default): under a scheduler that
+    /// idles between queues (BFQ) once that write's install has synced,
+    /// elsewhere at once. On it, the write that starts a batch makes its files and
+    /// the install of its table syncs their folder among its own syncs; every
+    /// sync the pool issues falls inside one write, so a test that counts an
+    /// operation's syncs, or fails one of them, sees the same ones every run.
     #[doc(hidden)]
     #[must_use]
     pub fn table_file_refill_inline(mut self, inline: bool) -> Self {

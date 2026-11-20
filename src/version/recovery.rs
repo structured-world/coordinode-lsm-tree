@@ -361,11 +361,50 @@ fn parse_retention_floor_section(mut bytes: &[u8]) -> crate::Result<SeqNo> {
     Ok(floor)
 }
 
+/// Parses the optional `flush_watermark` section: one `u64 LE`, the highest
+/// synced-flush number the manifest decides. Read strictly (exactly eight
+/// bytes): a watermark read too low would install the tables of a flush the
+/// manifest dropped. `u64::MAX` is no number a flush takes.
+pub(crate) fn parse_flush_watermark_section(mut bytes: &[u8]) -> crate::Result<u64> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("flush_watermark section");
+    let r = &mut bytes;
+    let watermark = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+    if !r.is_empty() || watermark == u64::MAX {
+        return Err(ERR);
+    }
+    Ok(watermark)
+}
+
 /// Reads the registered dictionary ids: `count: u32 | id: u32 * count`.
 ///
 /// Read strictly, like the sections above: a lost id is a dictionary the tree
 /// stops accounting for, so the tables written against it would fail to open
 /// while its file is left behind as an orphan.
+/// Parses the `routes` section: a `u32` count, then each route as a `u32`
+/// length and that many bytes of UTF-8.
+fn parse_routes_section(mut bytes: &[u8]) -> crate::Result<Vec<alloc::string::String>> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("routes section");
+    let r = &mut bytes;
+    let count = r.read_u32::<LittleEndian>().map_err(|_| ERR)? as usize;
+    // Each route takes at least its length: a count past what the bytes can
+    // hold is refused before anything is reserved for it.
+    if count > r.len() / size_of::<u32>() {
+        return Err(ERR);
+    }
+    let mut routes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = r.read_u32::<LittleEndian>().map_err(|_| ERR)? as usize;
+        let (route, rest) = r.split_at_checked(len).ok_or(ERR)?;
+        let route = core::str::from_utf8(route).map_err(|_| ERR)?;
+        routes.push(route.into());
+        *r = rest;
+    }
+    if !r.is_empty() {
+        return Err(ERR);
+    }
+    Ok(routes)
+}
+
 fn parse_dicts_section(mut bytes: &[u8]) -> crate::Result<Vec<crate::file::DictId>> {
     const ERR: crate::Error = crate::Error::InvalidHeader("dicts section");
     let r = &mut bytes;
@@ -502,6 +541,47 @@ pub(crate) fn owed_repair_report(
     }
     match archive.read_section("repair_report") {
         Ok(bytes) => Ok(Some(OwedReport::Readable(bytes))),
+        Err(e) => unreadable(e),
+    }
+}
+
+/// The level routes the installed snapshot of the tree in `folder` records,
+/// read from that one section, so damage elsewhere in the snapshot does not
+/// hide them; `None` when there is no snapshot or the section does not read.
+///
+/// # Errors
+///
+/// Propagates a failure to list the folder, and an environmental failure to
+/// read the snapshot.
+#[cfg(feature = "std")]
+pub(crate) fn recorded_routes(
+    folder: &Path,
+    fs: &dyn Fs,
+    encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+) -> crate::Result<Option<Vec<alloc::string::String>>> {
+    let Some(id) = installed_snapshot(folder, fs)? else {
+        return Ok(None);
+    };
+    let unreadable = |e: crate::Error| {
+        if e.is_environmental() {
+            Err(e)
+        } else {
+            log::warn!("snapshot v{id} cannot say which level routes it records: {e}");
+            Ok(None)
+        }
+    };
+    let mut archive = match open_snapshot(folder, id, fs, encryption) {
+        Ok(archive) => archive,
+        Err(e) => return unreadable(e),
+    };
+    if archive.section("routes").is_none() {
+        return Ok(Some(Vec::new()));
+    }
+    match archive
+        .read_section("routes")
+        .and_then(|bytes| parse_routes_section(&bytes))
+    {
+        Ok(routes) => Ok(Some(routes)),
         Err(e) => unreadable(e),
     }
 }
@@ -688,6 +768,18 @@ pub(crate) struct Recovery {
     /// The encoded report of a repair the tree still owes, from the snapshot's
     /// `repair_report` section. Edits never carry it: only a snapshot does.
     pub repair_report: Option<Vec<u8>>,
+    /// The highest synced-flush number the recovered manifest decides (see
+    /// [`super::FlushSeqs`]): a flush up to it is in the tree if the manifest
+    /// names its tables, gone if not. From the snapshot's `flush_watermark`
+    /// section (`0` when absent) and overwritten by each edit that carries one.
+    pub flush_watermark: u64,
+    /// The level routes of the open that wrote the snapshot, each as its
+    /// tables folder relative to the tree's folder (see
+    /// [`super::routes`]); empty when the snapshot records none.
+    pub routes: Vec<alloc::string::String>,
+    /// Whether the log ends with the edit a clean close appends: every flush
+    /// is in the manifest then, wherever its tables lie.
+    pub closed_cleanly: bool,
 }
 
 impl Recovery {
@@ -785,6 +877,15 @@ impl Recovery {
         if let Some(dicts) = &edit.dicts {
             self.dicts.clone_from(dicts);
         }
+
+        // Absolute, as the floor.
+        if let Some(watermark) = edit.flush_watermark {
+            self.flush_watermark = watermark;
+        }
+
+        // Only the last edit says it: one after a clean close would be a
+        // flush or a compaction of the tree opened again.
+        self.closed_cleanly = edit.clean_close;
 
         self.curr_version_id = edit.new_version_id;
         Ok(())
@@ -907,6 +1008,23 @@ pub(crate) fn recover(
         } else {
             None
         },
+        // Absent from a snapshot written before synced flushes described
+        // themselves: none of its tables does, so none is above 0.
+        flush_watermark: if archive.section("flush_watermark").is_some() {
+            parse_flush_watermark_section(&archive.read_section("flush_watermark")?)?
+        } else {
+            0
+        },
+        // Absent from a snapshot of a tree with no routes, or written before
+        // routes were recorded: nothing to check them against.
+        routes: if archive.section("routes").is_some() {
+            parse_routes_section(&archive.read_section("routes")?)?
+        } else {
+            Vec::new()
+        },
+        // A snapshot is written by an open, a rotation or a repair, with the
+        // tree in use; only a clean close's edit after it says otherwise.
+        closed_cleanly: false,
     };
 
     // Replay the incremental edit log layered on top of the snapshot. The log

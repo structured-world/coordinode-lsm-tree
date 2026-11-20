@@ -15,10 +15,14 @@
 //! version names is a pool file, adopted again by the next open.
 //!
 //! With `std` a tree's pools refill off the writer's thread: a claim that
-//! leaves half a batch starts a refill, long before the pool runs dry, so a
-//! write waits on a batch only when it comes before the first one is ready.
-//! A claim that finds the pool dry with no refill under way makes its file
-//! and starts one.
+//! leaves half a batch reserves a refill, long before the pool runs dry, and a
+//! claim that finds the pool dry with no refill under way makes its file and
+//! reserves one. The refill starts at once, or, on a device whose I/O
+//! scheduler idles between queues, once the write's install has synced, so it
+//! never runs beside the write's own syncs there. Refilling on the writer's thread
+//! is an option: the write that finds its pool dry makes the batch, takes its
+//! file from it, and the install of its table syncs the folder among its own
+//! syncs, which makes the whole batch durable.
 
 use crate::{
     SequenceNumberCounter, TableId,
@@ -151,6 +155,11 @@ struct FolderPool {
     writing: Unwritten,
     /// Whether a refill off the claiming thread is under way.
     refilling: bool,
+    /// The first id of the batch a claim made last on the claiming thread:
+    /// the claim took it, and the install of its table syncs the folder, which
+    /// makes every pooled file made before durable by name (see
+    /// [`TableFilePools::synced_with`]).
+    latest_batch: Option<TableId>,
 }
 
 /// What every pool of a tree shares, with the refills running off the
@@ -175,12 +184,19 @@ struct Pools {
 /// Where a table file pool is refilled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RefillOn {
-    /// Off the thread of the write that claims from it: no write waits on a
-    /// batch.
+    /// Off the thread of the write that claims from it. Under a scheduler
+    /// that idles for each queue's next request (BFQ) a write holds the
+    /// refill its claim reserves until its install has synced, so none syncs
+    /// beside a batch; elsewhere the refill starts at once. A claim that finds
+    /// the pool dry while a refill fills it starts that refill if it is held,
+    /// its own write's included, and waits for it: a write needing another
+    /// file before its install still gets one. The default.
     #[default]
     Background,
-    /// On that thread: a write waits on the batch it starts, and every sync
-    /// the pool issues falls inside one write.
+    /// On that thread: the write that starts a batch makes its files, and the
+    /// install of its table syncs their folder among its own syncs. Measured
+    /// 20% slower than off it on the first flush of a new tree, whatever the
+    /// I/O scheduler.
     ClaimingThread,
 }
 
@@ -201,6 +217,33 @@ struct Refill {
     ids: Vec<TableId>,
 }
 
+/// The write a held refill waits for (see [`RefillHold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HoldId(usize);
+
+/// A write's hold on the refills its claims reserve: they start when it is
+/// dropped, once the write's tables are installed or the write gave up, and
+/// never on another write's install, which may come while this write still
+/// syncs.
+#[must_use = "dropping the hold starts the refills it holds"]
+pub(crate) struct RefillHold {
+    pools: Arc<TableFilePools>,
+    id: HoldId,
+}
+
+impl RefillHold {
+    /// What the write's claims are held for.
+    pub(crate) fn id(&self) -> HoldId {
+        self.id
+    }
+}
+
+impl Drop for RefillHold {
+    fn drop(&mut self) {
+        self.pools.start_held_by(self.id);
+    }
+}
+
 /// The pools of a tree's tables folders, and the ids their files take.
 pub(crate) struct TableFilePools {
     pools: Arc<Pools>,
@@ -208,6 +251,13 @@ pub(crate) struct TableFilePools {
     /// go: none makes a file in a folder after its tree is closed.
     #[cfg(feature = "std")]
     refills: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The refills claims reserved, each held until the write it is held for
+    /// drops its [`RefillHold`].
+    #[cfg(feature = "std")]
+    pending: Mutex<Vec<(HoldId, Refill)>>,
+    /// The id the next [`RefillHold`] takes. Wrapping is harmless: two holds
+    /// share an id only when one outlives `usize::MAX` writes started after it.
+    next_hold: core::sync::atomic::AtomicUsize,
     /// The liveness of the tree whose folders these are, given up only once
     /// the last refill is joined.
     life: Option<Arc<crate::close::Life>>,
@@ -219,7 +269,7 @@ impl TableFilePools {
         Self::with(ids, batch, sync_mode, false, None)
     }
 
-    /// Pools that refill off the claiming thread: no claim waits on a batch.
+    /// Pools that refill off the claiming thread.
     #[cfg(all(test, feature = "std"))]
     pub(crate) fn refilling_in_background(
         ids: SequenceNumberCounter,
@@ -261,7 +311,23 @@ impl TableFilePools {
             }),
             #[cfg(feature = "std")]
             refills: Mutex::new(Vec::new()),
+            #[cfg(feature = "std")]
+            pending: Mutex::new(Vec::new()),
+            next_hold: core::sync::atomic::AtomicUsize::new(0),
             life,
+        }
+    }
+
+    /// A hold for a write whose claims' refills wait for its install (see
+    /// `IoStrategy::refill_after_install`): the write keeps it until its
+    /// tables are installed.
+    pub(crate) fn hold(self: &Arc<Self>) -> RefillHold {
+        RefillHold {
+            pools: Arc::clone(self),
+            id: HoldId(
+                self.next_hold
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 
@@ -312,7 +378,9 @@ impl TableFilePools {
     /// file and starts a refill, as does one that leaves half a batch.
     ///
     /// The file is opened for writing as `origin`'s; the empty files a refill
-    /// makes ahead are [`WriteOrigin::Metadata`].
+    /// makes ahead are [`WriteOrigin::Metadata`]. A refill the claim reserves
+    /// starts at once, or, `held_for` a write, when that write drops its
+    /// [`RefillHold`].
     ///
     /// # Errors
     ///
@@ -324,6 +392,11 @@ impl TableFilePools {
         above: Option<TableId>,
         may_refill: bool,
         origin: WriteOrigin,
+        #[cfg_attr(
+            not(feature = "std"),
+            expect(unused_variables, reason = "without std no refill is held")
+        )]
+        held_for: Option<HoldId>,
     ) -> crate::Result<ClaimedFile> {
         // Held across the refill and the open, so two claims never take one
         // file.
@@ -334,12 +407,26 @@ impl TableFilePools {
         // ids a folder hands out would depend on how far the refill got.
         // Only a write that comes before the first batch is ready waits; one
         // started at half a batch is ready long before the pool runs dry.
+        //
+        // The refill filling it may be held for a write, this claim's own
+        // among them, which cannot install while this claim waits: it is
+        // started here, whichever write holds it. It is held under this lock,
+        // so the check cannot miss it.
         #[cfg(feature = "std")]
         while folders
             .get(at)
             .is_some_and(|pool| pool.refilling && pool.ids.is_empty())
         {
-            self.pools.refilled.wait(&mut folders);
+            let waited = self.take_held(|_, refill| refill.at == at);
+            if waited.is_empty() {
+                self.pools.refilled.wait(&mut folders);
+            } else {
+                parking_lot::MutexGuard::unlocked(&mut folders, || {
+                    for refill in waited {
+                        self.start(refill);
+                    }
+                });
+            }
         }
         let Some(pool) = folders.get_mut(at) else {
             return Err(crate::Error::Unrecoverable);
@@ -356,6 +443,16 @@ impl TableFilePools {
         // tables written into the folder.
         let pooled = claimed?.ok_or_else(|| Writing::new(&pool.writing, self.pools.ids.next()));
         let refill = due.then(|| self.pools.reserve(pool, at, folder, fs));
+        // Held under the pools' lock, with the reservation: a claim that finds
+        // the pool dry sees the refill it waits on.
+        #[cfg(feature = "std")]
+        let refill = match (refill, held_for) {
+            (Some(refill), Some(by)) => {
+                self.pending.lock().push((by, refill));
+                None
+            }
+            (refill, _) => refill,
+        };
         drop(folders);
         // The write's own file is made before the refill starts, so the batch
         // never reaches the backend ahead of the file the write waits on.
@@ -363,13 +460,43 @@ impl TableFilePools {
             Ok(claimed) => Ok(claimed),
             Err(made) => Pools::create(folder, fs, made, origin),
         };
+        // A refill held for the install was taken above; without std none runs
+        // off the claiming thread, held or not.
         if let Some(refill) = refill {
             self.start(refill);
         }
         claimed
     }
 
-    /// [`Self::claim_as`] for a flush's table.
+    /// The held refills `which` picks, taken off the list.
+    #[cfg(feature = "std")]
+    fn take_held(&self, mut which: impl FnMut(HoldId, &Refill) -> bool) -> Vec<Refill> {
+        self.pending
+            .lock()
+            .extract_if(.., |(by, refill)| which(*by, refill))
+            .map(|(_, refill)| refill)
+            .collect()
+    }
+
+    /// Starts the refills held for the write `by`, once its syncs are done:
+    /// a batch the write's claim started never runs beside them. On a
+    /// scheduler that idles for each thread's next request (BFQ) the two took
+    /// the first flush of a new tree to 105 ms at p99, against 7 with the
+    /// batch after it. Those held for other writes stay held: they may still
+    /// be syncing.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(unused_variables, reason = "without std no refill is held")
+    )]
+    fn start_held_by(&self, by: HoldId) {
+        #[cfg(feature = "std")]
+        for refill in self.take_held(|held_for, _| held_for == by) {
+            self.start(refill);
+        }
+    }
+
+    /// [`Self::claim_as`] for a flush's table, a refill it reserves started at
+    /// once.
     #[cfg(test)]
     pub(crate) fn claim(
         &self,
@@ -378,7 +505,27 @@ impl TableFilePools {
         above: Option<TableId>,
         may_refill: bool,
     ) -> crate::Result<ClaimedFile> {
-        self.claim_as(folder, fs, above, may_refill, WriteOrigin::FlushTable)
+        self.claim_as(folder, fs, above, may_refill, WriteOrigin::FlushTable, None)
+    }
+
+    /// [`Self::claim_as`] for a flush's table, a refill it reserves held for
+    /// the write `hold` is.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn claim_held(
+        &self,
+        folder: &Path,
+        fs: &Arc<dyn Fs>,
+        may_refill: bool,
+        hold: &RefillHold,
+    ) -> crate::Result<ClaimedFile> {
+        self.claim_as(
+            folder,
+            fs,
+            None,
+            may_refill,
+            WriteOrigin::FlushTable,
+            Some(hold.id()),
+        )
     }
 
     /// Runs `refill` off this thread. A thread that cannot be started leaves
@@ -418,8 +565,35 @@ impl TableFilePools {
         self.pools.withdraw(refill.at, &refill.ids);
     }
 
-    /// Waits for the refills running off the claiming thread to finish.
+    /// Tells the pool of `folder` on `fs` that the install of the table `id`
+    /// synced the folder. When that table took the first file of the latest
+    /// batch a claim made, every pooled file was made before that claim
+    /// returned, so before the sync began, and is durable by name: the next
+    /// claim need not sync the folder again. A batch made since then is not
+    /// covered, and the pool stays as it was.
+    pub(crate) fn synced_with(&self, folder: &Path, fs: &Arc<dyn Fs>, id: TableId) {
+        if let Some(pool) = self.pools.folders.lock().iter_mut().find(|pool| {
+            pool.routes
+                .iter()
+                .any(|(route_fs, route)| Arc::ptr_eq(route_fs, fs) && route == folder)
+        }) && pool.latest_batch == Some(id)
+        {
+            pool.synced = true;
+        }
+    }
+
+    /// Starts every refill held, whichever write it is held for, and waits
+    /// for every refill running off the claiming thread to finish.
     pub(crate) fn wait_for_refills(&self) {
+        #[cfg(feature = "std")]
+        for refill in self.take_held(|_, _| true) {
+            self.start(refill);
+        }
+        self.join_refills();
+    }
+
+    /// Waits for the refills running off the claiming thread to finish.
+    fn join_refills(&self) {
         #[cfg(feature = "std")]
         {
             let refills = core::mem::take(&mut *self.refills.lock());
@@ -434,7 +608,16 @@ impl TableFilePools {
 
 impl Drop for TableFilePools {
     fn drop(&mut self) {
-        self.wait_for_refills();
+        // A refill still held makes nothing for a tree that is closing: its
+        // ids are given back, as for one that could not start.
+        #[cfg(feature = "std")]
+        {
+            let pending = core::mem::take(&mut *self.pending.lock());
+            for (_, refill) in pending {
+                self.pools.withdraw(refill.at, &refill.ids);
+            }
+        }
+        self.join_refills();
         // Only now: no refill makes a file once the tree may close.
         drop(self.life.take());
     }
@@ -457,18 +640,10 @@ impl Pools {
     ) -> (crate::Result<Option<ClaimedFile>>, bool) {
         let mut refilled = false;
         let claimed = loop {
-            if !pool.synced && !pool.ids.is_empty() {
-                if let Err(e) = crate::file::fsync_directory(folder, &**fs, self.sync_mode) {
-                    break Err(e.into());
-                }
-                pool.synced = true;
-            }
             let Some(id) = pool.ids.pop_front() else {
                 if self.background || refilled || !may_refill {
                     break Ok(None);
                 }
-                // Synced by the refill itself, or left unsynced for the
-                // next claim when its sync fails.
                 if let Err(e) = self.refill(pool, folder, &**fs) {
                     break Err(e);
                 }
@@ -481,13 +656,22 @@ impl Pools {
                 discard(&**fs, &path);
                 continue;
             }
+            // Only a file handed out needs its name durable. A batch this
+            // claim made is synced by the install of its table instead.
+            if !pool.synced && !refilled {
+                if let Err(e) = crate::file::fsync_directory(folder, &**fs, self.sync_mode) {
+                    pool.ids.push_front(id);
+                    break Err(e.into());
+                }
+                pool.synced = true;
+            }
             match open_unshared_empty(&**fs, &path, origin) {
                 Ok(Opened::Unshared(file)) => {
                     break Ok(Some(ClaimedFile {
                         id,
                         path,
                         file,
-                        durable_entry: true,
+                        durable_entry: !refilled,
                         writing: Writing::listed(&pool.writing, id),
                     }));
                 }
@@ -637,20 +821,25 @@ impl Pools {
     }
 
     /// Creates a batch of empty files in `folder` on `fs`, `pool`'s folder,
-    /// and syncs it once. Whatever was created stays pooled when a later step
-    /// fails, unsynced, so the next claim syncs the folder before handing one
-    /// out.
+    /// without syncing it: the claim that refilled hands its file out with
+    /// the entry not yet durable, so the install of its table syncs the
+    /// folder among its own syncs, and that sync makes the whole batch
+    /// durable. Until a claim sees it synced the pool stays unsynced, so the
+    /// next claim syncs the folder before handing a file out (cheap by then).
+    /// Whatever was created stays pooled when a later step fails.
     fn refill(&self, pool: &mut FolderPool, folder: &Path, fs: &dyn Fs) -> crate::Result<()> {
         pool.synced = false;
-        for _ in 0..self.batch {
+        pool.latest_batch = None;
+        for at in 0..self.batch {
             let id = self.ids.next();
+            if at == 0 {
+                pool.latest_batch = Some(id);
+            }
             let path = folder.join(id.to_string());
             drop(fs.open(&path, &pool_file())?);
             pool.writing.lock().push(id);
             pool.ids.push_back(id);
         }
-        crate::file::fsync_directory(folder, fs, self.sync_mode)?;
-        pool.synced = true;
         Ok(())
     }
 }
@@ -685,6 +874,7 @@ fn pool_of(folders: &mut Vec<FolderPool>, folder: &Path, fs: &Arc<dyn Fs>) -> us
                 unpooled: fs.capabilities(folder).directory_sync_noop,
                 writing: Arc::new(Mutex::new(Vec::new())),
                 refilling: false,
+                latest_batch: None,
             });
             folders.len() - 1
         }

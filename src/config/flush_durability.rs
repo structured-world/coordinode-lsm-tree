@@ -8,8 +8,15 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FlushDurability {
-    /// A flush syncs its tables, their directory and the manifest edit naming
-    /// them before it returns. The default.
+    /// A flush syncs its tables, its blob files and their directories before
+    /// it returns. The default.
+    ///
+    /// It writes no manifest edit: each table records which flush wrote it
+    /// and its place in that flush's run, and an open after a power loss
+    /// installs every flush whose tables are all there, so one that returned
+    /// is kept and one cut short is left out. The next install that writes
+    /// the manifest (a compaction, [`AbstractTree::persist_flushes`](crate::AbstractTree::persist_flushes),
+    /// a tree that is dropped) names the tables.
     #[default]
     Synced,
 

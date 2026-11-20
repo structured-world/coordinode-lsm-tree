@@ -9,6 +9,12 @@ use crate::path::{Path, PathBuf};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use std::fs::{File, OpenOptions};
 
+#[cfg(io_uring_fs)]
+mod ring_sync;
+
+#[cfg(target_os = "linux")]
+mod scheduler;
+
 /// Delays between the attempts of a rename or delete that another process is
 /// briefly holding the file against, before the last error is returned: about
 /// half a second in all, longer than an antivirus or indexer scan of a fresh
@@ -200,6 +206,14 @@ impl FsFile for File {
 
     fn read_many_buf(&self, regions: &mut [(u64, ReadBuf<'_>)]) -> io::Result<()> {
         super::read_buf::read_each(self, regions)
+    }
+
+    /// The descriptor the handle holds: a batch of syncs through handles kept
+    /// open since their writes (a synced flush's) reaches one ring by it.
+    #[cfg(unix)]
+    fn backing_fd(&self) -> Option<i32> {
+        use std::os::unix::io::AsRawFd as _;
+        Some(self.as_raw_fd())
     }
 
     fn lock_exclusive(&self) -> io::Result<()> {
@@ -521,16 +535,35 @@ impl Fs for StdFs {
     }
 
     fn sync_device(&self, path: &Path) -> io::Result<()> {
+        self.sync_device_noting(path).map_err(|(error, _)| error)
+    }
+
+    fn sync_device_noting(&self, path: &Path) -> Result<(), (io::Error, bool)> {
         // `F_FULLFSYNC` flushes the whole drive cache, whatever descriptor of
         // the device it is issued on.
         #[cfg(target_os = "macos")]
         {
-            File::open(path)?.sync_all().map_err(io::Error::from)
+            let device = File::open(path).map_err(|error| (io::Error::from(error), false))?;
+            device
+                .sync_all()
+                .map_err(|error| (io::Error::from(error), true))
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = path;
             Ok(())
+        }
+    }
+
+    #[cfg(io_uring_fs)]
+    fn sync_many(&self, targets: &[super::SyncTarget<'_>]) -> Result<(), super::SyncFailure> {
+        if let [_] = targets {
+            return super::sync_each_target(self, targets);
+        }
+        match ring_sync::sync_on_ring(targets) {
+            Some(result) => result,
+            // No ring on this kernel (or none allowed): one thread per sync.
+            None => super::sync_each_target(self, targets),
         }
     }
 
@@ -632,13 +665,20 @@ impl Fs for StdFs {
         linux_caps::capabilities(path)
     }
 
+    /// Linux: from the I/O scheduler of the disks under `path`.
+    #[cfg(target_os = "linux")]
+    fn idles_between_io_queues(&self, path: &Path) -> bool {
+        scheduler::idles_between_queues(path)
+    }
+
     /// Windows: no directory can be synced (see `sync_directory`), so the
-    /// directory sync is reported as doing nothing; every other capability
-    /// is the conservative default.
+    /// directory sync is reported as doing nothing, and files are synced one
+    /// at a time; every other capability is the conservative default.
     #[cfg(target_os = "windows")]
     fn capabilities(&self, _path: &Path) -> super::FsCapabilities {
         super::FsCapabilities {
             directory_sync_noop: true,
+            serial_syncs: true,
             ..super::FsCapabilities::default()
         }
     }

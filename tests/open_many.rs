@@ -81,8 +81,10 @@ fn a_power_loss_leaves_all_of_a_batch_or_none() {
         let (_, clean) = stack_with(warm);
         let fs: Arc<dyn Fs> = clean.clone();
         let _ = clean.injector().take_syncs();
-        drop(Config::open_many(configs(&fs)).expect("the batch"));
+        let trees = Config::open_many(configs(&fs)).expect("the batch");
+        // The batch's own syncs, not the ones its trees' close makes.
         let syncs = clean.injector().take_syncs();
+        drop(trees);
         assert!(!syncs.is_empty(), "self-check: the batch syncs");
 
         for kept in 0..=syncs.len() {

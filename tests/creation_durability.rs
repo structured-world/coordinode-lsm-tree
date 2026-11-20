@@ -31,13 +31,14 @@ fn reopen(fs: &CrashFs, blob: bool) -> AnyTree {
         .expect("the tree reopens after the power loss")
 }
 
-/// A flush whose edit could not be synced is still in the log a later open
-/// reads, and that open shows its keys as persisted, so a caller may trim its
-/// own log by them. The open removes nothing, yet it makes the log it read
+/// An ingestion whose edit could not be synced is still in the log a later
+/// open reads, and that open shows its keys as persisted, so a caller may trim
+/// its own log by them. The open removes nothing, yet it makes the log it read
 /// durable before it returns the tree: a power loss then keeps the keys the
-/// open showed.
+/// open showed. (A synced flush writes no edit: its tables describe
+/// themselves, so an ingestion is the install whose keys only the edit names.)
 #[test]
-fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() {
+fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() -> lsm_tree::Result<()> {
     use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
     let crash = CrashFs::new(MemFs::new());
     let fault = Arc::new(FaultFs::new(crash.clone()));
@@ -50,8 +51,9 @@ fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() {
         .with_shared_fs(fault.clone())
     };
     {
-        let tree = config().open().expect("create");
-        tree.insert("key", "value", 0);
+        let tree = config().open()?;
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write("key", "value")?;
         fault.injector().arm(
             FaultRule::new(
                 FaultOp::SyncData,
@@ -61,26 +63,40 @@ fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() {
             .once(),
         );
         assert!(
-            tree.flush_active_memtable(0).is_err(),
-            "self-check: the flush's edit is not synced"
+            ingestion.finish().is_err(),
+            "self-check: the ingestion's edit is not synced"
         );
     }
-    {
-        let tree = config().open().expect("an open over the unsynced edit");
-        assert!(
-            tree.get("key", u64::MAX).expect("get").is_some(),
-            "self-check: the open shows the flushed key"
-        );
-    }
-
-    crash.crash();
-    let tree = config()
-        .open()
-        .expect("the tree opens after the power loss");
+    let shown = config().open()?;
     assert!(
-        tree.get("key", u64::MAX).expect("get").is_some(),
+        shown.get("key", u64::MAX)?.is_some(),
+        "self-check: the open shows the flushed key"
+    );
+
+    // The power goes with that tree open: its close, which persists its
+    // flushes, makes nothing durable the open did not.
+    crash.crash();
+    for op in [
+        FaultOp::Open,
+        FaultOp::SyncData,
+        FaultOp::SyncAll,
+        FaultOp::SyncDirectory,
+        FaultOp::Rename,
+        FaultOp::RemoveFile,
+    ] {
+        fault.injector().arm(FaultRule::new(
+            op,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        ));
+    }
+    drop(shown);
+    fault.injector().clear();
+    let tree = config().open()?;
+    assert!(
+        tree.get("key", u64::MAX)?.is_some(),
         "the key the open showed survives the power loss"
     );
+    Ok(())
 }
 
 /// A compaction whose edit could not be synced may or may not be in the log
@@ -199,8 +215,9 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
     let fs = CrashFs::new(mem.clone());
     {
         // The first install appends, the second rotates, the third appends
-        // to the rotated generation's log. No pooled table files, so the log
-        // is the only state left.
+        // to the rotated generation's log. A flush writes no manifest, so
+        // each is persisted. No pooled table files, so the log is the only
+        // state left.
         let tree = config(&fs, false)
             .manifest_log_rotate_bytes(1)
             .table_file_pool(0)
@@ -209,6 +226,7 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
         for i in 0..2u64 {
             tree.insert(format!("key{i}"), "value", i);
             tree.flush_active_memtable(0).expect("flush");
+            tree.persist_flushes().expect("persist");
         }
         tree.clear().expect("clear");
     }
@@ -518,11 +536,10 @@ fn an_open_without_a_snapshot_refuses_a_rotated_generations_empty_log() {
         if entry.file_name.starts_with('v') {
             mem.remove_file(&entry.path).expect("lose the snapshot");
         } else if entry.file_name.starts_with("edits-") && entry.file_name != "edits-0" {
-            assert_eq!(
-                mem.metadata(&entry.path).expect("log").len,
-                0,
-                "self-check: the rotated log is empty"
-            );
+            // The close appended its mark; a tree killed before its close
+            // leaves the log empty, as here.
+            mem.truncate_file(&entry.path)
+                .expect("empty the rotated log");
             rotated_logs += 1;
         }
     }

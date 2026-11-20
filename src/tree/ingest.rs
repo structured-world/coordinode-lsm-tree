@@ -133,15 +133,27 @@ impl<'a> Ingestion<'a> {
             rc.ecc_scheme,
         );
 
+        // Carried in the write pin to the install. The flush `finish` runs
+        // first starts only its own refills, so these never run beside the
+        // ingestion's syncs.
+        let refills = rc
+            .io
+            .refill_after_install()
+            .then(|| tree.table_files.hold());
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::from_pool(
             folder.clone(),
-            Arc::clone(&tree.table_files),
-            None,
+            crate::table::multi_writer::TableFiles::new(
+                Arc::clone(&tree.table_files),
+                None,
+                crate::fs::WriteOrigin::IngestTable,
+                refills
+                    .as_ref()
+                    .map(crate::table::file_pool::RefillHold::id),
+            ),
             tree.config.table_target_size,
             ingest_level,
             level_fs.clone(),
-            crate::fs::WriteOrigin::IngestTable,
         )?
         .set_comparator(tree.config.comparator.clone())
         .use_bloom_policy(bloom_policy)
@@ -261,7 +273,9 @@ impl<'a> Ingestion<'a> {
             level_fs,
             tree,
             writer,
-            write_pin: crate::runtime_config::WritePin::new(rc).with_filter_sizing(filter_sizing),
+            write_pin: crate::runtime_config::WritePin::new(rc)
+                .with_filter_sizing(filter_sizing)
+                .with_refills(refills),
             seqno: 0,
             last_key: None,
             #[cfg(feature = "columnar")]

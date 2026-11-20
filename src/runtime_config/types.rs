@@ -1005,6 +1005,15 @@ pub struct RuntimeConfig {
     /// Live-toggleable: the verdict is computed, not latched, so it clears as
     /// soon as compaction drains below the thresholds.
     pub backpressure: crate::backpressure::BackpressureThresholds,
+
+    /// What a flush does on the device under the tree, set from its I/O
+    /// scheduler when the tree opens and by
+    /// [`crate::IoPolicy::refresh`] when the scheduler changes. A property of
+    /// the host, not of the tree: never written to the manifest. One per tree,
+    /// from the tree's own folder: a level routed to a volume under another
+    /// scheduler flushes by the tree folder's, which picks only how syncs are
+    /// batched and when a file pool refills, a matter of speed, never of data.
+    pub(crate) io: crate::io_policy::IoStrategy,
 }
 
 impl Default for RuntimeConfig {
@@ -1050,6 +1059,7 @@ impl Default for RuntimeConfig {
             storage_limit_bytes: None,
             tight_space_compaction: false,
             backpressure: crate::backpressure::BackpressureThresholds::OFF,
+            io: crate::io_policy::IoStrategy::NONE,
         }
     }
 }

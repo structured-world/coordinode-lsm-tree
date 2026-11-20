@@ -287,8 +287,9 @@ fn filterless_tables_do_not_price_the_others() -> crate::Result<()> {
 }
 
 /// A flush whose filters would take the budget past its limit, and whose
-/// install then fails, leaves the over-budget state to the filters that are
-/// live: they still fit, so the tree is not over its budget.
+/// install then fails (its tables cannot be made durable), leaves the
+/// over-budget state to the filters that are live: they still fit, so the
+/// tree is not over its budget.
 #[test]
 fn a_failed_install_leaves_the_budget_to_the_live_filters() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
@@ -318,7 +319,8 @@ fn a_failed_install_leaves_the_budget_to_the_live_filters() -> crate::Result<()>
         tree.insert(key("new", 2 * i), "value", u64::from(KEYS + i));
     }
     injector.arm(
-        FaultRule::new(FaultOp::Write, Fault::Error(crate::io::ErrorKind::Other)).on_path("edits-"),
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("tables"),
     );
     assert!(tree.flush_active_memtable(0).is_err(), "the install fails");
     injector.clear();
@@ -590,11 +592,11 @@ fn a_caller_flushed_stream_is_sized_and_registered() -> crate::Result<()> {
             crate::ValueType::Value,
         ))
     });
-    let Some((tables, _, pin)) = tree.flush_to_tables(entries)? else {
+    let Some((tables, _, pin, kept)) = tree.flush_to_tables(entries)? else {
         panic!("the stream writes tables");
     };
     assert!(tables.iter().all(|table| table.filter_size() > 0));
-    tree.register_tables(&tables, None, None, &[], 0, false)?;
+    tree.register_tables(&tables, None, None, &[], 0, false, &kept)?;
 
     assert!(tree.get(key("k", 2), SeqNo::MAX)?.is_some());
     let AnyTree::Standard(standard) = &tree else {
