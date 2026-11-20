@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795205924813,
+  "lastUpdate": 1795205930829,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -115644,6 +115644,852 @@ window.BENCHMARK_DATA = {
             "value": 0.9381818181818182,
             "unit": "B/row",
             "extra": "keys: 100000 | rows: 1100 | read: 22428159 B | decoded: 17236521 B | copied: 16396252 B | materialized: 13339024 B | payload useful: 9509 B | payload incidental: 1032 B | blob prefetched: 4823400 B | elapsed: 283.436203ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / compaction-one-segment encoded share of output",
+            "value": 0,
+            "unit": "B/B",
+            "extra": "keys: 100000 | rows: 100000 | output: 31521190 B | copied: 31521190 B\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / compaction-overlap-8 encoded share of output",
+            "value": 1,
+            "unit": "B/B",
+            "extra": "keys: 100000 | rows: 100000 | output: 31544948 B | copied: 0 B\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / compaction-row-updates-over-columnar-base encoded share of output",
+            "value": 1,
+            "unit": "B/B",
+            "extra": "keys: 100000 | rows: 100000 | output: 23279247 B | copied: 0 B\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / compaction-wide-cells encoded share of output",
+            "value": 0,
+            "unit": "B/B",
+            "extra": "keys: 100000 | rows: 100000 | output: 9665446 B | copied: 9665446 B\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / compaction bytes per written byte",
+            "value": 2.1859934913793104,
+            "unit": "x",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / tables per merge",
+            "value": 5.679245283018868,
+            "unit": "tables",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / output tables per merge",
+            "value": 4.69811320754717,
+            "unit": "tables",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / peak debt",
+            "value": 5548142,
+            "unit": "bytes",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / mean debt",
+            "value": 1959186.4782608696,
+            "unit": "bytes",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / compaction bytes per step p99",
+            "value": 5410815,
+            "unit": "bytes",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / compaction bytes per written byte",
+            "value": 2.3000200431034483,
+            "unit": "x",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / tables per merge",
+            "value": 12.217391304347826,
+            "unit": "tables",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / output tables per merge",
+            "value": 9.434782608695652,
+            "unit": "tables",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / peak debt",
+            "value": 5470119,
+            "unit": "bytes",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / mean debt",
+            "value": 1877870,
+            "unit": "bytes",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / compaction bytes per step p99",
+            "value": 5898239,
+            "unit": "bytes",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "baebe735cd6cf95d64cfeae687773a1dd9bbdd56",
+          "message": "perf(write): speed up the overwrite path (#1092)\n\n## Summary\n\n- A synced flush writes no manifest edit: its tables describe\nthemselves, and an open takes in every whole flush above the manifest's\nwatermark from them.\n- A flush syncs its files side by side, under BFQ in one `io_uring`\nbatch, and file buffers are written on worker lanes.\n- `IoPolicy` picks the flush strategy from each location's I/O scheduler\nand switches trees live.\n\n## Changes\n\n- Self-described flushes: each table records its flush number, place in\nthe run, run length, retention floor and the last flush that had\nreturned when it began. An open reads every block of those tables and\nevery frame and dictionary of their blob files. A returned flush the\nbytes prove damaged fails the open with `Error::DamagedFlush`, which\n`open_or_repair` repairs; one of which no table is found, or one a\ndictionary the manifest references keeps from reading, fails it without\na repair. A flush that never returned, or that a later flush began after\nwithout naming it, is set aside. Of several copies of a table, one that\nreads whole is taken. Repair keeps the flushes no manifest names yet. A\nsynced flush after a manifest append that failed rotates the manifest\nbefore it returns, past the record that append may have left torn.\n- Routes and clean close: every snapshot records the tables folders of\nthe level routes, relative to the tree's folder (a `%` or a byte that is\nnot UTF-8 written as `%XX`), and a clean close appends an edit saying\nthe manifest names every flush. An open or a repair after a crash\nrefuses with `Error::MissingRoute` while a recorded route is not\nconfigured or its folder is missing, since a flush that returned may lie\nthere; a repair whose manifest does not load reads the routes section of\nits snapshot alone. After a clean close a route can be removed.\n- A synced flush syncs up to 16 tables and as many blob files through\nthe handles its writers wrote them with (`SyncTarget::OpenFile`; the std\nbackend's handles show their descriptors, so the batch reaches the\nring), and syncs each one past them through its handle before closing\nit, so a flush of thousands of files holds no descriptor for each until\nits install; without std a synced flush's files sync through their\nhandles before they close. The install syncs no such file again, and\nstill counts its device for a barrier's device flush. A file not kept\nopen still reports a failure of its last write before it is handed to\nthe install.\n- Flush numbers are decided under the install's version lock; the flush\nand persist docs say when a caller may drop its own journal.\n- Batched syncs: `Fs::sync_many` syncs a batch on threads, or on Linux\nthrough a thread-local ring in chunks of 64 open files; no file claimed\nafter a failed sync is synced, and a thread the kernel gives no ring for\ngood stops asking for one. A failed batch returns a `SyncFailure` naming\neach target a sync ran on and did not report synced, so a persist of\ndeferred flushes marks only those files as never to be acknowledged, and\na file that did not open, or whose sync never left the ring's queue,\nsyncs again. Windows syncs one at a time; under barrier syncs every\nother device is flushed before the dependent step: a device whose flush\nfailed fails the syncs to it, and one whose flush never began\n(`Fs::sync_device_noting`) leaves them to sync again.\n- `IoPolicy` (`Config::use_io_policy`) asks each location's scheduler\nonce and sets `IoStrategy` in each tree's runtime config;\n`IoPolicy::refresh` re-probes. Under BFQ a table file pool refill waits\nfor the write whose claim reserved it.\n- The runtime config handle records the snapshots a swap replaces, so a\ndictionary a running write's snapshot names is never collected.\n- File buffers go to parking_lot worker lanes once a file passes its\nfirst megabyte; a panicked inner write, flush or seek fails the file for\ngood, no unwind of a lane's drain leaves the lane marked, and a writer\ndropped while its owner unwinds writes nothing more.\n- The frame check of a blob file refuses a chunk frame no head lists; a\nrepair removes a blob file no table references and no manifest names\nwithout reading it.\n\n## Testing\n\nFormatting, clippy (default, all features), docs, the no-std check and\nthe tests of the changed areas pass locally on macOS, and the `io_uring`\nand ring-sync tests on Linux; the full suite and Linux and Windows run\nin CI.\n\nMeasured against v7.6.0 on one Linux benchmark host (`compare` bench,\noverwrite groups, median ns per write, ratio to RocksDB in the same\nrun):\n\n| arm | v7.6.0 | this PR |\n|---|---|---|\n| overwrite, 10,000 keys | 2,092 (0.85x) | 1,652 (0.69x) |\n| overwrite, 70,000 keys | 2,542 (0.89x) | 1,812 (0.69x) |\n| overwrite, deferred caller log, 70,000 keys | 4,180 (1.47x) | 3,133\n(1.20x) |\n| overwrite_sustained | 1,847 (1.12x) | 1,498 (0.90x) |\n| overwrite_sustained, zstd 22 | 15,662 (0.67x) | 14,707 (0.60x) |\n\nIn the sustained group, write amplification drops from 0.64 to 0.57.\nReader p50 moves from 5.8 µs to 6.0 µs and p99 from 27.5 µs to 29.3 µs,\nboth inside the run's spread.\n\nThe benchmark harness for this path follows in a stacked PR. Replaces\n#1090 (and #1088, #1082 before it). Part of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Synced flushes can be recovered after a crash without waiting for a\nmanifest update, provided their files are intact.\n* Configurable I/O policies adapt file syncing and refill behavior to\nthe storage backend.\n* After an unclean shutdown, opens validate recorded table locations and\nreport missing routes.\n* **Bug Fixes**\n* Recovery and repair better distinguish complete, interrupted, and\ndamaged flushes, preserving readable data and reporting unrecoverable\nlosses.\n* Improved durability handling for file syncing, checkpoints, and clean\nshutdowns.\n* **Documentation**\n  * Clarified flush durability, recovery, and file-refill behavior.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-20T20:49:59+02:00",
+          "tree_id": "eb6051a6534314494f7ef4fbb5805e88b29d8bcc",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/baebe735cd6cf95d64cfeae687773a1dd9bbdd56"
+        },
+        "date": 1795205929576,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / narrow-records bytes read per row",
+            "value": 40.3518,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8070360 B | decoded: 7998618 B | copied: 9000000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 355.693892ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes decoded per row",
+            "value": 39.99309,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8070360 B | decoded: 7998618 B | copied: 9000000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 355.693892ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes copied per row",
+            "value": 45,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8070360 B | decoded: 7998618 B | copied: 9000000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 355.693892ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes read per row",
+            "value": 4215,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 382.381785ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes decoded per row",
+            "value": 4182,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 382.381785ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes copied per row",
+            "value": 4141,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 382.381785ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes read per row",
+            "value": 865.41186,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86541186 B | decoded: 86211153 B | copied: 86420000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 272.3005ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes decoded per row",
+            "value": 862.11153,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86541186 B | decoded: 86211153 B | copied: 86420000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 272.3005ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes copied per row",
+            "value": 864.2,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86541186 B | decoded: 86211153 B | copied: 86420000 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 272.3005ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes read per row",
+            "value": 214.84233,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21484233 B | decoded: 20876241 B | copied: 51100094 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 1.358566428s\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes decoded per row",
+            "value": 208.76241,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21484233 B | decoded: 20876241 B | copied: 51100094 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 1.358566428s\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes copied per row",
+            "value": 511.00094,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21484233 B | decoded: 20876241 B | copied: 51100094 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 1.358566428s\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan bytes read per row",
+            "value": 210.90209,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 132.923335ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan bytes decoded per row",
+            "value": 206.40914,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 132.923335ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan bytes copied per row",
+            "value": 149.31016,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 132.923335ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan bytes materialized per row",
+            "value": 149.31016,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 132.923335ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan retained payload",
+            "value": 177136,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 132.923335ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan bytes read to first batch",
+            "value": 163296,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 132.923335ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes read per row",
+            "value": 130.66365789473684,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 9930438 B | decoded: 9846849 B | copied: 10013359 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 262.737859ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes decoded per row",
+            "value": 129.56380263157894,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 9930438 B | decoded: 9846849 B | copied: 10013359 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 262.737859ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes copied per row",
+            "value": 131.75472368421052,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 9930438 B | decoded: 9846849 B | copied: 10013359 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 262.737859ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes read per row",
+            "value": 4249.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | materialized: 293835 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 136.956442ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes decoded per row",
+            "value": 4084.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | materialized: 293835 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 136.956442ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes copied per row",
+            "value": 285,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | materialized: 293835 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 136.956442ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes materialized per row",
+            "value": 285,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | materialized: 293835 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 136.956442ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes read per row",
+            "value": 340.1047555555555,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | materialized: 24990376 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 245.16411ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes decoded per row",
+            "value": 330.41925555555554,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | materialized: 24990376 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 245.16411ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes copied per row",
+            "value": 277.67084444444447,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | materialized: 24990376 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 245.16411ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes materialized per row",
+            "value": 277.67084444444447,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | materialized: 24990376 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 245.16411ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes read per row",
+            "value": 286.70793,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 222.212292ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes decoded per row",
+            "value": 281.58666,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 222.212292ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes copied per row",
+            "value": 0,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 222.212292ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes materialized per row",
+            "value": 277.55176,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 222.212292ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment retained payload",
+            "value": 16098,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 222.212292ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
+            "value": 16629,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 222.212292ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes read per row",
+            "value": 298.36368,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 532.273186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes decoded per row",
+            "value": 290.9664,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 532.273186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes copied per row",
+            "value": 277.55168,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 532.273186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes materialized per row",
+            "value": 277.55168,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 532.273186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 retained payload",
+            "value": 132496,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 532.273186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
+            "value": 138440,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 532.273186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes read per row",
+            "value": 8308.0115,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83080115 B | decoded: 82408333 B | copied: 82501749 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 82901709 B | elapsed: 57.552241ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes decoded per row",
+            "value": 8240.8333,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83080115 B | decoded: 82408333 B | copied: 82501749 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 82901709 B | elapsed: 57.552241ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes copied per row",
+            "value": 8250.1749,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83080115 B | decoded: 82408333 B | copied: 82501749 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 82901709 B | elapsed: 57.552241ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes read per row",
+            "value": 8322.074,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83220740 B | decoded: 82547572 B | copied: 61882500 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 62182500 B | elapsed: 104.822188ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes decoded per row",
+            "value": 8254.7572,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83220740 B | decoded: 82547572 B | copied: 61882500 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 62182500 B | elapsed: 104.822188ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes copied per row",
+            "value": 6188.25,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83220740 B | decoded: 82547572 B | copied: 61882500 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 62182500 B | elapsed: 104.822188ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed-churn bytes read per row",
+            "value": 8307.8615,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541507 B | decoded: 148332306 B | copied: 147973434 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 148690794 B | elapsed: 129.161836ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed-churn bytes decoded per row",
+            "value": 8240.683666666666,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541507 B | decoded: 148332306 B | copied: 147973434 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 148690794 B | elapsed: 129.161836ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed-churn bytes copied per row",
+            "value": 8220.746333333333,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541507 B | decoded: 148332306 B | copied: 147973434 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 148690794 B | elapsed: 129.161836ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed-churn relocated bytes per reclaimed byte",
+            "value": 0,
+            "unit": "B/B",
+            "extra": "keys: 18000 | relocated: 0 B | reclaimed: 58037000 B | blob files: 11\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed-churn-one-group bytes read per row",
+            "value": 8307.870055555555,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541661 B | decoded: 148332460 B | copied: 147989936 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 148707376 B | elapsed: 319.426703ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed-churn-one-group bytes decoded per row",
+            "value": 8240.692222222222,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541661 B | decoded: 148332460 B | copied: 147989936 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 148707376 B | elapsed: 319.426703ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed-churn-one-group bytes copied per row",
+            "value": 8221.663111111111,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541661 B | decoded: 148332460 B | copied: 147989936 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 148707376 B | elapsed: 319.426703ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed-churn-one-group relocated bytes per reclaimed byte",
+            "value": 0.42857142857142855,
+            "unit": "B/B",
+            "extra": "keys: 18000 | relocated: 24873000 B | reclaimed: 58037000 B | blob files: 10\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered-churn bytes read per row",
+            "value": 8307.839722222223,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541115 B | decoded: 148331947 B | copied: 143790177 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 144487257 B | elapsed: 114.514907ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered-churn bytes decoded per row",
+            "value": 8240.663722222222,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541115 B | decoded: 148331947 B | copied: 143790177 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 144487257 B | elapsed: 114.514907ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered-churn bytes copied per row",
+            "value": 7988.343166666667,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541115 B | decoded: 148331947 B | copied: 143790177 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 144487257 B | elapsed: 114.514907ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered-churn relocated bytes per reclaimed byte",
+            "value": 0.10725405763497847,
+            "unit": "B/B",
+            "extra": "keys: 18000 | relocated: 13423129 B | reclaimed: 125152645 B | blob files: 14\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered-churn-one-group bytes read per row",
+            "value": 8307.851611111111,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541329 B | decoded: 148332128 B | copied: 146950310 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 147662710 B | elapsed: 96.328859ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered-churn-one-group bytes decoded per row",
+            "value": 8240.673777777778,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541329 B | decoded: 148332128 B | copied: 146950310 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 147662710 B | elapsed: 96.328859ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered-churn-one-group bytes copied per row",
+            "value": 8163.906111111111,
+            "unit": "B/row",
+            "extra": "keys: 18000 | rows: 18000 | read: 149541329 B | decoded: 148332128 B | copied: 146950310 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 147662710 B | elapsed: 96.328859ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered-churn-one-group relocated bytes per reclaimed byte",
+            "value": 0.29411764705882354,
+            "unit": "B/B",
+            "extra": "keys: 18000 | relocated: 41455000 B | reclaimed: 140947000 B | blob files: 13\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-filtered-before-fetch bytes read per row",
+            "value": 16353.356435643564,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 101 | read: 1651689 B | decoded: 1585456 B | copied: 8040 B | materialized: 834145 B | payload useful: 1409 B | payload incidental: 106974 B | blob prefetched: 0 B | elapsed: 38.892927ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-filtered-before-fetch bytes decoded per row",
+            "value": 15697.584158415842,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 101 | read: 1651689 B | decoded: 1585456 B | copied: 8040 B | materialized: 834145 B | payload useful: 1409 B | payload incidental: 106974 B | blob prefetched: 0 B | elapsed: 38.892927ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-filtered-before-fetch bytes copied per row",
+            "value": 79.60396039603961,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 101 | read: 1651689 B | decoded: 1585456 B | copied: 8040 B | materialized: 834145 B | payload useful: 1409 B | payload incidental: 106974 B | blob prefetched: 0 B | elapsed: 38.892927ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-filtered-before-fetch bytes materialized per row",
+            "value": 8258.861386138615,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 101 | read: 1651689 B | decoded: 1585456 B | copied: 8040 B | materialized: 834145 B | payload useful: 1409 B | payload incidental: 106974 B | blob prefetched: 0 B | elapsed: 38.892927ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-filtered-before-fetch payload bytes useful per row",
+            "value": 13.950495049504951,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 101 | read: 1651689 B | decoded: 1585456 B | copied: 8040 B | materialized: 834145 B | payload useful: 1409 B | payload incidental: 106974 B | blob prefetched: 0 B | elapsed: 38.892927ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-filtered-before-fetch payload bytes incidental per row",
+            "value": 1059.148514851485,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 101 | read: 1651689 B | decoded: 1585456 B | copied: 8040 B | materialized: 834145 B | payload useful: 1409 B | payload incidental: 106974 B | blob prefetched: 0 B | elapsed: 38.892927ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-cells-projected bytes read per row",
+            "value": 64.75122,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 6475122 B | decoded: 6033483 B | copied: 5700321 B | materialized: 2508452 B | payload useful: 6201 B | payload incidental: 2344 B | blob prefetched: 0 B | elapsed: 126.208163ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-cells-projected bytes decoded per row",
+            "value": 60.33483,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 6475122 B | decoded: 6033483 B | copied: 5700321 B | materialized: 2508452 B | payload useful: 6201 B | payload incidental: 2344 B | blob prefetched: 0 B | elapsed: 126.208163ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-cells-projected bytes copied per row",
+            "value": 57.00321,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 6475122 B | decoded: 6033483 B | copied: 5700321 B | materialized: 2508452 B | payload useful: 6201 B | payload incidental: 2344 B | blob prefetched: 0 B | elapsed: 126.208163ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-cells-projected bytes materialized per row",
+            "value": 25.08452,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 6475122 B | decoded: 6033483 B | copied: 5700321 B | materialized: 2508452 B | payload useful: 6201 B | payload incidental: 2344 B | blob prefetched: 0 B | elapsed: 126.208163ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-cells-projected payload bytes useful per row",
+            "value": 0.06201,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 6475122 B | decoded: 6033483 B | copied: 5700321 B | materialized: 2508452 B | payload useful: 6201 B | payload incidental: 2344 B | blob prefetched: 0 B | elapsed: 126.208163ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-cells-projected payload bytes incidental per row",
+            "value": 0.02344,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 6475122 B | decoded: 6033483 B | copied: 5700321 B | materialized: 2508452 B | payload useful: 6201 B | payload incidental: 2344 B | blob prefetched: 0 B | elapsed: 126.208163ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / metadata-only-update bytes read per row",
+            "value": 92.77098,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 9277098 B | decoded: 8603040 B | copied: 33544615 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 1.506486537s\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / metadata-only-update bytes decoded per row",
+            "value": 86.0304,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 9277098 B | decoded: 8603040 B | copied: 33544615 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 1.506486537s\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / metadata-only-update bytes copied per row",
+            "value": 335.44615,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 9277098 B | decoded: 8603040 B | copied: 33544615 B | materialized: 0 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 1.506486537s\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / metadata-only-update payload bytes written per row",
+            "value": 0,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | payload written: 0 B\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-clustered bytes read per row",
+            "value": 4485.195454545455,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 4933715 B | decoded: 4238471 B | copied: 166732 B | materialized: 146812 B | payload useful: 82992 B | payload incidental: 22672 B | blob prefetched: 0 B | elapsed: 338.069467ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-clustered bytes decoded per row",
+            "value": 3853.1554545454546,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 4933715 B | decoded: 4238471 B | copied: 166732 B | materialized: 146812 B | payload useful: 82992 B | payload incidental: 22672 B | blob prefetched: 0 B | elapsed: 338.069467ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-clustered bytes copied per row",
+            "value": 151.57454545454544,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 4933715 B | decoded: 4238471 B | copied: 166732 B | materialized: 146812 B | payload useful: 82992 B | payload incidental: 22672 B | blob prefetched: 0 B | elapsed: 338.069467ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-clustered bytes materialized per row",
+            "value": 133.46545454545455,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 4933715 B | decoded: 4238471 B | copied: 166732 B | materialized: 146812 B | payload useful: 82992 B | payload incidental: 22672 B | blob prefetched: 0 B | elapsed: 338.069467ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-clustered payload bytes useful per row",
+            "value": 75.44727272727273,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 4933715 B | decoded: 4238471 B | copied: 166732 B | materialized: 146812 B | payload useful: 82992 B | payload incidental: 22672 B | blob prefetched: 0 B | elapsed: 338.069467ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-clustered payload bytes incidental per row",
+            "value": 20.61090909090909,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 4933715 B | decoded: 4238471 B | copied: 166732 B | materialized: 146812 B | payload useful: 82992 B | payload incidental: 22672 B | blob prefetched: 0 B | elapsed: 338.069467ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page bytes read per row",
+            "value": 4175.1585,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16700634 B | decoded: 15533655 B | copied: 685206 B | materialized: 562824 B | payload useful: 416 B | payload incidental: 8344 B | blob prefetched: 0 B | elapsed: 147.643783ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page bytes decoded per row",
+            "value": 3883.41375,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16700634 B | decoded: 15533655 B | copied: 685206 B | materialized: 562824 B | payload useful: 416 B | payload incidental: 8344 B | blob prefetched: 0 B | elapsed: 147.643783ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page bytes copied per row",
+            "value": 171.3015,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16700634 B | decoded: 15533655 B | copied: 685206 B | materialized: 562824 B | payload useful: 416 B | payload incidental: 8344 B | blob prefetched: 0 B | elapsed: 147.643783ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page bytes materialized per row",
+            "value": 140.706,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16700634 B | decoded: 15533655 B | copied: 685206 B | materialized: 562824 B | payload useful: 416 B | payload incidental: 8344 B | blob prefetched: 0 B | elapsed: 147.643783ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page payload bytes useful per row",
+            "value": 0.104,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16700634 B | decoded: 15533655 B | copied: 685206 B | materialized: 562824 B | payload useful: 416 B | payload incidental: 8344 B | blob prefetched: 0 B | elapsed: 147.643783ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page payload bytes incidental per row",
+            "value": 2.086,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16700634 B | decoded: 15533655 B | copied: 685206 B | materialized: 562824 B | payload useful: 416 B | payload incidental: 8344 B | blob prefetched: 0 B | elapsed: 147.643783ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page-eager bytes read per row",
+            "value": 4175.31275,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 187.886114ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page-eager bytes decoded per row",
+            "value": 3883.54325,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 187.886114ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page-eager bytes copied per row",
+            "value": 3781.40175,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 187.886114ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page-eager bytes materialized per row",
+            "value": 3334.756,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 187.886114ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page-eager payload bytes useful per row",
+            "value": 2.296,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 187.886114ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-sparse-one-per-page-eager payload bytes incidental per row",
+            "value": 0.172,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 4000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 187.886114ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full bytes read per row",
+            "value": 185.56945555555555,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 13618291 B | materialized: 12009024 B | payload useful: 7592 B | payload incidental: 1624 B | blob prefetched: 0 B | elapsed: 215.725622ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full bytes decoded per row",
+            "value": 172.6019222222222,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 13618291 B | materialized: 12009024 B | payload useful: 7592 B | payload incidental: 1624 B | blob prefetched: 0 B | elapsed: 215.725622ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full bytes copied per row",
+            "value": 151.31434444444446,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 13618291 B | materialized: 12009024 B | payload useful: 7592 B | payload incidental: 1624 B | blob prefetched: 0 B | elapsed: 215.725622ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full bytes materialized per row",
+            "value": 133.4336,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 13618291 B | materialized: 12009024 B | payload useful: 7592 B | payload incidental: 1624 B | blob prefetched: 0 B | elapsed: 215.725622ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full payload bytes useful per row",
+            "value": 0.08435555555555556,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 13618291 B | materialized: 12009024 B | payload useful: 7592 B | payload incidental: 1624 B | blob prefetched: 0 B | elapsed: 215.725622ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full payload bytes incidental per row",
+            "value": 0.018044444444444443,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 13618291 B | materialized: 12009024 B | payload useful: 7592 B | payload incidental: 1624 B | blob prefetched: 0 B | elapsed: 215.725622ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full-eager bytes read per row",
+            "value": 185.56945555555555,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 212.962474ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full-eager bytes decoded per row",
+            "value": 172.6019222222222,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 212.962474ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full-eager bytes copied per row",
+            "value": 168.0623,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 212.962474ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full-eager bytes materialized per row",
+            "value": 148.21137777777778,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 212.962474ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full-eager payload bytes useful per row",
+            "value": 0.10204444444444444,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 212.962474ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-near-full-eager payload bytes incidental per row",
+            "value": 0.007644444444444444,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 16701251 B | decoded: 15534173 B | copied: 15125607 B | materialized: 13339024 B | payload useful: 9184 B | payload incidental: 688 B | blob prefetched: 0 B | elapsed: 212.962474ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered bytes read per row",
+            "value": 10304.530909090909,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 11334984 B | decoded: 6458034 B | copied: 359622 B | materialized: 146796 B | payload useful: 93177 B | payload incidental: 2092716 B | blob prefetched: 4823400 B | elapsed: 408.552998ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered bytes decoded per row",
+            "value": 5870.94,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 11334984 B | decoded: 6458034 B | copied: 359622 B | materialized: 146796 B | payload useful: 93177 B | payload incidental: 2092716 B | blob prefetched: 4823400 B | elapsed: 408.552998ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered bytes copied per row",
+            "value": 326.9290909090909,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 11334984 B | decoded: 6458034 B | copied: 359622 B | materialized: 146796 B | payload useful: 93177 B | payload incidental: 2092716 B | blob prefetched: 4823400 B | elapsed: 408.552998ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered bytes materialized per row",
+            "value": 133.45090909090908,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 11334984 B | decoded: 6458034 B | copied: 359622 B | materialized: 146796 B | payload useful: 93177 B | payload incidental: 2092716 B | blob prefetched: 4823400 B | elapsed: 408.552998ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered payload bytes useful per row",
+            "value": 84.70636363636363,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 11334984 B | decoded: 6458034 B | copied: 359622 B | materialized: 146796 B | payload useful: 93177 B | payload incidental: 2092716 B | blob prefetched: 4823400 B | elapsed: 408.552998ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered payload bytes incidental per row",
+            "value": 1902.469090909091,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 11334984 B | decoded: 6458034 B | copied: 359622 B | materialized: 146796 B | payload useful: 93177 B | payload incidental: 2092716 B | blob prefetched: 4823400 B | elapsed: 408.552998ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered-eager bytes read per row",
+            "value": 20389.235454545455,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 22428159 B | decoded: 17236521 B | copied: 16396252 B | materialized: 13339024 B | payload useful: 9509 B | payload incidental: 1032 B | blob prefetched: 4823400 B | elapsed: 593.292086ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered-eager bytes decoded per row",
+            "value": 15669.564545454545,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 22428159 B | decoded: 17236521 B | copied: 16396252 B | materialized: 13339024 B | payload useful: 9509 B | payload incidental: 1032 B | blob prefetched: 4823400 B | elapsed: 593.292086ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered-eager bytes copied per row",
+            "value": 14905.683636363636,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 22428159 B | decoded: 17236521 B | copied: 16396252 B | materialized: 13339024 B | payload useful: 9509 B | payload incidental: 1032 B | blob prefetched: 4823400 B | elapsed: 593.292086ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered-eager bytes materialized per row",
+            "value": 12126.385454545454,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 22428159 B | decoded: 17236521 B | copied: 16396252 B | materialized: 13339024 B | payload useful: 9509 B | payload incidental: 1032 B | blob prefetched: 4823400 B | elapsed: 593.292086ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered-eager payload bytes useful per row",
+            "value": 8.644545454545455,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 22428159 B | decoded: 17236521 B | copied: 16396252 B | materialized: 13339024 B | payload useful: 9509 B | payload incidental: 1032 B | blob prefetched: 4823400 B | elapsed: 593.292086ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-ref-filtered-eager payload bytes incidental per row",
+            "value": 0.9381818181818182,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1100 | read: 22428159 B | decoded: 17236521 B | copied: 16396252 B | materialized: 13339024 B | payload useful: 9509 B | payload incidental: 1032 B | blob prefetched: 4823400 B | elapsed: 593.292086ms\niterations: 3"
           },
           {
             "name": "mixed-layout / compaction-one-segment encoded share of output",
