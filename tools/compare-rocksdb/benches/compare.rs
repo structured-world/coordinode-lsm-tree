@@ -2286,30 +2286,45 @@ fn seek_random_routine<'a>(
 /// length-prefixed record per write, made durable by one `sync_data` per
 /// commit. Under [`lsm_tree::config::FlushDurability::Deferred`] the log is
 /// what makes an acknowledged write durable, and a flush syncs nothing.
+///
+/// A commit is encoded into one buffer and written with one call, as a log
+/// writes a batch: written field by field through a small buffered writer it
+/// took eight times as long, which the arm would have charged to the engine.
 struct CallerWal {
-    file: std::io::BufWriter<std::fs::File>,
+    file: std::fs::File,
+    /// The commit being encoded, kept across commits.
+    buf: Vec<u8>,
 }
 
 impl CallerWal {
     fn create(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            file: std::io::BufWriter::new(std::fs::File::create(path)?),
+            file: std::fs::File::create(path)?,
+            buf: Vec::new(),
         })
     }
 
     /// Appends every write of `inputs` and syncs the log once.
     fn commit(&mut self, inputs: &WorkloadInputs) -> std::io::Result<()> {
         use std::io::Write;
+        self.buf.clear();
+        let bytes: usize = inputs
+            .keys
+            .iter()
+            .zip(inputs.values.iter())
+            .map(|(key, value)| 8 + key.len() + value.len())
+            .sum();
+        self.buf.reserve(bytes);
         for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
             for field in [key.as_slice(), value.as_slice()] {
                 let len = u32::try_from(field.len())
                     .map_err(|_| std::io::Error::other("a field over 4 GiB"))?;
-                self.file.write_all(&len.to_le_bytes())?;
-                self.file.write_all(field)?;
+                self.buf.extend_from_slice(&len.to_le_bytes());
+                self.buf.extend_from_slice(field);
             }
         }
-        self.file.flush()?;
-        self.file.get_ref().sync_data()
+        self.file.write_all(&self.buf)?;
+        self.file.sync_data()
     }
 }
 
@@ -2322,11 +2337,12 @@ impl CallerWal {
 /// the seed, so each measurement starts from the same one-copy state.
 ///
 /// The `ours-deferred-wal` series runs our engine the way a caller with its
-/// own write-ahead log does, the same work SurrealKV's timed commit does: the
-/// log is written and synced, then the keys go into the memtable. One sync
-/// makes the batch durable. The flush of that memtable is not timed, as
-/// SurrealKV's commit leaves its own memtable flush for later; the plain arms
-/// flush in the timed body and are set against RocksDB, which does too.
+/// own write-ahead log does: the log is written and synced, then the keys go
+/// into the memtable. One sync makes the batch durable. It is set against
+/// `rocksdb-wal`, RocksDB writing the same batch through its own log with a
+/// sync, which appends and syncs the log and fills the memtable; SurrealKV's
+/// commit does the same work. None of the three flushes in the timed body;
+/// the plain arms do and are set against RocksDB, which does too.
 fn overwrite_variant(
     run: &mut Run,
     group_name: &str,
@@ -2353,18 +2369,22 @@ fn overwrite_variant(
                 (engine, seed)
             })
             .collect();
-        // The deferred-log arm answers SurrealKV's one-sync commit on the
-        // groups SurrealKV runs in, its only baseline; the blob groups compare
-        // blob paths.
-        // It starts from our engine's seed whether or not the plain `ours` arm
-        // runs too, so `COMPARE_ENGINES=ours-deferred-wal` runs it alone.
-        let ours_seed = (spec.values == Values::Pool
+        // The logged arms run on the groups SurrealKV runs in, beside its
+        // one-sync commit; the blob groups compare blob paths. Each starts from
+        // its engine's seed whether or not that engine's plain arm runs too, so
+        // `COMPARE_ENGINES=ours-deferred-wal,rocksdb-wal` runs them alone.
+        let logged = spec.values == Values::Pool
             && spec.engines.contains(&Engine::Ours)
-            && spec.engines.contains(&Engine::SurrealKv)
-            && run.wants_engine("ours-deferred-wal"))
-        .then(|| {
+            && spec.engines.contains(&Engine::RocksDb)
+            && spec.engines.contains(&Engine::SurrealKv);
+        let ours_seed = (logged && run.wants_engine("ours-deferred-wal")).then(|| {
             seeds
                 .seed(Engine::Ours, compression, IndexStrategy::Binary, &inputs)
+                .to_path_buf()
+        });
+        let rocksdb_seed = (logged && run.wants_engine("rocksdb-wal")).then(|| {
+            seeds
+                .seed(Engine::RocksDb, compression, IndexStrategy::Binary, &inputs)
                 .to_path_buf()
         });
         let mut arms: Vec<_> = seeded
@@ -2445,6 +2465,29 @@ fn overwrite_variant(
                 })
             })
             .collect();
+        if let Some(seed) = rocksdb_seed {
+            let inputs = &inputs;
+            arms.push(paired::Arm::new("rocksdb-wal", move |iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let dir = copy_of(&seed);
+                    let db = open_rocksdb(dir.path(), compression, false, None);
+                    let mut write_opts = rocksdb::WriteOptions::default();
+                    write_opts.set_sync(true);
+                    let start = std::time::Instant::now();
+                    let mut batch = rocksdb::WriteBatch::default();
+                    for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                        batch.put(key, value);
+                    }
+                    db.write_opt(batch, &write_opts)
+                        .expect("rocksdb-wal: overwrite write");
+                    total += start.elapsed();
+                    drop((db, dir));
+                    settle_removal();
+                }
+                total
+            }));
+        }
         if let Some(seed) = ours_seed {
             let inputs = &inputs;
             arms.push(paired::Arm::new("ours-deferred-wal", move |iters| {
@@ -2469,8 +2512,9 @@ fn overwrite_variant(
                         tree.insert(key, value, seqno);
                     }
                     total += start.elapsed();
-                    // The memtable is flushed outside the window, as
-                    // SurrealKV's is, so a round leaves what the next finds.
+                    // The memtable is flushed outside the window, which the
+                    // other logged arms leave out too, so a round leaves what
+                    // the next finds.
                     tree.flush_active_memtable(0)
                         .expect("ours-deferred-wal: overwrite flush");
                     drop((tree, wal, wal_dir, dir));
@@ -3518,7 +3562,7 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "overwrite",
-        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush. Both engines compress blocks on 4 threads. ours-deferred-wal: our engine with a caller-kept log, the log written and synced once and the keys put in the memtable, the work SurrealKV's commit does; its flush, like SurrealKV's, is not timed. Set against SurrealKV, and the plain arms against RocksDB.",
+        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush. Both engines compress blocks on 4 threads. ours-deferred-wal: our engine with a caller-kept log, the batch written to the log in one call and synced once, then the keys put in the memtable. rocksdb-wal: RocksDB writing the same batch through its own log with a sync. SurrealKV's commit does the same work. None of the three flushes in the timed window. ours-deferred-wal is set against rocksdb-wal, the plain arms and SurrealKV against RocksDB.",
     ),
     (
         "overwrite_sustained",
@@ -3607,13 +3651,14 @@ fn blob_codec_of(label: &str) -> Option<BlobCodec> {
         .and_then(|engine| engine.kv_separated().or(engine.blob_files()))
 }
 
-/// The arm the ratio of the arm labelled `label` is taken against: SurrealKV
-/// for our caller-kept-log arm, which does the work SurrealKV's commit does;
-/// RocksDB with blob files under the same codec for a blob arm, so the ratio
-/// compares the engines and not the codecs; plain RocksDB for every other arm.
+/// The arm the ratio of the arm labelled `label` is taken against: RocksDB
+/// writing through its own synced log for our caller-kept-log arm, which does
+/// the same work; RocksDB with blob files under the same codec for a blob arm,
+/// so the ratio compares the engines and not the codecs; plain RocksDB for
+/// every other arm.
 fn baseline_of(label: &str) -> &'static str {
     if label == "ours-deferred-wal" {
-        return Engine::SurrealKv.label();
+        return "rocksdb-wal";
     }
     // An `overwrite_parts` arm against the arm it differs from in one part
     // (see `PARTS`).

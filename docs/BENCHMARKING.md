@@ -73,6 +73,11 @@ Beyond the preset, every engine gets the same work:
   seeks its `raw_iterator`, both zero-copy, the way our engine hands out values.
 - **Matched block options.** Block size, a 10-bit bloom filter and a 16 MiB LRU
   block cache on both sides, compaction scenarios included; no WAL.
+- **Logged writes against a logged RocksDB.** The overwrite group's
+  `ours-deferred-wal` arm keeps a caller's log: the batch is written to it in
+  one call and synced once, then put in the memtable. It is set against
+  `rocksdb-wal`, RocksDB writing the same batch through its own log with a
+  sync. Neither flushes in the timed window.
 - **The same cores.** Both engines compress a table's blocks on four threads
   wherever they compress (ours through `compaction_threads`, RocksDB through
   `compression_options_parallel_threads`). At their defaults ours would use
@@ -98,8 +103,9 @@ engine:
 - **the ratio to RocksDB**: the median over the rounds of this engine's time
   over RocksDB's in the same round, with a distribution-free 95% confidence
   interval (the order statistics a Binomial(rounds, 1/2) count bounds). Our
-  tree with blob files is taken against RocksDB with blob files, every other
-  engine against plain RocksDB, and the page shows the two value layouts one
+  tree with blob files is taken against RocksDB with blob files, our
+  caller-log arm against `rocksdb-wal`, every other engine against plain
+  RocksDB, and the page shows the two value layouts one
   at a time;
 - **the time per operation**: the median over the rounds, with the same kind
   of interval.
