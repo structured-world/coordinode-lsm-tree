@@ -140,6 +140,76 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
     Ok(())
 }
 
+/// An import that writes a level's tables to a folder of their own records
+/// that folder as a route in the snapshot it installs, once, and the tree's
+/// own folder not at all. Guards against a manifest that stops loading before
+/// the first open leaving a repair, configured without that route, to rebuild
+/// a manifest without the tables there instead of refusing.
+#[test]
+fn an_import_records_the_routes_it_wrote_to() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::StdFs);
+    let own = folder.path().join(crate::file::TABLES_FOLDER);
+    let cold = folder.path().join("cold");
+    for tables in [&own, &cold] {
+        std::fs::create_dir_all(tables)?;
+    }
+    let comparator: SharedComparator = Arc::new(crate::DefaultUserComparator);
+    let mut levels = vec![Vec::new(); 7];
+    for (id, level) in [(1, 5), (2, 6)] {
+        let mut table = TableImport::create(
+            cold.join(id.to_string()),
+            id,
+            level,
+            fs.clone(),
+            comparator.clone(),
+            plain_settings(0),
+        )?;
+        table.append_block(rows(4))?;
+        let checksum = table.finish()?;
+        levels[usize::from(level)] = vec![vec![TablePlacement {
+            id,
+            checksum,
+            global_seqno: 0,
+            recency: 1,
+        }]];
+    }
+    install_manifest(
+        folder.path(),
+        &|level| {
+            if level >= 5 {
+                cold.clone()
+            } else {
+                own.clone()
+            }
+        },
+        &ManifestImage {
+            tree_type: TreeType::Standard,
+            version_id: 0,
+            levels,
+            blob_files: Vec::new(),
+            restrictions: Vec::new(),
+            retention_floor: 0,
+            dicts: Vec::new(),
+            comparator_name: "default",
+        },
+        &fs,
+        &comparator,
+        None,
+        #[cfg(zstd_any)]
+        &crate::compression::ZstdDictionaries::new(),
+    )?;
+    let recovery = crate::version::recovery::recover(
+        folder.path(),
+        &*fs,
+        ManifestRecoveryMode::AbsoluteConsistency,
+        None,
+    )?;
+    assert_eq!(recovery.routes, ["cold"]);
+    assert!(!recovery.closed_cleanly);
+    Ok(())
+}
+
 /// A blob tree installed from an image records each table's blob links, the
 /// entries its values keep in shared blocks apart from frames of their own,
 /// and carries over the stale bytes the image gives each blob file.

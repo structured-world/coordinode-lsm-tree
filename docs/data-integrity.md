@@ -225,8 +225,11 @@ them differently:
   flush's number and their place in its run, and an open installs every whole
   flush above the watermark the manifest records. Each flush's tables name the
   last flush that had returned before it; a flush so named that is missing or
-  does not read whole was damaged after it returned and fails the open with
-  `Unrecoverable`, for a repair to salvage. Any other flush that is missing a
+  does not read whole was damaged after it returned and fails the open, for a
+  repair to salvage: with `DamagedFlush`, which `open_or_repair` repairs, when
+  its bytes prove the damage, and with `Unrecoverable` when none of its tables
+  is found or a dictionary the tree does not hold keeps one from reading, since
+  the configuration may be what is wrong. Any other flush that is missing a
   table, or a block or blob frame that does not check, failed or is the latest
   (which nothing names yet): it is taken for one a power loss cut short, the
   tables of it that open are set aside as `{id}.torn-flush`, and it is left out

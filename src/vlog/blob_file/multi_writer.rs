@@ -907,9 +907,18 @@ impl MultiWriter {
         let Some((blob_file, kept)) = finished else {
             return Ok(());
         };
+        // A file this fails is named by no version: marked deleted, its
+        // handle's drop unlinks it and evicts its descriptor, as a write that
+        // fails at its finish does for the files it finished. Its writing
+        // handle is closed first: an open one keeps the unlink from going
+        // through on Windows.
         // Before the next file takes more room.
         if let Some(outputs) = &self.outputs {
-            outputs.landed(&*self.fs, blob_file.path())?;
+            if let Err(e) = outputs.landed(&*self.fs, blob_file.path()) {
+                drop(kept);
+                blob_file.mark_as_deleted();
+                return Err(e);
+            }
             self.landed += 1;
         }
         // A file past the limit is synced through the handle it was written
@@ -919,7 +928,12 @@ impl MultiWriter {
         if let Some(file) = kept
             && let Some(closing) = crate::fs::keep_open(&mut self.kept, blob_file.id(), file)
         {
-            closing.sync_data_with(self.sync_mode)?;
+            let synced = closing.sync_data_with(self.sync_mode);
+            drop(closing);
+            if let Err(e) = synced {
+                blob_file.mark_as_deleted();
+                return Err(e.into());
+            }
         }
         self.results.push(blob_file);
 

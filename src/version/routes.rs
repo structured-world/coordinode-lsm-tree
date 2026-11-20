@@ -80,10 +80,18 @@ const SEPARATORS: &[char] = &['/', '\\'];
 #[cfg(not(windows))]
 const SEPARATORS: &[char] = &['/'];
 
-/// The named parts of `text`, split at this platform's separators.
+/// The named parts of `text`, split at this platform's separators, after a
+/// `/` part for a root it starts from: `/cold` and `cold` are different
+/// folders, and a route must name one of them only. Without std a folder is
+/// recorded as configured, not made absolute first.
 fn parts(text: &str) -> Vec<&str> {
-    text.split(SEPARATORS)
-        .filter(|part| !part.is_empty() && *part != ".")
+    let rooted = text.starts_with(SEPARATORS).then_some("/");
+    rooted
+        .into_iter()
+        .chain(
+            text.split(SEPARATORS)
+                .filter(|part| !part.is_empty() && *part != "."),
+        )
         .collect()
 }
 

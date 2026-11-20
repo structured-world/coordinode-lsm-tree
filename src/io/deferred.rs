@@ -90,10 +90,15 @@ fn forget_payload(payload: Box<dyn core::any::Any + Send>) {
     core::mem::forget(payload);
 }
 
-/// A failed write, kept to be returned again.
+/// A failed write, kept to be returned again with what classifies it: the
+/// operating system's error code, or an error of this crate a backend
+/// returned, either of which tells a kind std has no variant for
+/// (`TooManyOpenFiles`) from a failure the bytes caused.
 struct Failure {
     kind: io::ErrorKind,
     message: String,
+    raw: Option<i32>,
+    ours: Option<super::Error>,
 }
 
 impl Failure {
@@ -105,14 +110,35 @@ impl Failure {
                 forget_payload(payload);
                 String::from("the file's writer failed with an unprintable error")
             });
+        let ours = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<super::Error>())
+            .map(|ours| super::Error {
+                kind: ours.kind,
+                message: ours.message.clone(),
+            });
         Self {
             kind: error.kind(),
             message,
+            raw: error.raw_os_error(),
+            ours,
         }
     }
 
     fn error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.clone())
+        if let Some(code) = self.raw {
+            return io::Error::from_raw_os_error(code);
+        }
+        match &self.ours {
+            Some(ours) => io::Error::new(
+                self.kind,
+                super::Error {
+                    kind: ours.kind,
+                    message: ours.message.clone(),
+                },
+            ),
+            None => io::Error::new(self.kind, self.message.clone()),
+        }
     }
 }
 
@@ -653,12 +679,24 @@ impl<W: Write + Send + 'static> Drop for DeferredWriter<W> {
         // failure has no one to go to; a writer whose write panicked is not
         // called again, and none is called while a panic unwinds through the
         // owner (a second panic there would abort): the file is given up with
-        // the operation. A lane is left idle, so the inner writer is dropped
-        // here and not later by a worker, and the caller may remove the file.
-        if !self.panicked && !std::thread::panicking() {
-            drop(self.hand_over());
+        // the operation, and what its lane holds no worker has started is
+        // dropped unwritten. A lane is left idle, so the inner writer is
+        // dropped here and not later by a worker, and the caller may remove
+        // the file. The error of a write here goes as a lane's does, a panic
+        // of its payload's drop kept.
+        let given_up = self.panicked || std::thread::panicking();
+        if !given_up {
+            drop_contained(self.hand_over());
         }
         if let Sink::Lane(lane, _) = &self.sink {
+            if given_up {
+                let queued = {
+                    let mut state = lane.lock();
+                    state.queued_bytes = 0;
+                    core::mem::take(&mut state.queue)
+                };
+                drop_contained(queued);
+            }
             drop(lane.settle().inner.take());
         }
     }

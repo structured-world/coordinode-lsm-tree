@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 /// partition is three.
 const MAX_STACK: u8 = 8;
 
-/// Whether a disk under `folder` runs BFQ.
+/// Whether a disk under `folder` runs BFQ with idling on.
 pub(super) fn idles_between_queues(folder: &Path) -> bool {
     let Some(device) = block_device(folder) else {
         return false;
@@ -181,6 +181,7 @@ fn stalls_under(device: &Path, depth: u8) -> bool {
     };
     if let Some(line) = read_text(&disk.join("queue").join("scheduler"))
         && active_scheduler(&line) == Some("bfq")
+        && bfq_idles(&disk.join("queue").join("iosched"))
     {
         return true;
     }
@@ -192,6 +193,18 @@ fn stalls_under(device: &Path, depth: u8) -> bool {
     below
         .filter_map(Result::ok)
         .any(|slave| stalls_under(&slave.path(), depth + 1))
+}
+
+/// Whether BFQ, whose tunables lie in `iosched`, idles for a queue's next
+/// request: unless `slice_idle` is set to zero, which turns idling off, and
+/// `strict_guarantees` is off, which forces it on (the kernel's BFQ
+/// documentation, "slice_idle" and "strict_guarantees"). A tunable that
+/// cannot be read is taken at its default: `slice_idle` 8 ms.
+fn bfq_idles(iosched: &Path) -> bool {
+    let set = |name: &str| {
+        read_text(&iosched.join(name)).and_then(|value| value.trim().parse::<u64>().ok())
+    };
+    set("slice_idle") != Some(0) || set("strict_guarantees").is_some_and(|on| on != 0)
 }
 
 /// The scheduler a `queue/scheduler` line names active: the one in brackets

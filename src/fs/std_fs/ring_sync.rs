@@ -41,6 +41,19 @@ std::thread_local! {
     static NO_RING_SYNC: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
+/// Whether this thread holds a ring for its batches, after dropping any it
+/// held when `drop_first`: how a test tells a batch that went through the
+/// ring from one synced another way.
+#[cfg(test)]
+pub(crate) fn thread_ring(drop_first: bool) -> bool {
+    RING.with_borrow_mut(|slot| {
+        if drop_first {
+            *slot = None;
+        }
+        slot.is_some()
+    })
+}
+
 /// How a batch went through a ring.
 #[derive(Debug, PartialEq, Eq)]
 enum Through {
@@ -48,6 +61,20 @@ enum Through {
     Synced,
     /// The ring does not run the sync opcode: nothing is known to be synced.
     Refused,
+    /// The kernel took none of the batch's syncs for a reason that may pass
+    /// (short memory): nothing ran, and the batch goes another way this once.
+    Unsubmitted,
+}
+
+/// What a submission the kernel took none of says about the ring: refused for
+/// good when its `errno` says so ([`refuses_setup`], [`refuses_sync`]: a
+/// sandbox that keeps `io_uring_enter` from the process), passing otherwise.
+fn unsubmitted(errno: Option<i32>) -> Through {
+    if errno.is_some_and(|errno| refuses_setup(errno) || refuses_sync(errno)) {
+        Through::Refused
+    } else {
+        Through::Unsubmitted
+    }
 }
 
 /// Whether a sync's completion `errno` says the ring does not run the opcode
@@ -174,17 +201,17 @@ pub(super) fn sync_on_ring(targets: &[SyncTarget<'_>]) -> Option<Result<(), Sync
             }
         }
         let ring = slot.as_mut()?;
-        let mut refused = false;
+        let mut declined = None;
         let synced = targets
             .chunks(MAX_IN_FLIGHT)
             .enumerate()
             .try_for_each(|(chunk_at, chunk)| {
                 match sync_through(ring, chunk_at * MAX_IN_FLIGHT, chunk)? {
                     Through::Synced => Ok(()),
-                    Through::Refused => {
-                        refused = true;
+                    through => {
+                        declined = Some(through);
                         Err(SyncFailure::unspent(io::Error::other(
-                            "io_uring refused the sync opcode",
+                            "io_uring ran none of the syncs",
                         )))
                     }
                 }
@@ -194,11 +221,13 @@ pub(super) fn sync_on_ring(targets: &[SyncTarget<'_>]) -> Option<Result<(), Sync
             // batch gets a ring of its own rather than their completions.
             *slot = None;
         }
-        if refused {
+        if let Some(through) = declined {
             // The caller syncs every target another way: a sync done twice
             // is done once.
-            log::debug!("io_uring refused the sync opcode, syncing on threads");
-            NO_RING_SYNC.set(true);
+            log::debug!("io_uring ran none of the syncs ({through:?}), syncing on threads");
+            if through == Through::Refused {
+                NO_RING_SYNC.set(true);
+            }
             return None;
         }
         Some(synced)
@@ -221,7 +250,7 @@ fn sync_through(
             let (first, second) = targets.split_at(targets.len() / 2);
             return match sync_through(ring, base, first)? {
                 Through::Synced => sync_through(ring, base + first.len(), second),
-                Through::Refused => Ok(Through::Refused),
+                declined => Ok(declined),
             };
         }
         Err(e) => return Err(SyncFailure::unspent(e)),
@@ -244,11 +273,11 @@ fn sync_through(
             SyncTarget::Folder { .. } => sync,
         };
         if let Err(error) = push(ring, &sync.build().user_data(at as u64)) {
-            // Those pushed before may run: none is reported synced.
-            return Err(SyncFailure {
-                error,
-                spent: (base..base + at).collect(),
-            });
+            // Those pushed before ran no sync: the ring has no kernel thread
+            // polling its queue (no `SQPOLL`), so an entry reaches the kernel
+            // only through the submission this batch never made, and the ring
+            // holding them is dropped with the failure.
+            return Err(SyncFailure::unspent(error));
         }
     }
     let mut completions = Completions::default();
@@ -260,9 +289,10 @@ fn sync_through(
             // wait collects them.
             if e.kind() != std::io::ErrorKind::Interrupted {
                 // A submission the kernel took none of (a sandbox refusing
-                // `io_uring_enter`) ran no sync: the batch goes another way.
+                // `io_uring_enter`, or short memory) ran no sync: the batch
+                // goes another way.
                 if completions.reaped == 0 && ring.submission().len() == opened.len() {
-                    return Ok(Through::Refused);
+                    return Ok(unsubmitted(e.raw_os_error()));
                 }
                 // Whatever was submitted is not waited out here; the ring is
                 // dropped, and the kernel finishes its entries before freeing

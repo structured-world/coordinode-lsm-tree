@@ -192,6 +192,51 @@ fn a_lane_drops_what_is_queued_behind_a_failed_write() {
     );
 }
 
+/// A writer whose every write fails with the error `fail` makes.
+struct FailsWith(fn() -> io::Error);
+
+impl Write for FailsWith {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err((self.0)())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The kind of this crate's error each later call of a writer whose lane
+/// write failed with `fail` returns.
+fn replayed_kinds(fail: fn() -> io::Error) -> Vec<crate::io::ErrorKind> {
+    let mut out = DeferredWriter::with_capacity(8, FailsWith(fail), true);
+    out.use_spawner_now(Arc::new(Prompt));
+    drop(out.write_all(&[7; 16]));
+    [out.flush(), out.flush()]
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| crate::io::Error::from(error).kind())
+        .collect()
+}
+
+/// A lane's failure returned again keeps what classifies it: the operating
+/// system's error code, or an error of this crate a backend returned. Guards
+/// against a descriptor shortage replayed as `Other`, which tells a failure
+/// the environment caused from one the bytes did no more.
+#[test]
+fn a_replayed_failure_keeps_its_classification() {
+    use crate::io::ErrorKind;
+    #[cfg(unix)]
+    assert_eq!(
+        replayed_kinds(|| io::Error::from_raw_os_error(libc::EMFILE)),
+        [ErrorKind::TooManyOpenFiles; 2]
+    );
+    assert_eq!(
+        replayed_kinds(|| io::Error::other(crate::io::Error::from_kind(
+            ErrorKind::TooManyOpenFiles
+        ))),
+        [ErrorKind::TooManyOpenFiles; 2]
+    );
+}
+
 /// A writer already on a lane takes a new spawner for its later buffers, the
 /// new one getting the work, and keeps the file's order.
 #[test]
@@ -724,6 +769,58 @@ fn a_failure_whose_error_panics_when_dropped_leaves_the_lane_released() {
     assert!(second, "the file stays failed");
 }
 
+/// A writer without workers dropped with bytes buffered, whose write fails
+/// with an error whose payload panics when dropped, drops without a panic.
+/// Guards against that payload's drop unwinding out of the writer's drop,
+/// which the lane keeps for its own failures.
+#[test]
+fn a_drop_whose_write_fails_with_a_bomb_does_not_panic() {
+    let dropped = std::panic::catch_unwind(|| {
+        let mut out = DeferredWriter::with_capacity(8, FailsWithABomb, true);
+        assert!(out.write_all(&[7; 4]).is_ok(), "buffered only");
+        drop(out);
+    });
+    assert!(dropped.is_ok(), "the drop did not panic");
+}
+
+/// A writer dropped while a panic unwinds through its owner writes nothing of
+/// what its lane holds that no worker started. Guards against the drop
+/// draining the lane on the unwinding thread: writes started after the
+/// operation failed, in a file the caller removes, delaying its cleanup.
+#[test]
+fn a_writer_dropped_while_unwinding_drops_its_queued_writes() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let queued = Arc::new(AtomicUsize::new(0));
+    let unwound = std::panic::catch_unwind({
+        let attempts = Arc::clone(&attempts);
+        let queued = Arc::clone(&queued);
+        move || {
+            let sink = Sink {
+                attempts: Some(attempts),
+                ..Sink::default()
+            };
+            let mut out = DeferredWriter::with_capacity(8, sink, true);
+            // Workers that never run: the buffers wait in the lane.
+            out.use_spawner_now(Arc::new(Never::default()));
+            for _ in 0..3 {
+                assert!(out.write_all(&[7; 8]).is_ok(), "queued");
+            }
+            queued.store(out.queued_bytes(), Ordering::SeqCst);
+            std::panic::panic_any("the owner fails");
+        }
+    });
+    assert!(unwound.is_err(), "the owner panicked");
+    assert!(
+        queued.load(Ordering::SeqCst) > 0,
+        "self-check: buffers waited in the lane"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "nothing was written while unwinding"
+    );
+}
+
 /// A sink that panics in its first write, a while into it, and takes a while
 /// to close; `entered` is set once a write starts.
 struct ClosesSlowly {
@@ -1069,7 +1166,11 @@ fn workers_taken_on_midway_keep_the_order() -> io::Result<()> {
     let mut out = DeferredWriter::with_capacity(1_024, Sink::default(), true);
     let (before, after) = data.split_at(10_500);
     out.write_all(before)?;
+    assert!(out.writes_here(), "self-check: the first writes stay here");
+    // Counts the file as past the threshold, as a writer that wrote it here
+    // would be.
     out.use_spawner_now(Arc::new(Threads));
+    assert!(!out.writes_here(), "the writer entered the lane");
     out.write_all(after)?;
     assert_eq!(out.finish()?.bytes, data);
     Ok(())

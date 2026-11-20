@@ -227,6 +227,33 @@ fn a_files_own_device_is_its_disk_only_when_sysfs_lists_it() -> std::io::Result<
     Ok(())
 }
 
+/// BFQ with `slice_idle` set to zero does not idle between queues, unless
+/// `strict_guarantees` forces it to; a stacked device over such a disk
+/// answers the same. Guards against a host that turned BFQ's idling off
+/// still getting the batching and serialization meant for a scheduler that
+/// idles.
+#[test]
+fn bfq_with_idling_turned_off_does_not_idle() -> std::io::Result<()> {
+    let root = sysfs("none mq-deadline kyber [bfq]\n")?;
+    let iosched = root.path().join("devices/sdb/queue/iosched");
+    std::fs::create_dir_all(&iosched)?;
+    std::fs::write(iosched.join("slice_idle"), "0\n")?;
+    std::fs::write(iosched.join("strict_guarantees"), "0\n")?;
+    assert!(!stalls_under(&root.path().join("dev/8:17"), 0));
+    assert!(!stalls_under(&root.path().join("dev/253:0"), 0));
+
+    std::fs::write(iosched.join("strict_guarantees"), "1\n")?;
+    assert!(stalls_under(&root.path().join("dev/8:17"), 0), "forced on");
+
+    std::fs::write(iosched.join("strict_guarantees"), "0\n")?;
+    std::fs::write(iosched.join("slice_idle"), "8\n")?;
+    assert!(
+        stalls_under(&root.path().join("dev/253:0"), 0),
+        "the default"
+    );
+    Ok(())
+}
+
 /// A device sysfs does not list answers no: the behaviour of a backend that
 /// says nothing about its scheduler.
 #[test]

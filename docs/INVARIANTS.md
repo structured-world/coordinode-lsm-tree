@@ -232,8 +232,13 @@ matching entry (and add one for a new subsystem).
   that had returned when it began, so the flushes above the watermark known to
   have returned are the ones some table names. One of those that does not read
   whole, or of which no table is found, was lost to the medium after it
-  returned: the open fails with `Unrecoverable`, before it renames any file,
-  and a repair keeps its tables, and every blob file, for its scan, and reports
+  returned, and the open fails before it renames any file: with `DamagedFlush`,
+  which `open_or_repair` repairs, when the bytes prove the damage (a table of
+  its run missing beside others found, a table or blob file that does not read
+  for a reason its bytes decide), and with `Unrecoverable` when no table of it
+  is found or a dictionary the tree does not hold keeps one from reading, since
+  the configuration may be what is wrong. A repair keeps its tables, and every
+  blob file, for its scan, and reports
   a flush with no table found as an unscopable loss. Any other flush that does
   not read whole failed, or is the latest, which returned or not, nothing names
   yet: it is taken for one a power loss cut short, as a log's torn tail is, and

@@ -584,6 +584,18 @@ fn a_resumed_restore_leaves_out_the_first_attempts_flush() -> lsm_tree::Result<(
 
     let dst = tempfile::tempdir()?;
     ship(&pin, dst.path())?;
+    // The tables holding data, by name.
+    let tables_with_data = |root: &Path| -> std::io::Result<Vec<std::ffi::OsString>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(root.join("tables"))? {
+            let entry = entry?;
+            if entry.metadata()?.len() > 0 {
+                names.push(entry.file_name());
+            }
+        }
+        Ok(names)
+    };
+    let shipped = tables_with_data(dst.path())?;
     let injector = Arc::new(FaultInjector::new());
     // Everything lands but the marker's removal.
     injector.arm(
@@ -594,8 +606,25 @@ fn a_resumed_restore_leaves_out_the_first_attempts_flush() -> lsm_tree::Result<(
         dst.path(),
         Some(FaultFs::with_injector(StdFs, Arc::clone(&injector))),
     );
-    assert!(interrupted.is_err(), "the fault stopped the restore");
-    drop(interrupted);
+    let Err(stopped) = interrupted else {
+        panic!("the fault stopped the restore");
+    };
+    assert!(
+        stopped.to_string().contains("RemoveFile"),
+        "self-check: the marker's removal failed, after the flush: {stopped}"
+    );
+    assert!(
+        dst.path()
+            .join(lsm_tree::file::RESTORE_MARKER_FILE)
+            .exists(),
+        "self-check: the marker stays"
+    );
+    assert!(
+        tables_with_data(dst.path())?
+            .iter()
+            .any(|name| !shipped.contains(name)),
+        "self-check: the first attempt flushed a table beyond the shipped ones"
+    );
 
     let restored = restore(dst.path(), None)?;
     assert_eq!(

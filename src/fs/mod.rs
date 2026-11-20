@@ -618,18 +618,35 @@ impl<'a> SyncTarget<'a> {
     /// [`Self::sync_alone`], with whether a failure came from the sync
     /// itself (`true`) rather than from the open before it.
     fn sync_noting<F: Fs + ?Sized>(&self, fs: &F) -> Result<(), (io::Error, bool)> {
+        self.sync_unless(fs, || false).map(|_| ())
+    }
+
+    /// [`Self::sync_noting`], leaving the target unsynced (`Ok(false)`) when
+    /// `stopped` says so once its file is open: an open can block, and a batch
+    /// that recorded a failure meanwhile starts no sync after it.
+    fn sync_unless<F: Fs + ?Sized>(
+        &self,
+        fs: &F,
+        stopped: impl Fn() -> bool,
+    ) -> Result<bool, (io::Error, bool)> {
         match *self {
             Self::FileData { path, origin, mode } => {
                 let file = fs
                     .open(path, &FsOpenOptions::new().write(true).write_origin(origin))
                     .map_err(|e| (e, false))?;
-                file.sync_data_with(mode).map_err(|e| (e, true))
+                if stopped() {
+                    return Ok(false);
+                }
+                file.sync_data_with(mode).map_err(|e| (e, true))?;
             }
-            Self::OpenFile { file, mode, .. } => file.sync_data_with(mode).map_err(|e| (e, true)),
+            Self::OpenFile { file, mode, .. } => {
+                file.sync_data_with(mode).map_err(|e| (e, true))?;
+            }
             Self::Folder { path, mode } => {
-                fs.sync_directory_with(path, mode).map_err(|e| (e, true))
+                fs.sync_directory_with(path, mode).map_err(|e| (e, true))?;
             }
         }
+        Ok(true)
     }
 }
 
@@ -764,24 +781,30 @@ fn sync_side_by_side<F: Fs + ?Sized>(
         while let Some((at, file)) =
             files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
         {
-            // Checked once the file is claimed, right before its sync: a file
-            // claimed and not synced is left unspent, for the next batch.
-            if stop.load(core::sync::atomic::Ordering::Acquire) {
+            // Checked once the file is claimed, and again once it is open,
+            // right before its sync: a file claimed and not synced is left
+            // unspent, for the next batch.
+            let stopped = || stop.load(core::sync::atomic::Ordering::Acquire);
+            if stopped() {
                 return;
             }
-            if let Err((error, ran)) = file.sync_noting(fs) {
-                let mut failed = failed.lock();
-                let failure = failed.get_or_insert_with(|| SyncFailure::unspent(error));
-                if ran {
-                    failure.spent.push(*at);
+            match file.sync_unless(fs, stopped) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err((error, ran)) => {
+                    let mut failed = failed.lock();
+                    let failure = failed.get_or_insert_with(|| SyncFailure::unspent(error));
+                    if ran {
+                        failure.spent.push(*at);
+                    }
+                    stop.store(true, core::sync::atomic::Ordering::Release);
+                    #[cfg(test)]
+                    if let Some(recorded) = &recorded {
+                        recorded.store(true, core::sync::atomic::Ordering::SeqCst);
+                    }
+                    drop(failed);
+                    return;
                 }
-                stop.store(true, core::sync::atomic::Ordering::Release);
-                #[cfg(test)]
-                if let Some(recorded) = &recorded {
-                    recorded.store(true, core::sync::atomic::Ordering::SeqCst);
-                }
-                drop(failed);
-                return;
             }
         }
     };

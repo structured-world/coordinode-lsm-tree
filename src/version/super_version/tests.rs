@@ -525,3 +525,67 @@ fn new_history_seeds_the_floor_as_the_boundary() {
     assert!(history.get_version_for_snapshot(42).is_err());
     assert!(history.get_version_for_snapshot(43).is_ok());
 }
+
+/// A backend that can no longer tell any folder's device: one whose device
+/// flush just failed.
+struct DeviceGone(crate::fs::MemFs);
+
+impl Fs for DeviceGone {
+    fn volume_id(&self, _: &Path) -> Option<u64> {
+        None
+    }
+    fn open(
+        &self,
+        path: &Path,
+        opts: &crate::fs::FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        self.0.open(path, opts)
+    }
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.0.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        self.0.read_dir(path)
+    }
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        self.0.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.0.remove_dir_all(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        self.0.rename(from, to)
+    }
+    fn metadata(&self, path: &Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.0.metadata(path)
+    }
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
+        self.0.sync_directory(path)
+    }
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        self.0.exists(path)
+    }
+}
+
+/// Two files in different folders that the devices asked before a flush put
+/// on one device are both charged with that device's failed flush, though
+/// the backend can no longer tell either folder's device. Guards against a
+/// file whose writeback error the failed flush may have consumed being left
+/// to a later barrier, which would sync it alone and take that for proof.
+#[test]
+fn a_failed_device_flush_charges_its_files_by_the_devices_asked_before() {
+    use crate::fs::{SyncTarget, WriteOrigin};
+    let fs: Arc<dyn Fs> = Arc::new(DeviceGone(crate::fs::MemFs::new()));
+    let file = |path: &'static str| SyncTarget::FileData {
+        path: Path::new(path),
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Barrier,
+    };
+    let syncs = [(&fs, file("/fast/a/1")), (&fs, file("/fast/b/2"))];
+    let volumes = [Some(2), Some(2)];
+    assert!(same_flushed_device(&syncs, &volumes, 1, 0));
+    assert!(
+        !same_flushed_device(&syncs, &[Some(2), Some(3)], 1, 0),
+        "another device's file is not charged"
+    );
+}

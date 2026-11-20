@@ -330,21 +330,41 @@ fn a_flush_of_many_files_syncs_each_once() {
         }
         census.take();
         tree.flush_active_memtable(0).expect("flush");
-        let syncs = census.take();
+        // By path: a file synced twice and another not at all would match a
+        // count by kind.
+        let syncs = fs.injector().take_syncs();
+        let synced_in = |folder: &str| -> (usize, Vec<PathBuf>) {
+            let mut paths: Vec<&PathBuf> = syncs
+                .iter()
+                .filter(|(path, kind)| {
+                    *kind == SyncKind::FileData
+                        && path.parent().is_some_and(|p| p.ends_with(folder))
+                })
+                .map(|(path, _)| path)
+                .collect();
+            paths.sort();
+            let twice: Vec<PathBuf> = paths
+                .windows(2)
+                .filter_map(|pair| match pair {
+                    [a, b] if a == b => Some((*a).clone()),
+                    _ => None,
+                })
+                .collect();
+            paths.dedup();
+            (paths.len(), twice)
+        };
 
         let tables = tree.table_count();
         assert!(tables > 16, "self-check: {tables} tables, past the limit");
-        let count = |of: Synced| {
-            syncs
-                .iter()
-                .filter(|(synced, kind)| *synced == of && *kind == SyncKind::FileData)
-                .count()
-        };
-        assert_eq!(count(Synced::Table), tables, "table syncs (blob: {blob})");
+        let (synced, twice) = synced_in("tables");
+        assert_eq!(synced, tables, "each table synced (blob: {blob})");
+        assert!(twice.is_empty(), "tables synced twice: {twice:?}");
         if blob {
             let blobs = tree.blob_file_count();
             assert!(blobs > 16, "self-check: {blobs} blob files, past the limit");
-            assert_eq!(count(Synced::Blob), blobs, "blob file syncs");
+            let (synced, twice) = synced_in("blobs");
+            assert_eq!(synced, blobs, "each blob file synced");
+            assert!(twice.is_empty(), "blob files synced twice: {twice:?}");
         }
     }
 }

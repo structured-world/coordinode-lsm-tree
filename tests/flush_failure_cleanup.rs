@@ -363,6 +363,76 @@ fn a_blob_compaction_of_unknown_install_outcome_keeps_its_files_until_superseded
     assert_unknown_outcome_keeps_until_superseded(&open(blob_tree)?)
 }
 
+/// A compaction that relocates live values into blob files of its own, whose
+/// install may have happened, keeps those new blob files with its tables
+/// until a later install supersedes it. Guards against a blob file written by
+/// such a compaction going at the failure, which a reopen after a power loss
+/// that kept the install would find its tables referring to.
+#[test]
+fn a_relocating_compaction_of_unknown_install_outcome_keeps_its_blob_files_until_superseded()
+-> lsm_tree::Result<()> {
+    let f = open(|c| {
+        c.with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(64)
+                .age_cutoff(1.0)
+                .staleness_threshold(0.1)
+                .file_target_size(16 * 1024),
+        ))
+    })?;
+    for i in 0..KEYS {
+        f.tree.insert(key(i), value(i), i);
+    }
+    f.tree.flush_active_memtable(0)?;
+    // Half of the first generation goes stale. The first merge drops it and
+    // records the dead half, so the next one relocates the rest.
+    for i in (0..KEYS).step_by(2) {
+        f.tree.insert(key(i), value(i), KEYS + i);
+    }
+    f.tree.flush_active_memtable(0)?;
+    let past_every_version = 2 * KEYS;
+    f.tree.major_compact(u64::MAX, past_every_version)?;
+
+    let before = on_disk(f.dir.path())?;
+    f.injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .once(),
+    );
+    assert!(matches!(
+        f.tree.major_compact(u64::MAX, past_every_version),
+        Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+    ));
+    f.injector.clear();
+    let kept: BTreeSet<String> = on_disk(f.dir.path())?
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(
+        kept.iter().any(|name| name.starts_with("blobs/")),
+        "the relocation's new blob files stay past the failure: {kept:?}"
+    );
+
+    // The retry compacts again; its install rotates, superseding the failed
+    // edit.
+    f.tree.major_compact(u64::MAX, past_every_version)?;
+    let now = on_disk(f.dir.path())?;
+    for name in &kept {
+        assert!(
+            !now.contains(name),
+            "the kept file {name} goes once superseded"
+        );
+    }
+    for i in 0..KEYS {
+        assert_eq!(
+            f.tree.get(key(i), MAX_SEQNO)?.as_deref(),
+            Some(value(i).as_slice()),
+            "key {i} after the retry",
+        );
+    }
+    Ok(())
+}
+
 /// The tables are written and finished, and loading one of them fails: none
 /// of the flush's files stays.
 #[test]

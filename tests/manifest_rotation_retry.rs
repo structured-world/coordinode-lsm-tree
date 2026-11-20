@@ -334,6 +334,14 @@ fn a_persist_after_a_rotation_of_unknown_outcome_installs_above_it() -> lsm_tree
             left.is_empty(),
             "the compaction's output is removed: {left:?}"
         );
+        // The process dies: nothing the closing tree does reaches the disk,
+        // so the reopen takes the generation the persist installed, not one
+        // a clean close would write over it.
+        for op in [FaultOp::Open, FaultOp::Rename, FaultOp::RemoveFile] {
+            injector.arm(FaultRule::new(op, Fault::Error(ErrorKind::Other)));
+        }
+        drop(tree);
+        injector.clear();
     }
 
     let tree = open(FaultFs::new(StdFs))?;

@@ -403,21 +403,41 @@ fn a_flush_whose_table_entry_did_not_reach_the_disk_is_gone() -> lsm_tree::Resul
 /// an open that checks a flush's tables and not its blob files.
 #[test]
 fn a_flush_whose_blob_file_did_not_reach_the_disk_is_gone() -> lsm_tree::Result<()> {
+    // Pooled tables: a table's directory entry is durable before the flush
+    // writes it, so the table reaches the disk with its data sync, while the
+    // blob file's entry needs the folder sync that fails.
+    let open = |fs| blob_config(fs).table_file_pool(4).open();
     let big = "x".repeat(4_096);
     let disk = Disk::new();
-    let tree = blob_config(disk.fs()).open()?;
+    let tree = open(disk.fs())?;
     tree.insert("kept", &big, 0);
     tree.flush_active_memtable(0)?;
 
     tree.insert("lost", &big, 1);
-    disk.fail_once(FaultOp::SyncData, "blobs");
+    disk.fail_once(FaultOp::SyncDirectory, "blobs");
+    // The process dies before the failed flush removes its files.
+    disk.fs.injector().arm(FaultRule::new(
+        FaultOp::RemoveFile,
+        Fault::Error(lsm_tree::io::ErrorKind::Other),
+    ));
     assert!(
         tree.flush_active_memtable(0).is_err(),
-        "the flush fails on its blob file's sync"
+        "the flush fails on its blob file's folder sync"
     );
     let crash = disk.power_loss(tree);
+    assert_eq!(
+        data_files(&crash, &at(DB).join("tables"))?.len(),
+        2,
+        "self-check: the failed flush's table reaches the open, which must \
+         leave it out for its blob file"
+    );
+    assert_eq!(
+        data_files(&crash, &at(DB).join("blobs"))?.len(),
+        1,
+        "self-check: its blob file does not"
+    );
 
-    let tree = blob_config(Arc::new(crash)).open()?;
+    let tree = open(Arc::new(crash))?;
     assert_eq!(value(&tree, "kept")?.as_deref(), Some(big.as_str()));
     assert_eq!(value(&tree, "lost")?, None);
     assert_eq!(tree.blob_file_count(), 1);
@@ -471,8 +491,18 @@ fn a_cleared_flush_does_not_come_back_after_a_power_loss() -> lsm_tree::Result<(
         tree.insert(key, "1", seqno);
         tree.flush_active_memtable(0)?;
     }
+    // The clear's deletions never happen: its tables reach the open.
+    disk.fs.injector().arm(FaultRule::new(
+        FaultOp::RemoveFile,
+        Fault::Error(lsm_tree::io::ErrorKind::Other),
+    ));
     tree.clear()?;
     let crash = disk.power_loss(tree);
+    assert_eq!(
+        data_files(&crash, &at(DB).join("tables"))?.len(),
+        2,
+        "self-check: both cleared tables are on disk"
+    );
 
     let tree = config(Arc::new(crash)).open()?;
     assert_eq!(value(&tree, "a")?, None);
@@ -1677,9 +1707,19 @@ fn a_compacted_flush_does_not_come_back_beside_its_output() -> lsm_tree::Result<
     tree.flush_active_memtable(0)?;
     tree.insert("a", "2", 1);
     tree.flush_active_memtable(0)?;
+    // The inputs' deletions never happen: they reach the open.
+    disk.fs.injector().arm(FaultRule::new(
+        FaultOp::RemoveFile,
+        Fault::Error(lsm_tree::io::ErrorKind::Other),
+    ));
     tree.major_compact(u64::MAX, 0)?;
     assert_eq!(tree.table_count(), 1);
     let crash = disk.power_loss(tree);
+    assert_eq!(
+        data_files(&crash, &at(DB).join("tables"))?.len(),
+        3,
+        "self-check: both inputs and the output are on disk"
+    );
 
     let tree = config(Arc::new(crash)).open()?;
     assert_eq!(value(&tree, "a")?.as_deref(), Some("2"));

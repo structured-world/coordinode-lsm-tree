@@ -282,13 +282,8 @@ fn a_chunk_mark_no_head_lists_fails_the_frame_check() -> crate::Result<()> {
     verify_frames(&*file, &frames)?;
     drop(file);
 
-    // The second frame rots, and an index marks it as a chunk of nothing.
-    let second = usize::try_from(frames.get(1).copied().unwrap_or_default()).unwrap_or_default();
-    let mut bytes = std::fs::read(&path)?;
-    if let Some(byte) = bytes.get_mut(second + 4) {
-        *byte ^= 0xFF;
-    }
-    std::fs::write(&path, &bytes)?;
+    // The second frame stays whole, and an index marks it as a chunk of
+    // nothing: only the mark can fail the check.
     let orphan = blob_file::writer::FrameIndex::new(frames.to_vec(), alloc::vec![1 << 1]);
 
     let file = crate::fs::StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
@@ -325,6 +320,27 @@ fn an_index_short_of_its_frames_fails_the_frame_check() -> crate::Result<()> {
             Err(crate::Error::InvalidHeader("BlobFile"))
         ),
         "an index without a frame"
+    );
+    let Some(&end) = frames.last() else {
+        panic!("self-check: the data end");
+    };
+    let sentinel_only = blob_file::writer::FrameIndex::new(alloc::vec![end], Vec::new());
+    assert!(
+        matches!(
+            verify_frames(&*file, &sentinel_only),
+            Err(crate::Error::InvalidHeader("BlobFile"))
+        ),
+        "an index of the data end alone"
+    );
+    // The head's first chunk not marked as one: a reader would take it for a
+    // frame of its own.
+    let unmarked = blob_file::writer::FrameIndex::new(frames.to_vec(), Vec::new());
+    assert!(
+        matches!(
+            verify_frames(&*file, &unmarked),
+            Err(crate::Error::InvalidHeader("BlobFile"))
+        ),
+        "a listed chunk the index does not mark"
     );
     let headless = blob_file::writer::FrameIndex::new(alloc::vec![head, first_chunk], Vec::new());
     assert!(

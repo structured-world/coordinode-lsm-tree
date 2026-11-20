@@ -124,11 +124,13 @@ fn a_thread_whose_ring_refused_the_opcode_asks_no_ring_again() -> crate::Result<
     Ok(())
 }
 
-/// A sync the queue has no room for fails the batch, and every sync queued
-/// before it is spent with the batch's own index: they may run. Guards
-/// against a full queue reporting the queued syncs as never started.
+/// A sync the queue has no room for fails the batch, and no sync queued
+/// before it is spent: nothing was submitted, and a ring without a polling
+/// kernel thread runs only what is submitted. Guards against those targets
+/// being marked as failed syncs, which fails every later persist naming them
+/// though none of their syncs ran.
 #[test]
-fn a_full_submission_queue_fails_the_batch_and_spends_what_was_queued() -> crate::Result<()> {
+fn a_full_submission_queue_fails_the_batch_and_spends_nothing() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let paths = [dir.path().join("a"), dir.path().join("b")];
     for path in &paths {
@@ -149,8 +151,33 @@ fn a_full_submission_queue_fails_the_batch_and_spends_what_was_queued() -> crate
     let Err(failure) = super::sync_through(&mut ring, 5, &targets) else {
         panic!("two syncs fit a queue of one");
     };
-    assert_eq!(failure.spent, [5], "the queued sync is spent at its index");
+    assert!(
+        failure.spent.is_empty(),
+        "the queued sync never ran: {:?}",
+        failure.spent
+    );
     Ok(())
+}
+
+/// A submission the kernel took none of turns the ring off for the thread
+/// only when its error says the ring is refused for good; a shortage that may
+/// pass sends this batch another way and leaves the ring on. Guards against
+/// one `EAGAIN` under memory pressure costing the thread its ring for good.
+#[test]
+fn only_a_lasting_refusal_of_a_submission_turns_the_ring_off() {
+    use super::Through;
+
+    for errno in [libc::EPERM, libc::ENOSYS, libc::EOPNOTSUPP, libc::EINVAL] {
+        assert_eq!(super::unsubmitted(Some(errno)), Through::Refused, "{errno}");
+    }
+    for errno in [
+        Some(libc::EAGAIN),
+        Some(libc::ENOMEM),
+        Some(libc::EBUSY),
+        None,
+    ] {
+        assert_eq!(super::unsubmitted(errno), Through::Unsubmitted, "{errno:?}");
+    }
 }
 
 /// A batch of file and folder syncs goes through one ring and reports every
@@ -357,29 +384,15 @@ fn a_batch_larger_than_the_descriptor_limit_syncs() -> crate::Result<()> {
     const CHILD: &str = "LSM_TREE_DESCRIPTOR_LIMIT_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let name = "fs::std_fs::ring_sync::tests::a_batch_larger_than_the_descriptor_limit_syncs";
-        // The child runs the way cargo ran this test: through the target's
-        // runner when one is set (an emulator for a cross build, whose
-        // binary the host cannot exec), directly otherwise. The variable
-        // names the target's triple, whose architecture and system are this
-        // binary's own; a runner a cargo config names reaches no process
-        // cargo starts, and none is named in this repository's.
-        // A triple spells 32-bit x86 by the processor (`i686`), the
-        // architecture constant as `x86`.
-        let arches: Vec<String> = match std::env::consts::ARCH {
-            "x86" => vec!["I386".into(), "I586".into(), "I686".into()],
-            arch => vec![arch.to_ascii_uppercase()],
-        };
-        let os = std::env::consts::OS.to_ascii_uppercase();
-        let runner = std::env::vars()
-            .find(|(key, _)| {
-                key.strip_prefix("CARGO_TARGET_")
-                    .and_then(|key| key.strip_suffix("_RUNNER"))
-                    .is_some_and(|triple| {
-                        arches.iter().any(|arch| triple.starts_with(arch.as_str()))
-                            && triple.contains(&os)
-                    })
-            })
-            .map(|(_, value)| value);
+        // The child runs the way cargo ran this test: through the runner of
+        // the exact triple this binary was built for when one is set (an
+        // emulator for a cross build, whose binary the host cannot exec),
+        // directly otherwise. A runner a cargo config names reaches no
+        // process cargo starts, and none is named in this repository's.
+        let triple = env!("LSM_TREE_TARGET")
+            .to_ascii_uppercase()
+            .replace(['-', '.'], "_");
+        let runner = std::env::var(format!("CARGO_TARGET_{triple}_RUNNER")).ok();
         let mut runner_words = runner.iter().flat_map(|value| value.split_whitespace());
         let mut command = match runner_words.next() {
             Some(program) => {

@@ -12,6 +12,9 @@ use std::fs::{File, OpenOptions};
 #[cfg(io_uring_fs)]
 mod ring_sync;
 
+#[cfg(all(test, io_uring_fs))]
+pub(super) use ring_sync::thread_ring;
+
 #[cfg(target_os = "linux")]
 mod scheduler;
 

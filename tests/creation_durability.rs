@@ -552,22 +552,60 @@ fn an_open_without_a_snapshot_refuses_a_rotated_generations_empty_log() {
 }
 
 /// Flushes past a manifest rotation survive a power loss: the rotated
-/// generation's log, created with its snapshot, holds the edits after it.
+/// generation's log, created with its snapshot, holds the edits after it, and
+/// a flush after the last persist describes itself. A synced flush writes no
+/// edit, so each is persisted to make the edits that rotate the manifest; the
+/// power goes before the close, whose own append would otherwise stand in for
+/// them.
 #[test]
 fn flushes_across_a_manifest_rotation_survive_a_power_loss() {
-    let fs = CrashFs::new(MemFs::new());
-    let tree = config(&fs, false)
-        .manifest_log_rotate_bytes(1)
-        .open()
-        .expect("create");
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs as _};
+    let crash = CrashFs::new(MemFs::new());
+    let fault = Arc::new(FaultFs::new(crash.clone()));
+    let tree = Config::new(
+        DB,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fault.clone())
+    .manifest_log_rotate_bytes(1)
+    .open()
+    .expect("create");
     for i in 0..5u64 {
         tree.insert(format!("key{i}"), "value", i);
         tree.flush_active_memtable(0).expect("flush");
+        tree.persist_flushes().expect("persist");
+    }
+    let db = std::path::absolute(DB).expect("absolute path");
+    assert!(
+        crash
+            .read_dir(&db)
+            .expect("tree folder")
+            .iter()
+            .any(|entry| entry.file_name.starts_with("edits-") && entry.file_name != "edits-0"),
+        "self-check: the persists rotated the manifest"
+    );
+    tree.insert("key5", "value", 5);
+    tree.flush_active_memtable(0)
+        .expect("the flush after the last persist");
+
+    crash.crash();
+    for op in [
+        FaultOp::Open,
+        FaultOp::SyncData,
+        FaultOp::SyncAll,
+        FaultOp::SyncDirectory,
+        FaultOp::Rename,
+        FaultOp::RemoveFile,
+    ] {
+        fault.injector().arm(FaultRule::new(
+            op,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        ));
     }
     drop(tree);
-    fs.crash();
-    let tree = reopen(&fs, false);
-    for i in 0..5u64 {
+    let tree = reopen(&crash, false);
+    for i in 0..6u64 {
         assert!(
             tree.get(format!("key{i}"), u64::MAX)
                 .expect("get")

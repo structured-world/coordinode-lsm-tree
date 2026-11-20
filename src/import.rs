@@ -924,8 +924,7 @@ pub fn install_manifest(
         repair_report: None,
         // The snapshot written below raises it to what its tables carry.
         flush_watermark: 0,
-        // The import names every table it writes; the open after it records
-        // its own routes.
+        // The snapshot is written with the routes below.
         routes: Vec::new(),
         closed_cleanly: false,
     };
@@ -954,7 +953,23 @@ pub fn install_manifest(
                 .and_then(RecordedTable::of)
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    crate::version::persist_version(
+    // The tables folders the import wrote to other than the tree's own: until
+    // an open records its routes, a repair of a manifest that does not load
+    // reads them from this snapshot, and refuses while one is not configured
+    // rather than rebuild a manifest without the tables it holds.
+    let own = folder.join(crate::file::TABLES_FOLDER);
+    let mut routes: Vec<String> = Vec::new();
+    for level in 0..image.levels.len() {
+        let routed = tables_folder(level);
+        if routed == own {
+            continue;
+        }
+        let route = crate::version::routes::relative(folder, &routed);
+        if !routes.contains(&route) {
+            routes.push(route);
+        }
+    }
+    crate::version::persist_version_with(
         folder,
         &version,
         image.comparator_name,
@@ -963,6 +978,7 @@ pub fn install_manifest(
         encryption.clone(),
         crate::fs::SyncMode::default(),
         0,
+        &routes,
     )?;
     // The manifest just written reads back under the strictest mode.
     crate::version::recovery::recover(

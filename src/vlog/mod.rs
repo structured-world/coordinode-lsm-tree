@@ -568,8 +568,9 @@ pub(crate) fn verify_frames(
         // boundary an untrusted file crosses.
         Ok(crate::file::read_exact(file, from, len)?)
     };
-    // The last start is the data end, not a frame.
-    let Some(count) = frames.len().checked_sub(1) else {
+    // The last start is the data end, not a frame; a file holds one frame at
+    // least, as the writer writes one only for a value.
+    let Some(count) = frames.len().checked_sub(1).filter(|&count| count > 0) else {
         return Err(crate::Error::InvalidHeader("BlobFile"));
     };
     // The last frame the latest head's table lists.
@@ -589,7 +590,13 @@ pub(crate) fn verify_frames(
             let chunks = head_chunks(&bytes)?;
             listed_through = Some(at + chunks.len());
             for (n, spec) in chunks.iter().enumerate() {
-                check_chunk(spec, &bytes_of(at + 1 + n)?)?;
+                let stored = bytes_of(at + 1 + n)?;
+                // A reader takes a span the index does not mark as a chunk for
+                // a frame of its own.
+                if !frames.is_chunk(at + 1 + n) {
+                    return Err(crate::Error::InvalidHeader("BlobFile"));
+                }
+                check_chunk(spec, &stored)?;
             }
         }
     }

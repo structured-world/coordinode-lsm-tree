@@ -30,6 +30,31 @@ fn a_route_is_named_relative_to_the_tree() {
     );
 }
 
+/// A folder named from the root and one named without it record different
+/// routes, whichever of them the tree's own folder is named like. Guards
+/// against a build that keeps folders as configured (no std) letting an
+/// unclean open configured with `cold/tables` pass the check of a route
+/// recorded for `/cold/tables`, and scan the wrong folder.
+#[test]
+fn folders_apart_only_in_their_root_record_apart() {
+    for base in ["/db", "db"] {
+        assert_ne!(
+            relative(Path::new(base), Path::new("/cold/tables")),
+            relative(Path::new(base), Path::new("cold/tables")),
+            "from {base}"
+        );
+    }
+    // Both rooted, as std makes every configured folder: unchanged.
+    assert_eq!(
+        relative(Path::new("/db"), Path::new("/cold/tables")),
+        "../cold/tables"
+    );
+    assert_eq!(
+        relative(Path::new("db"), Path::new("cold/tables")),
+        "../cold/tables"
+    );
+}
+
 /// Off Windows a backslash is a character of a folder's name, not a
 /// separator. Guards against two different folders (`fast\cold` and
 /// `fast/cold`) recording the same route, so an unclean open configured with

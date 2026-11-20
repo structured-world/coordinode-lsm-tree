@@ -91,10 +91,21 @@ fn device_folder<'a>(target: &crate::fs::SyncTarget<'a>) -> &'a Path {
     }
 }
 
+/// The device of each sync in `syncs`, by its place, as its backend tells it.
+fn device_volumes(syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)]) -> Vec<Option<u64>> {
+    syncs
+        .iter()
+        .map(|(fs, target)| fs.volume_id(device_folder(target)))
+        .collect()
+}
+
 /// Whether the sync at `at` in `syncs` went to the device the sync at `of`
-/// went to, as [`flush_other_devices`] groups them.
+/// went to, as [`flush_other_devices`] grouped them with `volumes`. The
+/// devices asked before the flush: a device whose flush failed may no longer
+/// tell its id, which would leave a file on it out of the failure.
 fn same_flushed_device(
     syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)],
+    volumes: &[Option<u64>],
     at: usize,
     of: usize,
 ) -> bool {
@@ -102,9 +113,9 @@ fn same_flushed_device(
         return false;
     };
     let (folder, of_folder) = (device_folder(target), device_folder(of_target));
-    let volume = fs.volume_id(folder);
+    let volume = volumes.get(at).copied().flatten();
     Arc::ptr_eq(fs, of_fs)
-        && (volume.is_some() && volume == of_fs.volume_id(of_folder) || folder == of_folder)
+        && (volume.is_some() && volume == volumes.get(of).copied().flatten() || folder == of_folder)
 }
 
 /// Flushes, once each, every device `syncs` reached that is not provably the
@@ -120,13 +131,22 @@ fn same_flushed_device(
 /// never began left them to a later flush.
 pub(crate) fn flush_other_devices(
     syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)],
+    step: (&dyn Fs, &Path),
+) -> Result<(), (crate::io::Error, usize, bool)> {
+    flush_devices_of(syncs, &device_volumes(syncs), step)
+}
+
+/// [`flush_other_devices`], with the device of each sync in `volumes`.
+fn flush_devices_of(
+    syncs: &[(&Arc<dyn Fs>, crate::fs::SyncTarget<'_>)],
+    volumes: &[Option<u64>],
     (step_fs, step_path): (&dyn Fs, &Path),
 ) -> Result<(), (crate::io::Error, usize, bool)> {
     let step_volume = step_fs.volume_id(step_path);
     let mut flushed: Vec<(&Arc<dyn Fs>, Option<u64>, &Path)> = Vec::new();
     for (at, (fs, target)) in syncs.iter().enumerate() {
         let folder = device_folder(target);
-        let volume = fs.volume_id(folder);
+        let volume = volumes.get(at).copied().flatten();
         if volume.is_some() && volume == step_volume {
             continue;
         }
@@ -1152,7 +1172,8 @@ impl SuperVersions {
             // one. A flush that never began (its folder did not open) asked
             // the device nothing: the files' syncs consumed no error, and a
             // later persist syncs them and flushes the device again.
-            flush_other_devices(&syncs, step).map_err(|(error, failed_at, began)| {
+            let volumes = device_volumes(&syncs);
+            flush_devices_of(&syncs, &volumes, step).map_err(|(error, failed_at, began)| {
                 crate::fs::SyncFailure {
                     error,
                     spent: (0..syncs.len())
@@ -1161,7 +1182,7 @@ impl SuperVersions {
                                 && syncs
                                     .get(at)
                                     .is_some_and(|(_, target)| target.origin().is_some())
-                                && same_flushed_device(&syncs, at, failed_at)
+                                && same_flushed_device(&syncs, &volumes, at, failed_at)
                         })
                         .collect(),
                 }
