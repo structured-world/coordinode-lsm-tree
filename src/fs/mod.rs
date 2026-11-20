@@ -623,7 +623,7 @@ impl<'a> SyncTarget<'a> {
 
     /// [`Self::sync_noting`], leaving the target unsynced (`Ok(false)`) when
     /// `stopped` says so once its file is open: an open can block, and a batch
-    /// that recorded a failure meanwhile starts no sync after it.
+    /// that recorded a failure meanwhile leaves the file unsynced.
     fn sync_unless<F: Fs + ?Sized>(
         &self,
         fs: &F,
@@ -730,7 +730,7 @@ pub(crate) fn keep_open<Id>(
 /// # Errors
 ///
 /// The first error a target's sync returned, once every file sync under way
-/// has ended: no file is started after it, and no folder.
+/// has ended: no file claimed after it is synced, and no folder.
 pub(crate) fn sync_each_target<F: Fs + ?Sized>(
     fs: &F,
     targets: &[SyncTarget<'_>],
@@ -773,7 +773,10 @@ fn sync_side_by_side<F: Fs + ?Sized>(
     }
     let next = core::sync::atomic::AtomicUsize::new(0);
     let failed: parking_lot::Mutex<Option<SyncFailure>> = parking_lot::Mutex::new(None);
-    // Set once a failure is recorded: no sync starts after it.
+    // Set once a failure is recorded: a worker that sees it syncs nothing
+    // more. A sync whose check passed just before may still enter after the
+    // record; nothing short of serializing the syncs closes that window, and
+    // its outcome is reported as any other.
     let stop = core::sync::atomic::AtomicBool::new(false);
     #[cfg(test)]
     let recorded = FAILURE_RECORDED.with_borrow(Clone::clone);

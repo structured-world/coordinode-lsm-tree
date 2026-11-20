@@ -58,6 +58,24 @@ pub(crate) fn thread_ring(drop_first: bool) -> bool {
     })
 }
 
+/// Whether a sync of `file` goes through a ring on this thread: a probe, run
+/// before a test's own batch, for a kernel or sandbox that sets rings up and
+/// refuses the sync opcode. Leaves the thread with no ring, and with its
+/// refusal noted when there was one.
+#[cfg(test)]
+pub(crate) fn ring_runs_syncs(file: &std::path::Path) -> bool {
+    let synced = matches!(
+        sync_on_ring(&[SyncTarget::FileData {
+            path: file,
+            origin: crate::fs::WriteOrigin::FlushTable,
+            mode: crate::fs::SyncMode::default(),
+        }]),
+        Some(Ok(()))
+    );
+    thread_ring(true);
+    synced
+}
+
 /// How a batch went through a ring.
 #[derive(Debug, PartialEq, Eq)]
 enum Through {

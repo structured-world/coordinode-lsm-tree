@@ -695,7 +695,15 @@ impl<W: Write + Send + 'static> Drop for DeferredWriter<W> {
                     state.queued_bytes = 0;
                     core::mem::take(&mut state.queue)
                 };
-                drop_contained(queued);
+                // One at a time: a second panicking drop while the first
+                // unwinds would abort the process.
+                for job in queued {
+                    if !drop_contained(job) {
+                        log::warn!(
+                            "a job a given-up file's writer did not run panicked when dropped"
+                        );
+                    }
+                }
             }
             drop(lane.settle().inner.take());
         }

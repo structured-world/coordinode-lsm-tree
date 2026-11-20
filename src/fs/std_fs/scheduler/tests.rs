@@ -251,6 +251,20 @@ fn bfq_with_idling_turned_off_does_not_idle() -> std::io::Result<()> {
         stalls_under(&root.path().join("dev/253:0"), 0),
         "the default"
     );
+
+    // `slice_idle` shows whole milliseconds: an interval below one reads as
+    // zero there, and only `slice_idle_us` tells it from idling turned off.
+    std::fs::write(iosched.join("slice_idle"), "0\n")?;
+    std::fs::write(iosched.join("slice_idle_us"), "500\n")?;
+    assert!(
+        stalls_under(&root.path().join("dev/8:17"), 0),
+        "an interval under a millisecond"
+    );
+    std::fs::write(iosched.join("slice_idle_us"), "0\n")?;
+    assert!(
+        !stalls_under(&root.path().join("dev/8:17"), 0),
+        "zero microseconds"
+    );
     Ok(())
 }
 

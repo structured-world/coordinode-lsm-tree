@@ -248,8 +248,9 @@ impl super::FsFile for Gated {
     }
 }
 
-/// Once a sync of the batch failed, no file sync starts: the syncs under way
-/// end, and the files no worker had claimed yet are left unsynced. Guards
+/// Once a sync of the batch failed, no file claimed after it is synced: the
+/// syncs under way end, and the files no worker had claimed yet are left
+/// unsynced. Guards
 /// against a worker that finishes its sync after the failure claiming the
 /// next file and syncing it, against the batch's contract.
 #[test]
@@ -298,7 +299,10 @@ fn no_file_sync_starts_after_a_failure() -> crate::Result<()> {
         "a peer's sync was under way at the failure"
     );
     // The workers each claimed one of the first files; the last two were
-    // claimed only after the failure, by a worker done with its sync.
+    // claimed only after the failure, by a worker done with its sync. Checked
+    // by claim, not by when a sync began: a file claimed before the failure
+    // whose stop check passed may enter its sync after the record, which the
+    // batch allows.
     assert!(
         synced.iter().all(|&at| at < FILES - 2),
         "no sync started after the failure: {synced:?}"
@@ -307,13 +311,14 @@ fn no_file_sync_starts_after_a_failure() -> crate::Result<()> {
 }
 
 /// A backend over [`MemFs`] whose open of `held` waits until the batch has
-/// recorded a failure, noting first that it is under way, and hands back a
-/// handle that records its syncs; the open of any other file hands back one
-/// whose sync fails once that open is under way.
+/// recorded a failure, noting first that it is under way and then that it
+/// returned a handle (`returned`), which records its syncs; the open of any
+/// other file hands back one whose sync fails once that open is under way.
 struct HeldOpen {
     inner: MemFs,
     held: std::path::PathBuf,
     opening: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    returned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     recorded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     synced: std::sync::Arc<parking_lot::Mutex<Vec<usize>>>,
 }
@@ -330,6 +335,7 @@ impl Fs for HeldOpen {
                 || self.recorded.load(Ordering::SeqCst),
                 "the failure's record",
             )?;
+            self.returned.store(true, Ordering::SeqCst);
         }
         let opening = Arc::clone(&self.opening);
         Ok(Box::new(Gated {
@@ -380,6 +386,7 @@ fn a_file_opened_after_a_failure_is_not_synced() -> crate::Result<()> {
         inner: MemFs::new(),
         held: std::path::PathBuf::from("/db/held"),
         opening: Arc::new(AtomicBool::new(false)),
+        returned: Arc::new(AtomicBool::new(false)),
         recorded: Arc::new(AtomicBool::new(false)),
         synced: Arc::new(parking_lot::Mutex::new(Vec::new())),
     };
@@ -405,6 +412,10 @@ fn a_file_opened_after_a_failure_is_not_synced() -> crate::Result<()> {
         panic!("the first file's sync fails");
     };
     assert_eq!(failure.spent, [0], "only the failed sync is spent");
+    assert!(
+        backend.returned.load(std::sync::atomic::Ordering::SeqCst),
+        "self-check: the held open returned a handle after the failure"
+    );
     assert!(
         backend.synced.lock().is_empty(),
         "the held file was not synced once its open returned"
@@ -444,8 +455,9 @@ fn a_batch_of_one_on_the_std_backend_syncs_it_alone() -> crate::Result<()> {
 }
 
 /// The `io_uring` backend batches its syncs as the std backend does: every
-/// target is synced, through the thread's ring. Guards against its batch
-/// falling back to the trait's default, which syncs one target at a time.
+/// target is synced, through the thread's ring where a probe sync goes
+/// through one. Guards against its batch falling back to the trait's default,
+/// which syncs one target at a time.
 #[cfg(io_uring_fs)]
 #[test]
 fn the_io_uring_backend_syncs_a_batch() -> crate::Result<()> {
@@ -471,15 +483,21 @@ fn the_io_uring_backend_syncs_a_batch() -> crate::Result<()> {
         path: dir.path(),
         mode,
     });
+    // A kernel or sandbox that sets rings up and refuses the sync opcode
+    // syncs the batch another way, as it should: the ring is asked of the
+    // batch only where a probe of its own, before the batch, went through.
+    let rings = super::std_fs::ring_runs_syncs(&files[0]);
     assert!(
-        !super::std_fs::thread_ring(true),
+        !super::std_fs::thread_ring(false),
         "no ring before the batch"
     );
     fs.sync_many(&targets)?;
-    assert!(
-        super::std_fs::thread_ring(false),
-        "the batch went through the thread's ring"
-    );
+    if rings {
+        assert!(
+            super::std_fs::thread_ring(false),
+            "the batch went through the thread's ring"
+        );
+    }
     Ok(())
 }
 

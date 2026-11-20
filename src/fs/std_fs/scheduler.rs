@@ -196,15 +196,18 @@ fn stalls_under(device: &Path, depth: u8) -> bool {
 }
 
 /// Whether BFQ, whose tunables lie in `iosched`, idles for a queue's next
-/// request: unless `slice_idle` is set to zero, which turns idling off, and
-/// `strict_guarantees` is off, which forces it on (the kernel's BFQ
-/// documentation, `slice_idle` and `strict_guarantees`). A tunable that
-/// cannot be read is taken at its default: `slice_idle` 8 ms.
+/// request: unless its idle interval is set to zero, which turns idling off,
+/// and `strict_guarantees` is off, which forces it on (the kernel's BFQ
+/// documentation, `slice_idle`, `slice_idle_us` and `strict_guarantees`).
+/// The interval is read in microseconds: `slice_idle` shows whole
+/// milliseconds, so an interval below one reads as zero there. A tunable that
+/// cannot be read is taken at its default: 8 ms.
 fn bfq_idles(iosched: &Path) -> bool {
     let set = |name: &str| {
         read_text(&iosched.join(name)).and_then(|value| value.trim().parse::<u64>().ok())
     };
-    set("slice_idle") != Some(0) || set("strict_guarantees").is_some_and(|on| on != 0)
+    let interval = set("slice_idle_us").or_else(|| set("slice_idle"));
+    interval != Some(0) || set("strict_guarantees").is_some_and(|on| on != 0)
 }
 
 /// The scheduler a `queue/scheduler` line names active: the one in brackets

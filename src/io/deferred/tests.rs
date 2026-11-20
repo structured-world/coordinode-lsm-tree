@@ -821,6 +821,30 @@ fn a_writer_dropped_while_unwinding_drops_its_queued_writes() {
     );
 }
 
+/// A writer dropped while its owner unwinds, whose lane holds jobs each of
+/// whose drops panics, drops them all without aborting the process. Guards
+/// against the queue dropped in one piece: the second job's drop then panics
+/// while the first one's unwinds.
+#[test]
+fn a_writer_dropped_while_unwinding_drops_jobs_whose_drops_panic() {
+    let unwound = std::panic::catch_unwind(|| {
+        let mut out = DeferredWriter::with_capacity(8, Sink::default(), true);
+        // Workers that never run: the jobs wait in the lane.
+        out.use_spawner_now(Arc::new(Never::default()));
+        for _ in 0..2 {
+            let bomb = Bomb;
+            drop(out.after_writes(move |_| {
+                core::hint::black_box(&bomb);
+            }));
+        }
+        std::panic::panic_any("the owner fails");
+    });
+    assert!(
+        unwound.is_err(),
+        "the owner panicked, and the process lives"
+    );
+}
+
 /// A sink that panics in its first write, a while into it, and takes a while
 /// to close; `entered` is set once a write starts.
 struct ClosesSlowly {
