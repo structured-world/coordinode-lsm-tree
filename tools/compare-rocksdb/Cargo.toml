@@ -56,6 +56,9 @@ surrealkv = "=1.1.1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # Writes the summary the published page is drawn from.
 serde_json = "1"
+# Inline storage for the sync batch a skipping backend forwards, so the arms
+# that leave syncs out do not add heap allocations to the measured flush.
+smallvec = "1"
 tempfile = "3"
 
 [features]

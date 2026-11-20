@@ -16,6 +16,12 @@ use lsm_tree::fs::{
 };
 use lsm_tree::io;
 use lsm_tree::write_budget::WriteBudget;
+use smallvec::SmallVec;
+
+/// The sync targets a filtered batch keeps inline: more than a flush syncs at
+/// once (up to 16 tables, as many blob files and their folders), and as many
+/// as one chunk of the backend's ring.
+const BATCH: usize = 64;
 
 /// The syncs a [`SkipSyncFs`] leaves out.
 #[derive(Clone, Copy)]
@@ -173,22 +179,31 @@ impl Fs for SkipSyncFs {
         self.inner.sync_device(path)
     }
 
-    // The targets left in go to the backend as one batch, so the arm that
-    // skips nothing syncs them as the bare backend does. A skipped file is
-    // not opened either: an error opening it does not surface.
+    // The targets left in go to the backend as one batch. A batch none of
+    // whose targets is skipped is handed over as it came, with no copy, so
+    // the arm that skips nothing syncs exactly as the bare backend does. A
+    // skipped file is not opened either: an error opening it does not surface.
     fn sync_many(&self, targets: &[SyncTarget<'_>]) -> Result<(), SyncFailure> {
+        let skipped = |target: &SyncTarget<'_>| match target {
+            SyncTarget::FileData { origin, .. } | SyncTarget::OpenFile { origin, .. } => {
+                self.skip.file(Some(*origin))
+            }
+            SyncTarget::Folder { .. } => self.skip.directories,
+        };
+        if !targets.iter().any(skipped) {
+            return self.inner.sync_many(targets);
+        }
         // Each kept target with its index in `targets`, which a failure names.
-        let (at, kept): (Vec<usize>, Vec<SyncTarget<'_>>) = targets
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, target)| match target {
-                SyncTarget::FileData { origin, .. } | SyncTarget::OpenFile { origin, .. } => {
-                    !self.skip.file(Some(*origin))
-                }
-                SyncTarget::Folder { .. } => !self.skip.directories,
-            })
-            .unzip();
+        // Inline up to a flush's batch, so a filtered arm allocates no more
+        // than the bare backend does.
+        let mut at: SmallVec<[usize; BATCH]> = SmallVec::new();
+        let mut kept: SmallVec<[SyncTarget<'_>; BATCH]> = SmallVec::new();
+        for (i, target) in targets.iter().enumerate() {
+            if !skipped(target) {
+                at.push(i);
+                kept.push(*target);
+            }
+        }
         if kept.is_empty() {
             return Ok(());
         }
