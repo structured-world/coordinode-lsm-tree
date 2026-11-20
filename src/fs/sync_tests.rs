@@ -59,6 +59,53 @@ fn a_synced_flush_syncs_through_the_handles_it_wrote_with() -> crate::Result<()>
     Ok(())
 }
 
+/// Each kind of sync target names its path, and its debug form names its
+/// kind, path, origin and mode, leaving out the handle of a kept file, which
+/// has no debug form of its own. Guards a failure report that names the wrong
+/// file, or none.
+#[test]
+fn a_sync_target_names_its_path_and_kind() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let file_path = Path::new("/t/1");
+    fs.create_dir_all(Path::new("/t"))?;
+    let kept = fs.open(file_path, &FsOpenOptions::new().write(true).create(true))?;
+    let targets = [
+        SyncTarget::FileData {
+            path: file_path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Full,
+        },
+        SyncTarget::OpenFile {
+            file: &*kept,
+            path: file_path,
+            origin: WriteOrigin::FlushBlob,
+            mode: SyncMode::Normal,
+        },
+        SyncTarget::Folder {
+            path: Path::new("/t"),
+            mode: SyncMode::Barrier,
+        },
+    ];
+    let paths: Vec<&Path> = targets.iter().map(SyncTarget::path).collect();
+    assert_eq!(paths, [file_path, file_path, Path::new("/t")]);
+    let shown: Vec<String> = targets.iter().map(|target| format!("{target:?}")).collect();
+    for (shown, words) in shown.iter().zip([
+        ["FileData", "/t/1", "FlushTable", "Full"],
+        ["OpenFile", "/t/1", "FlushBlob", "Normal"],
+        ["Folder", "/t", "Barrier", "mode"],
+    ]) {
+        for word in words {
+            assert!(shown.contains(word), "{shown} names {word}");
+        }
+    }
+    let open = shown.get(1).map_or("", String::as_str);
+    assert!(
+        open.ends_with(".. }"),
+        "the kept handle is left out: {open}"
+    );
+    Ok(())
+}
+
 /// A backend that keeps the default batch syncs every target of it, files
 /// side by side and then the folders, and reports the first failure.
 #[test]

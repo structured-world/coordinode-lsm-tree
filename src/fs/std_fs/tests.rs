@@ -367,6 +367,23 @@ fn std_fs_sync_directory() -> io::Result<()> {
     Ok(())
 }
 
+/// The device under a folder that exists is flushed. On macOS, where the
+/// flush goes through a descriptor of the folder, one under a folder that
+/// does not exist is refused and reported as never begun, so the syncs that
+/// depend on it are left to sync again rather than marked failed.
+#[test]
+fn std_fs_sync_device_flushes_an_existing_folder() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    fs.sync_device(dir.path())?;
+    #[cfg(target_os = "macos")]
+    match fs.sync_device_noting(&dir.path().join("missing")) {
+        Err((_, began)) => assert!(!began, "nothing was asked of the device"),
+        Ok(()) => panic!("a missing folder has no device to flush"),
+    }
+    Ok(())
+}
+
 #[test]
 fn fs_file_metadata() -> io::Result<()> {
     let dir = tempfile::tempdir()?;

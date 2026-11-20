@@ -99,6 +99,46 @@ fn handle() -> Arc<RuntimeConfigHandle> {
     Arc::new(RuntimeConfigHandle::new(RuntimeConfig::default()))
 }
 
+/// A tree on a device whose scheduler idles between queues flushes under the
+/// strategy for it: the pool's refill waits for the flush's syncs, and what
+/// the flushes wrote reads back, before and after a reopen. Guards the flush
+/// path that holds the pool's refill through the install.
+#[test]
+fn a_tree_on_a_device_that_idles_between_queues_flushes_and_reads_back() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter};
+
+    let fs: Arc<dyn Fs> = Arc::new(Scheduled::on_volume(0xb1, true));
+    let config = || {
+        Config::new(
+            "/idles",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+        .use_io_policy(Arc::new(IoPolicy::new()))
+    };
+    let crate::AnyTree::Standard(tree) = config().open()? else {
+        panic!("a tree without KV separation is a standard one");
+    };
+    assert_eq!(
+        tree.0.runtime_config.load().io,
+        IoStrategy::for_scheduler(true)
+    );
+    for round in 0..3u64 {
+        tree.insert(format!("k{round}"), "v", round);
+        tree.flush_active_memtable(0)?;
+    }
+    for round in 0..3u64 {
+        assert!(tree.get(format!("k{round}"), SeqNo::MAX)?.is_some());
+    }
+    drop(tree);
+    let tree = config().open()?;
+    for round in 0..3u64 {
+        assert!(tree.get(format!("k{round}"), SeqNo::MAX)?.is_some());
+    }
+    Ok(())
+}
+
 /// The policy prints as itself, without the trees and locations it holds:
 /// a config that carries it prints without walking them.
 #[test]

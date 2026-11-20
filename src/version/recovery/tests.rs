@@ -47,6 +47,46 @@ fn a_flush_watermark_section_is_read_strictly() {
     }
 }
 
+/// A snapshot's routes section reads back its routes, and is read strictly:
+/// a count past what the bytes hold, a route cut short, bytes that are not
+/// UTF-8 and trailing bytes are refused. Guards against a route misread or
+/// dropped, which would let an unclean open skip the folder it names.
+#[test]
+fn a_routes_section_is_read_strictly() -> crate::Result<()> {
+    let section = |routes: &[&[u8]], count: u32| -> crate::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        bytes.write_u32::<LittleEndian>(count)?;
+        for route in routes {
+            bytes.write_u32::<LittleEndian>(u32::try_from(route.len()).unwrap_or(u32::MAX))?;
+            bytes.write_all(route)?;
+        }
+        Ok(bytes)
+    };
+    assert_eq!(
+        parse_routes_section(&section(&[b"../fast/tables", b"cold"], 2)?)?,
+        ["../fast/tables", "cold"]
+    );
+    let mut trailing = section(&[b"cold"], 1)?;
+    trailing.push(0);
+    let mut cut = section(&[b"cold"], 1)?;
+    cut.pop();
+    for bad in [
+        section(&[b"cold"], u32::MAX)?,
+        cut,
+        section(&[b"\xFF"], 1)?,
+        trailing,
+    ] {
+        assert!(
+            matches!(
+                parse_routes_section(&bad),
+                Err(crate::Error::InvalidHeader("routes section"))
+            ),
+            "{bad:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The flush watermark an edit carries replaces the recovered one, as an
 /// absolute value; an edit without one leaves it as it was.
 #[test]

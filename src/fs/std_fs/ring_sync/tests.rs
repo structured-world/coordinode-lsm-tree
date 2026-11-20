@@ -467,6 +467,89 @@ fn a_sync_the_kernel_refuses_fails_the_batch() -> crate::Result<()> {
     Ok(())
 }
 
+/// Only a ring setup the kernel refuses for good (no `io_uring`, or one a
+/// filter or sysctl keeps from the process) turns the ring off for the
+/// thread; short memory or descriptors may pass. Guards against a thread
+/// giving up the ring over a passing shortage, or asking again on every batch
+/// for a ring it will never get.
+#[test]
+fn only_a_lasting_refusal_of_a_ring_turns_it_off() {
+    assert!(super::refuses_setup(libc::ENOSYS));
+    assert!(super::refuses_setup(libc::EPERM));
+    assert!(!super::refuses_setup(libc::ENOMEM));
+    assert!(!super::refuses_setup(libc::EMFILE));
+}
+
+/// A wait that fails before any sync is reaped, with none failed, fails the
+/// batch with the wait's own error and spends what the kernel took. Guards
+/// against such a batch reporting no error, or a sync error it never had.
+#[test]
+fn a_batch_cut_short_before_any_completion_fails_with_the_wait() {
+    let failure = super::Completions::default()
+        .cut_short(std::io::Error::other("the wait failed"), [0, 2].into_iter());
+    assert!(
+        failure.error.to_string().contains("the wait failed"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(failure.spent, [0, 2]);
+}
+
+/// A kept handle with no descriptor is refused by the ring's open rather
+/// than synced through some other descriptor. Guards the open the ring path
+/// reaches only past the batch's own check.
+#[test]
+fn a_kept_handle_without_a_descriptor_does_not_open_for_the_ring() -> crate::Result<()> {
+    use crate::fs::{FsOpenOptions, MemFs};
+
+    let memory = MemFs::new();
+    let path = std::path::Path::new("/m");
+    let file = memory.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
+    let opened = super::open(&SyncTarget::OpenFile {
+        file: &*file,
+        path,
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    });
+    assert!(opened.is_err(), "no descriptor to sync through");
+    Ok(())
+}
+
+/// A batch whose every sync the ring answers as it would an opcode it does
+/// not run goes another way, and the thread asks no ring again: each
+/// `/dev/null` takes no data sync, which is that answer. Guards against such
+/// a batch being reported synced, or failed, rather than synced elsewhere.
+#[test]
+fn a_batch_every_sync_refused_goes_another_way() -> crate::Result<()> {
+    use super::NO_RING_SYNC;
+
+    NO_RING_SYNC.set(false);
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("f");
+    std::fs::File::create(&file)?.write_all(b"x")?;
+    let regular = SyncTarget::FileData {
+        path: &file,
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    };
+    // The ring is known to sync a regular file, or there is nothing to test.
+    let Some(alone) = sync_on_ring(core::slice::from_ref(&regular)) else {
+        return Ok(());
+    };
+    alone?;
+    let null = SyncTarget::FileData {
+        path: std::path::Path::new("/dev/null"),
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    };
+    let through_ring = sync_on_ring(&[null, null]);
+    let turned_off = NO_RING_SYNC.get();
+    NO_RING_SYNC.set(false);
+    assert!(through_ring.is_none(), "the batch goes another way");
+    assert!(turned_off, "the thread asks no ring again");
+    Ok(())
+}
+
 /// A folder target that names a file is refused, as
 /// `StdFs::sync_directory_with` refuses it: the ring path does not sync a
 /// file in place of the folder a caller meant to make durable.
