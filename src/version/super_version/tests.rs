@@ -567,6 +567,94 @@ impl Fs for DeviceGone {
     }
 }
 
+/// A backend whose answer about the blobs folder's device panics once armed:
+/// a backend that fails while a barrier works out its syncs.
+struct PanicsOnBlobsVolume {
+    inner: crate::fs::MemFs,
+    armed: core::sync::atomic::AtomicBool,
+}
+
+impl Fs for PanicsOnBlobsVolume {
+    fn volume_id(&self, path: &Path) -> Option<u64> {
+        assert!(
+            !(path.ends_with("blobs")
+                && self.armed.swap(false, core::sync::atomic::Ordering::SeqCst)),
+            "the backend fails to tell the blobs folder's device"
+        );
+        Some(1)
+    }
+    fn open(
+        &self,
+        path: &Path,
+        opts: &crate::fs::FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        self.inner.open(path, opts)
+    }
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn metadata(&self, path: &Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata(path)
+    }
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        self.inner.exists(path)
+    }
+}
+
+/// A persist whose backend panics while the barrier works out its syncs,
+/// before any of them begins, leaves the deferred files to sync again: the
+/// next persist succeeds. Guards against the files latched as failed syncs,
+/// which fails every persist naming them until the tree reopens, though no
+/// sync of theirs began.
+#[test]
+fn a_panic_before_any_sync_leaves_the_files_to_sync_again() -> crate::Result<()> {
+    use crate::config::FlushDurability;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let fs = Arc::new(PanicsOnBlobsVolume {
+        inner: crate::fs::MemFs::new(),
+        armed: core::sync::atomic::AtomicBool::new(false),
+    });
+    let tree = Config::new(
+        std::path::absolute("/db")?,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .sync_mode(SyncMode::Barrier)
+    .flush_durability(FlushDurability::Deferred)
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .open()?;
+    tree.insert("a", "a blob value", 0);
+    tree.flush_active_memtable(0)?;
+
+    fs.armed.store(true, core::sync::atomic::Ordering::SeqCst);
+    let panicked =
+        std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| tree.persist_flushes()));
+    assert!(panicked.is_err(), "self-check: the backend panicked");
+    assert!(
+        !fs.armed.load(core::sync::atomic::Ordering::SeqCst),
+        "self-check: the panic came from the blobs folder's device"
+    );
+    tree.persist_flushes()?;
+    Ok(())
+}
+
 /// Two files in different folders that the devices asked before a flush put
 /// on one device are both charged with that device's failed flush, though
 /// the backend can no longer tell either folder's device. Guards against a

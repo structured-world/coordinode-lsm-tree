@@ -39,6 +39,10 @@ std::thread_local! {
     /// nothing through them). The batches then go another way without asking
     /// again.
     static NO_RING_SYNC: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Whether a sync through this thread's ring has completed: the kernel
+    /// runs the opcode, so a sync answered as if it did not is its target's
+    /// own failure, in whatever later chunk or batch it comes.
+    static RING_SYNCS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Whether this thread holds a ring for its batches, after dropping any it
@@ -103,6 +107,8 @@ struct Completions {
     refused: Vec<(usize, i32)>,
     /// How many completions were taken.
     reaped: usize,
+    /// Whether a sync completed: proof that the ring runs the opcode.
+    synced_any: bool,
 }
 
 impl Completions {
@@ -110,6 +116,7 @@ impl Completions {
     fn note(&mut self, at: usize, result: i32) {
         self.reaped += 1;
         if result >= 0 {
+            self.synced_any = true;
             return;
         }
         if refuses_sync(-result) {
@@ -130,11 +137,16 @@ impl Completions {
     }
 
     /// The batch's outcome. A ring that does not run the opcode answers every
-    /// sync alike, so only a batch whose every sync answered so is refused;
-    /// beside a sync that ran, the same `errno` is that target's own (a
+    /// sync alike, so only a batch whose every sync answered so is refused,
+    /// and only on a ring not `proven` to run it; beside a sync that ran, now
+    /// or before on this thread, the same `errno` is that target's own (a
     /// `/dev/null` has no sync) and fails the batch like any other.
-    fn outcome(mut self) -> Result<Through, SyncFailure> {
-        if self.failed.is_none() && !self.refused.is_empty() && self.refused.len() == self.reaped {
+    fn outcome(mut self, proven: bool) -> Result<Through, SyncFailure> {
+        if !proven
+            && self.failed.is_none()
+            && !self.refused.is_empty()
+            && self.refused.len() == self.reaped
+        {
             return Ok(Through::Refused);
         }
         for (at, errno) in core::mem::take(&mut self.refused) {
@@ -253,6 +265,9 @@ fn sync_through(
                 declined => Ok(declined),
             };
         }
+        // A lone target that still finds no descriptor fails unspent, for a
+        // retry: the process is at its limit, which is its environment's to
+        // raise, and the ring's own descriptor is not given up to save one.
         Err(e) => return Err(SyncFailure::unspent(e)),
     };
     let fds: Vec<i32> = opened
@@ -319,7 +334,10 @@ fn sync_through(
             completions.note(base + at, done.result());
         }
     }
-    completions.outcome()
+    if completions.synced_any {
+        RING_SYNCS.set(true);
+    }
+    completions.outcome(RING_SYNCS.get())
 }
 
 /// The indices of the syncs the kernel took from the submission queue and

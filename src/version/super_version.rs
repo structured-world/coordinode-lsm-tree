@@ -264,6 +264,14 @@ pub(crate) enum Written<'a> {
     Synced,
 }
 
+/// The syncs a barrier makes, worked out before any begins: each target with
+/// the backend it goes to, the files first, and whether its data was synced
+/// already (it keeps its place, and is not synced again).
+pub(crate) struct SyncPlan<'a> {
+    syncs: Vec<(&'a Arc<dyn Fs>, crate::fs::SyncTarget<'a>)>,
+    presynced: Vec<bool>,
+}
+
 /// A file a flush wrote, borrowed: what syncing it takes, with what the
 /// install has of it.
 #[derive(Clone, Copy)]
@@ -1073,6 +1081,18 @@ impl SuperVersions {
         schedule: crate::io_policy::SyncSchedule,
         step: (&dyn Fs, &Path),
     ) -> Result<(), crate::fs::SyncFailure> {
+        let plan = Self::plan_syncs(files, folders, sync_mode);
+        Self::run_syncs(&plan, sync_mode, schedule, step)
+    }
+
+    /// The syncs [`Self::sync_files`] makes, in their order, worked out before
+    /// any of them begins: working them out asks the backends about folders,
+    /// which may panic, and no file's sync has begun then.
+    fn plan_syncs<'a>(
+        files: impl IntoIterator<Item = FlushFile<'a>>,
+        folders: &[(&'a Arc<dyn Fs>, &'a Path)],
+        sync_mode: SyncMode,
+    ) -> SyncPlan<'a> {
         // Every sync, with the backend it goes to. A file whose data was
         // synced before it closed keeps its place, for the device flush below
         // and the indices of a failure, but is not synced again.
@@ -1126,11 +1146,22 @@ impl SuperVersions {
                 },
             ));
         }
+        SyncPlan { syncs, presynced }
+    }
+
+    /// Makes the syncs of `plan`, as [`Self::sync_files`] describes.
+    fn run_syncs(
+        plan: &SyncPlan<'_>,
+        sync_mode: SyncMode,
+        schedule: crate::io_policy::SyncSchedule,
+        step: (&dyn Fs, &Path),
+    ) -> Result<(), crate::fs::SyncFailure> {
+        let (syncs, presynced) = (plan.syncs.as_slice(), plan.presynced.as_slice());
         // The files come first in `syncs`, so an index of a sync below their
         // count is the file's.
         if schedule == crate::io_policy::SyncSchedule::OneAtATime {
             // Each target synced on its own, with no batch built around it.
-            for (at, ((fs, target), &ran)) in syncs.iter().zip(&presynced).enumerate() {
+            for (at, ((fs, target), &ran)) in syncs.iter().zip(presynced).enumerate() {
                 if !ran {
                     target.sync_at(&***fs, at)?;
                 }
@@ -1138,14 +1169,14 @@ impl SuperVersions {
         } else {
             // One batch per backend, in the order the backends are first named.
             let mut done: Vec<&Arc<dyn Fs>> = Vec::new();
-            for (fs, _) in &syncs {
+            for (fs, _) in syncs {
                 if done.iter().any(|known| Arc::ptr_eq(known, fs)) {
                     continue;
                 }
                 done.push(fs);
                 let (members, targets): (Vec<usize>, Vec<crate::fs::SyncTarget<'_>>) = syncs
                     .iter()
-                    .zip(&presynced)
+                    .zip(presynced)
                     .enumerate()
                     .filter(|(_, ((on, _), ran))| Arc::ptr_eq(on, fs) && !**ran)
                     .map(|(at, ((_, target), _))| (at, *target))
@@ -1172,8 +1203,8 @@ impl SuperVersions {
             // one. A flush that never began (its folder did not open) asked
             // the device nothing: the files' syncs consumed no error, and a
             // later persist syncs them and flushes the device again.
-            let volumes = device_volumes(&syncs);
-            flush_devices_of(&syncs, &volumes, step).map_err(|(error, failed_at, began)| {
+            let volumes = device_volumes(syncs);
+            flush_devices_of(syncs, &volumes, step).map_err(|(error, failed_at, began)| {
                 crate::fs::SyncFailure {
                     error,
                     spent: (0..syncs.len())
@@ -1182,7 +1213,7 @@ impl SuperVersions {
                                 && syncs
                                     .get(at)
                                     .is_some_and(|(_, target)| target.origin().is_some())
-                                && same_flushed_device(&syncs, &volumes, at, failed_at)
+                                && same_flushed_device(syncs, &volumes, at, failed_at)
                         })
                         .collect(),
                 }
@@ -1228,18 +1259,20 @@ impl SuperVersions {
                 "a file a deferred flush wrote failed to sync, so no persist can name it",
             )));
         }
-        // Latched first, so a sync that panics after consuming an error leaves
-        // every file of the batch set; the outcome then clears what it may.
-        for (_, failed) in &mut held {
-            **failed = true;
-        }
-        let synced = Self::sync_files(
+        // Worked out before the latch: a panic while asking the backends about
+        // folders comes before any sync, and leaves every file to sync again.
+        let plan = Self::plan_syncs(
             files.iter().map(UnsyncedFile::as_flush_file),
             &[],
             sync_mode,
-            schedule,
-            step,
         );
+        // Latched before the first sync, so a sync that panics after consuming
+        // an error leaves every file of the batch set; the outcome then clears
+        // what it may.
+        for (_, failed) in &mut held {
+            **failed = true;
+        }
+        let synced = Self::run_syncs(&plan, sync_mode, schedule, step);
         for (file, failed) in &mut held {
             **failed = synced.as_ref().is_err_and(|failure| {
                 failure

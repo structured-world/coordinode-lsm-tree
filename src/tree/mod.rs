@@ -8571,7 +8571,9 @@ mod adoption_tests;
 /// about the bytes. A feature this build lacks says nothing about them
 /// either: setting the flush aside would lose it for good, its watermark
 /// raised past it. A missing dictionary does say something, about a table the
-/// manifest does not name.
+/// manifest does not name. Such a failure on one copy of a table fails the open
+/// even when another copy would read whole: the open retried once the
+/// environment is fixed takes that copy, so nothing is lost by stopping.
 fn fails_adoption(e: &crate::Error) -> bool {
     matches!(e, crate::Error::FeatureUnsupported(_))
         || (e.is_environmental() && !matches!(e, crate::Error::ZstdDictMismatch { .. }))

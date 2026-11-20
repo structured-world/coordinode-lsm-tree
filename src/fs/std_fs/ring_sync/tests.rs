@@ -68,7 +68,7 @@ fn only_a_batch_every_sync_refused_is_refused() {
         for (at, result) in results.into_iter().enumerate() {
             completions.note(at, result);
         }
-        let Err(e) = completions.outcome() else {
+        let Err(e) = completions.outcome(false) else {
             panic!("the failed syncs are reported: {results:?}");
         };
         let mut spent = e.spent;
@@ -80,7 +80,7 @@ fn only_a_batch_every_sync_refused_is_refused() {
         for (at, result) in results.into_iter().enumerate() {
             completions.note(at, result);
         }
-        let Err(e) = completions.outcome() else {
+        let Err(e) = completions.outcome(false) else {
             panic!("a target that has no sync fails the batch: {results:?}");
         };
         let refused_at = results
@@ -91,15 +91,72 @@ fn only_a_batch_every_sync_refused_is_refused() {
     }
     assert!(!NO_RING_SYNC.get(), "the ring stays on");
 
-    let mut refused = Completions::default();
-    for (at, result) in [-libc::EINVAL, -libc::EOPNOTSUPP].into_iter().enumerate() {
-        refused.note(at, result);
-    }
-    assert!(matches!(refused.outcome(), Ok(Through::Refused)));
+    let refused = || {
+        let mut refused = Completions::default();
+        for (at, result) in [-libc::EINVAL, -libc::EOPNOTSUPP].into_iter().enumerate() {
+            refused.note(at, result);
+        }
+        refused
+    };
+    assert!(matches!(refused().outcome(false), Ok(Through::Refused)));
+    // A ring a sync completed through before runs the opcode: the same
+    // answers are the targets' own.
+    let Err(e) = refused().outcome(true) else {
+        panic!("on a proven ring the refused syncs fail the batch");
+    };
+    let mut spent = e.spent;
+    spent.sort_unstable();
+    assert_eq!(spent, [0, 1]);
 
     let mut synced = Completions::default();
     synced.note(0, 0);
-    assert!(matches!(synced.outcome(), Ok(Through::Synced)));
+    assert!(matches!(synced.outcome(false), Ok(Through::Synced)));
+}
+
+/// A chunk whose every sync the ring refuses, after a chunk of the same batch
+/// synced through it, fails the batch at that target's own index and leaves
+/// the ring on: the first chunk proved the ring runs the opcode. Guards
+/// against one target with no sync, landing alone in a later chunk, turning
+/// the ring off for the thread and sending the whole batch through threads.
+#[test]
+fn a_later_chunk_refused_on_a_proven_ring_fails_at_its_target() -> crate::Result<()> {
+    use super::{MAX_IN_FLIGHT, NO_RING_SYNC};
+
+    NO_RING_SYNC.set(false);
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<std::path::PathBuf> = (0..MAX_IN_FLIGHT)
+        .map(|i| dir.path().join(format!("f{i}")))
+        .collect();
+    for path in &paths {
+        std::fs::File::create(path)?.write_all(b"x")?;
+    }
+    let mut targets: Vec<SyncTarget<'_>> = paths
+        .iter()
+        .map(|path| SyncTarget::FileData {
+            path,
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        })
+        .collect();
+    targets.push(SyncTarget::FileData {
+        path: std::path::Path::new("/dev/null"),
+        origin: WriteOrigin::FlushTable,
+        mode: SyncMode::Normal,
+    });
+    // A kernel that refuses io_uring has nothing to test here.
+    let Some(result) = sync_on_ring(&targets) else {
+        assert!(
+            sync_on_ring(&targets[..1]).is_none(),
+            "the batch went another way only for want of a ring"
+        );
+        return Ok(());
+    };
+    let Err(failure) = result else {
+        panic!("the target with no sync fails the batch");
+    };
+    assert_eq!(failure.spent, [MAX_IN_FLIGHT], "at its own index");
+    assert!(!NO_RING_SYNC.get(), "the ring stays on");
+    Ok(())
 }
 
 /// Once a ring refused the opcode on a thread, its batches go another way
@@ -550,15 +607,19 @@ fn a_batch_every_sync_refused_goes_another_way() -> crate::Result<()> {
         return Ok(());
     };
     alone?;
-    let null = SyncTarget::FileData {
-        path: std::path::Path::new("/dev/null"),
-        origin: WriteOrigin::FlushTable,
-        mode: SyncMode::Normal,
-    };
-    let through_ring = sync_on_ring(&[null, null]);
-    let turned_off = NO_RING_SYNC.get();
-    NO_RING_SYNC.set(false);
-    assert!(through_ring.is_none(), "the batch goes another way");
+    // On a thread of its own: this one proved its ring runs the opcode.
+    let (went_another_way, turned_off) = std::thread::spawn(|| {
+        let null = SyncTarget::FileData {
+            path: std::path::Path::new("/dev/null"),
+            origin: WriteOrigin::FlushTable,
+            mode: SyncMode::Normal,
+        };
+        let through_ring = sync_on_ring(&[null, null]);
+        (through_ring.is_none(), NO_RING_SYNC.get())
+    })
+    .join()
+    .map_err(|_| crate::Error::Unrecoverable)?;
+    assert!(went_another_way, "the batch goes another way");
     assert!(turned_off, "the thread asks no ring again");
     Ok(())
 }
