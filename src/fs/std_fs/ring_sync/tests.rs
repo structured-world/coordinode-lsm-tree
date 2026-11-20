@@ -146,7 +146,7 @@ fn a_later_chunk_refused_on_a_proven_ring_fails_at_its_target() -> crate::Result
     // A kernel that refuses io_uring has nothing to test here.
     let Some(result) = sync_on_ring(&targets) else {
         assert!(
-            sync_on_ring(&targets[..1]).is_none(),
+            sync_on_ring(targets.get(..1).unwrap_or_default()).is_none(),
             "the batch went another way only for want of a ring"
         );
         return Ok(());
