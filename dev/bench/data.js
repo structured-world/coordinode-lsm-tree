@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795205930829,
+  "lastUpdate": 1795205935447,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -117846,6 +117846,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.394268899,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "baebe735cd6cf95d64cfeae687773a1dd9bbdd56",
+          "message": "perf(write): speed up the overwrite path (#1092)\n\n## Summary\n\n- A synced flush writes no manifest edit: its tables describe\nthemselves, and an open takes in every whole flush above the manifest's\nwatermark from them.\n- A flush syncs its files side by side, under BFQ in one `io_uring`\nbatch, and file buffers are written on worker lanes.\n- `IoPolicy` picks the flush strategy from each location's I/O scheduler\nand switches trees live.\n\n## Changes\n\n- Self-described flushes: each table records its flush number, place in\nthe run, run length, retention floor and the last flush that had\nreturned when it began. An open reads every block of those tables and\nevery frame and dictionary of their blob files. A returned flush the\nbytes prove damaged fails the open with `Error::DamagedFlush`, which\n`open_or_repair` repairs; one of which no table is found, or one a\ndictionary the manifest references keeps from reading, fails it without\na repair. A flush that never returned, or that a later flush began after\nwithout naming it, is set aside. Of several copies of a table, one that\nreads whole is taken. Repair keeps the flushes no manifest names yet. A\nsynced flush after a manifest append that failed rotates the manifest\nbefore it returns, past the record that append may have left torn.\n- Routes and clean close: every snapshot records the tables folders of\nthe level routes, relative to the tree's folder (a `%` or a byte that is\nnot UTF-8 written as `%XX`), and a clean close appends an edit saying\nthe manifest names every flush. An open or a repair after a crash\nrefuses with `Error::MissingRoute` while a recorded route is not\nconfigured or its folder is missing, since a flush that returned may lie\nthere; a repair whose manifest does not load reads the routes section of\nits snapshot alone. After a clean close a route can be removed.\n- A synced flush syncs up to 16 tables and as many blob files through\nthe handles its writers wrote them with (`SyncTarget::OpenFile`; the std\nbackend's handles show their descriptors, so the batch reaches the\nring), and syncs each one past them through its handle before closing\nit, so a flush of thousands of files holds no descriptor for each until\nits install; without std a synced flush's files sync through their\nhandles before they close. The install syncs no such file again, and\nstill counts its device for a barrier's device flush. A file not kept\nopen still reports a failure of its last write before it is handed to\nthe install.\n- Flush numbers are decided under the install's version lock; the flush\nand persist docs say when a caller may drop its own journal.\n- Batched syncs: `Fs::sync_many` syncs a batch on threads, or on Linux\nthrough a thread-local ring in chunks of 64 open files; no file claimed\nafter a failed sync is synced, and a thread the kernel gives no ring for\ngood stops asking for one. A failed batch returns a `SyncFailure` naming\neach target a sync ran on and did not report synced, so a persist of\ndeferred flushes marks only those files as never to be acknowledged, and\na file that did not open, or whose sync never left the ring's queue,\nsyncs again. Windows syncs one at a time; under barrier syncs every\nother device is flushed before the dependent step: a device whose flush\nfailed fails the syncs to it, and one whose flush never began\n(`Fs::sync_device_noting`) leaves them to sync again.\n- `IoPolicy` (`Config::use_io_policy`) asks each location's scheduler\nonce and sets `IoStrategy` in each tree's runtime config;\n`IoPolicy::refresh` re-probes. Under BFQ a table file pool refill waits\nfor the write whose claim reserved it.\n- The runtime config handle records the snapshots a swap replaces, so a\ndictionary a running write's snapshot names is never collected.\n- File buffers go to parking_lot worker lanes once a file passes its\nfirst megabyte; a panicked inner write, flush or seek fails the file for\ngood, no unwind of a lane's drain leaves the lane marked, and a writer\ndropped while its owner unwinds writes nothing more.\n- The frame check of a blob file refuses a chunk frame no head lists; a\nrepair removes a blob file no table references and no manifest names\nwithout reading it.\n\n## Testing\n\nFormatting, clippy (default, all features), docs, the no-std check and\nthe tests of the changed areas pass locally on macOS, and the `io_uring`\nand ring-sync tests on Linux; the full suite and Linux and Windows run\nin CI.\n\nMeasured against v7.6.0 on one Linux benchmark host (`compare` bench,\noverwrite groups, median ns per write, ratio to RocksDB in the same\nrun):\n\n| arm | v7.6.0 | this PR |\n|---|---|---|\n| overwrite, 10,000 keys | 2,092 (0.85x) | 1,652 (0.69x) |\n| overwrite, 70,000 keys | 2,542 (0.89x) | 1,812 (0.69x) |\n| overwrite, deferred caller log, 70,000 keys | 4,180 (1.47x) | 3,133\n(1.20x) |\n| overwrite_sustained | 1,847 (1.12x) | 1,498 (0.90x) |\n| overwrite_sustained, zstd 22 | 15,662 (0.67x) | 14,707 (0.60x) |\n\nIn the sustained group, write amplification drops from 0.64 to 0.57.\nReader p50 moves from 5.8 µs to 6.0 µs and p99 from 27.5 µs to 29.3 µs,\nboth inside the run's spread.\n\nThe benchmark harness for this path follows in a stacked PR. Replaces\n#1090 (and #1088, #1082 before it). Part of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Synced flushes can be recovered after a crash without waiting for a\nmanifest update, provided their files are intact.\n* Configurable I/O policies adapt file syncing and refill behavior to\nthe storage backend.\n* After an unclean shutdown, opens validate recorded table locations and\nreport missing routes.\n* **Bug Fixes**\n* Recovery and repair better distinguish complete, interrupted, and\ndamaged flushes, preserving readable data and reporting unrecoverable\nlosses.\n* Improved durability handling for file syncing, checkpoints, and clean\nshutdowns.\n* **Documentation**\n  * Clarified flush durability, recovery, and file-refill behavior.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-20T20:49:59+02:00",
+          "tree_id": "eb6051a6534314494f7ef4fbb5805e88b29d8bcc",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/baebe735cd6cf95d64cfeae687773a1dd9bbdd56"
+        },
+        "date": 1795205934256,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 616.549,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 134.532434ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 249.852,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 141.972804ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 887.8720000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 186.106354ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 48853.909,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 100137.872,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 24.623,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 139.329535,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 1.058193562,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 24.111,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 107.806719,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.888727124,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
