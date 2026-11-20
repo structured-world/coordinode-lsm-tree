@@ -3949,12 +3949,14 @@ fn check_rocksdb_blob_levels() {
 }
 
 fn main() {
+    // Arguments first: `--list` and `--help` exit the process, which runs no
+    // destructor, so a state root made before them would stay on disk.
+    let mut run = Run::from_args();
     // Removed when the run ends, with every state still under it.
     let root = make_state_root();
     STATE_ROOT
         .set(root.path().to_path_buf())
         .expect("the state root is set once");
-    let mut run = Run::from_args();
     check_rocksdb_blob_levels();
     let mode = if run.measuring {
         "measurement"
