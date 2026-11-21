@@ -963,8 +963,13 @@ fn only_borrowed_bytes_up_to_the_limit_go_into_the_arena() {
         map.insert_with_kv_digest(&make_key(b"k", 1), value, None);
         map.value_in_arena(map.first_node())
     };
-    let inline = vec![7u8; crate::byteview::INLINE_SIZE];
-    let past_inline = vec![7u8; crate::byteview::INLINE_SIZE + 1];
+    // The `bytes` backend places nothing in the arena, at any size.
+    #[cfg(not(feature = "bytes_1"))]
+    let inline_size = crate::byteview::INLINE_SIZE;
+    #[cfg(feature = "bytes_1")]
+    let inline_size = 20;
+    let inline = vec![7u8; inline_size];
+    let past_inline = vec![7u8; inline_size + 1];
     let at_limit = vec![7u8; ARENA_VALUE_MAX];
     let past_limit = vec![7u8; ARENA_VALUE_MAX + 1];
     let arena_values = cfg!(not(feature = "bytes_1"));
