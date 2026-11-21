@@ -21,7 +21,7 @@ use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
 use crate::runtime_config::ChecksumAlgorithm;
 use crate::value::{InternalValue, SeqNo, UserValue};
-use crate::{UserKey, ValueType};
+use crate::{InsertBytes, UserKey, ValueType};
 
 use core::cmp::Ordering as CmpOrdering;
 use core::ops::{Bound, RangeBounds};
@@ -62,10 +62,14 @@ const BACK_BATCH_LEVEL: usize = 2;
 //                              height-1/2 node; `key_offset` still addresses
 //                              it like any arena span)
 //
-// Values are stored in a separate heap-backed Vec so that large values
+// +24+4×height+key_len  u32 + [u8; len] — the value, when the write handed
+//                              over bytes of at most `ARENA_VALUE_MAX` and the
+//                              arena had room (flagged in the value_type byte)
+//
+// Other values are kept in a separate heap-backed store, so large values
 // don't bloat the arena and cause exhaustion.
 //
-// Total: 24 + 4 × height + key_len   (always 4-byte aligned)
+// Total: 24 + 4 × height + key_len [+ 4 + value_len]   (always 4-byte aligned)
 
 // Layout offsets — only OFF_HEIGHT and OFF_TOWER are used by name in code;
 // the rest are accessed via array slicing in the node_*() accessors.
@@ -86,6 +90,15 @@ const OFF_TOWER: u32 = 24;
 // mixed-variant memtable after an Off -> AtInsert toggle).
 const KV_DIGEST_PRESENT: u8 = 0x80;
 const VALUE_TYPE_MASK: u8 = 0x07;
+// Bit 3 of the value_type byte: the value lies in the arena right after the
+// key, behind its native-endian u32 length, instead of in the `ValueStore`.
+const VALUE_IN_ARENA: u8 = 0x08;
+
+/// Largest value the arena holds. A write's bytes up to it are copied in with
+/// the node, so the memtable allocates and frees nothing per value; larger
+/// ones keep a buffer of their own in the `ValueStore`, so one value cannot
+/// strand most of an arena block. The arena's blocks are 4 MiB.
+pub(crate) const ARENA_VALUE_MAX: usize = 64 * 1024;
 const KV_ALGO_SHIFT: u8 = 5;
 const KV_ALGO_MASK: u8 = 0x60;
 
@@ -304,7 +317,7 @@ impl SkipMap {
     /// Multiple entries with the same `user_key` but different `seqno` are
     /// expected (MVCC).  No deduplication is performed.
     pub(crate) fn insert(&self, key: &InternalKey, value: UserValue) {
-        self.insert_with_kv_digest(key, value, None);
+        self.insert_with_kv_digest(key, InsertBytes::Shared(value), None);
     }
 
     /// Inserts a key-value pair, optionally storing a 4-byte per-KV digest
@@ -324,18 +337,42 @@ impl SkipMap {
     pub(crate) fn insert_with_kv_digest(
         &self,
         key: &InternalKey,
-        value: UserValue,
+        value: InsertBytes<'_>,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) {
         let value_idx = self.values.reserve();
+        let height = node_height(self.height_seed, value_idx);
+        // Small borrowed bytes go into the node's own allocation. That attempt
+        // cannot panic: it fails only when the arena is out of room, and the
+        // value then takes a buffer of its own like any other.
+        #[cfg(not(feature = "bytes_1"))]
+        let in_arena = match &value {
+            InsertBytes::Borrowed(bytes) if bytes.len() <= ARENA_VALUE_MAX => {
+                self.try_alloc_node(key, value_idx, height, kv_digest, Some(bytes))
+            }
+            _ => None,
+        };
+        // A `Bytes` value cannot view the arena: reads would copy it out.
+        #[cfg(feature = "bytes_1")]
+        let in_arena = None;
         // The slot is written before anything that can panic: the store
         // drops every slot below its count as a value, so a reserved slot
         // left unwritten by a panic in the node's allocation would be dropped
-        // as one it never held.
-        // SAFETY: `value_idx` was reserved by this insert and is written once.
-        unsafe { self.values.write(value_idx, value) };
-        let height = node_height(self.height_seed, value_idx);
-        let node = self.alloc_node(key, value_idx, height, kv_digest);
+        // as one it never held. A value in the arena leaves the slot an empty
+        // inline value, which owns nothing.
+        let node = if let Some(node) = in_arena {
+            // SAFETY: `value_idx` was reserved by this insert and is written once.
+            unsafe { self.values.write(value_idx, UserValue::empty()) };
+            node
+        } else {
+            let value = match value {
+                InsertBytes::Borrowed(bytes) => UserValue::from(bytes),
+                InsertBytes::Shared(value) => value,
+            };
+            // SAFETY: `value_idx` was reserved by this insert and is written once.
+            unsafe { self.values.write(value_idx, value) };
+            self.alloc_node(key, value_idx, height, kv_digest)
+        };
 
         // Raise the list height if needed.
         let mut list_h = self.height.load(Ordering::Relaxed);
@@ -444,6 +481,37 @@ impl SkipMap {
                 *b ^= 0xFF;
             }
         }
+    }
+
+    /// Test-only: flips a bit in the first node's value bytes, which must lie
+    /// in the arena, simulating a RAM bit-flip there.
+    #[cfg(test)]
+    pub(crate) fn test_flip_first_arena_value_byte(&self) {
+        let node = self.first_node();
+        assert_ne!(node, UNSET, "skiplist must be non-empty to corrupt");
+        assert!(
+            self.value_in_arena(node),
+            "the first value must be in the arena"
+        );
+        let at = self.node_key_offset(node) + u32::from(self.node_key_len(node)) + 4;
+        // SAFETY: a non-empty arena value's first byte follows its length word.
+        unsafe {
+            if let Some(b) = self.arena.get_bytes_mut(at, 1).first_mut() {
+                *b ^= 0xFF;
+            }
+        }
+    }
+
+    /// Test-only: whether `node`'s value lies in the arena.
+    #[cfg(test)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    pub(crate) fn value_in_arena(&self, node: u32) -> bool {
+        // SAFETY: `node` is a published node.
+        let meta = unsafe { self.meta(node) };
+        meta[10] & VALUE_IN_ARENA != 0
     }
 
     /// Test-only: corrupts the first node's `value_type` low bits to an invalid
@@ -577,12 +645,8 @@ impl SkipMap {
 
     /// Allocates and initialises a node in the arena, returning its offset.
     ///
-    /// Key data is stored in the arena for comparison locality.
-    /// Value data is appended to the heap-backed `values` Vec.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "key_bytes.len() <= u16::MAX, value idx <= u32::MAX, height <= MAX_HEIGHT (20)"
-    )]
+    /// Key data is stored in the arena for comparison locality; the value
+    /// stays in the `ValueStore`.
     fn alloc_node(
         &self,
         key: &InternalKey,
@@ -590,7 +654,35 @@ impl SkipMap {
         height: usize,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) -> u32 {
+        #[expect(
+            clippy::expect_used,
+            reason = "arena capacity is fixed; exhaustion is fatal"
+        )]
+        self.try_alloc_node(key, value_idx, height, kv_digest, None)
+            .expect("arena exhausted (node)")
+    }
+
+    /// [`Self::alloc_node`], with `value`'s bytes in the same allocation right
+    /// after the key, behind their 4-byte length, when given; `None` when the
+    /// arena cannot take the allocation.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "key_bytes.len() <= u16::MAX, a value here <= ARENA_VALUE_MAX, \
+                  value idx <= u32::MAX, height <= MAX_HEIGHT (20)"
+    )]
+    fn try_alloc_node(
+        &self,
+        key: &InternalKey,
+        value_idx: u32,
+        height: usize,
+        kv_digest: Option<(u32, ChecksumAlgorithm)>,
+        value: Option<&[u8]>,
+    ) -> Option<u32> {
         let key_bytes: &[u8] = &key.user_key;
+        debug_assert!(
+            value.is_none_or(|v| v.len() <= ARENA_VALUE_MAX),
+            "only small values go into the arena"
+        );
 
         // One arena allocation carries the node header, the tower AND the key
         // bytes (key right after the tower). Two separate allocations would
@@ -599,14 +691,10 @@ impl SkipMap {
         // before it — with a typical height of 1-2 the key starts at +28/+32,
         // on the same cache line as the header `compare_key` just loaded.
         let n_size = node_size(height);
-        #[expect(
-            clippy::expect_used,
-            reason = "arena capacity is fixed; exhaustion is fatal"
-        )]
+        let value_size = value.map_or(0, |v| 4 + v.len() as u32);
         let node = self
             .arena
-            .alloc(n_size + key_bytes.len() as u32, 4)
-            .expect("arena exhausted (node)");
+            .alloc(n_size + key_bytes.len() as u32 + value_size, 4)?;
         let key_offset = node + n_size;
         if !key_bytes.is_empty() {
             // SAFETY: key_offset..+len is within the allocation made above;
@@ -615,6 +703,22 @@ impl SkipMap {
                 self.arena
                     .get_bytes_mut(key_offset, key_bytes.len() as u32)
                     .copy_from_slice(key_bytes);
+            }
+        }
+        if let Some(value) = value {
+            let at = key_offset + key_bytes.len() as u32;
+            // SAFETY: the length word and the value bytes lie right after the
+            // key, within the allocation made above; exclusive access before
+            // publish.
+            unsafe {
+                self.arena
+                    .get_bytes_mut(at, 4)
+                    .copy_from_slice(&(value.len() as u32).to_ne_bytes());
+                if !value.is_empty() {
+                    self.arena
+                        .get_bytes_mut(at + 4, value.len() as u32)
+                        .copy_from_slice(value);
+                }
             }
         }
 
@@ -635,7 +739,8 @@ impl SkipMap {
             meta[8..10].copy_from_slice(&(key_bytes.len() as u16).to_ne_bytes());
             // ValueType discriminant in the low bits; high bit (KV_DIGEST_PRESENT)
             // flags an insert-time per-KV digest in the reserved slot below.
-            let vt_byte = u8::from(key.value_type);
+            let vt_byte =
+                u8::from(key.value_type) | if value.is_some() { VALUE_IN_ARENA } else { 0 };
             // Arena memory is uninitialized — the reserved padding at +12 is
             // either the digest (when present) or zeroed, so the whole header
             // is fully written before the node is published. The algorithm's
@@ -656,7 +761,7 @@ impl SkipMap {
             // arena did not zero them.
         }
 
-        node
+        Some(node)
     }
 
     // -----------------------------------------------------------------------
@@ -849,8 +954,47 @@ impl SkipMap {
         })
     }
 
-    /// Reads the value for `node` from the lock-free value store (wait-free).
+    /// A view of `node`'s value bytes in the arena, or `None` when its value
+    /// lives in the value store. Zero-copy, as [`Self::node_internal_key`].
+    #[cfg(not(feature = "bytes_1"))]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: fixed-width slices always convert to arrays"
+    )]
+    fn arena_value(&self, node: u32) -> Option<UserValue> {
+        // SAFETY: `node` is a published node, its header fully written.
+        let m = unsafe { self.meta(node) };
+        if m[10] & VALUE_IN_ARENA == 0 {
+            return None;
+        }
+        let key_off = u32::from_ne_bytes(m[0..4].try_into().expect("4 bytes"));
+        let key_len = u32::from(u16::from_ne_bytes(m[8..10].try_into().expect("2 bytes")));
+        let at = key_off + key_len;
+        // SAFETY: the insert wrote the length word and the value bytes right
+        // after the key, in the node's allocation, before the publishing CAS;
+        // published bytes are never rewritten.
+        let len = u32::from_ne_bytes(
+            unsafe { self.arena.get_bytes(at, 4) }
+                .try_into()
+                .expect("4 bytes"),
+        );
+        // SAFETY: as above, `len` bytes follow the length word.
+        Some(UserValue::from_view(unsafe {
+            self.arena.get_view(at + 4, len)
+        }))
+    }
+
+    /// Reads the value for `node`: a view of its bytes in the arena, or its
+    /// buffer from the lock-free value store (wait-free either way).
     fn node_value(&self, node: u32) -> UserValue {
+        #[cfg(not(feature = "bytes_1"))]
+        if let Some(value) = self.arena_value(node) {
+            return value;
+        }
         // SAFETY: node_value_idx is the index the insert reserved and wrote
         // (`ValueStore::reserve` then `write`) before allocating this node,
         // and the node is only reachable after the skiplist CAS that published

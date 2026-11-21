@@ -67,6 +67,25 @@ pub const FOOTER_TAIL_LEN: usize = 1 + 4;
 /// not-compiled-in error.
 #[must_use]
 pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
+    kv_digest_parts(
+        item.key.value_type,
+        item.key.seqno,
+        &item.key.user_key,
+        &item.value,
+        algo,
+    )
+}
+
+/// [`kv_digest`] over the entry's fields, for a write that has not built an
+/// [`InternalValue`].
+#[must_use]
+pub fn kv_digest_parts(
+    value_type: crate::ValueType,
+    seqno: crate::SeqNo,
+    user_key: &[u8],
+    value: &[u8],
+    algo: ChecksumAlgorithm,
+) -> Option<u64> {
     // Logical domain: the same fields the writer/memtable hold, independent of
     // on-disk prefix truncation. The fixed-width prefix (value_type ‖ seqno ‖
     // len(user_key)) lives in a 13-byte stack array; the two variable-length
@@ -81,14 +100,14 @@ pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
         clippy::cast_possible_truncation,
         reason = "user keys are bounded well below u32::MAX"
     )]
-    let user_key_len = item.key.user_key.len() as u32;
+    let user_key_len = user_key.len() as u32;
 
     let mut head = [0u8; 1 + 8 + 4];
-    head[0] = u8::from(item.key.value_type);
-    head[1..9].copy_from_slice(&item.key.seqno.to_le_bytes());
+    head[0] = u8::from(value_type);
+    head[1..9].copy_from_slice(&seqno.to_le_bytes());
     head[9..13].copy_from_slice(&user_key_len.to_le_bytes());
 
-    algo.compute_chunks(&[&head, &item.key.user_key, &item.value])
+    algo.compute_chunks(&[&head, user_key, value])
 }
 
 /// Appends the per-KV checksum footer to `payload` (which already holds the
