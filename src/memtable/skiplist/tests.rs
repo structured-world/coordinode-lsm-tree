@@ -1014,3 +1014,105 @@ fn verify_kv_digests_detects_corruption_of_an_arena_value() {
         "expected MemtableKvChecksumMismatch, got {err:?}"
     );
 }
+
+/// Every search compares each node at most once, and still stops where a
+/// linear walk does. The successor a level stops at sorts on the far side of
+/// the target, so a level below that reaches it again ends there without a
+/// second comparison; with a long shared key prefix each repeat costs a walk
+/// over the prefix. Probes fall between, on and around stored keys, versions
+/// above and below the stored seqno included.
+#[test]
+fn a_search_compares_no_node_twice_and_stops_where_a_walk_does() {
+    let map = new_map();
+    let key = |i: u32| {
+        let mut k = [0x5A_u8; 36];
+        k[32..].copy_from_slice(&i.wrapping_mul(0x9E37_79B9).to_be_bytes());
+        k
+    };
+    for i in (0..8192).step_by(2) {
+        map.insert(&make_key(&key(i), 5), make_value(b"v"));
+    }
+    // The first node at or after `target` in a walk of level 0, or UNSET.
+    let walk_ge = |target: &InternalKey| {
+        let mut node = map.first_node();
+        while node != UNSET && map.compare_key(node, target) == CmpOrdering::Less {
+            node = map.next_at(node, 0);
+        }
+        node
+    };
+    let once = |what: &str, compared: Vec<u32>| {
+        let mut sorted = compared.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            compared.len(),
+            "{what}: a node compared twice in {compared:?}"
+        );
+    };
+    for i in 0..600 {
+        for seqno in [1, 5, 9] {
+            let target = make_key(&key(i), seqno);
+            let expected = walk_ge(&target);
+
+            let (mut preds, mut succs) = ([map.head; MAX_HEIGHT], [UNSET; MAX_HEIGHT]);
+            map.record_compared();
+            map.find_splice(&target, &mut preds, &mut succs);
+            once("find_splice", map.take_compared());
+            assert_eq!(succs[0], expected, "find_splice at {i}/{seqno}");
+
+            let (mut preds, mut succs) = ([map.head; MAX_HEIGHT], [UNSET; MAX_HEIGHT]);
+            map.record_compared();
+            map.find_splice_for_level(&target, &mut preds, &mut succs, 0);
+            once("find_splice_for_level", map.take_compared());
+            assert_eq!(succs[0], expected, "find_splice_for_level at {i}/{seqno}");
+
+            map.record_compared();
+            let ge = map.seek_ge(&target);
+            once("seek_ge", map.take_compared());
+            assert_eq!(ge, expected, "seek_ge at {i}/{seqno}");
+
+            map.record_compared();
+            let lt = map.seek_lt(&target);
+            once("seek_lt", map.take_compared());
+            let walked_lt = (expected != map.first_node()).then(|| {
+                let mut node = map.first_node();
+                while map.next_at(node, 0) != expected {
+                    node = map.next_at(node, 0);
+                }
+                node
+            });
+            assert_eq!(
+                Some(lt).filter(|&n| n != UNSET),
+                walked_lt,
+                "seek_lt at {i}/{seqno}"
+            );
+
+            map.record_compared();
+            let gt = map.seek_gt(&target);
+            once("seek_gt", map.take_compared());
+            map.record_compared();
+            let le = map.seek_le(&target);
+            once("seek_le", map.take_compared());
+            // A stored version equal to the target sits between the two.
+            let equal =
+                expected != UNSET && map.compare_key(expected, &target) == CmpOrdering::Equal;
+            let after = if equal {
+                map.next_at(expected, 0)
+            } else {
+                expected
+            };
+            assert_eq!(gt, after, "seek_gt at {i}/{seqno}");
+            let at_or_below = if equal { Some(expected) } else { walked_lt };
+            assert_eq!(
+                Some(le).filter(|&n| n != UNSET),
+                at_or_below,
+                "seek_le at {i}/{seqno}"
+            );
+
+            map.record_compared();
+            map.seek_past_user_key(&key(i));
+            once("seek_past_user_key", map.take_compared());
+        }
+    }
+}

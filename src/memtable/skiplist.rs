@@ -187,6 +187,9 @@ pub(crate) struct SkipMap {
     /// its first link, so a test can race that link deterministically.
     #[cfg(all(test, feature = "metrics"))]
     link_hook: std::sync::Mutex<Option<SeekHook>>,
+    /// Test-only: while armed, every node a key comparison reads, in order.
+    #[cfg(test)]
+    compared: std::sync::Mutex<Option<alloc::vec::Vec<u32>>>,
 }
 
 /// What [`SkipMap::seek_hook`] runs.
@@ -258,7 +261,29 @@ impl SkipMap {
             seek_hook: std::sync::Mutex::new(None),
             #[cfg(all(test, feature = "metrics"))]
             link_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            compared: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Test-only: starts recording the nodes key comparisons read.
+    #[cfg(test)]
+    pub(crate) fn record_compared(&self) {
+        *self
+            .compared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(alloc::vec::Vec::new());
+    }
+
+    /// Test-only: the nodes compared since [`Self::record_compared`], which
+    /// stops the recording.
+    #[cfg(test)]
+    pub(crate) fn take_compared(&self) -> alloc::vec::Vec<u32> {
+        self.compared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default()
     }
 
     /// Inserts whose link was retried because another writer changed the
@@ -1137,6 +1162,15 @@ impl SkipMap {
     )]
     #[inline(always)]
     fn compare_key_parts(&self, node: u32, target_uk: &[u8], target_seqno: SeqNo) -> CmpOrdering {
+        #[cfg(test)]
+        if let Some(compared) = self
+            .compared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            compared.push(node);
+        }
         // One metadata read serves key offset, key length AND (on the equal
         // branch) the seqno: every field split into its own accessor would
         // re-resolve the arena block pointer (an extra Acquire load + branch)
@@ -1233,18 +1267,25 @@ impl SkipMap {
     ) {
         let list_h = self.height.load(Ordering::Acquire);
         let mut node = self.head;
+        // The successor the level above stopped at: it sorts at or after the
+        // key, so reaching it again a level down ends that level without
+        // comparing it a second time. A node linked in between since is met
+        // first and compared.
+        let mut above = UNSET;
 
         for level in (0..list_h).rev() {
             // Track the successor from the comparison loop — do NOT re-read
             // from the list, as a concurrent insert could return a node that
             // sorts before our key, leading to an out-of-order CAS.
             let mut next = self.next_at(node, level);
-            while next != UNSET && self.compare_key(next, key) == CmpOrdering::Less {
+            while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less
+            {
                 node = next;
                 next = self.next_at(node, level);
             }
             preds[level] = node;
             succs[level] = next;
+            above = next;
         }
     }
 
@@ -1267,21 +1308,25 @@ impl SkipMap {
         // Starting from head is safe and still O(log n) via the walk-down.
         let mut node = self.head;
         let list_h = self.height.load(Ordering::Acquire);
+        // The successor the level above stopped at, as in `find_splice`.
+        let mut above = UNSET;
 
         // Walk down from the list height, narrowing the search at each level.
         // Every node reached via next_at(node, lv) was linked at level lv,
         // so its height > lv — tower reads are always in-bounds.
         for lv in (level + 1..list_h).rev() {
             let mut next = self.next_at(node, lv);
-            while next != UNSET && self.compare_key(next, key) == CmpOrdering::Less {
+            while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less
+            {
                 node = next;
                 next = self.next_at(node, lv);
             }
+            above = next;
         }
 
         // Final search at the target level.
         let mut next = self.next_at(node, level);
-        while next != UNSET && self.compare_key(next, key) == CmpOrdering::Less {
+        while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less {
             node = next;
             next = self.next_at(node, level);
         }
@@ -1303,9 +1348,13 @@ impl SkipMap {
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // `next` still holds the successor the level above stopped at,
+            // known not to sort before the target: met again, it ends this
+            // level uncompared (see `find_splice`).
+            let above = next;
             loop {
                 next = self.next_at(node, level);
-                if next == UNSET {
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key_parts(next, target_uk, target_seqno) == CmpOrdering::Less {
@@ -1353,9 +1402,11 @@ impl SkipMap {
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // The level above's stop, known to sort after the target.
+            let above = next;
             loop {
                 next = self.next_at(node, level);
-                if next == UNSET {
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key(next, target) == CmpOrdering::Greater {
@@ -1383,9 +1434,11 @@ impl SkipMap {
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // The level above's stop, known to sort after the bound.
+            let above = next;
             loop {
                 next = self.next_at(node, level);
-                if next == UNSET {
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key_parts(next, user_key, 0) == CmpOrdering::Greater {
@@ -1402,12 +1455,15 @@ impl SkipMap {
     /// Finds the last node whose key <= `target`, or UNSET if all nodes > target.
     fn seek_le(&self, target: &InternalKey) -> u32 {
         let mut node = self.head;
+        let mut next = UNSET;
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // The level above's stop, known to sort after the target.
+            let above = next;
             loop {
-                let next = self.next_at(node, level);
-                if next == UNSET {
+                next = self.next_at(node, level);
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key(next, target) == CmpOrdering::Greater {
@@ -1423,12 +1479,15 @@ impl SkipMap {
     /// Finds the last node whose key < `target`, or UNSET.
     fn seek_lt(&self, target: &InternalKey) -> u32 {
         let mut node = self.head;
+        let mut next = UNSET;
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // The level above's stop, known not to sort before the target.
+            let above = next;
             loop {
-                let next = self.next_at(node, level);
-                if next == UNSET {
+                next = self.next_at(node, level);
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key(next, target) == CmpOrdering::Less {
