@@ -59,7 +59,7 @@ impl OverwrittenKeys {
 ///
 /// A key is queued before its newest version leaves this iterator, so the
 /// writer, which receives that version later, always finds it queued.
-pub struct MarkOverwritten<'q, I: Iterator<Item = crate::Result<InternalValue>>> {
+pub(crate) struct MarkOverwritten<'q, I: Iterator<Item = crate::Result<InternalValue>>> {
     inner: I,
     /// The entry read ahead to see whether the one passed has a further
     /// version. Only marking reads ahead: without `keys` every entry goes

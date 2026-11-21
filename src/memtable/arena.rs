@@ -61,6 +61,10 @@ struct Held {
 }
 
 /// The pool every memtable's arena uses.
+///
+/// Process-wide on purpose, as the allocator's own caches are: it holds raw
+/// memory and no data, so no tree reads what another left. A pool per tree
+/// leaves a newly opened tree to fault in fresh pages, the cost it removes.
 pub(crate) static BLOCKS: BlockPool = BlockPool::new();
 
 /// The data base of a `BLOCK_SIZE` shared heap region, held by one owner.

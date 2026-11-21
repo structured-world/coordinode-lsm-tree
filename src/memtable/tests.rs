@@ -504,7 +504,8 @@ fn memtable_get_old_version() {
 /// the shared pool by the time the drop returns, so the next tree opened, a
 /// short-lived one included, writes into memory already mapped. Long keys
 /// fill the blocks on every backend, the `bytes` one keeping its values out
-/// of the arena.
+/// of the arena. The pool is the process's, so the count holds under the
+/// runner the crate's tests use, which runs each test in a process of its own.
 #[test]
 #[expect(clippy::expect_used, reason = "test setup")]
 fn a_dropped_tree_leaves_its_arena_blocks_to_the_next() -> crate::Result<()> {
