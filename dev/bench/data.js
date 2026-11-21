@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795205935447,
+  "lastUpdate": 1795223845567,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103894,6 +103894,90 @@ window.BENCHMARK_DATA = {
             "value": 259181.42990765508,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 16.6us | P99.9: 103.0us\nthreads: 1 | elapsed: 0.77s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "21b293a5e43749a5877d9c1c24d94dee3d96f8e2",
+          "message": "bench(compare): measure the overwrite path in parts (#1093)\n\n## Summary\n\n- The comparison benchmark measures the overwrite path in parts, under\nsustained load, and on Windows, and sets our caller-kept log against\nRocksDB's own.\n\n## Changes\n\n- Overwrite breakdown arms that time each part of an overwrite apart.\n- A sustained overwrite scenario.\n- Windows runs of the comparison.\n- Batched syncs through the sync-skipping backend, so a run without\nsyncs still exercises the batch path; a batch it skips nothing of is\nhanded over uncopied, and a filtered one is kept inline, so the arms\ndiffer only by the syncs they leave out.\n- The caller's log of `ours-deferred-wal` encodes the batch into one\nbuffer and writes it with one call, and the arm is set against\n`rocksdb-wal`: RocksDB writing the same batch through its own log with a\nsync. Neither flushes in the timed window.\n\n## Testing\n\nThe harness builds and lints clean (clippy, all targets) on macOS and\nruns on a Linux benchmark host; its paired-run test runs in CI.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Benchmarking**\n* Added overwrite comparisons between deferred-write and RocksDB\nwrite-ahead logging, with timed measurements excluding flushes.\n* Added overwrite-part benchmarks that measure the impact of skipping\nselected sync operations, with optional filter disabling.\n* Clarified benchmark budgets and how setup time affects iteration\nsizing and reported samples.\n* Documented engine configurations for paired comparisons and how shared\nbenchmark state is stored and prepared.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-21T02:03:31+02:00",
+          "tree_id": "12dc27a488d1d6401442d9f94ba4529842ff673d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/21b293a5e43749a5877d9c1c24d94dee3d96f8e2"
+        },
+        "date": 1795223844358,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 145862.86177525308,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.7us | P99.9: 30.2us\nthreads: 1 | elapsed: 3.67s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3046599.568357773,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 922093.3048695424,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.0us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 507341.3807129775,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.6us | P99.9: 20.3us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3189956.1805289346,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 324239.60559805646,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.3us | P99.9: 14.8us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 192811.20728099233,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.7us | P99.9: 20.0us\nthreads: 1 | elapsed: 1.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 862642.4182196117,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 12.2us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1057322.423267323,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.5us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 365935.07128035533,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 11.9us | P99.9: 91.1us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
           }
         ]
       }
