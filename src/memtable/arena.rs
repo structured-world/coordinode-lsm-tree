@@ -42,10 +42,22 @@ use spin::Mutex;
 /// memtable faults in one by one; reused, it is already mapped. A tree opened
 /// after another closed takes the blocks that one left, as small buffers
 /// freed to the allocator would be reused, so a short-lived tree pays no more
-/// than a long-lived one. The pool keeps at most as many blocks as the last
-/// arena that gave any held: what one memtable takes, never more.
+/// than a long-lived one.
+///
+/// The pool keeps at most the blocks of the largest memtable dropped lately:
+/// an arena that held more raises that bound to its count, and each one of
+/// two blocks or more that held fewer lowers it by an eighth, at least one. A
+/// flushed memtable followed by the empty one its tree closes with leaves the
+/// flushed one's blocks, and after memtables shrink the bound comes down to
+/// their size in a few drops.
 pub(crate) struct BlockPool {
-    blocks: Mutex<Vec<Block>>,
+    held: Mutex<Held>,
+}
+
+/// What the pool holds: its blocks and the most it keeps.
+struct Held {
+    blocks: Vec<Block>,
+    bound: usize,
 }
 
 /// The pool every memtable's arena uses.
@@ -61,29 +73,55 @@ unsafe impl Send for Block {}
 impl BlockPool {
     pub(crate) const fn new() -> Self {
         Self {
-            blocks: Mutex::new(Vec::new()),
+            held: Mutex::new(Held {
+                blocks: Vec::new(),
+                bound: 0,
+            }),
         }
+    }
+
+    /// Test-only: blocks the pool holds.
+    #[cfg(test)]
+    pub(crate) fn pooled(&self) -> usize {
+        self.held.lock().blocks.len()
     }
 
     fn take(&self) -> Option<*mut u8> {
-        self.blocks.lock().pop().map(|block| block.0)
+        self.held.lock().blocks.pop().map(|block| block.0)
     }
 
-    /// Takes `blocks` back, keeping at most `keep` in all.
-    fn give(&self, blocks: Vec<*mut u8>, keep: usize) {
-        let mut pool = self.blocks.lock();
-        pool.extend(blocks.into_iter().map(Block));
-        while pool.len() > keep {
-            if let Some(block) = pool.pop() {
+    /// Takes back `blocks` from an arena that held `arena_held` blocks.
+    fn give(&self, blocks: Vec<*mut u8>, arena_held: usize) {
+        let mut held = self.held.lock();
+        held.bound = if arena_held >= held.bound {
+            arena_held
+        } else if arena_held > 1 {
+            // At least a block a drop, so a small bound comes down too.
+            (held.bound - held.bound.div_ceil(8)).max(arena_held)
+        } else {
+            // A memtable of a single block was dropped empty or nearly so,
+            // as every tree's last one is: it says nothing of the size the
+            // tree's memtables reach.
+            held.bound
+        };
+        held.blocks.extend(blocks.into_iter().map(Block));
+        while held.blocks.len() > held.bound {
+            if let Some(block) = held.blocks.pop() {
                 release(block.0);
             }
         }
+    }
+
+    /// Takes back a block an arena allocated and could not use, which counts
+    /// toward no bound.
+    fn give_unused(&self, block: *mut u8) {
+        self.held.lock().blocks.push(Block(block));
     }
 }
 
 impl Drop for BlockPool {
     fn drop(&mut self) {
-        for block in self.blocks.get_mut().drain(..) {
+        for block in self.held.get_mut().blocks.drain(..) {
             release(block.0);
         }
     }
@@ -442,7 +480,7 @@ impl Arena {
                 .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                self.pool.give(alloc::vec![raw], usize::MAX);
+                self.pool.give_unused(raw);
             }
         }
     }

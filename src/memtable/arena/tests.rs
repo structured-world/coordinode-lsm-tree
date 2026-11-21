@@ -282,21 +282,36 @@ fn a_viewed_block_is_not_handed_on() {
     assert_eq!(&*view, &[0xAB; 64][..]);
 }
 
-/// The pool keeps at most the blocks the last arena that gave any held, so
-/// memtables that shrink do not hold on to the memory of a larger one.
-#[test]
-fn the_pool_keeps_no_more_than_the_last_arena_held() {
-    let pool = own_pool();
-    let large = Arena::with_pool(pool);
-    for _ in 0..3 {
-        // Each nearly a block: three blocks in all.
-        large.alloc(BLOCK_SIZE - 8, 4).expect("alloc");
+/// An arena of `blocks` blocks on `pool`, dropped.
+fn drop_arena_of(pool: &'static BlockPool, blocks: usize) {
+    let arena = Arena::with_pool(pool);
+    for _ in 0..blocks {
+        // Each nearly a block, so every one takes a block of its own.
+        arena.alloc(BLOCK_SIZE - 8, 4).expect("alloc");
     }
-    drop(large);
-    assert_eq!(pool.blocks.lock().len(), 3);
+    drop(arena);
+}
 
-    let small = Arena::with_pool(pool);
-    first_block(&small);
-    drop(small);
-    assert_eq!(pool.blocks.lock().len(), 1);
+/// The empty memtable a tree closes with, dropped right after a large one
+/// was flushed, does not shrink the pool to its own single block: the next
+/// tree finds the large one's blocks.
+#[test]
+fn a_small_arena_after_a_large_one_leaves_the_large_ones_blocks() {
+    let pool = own_pool();
+    drop_arena_of(pool, 6);
+    drop_arena_of(pool, 1);
+    assert_eq!(pool.pooled(), 6);
+}
+
+/// Once memtables shrink, the pool comes down to their size in a few drops
+/// instead of holding the memory of a larger one for good.
+#[test]
+fn the_pool_comes_down_to_the_memtables_it_serves() {
+    let pool = own_pool();
+    drop_arena_of(pool, 8);
+    assert_eq!(pool.pooled(), 8);
+    for _ in 0..6 {
+        drop_arena_of(pool, 2);
+    }
+    assert_eq!(pool.pooled(), 2);
 }
