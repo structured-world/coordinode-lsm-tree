@@ -51,7 +51,7 @@ use crate::runtime_config::ChecksumAlgorithm;
 
 /// Size of the fixed footer tail after the checksum array: a one-byte
 /// algorithm tag plus a four-byte little-endian entry count.
-pub const FOOTER_TAIL_LEN: usize = 1 + 4;
+pub(crate) const FOOTER_TAIL_LEN: usize = 1 + 4;
 
 /// Computes the per-KV digest of `item` under `algo` over the entry's
 /// logical content (`value_type ‖ seqno ‖ len(user_key) ‖ user_key ‖ value`).
@@ -66,7 +66,26 @@ pub const FOOTER_TAIL_LEN: usize = 1 + 4;
 /// [`ChecksumAlgorithm::compute`]); callers translate that into a typed
 /// not-compiled-in error.
 #[must_use]
-pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
+pub(crate) fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
+    kv_digest_parts(
+        item.key.value_type,
+        item.key.seqno,
+        &item.key.user_key,
+        &item.value,
+        algo,
+    )
+}
+
+/// [`kv_digest`] over the entry's fields, for a write that has not built an
+/// [`InternalValue`].
+#[must_use]
+pub(crate) fn kv_digest_parts(
+    value_type: crate::ValueType,
+    seqno: crate::SeqNo,
+    user_key: &[u8],
+    value: &[u8],
+    algo: ChecksumAlgorithm,
+) -> Option<u64> {
     // Logical domain: the same fields the writer/memtable hold, independent of
     // on-disk prefix truncation. The fixed-width prefix (value_type ‖ seqno ‖
     // len(user_key)) lives in a 13-byte stack array; the two variable-length
@@ -81,14 +100,14 @@ pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
         clippy::cast_possible_truncation,
         reason = "user keys are bounded well below u32::MAX"
     )]
-    let user_key_len = item.key.user_key.len() as u32;
+    let user_key_len = user_key.len() as u32;
 
     let mut head = [0u8; 1 + 8 + 4];
-    head[0] = u8::from(item.key.value_type);
-    head[1..9].copy_from_slice(&item.key.seqno.to_le_bytes());
+    head[0] = u8::from(value_type);
+    head[1..9].copy_from_slice(&seqno.to_le_bytes());
     head[9..13].copy_from_slice(&user_key_len.to_le_bytes());
 
-    algo.compute_chunks(&[&head, &item.key.user_key, &item.value])
+    algo.compute_chunks(&[&head, user_key, value])
 }
 
 /// Appends the per-KV checksum footer to `payload` (which already holds the
@@ -98,7 +117,7 @@ pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
 /// bytes, in entry order. The tail records `algo`'s wire tag and the entry
 /// count so the reader can split the footer without consulting the block
 /// trailer.
-pub fn append_footer(payload: &mut Vec<u8>, digests: &[u64], algo: ChecksumAlgorithm) {
+pub(crate) fn append_footer(payload: &mut Vec<u8>, digests: &[u64], algo: ChecksumAlgorithm) {
     let size = algo.digest_size();
     // Every digest is stored from a `u64`'s LE bytes, so the width must fit
     // in 8. A future algorithm with a wider digest would silently skip the
@@ -137,7 +156,7 @@ pub fn append_footer(payload: &mut Vec<u8>, digests: &[u64], algo: ChecksumAlgor
 /// fully describes whether every data block carries a footer and under
 /// which algorithm — no per-block inspection needed.
 #[must_use]
-pub fn descriptor_byte(algo: Option<ChecksumAlgorithm>) -> u8 {
+pub(crate) fn descriptor_byte(algo: Option<ChecksumAlgorithm>) -> u8 {
     match algo {
         None => 0,
         Some(a) => 1 + a.wire_tag(),
@@ -154,7 +173,7 @@ pub fn descriptor_byte(algo: Option<ChecksumAlgorithm>) -> u8 {
 ///
 /// Returns [`crate::Error::InvalidTrailer`] for a non-zero byte that does
 /// not map to a known algorithm (forward-incompatible or corrupt meta).
-pub fn descriptor_from_byte(byte: u8) -> crate::Result<Option<ChecksumAlgorithm>> {
+pub(crate) fn descriptor_from_byte(byte: u8) -> crate::Result<Option<ChecksumAlgorithm>> {
     if byte == 0 {
         return Ok(None);
     }
@@ -179,7 +198,7 @@ pub fn descriptor_from_byte(byte: u8) -> crate::Result<Option<ChecksumAlgorithm>
 /// Returns [`crate::Error::InvalidTrailer`] when the footer is structurally
 /// malformed: too short to hold the tail, an unknown algorithm tag, or a
 /// `count` inconsistent with the available bytes.
-pub fn split_inner(bytes: &[u8]) -> crate::Result<&[u8]> {
+pub(crate) fn split_inner(bytes: &[u8]) -> crate::Result<&[u8]> {
     let total = bytes.len();
     if total < FOOTER_TAIL_LEN {
         return Err(crate::Error::InvalidTrailer);
@@ -225,7 +244,7 @@ pub fn split_inner(bytes: &[u8]) -> crate::Result<&[u8]> {
         reason = "core+alloc per-KV scrub view; the verify/scrub consumer is std-gated, so unused under no_std"
     )
 )]
-pub struct SplitFull<'a> {
+pub(crate) struct SplitFull<'a> {
     /// Inner payload: byte-identical to a plain `BlockType::Data` block.
     pub inner: &'a [u8],
     /// Raw on-disk per-entry digest array: `count × digest_size` bytes, in
@@ -247,7 +266,7 @@ pub struct SplitFull<'a> {
 impl SplitFull<'_> {
     /// Number of per-entry digests stored in the footer.
     #[must_use]
-    pub fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.count
     }
 
@@ -255,7 +274,7 @@ impl SplitFull<'_> {
     /// on-disk digest array (low `digest_size` bytes, little-endian, widened
     /// to `u64`). Returns `None` if `index` is out of range.
     #[must_use]
-    pub fn digest(&self, index: usize) -> Option<u64> {
+    pub(crate) fn digest(&self, index: usize) -> Option<u64> {
         let size = self.algo.digest_size();
         let off = index.checked_mul(size)?;
         let end = off.checked_add(size)?;
@@ -283,7 +302,7 @@ impl SplitFull<'_> {
         reason = "core+alloc per-KV scrub splitter; the verify/scrub consumer is std-gated, so unused under no_std"
     )
 )]
-pub fn split_full(bytes: &[u8]) -> crate::Result<SplitFull<'_>> {
+pub(crate) fn split_full(bytes: &[u8]) -> crate::Result<SplitFull<'_>> {
     let total = bytes.len();
     if total < FOOTER_TAIL_LEN {
         return Err(crate::Error::InvalidTrailer);

@@ -2131,6 +2131,11 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Returns the added item's size and new size of the memtable.
     ///
+    /// Bytes (`&[u8]`, `&str`, `Vec<u8>`, `String`, an array) are copied into
+    /// the memtable, which holds small values in its own memory without a
+    /// buffer per value; a [`Slice`](crate::Slice) is kept without a copy (see
+    /// [`InsertValue`](crate::InsertValue)).
+    ///
     /// # Examples
     ///
     /// ```
@@ -2143,10 +2148,11 @@ pub trait AbstractTree: sealed::Sealed {
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Will return `Err` if an IO error occurs.
-    fn insert<K: Into<UserKey>, V: Into<UserValue>>(
+    /// Panics if the key is empty or longer than 2^16 bytes, or the value is
+    /// longer than 2^32 bytes.
+    fn insert<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         value: V,
@@ -2166,7 +2172,7 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
     /// is closed.
-    fn try_insert<K: Into<UserKey>, V: Into<UserValue>>(
+    fn try_insert<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         value: V,
@@ -2183,7 +2189,7 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
     /// is closed.
-    fn try_merge<K: Into<UserKey>, V: Into<UserValue>>(
+    fn try_merge<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         operand: V,
@@ -2295,7 +2301,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// tree.merge("counter", 1_i64.to_le_bytes(), 0);
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
-    fn merge<K: Into<UserKey>, V: Into<UserValue>>(
+    fn merge<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         operand: V,

@@ -13,7 +13,7 @@
 
 use crate::{InternalValue, UserKey, comparator::SharedComparator};
 use alloc::collections::VecDeque;
-use core::{cell::RefCell, cmp::Ordering, iter::Peekable};
+use core::{cell::RefCell, cmp::Ordering};
 
 /// Keys seen with more than one version, in key order, from the position the
 /// flush writer has reached up to the position the merge has read.
@@ -59,8 +59,12 @@ impl OverwrittenKeys {
 ///
 /// A key is queued before its newest version leaves this iterator, so the
 /// writer, which receives that version later, always finds it queued.
-pub struct MarkOverwritten<'q, I: Iterator<Item = crate::Result<InternalValue>>> {
-    inner: Peekable<I>,
+pub(crate) struct MarkOverwritten<'q, I: Iterator<Item = crate::Result<InternalValue>>> {
+    inner: I,
+    /// The entry read ahead to see whether the one passed has a further
+    /// version. Only marking reads ahead: without `keys` every entry goes
+    /// straight from `inner` to the caller, with no buffer to move it through.
+    ahead: Option<crate::Result<InternalValue>>,
     keys: Option<&'q OverwrittenKeys>,
 }
 
@@ -68,7 +72,8 @@ impl<'q, I: Iterator<Item = crate::Result<InternalValue>>> MarkOverwritten<'q, I
     /// Marks into `keys`, or passes `inner` through untouched when `None`.
     pub(crate) fn new(inner: I, keys: Option<&'q OverwrittenKeys>) -> Self {
         Self {
-            inner: inner.peekable(),
+            inner,
+            ahead: None,
             keys,
         }
     }
@@ -78,9 +83,12 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for MarkOverwrit
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let item = self.inner.next()?;
-        if let (Some(keys), Ok(current)) = (self.keys, &item)
-            && let Some(Ok(next)) = self.inner.peek()
+        let Some(keys) = self.keys else {
+            return self.inner.next();
+        };
+        let item = self.ahead.take().or_else(|| self.inner.next())?;
+        self.ahead = self.inner.next();
+        if let (Ok(current), Some(Ok(next))) = (&item, &self.ahead)
             && crate::comparator::same_user_key(&next.key.user_key, &current.key.user_key)
         {
             keys.mark(&current.key.user_key);
@@ -89,7 +97,14 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for MarkOverwrit
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        let ahead = usize::from(self.ahead.is_some());
+        let (low, high) = self.inner.size_hint();
+        // A lower bound may stop at `usize::MAX` and an upper one be unknown
+        // past it, as `Peekable` reports them.
+        (
+            low.saturating_add(ahead),
+            high.and_then(|high| high.checked_add(ahead)),
+        )
     }
 }
 

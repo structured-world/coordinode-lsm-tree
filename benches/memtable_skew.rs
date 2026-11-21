@@ -15,6 +15,16 @@
 //! | writers | 1, 4, 16, 32 threads, each taking its share of the versions |
 //! | route | `tree` (`Tree::insert`, through the thread's insert gate shard) or `direct` (the active memtable itself) |
 //!
+//! The two routes store a value differently, so their times differ by more
+//! than the insert gate. On the default backend a value up to the inline size
+//! (20 bytes on 64-bit targets, 16 on 32-bit) is held inline by both routes and
+//! allocates nothing. Past it, `tree` hands the memtable borrowed bytes, which
+//! it copies into its value arena up to 64 KiB, while `direct` goes through the
+//! memtable's public insert of an owned `InternalValue` and allocates the value
+//! on the heap. With `bytes_1` there is no value arena and no inline value:
+//! both routes allocate every non-empty value, so they differ only by the
+//! insert gate.
+//!
 //! Per configuration it prints the median over the rounds of the time per
 //! insert seen by a writer, the inserts per second over all of them, the
 //! memtable bytes per version, and the P50/P99/P999 latency of one insert,
@@ -32,7 +42,8 @@
 //!
 //! `MEMTABLE_SKEW_VERSIONS` (default 400000) sets the versions per
 //! configuration, `MEMTABLE_SKEW_KEYS` (default 100000) the key space of the
-//! skewed orders, `MEMTABLE_SKEW_ROUNDS` (default 5) the rounds.
+//! skewed orders, `MEMTABLE_SKEW_ROUNDS` (default 5) the rounds,
+//! `MEMTABLE_SKEW_VALUE_SIZE` (default 256) the bytes of every value.
 //! `MEMTABLE_SKEW_ORDERS`, `MEMTABLE_SKEW_PREFIXES` and `MEMTABLE_SKEW_WRITERS`
 //! (comma-separated, e.g. `uniform`, `0`, `1`) run only the configurations they
 //! name, so one can be profiled alone; unset, each axis runs in full.
@@ -51,7 +62,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-/// Bytes per value, as in the head-to-head harness.
+/// Bytes per value by default, as in the head-to-head harness.
 const VALUE_SIZE: usize = 256;
 
 /// Every this many inserts of a writer one is timed alone, for the latency
@@ -184,9 +195,13 @@ fn open(comparator: Option<Arc<CountingComparator>>) -> lsm_tree::Result<AnyTree
 /// How a write reaches the memtable.
 #[derive(Clone, Copy)]
 enum Route {
-    /// `Tree::insert`: the thread's insert gate shard, then the memtable.
+    /// `Tree::insert`: the thread's insert gate shard, then the memtable,
+    /// which copies a borrowed value past the inline size and up to 64 KiB
+    /// into its value arena (default backend; see the module docs).
     Tree,
-    /// The active memtable directly: its own cost alone.
+    /// The active memtable directly, through its public insert of an owned
+    /// `InternalValue`: no insert gate, but a heap allocation for a value past
+    /// the inline size (see the module docs).
     Memtable,
 }
 
@@ -208,13 +223,13 @@ struct Writes {
 }
 
 impl Writes {
-    fn new(order: KeyOrder, prefix: usize, versions: usize, keys: usize) -> Self {
+    fn new(order: KeyOrder, prefix: usize, versions: usize, keys: usize, value: usize) -> Self {
         Self {
             keys: key_indices(order, versions, keys)
                 .into_iter()
                 .map(|i| key(order, prefix, i))
                 .collect(),
-            value: vec![b'v'; VALUE_SIZE],
+            value: vec![b'v'; value],
         }
     }
 
@@ -353,6 +368,7 @@ fn main() -> lsm_tree::Result<()> {
     } else {
         (2_000, 500, 1)
     };
+    let value_size = env_or("MEMTABLE_SKEW_VALUE_SIZE", VALUE_SIZE);
     for order in KeyOrder::ALL {
         if !picked("MEMTABLE_SKEW_ORDERS", order.label()) {
             continue;
@@ -361,7 +377,7 @@ fn main() -> lsm_tree::Result<()> {
             if !picked("MEMTABLE_SKEW_PREFIXES", &prefix.to_string()) {
                 continue;
             }
-            let writes = Writes::new(order, prefix, versions, keys);
+            let writes = Writes::new(order, prefix, versions, keys, value_size);
             for writers in WRITERS {
                 if !picked("MEMTABLE_SKEW_WRITERS", &writers.to_string()) {
                     continue;

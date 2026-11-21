@@ -684,7 +684,7 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
-    fn insert<K: Into<UserKey>, V: Into<UserValue>>(
+    fn insert<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         value: V,
@@ -694,7 +694,7 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
-    fn try_insert<K: Into<UserKey>, V: Into<UserValue>>(
+    fn try_insert<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         value: V,
@@ -704,7 +704,7 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
-    fn try_merge<K: Into<UserKey>, V: Into<UserValue>>(
+    fn try_merge<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         operand: V,
@@ -739,7 +739,7 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
-    fn merge<K: Into<UserKey>, V: Into<UserValue>>(
+    fn merge<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         operand: V,

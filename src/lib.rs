@@ -487,9 +487,12 @@ pub use time::set_clock;
 /// Utility functions
 pub mod util;
 
+mod insert_value;
 mod value;
 mod value_type;
 mod write_batch;
+
+pub use insert_value::{InsertBytes, InsertValue};
 
 /// Integrity verification for SST and blob files.
 ///

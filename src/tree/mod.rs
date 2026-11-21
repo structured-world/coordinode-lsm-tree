@@ -2425,24 +2425,24 @@ impl AbstractTree for Tree {
         Ok(self.append_batch(batch.materialize(seqno)?))
     }
 
-    fn insert<K: Into<UserKey>, V: Into<UserValue>>(
+    fn insert<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         value: V,
         seqno: SeqNo,
     ) -> (u64, u64) {
-        let value = InternalValue::from_components(key, value, seqno, ValueType::Value);
-        self.append_entry(value)
+        let key = InternalKey::new(key, seqno, ValueType::Value);
+        value.with_insert_bytes(|value| self.append_bytes(&key, value))
     }
 
-    fn merge<K: Into<UserKey>, V: Into<UserValue>>(
+    fn merge<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         operand: V,
         seqno: SeqNo,
     ) -> (u64, u64) {
-        let value = InternalValue::new_merge_operand(key, operand, seqno);
-        self.append_entry(value)
+        let key = InternalKey::new(key, seqno, ValueType::MergeOperand);
+        operand.with_insert_bytes(|operand| self.append_bytes(&key, operand))
     }
 
     fn remove<K: Into<UserKey>>(&self, key: K, seqno: SeqNo) -> (u64, u64) {
@@ -5801,6 +5801,48 @@ impl Tree {
         }
     }
 
+    /// [`Self::append_entry`] for a value handed over as
+    /// [`crate::InsertBytes`]: borrowed bytes are copied into the memtable
+    /// without a buffer of their own, a shared value is kept without a copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key is empty or the value is longer than 2^32 bytes, as
+    /// [`InternalValue::new`] does.
+    pub(crate) fn append_bytes(
+        &self,
+        key: &InternalKey,
+        value: crate::InsertBytes<'_>,
+    ) -> (u64, u64) {
+        let bytes = value.as_bytes();
+        assert!(!key.user_key.is_empty(), "key may not be empty");
+        assert!(
+            u32::try_from(bytes.len()).is_ok(),
+            "values can be 2^32 bytes in length"
+        );
+        #[cfg(feature = "metrics")]
+        self.accept_parts(key.value_type, key.user_key.len(), bytes.len());
+        let kv_digest = self.insert_digest_parts(key, bytes);
+
+        // The insert gate as in `append_entry`.
+        #[cfg(feature = "std")]
+        {
+            self.insert_gate
+                .enter()
+                .memtable()
+                .insert_bytes_with_kv_digest(key, value, kv_digest)
+        }
+        // no-std: the history read lock, with the same guarantee.
+        #[cfg(not(feature = "std"))]
+        {
+            self.version_history
+                .read()
+                .latest_version_ref()
+                .active_memtable
+                .insert_bytes_with_kv_digest(key, value, kv_digest)
+        }
+    }
+
     /// Adds a cell row whose references are `refs` to the active memtable,
     /// once each reference is shown to name a frame the current version still
     /// holds.
@@ -5861,11 +5903,20 @@ impl Tree {
     /// and value.
     #[cfg(feature = "metrics")]
     fn accept(&self, value: &InternalValue) {
-        let key = value.key.user_key.len();
-        if value.key.value_type.is_tombstone() {
+        self.accept_parts(
+            value.key.value_type,
+            value.key.user_key.len(),
+            value.value.len(),
+        );
+    }
+
+    /// [`Self::accept`] for an entry's type and its key and value lengths.
+    #[cfg(feature = "metrics")]
+    fn accept_parts(&self, value_type: ValueType, key: usize, value: usize) {
+        if value_type.is_tombstone() {
             self.0.metrics.accepted_deletion(key);
         } else {
-            self.0.metrics.accepted_value(key + value.value.len());
+            self.0.metrics.accepted_value(key + value);
         }
     }
 
@@ -5874,6 +5925,15 @@ impl Tree {
     fn insert_digest(
         &self,
         value: &InternalValue,
+    ) -> Option<(u32, crate::runtime_config::ChecksumAlgorithm)> {
+        self.insert_digest_parts(&value.key, &value.value)
+    }
+
+    /// [`Self::insert_digest`] for an entry's key and value bytes.
+    fn insert_digest_parts(
+        &self,
+        key: &InternalKey,
+        value: &[u8],
     ) -> Option<(u32, crate::runtime_config::ChecksumAlgorithm)> {
         // Per-KV residence digest (KvChecksumComputePoint::AtInsert): compute
         // the entry's 4-byte logical-content digest now, so a RAM bit-flip
@@ -5890,7 +5950,14 @@ impl Tree {
             .kv_digest_at_insert
             .load(core::sync::atomic::Ordering::Relaxed);
         inner::kv_digest_algo_from_gate(gate).and_then(|algo| {
-            crate::table::block::kv_checksum::kv_digest(value, algo).map(|d| {
+            crate::table::block::kv_checksum::kv_digest_parts(
+                key.value_type,
+                key.seqno,
+                &key.user_key,
+                value,
+                algo,
+            )
+            .map(|d| {
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "AtInsert is config-validated to a 4-byte algorithm; the digest fits u32"

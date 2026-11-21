@@ -499,3 +499,32 @@ fn memtable_get_old_version() {
         memtable.get(b"abc", 50)
     );
 }
+
+/// A tree written, flushed and dropped leaves its memtable's arena blocks to
+/// the shared pool by the time the drop returns, so the next tree opened, a
+/// short-lived one included, writes into memory already mapped. Long keys
+/// fill the blocks on every backend, the `bytes` one keeping its values out
+/// of the arena. The pool is the process's, so the count holds under the
+/// runner the crate's tests use, which runs each test in a process of its own.
+#[test]
+#[expect(clippy::expect_used, reason = "test setup")]
+fn a_dropped_tree_leaves_its_arena_blocks_to_the_next() -> crate::Result<()> {
+    use crate::AbstractTree;
+    let folder = tempfile::tempdir().expect("tempdir");
+    let tree = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let mut key = [0x5Au8; 256];
+    for i in 0..100_000u64 {
+        key[248..].copy_from_slice(&i.to_be_bytes());
+        tree.insert(key, [7u8; 8], i);
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+    let pooled = arena::BLOCKS.pooled();
+    assert!(pooled >= 5, "{pooled} blocks pooled after the tree dropped");
+    Ok(())
+}

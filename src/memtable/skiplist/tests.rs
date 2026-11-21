@@ -96,7 +96,11 @@ fn verify_kv_digests_passes_when_uncorrupted() {
     for i in 0..8u8 {
         let key = make_key(&[b'k', i], u64::from(i) + 1);
         let val = make_value(&[b'v', i, i, i]);
-        map.insert_with_kv_digest(&key, val.clone(), Some((digest4(&key, &val, algo), algo)));
+        map.insert_with_kv_digest(
+            &key,
+            InsertBytes::Borrowed(&val),
+            Some((digest4(&key, &val, algo), algo)),
+        );
     }
     assert!(map.verify_kv_digests().is_ok());
 }
@@ -112,7 +116,11 @@ fn verify_kv_digests_detects_residence_corruption() {
     let map = new_map();
     let key = make_key(b"victim", 42);
     let val = make_value(b"payload");
-    map.insert_with_kv_digest(&key, val.clone(), Some((digest4(&key, &val, algo), algo)));
+    map.insert_with_kv_digest(
+        &key,
+        InsertBytes::Borrowed(&val),
+        Some((digest4(&key, &val, algo), algo)),
+    );
 
     // Flip a bit in the (only) node's user-key bytes, simulating residence
     // corruption.
@@ -138,12 +146,17 @@ fn verify_kv_digests_skips_nodes_without_a_digest() {
     // No-digest node (pre-toggle): corrupt it later; must be skipped.
     let k0 = make_key(b"aaa", 1);
     let v0 = make_value(b"no-digest");
-    map.insert_with_kv_digest(&k0, v0, None);
+    // A kept buffer, the other in the arena: both placements are verified.
+    map.insert_with_kv_digest(&k0, InsertBytes::Shared(v0), None);
 
     // Digest-bearing node (post-toggle): left intact.
     let k1 = make_key(b"bbb", 2);
     let v1 = make_value(b"has-digest");
-    map.insert_with_kv_digest(&k1, v1.clone(), Some((digest4(&k1, &v1, algo), algo)));
+    map.insert_with_kv_digest(
+        &k1,
+        InsertBytes::Borrowed(&v1),
+        Some((digest4(&k1, &v1, algo), algo)),
+    );
 
     // Corrupt the FIRST node's key (the no-digest "aaa" entry sorts first).
     map.test_flip_first_key_byte();
@@ -182,7 +195,11 @@ fn verify_kv_digests_rejects_non_4_byte_algorithm_tag() {
     #[expect(clippy::cast_possible_truncation, reason = "low 32 bits on purpose")]
     let d64 = crate::table::block::kv_checksum::kv_digest(&item, ChecksumAlgorithm::Xxh3_64)
         .expect("xxh3 always available") as u32;
-    map.insert_with_kv_digest(&key, val, Some((d64, ChecksumAlgorithm::Xxh3_64)));
+    map.insert_with_kv_digest(
+        &key,
+        InsertBytes::Borrowed(&val),
+        Some((d64, ChecksumAlgorithm::Xxh3_64)),
+    );
 
     assert!(
         map.verify_kv_digests().is_err(),
@@ -200,7 +217,11 @@ fn verify_kv_digests_fails_closed_on_corrupt_value_type() {
     let map = new_map();
     let key = make_key(b"k", 1);
     let val = make_value(b"v");
-    map.insert_with_kv_digest(&key, val.clone(), Some((digest4(&key, &val, algo), algo)));
+    map.insert_with_kv_digest(
+        &key,
+        InsertBytes::Borrowed(&val),
+        Some((digest4(&key, &val, algo), algo)),
+    );
 
     map.test_corrupt_first_node_value_type();
 
@@ -875,4 +896,277 @@ fn point_get_never_returns_a_version_above_its_snapshot_inserted_during_the_seek
         })
         .collect();
     assert_eq!(got, vec![(9, Some(3)), (6, Some(3))]);
+}
+
+/// A value of every size around the arena's limits reads back exactly as
+/// written, by iteration and by point lookup, whether its bytes were copied
+/// into the arena or its buffer kept: empty, inline-sized, just past the
+/// inline size, and on both sides of the largest value the arena holds.
+/// Guards the length word, the offset past the key and the placement choice.
+#[test]
+fn values_of_every_placement_read_back_as_written() {
+    let sizes = [
+        0,
+        1,
+        20,
+        21,
+        255,
+        4096,
+        ARENA_VALUE_MAX,
+        ARENA_VALUE_MAX + 1,
+    ];
+    let map = new_map();
+    let mut expected = Vec::new();
+    for (i, &size) in sizes.iter().enumerate() {
+        let value: Vec<u8> = (0..size)
+            .map(|b| u8::try_from((b * 31 + i) % 251).expect("below 251"))
+            .collect();
+        // Keys of odd lengths put the length word at every alignment.
+        let borrowed = vec![b'b'; i + 1];
+        let shared = vec![b's'; i + 1];
+        map.insert_with_kv_digest(&make_key(&borrowed, 1), InsertBytes::Borrowed(&value), None);
+        map.insert_with_kv_digest(
+            &make_key(&shared, 1),
+            InsertBytes::Shared(make_value(&value)),
+            None,
+        );
+        expected.push((borrowed, value.clone()));
+        expected.push((shared, value));
+    }
+    for (key, value) in &expected {
+        let got = map.point_get(key, 2).map(|v| v.value.to_vec());
+        assert_eq!(
+            got.as_deref(),
+            Some(value.as_slice()),
+            "{} bytes",
+            value.len()
+        );
+    }
+    let mut iterated: Vec<(Vec<u8>, Vec<u8>)> = map
+        .iter()
+        .map(|e| (e.key().user_key.to_vec(), e.value().to_vec()))
+        .collect();
+    iterated.sort();
+    expected.sort();
+    assert_eq!(iterated, expected);
+}
+
+/// Borrowed bytes past the inline size and up to the limit go into the arena,
+/// and nothing past it: bytes a value holds inline stay in its slot, which
+/// costs them no allocation, and a kept buffer never goes there. With the
+/// `bytes` backend nothing goes there, since a `Bytes` value cannot view an
+/// arena block.
+#[test]
+fn only_borrowed_bytes_up_to_the_limit_go_into_the_arena() {
+    let placed = |value: InsertBytes<'_>| {
+        let map = new_map();
+        map.insert_with_kv_digest(&make_key(b"k", 1), value, None);
+        map.value_in_arena(map.first_node())
+    };
+    // The `bytes` backend places nothing in the arena, at any size.
+    #[cfg(not(feature = "bytes_1"))]
+    let inline_size = crate::byteview::INLINE_SIZE;
+    #[cfg(feature = "bytes_1")]
+    let inline_size = 20;
+    let inline = vec![7u8; inline_size];
+    let past_inline = vec![7u8; inline_size + 1];
+    let at_limit = vec![7u8; ARENA_VALUE_MAX];
+    let past_limit = vec![7u8; ARENA_VALUE_MAX + 1];
+    let arena_values = cfg!(not(feature = "bytes_1"));
+    assert!(!placed(InsertBytes::Borrowed(b"")));
+    assert!(!placed(InsertBytes::Borrowed(&inline)));
+    assert_eq!(placed(InsertBytes::Borrowed(&past_inline)), arena_values);
+    assert_eq!(placed(InsertBytes::Borrowed(&at_limit)), arena_values);
+    assert!(!placed(InsertBytes::Borrowed(&past_limit)));
+    assert!(!placed(InsertBytes::Shared(make_value(b"small"))));
+}
+
+/// An insert that unwinds between reserving its value slot and writing it
+/// (a failed allocation of its node or of its value's buffer, which unwinds
+/// without `std`) leaves the slot an empty value: the store drops every
+/// reserved slot, and the slot lies in a segment an earlier insert allocated,
+/// filled with a pattern that reads as a value with a wild pointer. Covered
+/// for a value bound for the arena and for one bound for the store.
+#[test]
+fn an_insert_unwinding_before_its_value_write_leaves_a_droppable_slot() {
+    for value in [
+        InsertBytes::Borrowed(b"small"),
+        InsertBytes::Shared(make_value(b"a value too long to be held inline")),
+    ] {
+        let map = new_map();
+        map.values_for_test().scribble_segments_for_test();
+        map.insert(
+            &make_key(b"a", 1),
+            make_value(b"first, allocating the segment"),
+        );
+
+        map.unwind_before_value_write_for_test();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.insert_with_kv_digest(&make_key(b"b", 2), value, None);
+        }));
+        assert!(
+            unwound.is_err(),
+            "the injected unwind must reach the caller"
+        );
+
+        // The map stays usable and drops every slot it reserved.
+        map.insert(&make_key(b"c", 3), make_value(b"after the unwind"));
+        assert_eq!(
+            map.point_get(b"c", 4).map(|v| v.value).as_deref(),
+            Some(&b"after the unwind"[..])
+        );
+        assert!(map.point_get(b"b", 4).is_none());
+        drop(map);
+    }
+}
+
+/// A value read from the arena stays valid after the map that held it is
+/// dropped and its memory reused, as a key read from it does: the read is a
+/// view that keeps its arena block alive.
+#[test]
+fn an_arena_value_outlives_the_map() {
+    let map = new_map();
+    let value = vec![0xA5u8; 300];
+    map.insert_with_kv_digest(&make_key(b"k", 1), InsertBytes::Borrowed(&value), None);
+    let read = map.point_get(b"k", 2).map(|v| v.value);
+    drop(map);
+
+    let other = new_map();
+    for i in 0..100u64 {
+        other.insert_with_kv_digest(
+            &make_key(&i.to_be_bytes(), i),
+            InsertBytes::Borrowed(&[0x5Au8; 300]),
+            None,
+        );
+    }
+    assert_eq!(read.as_deref(), Some(value.as_slice()));
+}
+
+/// A bit flip in a value held in the arena is caught by the residence check,
+/// as one in its key is: the digest covers the bytes where they lie. The
+/// `bytes` backend keeps no values in the arena.
+#[test]
+#[cfg(not(feature = "bytes_1"))]
+#[expect(clippy::expect_used, reason = "test asserts the error via expect_err")]
+fn verify_kv_digests_detects_corruption_of_an_arena_value() {
+    let algo = ChecksumAlgorithm::Xxh3Low32;
+    let map = new_map();
+    let key = make_key(b"victim", 42);
+    // Past the inline size, which stays out of the arena.
+    let val = make_value(b"a payload too long to be held inline");
+    map.insert_with_kv_digest(
+        &key,
+        InsertBytes::Borrowed(&val),
+        Some((digest4(&key, &val, algo), algo)),
+    );
+    map.test_flip_first_arena_value_byte();
+    let err = map
+        .verify_kv_digests()
+        .expect_err("corruption must be detected");
+    assert!(
+        matches!(err, crate::Error::MemtableKvChecksumMismatch { .. }),
+        "expected MemtableKvChecksumMismatch, got {err:?}"
+    );
+}
+
+/// Every search compares each node at most once, and still stops where a
+/// linear walk does. The successor a level stops at sorts on the far side of
+/// the target, so a level below that reaches it again ends there without a
+/// second comparison; with a long shared key prefix each repeat costs a walk
+/// over the prefix. Probes fall between, on and around stored keys, versions
+/// above and below the stored seqno included.
+#[test]
+fn a_search_compares_no_node_twice_and_stops_where_a_walk_does() {
+    let map = new_map();
+    let key = |i: u32| {
+        let mut k = [0x5A_u8; 36];
+        k[32..].copy_from_slice(&i.wrapping_mul(0x9E37_79B9).to_be_bytes());
+        k
+    };
+    for i in (0..8192).step_by(2) {
+        map.insert(&make_key(&key(i), 5), make_value(b"v"));
+    }
+    // The first node at or after `target` in a walk of level 0, or UNSET.
+    let walk_ge = |target: &InternalKey| {
+        let mut node = map.first_node();
+        while node != UNSET && map.compare_key(node, target) == CmpOrdering::Less {
+            node = map.next_at(node, 0);
+        }
+        node
+    };
+    let once = |what: &str, compared: Vec<u32>| {
+        let mut sorted = compared.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            compared.len(),
+            "{what}: a node compared twice in {compared:?}"
+        );
+    };
+    for i in 0..600 {
+        for seqno in [1, 5, 9] {
+            let target = make_key(&key(i), seqno);
+            let expected = walk_ge(&target);
+
+            let (mut preds, mut succs) = ([map.head; MAX_HEIGHT], [UNSET; MAX_HEIGHT]);
+            map.record_compared();
+            map.find_splice(&target, &mut preds, &mut succs);
+            once("find_splice", map.take_compared());
+            assert_eq!(succs[0], expected, "find_splice at {i}/{seqno}");
+
+            let (mut preds, mut succs) = ([map.head; MAX_HEIGHT], [UNSET; MAX_HEIGHT]);
+            map.record_compared();
+            map.find_splice_for_level(&target, &mut preds, &mut succs, 0);
+            once("find_splice_for_level", map.take_compared());
+            assert_eq!(succs[0], expected, "find_splice_for_level at {i}/{seqno}");
+
+            map.record_compared();
+            let ge = map.seek_ge(&target);
+            once("seek_ge", map.take_compared());
+            assert_eq!(ge, expected, "seek_ge at {i}/{seqno}");
+
+            map.record_compared();
+            let lt = map.seek_lt(&target);
+            once("seek_lt", map.take_compared());
+            let walked_lt = (expected != map.first_node()).then(|| {
+                let mut node = map.first_node();
+                while map.next_at(node, 0) != expected {
+                    node = map.next_at(node, 0);
+                }
+                node
+            });
+            assert_eq!(
+                Some(lt).filter(|&n| n != UNSET),
+                walked_lt,
+                "seek_lt at {i}/{seqno}"
+            );
+
+            map.record_compared();
+            let gt = map.seek_gt(&target);
+            once("seek_gt", map.take_compared());
+            map.record_compared();
+            let le = map.seek_le(&target);
+            once("seek_le", map.take_compared());
+            // A stored version equal to the target sits between the two.
+            let equal =
+                expected != UNSET && map.compare_key(expected, &target) == CmpOrdering::Equal;
+            let after = if equal {
+                map.next_at(expected, 0)
+            } else {
+                expected
+            };
+            assert_eq!(gt, after, "seek_gt at {i}/{seqno}");
+            let at_or_below = if equal { Some(expected) } else { walked_lt };
+            assert_eq!(
+                Some(le).filter(|&n| n != UNSET),
+                at_or_below,
+                "seek_le at {i}/{seqno}"
+            );
+
+            map.record_compared();
+            map.seek_past_user_key(&key(i));
+            once("seek_past_user_key", map.take_compared());
+        }
+    }
 }

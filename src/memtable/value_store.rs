@@ -155,6 +155,50 @@ impl ValueStore {
         idx
     }
 
+    /// Reserves the next index as a [`Reservation`], which leaves its slot an
+    /// empty value if it is dropped unwritten.
+    ///
+    /// # Panics
+    ///
+    /// As [`reserve`](Self::reserve).
+    pub(crate) fn reserve_slot(&self) -> Reservation<'_> {
+        Reservation {
+            store: self,
+            idx: self.reserve(),
+        }
+    }
+
+    /// Leaves the reserved, unwritten slot of `idx` an empty value, for an
+    /// insert that unwinds before its write. Allocates nothing, since it runs
+    /// while unwinding: a segment not allocated yet is marked torn, so the
+    /// write that allocates it fills every slot with an empty value.
+    #[cold]
+    #[inline(never)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "seg_idx < MAX_SEGMENTS, checked by reserve"
+    )]
+    fn abandon(&self, idx: u32) {
+        let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
+        let slot = (idx & SEGMENT_MASK) as usize;
+        let segment = &self.segments[seg_idx];
+
+        let mut seg_ptr = segment.load(Ordering::Acquire);
+        if seg_ptr.is_null() {
+            match segment.compare_exchange(seg_ptr, torn(), Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(actual) => seg_ptr = actual,
+            }
+        }
+        // A torn segment is filled with empty values when it is allocated.
+        if seg_ptr.addr() <= TORN_ADDR {
+            return;
+        }
+        // SAFETY: the segment is allocated, and the reservation makes `slot`
+        // unique to this caller, which never wrote it.
+        unsafe { ptr::write(seg_ptr.add(slot), UserValue::empty()) };
+    }
+
     /// Moves `value` into the slot of `idx`: the caller's handle becomes the
     /// stored one, so the insert path does no refcount traffic.
     ///
@@ -331,6 +375,44 @@ impl ValueStore {
     }
 }
 
+/// A reserved slot of a [`ValueStore`], to be written once.
+///
+/// The store drops every slot below its count as a value, so a slot must hold
+/// one even when its insert unwinds before writing it (a failed allocation of
+/// the node or of the value's buffer unwinds without `std`). Dropped unwritten,
+/// a reservation leaves the slot an empty value; written, it is forgotten, so
+/// the insert that completes pays nothing for it.
+pub(crate) struct Reservation<'s> {
+    store: &'s ValueStore,
+    idx: u32,
+}
+
+impl Reservation<'_> {
+    /// The reserved index.
+    pub(crate) fn idx(&self) -> u32 {
+        self.idx
+    }
+
+    /// Moves `value` into the reserved slot.
+    ///
+    /// The slot is written before the node that refers to it is published, so
+    /// a reader reaches it only once it is fully written.
+    pub(crate) fn write(self, value: UserValue) {
+        // A write that unwinds on its segment's allocation leaves the slot to
+        // the torn segment's fill, not to `Drop`.
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `idx` came from `reserve`, and consuming the reservation
+        // makes this its only write.
+        unsafe { this.store.write(this.idx, value) };
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.store.abandon(self.idx);
+    }
+}
+
 /// Address of the torn marker: a segment whose allocation failed while a
 /// write that reserved one of its slots was waiting on it. No allocation of a
 /// `UserValue` array lies at it, as it is not aligned for one.
@@ -384,11 +466,11 @@ impl Drop for ValueStore {
             if seg_start < total {
                 let count = (seg_end - seg_start) as usize;
                 for i in 0..count {
-                    // SAFETY: slots 0..count were initialised via ptr::write
-                    // in write(), which every reserved slot gets before its
-                    // insert can panic, except a slot whose segment failed to
-                    // allocate: that segment was filled with empty values when
-                    // it was allocated after all. A write over an empty value
+                    // SAFETY: slots 0..count were initialised via ptr::write:
+                    // by write(), or with an empty value by a `Reservation`
+                    // its insert dropped unwritten while unwinding; a slot
+                    // whose segment was not allocated then lies in a segment
+                    // filled with empty values when it was allocated after all. A write over an empty value
                     // leaks nothing, as an empty value owns nothing.
                     // We're the only thread running (Drop is &mut).
                     unsafe {

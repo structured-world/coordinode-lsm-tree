@@ -21,7 +21,7 @@ use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
 use crate::runtime_config::ChecksumAlgorithm;
 use crate::value::{InternalValue, SeqNo, UserValue};
-use crate::{UserKey, ValueType};
+use crate::{InsertBytes, UserKey, ValueType};
 
 use core::cmp::Ordering as CmpOrdering;
 use core::ops::{Bound, RangeBounds};
@@ -62,7 +62,12 @@ const BACK_BATCH_LEVEL: usize = 2;
 //                              height-1/2 node; `key_offset` still addresses
 //                              it like any arena span)
 //
-// Values are stored in a separate heap-backed Vec so that large values
+// A value the write handed over as bytes of at most `ARENA_VALUE_MAX` lies in
+// the separate value arena as u32 length + bytes, and the node (flagged in the
+// value_type byte) holds its offset there at +4 in place of the value index:
+// the nodes a search walks stay packed, not spaced out by their values.
+//
+// Other values are kept in a separate heap-backed store, so large values
 // don't bloat the arena and cause exhaustion.
 //
 // Total: 24 + 4 × height + key_len   (always 4-byte aligned)
@@ -86,6 +91,15 @@ const OFF_TOWER: u32 = 24;
 // mixed-variant memtable after an Off -> AtInsert toggle).
 const KV_DIGEST_PRESENT: u8 = 0x80;
 const VALUE_TYPE_MASK: u8 = 0x07;
+// Bit 3 of the value_type byte: the value lies in the arena right after the
+// key, behind its native-endian u32 length, instead of in the `ValueStore`.
+const VALUE_IN_ARENA: u8 = 0x08;
+
+/// Largest value the arena holds. A write's bytes up to it are copied in with
+/// the node, so the memtable allocates and frees nothing per value; larger
+/// ones keep a buffer of their own in the `ValueStore`, so one value cannot
+/// strand most of an arena block. The arena's blocks are 4 MiB.
+pub(crate) const ARENA_VALUE_MAX: usize = 64 * 1024;
 const KV_ALGO_SHIFT: u8 = 5;
 const KV_ALGO_MASK: u8 = 0x60;
 
@@ -128,6 +142,10 @@ enum NodeKvDigest {
 /// [`InternalKey`] (ordered by `user_key` ascending, then seqno descending).
 pub(crate) struct SkipMap {
     arena: Arena,
+    /// The values written as bytes, apart from the nodes so a search walks
+    /// packed nodes; a node flagged `VALUE_IN_ARENA` holds its value's offset
+    /// here in place of its value index.
+    value_arena: Arena,
     /// Lock-free segmented storage for values.  Keys live in the arena for
     /// cache locality during comparisons; values live here so large blobs
     /// don't exhaust the arena.  Indexed by `value_idx` stored in each node.
@@ -169,6 +187,13 @@ pub(crate) struct SkipMap {
     /// its first link, so a test can race that link deterministically.
     #[cfg(all(test, feature = "metrics"))]
     link_hook: std::sync::Mutex<Option<SeekHook>>,
+    /// Test-only: while armed, every node a key comparison reads, in order.
+    #[cfg(test)]
+    compared: std::sync::Mutex<Option<alloc::vec::Vec<u32>>>,
+    /// Test-only: the next insert unwinds between reserving its value slot
+    /// and writing it, as a failed allocation there does without `std`.
+    #[cfg(test)]
+    unwind_before_value_write: core::sync::atomic::AtomicBool,
 }
 
 /// What [`SkipMap::seek_hook`] runs.
@@ -226,6 +251,7 @@ impl SkipMap {
         let is_lexicographic = comparator.is_lexicographic();
         Self {
             arena,
+            value_arena: Arena::new(),
             values: ValueStore::new(),
             comparator,
             is_lexicographic,
@@ -239,7 +265,44 @@ impl SkipMap {
             seek_hook: std::sync::Mutex::new(None),
             #[cfg(all(test, feature = "metrics"))]
             link_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            compared: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            unwind_before_value_write: core::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Test-only: makes the next insert unwind before it writes its value slot.
+    #[cfg(test)]
+    pub(crate) fn unwind_before_value_write_for_test(&self) {
+        self.unwind_before_value_write
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: the values' store, to set its faults.
+    #[cfg(test)]
+    pub(crate) fn values_for_test(&self) -> &ValueStore {
+        &self.values
+    }
+
+    /// Test-only: starts recording the nodes key comparisons read.
+    #[cfg(test)]
+    pub(crate) fn record_compared(&self) {
+        *self
+            .compared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(alloc::vec::Vec::new());
+    }
+
+    /// Test-only: the nodes compared since [`Self::record_compared`], which
+    /// stops the recording.
+    #[cfg(test)]
+    pub(crate) fn take_compared(&self) -> alloc::vec::Vec<u32> {
+        self.compared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default()
     }
 
     /// Inserts whose link was retried because another writer changed the
@@ -304,7 +367,7 @@ impl SkipMap {
     /// Multiple entries with the same `user_key` but different `seqno` are
     /// expected (MVCC).  No deduplication is performed.
     pub(crate) fn insert(&self, key: &InternalKey, value: UserValue) {
-        self.insert_with_kv_digest(key, value, None);
+        self.insert_with_kv_digest(key, InsertBytes::Shared(value), None);
     }
 
     /// Inserts a key-value pair, optionally storing a 4-byte per-KV digest
@@ -324,18 +387,52 @@ impl SkipMap {
     pub(crate) fn insert_with_kv_digest(
         &self,
         key: &InternalKey,
-        value: UserValue,
+        value: InsertBytes<'_>,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) {
-        let value_idx = self.values.reserve();
-        // The slot is written before anything that can panic: the store
-        // drops every slot below its count as a value, so a reserved slot
-        // left unwritten by a panic in the node's allocation would be dropped
-        // as one it never held.
-        // SAFETY: `value_idx` was reserved by this insert and is written once.
-        unsafe { self.values.write(value_idx, value) };
+        // Until it is written, the reservation leaves the slot an empty value
+        // if anything below unwinds (a failed allocation of the node's block
+        // or of the value's buffer does without `std`): the store drops every
+        // slot below its count as a value.
+        let slot = self.values.reserve_slot();
+        let value_idx = slot.idx();
         let height = node_height(self.height_seed, value_idx);
-        let node = self.alloc_node(key, value_idx, height, kv_digest);
+        // Small borrowed bytes go into the value arena. Without room there the
+        // value takes a buffer of its own like any other. Bytes a value holds
+        // inline stay in its slot: they cost no allocation there, and a read
+        // copies them into an inline value either way.
+        #[cfg(not(feature = "bytes_1"))]
+        let in_arena = match &value {
+            InsertBytes::Borrowed(bytes)
+                if bytes.len() > crate::byteview::INLINE_SIZE && bytes.len() <= ARENA_VALUE_MAX =>
+            {
+                self.try_alloc_node(key, value_idx, height, kv_digest, Some(bytes))
+            }
+            _ => None,
+        };
+        // A `Bytes` value cannot view the arena: reads would copy it out.
+        #[cfg(feature = "bytes_1")]
+        let in_arena = None;
+        #[cfg(test)]
+        assert!(
+            !self
+                .unwind_before_value_write
+                .swap(false, Ordering::Relaxed),
+            "injected unwind before the value write"
+        );
+        // A value in the arena leaves the slot an empty inline value, which
+        // owns nothing.
+        let node = if let Some(node) = in_arena {
+            slot.write(UserValue::empty());
+            node
+        } else {
+            let value = match value {
+                InsertBytes::Borrowed(bytes) => UserValue::from(bytes),
+                InsertBytes::Shared(value) => value,
+            };
+            slot.write(value);
+            self.alloc_node(key, value_idx, height, kv_digest)
+        };
 
         // Raise the list height if needed.
         let mut list_h = self.height.load(Ordering::Relaxed);
@@ -444,6 +541,37 @@ impl SkipMap {
                 *b ^= 0xFF;
             }
         }
+    }
+
+    /// Test-only: flips a bit in the first node's value bytes, which must lie
+    /// in the arena, simulating a RAM bit-flip there.
+    #[cfg(all(test, not(feature = "bytes_1")))]
+    pub(crate) fn test_flip_first_arena_value_byte(&self) {
+        let node = self.first_node();
+        assert_ne!(node, UNSET, "skiplist must be non-empty to corrupt");
+        assert!(
+            self.value_in_arena(node),
+            "the first value must be in the arena"
+        );
+        let at = self.node_value_idx(node) + 4;
+        // SAFETY: a non-empty arena value's first byte follows its length word.
+        unsafe {
+            if let Some(b) = self.value_arena.get_bytes_mut(at, 1).first_mut() {
+                *b ^= 0xFF;
+            }
+        }
+    }
+
+    /// Test-only: whether `node`'s value lies in the arena.
+    #[cfg(test)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    pub(crate) fn value_in_arena(&self, node: u32) -> bool {
+        // SAFETY: `node` is a published node.
+        let meta = unsafe { self.meta(node) };
+        meta[10] & VALUE_IN_ARENA != 0
     }
 
     /// Test-only: corrupts the first node's `value_type` low bits to an invalid
@@ -577,12 +705,8 @@ impl SkipMap {
 
     /// Allocates and initialises a node in the arena, returning its offset.
     ///
-    /// Key data is stored in the arena for comparison locality.
-    /// Value data is appended to the heap-backed `values` Vec.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "key_bytes.len() <= u16::MAX, value idx <= u32::MAX, height <= MAX_HEIGHT (20)"
-    )]
+    /// Key data is stored in the arena for comparison locality; the value
+    /// stays in the `ValueStore`.
     fn alloc_node(
         &self,
         key: &InternalKey,
@@ -590,7 +714,60 @@ impl SkipMap {
         height: usize,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) -> u32 {
+        #[expect(
+            clippy::expect_used,
+            reason = "arena capacity is fixed; exhaustion is fatal"
+        )]
+        self.try_alloc_node(key, value_idx, height, kv_digest, None)
+            .expect("arena exhausted (node)")
+    }
+
+    /// [`Self::alloc_node`], with `value`'s bytes in the value arena behind
+    /// their 4-byte length, when given; `None` when an arena cannot take the
+    /// allocation.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "key_bytes.len() <= u16::MAX, a value here <= ARENA_VALUE_MAX, \
+                  value idx <= u32::MAX, height <= MAX_HEIGHT (20)"
+    )]
+    fn try_alloc_node(
+        &self,
+        key: &InternalKey,
+        value_idx: u32,
+        height: usize,
+        kv_digest: Option<(u32, ChecksumAlgorithm)>,
+        value: Option<&[u8]>,
+    ) -> Option<u32> {
         let key_bytes: &[u8] = &key.user_key;
+        debug_assert!(
+            value.is_none_or(|v| v.len() <= ARENA_VALUE_MAX),
+            "only small values go into the arena"
+        );
+
+        // The value goes into an arena of its own, so the nodes a search
+        // walks stay packed together with their keys: interleaved with the
+        // values, every step of a search would land on another cache line.
+        // Taken first: a value arena out of room falls back before the node
+        // takes any memory.
+        let value_at = match value {
+            Some(value) => {
+                let at = self.value_arena.alloc(4 + value.len() as u32, 4)?;
+                // SAFETY: the length word and the value bytes are the
+                // allocation made above; exclusive access before publish.
+                unsafe {
+                    self.value_arena
+                        .get_bytes_mut(at, 4)
+                        .copy_from_slice(&(value.len() as u32).to_ne_bytes());
+                    if !value.is_empty() {
+                        self.value_arena
+                            .get_bytes_mut(at + 4, value.len() as u32)
+                            .copy_from_slice(value);
+                    }
+                }
+                Some(at)
+            }
+            None => None,
+        };
 
         // One arena allocation carries the node header, the tower AND the key
         // bytes (key right after the tower). Two separate allocations would
@@ -599,14 +776,7 @@ impl SkipMap {
         // before it — with a typical height of 1-2 the key starts at +28/+32,
         // on the same cache line as the header `compare_key` just loaded.
         let n_size = node_size(height);
-        #[expect(
-            clippy::expect_used,
-            reason = "arena capacity is fixed; exhaustion is fatal"
-        )]
-        let node = self
-            .arena
-            .alloc(n_size + key_bytes.len() as u32, 4)
-            .expect("arena exhausted (node)");
+        let node = self.arena.alloc(n_size + key_bytes.len() as u32, 4)?;
         let key_offset = node + n_size;
         if !key_bytes.is_empty() {
             // SAFETY: key_offset..+len is within the allocation made above;
@@ -630,12 +800,19 @@ impl SkipMap {
         unsafe {
             let meta = self.arena.get_bytes_mut(node, OFF_TOWER);
             meta[0..4].copy_from_slice(&key_offset.to_ne_bytes());
-            meta[4..8].copy_from_slice(&value_idx.to_ne_bytes());
+            // A value in the value arena is found by its offset there; its
+            // store slot stays empty, so the index is not needed.
+            meta[4..8].copy_from_slice(&value_at.unwrap_or(value_idx).to_ne_bytes());
             // Cast is safe: InternalKey::new() asserts key.len() <= u16::MAX.
             meta[8..10].copy_from_slice(&(key_bytes.len() as u16).to_ne_bytes());
             // ValueType discriminant in the low bits; high bit (KV_DIGEST_PRESENT)
             // flags an insert-time per-KV digest in the reserved slot below.
-            let vt_byte = u8::from(key.value_type);
+            let vt_byte = u8::from(key.value_type)
+                | if value_at.is_some() {
+                    VALUE_IN_ARENA
+                } else {
+                    0
+                };
             // Arena memory is uninitialized — the reserved padding at +12 is
             // either the digest (when present) or zeroed, so the whole header
             // is fully written before the node is published. The algorithm's
@@ -656,7 +833,7 @@ impl SkipMap {
             // arena did not zero them.
         }
 
-        node
+        Some(node)
     }
 
     // -----------------------------------------------------------------------
@@ -849,8 +1026,101 @@ impl SkipMap {
         })
     }
 
-    /// Reads the value for `node` from the lock-free value store (wait-free).
+    /// A view of `node`'s value bytes in the arena, or `None` when its value
+    /// lives in the value store. Zero-copy, as [`Self::node_internal_key`].
+    #[cfg(not(feature = "bytes_1"))]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: fixed-width slices always convert to arrays"
+    )]
+    fn arena_value(&self, node: u32) -> Option<UserValue> {
+        // SAFETY: `node` is a published node, its header fully written.
+        let m = unsafe { self.meta(node) };
+        if m[10] & VALUE_IN_ARENA == 0 {
+            return None;
+        }
+        let value_at = u32::from_ne_bytes(m[4..8].try_into().expect("4 bytes"));
+        // SAFETY: the insert wrote the length word and the value bytes at
+        // `value_at` in the value arena before the publishing CAS; published
+        // bytes are never rewritten.
+        Some(UserValue::from_view(unsafe {
+            self.value_arena.get_len_prefixed_view(value_at)
+        }))
+    }
+
+    /// The entry at `node`, its key and its value, read from one look at the
+    /// node's header: the iterators build every entry they yield this way.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: fixed-width slices always convert to arrays; \
+                  the ValueType discriminant written during alloc_node is valid"
+    )]
+    fn node_entry(&self, node: u32) -> InternalValue {
+        // SAFETY: `node` is a published node, its header fully written.
+        let m = unsafe { self.meta(node) };
+        let key_off = u32::from_ne_bytes(m[0..4].try_into().expect("4 bytes"));
+        let key_len = u32::from(u16::from_ne_bytes(m[8..10].try_into().expect("2 bytes")));
+        let seqno = u64::from_ne_bytes(m[16..24].try_into().expect("8 bytes"));
+        let value_type =
+            ValueType::try_from(m[10] & VALUE_TYPE_MASK).expect("valid ValueType discriminant");
+        #[cfg(not(feature = "bytes_1"))]
+        // SAFETY: as `node_internal_key`: the key span was written before the
+        // publishing CAS and is never rewritten.
+        let user_key = UserKey::from_view(unsafe { self.arena.get_view(key_off, key_len) });
+        #[cfg(feature = "bytes_1")]
+        // SAFETY: as above.
+        let user_key: UserKey = unsafe { self.arena.get_bytes(key_off, key_len) }.into();
+        #[cfg(not(feature = "bytes_1"))]
+        let value = if m[10] & VALUE_IN_ARENA == 0 {
+            self.node_value_from_store(m)
+        } else {
+            let value_at = u32::from_ne_bytes(m[4..8].try_into().expect("4 bytes"));
+            // SAFETY: as `arena_value`.
+            UserValue::from_view(unsafe { self.value_arena.get_len_prefixed_view(value_at) })
+        };
+        #[cfg(feature = "bytes_1")]
+        let value = self.node_value_from_store(m);
+        InternalValue {
+            key: InternalKey {
+                user_key,
+                seqno,
+                value_type,
+            },
+            value,
+        }
+    }
+
+    /// The value the store holds for the node whose header is `m`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: a 4-byte slice always converts to [u8; 4]"
+    )]
+    fn node_value_from_store(&self, m: &[u8]) -> UserValue {
+        let value_idx = u32::from_ne_bytes(m[4..8].try_into().expect("4 bytes"));
+        // SAFETY: as `node_value`: the insert reserved and wrote this index
+        // before the node was published.
+        unsafe { self.values.get(value_idx) }
+    }
+
+    /// Reads the value for `node`: a view of its bytes in the arena, or its
+    /// buffer from the lock-free value store (wait-free either way).
     fn node_value(&self, node: u32) -> UserValue {
+        #[cfg(not(feature = "bytes_1"))]
+        if let Some(value) = self.arena_value(node) {
+            return value;
+        }
         // SAFETY: node_value_idx is the index the insert reserved and wrote
         // (`ValueStore::reserve` then `write`) before allocating this node,
         // and the node is only reachable after the skiplist CAS that published
@@ -921,6 +1191,15 @@ impl SkipMap {
     )]
     #[inline(always)]
     fn compare_key_parts(&self, node: u32, target_uk: &[u8], target_seqno: SeqNo) -> CmpOrdering {
+        #[cfg(test)]
+        if let Some(compared) = self
+            .compared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            compared.push(node);
+        }
         // One metadata read serves key offset, key length AND (on the equal
         // branch) the seqno: every field split into its own accessor would
         // re-resolve the arena block pointer (an extra Acquire load + branch)
@@ -1017,18 +1296,25 @@ impl SkipMap {
     ) {
         let list_h = self.height.load(Ordering::Acquire);
         let mut node = self.head;
+        // The successor the level above stopped at: it sorts at or after the
+        // key, so reaching it again a level down ends that level without
+        // comparing it a second time. A node linked in between since is met
+        // first and compared.
+        let mut above = UNSET;
 
         for level in (0..list_h).rev() {
             // Track the successor from the comparison loop — do NOT re-read
             // from the list, as a concurrent insert could return a node that
             // sorts before our key, leading to an out-of-order CAS.
             let mut next = self.next_at(node, level);
-            while next != UNSET && self.compare_key(next, key) == CmpOrdering::Less {
+            while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less
+            {
                 node = next;
                 next = self.next_at(node, level);
             }
             preds[level] = node;
             succs[level] = next;
+            above = next;
         }
     }
 
@@ -1051,21 +1337,25 @@ impl SkipMap {
         // Starting from head is safe and still O(log n) via the walk-down.
         let mut node = self.head;
         let list_h = self.height.load(Ordering::Acquire);
+        // The successor the level above stopped at, as in `find_splice`.
+        let mut above = UNSET;
 
         // Walk down from the list height, narrowing the search at each level.
         // Every node reached via next_at(node, lv) was linked at level lv,
         // so its height > lv — tower reads are always in-bounds.
         for lv in (level + 1..list_h).rev() {
             let mut next = self.next_at(node, lv);
-            while next != UNSET && self.compare_key(next, key) == CmpOrdering::Less {
+            while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less
+            {
                 node = next;
                 next = self.next_at(node, lv);
             }
+            above = next;
         }
 
         // Final search at the target level.
         let mut next = self.next_at(node, level);
-        while next != UNSET && self.compare_key(next, key) == CmpOrdering::Less {
+        while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less {
             node = next;
             next = self.next_at(node, level);
         }
@@ -1087,9 +1377,13 @@ impl SkipMap {
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // `next` still holds the successor the level above stopped at,
+            // known not to sort before the target: met again, it ends this
+            // level uncompared (see `find_splice`).
+            let above = next;
             loop {
                 next = self.next_at(node, level);
-                if next == UNSET {
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key_parts(next, target_uk, target_seqno) == CmpOrdering::Less {
@@ -1127,10 +1421,7 @@ impl SkipMap {
         if !crate::comparator::same_user_key(self.node_user_key_bytes(node), key) {
             return None;
         }
-        Some(InternalValue {
-            key: self.node_internal_key(node),
-            value: self.node_value(node),
-        })
+        Some(self.node_entry(node))
     }
 
     /// Finds the first node whose key > `target`, or UNSET.
@@ -1140,9 +1431,11 @@ impl SkipMap {
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // The level above's stop, known to sort after the target.
+            let above = next;
             loop {
                 next = self.next_at(node, level);
-                if next == UNSET {
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key(next, target) == CmpOrdering::Greater {
@@ -1170,9 +1463,11 @@ impl SkipMap {
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // The level above's stop, known to sort after the bound.
+            let above = next;
             loop {
                 next = self.next_at(node, level);
-                if next == UNSET {
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key_parts(next, user_key, 0) == CmpOrdering::Greater {
@@ -1189,12 +1484,15 @@ impl SkipMap {
     /// Finds the last node whose key <= `target`, or UNSET if all nodes > target.
     fn seek_le(&self, target: &InternalKey) -> u32 {
         let mut node = self.head;
+        let mut next = UNSET;
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // The level above's stop, known to sort after the target.
+            let above = next;
             loop {
-                let next = self.next_at(node, level);
-                if next == UNSET {
+                next = self.next_at(node, level);
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key(next, target) == CmpOrdering::Greater {
@@ -1210,12 +1508,15 @@ impl SkipMap {
     /// Finds the last node whose key < `target`, or UNSET.
     fn seek_lt(&self, target: &InternalKey) -> u32 {
         let mut node = self.head;
+        let mut next = UNSET;
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
+            // The level above's stop, known not to sort before the target.
+            let above = next;
             loop {
-                let next = self.next_at(node, level);
-                if next == UNSET {
+                next = self.next_at(node, level);
+                if next == UNSET || next == above {
                     break;
                 }
                 if self.compare_key(next, target) == CmpOrdering::Less {
@@ -1366,6 +1667,11 @@ impl Entry<'_> {
     /// Reconstructs the value (allocates a new `Slice`).
     pub(crate) fn value(&self) -> UserValue {
         self.map.node_value(self.node)
+    }
+
+    /// The key and the value together, read from one look at the node.
+    pub(crate) fn internal_value(&self) -> InternalValue {
+        self.map.node_entry(self.node)
     }
 }
 
