@@ -186,9 +186,19 @@ impl Memtable {
     )]
     #[must_use]
     pub fn new(id: MemtableId, comparator: SharedComparator) -> Self {
+        Self::with_block_pool(id, &comparator, None)
+    }
+
+    /// A memtable whose arena takes its blocks from `pool`, the tree's, and
+    /// hands them back to it when the memtable drops.
+    pub(crate) fn with_block_pool(
+        id: MemtableId,
+        comparator: &SharedComparator,
+        pool: Option<alloc::sync::Arc<arena::BlockPool>>,
+    ) -> Self {
         Self {
             id,
-            items: skiplist::SkipMap::new(comparator.clone()),
+            items: skiplist::SkipMap::with_block_pool(comparator.clone(), pool),
             comparator: comparator.clone(),
             range_tombstones: RwLock::new(interval_tree::IntervalTree::new_with_comparator(
                 comparator.clone(),

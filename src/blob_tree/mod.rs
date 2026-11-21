@@ -2254,9 +2254,10 @@ impl AbstractTree for BlobTree {
                 // that number.
                 self.index.flush_seqs.decide_taken();
                 let mut copy = v.clone();
-                copy.active_memtable = Arc::new(Memtable::new(
+                copy.active_memtable = Arc::new(Memtable::with_block_pool(
                     self.index.memtable_id_counter.next(),
-                    config.comparator.clone(),
+                    &config.comparator,
+                    Some(Arc::clone(&self.index.arena_blocks)),
                 ));
                 copy.sealed_memtables = Arc::default();
                 copy.version = v.version.cleared(&still_written);

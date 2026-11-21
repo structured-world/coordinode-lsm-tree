@@ -192,8 +192,18 @@ impl SkipMap {
     /// Creates a new empty skiplist with the given user key comparator.
     ///
     /// The arena grows lazily in 4 MiB blocks — no large upfront allocation.
+    #[cfg(test)]
     pub(crate) fn new(comparator: SharedComparator) -> Self {
-        let arena = Arena::new();
+        Self::with_block_pool(comparator, None)
+    }
+
+    /// [`Self::new`], its arena taking blocks from `pool` and handing them
+    /// back to it when the map drops.
+    pub(crate) fn with_block_pool(
+        comparator: SharedComparator,
+        pool: Option<alloc::sync::Arc<super::arena::BlockPool>>,
+    ) -> Self {
+        let arena = Arena::with_pool(pool);
 
         // Allocate the head sentinel with MAX_HEIGHT.
         let head_size = node_size(MAX_HEIGHT);

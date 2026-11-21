@@ -121,6 +121,10 @@ pub struct TreeInner {
     #[doc(hidden)]
     pub memtable_id_counter: SequenceNumberCounter,
 
+    /// The arena blocks the tree's dropped memtables leave to its next ones,
+    /// so a new memtable writes into memory already mapped.
+    pub(crate) arena_blocks: Arc<crate::memtable::arena::BlockPool>,
+
     /// Hands out a unique (monotonically increasing) table ID
     #[doc(hidden)]
     pub table_id_counter: SequenceNumberCounter,
@@ -456,6 +460,7 @@ impl TreeInner {
 
         Ok(Self {
             id: get_next_tree_id(),
+            arena_blocks: Arc::default(),
             deletion_pause: DeletionPause::for_tree(Arc::clone(&life)),
             #[cfg(feature = "std")]
             background_deleter: Arc::new(crate::BackgroundDeleter::for_tree(

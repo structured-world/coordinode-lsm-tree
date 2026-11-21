@@ -232,3 +232,66 @@ fn exact_block_fill_does_not_corrupt() {
         "block 1 data must not be corrupted by subsequent allocations"
     );
 }
+
+/// The block an arena allocated first, as the next arena on the same pool
+/// sees it.
+fn first_block(arena: &Arena) -> *mut u8 {
+    arena.alloc(8, 4).expect("alloc");
+    arena.blocks[0].load(Ordering::Acquire)
+}
+
+/// A block nothing views any more goes to the pool when its arena drops and
+/// is the next arena's first block: a new memtable writes into memory already
+/// mapped instead of faulting in fresh pages.
+#[test]
+fn a_dropped_arena_hands_its_unviewed_block_to_the_next() {
+    let pool = Arc::new(BlockPool::default());
+    let first = Arena::with_pool(Some(Arc::clone(&pool)));
+    let block = first_block(&first);
+    drop(first);
+    let second = Arena::with_pool(Some(Arc::clone(&pool)));
+    assert_eq!(first_block(&second), block);
+}
+
+/// A block a view still reads stays with the view: the next arena gets
+/// another, and writing into it leaves the viewed bytes as they were. The
+/// `bytes` backend takes no views of the arena.
+#[test]
+#[cfg(not(feature = "bytes_1"))]
+fn a_viewed_block_is_not_handed_on() {
+    let pool = Arc::new(BlockPool::default());
+    let first = Arena::with_pool(Some(Arc::clone(&pool)));
+    let at = first.alloc(64, 4).expect("alloc");
+    // SAFETY: `at..at+64` was just allocated; written before it is viewed.
+    unsafe { first.get_bytes_mut(at, 64).fill(0xAB) };
+    let block = first.blocks[0].load(Ordering::Acquire);
+    // SAFETY: the span was allocated and written above, and not written again.
+    let view = unsafe { first.get_view(at, 64) };
+    drop(first);
+
+    let second = Arena::with_pool(Some(Arc::clone(&pool)));
+    assert_ne!(first_block(&second), block, "a viewed block was handed on");
+    let next = second.alloc(64, 4).expect("alloc");
+    // SAFETY: `next..next+64` was just allocated.
+    unsafe { second.get_bytes_mut(next, 64).fill(0x00) };
+    assert_eq!(&*view, &[0xAB; 64][..]);
+}
+
+/// The pool keeps at most the blocks the last arena that gave any held, so a
+/// tree whose memtables shrink does not hold on to the memory of a larger one.
+#[test]
+fn the_pool_keeps_no_more_than_the_last_arena_held() {
+    let pool = Arc::new(BlockPool::default());
+    let large = Arena::with_pool(Some(Arc::clone(&pool)));
+    for _ in 0..3 {
+        // Each nearly a block: three blocks in all.
+        large.alloc(BLOCK_SIZE - 8, 4).expect("alloc");
+    }
+    drop(large);
+    assert_eq!(pool.blocks.lock().len(), 3);
+
+    let small = Arena::with_pool(Some(Arc::clone(&pool)));
+    first_block(&small);
+    drop(small);
+    assert_eq!(pool.blocks.lock().len(), 1);
+}
