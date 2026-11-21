@@ -951,10 +951,11 @@ fn values_of_every_placement_read_back_as_written() {
     assert_eq!(iterated, expected);
 }
 
-/// Borrowed bytes up to the limit go into the arena and nothing past it, and
-/// a kept buffer never does: the placement the memtable's memory accounting
-/// and the read path rely on. With the `bytes` backend nothing goes there,
-/// since a `Bytes` value cannot view an arena block.
+/// Borrowed bytes past the inline size and up to the limit go into the arena,
+/// and nothing past it: bytes a value holds inline stay in its slot, which
+/// costs them no allocation, and a kept buffer never goes there. With the
+/// `bytes` backend nothing goes there, since a `Bytes` value cannot view an
+/// arena block.
 #[test]
 fn only_borrowed_bytes_up_to_the_limit_go_into_the_arena() {
     let placed = |value: InsertBytes<'_>| {
@@ -962,10 +963,14 @@ fn only_borrowed_bytes_up_to_the_limit_go_into_the_arena() {
         map.insert_with_kv_digest(&make_key(b"k", 1), value, None);
         map.value_in_arena(map.first_node())
     };
+    let inline = vec![7u8; crate::byteview::INLINE_SIZE];
+    let past_inline = vec![7u8; crate::byteview::INLINE_SIZE + 1];
     let at_limit = vec![7u8; ARENA_VALUE_MAX];
     let past_limit = vec![7u8; ARENA_VALUE_MAX + 1];
     let arena_values = cfg!(not(feature = "bytes_1"));
-    assert_eq!(placed(InsertBytes::Borrowed(b"small")), arena_values);
+    assert!(!placed(InsertBytes::Borrowed(b"")));
+    assert!(!placed(InsertBytes::Borrowed(&inline)));
+    assert_eq!(placed(InsertBytes::Borrowed(&past_inline)), arena_values);
     assert_eq!(placed(InsertBytes::Borrowed(&at_limit)), arena_values);
     assert!(!placed(InsertBytes::Borrowed(&past_limit)));
     assert!(!placed(InsertBytes::Shared(make_value(b"small"))));
@@ -1042,7 +1047,8 @@ fn verify_kv_digests_detects_corruption_of_an_arena_value() {
     let algo = ChecksumAlgorithm::Xxh3Low32;
     let map = new_map();
     let key = make_key(b"victim", 42);
-    let val = make_value(b"payload");
+    // Past the inline size, which stays out of the arena.
+    let val = make_value(b"a payload too long to be held inline");
     map.insert_with_kv_digest(
         &key,
         InsertBytes::Borrowed(&val),

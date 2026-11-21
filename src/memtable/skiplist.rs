@@ -397,11 +397,15 @@ impl SkipMap {
         let slot = self.values.reserve_slot();
         let value_idx = slot.idx();
         let height = node_height(self.height_seed, value_idx);
-        // Small borrowed bytes go into the node's own allocation. Without room
-        // in the arena the value takes a buffer of its own like any other.
+        // Small borrowed bytes go into the value arena. Without room there the
+        // value takes a buffer of its own like any other. Bytes a value holds
+        // inline stay in its slot: they cost no allocation there, and a read
+        // copies them into an inline value either way.
         #[cfg(not(feature = "bytes_1"))]
         let in_arena = match &value {
-            InsertBytes::Borrowed(bytes) if bytes.len() <= ARENA_VALUE_MAX => {
+            InsertBytes::Borrowed(bytes)
+                if bytes.len() > crate::byteview::INLINE_SIZE && bytes.len() <= ARENA_VALUE_MAX =>
+            {
                 self.try_alloc_node(key, value_idx, height, kv_digest, Some(bytes))
             }
             _ => None,
