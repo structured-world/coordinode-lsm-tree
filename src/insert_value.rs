@@ -36,7 +36,8 @@ impl InsertBytes<'_> {
 /// which holds small values in its own memory: a write allocates nothing per
 /// value, as the `RocksDB` memtable does. A [`Slice`] (and a `bytes::Bytes` under
 /// the `bytes_1` feature) is kept as the buffer it is, so a caller that already
-/// holds one pays no copy.
+/// holds one pays no copy. Under `bytes_1`, which keeps no value in the
+/// memtable's arena, an owned `Vec<u8>` or `String` is kept as its buffer too.
 ///
 /// # Examples
 ///
@@ -78,12 +79,38 @@ macro_rules! copied {
 copied! {
     &[u8] => |v| v;
     &Vec<u8> => |v| v.as_slice();
-    Vec<u8> => |v| v.as_slice();
     &str => |v| v.as_bytes();
     &String => |v| v.as_bytes();
-    String => |v| v.as_bytes();
     Arc<[u8]> => |v| &v;
     Arc<str> => |v| v.as_bytes();
+}
+
+// The default backend copies an owned buffer into a value of its own anyway,
+// so its bytes go where the memtable puts small values: its arena.
+#[cfg(not(feature = "bytes_1"))]
+copied! {
+    Vec<u8> => |v| v.as_slice();
+    String => |v| v.as_bytes();
+}
+
+/// On the bytes backend an owned buffer becomes the value as it is: the
+/// memtable keeps no value in its arena there, so copying it would allocate
+/// and copy bytes the caller already handed over.
+#[cfg(feature = "bytes_1")]
+impl InsertValue for Vec<u8> {
+    #[inline]
+    fn with_insert_bytes<R>(self, f: impl FnOnce(InsertBytes<'_>) -> R) -> R {
+        f(InsertBytes::Shared(Slice::from(self)))
+    }
+}
+
+/// See the `Vec<u8>` implementation.
+#[cfg(feature = "bytes_1")]
+impl InsertValue for String {
+    #[inline]
+    fn with_insert_bytes<R>(self, f: impl FnOnce(InsertBytes<'_>) -> R) -> R {
+        f(InsertBytes::Shared(Slice::from(self)))
+    }
 }
 
 #[cfg(feature = "std")]

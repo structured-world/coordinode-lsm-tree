@@ -17,15 +17,17 @@ fn bytes_are_copied_and_a_slice_is_kept() {
     assert_eq!(b"value".with_insert_bytes(copied), Some(v.clone()));
     assert_eq!((*b"value").with_insert_bytes(copied), Some(v.clone()));
     assert_eq!("value".with_insert_bytes(copied), Some(v.clone()));
+    // The bytes backend keeps an owned vector or string as its buffer.
+    let owned_copied = cfg!(not(feature = "bytes_1")).then(|| v.clone());
     assert_eq!(
         String::from("value").with_insert_bytes(copied),
-        Some(v.clone())
+        owned_copied
     );
     assert_eq!(
         (&String::from("value")).with_insert_bytes(copied),
         Some(v.clone())
     );
-    assert_eq!(v.clone().with_insert_bytes(copied), Some(v.clone()));
+    assert_eq!(v.clone().with_insert_bytes(copied), owned_copied);
     assert_eq!((&v).with_insert_bytes(copied), Some(v.clone()));
     assert_eq!(
         Arc::<[u8]>::from(v.as_slice()).with_insert_bytes(copied),
@@ -40,4 +42,23 @@ fn bytes_are_copied_and_a_slice_is_kept() {
     };
     assert_eq!((&slice).with_insert_bytes(kept), Some(slice.clone()));
     assert_eq!(slice.clone().with_insert_bytes(kept), Some(slice));
+}
+
+/// On the bytes backend an owned vector or string becomes the value's buffer
+/// as it is: the memtable keeps no value in its arena there, so handing the
+/// bytes over to copy would allocate and copy a value the caller already owns.
+#[test]
+#[cfg(feature = "bytes_1")]
+fn owned_bytes_keep_their_buffer_on_the_bytes_backend() {
+    let kept_at = |bytes: InsertBytes<'_>| match bytes {
+        InsertBytes::Shared(value) => Some(value.as_ptr()),
+        InsertBytes::Borrowed(_) => None,
+    };
+    let v = vec![7u8; 4096];
+    let at = v.as_ptr();
+    assert_eq!(v.with_insert_bytes(kept_at), Some(at));
+
+    let s = "x".repeat(4096);
+    let at = s.as_ptr();
+    assert_eq!(s.with_insert_bytes(kept_at), Some(at));
 }
