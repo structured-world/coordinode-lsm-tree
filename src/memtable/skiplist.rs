@@ -190,6 +190,10 @@ pub(crate) struct SkipMap {
     /// Test-only: while armed, every node a key comparison reads, in order.
     #[cfg(test)]
     compared: std::sync::Mutex<Option<alloc::vec::Vec<u32>>>,
+    /// Test-only: the next insert unwinds between reserving its value slot
+    /// and writing it, as a failed allocation there does without `std`.
+    #[cfg(test)]
+    unwind_before_value_write: core::sync::atomic::AtomicBool,
 }
 
 /// What [`SkipMap::seek_hook`] runs.
@@ -263,7 +267,22 @@ impl SkipMap {
             link_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             compared: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            unwind_before_value_write: core::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Test-only: makes the next insert unwind before it writes its value slot.
+    #[cfg(test)]
+    pub(crate) fn unwind_before_value_write_for_test(&self) {
+        self.unwind_before_value_write
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: the values' store, to set its faults.
+    #[cfg(test)]
+    pub(crate) fn values_for_test(&self) -> &ValueStore {
+        &self.values
     }
 
     /// Test-only: starts recording the nodes key comparisons read.
@@ -371,11 +390,15 @@ impl SkipMap {
         value: InsertBytes<'_>,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) {
-        let value_idx = self.values.reserve();
+        // Until it is written, the reservation leaves the slot an empty value
+        // if anything below unwinds (a failed allocation of the node's block
+        // or of the value's buffer does without `std`): the store drops every
+        // slot below its count as a value.
+        let slot = self.values.reserve_slot();
+        let value_idx = slot.idx();
         let height = node_height(self.height_seed, value_idx);
-        // Small borrowed bytes go into the node's own allocation. That attempt
-        // cannot panic: it fails only when the arena is out of room, and the
-        // value then takes a buffer of its own like any other.
+        // Small borrowed bytes go into the node's own allocation. Without room
+        // in the arena the value takes a buffer of its own like any other.
         #[cfg(not(feature = "bytes_1"))]
         let in_arena = match &value {
             InsertBytes::Borrowed(bytes) if bytes.len() <= ARENA_VALUE_MAX => {
@@ -386,22 +409,24 @@ impl SkipMap {
         // A `Bytes` value cannot view the arena: reads would copy it out.
         #[cfg(feature = "bytes_1")]
         let in_arena = None;
-        // The slot is written before anything that can panic: the store
-        // drops every slot below its count as a value, so a reserved slot
-        // left unwritten by a panic in the node's allocation would be dropped
-        // as one it never held. A value in the arena leaves the slot an empty
-        // inline value, which owns nothing.
+        #[cfg(test)]
+        assert!(
+            !self
+                .unwind_before_value_write
+                .swap(false, Ordering::Relaxed),
+            "injected unwind before the value write"
+        );
+        // A value in the arena leaves the slot an empty inline value, which
+        // owns nothing.
         let node = if let Some(node) = in_arena {
-            // SAFETY: `value_idx` was reserved by this insert and is written once.
-            unsafe { self.values.write(value_idx, UserValue::empty()) };
+            slot.write(UserValue::empty());
             node
         } else {
             let value = match value {
                 InsertBytes::Borrowed(bytes) => UserValue::from(bytes),
                 InsertBytes::Shared(value) => value,
             };
-            // SAFETY: `value_idx` was reserved by this insert and is written once.
-            unsafe { self.values.write(value_idx, value) };
+            slot.write(value);
             self.alloc_node(key, value_idx, height, kv_digest)
         };
 

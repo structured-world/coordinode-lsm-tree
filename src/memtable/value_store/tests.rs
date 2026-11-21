@@ -180,6 +180,26 @@ fn a_failed_segment_allocation_uses_the_segment_another_write_installed() {
     );
 }
 
+/// A reservation dropped unwritten, its insert unwinding before any segment
+/// was allocated, allocates none (it runs while unwinding) but marks the
+/// segment torn, so the next write fills the slot with an empty value rather
+/// than leaving it to the fresh memory's pattern.
+#[test]
+fn a_reservation_dropped_before_its_segment_exists_leaves_an_empty_value() {
+    let store = ValueStore::new();
+    store.scribble_segments_for_test();
+    drop(store.reserve_slot());
+    assert_eq!(first_segment(&store), torn(), "no segment allocated yet");
+
+    let idx = store.append(val(b"a value too long to be held inline"));
+    assert!(unsafe { store.get(0) }.is_empty());
+    assert_eq!(
+        &*unsafe { store.get(idx) },
+        b"a value too long to be held inline"
+    );
+    drop(store);
+}
+
 /// A write that found its segment null and allocated it, while a failed
 /// allocation marked the segment torn meanwhile, installs its segment over
 /// the marker filled with empty values, so the slot the failed write left

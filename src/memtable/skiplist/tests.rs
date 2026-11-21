@@ -971,6 +971,45 @@ fn only_borrowed_bytes_up_to_the_limit_go_into_the_arena() {
     assert!(!placed(InsertBytes::Shared(make_value(b"small"))));
 }
 
+/// An insert that unwinds between reserving its value slot and writing it
+/// (a failed allocation of its node or of its value's buffer, which unwinds
+/// without `std`) leaves the slot an empty value: the store drops every
+/// reserved slot, and the slot lies in a segment an earlier insert allocated,
+/// filled with a pattern that reads as a value with a wild pointer. Covered
+/// for a value bound for the arena and for one bound for the store.
+#[test]
+fn an_insert_unwinding_before_its_value_write_leaves_a_droppable_slot() {
+    for value in [
+        InsertBytes::Borrowed(b"small"),
+        InsertBytes::Shared(make_value(b"a value too long to be held inline")),
+    ] {
+        let map = new_map();
+        map.values_for_test().scribble_segments_for_test();
+        map.insert(
+            &make_key(b"a", 1),
+            make_value(b"first, allocating the segment"),
+        );
+
+        map.unwind_before_value_write_for_test();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.insert_with_kv_digest(&make_key(b"b", 2), value, None);
+        }));
+        assert!(
+            unwound.is_err(),
+            "the injected unwind must reach the caller"
+        );
+
+        // The map stays usable and drops every slot it reserved.
+        map.insert(&make_key(b"c", 3), make_value(b"after the unwind"));
+        assert_eq!(
+            map.point_get(b"c", 4).map(|v| v.value).as_deref(),
+            Some(&b"after the unwind"[..])
+        );
+        assert!(map.point_get(b"b", 4).is_none());
+        drop(map);
+    }
+}
+
 /// A value read from the arena stays valid after the map that held it is
 /// dropped and its memory reused, as a key read from it does: the read is a
 /// view that keeps its arena block alive.
