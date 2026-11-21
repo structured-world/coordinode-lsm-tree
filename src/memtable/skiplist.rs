@@ -62,14 +62,15 @@ const BACK_BATCH_LEVEL: usize = 2;
 //                              height-1/2 node; `key_offset` still addresses
 //                              it like any arena span)
 //
-// +24+4×height+key_len  u32 + [u8; len] — the value, when the write handed
-//                              over bytes of at most `ARENA_VALUE_MAX` and the
-//                              arena had room (flagged in the value_type byte)
+// A value the write handed over as bytes of at most `ARENA_VALUE_MAX` lies in
+// the separate value arena as u32 length + bytes, and the node (flagged in the
+// value_type byte) holds its offset there at +4 in place of the value index:
+// the nodes a search walks stay packed, not spaced out by their values.
 //
 // Other values are kept in a separate heap-backed store, so large values
 // don't bloat the arena and cause exhaustion.
 //
-// Total: 24 + 4 × height + key_len [+ 4 + value_len]   (always 4-byte aligned)
+// Total: 24 + 4 × height + key_len   (always 4-byte aligned)
 
 // Layout offsets — only OFF_HEIGHT and OFF_TOWER are used by name in code;
 // the rest are accessed via array slicing in the node_*() accessors.
@@ -141,6 +142,10 @@ enum NodeKvDigest {
 /// [`InternalKey`] (ordered by `user_key` ascending, then seqno descending).
 pub(crate) struct SkipMap {
     arena: Arena,
+    /// The values written as bytes, apart from the nodes so a search walks
+    /// packed nodes; a node flagged `VALUE_IN_ARENA` holds its value's offset
+    /// here in place of its value index.
+    value_arena: Arena,
     /// Lock-free segmented storage for values.  Keys live in the arena for
     /// cache locality during comparisons; values live here so large blobs
     /// don't exhaust the arena.  Indexed by `value_idx` stored in each node.
@@ -239,6 +244,7 @@ impl SkipMap {
         let is_lexicographic = comparator.is_lexicographic();
         Self {
             arena,
+            value_arena: Arena::new(),
             values: ValueStore::new(),
             comparator,
             is_lexicographic,
@@ -493,10 +499,10 @@ impl SkipMap {
             self.value_in_arena(node),
             "the first value must be in the arena"
         );
-        let at = self.node_key_offset(node) + u32::from(self.node_key_len(node)) + 4;
+        let at = self.node_value_idx(node) + 4;
         // SAFETY: a non-empty arena value's first byte follows its length word.
         unsafe {
-            if let Some(b) = self.arena.get_bytes_mut(at, 1).first_mut() {
+            if let Some(b) = self.value_arena.get_bytes_mut(at, 1).first_mut() {
                 *b ^= 0xFF;
             }
         }
@@ -662,9 +668,9 @@ impl SkipMap {
             .expect("arena exhausted (node)")
     }
 
-    /// [`Self::alloc_node`], with `value`'s bytes in the same allocation right
-    /// after the key, behind their 4-byte length, when given; `None` when the
-    /// arena cannot take the allocation.
+    /// [`Self::alloc_node`], with `value`'s bytes in the value arena behind
+    /// their 4-byte length, when given; `None` when an arena cannot take the
+    /// allocation.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "key_bytes.len() <= u16::MAX, a value here <= ARENA_VALUE_MAX, \
@@ -684,6 +690,31 @@ impl SkipMap {
             "only small values go into the arena"
         );
 
+        // The value goes into an arena of its own, so the nodes a search
+        // walks stay packed together with their keys: interleaved with the
+        // values, every step of a search would land on another cache line.
+        // Taken first: a value arena out of room falls back before the node
+        // takes any memory.
+        let value_at = match value {
+            Some(value) => {
+                let at = self.value_arena.alloc(4 + value.len() as u32, 4)?;
+                // SAFETY: the length word and the value bytes are the
+                // allocation made above; exclusive access before publish.
+                unsafe {
+                    self.value_arena
+                        .get_bytes_mut(at, 4)
+                        .copy_from_slice(&(value.len() as u32).to_ne_bytes());
+                    if !value.is_empty() {
+                        self.value_arena
+                            .get_bytes_mut(at + 4, value.len() as u32)
+                            .copy_from_slice(value);
+                    }
+                }
+                Some(at)
+            }
+            None => None,
+        };
+
         // One arena allocation carries the node header, the tower AND the key
         // bytes (key right after the tower). Two separate allocations would
         // cost a second CAS loop on the bump cursor per insert, and would let
@@ -691,10 +722,7 @@ impl SkipMap {
         // before it — with a typical height of 1-2 the key starts at +28/+32,
         // on the same cache line as the header `compare_key` just loaded.
         let n_size = node_size(height);
-        let value_size = value.map_or(0, |v| 4 + v.len() as u32);
-        let node = self
-            .arena
-            .alloc(n_size + key_bytes.len() as u32 + value_size, 4)?;
+        let node = self.arena.alloc(n_size + key_bytes.len() as u32, 4)?;
         let key_offset = node + n_size;
         if !key_bytes.is_empty() {
             // SAFETY: key_offset..+len is within the allocation made above;
@@ -703,22 +731,6 @@ impl SkipMap {
                 self.arena
                     .get_bytes_mut(key_offset, key_bytes.len() as u32)
                     .copy_from_slice(key_bytes);
-            }
-        }
-        if let Some(value) = value {
-            let at = key_offset + key_bytes.len() as u32;
-            // SAFETY: the length word and the value bytes lie right after the
-            // key, within the allocation made above; exclusive access before
-            // publish.
-            unsafe {
-                self.arena
-                    .get_bytes_mut(at, 4)
-                    .copy_from_slice(&(value.len() as u32).to_ne_bytes());
-                if !value.is_empty() {
-                    self.arena
-                        .get_bytes_mut(at + 4, value.len() as u32)
-                        .copy_from_slice(value);
-                }
             }
         }
 
@@ -734,13 +746,19 @@ impl SkipMap {
         unsafe {
             let meta = self.arena.get_bytes_mut(node, OFF_TOWER);
             meta[0..4].copy_from_slice(&key_offset.to_ne_bytes());
-            meta[4..8].copy_from_slice(&value_idx.to_ne_bytes());
+            // A value in the value arena is found by its offset there; its
+            // store slot stays empty, so the index is not needed.
+            meta[4..8].copy_from_slice(&value_at.unwrap_or(value_idx).to_ne_bytes());
             // Cast is safe: InternalKey::new() asserts key.len() <= u16::MAX.
             meta[8..10].copy_from_slice(&(key_bytes.len() as u16).to_ne_bytes());
             // ValueType discriminant in the low bits; high bit (KV_DIGEST_PRESENT)
             // flags an insert-time per-KV digest in the reserved slot below.
-            let vt_byte =
-                u8::from(key.value_type) | if value.is_some() { VALUE_IN_ARENA } else { 0 };
+            let vt_byte = u8::from(key.value_type)
+                | if value_at.is_some() {
+                    VALUE_IN_ARENA
+                } else {
+                    0
+                };
             // Arena memory is uninitialized — the reserved padding at +12 is
             // either the digest (when present) or zeroed, so the whole header
             // is fully written before the node is published. The algorithm's
@@ -971,13 +989,12 @@ impl SkipMap {
         if m[10] & VALUE_IN_ARENA == 0 {
             return None;
         }
-        let key_off = u32::from_ne_bytes(m[0..4].try_into().expect("4 bytes"));
-        let key_len = u32::from(u16::from_ne_bytes(m[8..10].try_into().expect("2 bytes")));
-        // SAFETY: the insert wrote the length word and the value bytes right
-        // after the key, in the node's allocation, before the publishing CAS;
-        // published bytes are never rewritten.
+        let value_at = u32::from_ne_bytes(m[4..8].try_into().expect("4 bytes"));
+        // SAFETY: the insert wrote the length word and the value bytes at
+        // `value_at` in the value arena before the publishing CAS; published
+        // bytes are never rewritten.
         Some(UserValue::from_view(unsafe {
-            self.arena.get_len_prefixed_view(key_off + key_len)
+            self.value_arena.get_len_prefixed_view(value_at)
         }))
     }
 
@@ -1011,8 +1028,9 @@ impl SkipMap {
         let value = if m[10] & VALUE_IN_ARENA == 0 {
             self.node_value_from_store(m)
         } else {
+            let value_at = u32::from_ne_bytes(m[4..8].try_into().expect("4 bytes"));
             // SAFETY: as `arena_value`.
-            UserValue::from_view(unsafe { self.arena.get_len_prefixed_view(key_off + key_len) })
+            UserValue::from_view(unsafe { self.value_arena.get_len_prefixed_view(value_at) })
         };
         #[cfg(feature = "bytes_1")]
         let value = self.node_value_from_store(m);
