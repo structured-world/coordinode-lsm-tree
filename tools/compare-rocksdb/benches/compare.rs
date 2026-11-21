@@ -136,8 +136,11 @@
 //!   several memtables large, compaction running behind the writes and a
 //!   reader alongside. Time per write, with write and space amplification and
 //!   the read percentiles reported beside it (see [`Sustained`]).
+//! - `overwrite_skew_*`: writes into a memtable that already holds a key set,
+//!   timed without a flush, by key distribution, writer count and shared key
+//!   prefix (see [`SkewShape`]). Uncompressed only: nothing is written to disk.
 //!
-//! Each of the above also has a `_zstd22` sibling, run at every size (see
+//! Each of the other groups above also has a `_zstd22` sibling, run at every size (see
 //! [`SIZES`]).
 //!
 //! Values carry the compressibility RocksDB's own `db_bench` gives its values
@@ -3218,6 +3221,297 @@ fn bench_overwrite_sustained(run: &mut Run) {
     }
 }
 
+/// How the keys of a skewed overwrite group are drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Skew {
+    /// New keys in increasing order past those the memtable holds, as a log
+    /// or a time series appends.
+    Append,
+    /// Keys of the held set, each equally likely.
+    Uniform,
+    /// Keys of the held set by Zipf(0.99) over their ranks, the YCSB skew.
+    Zipf,
+    /// One key, every write.
+    Hot,
+}
+
+impl Skew {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Uniform => "uniform",
+            Self::Zipf => "zipf",
+            Self::Hot => "hot",
+        }
+    }
+}
+
+/// The skewed overwrite groups: writes into a memtable that already holds a
+/// key set, timed without a flush, so the number is the insert path alone.
+struct SkewShape {
+    /// Keys the memtable holds before the timed writes.
+    keys: u64,
+    /// Timed writes.
+    writes: u64,
+}
+
+impl SkewShape {
+    /// RocksDB's write buffer for these groups: far above what a group
+    /// writes, so no flush starts inside the timed writes. Ours flushes only
+    /// when asked.
+    const WRITE_BUFFER: usize = 1 << 30;
+    /// The Zipf exponent, YCSB's.
+    const ZIPF_THETA: f64 = 0.99;
+    /// Writer threads of the writer axis.
+    const WRITERS: &[usize] = &[1, 4, 16, 32];
+    /// Bytes every key of the prefix axis shares before its own 8.
+    const PREFIXES: &[usize] = &[8, 32, 64];
+
+    fn new(measuring: bool) -> Self {
+        if measuring {
+            Self {
+                keys: 100_000,
+                writes: 200_000,
+            }
+        } else {
+            Self {
+                keys: 1_000,
+                writes: 2_000,
+            }
+        }
+    }
+}
+
+/// The keys of one skewed group, generated before any timing: the held set,
+/// then the timed writes, each `prefix` shared bytes and 8 of its own, laid
+/// end to end.
+struct SkewInputs {
+    stride: usize,
+    held: Vec<u8>,
+    writes: Vec<u8>,
+}
+
+impl SkewInputs {
+    fn new(shape: &SkewShape, skew: Skew, prefix: usize) -> Self {
+        let stride = prefix + 8;
+        // Append keys sort by their number; the others scatter it (an odd
+        // multiplier is a bijection on u64) so the held set lands in random
+        // order and the hot ranks spread over the key space.
+        let encode = |out: &mut Vec<u8>, id: u64| {
+            out.resize(out.len() + prefix, 0x5A);
+            let own = if skew == Skew::Append {
+                id
+            } else {
+                id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            };
+            out.extend_from_slice(&own.to_be_bytes());
+        };
+        let count = |n: u64| usize::try_from(n).expect("a key count fits usize") * stride;
+        let mut held = Vec::with_capacity(count(shape.keys));
+        for id in 0..shape.keys {
+            encode(&mut held, id);
+        }
+        let mut writes = Vec::with_capacity(count(shape.writes));
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let zipf_cdf = (skew == Skew::Zipf).then(|| {
+            let mut sum = 0.0;
+            let mut cdf: Vec<f64> = (0..shape.keys)
+                .map(|rank| {
+                    // Ranks stay below 2^53, where the conversion is exact.
+                    sum += 1.0 / ((rank + 1) as f64).powf(SkewShape::ZIPF_THETA);
+                    sum
+                })
+                .collect();
+            for p in &mut cdf {
+                *p /= sum;
+            }
+            cdf
+        });
+        for write in 0..shape.writes {
+            let id = match skew {
+                Skew::Append => shape.keys + write,
+                Skew::Uniform => next() % shape.keys,
+                Skew::Zipf => {
+                    let cdf = zipf_cdf.as_ref().expect("built for Zipf");
+                    // The top 53 bits as a fraction in [0, 1).
+                    let u = (next() >> 11) as f64 / (1_u64 << 53) as f64;
+                    let rank = cdf.partition_point(|&p| p <= u).min(cdf.len() - 1);
+                    u64::try_from(rank).expect("a rank fits u64")
+                }
+                Skew::Hot => 0,
+            };
+            encode(&mut writes, id);
+        }
+        Self {
+            stride,
+            held,
+            writes,
+        }
+    }
+
+    fn held(&self) -> std::slice::ChunksExact<'_, u8> {
+        self.held.chunks_exact(self.stride)
+    }
+
+    fn write(&self, i: usize) -> &[u8] {
+        &self.writes[i * self.stride..(i + 1) * self.stride]
+    }
+
+    fn write_count(&self) -> usize {
+        self.writes.len() / self.stride
+    }
+}
+
+/// Times `put` over every write of `inputs` on `writers` threads, write `i`
+/// on thread `i % writers`, so concurrent writers keep the order the writes
+/// were drawn in as a shared sequence would. One writer runs on the calling
+/// thread. The threads start together; the time runs from their start to the
+/// last one's end.
+fn time_writers(writers: usize, inputs: &SkewInputs, put: impl Fn(&[u8], u64) + Sync) -> Duration {
+    let n = inputs.write_count();
+    let index = |i: usize| u64::try_from(i).expect("an index fits u64");
+    if writers == 1 {
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            put(inputs.write(i), index(i));
+        }
+        return start.elapsed();
+    }
+    let barrier = std::sync::Barrier::new(writers + 1);
+    let start = std::thread::scope(|scope| {
+        for first in 0..writers {
+            let (barrier, put) = (&barrier, &put);
+            spawn_named(scope, "skew-writer", move || {
+                barrier.wait();
+                for i in (first..n).step_by(writers) {
+                    put(inputs.write(i), index(i));
+                }
+            });
+        }
+        barrier.wait();
+        std::time::Instant::now()
+    });
+    start.elapsed()
+}
+
+/// One skewed group, ours against RocksDB: each iteration opens an empty
+/// engine, writes the held set, then times the writes. Neither engine writes
+/// a log or flushes; ours takes each write's seqno from a shared counter, as
+/// RocksDB assigns its own.
+fn skew_group(
+    run: &mut Run,
+    group: &str,
+    shape: &SkewShape,
+    inputs: &SkewInputs,
+    writers: usize,
+    pool: &ValuePool,
+) {
+    if !run.wants(group) {
+        return;
+    }
+    let held = shape.keys;
+    let arms = run
+        .engines_of(&[Engine::Ours, Engine::RocksDb])
+        .into_iter()
+        .map(|engine| {
+            paired::Arm::new(engine.label(), move |iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let dir = state_dir();
+                    match engine {
+                        Engine::Ours => {
+                            let tree = ours_config(
+                                dir.path(),
+                                Compression::None,
+                                None,
+                                IndexStrategy::Binary,
+                                false,
+                            )
+                            .open()
+                            .expect("ours skew: open");
+                            for (seqno, key) in (0..).zip(inputs.held()) {
+                                tree.insert(key, pool.value(seqno), seqno);
+                            }
+                            let seqno = AtomicU64::new(held);
+                            total += time_writers(writers, inputs, |key, i| {
+                                let seqno = seqno.fetch_add(1, Ordering::Relaxed);
+                                tree.insert(key, pool.value(held + i), seqno);
+                            });
+                            drop(tree);
+                        }
+                        Engine::RocksDb => {
+                            let mut opts = rocksdb_options(Compression::None, false, None);
+                            opts.set_write_buffer_size(SkewShape::WRITE_BUFFER);
+                            let db =
+                                rocksdb::DB::open(&opts, dir.path()).expect("rocksdb skew: open");
+                            let mut write_opts = rocksdb::WriteOptions::default();
+                            write_opts.disable_wal(true);
+                            for (seqno, key) in (0..).zip(inputs.held()) {
+                                db.put_opt(key, pool.value(seqno), &write_opts)
+                                    .expect("rocksdb skew: held put");
+                            }
+                            total += time_writers(writers, inputs, |key, i| {
+                                db.put_opt(key, pool.value(held + i), &write_opts)
+                                    .expect("rocksdb skew: put");
+                            });
+                            drop(db);
+                        }
+                        _ => unreachable!("the skew groups run ours and rocksdb only"),
+                    }
+                    drop(dir);
+                    settle_removal();
+                }
+                total
+            })
+        })
+        .collect();
+    run.measure(group, shape.writes, arms);
+}
+
+/// The skewed overwrite groups: each key distribution on 1 to 32 writers with
+/// 8-byte keys (`overwrite_skew_<skew>_w<writers>`), and the uniform and Zipf
+/// writes of one writer with keys behind a shared prefix
+/// (`overwrite_skew_<skew>_prefix<bytes>`).
+fn bench_overwrite_skew(run: &mut Run) {
+    let shape = SkewShape::new(run.measuring);
+    let pool = ValuePool::new();
+    for skew in [Skew::Append, Skew::Uniform, Skew::Zipf, Skew::Hot] {
+        let groups: Vec<(String, usize)> = SkewShape::WRITERS
+            .iter()
+            .map(|&writers| {
+                (
+                    format!("overwrite_skew_{}_w{writers}", skew.label()),
+                    writers,
+                )
+            })
+            .filter(|(group, _)| run.wants(group))
+            .collect();
+        if groups.is_empty() {
+            continue;
+        }
+        let inputs = SkewInputs::new(&shape, skew, 0);
+        for (group, writers) in groups {
+            skew_group(run, &group, &shape, &inputs, writers, &pool);
+        }
+    }
+    for skew in [Skew::Uniform, Skew::Zipf] {
+        for &prefix in SkewShape::PREFIXES {
+            let group = format!("overwrite_skew_{}_prefix{prefix}", skew.label());
+            if !run.wants(&group) {
+                continue;
+            }
+            let inputs = SkewInputs::new(&shape, skew, prefix);
+            skew_group(run, &group, &shape, &inputs, 1, &pool);
+        }
+    }
+}
+
 /// L0 tables built before timing the compaction. Their key ranges overlap
 /// (the golden-ratio key scatter spreads consecutive indices across the
 /// keyspace), so neither engine can "trivially move" them to the next level
@@ -3567,6 +3861,10 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     (
         "overwrite_sustained",
         "100,000 keys, then 15 rewrites of a hot set of 20,000 of them, with compaction behind the writes and a reader alongside. 4 MiB memtables, 2 MiB tables, 4 L0 runs per compaction, no write-ahead log on either. Ours flushes on a thread of its own as RocksDB does, one sealed memtable at a time as RocksDB's two write buffers allow, with deferred durability and one sync barrier per 8 flushes; it runs leveled compaction on another thread and stops writes at 36 L0 runs, RocksDB's stop trigger. Time per write; beside it the compaction bytes per written byte until compaction rests, the disk bytes over live bytes when the last write lands, and the reader's p50 and p99.",
+    ),
+    (
+        "overwrite_skew",
+        "200,000 writes into a memtable that already holds 100,000 keys, timed without a flush: the insert path alone. No write-ahead log on either; RocksDB's write buffer holds every write. Keys drawn in increasing order past the held set (append), uniformly from it, by Zipf(0.99) over it, or one key every time (hot). _w<N>: on N writer threads, 8-byte keys. _prefix<N>: one writer, keys behind an N-byte shared prefix.",
     ),
     (
         "point_read",
@@ -3967,6 +4265,7 @@ fn main() {
     bench_write_throughput(&mut run);
     bench_seeded(&mut run);
     bench_overwrite_sustained(&mut run);
+    bench_overwrite_skew(&mut run);
     bench_compaction(&mut run);
     bench_subcompaction(&mut run);
     if !run.measuring {
