@@ -2678,6 +2678,10 @@ struct Sustained {
     hot: u64,
     /// Rewrites of the hot set.
     passes: u64,
+    /// Nanoseconds the writer takes at least per write, from
+    /// `COMPARE_SUSTAINED_WRITE_NS`; 0 writes as fast as the engine takes
+    /// them. A diagnostic: reads compared at equal load.
+    pace_ns: u64,
 }
 
 impl Sustained {
@@ -2697,23 +2701,48 @@ impl Sustained {
     const PERSIST_EVERY: u32 = 8;
 
     fn new(measuring: bool) -> Self {
+        // A pace from `COMPARE_SUSTAINED_WRITE_NS`, none without it. A value
+        // that is not one stops the run, as `COMPARE_SIZES` does.
+        let pace_ns = std::env::var("COMPARE_SUSTAINED_WRITE_NS").map_or(0, |v| {
+            v.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("COMPARE_SUSTAINED_WRITE_NS: not a count: {v}"))
+        });
         if measuring {
             Self {
                 keys: 100_000,
                 hot: 20_000,
                 passes: 15,
+                pace_ns,
             }
         } else {
             Self {
                 keys: 5_000,
                 hot: 1_000,
                 passes: 3,
+                pace_ns,
             }
         }
     }
 
     fn writes(self) -> u64 {
         self.hot * self.passes
+    }
+
+    /// Holds write `write` back until `pace_ns` per write have passed since
+    /// `start`, so engines of different speeds put the same load on their
+    /// reads; returns at once without a pace.
+    fn pace(self, start: std::time::Instant, write: u64) {
+        if self.pace_ns == 0 {
+            return;
+        }
+        // Writes and the pace stay far below 2^32 each, so the product fits.
+        let due = Duration::from_nanos(write * self.pace_ns);
+        // Spun, not slept: a sleep wakes far later than the microsecond a
+        // write takes.
+        while start.elapsed() < due {
+            std::hint::spin_loop();
+        }
     }
 
     /// Bytes of a key and its value.
@@ -3018,6 +3047,7 @@ fn sustained_ours(
         });
         let start = std::time::Instant::now();
         for write in 0..shape.writes() {
+            shape.pace(start, write);
             #[cfg(feature = "metrics")]
             let stalled_at = std::time::Instant::now();
             while tree.l0_run_count() >= Sustained::L0_STOP {
@@ -3147,6 +3177,7 @@ fn sustained_rocksdb(
         let _stop = RaiseOnDrop(&stop);
         let start = std::time::Instant::now();
         for write in 0..shape.writes() {
+            shape.pace(start, write);
             let key = &keys[usize::try_from(write % shape.hot).expect("an index fits usize")];
             db.put_opt(key, pool.value(shape.keys + write), &write_opts)
                 .expect("rocksdb sustained: put");
