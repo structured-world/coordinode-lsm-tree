@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795223850382,
+  "lastUpdate": 1795223855163,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -118866,6 +118866,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.888727124,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "21b293a5e43749a5877d9c1c24d94dee3d96f8e2",
+          "message": "bench(compare): measure the overwrite path in parts (#1093)\n\n## Summary\n\n- The comparison benchmark measures the overwrite path in parts, under\nsustained load, and on Windows, and sets our caller-kept log against\nRocksDB's own.\n\n## Changes\n\n- Overwrite breakdown arms that time each part of an overwrite apart.\n- A sustained overwrite scenario.\n- Windows runs of the comparison.\n- Batched syncs through the sync-skipping backend, so a run without\nsyncs still exercises the batch path; a batch it skips nothing of is\nhanded over uncopied, and a filtered one is kept inline, so the arms\ndiffer only by the syncs they leave out.\n- The caller's log of `ours-deferred-wal` encodes the batch into one\nbuffer and writes it with one call, and the arm is set against\n`rocksdb-wal`: RocksDB writing the same batch through its own log with a\nsync. Neither flushes in the timed window.\n\n## Testing\n\nThe harness builds and lints clean (clippy, all targets) on macOS and\nruns on a Linux benchmark host; its paired-run test runs in CI.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Benchmarking**\n* Added overwrite comparisons between deferred-write and RocksDB\nwrite-ahead logging, with timed measurements excluding flushes.\n* Added overwrite-part benchmarks that measure the impact of skipping\nselected sync operations, with optional filter disabling.\n* Clarified benchmark budgets and how setup time affects iteration\nsizing and reported samples.\n* Documented engine configurations for paired comparisons and how shared\nbenchmark state is stored and prepared.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-21T02:03:31+02:00",
+          "tree_id": "12dc27a488d1d6401442d9f94ba4529842ff673d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/21b293a5e43749a5877d9c1c24d94dee3d96f8e2"
+        },
+        "date": 1795223853887,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 597.2230000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 192.382336ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 341.89099999999996,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 190.594477ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1216.001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 267.215745ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5270.765,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 20665.082000000002,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 24.975,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 51.019775,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.423224739,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.615,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.887551,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.415738849,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
