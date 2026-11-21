@@ -160,7 +160,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 // `Guard` is a trait, used (not dead) for its `.value()` method on the
@@ -3414,21 +3414,59 @@ fn time_writers(writers: usize, inputs: &SkewInputs, put: impl Fn(&[u8], u64) + 
         }
         return start.elapsed();
     }
-    let barrier = std::sync::Barrier::new(writers + 1);
+    // The clock starts once every writer is waiting at the gate and before
+    // the gate opens, so no write runs ahead of it. A spawn that fails cancels
+    // the gate instead, so the writers already started return and the scope
+    // can join them rather than wait on a writer that never came.
+    let ready = AtomicUsize::new(0);
+    let gate = AtomicU8::new(GATE_CLOSED);
     let start = std::thread::scope(|scope| {
+        let cancel = CancelGate(&gate);
         for first in 0..writers {
-            let (barrier, put) = (&barrier, &put);
+            let (ready, gate, put) = (&ready, &gate, &put);
             spawn_named(scope, "skew-writer", move || {
-                barrier.wait();
+                ready.fetch_add(1, Ordering::Release);
+                loop {
+                    match gate.load(Ordering::Acquire) {
+                        GATE_OPEN => break,
+                        GATE_CANCELLED => return,
+                        _ => std::thread::yield_now(),
+                    }
+                }
                 for i in (first..n).step_by(writers) {
                     put(inputs.write(i), index(i));
                 }
             });
         }
-        barrier.wait();
-        std::time::Instant::now()
+        while ready.load(Ordering::Acquire) < writers {
+            std::thread::yield_now();
+        }
+        let start = std::time::Instant::now();
+        gate.store(GATE_OPEN, Ordering::Release);
+        drop(cancel);
+        start
     });
     start.elapsed()
+}
+
+/// [`time_writers`]' start gate: writers wait while it is closed.
+const GATE_CLOSED: u8 = 0;
+/// The writers start.
+const GATE_OPEN: u8 = 1;
+/// Setup failed: the writers return without writing.
+const GATE_CANCELLED: u8 = 2;
+
+/// Cancels a start gate still closed when dropped, as it is when a spawn
+/// unwinds before every writer started.
+struct CancelGate<'a>(&'a AtomicU8);
+
+impl Drop for CancelGate<'_> {
+    fn drop(&mut self) {
+        // Only the thread that spawns the writers opens or cancels the gate.
+        if self.0.load(Ordering::Relaxed) == GATE_CLOSED {
+            self.0.store(GATE_CANCELLED, Ordering::Release);
+        }
+    }
 }
 
 /// One skewed group, ours against RocksDB: each iteration opens an empty
