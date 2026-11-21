@@ -25,7 +25,6 @@
 //! longer eagerly zeroes its arena block).
 
 use super::own_line::OwnLine;
-use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 use core::ptr;
@@ -37,17 +36,20 @@ use parking_lot::Mutex;
 #[cfg(not(feature = "std"))]
 use spin::Mutex;
 
-/// Arena blocks the dropped memtables of one tree hand to its next ones.
+/// Arena blocks dropped memtables hand to the next ones, of any tree.
 ///
 /// A block freed back to the allocator comes back as fresh pages the next
-/// memtable faults in one by one; reused, it is already mapped. The pool
-/// keeps at most as many blocks as the last arena that gave any held, so it
-/// holds what a memtable of the tree takes, never more, and frees them all
-/// when the tree's last memtable is gone.
-#[derive(Default)]
+/// memtable faults in one by one; reused, it is already mapped. A tree opened
+/// after another closed takes the blocks that one left, as small buffers
+/// freed to the allocator would be reused, so a short-lived tree pays no more
+/// than a long-lived one. The pool keeps at most as many blocks as the last
+/// arena that gave any held: what one memtable takes, never more.
 pub(crate) struct BlockPool {
     blocks: Mutex<Vec<Block>>,
 }
+
+/// The pool every memtable's arena uses.
+pub(crate) static BLOCKS: BlockPool = BlockPool::new();
 
 /// The data base of a `BLOCK_SIZE` shared heap region, held by one owner.
 struct Block(*mut u8);
@@ -57,6 +59,12 @@ struct Block(*mut u8);
 unsafe impl Send for Block {}
 
 impl BlockPool {
+    pub(crate) const fn new() -> Self {
+        Self {
+            blocks: Mutex::new(Vec::new()),
+        }
+    }
+
     fn take(&self) -> Option<*mut u8> {
         self.blocks.lock().pop().map(|block| block.0)
     }
@@ -135,22 +143,22 @@ pub(crate) struct Arena {
     cursor: OwnLine<AtomicU32>,
 
     /// Where blocks come from before the allocator, and go back to when the
-    /// arena drops, if anywhere.
-    pool: Option<Arc<BlockPool>>,
+    /// arena drops.
+    pool: &'static BlockPool,
 }
 
 // Send+Sync derived automatically: all fields (Box<[AtomicPtr<_>]>, AtomicU32,
-// Arc of a Sync pool) are Send+Sync.
+// a reference to a Sync pool) are Send+Sync.
 
 impl Arena {
-    /// Creates a new empty arena.  No memory is allocated until the first
-    /// [`alloc`](Self::alloc) call.
+    /// Creates a new empty arena on the shared [`BLOCKS`] pool.  No memory is
+    /// allocated until the first [`alloc`](Self::alloc) call.
     pub(crate) fn new() -> Self {
-        Self::with_pool(None)
+        Self::with_pool(&BLOCKS)
     }
 
     /// [`Self::new`], taking blocks from `pool` and handing them back to it.
-    pub(crate) fn with_pool(pool: Option<Arc<BlockPool>>) -> Self {
+    pub(crate) fn with_pool(pool: &'static BlockPool) -> Self {
         let mut blocks = Vec::with_capacity(MAX_BLOCKS);
         for _ in 0..MAX_BLOCKS {
             blocks.push(AtomicPtr::new(ptr::null_mut()));
@@ -399,8 +407,7 @@ impl Arena {
             // pages are already mapped, and nothing reads it any more.
             let raw = self
                 .pool
-                .as_deref()
-                .and_then(BlockPool::take)
+                .take()
                 .unwrap_or_else(|| crate::byteview::ByteView::alloc_shared_heap(BLOCK_SIZE));
 
             // CAS null → raw.  If another thread won, give our block back.
@@ -408,10 +415,7 @@ impl Arena {
                 .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                match self.pool.as_deref() {
-                    Some(pool) => pool.give(alloc::vec![raw], usize::MAX),
-                    None => release(raw),
-                }
+                self.pool.give(alloc::vec![raw], usize::MAX);
             }
         }
     }
@@ -435,9 +439,7 @@ impl Drop for Arena {
             held += 1;
             // SAFETY: the arena holds a reference to every block it set, and
             // with the arena gone no view of it can be taken any more.
-            if self.pool.is_some()
-                && unsafe { crate::byteview::ByteView::shared_heap_is_unique(ptr) }
-            {
+            if unsafe { crate::byteview::ByteView::shared_heap_is_unique(ptr) } {
                 unviewed.push(ptr);
             } else {
                 // Outstanding views (ByteViews handed out by get_view) each
@@ -446,9 +448,7 @@ impl Drop for Arena {
                 release(ptr);
             }
         }
-        if let Some(pool) = &self.pool {
-            pool.give(unviewed, held);
-        }
+        self.pool.give(unviewed, held);
     }
 }
 

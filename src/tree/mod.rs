@@ -1068,10 +1068,9 @@ impl AbstractTree for Tree {
                 // that number.
                 self.flush_seqs.decide_taken();
                 let mut copy = v.clone();
-                copy.active_memtable = Arc::new(Memtable::with_block_pool(
+                copy.active_memtable = Arc::new(Memtable::new(
                     self.memtable_id_counter.next(),
-                    &self.config.comparator,
-                    Some(Arc::clone(&self.arena_blocks)),
+                    self.config.comparator.clone(),
                 ));
                 copy.sealed_memtables = Arc::default();
                 copy.version = v.version.cleared(&still_written);
@@ -1726,10 +1725,9 @@ impl AbstractTree for Tree {
         }
 
         let mut copy = version_history_lock.latest_version();
-        copy.active_memtable = Arc::new(Memtable::with_block_pool(
+        copy.active_memtable = Arc::new(Memtable::new(
             self.memtable_id_counter.next(),
-            &self.config.comparator,
-            Some(Arc::clone(&self.arena_blocks)),
+            self.config.comparator.clone(),
         ));
         copy.sealed_memtables = Arc::new(SealedMemtables::default());
 
@@ -5750,10 +5748,9 @@ impl Tree {
         let yanked_memtable = Arc::clone(&super_version.active_memtable);
 
         let mut copy = super_version.clone();
-        copy.active_memtable = Arc::new(Memtable::with_block_pool(
+        copy.active_memtable = Arc::new(Memtable::new(
             self.memtable_id_counter.next(),
-            &self.config.comparator,
-            Some(Arc::clone(&self.arena_blocks)),
+            self.config.comparator.clone(),
         ));
         copy.sealed_memtables =
             Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));
@@ -6207,7 +6204,6 @@ impl Tree {
             life,
             closing: core::sync::atomic::AtomicBool::new(false),
             memtable_id_counter: SequenceNumberCounter::new(1),
-            arena_blocks: Arc::default(),
             table_id_counter,
             table_files,
             blob_file_id_counter: SequenceNumberCounter::default(),
