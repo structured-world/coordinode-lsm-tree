@@ -953,7 +953,8 @@ fn values_of_every_placement_read_back_as_written() {
 
 /// Borrowed bytes up to the limit go into the arena and nothing past it, and
 /// a kept buffer never does: the placement the memtable's memory accounting
-/// and the read path rely on.
+/// and the read path rely on. With the `bytes` backend nothing goes there,
+/// since a `Bytes` value cannot view an arena block.
 #[test]
 fn only_borrowed_bytes_up_to_the_limit_go_into_the_arena() {
     let placed = |value: InsertBytes<'_>| {
@@ -963,8 +964,9 @@ fn only_borrowed_bytes_up_to_the_limit_go_into_the_arena() {
     };
     let at_limit = vec![7u8; ARENA_VALUE_MAX];
     let past_limit = vec![7u8; ARENA_VALUE_MAX + 1];
-    assert!(placed(InsertBytes::Borrowed(b"small")));
-    assert!(placed(InsertBytes::Borrowed(&at_limit)));
+    let arena_values = cfg!(not(feature = "bytes_1"));
+    assert_eq!(placed(InsertBytes::Borrowed(b"small")), arena_values);
+    assert_eq!(placed(InsertBytes::Borrowed(&at_limit)), arena_values);
     assert!(!placed(InsertBytes::Borrowed(&past_limit)));
     assert!(!placed(InsertBytes::Shared(make_value(b"small"))));
 }
@@ -992,8 +994,10 @@ fn an_arena_value_outlives_the_map() {
 }
 
 /// A bit flip in a value held in the arena is caught by the residence check,
-/// as one in its key is: the digest covers the bytes where they lie.
+/// as one in its key is: the digest covers the bytes where they lie. The
+/// `bytes` backend keeps no values in the arena.
 #[test]
+#[cfg(not(feature = "bytes_1"))]
 #[expect(clippy::expect_used, reason = "test asserts the error via expect_err")]
 fn verify_kv_digests_detects_corruption_of_an_arena_value() {
     let algo = ChecksumAlgorithm::Xxh3Low32;

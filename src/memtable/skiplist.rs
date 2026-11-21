@@ -516,7 +516,7 @@ impl SkipMap {
 
     /// Test-only: flips a bit in the first node's value bytes, which must lie
     /// in the arena, simulating a RAM bit-flip there.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "bytes_1")))]
     pub(crate) fn test_flip_first_arena_value_byte(&self) {
         let node = self.first_node();
         assert_ne!(node, UNSET, "skiplist must be non-empty to corrupt");

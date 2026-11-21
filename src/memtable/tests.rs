@@ -502,7 +502,9 @@ fn memtable_get_old_version() {
 
 /// A tree written, flushed and dropped leaves its memtable's arena blocks to
 /// the shared pool by the time the drop returns, so the next tree opened, a
-/// short-lived one included, writes into memory already mapped.
+/// short-lived one included, writes into memory already mapped. Long keys
+/// fill the blocks on every backend, the `bytes` one keeping its values out
+/// of the arena.
 #[test]
 #[expect(clippy::expect_used, reason = "test setup")]
 fn a_dropped_tree_leaves_its_arena_blocks_to_the_next() -> crate::Result<()> {
@@ -514,9 +516,10 @@ fn a_dropped_tree_leaves_its_arena_blocks_to_the_next() -> crate::Result<()> {
         crate::SequenceNumberCounter::default(),
     )
     .open()?;
-    let value = [7u8; 256];
-    for i in 0..70_000u64 {
-        tree.insert(i.to_be_bytes(), value, i);
+    let mut key = [0x5Au8; 256];
+    for i in 0..100_000u64 {
+        key[248..].copy_from_slice(&i.to_be_bytes());
+        tree.insert(key, [7u8; 8], i);
     }
     tree.flush_active_memtable(0)?;
     drop(tree);
