@@ -241,10 +241,7 @@ impl Memtable {
 
     /// Creates an iterator over all items.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = InternalValue> + '_ {
-        self.items.iter().map(|entry| InternalValue {
-            key: entry.key(),
-            value: entry.value(),
-        })
+        self.items.iter().map(|entry| entry.internal_value())
     }
 
     /// Creates an iterator over a range of items.
@@ -254,10 +251,7 @@ impl Memtable {
         &'a self,
         range: R,
     ) -> impl DoubleEndedIterator<Item = InternalValue> + 'a {
-        self.items.range(range).map(|entry| InternalValue {
-            key: entry.key(),
-            value: entry.value(),
-        })
+        self.items.range(range).map(|entry| entry.internal_value())
     }
 
     /// Returns the item by key if it exists.

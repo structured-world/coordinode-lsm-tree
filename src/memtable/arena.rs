@@ -292,6 +292,33 @@ impl Arena {
         }
     }
 
+    /// A zero-copy view of the bytes at the encoded `offset` behind their
+    /// native-endian `u32` length, found with one block lookup for both.
+    ///
+    /// # Safety
+    ///
+    /// As [`get_view`](Self::get_view), for the length word and the bytes it
+    /// counts, which the caller wrote at `offset` in one allocation.
+    #[cfg(not(feature = "bytes_1"))]
+    pub(crate) unsafe fn get_len_prefixed_view(&self, offset: u32) -> crate::byteview::ByteView {
+        let (ptr, off) = unsafe { self.decode(offset) };
+        // SAFETY: the caller guarantees the length word is allocated and
+        // written at `offset`; it may be unaligned.
+        let len = unsafe { ptr.add(off).cast::<u32>().read_unaligned() };
+        debug_assert!(
+            off + 4 + len as usize <= BLOCK_SIZE as usize,
+            "get_len_prefixed_view: off={off} + 4 + len={len} exceeds BLOCK_SIZE",
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "off < BLOCK_SIZE <= u32::MAX"
+        )]
+        // SAFETY: as `get_view`, for the `len` bytes after the length word.
+        unsafe {
+            crate::byteview::ByteView::view_of_shared(ptr, off as u32 + 4, len, BLOCK_SIZE)
+        }
+    }
+
     /// Returns an exclusive reference to `len` bytes at the encoded `offset`.
     ///
     /// # Safety

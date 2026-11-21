@@ -973,19 +973,73 @@ impl SkipMap {
         }
         let key_off = u32::from_ne_bytes(m[0..4].try_into().expect("4 bytes"));
         let key_len = u32::from(u16::from_ne_bytes(m[8..10].try_into().expect("2 bytes")));
-        let at = key_off + key_len;
         // SAFETY: the insert wrote the length word and the value bytes right
         // after the key, in the node's allocation, before the publishing CAS;
         // published bytes are never rewritten.
-        let len = u32::from_ne_bytes(
-            unsafe { self.arena.get_bytes(at, 4) }
-                .try_into()
-                .expect("4 bytes"),
-        );
-        // SAFETY: as above, `len` bytes follow the length word.
         Some(UserValue::from_view(unsafe {
-            self.arena.get_view(at + 4, len)
+            self.arena.get_len_prefixed_view(key_off + key_len)
         }))
+    }
+
+    /// The entry at `node`, its key and its value, read from one look at the
+    /// node's header: the iterators build every entry they yield this way.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: fixed-width slices always convert to arrays; \
+                  the ValueType discriminant written during alloc_node is valid"
+    )]
+    fn node_entry(&self, node: u32) -> InternalValue {
+        // SAFETY: `node` is a published node, its header fully written.
+        let m = unsafe { self.meta(node) };
+        let key_off = u32::from_ne_bytes(m[0..4].try_into().expect("4 bytes"));
+        let key_len = u32::from(u16::from_ne_bytes(m[8..10].try_into().expect("2 bytes")));
+        let seqno = u64::from_ne_bytes(m[16..24].try_into().expect("8 bytes"));
+        let value_type =
+            ValueType::try_from(m[10] & VALUE_TYPE_MASK).expect("valid ValueType discriminant");
+        #[cfg(not(feature = "bytes_1"))]
+        // SAFETY: as `node_internal_key`: the key span was written before the
+        // publishing CAS and is never rewritten.
+        let user_key = UserKey::from_view(unsafe { self.arena.get_view(key_off, key_len) });
+        #[cfg(feature = "bytes_1")]
+        // SAFETY: as above.
+        let user_key: UserKey = unsafe { self.arena.get_bytes(key_off, key_len) }.into();
+        #[cfg(not(feature = "bytes_1"))]
+        let value = if m[10] & VALUE_IN_ARENA == 0 {
+            self.node_value_from_store(m)
+        } else {
+            // SAFETY: as `arena_value`.
+            UserValue::from_view(unsafe { self.arena.get_len_prefixed_view(key_off + key_len) })
+        };
+        #[cfg(feature = "bytes_1")]
+        let value = self.node_value_from_store(m);
+        InternalValue {
+            key: InternalKey {
+                user_key,
+                seqno,
+                value_type,
+            },
+            value,
+        }
+    }
+
+    /// The value the store holds for the node whose header is `m`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: a 4-byte slice always converts to [u8; 4]"
+    )]
+    fn node_value_from_store(&self, m: &[u8]) -> UserValue {
+        let value_idx = u32::from_ne_bytes(m[4..8].try_into().expect("4 bytes"));
+        // SAFETY: as `node_value`: the insert reserved and wrote this index
+        // before the node was published.
+        unsafe { self.values.get(value_idx) }
     }
 
     /// Reads the value for `node`: a view of its bytes in the arena, or its
@@ -1510,6 +1564,11 @@ impl Entry<'_> {
     /// Reconstructs the value (allocates a new `Slice`).
     pub(crate) fn value(&self) -> UserValue {
         self.map.node_value(self.node)
+    }
+
+    /// The key and the value together, read from one look at the node.
+    pub(crate) fn internal_value(&self) -> InternalValue {
+        self.map.node_entry(self.node)
     }
 }
 
