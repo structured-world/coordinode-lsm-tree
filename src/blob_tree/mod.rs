@@ -2990,13 +2990,13 @@ impl AbstractTree for BlobTree {
         self.index.apply_batch(batch, seqno)
     }
 
-    fn insert<K: Into<UserKey>, V: Into<UserValue>>(
+    fn insert<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         value: V,
         seqno: SeqNo,
     ) -> (u64, u64) {
-        self.index.insert(key, value.into(), seqno)
+        self.index.insert(key, value, seqno)
     }
 
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<crate::UserValue>> {
@@ -3054,7 +3054,7 @@ impl AbstractTree for BlobTree {
         })
     }
 
-    fn merge<K: Into<UserKey>, V: Into<UserValue>>(
+    fn merge<K: Into<UserKey>, V: crate::InsertValue>(
         &self,
         key: K,
         operand: V,

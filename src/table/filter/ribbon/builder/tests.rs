@@ -44,10 +44,11 @@ fn payload_by_row_walk(coeff: &[u64], rhs: &[u64], r: usize) -> Vec<u8> {
 
 /// The output of a filter is on-disk bytes: the columns solve to what walking
 /// each row's bits and transposing them does, on every kernel, at every
-/// fingerprint width, whole last segment or partial.
+/// fingerprint width, whole last segment or partial. Every width a kernel is
+/// compiled for at a constant width is covered, and the first past them.
 #[test]
 fn every_kernel_solves_to_the_bytes_of_the_row_walk() -> Result<(), ConstructionFailure> {
-    for r in [1, 7, 8, 16, 33, 64] {
+    for r in (1..=17).chain([33, 64]) {
         for m in [64, 65, 127, 128, 1_000] {
             let (coeff, rhs) = rows(m, r, (r * m) as u64);
             let expected = payload_by_row_walk(&coeff, &rhs, r);
@@ -59,6 +60,12 @@ fn every_kernel_solves_to_the_bytes_of_the_row_walk() -> Result<(), Construction
             let mut best = vec![0; expected.len()];
             back_substitute_columns_best(&coeff, &rhs, r, &mut best)?;
             assert_eq!(best, expected, "best, r {r}, m {m}");
+
+            if r == 10 {
+                let mut fixed = vec![0; expected.len()];
+                back_substitute_columns_scalar_fixed::<10>(&coeff, &rhs, &mut fixed)?;
+                assert_eq!(fixed, expected, "scalar at a constant width, m {m}");
+            }
         }
     }
     Ok(())

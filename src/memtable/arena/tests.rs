@@ -232,3 +232,86 @@ fn exact_block_fill_does_not_corrupt() {
         "block 1 data must not be corrupted by subsequent allocations"
     );
 }
+
+/// The block an arena allocated first, as the next arena on the same pool
+/// sees it.
+fn first_block(arena: &Arena) -> *mut u8 {
+    arena.alloc(8, 4).expect("alloc");
+    arena.blocks[0].load(Ordering::Acquire)
+}
+
+/// A pool of the test's own, apart from the one every memtable shares.
+fn own_pool() -> &'static BlockPool {
+    Box::leak(Box::new(BlockPool::new()))
+}
+
+/// A block nothing views any more goes to the pool when its arena drops and
+/// is the next arena's first block, the next memtable's of any tree: it writes
+/// into memory already mapped instead of faulting in fresh pages.
+#[test]
+fn a_dropped_arena_hands_its_unviewed_block_to_the_next() {
+    let pool = own_pool();
+    let first = Arena::with_pool(pool);
+    let block = first_block(&first);
+    drop(first);
+    let second = Arena::with_pool(pool);
+    assert_eq!(first_block(&second), block);
+}
+
+/// A block a view still reads stays with the view: the next arena gets
+/// another, and writing into it leaves the viewed bytes as they were. The
+/// `bytes` backend takes no views of the arena.
+#[test]
+#[cfg(not(feature = "bytes_1"))]
+fn a_viewed_block_is_not_handed_on() {
+    let pool = own_pool();
+    let first = Arena::with_pool(pool);
+    let at = first.alloc(64, 4).expect("alloc");
+    // SAFETY: `at..at+64` was just allocated; written before it is viewed.
+    unsafe { first.get_bytes_mut(at, 64).fill(0xAB) };
+    let block = first.blocks[0].load(Ordering::Acquire);
+    // SAFETY: the span was allocated and written above, and not written again.
+    let view = unsafe { first.get_view(at, 64) };
+    drop(first);
+
+    let second = Arena::with_pool(pool);
+    assert_ne!(first_block(&second), block, "a viewed block was handed on");
+    let next = second.alloc(64, 4).expect("alloc");
+    // SAFETY: `next..next+64` was just allocated.
+    unsafe { second.get_bytes_mut(next, 64).fill(0x00) };
+    assert_eq!(&*view, &[0xAB; 64][..]);
+}
+
+/// An arena of `blocks` blocks on `pool`, dropped.
+fn drop_arena_of(pool: &'static BlockPool, blocks: usize) {
+    let arena = Arena::with_pool(pool);
+    for _ in 0..blocks {
+        // Each nearly a block, so every one takes a block of its own.
+        arena.alloc(BLOCK_SIZE - 8, 4).expect("alloc");
+    }
+    drop(arena);
+}
+
+/// The empty memtable a tree closes with, dropped right after a large one
+/// was flushed, does not shrink the pool to its own single block: the next
+/// tree finds the large one's blocks.
+#[test]
+fn a_small_arena_after_a_large_one_leaves_the_large_ones_blocks() {
+    let pool = own_pool();
+    drop_arena_of(pool, 6);
+    drop_arena_of(pool, 1);
+    assert_eq!(pool.pooled(), 6);
+}
+
+/// Once memtables shrink, the pool comes down to their size in a few drops
+/// instead of holding the memory of a larger one for good.
+#[test]
+fn the_pool_comes_down_to_the_memtables_it_serves() {
+    let pool = own_pool();
+    drop_arena_of(pool, 8);
+    assert_eq!(pool.pooled(), 8);
+    for _ in 0..6 {
+        drop_arena_of(pool, 2);
+    }
+    assert_eq!(pool.pooled(), 2);
+}

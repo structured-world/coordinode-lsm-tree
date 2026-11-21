@@ -609,6 +609,25 @@ impl ByteView {
     ///
     /// `data_base` / `data_len` must come from `alloc_shared_heap`, and the
     /// caller must own the reference being released.
+    /// Whether the caller's reference to the shared heap region at
+    /// `data_base` is the only one: no view of it is alive.
+    ///
+    /// # Safety
+    ///
+    /// `data_base` must come from [`Self::alloc_shared_heap`] and the caller
+    /// must hold a reference to it. The answer `true` is final only when no
+    /// new view can be taken from the region any more: views can only drop
+    /// then, never appear.
+    pub(crate) unsafe fn shared_heap_is_unique(data_base: *const u8) -> bool {
+        const HEADER_SIZE: usize = core::mem::size_of::<HeapAllocationHeader>();
+        // SAFETY: data_base came from alloc_shared_heap, so the header lives
+        // right below it, kept alive by the caller's reference.
+        let heap_region = unsafe { &*data_base.sub(HEADER_SIZE).cast::<HeapAllocationHeader>() };
+        // Acquire pairs with the release of the last view's decrement, so the
+        // bytes it read are done with before the region is written again.
+        heap_region.ref_count.load(Ordering::Acquire) == 1
+    }
+
     pub(crate) unsafe fn shared_heap_release(data_base: *const u8, data_len: u32) {
         const HEADER_SIZE: usize = core::mem::size_of::<HeapAllocationHeader>();
         const ALIGNMENT: usize = core::mem::align_of::<HeapAllocationHeader>();

@@ -22,10 +22,13 @@ use super::params::Params;
 /// words are that segment's payload words, so no row is ever stored.
 ///
 /// A macro so each caller compiles the parity for its own target features.
+/// `$width` sizes the column words: the fingerprint width itself when it is a
+/// constant, so every column stays in a register and the per-column loop is
+/// unrolled, or `Params::MAX_R` for a width known only at run time.
 macro_rules! back_substitute_columns {
-    ($coeff_lo:ident, $rhs:ident, $r:ident, $out:ident) => {{
+    ($coeff_lo:ident, $rhs:ident, $r:expr, $width:expr, $out:ident) => {{
         let m = $coeff_lo.len();
-        let mut columns = [0u64; Params::MAX_R];
+        let mut columns = [0u64; $width];
         for i in (0..m).rev() {
             let coeff = $coeff_lo[i];
             let row_end = i + coeff.bit_width() as usize;
@@ -60,7 +63,16 @@ fn back_substitute_columns_scalar(
     r: usize,
     out: &mut [u8],
 ) -> Result<(), ConstructionFailure> {
-    back_substitute_columns!(coeff_lo, rhs, r, out)
+    back_substitute_columns!(coeff_lo, rhs, r, Params::MAX_R, out)
+}
+
+/// The scalar kernel at a fingerprint width of `R` bits.
+fn back_substitute_columns_scalar_fixed<const R: usize>(
+    coeff_lo: &[u64],
+    rhs: &[u64],
+    out: &mut [u8],
+) -> Result<(), ConstructionFailure> {
+    back_substitute_columns!(coeff_lo, rhs, R, R, out)
 }
 
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
@@ -71,23 +83,67 @@ fn back_substitute_columns_popcnt(
     r: usize,
     out: &mut [u8],
 ) -> Result<(), ConstructionFailure> {
-    back_substitute_columns!(coeff_lo, rhs, r, out)
+    back_substitute_columns!(coeff_lo, rhs, r, Params::MAX_R, out)
+}
+
+/// The `popcnt` kernel at a fingerprint width of `R` bits.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "popcnt")]
+fn back_substitute_columns_popcnt_fixed<const R: usize>(
+    coeff_lo: &[u64],
+    rhs: &[u64],
+    out: &mut [u8],
+) -> Result<(), ConstructionFailure> {
+    back_substitute_columns!(coeff_lo, rhs, R, R, out)
+}
+
+/// Calls `$fixed::<r>` for the fingerprint widths filters are built at, so the
+/// kernel's columns are a constant count, or `$dynamic` for any other width.
+macro_rules! by_fingerprint_width {
+    ($r:expr, $fixed:ident, $dynamic:ident, ($c:ident, $v:ident, $o:ident); $($width:literal)*) => {
+        match $r {
+            $($width => $fixed::<$width>($c, $v, $o),)*
+            r => $dynamic($c, $v, $o, r),
+        }
+    };
 }
 
 /// Picks the kernel at run time: one binary serves every CPU of the target, and
-/// both kernels solve to the same bits.
+/// every kernel solves to the same bits.
 fn back_substitute_columns_best(
     coeff_lo: &[u64],
     rhs: &[u64],
     r: usize,
     out: &mut [u8],
 ) -> Result<(), ConstructionFailure> {
+    // The dynamic kernels take the width in the middle; these take it last.
+    fn scalar_any(
+        coeff_lo: &[u64],
+        rhs: &[u64],
+        out: &mut [u8],
+        r: usize,
+    ) -> Result<(), ConstructionFailure> {
+        back_substitute_columns_scalar(coeff_lo, rhs, r, out)
+    }
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     if std::is_x86_feature_detected!("popcnt") {
-        // SAFETY: the feature the kernel enables was just detected.
-        return unsafe { back_substitute_columns_popcnt(coeff_lo, rhs, r, out) };
+        #[target_feature(enable = "popcnt")]
+        fn popcnt_any(
+            coeff_lo: &[u64],
+            rhs: &[u64],
+            out: &mut [u8],
+            r: usize,
+        ) -> Result<(), ConstructionFailure> {
+            back_substitute_columns_popcnt(coeff_lo, rhs, r, out)
+        }
+        // SAFETY: the feature every kernel here enables was just detected.
+        return unsafe {
+            by_fingerprint_width!(r, back_substitute_columns_popcnt_fixed, popcnt_any,
+                (coeff_lo, rhs, out); 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+        };
     }
-    back_substitute_columns_scalar(coeff_lo, rhs, r, out)
+    by_fingerprint_width!(r, back_substitute_columns_scalar_fixed, scalar_any,
+        (coeff_lo, rhs, out); 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
 }
 
 #[derive(Debug, Clone)]

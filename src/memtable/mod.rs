@@ -209,10 +209,15 @@ impl Memtable {
     /// does not decode registers nothing: it fails at flush or read, which
     /// decode it again.
     fn note_blob_refs(&self, item: &InternalValue) {
-        if !item.key.value_type.is_cell_row() {
+        self.note_blob_refs_of(item.key.value_type, &item.value);
+    }
+
+    /// [`Self::note_blob_refs`] for an entry's type and value bytes.
+    fn note_blob_refs_of(&self, value_type: crate::ValueType, value: &[u8]) {
+        if !value_type.is_cell_row() {
             return;
         }
-        let Ok(refs) = crate::blob_tree::field_row::row_refs(&item.value) else {
+        let Ok(refs) = crate::blob_tree::field_row::row_refs(value) else {
             return;
         };
         if refs.is_empty() {
@@ -236,10 +241,7 @@ impl Memtable {
 
     /// Creates an iterator over all items.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = InternalValue> + '_ {
-        self.items.iter().map(|entry| InternalValue {
-            key: entry.key(),
-            value: entry.value(),
-        })
+        self.items.iter().map(|entry| entry.internal_value())
     }
 
     /// Creates an iterator over a range of items.
@@ -249,10 +251,7 @@ impl Memtable {
         &'a self,
         range: R,
     ) -> impl DoubleEndedIterator<Item = InternalValue> + 'a {
-        self.items.range(range).map(|entry| InternalValue {
-            key: entry.key(),
-            value: entry.value(),
-        })
+        self.items.range(range).map(|entry| entry.internal_value())
     }
 
     /// Returns the item by key if it exists.
@@ -392,8 +391,11 @@ impl Memtable {
                     (lo, algo)
                 })
             });
-            self.items
-                .insert_with_kv_digest(&item.key, item.value, digest);
+            self.items.insert_with_kv_digest(
+                &item.key,
+                crate::InsertBytes::Shared(item.value),
+                digest,
+            );
         }
 
         self.highest_seqno
@@ -452,12 +454,28 @@ impl Memtable {
         item: InternalValue,
         kv_digest: Option<(u32, crate::runtime_config::ChecksumAlgorithm)>,
     ) -> (u64, u64) {
+        self.insert_bytes_with_kv_digest(
+            &item.key,
+            crate::InsertBytes::Shared(item.value),
+            kv_digest,
+        )
+    }
+
+    /// [`Self::insert_with_kv_digest`] for a write that hands its value over
+    /// as [`crate::InsertBytes`]: borrowed bytes are copied into the memtable
+    /// without a buffer of their own, a shared value is kept as is.
+    pub(crate) fn insert_bytes_with_kv_digest(
+        &self,
+        key: &InternalKey,
+        value: crate::InsertBytes<'_>,
+        kv_digest: Option<(u32, crate::runtime_config::ChecksumAlgorithm)>,
+    ) -> (u64, u64) {
         #[expect(
             clippy::expect_used,
             reason = "keys are limited to 16-bit length + values are limited to 32-bit length"
         )]
-        let item_size = (item.key.user_key.len()
-            + item.value.len()
+        let item_size = (key.user_key.len()
+            + value.as_bytes().len()
             + core::mem::size_of::<InternalValue>()
             + core::mem::size_of::<SharedComparator>())
         .try_into()
@@ -475,13 +493,12 @@ impl Memtable {
                 .store(true, core::sync::atomic::Ordering::Relaxed);
         }
 
-        self.note_blob_refs(&item);
+        self.note_blob_refs_of(key.value_type, value.as_bytes());
 
-        self.items
-            .insert_with_kv_digest(&item.key, item.value, kv_digest);
+        self.items.insert_with_kv_digest(key, value, kv_digest);
 
         self.highest_seqno
-            .fetch_max(item.key.seqno, core::sync::atomic::Ordering::AcqRel);
+            .fetch_max(key.seqno, core::sync::atomic::Ordering::AcqRel);
 
         (item_size, size_before + item_size)
     }

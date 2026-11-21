@@ -630,6 +630,62 @@ fn varint_len_matches_the_written_length() {
     }
 }
 
+/// An entry's head and value length, encoded on the stack, are the bytes the
+/// LEB128 writer emits, at every 7-bit boundary of each field's range, so
+/// blocks keep their on-disk form.
+#[test]
+fn entry_fields_encode_as_the_varint_writer_does() {
+    use varint_rs::VarintWriter;
+
+    fn edges(bits: u32) -> Vec<u64> {
+        let max = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let mut values = vec![0, max];
+        for shift in 1..bits {
+            let edge = 1u64 << shift;
+            values.extend([edge - 1, edge, edge + 1]);
+        }
+        values
+    }
+
+    for seqno in edges(64) {
+        for key_len in edges(16) {
+            let mut head = super::EntryHead::new(0x41);
+            head.put(seqno);
+            head.put(key_len);
+            head.put(key_len);
+            let mut expected = vec![0x41];
+            expected.write_u64_varint(seqno).expect("write to a Vec");
+            #[expect(clippy::cast_possible_truncation, reason = "edges(16) fit u16")]
+            {
+                expected
+                    .write_u16_varint(key_len as u16)
+                    .expect("write to a Vec");
+                expected
+                    .write_u16_varint(key_len as u16)
+                    .expect("write to a Vec");
+            }
+            assert_eq!(head.bytes(), expected.as_slice(), "{seqno} {key_len}");
+        }
+    }
+
+    for len in [0usize, 1, 127, 128, 129, 16_383, 16_384, 70_000] {
+        let value = vec![7u8; len];
+        let mut written = Vec::new();
+        super::write_value(&mut written, &value).expect("write to a Vec");
+        let mut expected = Vec::new();
+        #[expect(clippy::cast_possible_truncation, reason = "test lengths fit u32")]
+        expected
+            .write_u32_varint(len as u32)
+            .expect("write to a Vec");
+        expected.extend_from_slice(&value);
+        assert_eq!(written, expected, "{len}");
+    }
+}
+
 /// The choice compares encoded lengths over every interval of the block and
 /// keeps full seqnos on a tie: deltas of the same length as the seqnos
 /// compress worse than them.

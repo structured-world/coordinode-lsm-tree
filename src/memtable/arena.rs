@@ -29,6 +29,112 @@ use super::own_line::OwnLine;
 use alloc::{boxed::Box, vec::Vec};
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+// `parking_lot::Mutex` (std: userspace fast path, no poisoning) / `spin::Mutex`
+// (no_std). The pool is locked once per 4 MiB block.
+#[cfg(feature = "std")]
+use parking_lot::Mutex;
+#[cfg(not(feature = "std"))]
+use spin::Mutex;
+
+/// Arena blocks dropped memtables hand to the next ones, of any tree.
+///
+/// A block freed back to the allocator comes back as fresh pages the next
+/// memtable faults in one by one; reused, it is already mapped. A tree opened
+/// after another closed takes the blocks that one left, as small buffers
+/// freed to the allocator would be reused, so a short-lived tree pays no more
+/// than a long-lived one.
+///
+/// The pool keeps at most the blocks of the largest memtable dropped lately:
+/// an arena that held more raises that bound to its count, and each one of
+/// two blocks or more that held fewer lowers it by an eighth, at least one. A
+/// flushed memtable followed by the empty one its tree closes with leaves the
+/// flushed one's blocks, and after memtables shrink the bound comes down to
+/// their size in a few drops.
+pub(crate) struct BlockPool {
+    held: Mutex<Held>,
+}
+
+/// What the pool holds: its blocks and the most it keeps.
+struct Held {
+    blocks: Vec<Block>,
+    bound: usize,
+}
+
+/// The pool every memtable's arena uses.
+pub(crate) static BLOCKS: BlockPool = BlockPool::new();
+
+/// The data base of a `BLOCK_SIZE` shared heap region, held by one owner.
+struct Block(*mut u8);
+
+// SAFETY: a block is plain memory with one owner at a time, the pool or one
+// arena, moved between them under the pool's lock.
+unsafe impl Send for Block {}
+
+impl BlockPool {
+    pub(crate) const fn new() -> Self {
+        Self {
+            held: Mutex::new(Held {
+                blocks: Vec::new(),
+                bound: 0,
+            }),
+        }
+    }
+
+    /// Test-only: blocks the pool holds.
+    #[cfg(test)]
+    pub(crate) fn pooled(&self) -> usize {
+        self.held.lock().blocks.len()
+    }
+
+    fn take(&self) -> Option<*mut u8> {
+        self.held.lock().blocks.pop().map(|block| block.0)
+    }
+
+    /// Takes back `blocks` from an arena that held `arena_held` blocks.
+    fn give(&self, blocks: Vec<*mut u8>, arena_held: usize) {
+        let mut held = self.held.lock();
+        held.bound = if arena_held >= held.bound {
+            arena_held
+        } else if arena_held > 1 {
+            // At least a block a drop, so a small bound comes down too.
+            (held.bound - held.bound.div_ceil(8)).max(arena_held)
+        } else {
+            // A memtable of a single block was dropped empty or nearly so,
+            // as every tree's last one is: it says nothing of the size the
+            // tree's memtables reach.
+            held.bound
+        };
+        held.blocks.extend(blocks.into_iter().map(Block));
+        while held.blocks.len() > held.bound {
+            if let Some(block) = held.blocks.pop() {
+                release(block.0);
+            }
+        }
+    }
+
+    /// Takes back a block an arena allocated and could not use, which counts
+    /// toward no bound.
+    fn give_unused(&self, block: *mut u8) {
+        self.held.lock().blocks.push(Block(block));
+    }
+}
+
+impl Drop for BlockPool {
+    fn drop(&mut self) {
+        for block in self.held.get_mut().blocks.drain(..) {
+            release(block.0);
+        }
+    }
+}
+
+/// Releases the reference to block `ptr` its holder owns.
+fn release(ptr: *mut u8) {
+    // SAFETY: every block is a BLOCK_SIZE shared heap region from
+    // `ensure_block`, and its holder gives up the reference it owns.
+    unsafe {
+        crate::byteview::ByteView::shared_heap_release(ptr, BLOCK_SIZE);
+    }
+}
 
 /// Bits used for the within-block offset: 2^22 = 4 MiB per block, on every
 /// target.
@@ -73,15 +179,24 @@ pub(crate) struct Arena {
     /// Every insert moves it; every search step reads `blocks`, so the two
     /// keep apart.
     cursor: OwnLine<AtomicU32>,
+
+    /// Where blocks come from before the allocator, and go back to when the
+    /// arena drops.
+    pool: &'static BlockPool,
 }
 
-// Send+Sync derived automatically: all fields (Box<[AtomicPtr<_>]>, AtomicU32)
-// are Send+Sync.
+// Send+Sync derived automatically: all fields (Box<[AtomicPtr<_>]>, AtomicU32,
+// a reference to a Sync pool) are Send+Sync.
 
 impl Arena {
-    /// Creates a new empty arena.  No memory is allocated until the first
-    /// [`alloc`](Self::alloc) call.
+    /// Creates a new empty arena on the shared [`BLOCKS`] pool.  No memory is
+    /// allocated until the first [`alloc`](Self::alloc) call.
     pub(crate) fn new() -> Self {
+        Self::with_pool(&BLOCKS)
+    }
+
+    /// [`Self::new`], taking blocks from `pool` and handing them back to it.
+    pub(crate) fn with_pool(pool: &'static BlockPool) -> Self {
         let mut blocks = Vec::with_capacity(MAX_BLOCKS);
         for _ in 0..MAX_BLOCKS {
             blocks.push(AtomicPtr::new(ptr::null_mut()));
@@ -91,6 +206,7 @@ impl Arena {
             blocks: blocks.into_boxed_slice(),
             // Offset 0 is reserved as the UNSET sentinel.
             cursor: OwnLine(AtomicU32::new(1)),
+            pool,
         }
     }
 
@@ -214,6 +330,33 @@ impl Arena {
         }
     }
 
+    /// A zero-copy view of the bytes at the encoded `offset` behind their
+    /// native-endian `u32` length, found with one block lookup for both.
+    ///
+    /// # Safety
+    ///
+    /// As [`get_view`](Self::get_view), for the length word and the bytes it
+    /// counts, which the caller wrote at `offset` in one allocation.
+    #[cfg(not(feature = "bytes_1"))]
+    pub(crate) unsafe fn get_len_prefixed_view(&self, offset: u32) -> crate::byteview::ByteView {
+        let (ptr, off) = unsafe { self.decode(offset) };
+        // SAFETY: the caller guarantees the length word is allocated and
+        // written at `offset`; it may be unaligned.
+        let len = unsafe { ptr.add(off).cast::<u32>().read_unaligned() };
+        debug_assert!(
+            off + 4 + len as usize <= BLOCK_SIZE as usize,
+            "get_len_prefixed_view: off={off} + 4 + len={len} exceeds BLOCK_SIZE",
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "off < BLOCK_SIZE <= u32::MAX"
+        )]
+        // SAFETY: as `get_view`, for the `len` bytes after the length word.
+        unsafe {
+            crate::byteview::ByteView::view_of_shared(ptr, off as u32 + 4, len, BLOCK_SIZE)
+        }
+    }
+
     /// Returns an exclusive reference to `len` bytes at the encoded `offset`.
     ///
     /// # Safety
@@ -324,18 +467,20 @@ impl Arena {
             // release CAS), and the head sentinel's tower is explicitly
             // UNSET-initialized at creation. No reader ever observes an
             // unwritten byte, so eager zeroing is pure waste.
-            let raw = crate::byteview::ByteView::alloc_shared_heap(BLOCK_SIZE);
+            //
+            // A block a dropped arena handed to the pool is taken first: its
+            // pages are already mapped, and nothing reads it any more.
+            let raw = self
+                .pool
+                .take()
+                .unwrap_or_else(|| crate::byteview::ByteView::alloc_shared_heap(BLOCK_SIZE));
 
-            // CAS null → raw.  If another thread won, free our block.
+            // CAS null → raw.  If another thread won, give our block back.
             if self.blocks[idx]
                 .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                // SAFETY: raw was just allocated as a BLOCK_SIZE shared heap
-                // region and holds only our own reference.
-                unsafe {
-                    crate::byteview::ByteView::shared_heap_release(raw, BLOCK_SIZE);
-                }
+                self.pool.give_unused(raw);
             }
         }
     }
@@ -349,19 +494,26 @@ impl Default for Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
+        let mut held = 0;
+        let mut unviewed = Vec::new();
         for block in &*self.blocks {
             let ptr = block.load(Ordering::Relaxed);
-            if !ptr.is_null() {
-                // SAFETY: `ptr` is the data base of a BLOCK_SIZE shared heap
-                // region allocated by ensure_block; this releases the arena's
-                // own reference. Outstanding views (ByteViews handed out by
-                // get_view) each hold their own reference, so the block stays
-                // alive until the last of them drops.
-                unsafe {
-                    crate::byteview::ByteView::shared_heap_release(ptr, BLOCK_SIZE);
-                }
+            if ptr.is_null() {
+                continue;
+            }
+            held += 1;
+            // SAFETY: the arena holds a reference to every block it set, and
+            // with the arena gone no view of it can be taken any more.
+            if unsafe { crate::byteview::ByteView::shared_heap_is_unique(ptr) } {
+                unviewed.push(ptr);
+            } else {
+                // Outstanding views (ByteViews handed out by get_view) each
+                // hold their own reference, so the block stays alive until
+                // the last of them drops.
+                release(ptr);
             }
         }
+        self.pool.give(unviewed, held);
     }
 }
 
