@@ -5,17 +5,24 @@ fn new_map() -> SkipMap {
     SkipMap::new(crate::comparator::default_comparator())
 }
 
-/// The word-at-a-time comparison orders every pair of keys as `<[u8]>::cmp`
-/// does: every length up to past the longest key compared in words, a
-/// difference at each position on either side of a word boundary, a key that
-/// is a prefix of the other, a short key against a long one, and
-/// pseudo-random pairs on both sides of the length limit. Guards against a
-/// word compare that reads the bytes in the wrong order, lets the length
-/// decide too early, or picks the path by the wrong key's length.
+/// Longest key the exhaustive pairs below reach: past two 32-byte runs, so a
+/// difference falls in a skipped run, in a word after the runs and in the
+/// byte tail.
+const LONGEST_EXHAUSTIVE_KEY: usize = 76;
+
+/// The prefix-skipping comparison orders every pair of keys as `<[u8]>::cmp`
+/// does and reports their exact common prefix, from every starting point a
+/// search can pass (any length up to that prefix): every length up to past
+/// two 32-byte runs, a difference at each position on either side of a run
+/// and word boundary, a key that is a prefix of the other, a short key
+/// against a long one, and pseudo-random pairs behind long shared runs.
+/// Guards against a compare that reads the bytes in the wrong order, lets the
+/// length decide too early, skips a run that differs, or misreports where two
+/// keys part, which would make a later comparison skip bytes it must read.
 #[test]
-fn the_word_comparison_orders_keys_as_the_byte_comparison() {
+fn the_prefix_skipping_comparison_orders_keys_and_finds_their_common_prefix() {
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for len in 0..=WORD_COMPARE_MAX + 12 {
+    for len in 0..=LONGEST_EXHAUSTIVE_KEY {
         let base: Vec<u8> = (0..len)
             .map(|i| u8::try_from((i * 37 + 11) % 256).expect("below 256"))
             .collect();
@@ -44,7 +51,7 @@ fn the_word_comparison_orders_keys_as_the_byte_comparison() {
         let mut below = |n: u64| next() % n;
         let (la, lb) = (below(160), below(160));
         // A small alphabet makes long common prefixes likely; every other
-        // pair also shares a prefix longer than the word-compare limit.
+        // pair also shares a prefix of two runs and a word.
         let mut a: Vec<u8> = (0..la)
             .map(|_| u8::try_from(below(3)).expect("below 3"))
             .collect();
@@ -52,14 +59,21 @@ fn the_word_comparison_orders_keys_as_the_byte_comparison() {
             .map(|_| u8::try_from(below(3)).expect("below 3"))
             .collect();
         if round % 2 == 0 {
-            let shared = [7u8; WORD_COMPARE_MAX + 4];
+            let shared = [7u8; 72];
             a = [&shared[..], &a].concat();
             b = [&shared[..], &b].concat();
         }
         pairs.push((a, b));
     }
     for (a, b) in pairs {
-        assert_eq!(lexicographic(&a, &b), a.cmp(&b), "{a:?} vs {b:?}");
+        let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        for from in 0..=common {
+            assert_eq!(
+                lexicographic_from(&a, &b, from),
+                (a.cmp(&b), common),
+                "{a:?} vs {b:?} from {from}"
+            );
+        }
     }
 }
 
@@ -1167,6 +1181,81 @@ fn a_search_compares_no_node_twice_and_stops_where_a_walk_does() {
             map.record_compared();
             map.seek_past_user_key(&key(i));
             once("seek_past_user_key", map.take_compared());
+        }
+    }
+}
+
+/// A search that skips the prefix its bounds share with the target still
+/// stops where a walk of each level does. Keys share prefixes of 0, 40 and
+/// 100 bytes and then differ in a short tail over a three-letter alphabet, so
+/// the prefix the bounds share changes at every step of a descent: a skip
+/// taken from one bound alone, or kept after the bound it came from moved,
+/// would pass a node that differs inside the skipped bytes and splice or seek
+/// at the wrong place. Each level is checked, those at and above the list's
+/// height included, for versions above, at and below the stored seqno.
+#[test]
+fn a_prefix_skipping_search_stops_where_a_walk_of_each_level_does() {
+    let map = new_map();
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut key = || {
+        let shared = [0usize, 40, 100][usize::try_from(next() % 3).expect("below 3")];
+        let tail = usize::try_from(next() % 12).expect("below 12");
+        let mut k = vec![0xA5_u8; shared];
+        k.extend((0..tail).map(|_| u8::try_from(next() % 3).expect("below 3")));
+        k
+    };
+    let stored: Vec<Vec<u8>> = (0..3000).map(|_| key()).collect();
+    let probes: Vec<Vec<u8>> = (0..600)
+        .map(|_| key())
+        .chain(stored[..600].to_vec())
+        .collect();
+    for k in &stored {
+        map.insert(&make_key(k, 5), make_value(b"v"));
+    }
+    // The first node at or after `target` in a walk of `level`, or UNSET.
+    let walk_ge = |target: &InternalKey, level: usize| {
+        let mut node = map.next_at(map.head, level);
+        while node != UNSET && map.compare_key(node, target) == CmpOrdering::Less {
+            node = map.next_at(node, level);
+        }
+        node
+    };
+    for probe in &probes {
+        for seqno in [1, 5, 9] {
+            let target = make_key(probe, seqno);
+
+            let (mut preds, mut succs) = ([map.head; MAX_HEIGHT], [UNSET; MAX_HEIGHT]);
+            map.find_splice(&target, &mut preds, &mut succs);
+            let height = map.height.load(Ordering::Acquire);
+            for (level, &succ) in succs.iter().enumerate().take(height) {
+                assert_eq!(
+                    succ,
+                    walk_ge(&target, level),
+                    "find_splice level {level} for {probe:?}/{seqno}"
+                );
+            }
+
+            for level in 0..MAX_HEIGHT {
+                let (mut preds, mut succs) = ([map.head; MAX_HEIGHT], [UNSET; MAX_HEIGHT]);
+                map.find_splice_for_level(&target, &mut preds, &mut succs, level);
+                assert_eq!(
+                    succs[level],
+                    walk_ge(&target, level),
+                    "find_splice_for_level {level} for {probe:?}/{seqno}"
+                );
+            }
+
+            assert_eq!(
+                map.seek_ge(&target),
+                walk_ge(&target, 0),
+                "seek_ge for {probe:?}/{seqno}"
+            );
         }
     }
 }
