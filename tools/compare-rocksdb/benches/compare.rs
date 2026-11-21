@@ -149,7 +149,9 @@
 //! (merge-operator semantics differ across engines) from [#244]'s list.
 
 mod paired;
+mod skip_sync;
 
+use skip_sync::{Skip, SkipSyncFs};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -166,8 +168,8 @@ use std::time::Duration;
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
     config::{
-        CompressionPolicy, FlushDurability, HashRatioPolicy, KvSeparationOptions, LocatorPolicy,
-        LocatorPolicyEntry, LocatorPrecision, PinningPolicy,
+        CompressionPolicy, FilterPolicy, FilterPolicyEntry, FlushDurability, HashRatioPolicy,
+        KvSeparationOptions, LocatorPolicy, LocatorPolicyEntry, LocatorPrecision, PinningPolicy,
     },
     runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
@@ -988,7 +990,7 @@ fn run_write_throughput(
     compression: Compression,
     inputs: &WorkloadInputs,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
+    let dir = state_dir();
     let start = std::time::Instant::now();
     let elapsed = match engine {
         Engine::Ours | Engine::BlobTree(_) => {
@@ -1060,7 +1062,7 @@ fn run_write_throughput(
         }
     };
     drop(dir);
-    settle();
+    settle_removal();
     Ok(elapsed)
 }
 
@@ -1627,28 +1629,131 @@ impl SeedStates {
 /// A fresh directory holding a copy of the state at `seed`, on disk before it
 /// is returned (see [`settle`]).
 fn copy_of(seed: &Path) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = state_dir();
     copy_dir(seed, dir.path()).expect("copy seed state");
-    settle();
+    settle(dir.path());
     dir
 }
 
-/// Writes out every dirty page and pending metadata change of the host's file
-/// systems, outside any timed window. Copying a starting state and removing a
-/// finished one leave tens of megabytes for the kernel to write back later;
-/// left alone, that write-back lands in the next engine's timed syncs, and in
-/// the write groups it doubled one engine's time while halving another's.
-fn settle() {
-    let status = std::process::Command::new("sync")
+/// Writes the files and folders under `root` to disk, and `root`'s entry in
+/// its folder, outside any timed window. Copying a starting state leaves tens
+/// of megabytes for the kernel to write back later; left alone, that
+/// write-back lands in the next engine's timed syncs, and in the write groups
+/// it doubled one engine's time while halving another's. Only what the
+/// harness wrote is synced: the host's other files are not this run's to
+/// write back, and a sync of every file system waits for them too.
+///
+/// A failure ends the run (as every I/O failure of the harness does), so no
+/// arm is measured on a state that did not reach the disk.
+fn settle(root: &Path) {
+    sync_tree(root).unwrap_or_else(|e| panic!("sync the starting state {}: {e}", root.display()));
+    if let Some(parent) = root.parent() {
+        sync_folder(parent).unwrap_or_else(|e| {
+            panic!(
+                "sync the folder {} of a starting state: {e}",
+                parent.display()
+            )
+        });
+    }
+}
+
+/// Commits the removal of a finished state, made under the run's state root,
+/// before the next timed write: the removal is a metadata change the file
+/// system would otherwise write back with that write's own syncs. A failure
+/// ends the run.
+fn settle_removal() {
+    let root = state_root();
+    sync_folder(root).unwrap_or_else(|e| panic!("sync the state root {}: {e}", root.display()));
+}
+
+/// The folder every state a run writes lies under, set once by `main` (see
+/// [`make_state_root`]).
+static STATE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The run's state root.
+fn state_root() -> &'static Path {
+    STATE_ROOT.get().expect("main sets the state root")
+}
+
+/// A new empty folder under the run's state root, for one engine's state.
+fn state_dir() -> tempfile::TempDir {
+    tempfile::tempdir_in(state_root()).expect("a state folder")
+}
+
+/// Makes the folder every state of a run lies under, with copy-on-write off
+/// (`chattr +C`), which every file and folder made under it inherits: both
+/// engines' files and the copies of their starting states. Our engine turns
+/// it off for its own files by default and the parity preset keeps that off,
+/// as RocksDB has no such setting; set on the folder, it holds for both. On
+/// Btrfs a copy-on-write file is also compressed by the file system when it
+/// is written back, a cost of the file system the comparison would otherwise
+/// time inside each engine's syncs. A file system without the flag (ext4)
+/// refuses it, and the run goes on as it is.
+fn make_state_root() -> tempfile::TempDir {
+    let root = tempfile::Builder::new()
+        .prefix("compare-rocksdb-")
+        .tempdir()
+        .expect("a state root");
+    #[cfg(target_os = "linux")]
+    match std::process::Command::new("chattr")
+        .arg("+C")
+        .arg(root.path())
         .status()
-        .expect("run sync");
-    assert!(status.success(), "sync failed: {status}");
+    {
+        Ok(status) if status.success() => eprintln!(
+            "compare-rocksdb: copy-on-write off under {}",
+            root.path().display()
+        ),
+        Ok(status) => eprintln!(
+            "compare-rocksdb: chattr +C on {} failed ({status}): files keep the file system's \
+             copy-on-write",
+            root.path().display()
+        ),
+        Err(e) => eprintln!(
+            "compare-rocksdb: chattr did not run ({e}): files keep the file system's copy-on-write"
+        ),
+    }
+    root
+}
+
+/// Syncs every file and folder under `path`, `path` included.
+fn sync_tree(path: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_tree(&entry.path())?;
+        } else {
+            // Opened for writing: Windows flushes a file only through a
+            // handle that may write it (`FlushFileBuffers` needs write
+            // access), and fails on a read-only one.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(entry.path())?
+                .sync_all()?;
+        }
+    }
+    sync_folder(path)
+}
+
+/// Syncs the folder `path`, which makes the names in it durable. Windows
+/// opens no folder as a file to sync it: a file's name there is durable with
+/// the file system's own log, and the step is skipped.
+fn sync_folder(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Writes the seed state for `key` into a new directory and closes the engine
 /// before returning, so the files are complete before anything copies them.
 fn write_seed(key: SeedKey, inputs: &WorkloadInputs) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("seed tempdir");
+    let dir = state_dir();
     match key.engine {
         Engine::Ours | Engine::BlobTree(_) => drop(populate_ours(
             dir.path(),
@@ -1733,6 +1838,8 @@ fn bench_seeded(run: &mut Run) {
         Spec::writes(zstd),
         &mut seeds,
     );
+    overwrite_parts_variant(run, "overwrite_parts", none, &mut seeds);
+    overwrite_parts_variant(run, "overwrite_parts_zstd22", zstd, &mut seeds);
     // Blobs: tables uncompressed, as random bytes give a codec nothing to do;
     // the compressed blob arms show what each engine stores and reads for a
     // value its codec cannot shrink. No seek group: with one key per blob it
@@ -1814,7 +1921,7 @@ impl WarmEngine {
                 Self::RocksDb { db, _dir: dir }
             }
             Engine::SurrealKv => {
-                let dir = tempfile::tempdir().expect("tempdir");
+                let dir = state_dir();
                 let (rt, tree) = setup_surrealkv_warm(dir.path(), inputs)
                     .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                 Self::SurrealKv {
@@ -2179,30 +2286,45 @@ fn seek_random_routine<'a>(
 /// length-prefixed record per write, made durable by one `sync_data` per
 /// commit. Under [`lsm_tree::config::FlushDurability::Deferred`] the log is
 /// what makes an acknowledged write durable, and a flush syncs nothing.
+///
+/// A commit is encoded into one buffer and written with one call, as a log
+/// writes a batch: written field by field through a small buffered writer it
+/// took eight times as long, which the arm would have charged to the engine.
 struct CallerWal {
-    file: std::io::BufWriter<std::fs::File>,
+    file: std::fs::File,
+    /// The commit being encoded, kept across commits.
+    buf: Vec<u8>,
 }
 
 impl CallerWal {
     fn create(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            file: std::io::BufWriter::new(std::fs::File::create(path)?),
+            file: std::fs::File::create(path)?,
+            buf: Vec::new(),
         })
     }
 
     /// Appends every write of `inputs` and syncs the log once.
     fn commit(&mut self, inputs: &WorkloadInputs) -> std::io::Result<()> {
         use std::io::Write;
+        self.buf.clear();
+        let bytes: usize = inputs
+            .keys
+            .iter()
+            .zip(inputs.values.iter())
+            .map(|(key, value)| 8 + key.len() + value.len())
+            .sum();
+        self.buf.reserve(bytes);
         for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
             for field in [key.as_slice(), value.as_slice()] {
                 let len = u32::try_from(field.len())
                     .map_err(|_| std::io::Error::other("a field over 4 GiB"))?;
-                self.file.write_all(&len.to_le_bytes())?;
-                self.file.write_all(field)?;
+                self.buf.extend_from_slice(&len.to_le_bytes());
+                self.buf.extend_from_slice(field);
             }
         }
-        self.file.flush()?;
-        self.file.get_ref().sync_data()
+        self.file.write_all(&self.buf)?;
+        self.file.sync_data()
     }
 }
 
@@ -2216,11 +2338,11 @@ impl CallerWal {
 ///
 /// The `ours-deferred-wal` series runs our engine the way a caller with its
 /// own write-ahead log does: the log is written and synced, then the keys go
-/// into the memtable and a deferred flush writes the table without a sync. One
-/// sync makes the batch durable, as one does in SurrealKV's commit. The barrier
-/// that later makes the deferred tables durable is not timed: a caller runs one
-/// per many flushes, as SurrealKV's commit leaves its own memtable flush for
-/// later.
+/// into the memtable. One sync makes the batch durable. It is set against
+/// `rocksdb-wal`, RocksDB writing the same batch through its own log with a
+/// sync, which appends and syncs the log and fills the memtable; SurrealKV's
+/// commit does the same work. None of the three flushes in the timed body;
+/// the plain arms do and are set against RocksDB, which does too.
 fn overwrite_variant(
     run: &mut Run,
     group_name: &str,
@@ -2247,16 +2369,22 @@ fn overwrite_variant(
                 (engine, seed)
             })
             .collect();
-        // The deferred-log arm answers SurrealKV's one-sync commit on the
-        // groups SurrealKV's charts share; the blob groups compare blob paths.
-        // It starts from our engine's seed whether or not the plain `ours` arm
-        // runs too, so `COMPARE_ENGINES=ours-deferred-wal` runs it alone.
-        let ours_seed = (spec.values == Values::Pool
+        // The logged arms run on the groups SurrealKV runs in, beside its
+        // one-sync commit; the blob groups compare blob paths. Each starts from
+        // its engine's seed whether or not that engine's plain arm runs too, so
+        // `COMPARE_ENGINES=ours-deferred-wal,rocksdb-wal` runs them alone.
+        let logged = spec.values == Values::Pool
             && spec.engines.contains(&Engine::Ours)
-            && run.wants_engine("ours-deferred-wal"))
-        .then(|| {
+            && spec.engines.contains(&Engine::RocksDb)
+            && spec.engines.contains(&Engine::SurrealKv);
+        let ours_seed = (logged && run.wants_engine("ours-deferred-wal")).then(|| {
             seeds
                 .seed(Engine::Ours, compression, IndexStrategy::Binary, &inputs)
+                .to_path_buf()
+        });
+        let rocksdb_seed = (logged && run.wants_engine("rocksdb-wal")).then(|| {
+            seeds
+                .seed(Engine::RocksDb, compression, IndexStrategy::Binary, &inputs)
                 .to_path_buf()
         });
         let mut arms: Vec<_> = seeded
@@ -2313,10 +2441,10 @@ fn overwrite_variant(
                                 // First copy (untimed) so the timed pass
                                 // overwrites existing keys; SurrealKV is not
                                 // seeded (see `SeedStates`).
-                                let dir = tempfile::tempdir().expect("tempdir");
+                                let dir = state_dir();
                                 let (rt, tree) = setup_surrealkv_warm(dir.path(), inputs)
                                     .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
-                                settle();
+                                settle(dir.path());
                                 let start = std::time::Instant::now();
                                 let mut txn = tree.begin().expect("surrealkv: begin");
                                 for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
@@ -2331,12 +2459,35 @@ fn overwrite_variant(
                         }
                         // The engine and its folder are gone: their removal
                         // goes to disk before the next timed write.
-                        settle();
+                        settle_removal();
                     }
                     total
                 })
             })
             .collect();
+        if let Some(seed) = rocksdb_seed {
+            let inputs = &inputs;
+            arms.push(paired::Arm::new("rocksdb-wal", move |iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let dir = copy_of(&seed);
+                    let db = open_rocksdb(dir.path(), compression, false, None);
+                    let mut write_opts = rocksdb::WriteOptions::default();
+                    write_opts.set_sync(true);
+                    let start = std::time::Instant::now();
+                    let mut batch = rocksdb::WriteBatch::default();
+                    for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                        batch.put(key, value);
+                    }
+                    db.write_opt(batch, &write_opts)
+                        .expect("rocksdb-wal: overwrite write");
+                    total += start.elapsed();
+                    drop((db, dir));
+                    settle_removal();
+                }
+                total
+            }));
+        }
         if let Some(seed) = ours_seed {
             let inputs = &inputs;
             arms.push(paired::Arm::new("ours-deferred-wal", move |iters| {
@@ -2350,7 +2501,7 @@ fn overwrite_variant(
                             .expect("ours-deferred-wal: open");
                     // Beside the tree's folder, not in it: the engine owns
                     // what its folder holds.
-                    let wal_dir = tempfile::tempdir().expect("caller wal dir");
+                    let wal_dir = state_dir();
                     let mut wal =
                         CallerWal::create(&wal_dir.path().join("caller.wal")).expect("caller wal");
                     let start = std::time::Instant::now();
@@ -2360,15 +2511,155 @@ fn overwrite_variant(
                     {
                         tree.insert(key, value, seqno);
                     }
+                    total += start.elapsed();
+                    // The memtable is flushed outside the window, which the
+                    // other logged arms leave out too, so a round leaves what
+                    // the next finds.
                     tree.flush_active_memtable(0)
                         .expect("ours-deferred-wal: overwrite flush");
-                    total += start.elapsed();
                     drop((tree, wal, wal_dir, dir));
-                    settle();
+                    settle_removal();
                 }
                 total
             }));
         }
+        run.measure(group_name, n, arms);
+    }
+}
+
+/// What one arm of the `overwrite_parts` groups leaves out of the timed body.
+#[derive(Clone, Copy)]
+enum Part {
+    /// The inserts and the flush, with the syncs `skip` names left out and
+    /// the filter built or not.
+    Flush { skip: Skip, filter: bool },
+    /// The inserts alone: the memtable's share.
+    Memtable,
+}
+
+/// The arms of the `overwrite_parts` groups. Each differs from `full` in one
+/// part, or from `no-sync` in one, so a part's cost is the difference of two
+/// arms' times measured in the same rounds. A sync left out shows what it adds
+/// beside the syncs that overlap it, not what it takes alone.
+const PARTS: &[(&str, Part)] = &[
+    (
+        "full",
+        Part::Flush {
+            skip: Skip::NONE,
+            filter: true,
+        },
+    ),
+    (
+        "no-table-sync",
+        Part::Flush {
+            skip: Skip {
+                flush_files: true,
+                ..Skip::NONE
+            },
+            filter: true,
+        },
+    ),
+    (
+        "no-manifest-sync",
+        Part::Flush {
+            skip: Skip {
+                manifest: true,
+                ..Skip::NONE
+            },
+            filter: true,
+        },
+    ),
+    (
+        "no-dir-sync",
+        Part::Flush {
+            skip: Skip {
+                directories: true,
+                ..Skip::NONE
+            },
+            filter: true,
+        },
+    ),
+    (
+        "no-sync",
+        Part::Flush {
+            skip: Skip::ALL,
+            filter: true,
+        },
+    ),
+    (
+        "no-sync-no-filter",
+        Part::Flush {
+            skip: Skip::ALL,
+            filter: false,
+        },
+    ),
+    ("memtable", Part::Memtable),
+];
+
+/// Where the time of an `overwrite` goes in our engine: the timed body of
+/// [`overwrite_variant`] with one part left out per arm (see [`PARTS`]). Runs
+/// only when the filter names it (contains `parts`), so the published
+/// head-to-head run does not pay for it.
+fn overwrite_parts_variant(
+    run: &mut Run,
+    group_name: &str,
+    compression: Compression,
+    seeds: &mut SeedStates,
+) {
+    if !run.filter.as_deref().is_some_and(|f| f.contains("parts")) || !run.wants(group_name) {
+        return;
+    }
+    let spec = Spec::writes(compression);
+    for n in run.sizes_of(spec.sizes) {
+        let inputs = WorkloadInputs::of(n, spec.values);
+        let seed = seeds
+            .seed(Engine::Ours, compression, IndexStrategy::Binary, &inputs)
+            .to_path_buf();
+        let arms = PARTS
+            .iter()
+            .map(|&(label, part)| {
+                let (inputs, seed) = (&inputs, &seed);
+                paired::Arm::new(label, move |iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let dir = copy_of(seed);
+                        let config = ours_config(
+                            dir.path(),
+                            compression,
+                            None,
+                            IndexStrategy::Binary,
+                            false,
+                        );
+                        let (skip, filter) = match part {
+                            Part::Flush { skip, filter } => (skip, filter),
+                            Part::Memtable => (Skip::NONE, true),
+                        };
+                        let fs = Arc::new(SkipSyncFs::new(Arc::clone(&config.fs), skip));
+                        let config = config.with_shared_fs(fs);
+                        let config = if filter {
+                            config
+                        } else {
+                            config.filter_policy(FilterPolicy::all(FilterPolicyEntry::None))
+                        };
+                        let tree = config.open().expect("overwrite parts: open");
+                        let start = std::time::Instant::now();
+                        for ((key, value), seqno) in
+                            inputs.keys.iter().zip(inputs.values.iter()).zip(n..)
+                        {
+                            tree.insert(key, value, seqno);
+                        }
+                        if let Part::Flush { .. } = part {
+                            tree.flush_active_memtable(0)
+                                .expect("overwrite parts: flush");
+                        }
+                        total += start.elapsed();
+                        drop((tree, dir));
+                        settle_removal();
+                    }
+                    total
+                })
+            })
+            .collect();
         run.measure(group_name, n, arms);
     }
 }
@@ -2615,7 +2906,7 @@ fn sustained_ours(
     keys: &[[u8; 16]],
     pool: &ValuePool,
 ) -> (Duration, SustainedSample) {
-    let dir = tempfile::tempdir().expect("ours sustained dir");
+    let dir = state_dir();
     let tree = ours_config(dir.path(), compression, blobs, IndexStrategy::Binary, false)
         .flush_durability(FlushDurability::Deferred)
         .open()
@@ -2830,7 +3121,7 @@ fn sustained_rocksdb(
     keys: &[[u8; 16]],
     pool: &ValuePool,
 ) -> (Duration, SustainedSample) {
-    let dir = tempfile::tempdir().expect("rocksdb sustained dir");
+    let dir = state_dir();
     let opts = rocksdb_sustained_options(compression, blob_files);
     let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb sustained: open");
     let mut write_opts = rocksdb::WriteOptions::default();
@@ -3168,7 +3459,7 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
             .engines_of(HEAD_TO_HEAD)
             .into_iter()
             .map(|engine| {
-                let dir = tempfile::tempdir().expect("compaction state tempdir");
+                let dir = state_dir();
                 write_compaction_state(engine, level, shape, &inputs, dir.path()).unwrap_or_else(
                     |e| panic!("compaction setup failed for {}: {e}", engine.label()),
                 );
@@ -3187,7 +3478,7 @@ fn compaction_variant(run: &mut Run, group_name: &str, level: i32, shape: Compac
                             |e| panic!("compaction failed for {}: {e}", engine.label()),
                         );
                         drop(work);
-                        settle();
+                        settle_removal();
                     }
                     total
                 })
@@ -3271,7 +3562,7 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "overwrite",
-        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush. Both engines compress blocks on 4 threads. ours-deferred-wal: our engine with a caller-kept log, the log written and synced once and the flush deferred, one sync per batch as in SurrealKV's commit.",
+        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush. Both engines compress blocks on 4 threads. ours-deferred-wal: our engine with a caller-kept log, the batch written to the log in one call and synced once, then the keys put in the memtable. rocksdb-wal: RocksDB writing the same batch through its own log with a sync. SurrealKV's commit does the same work. None of the three flushes in the timed window. ours-deferred-wal is set against rocksdb-wal, the plain arms and SurrealKV against RocksDB.",
     ),
     (
         "overwrite_sustained",
@@ -3361,9 +3652,22 @@ fn blob_codec_of(label: &str) -> Option<BlobCodec> {
 }
 
 /// The arm the ratio of the arm labelled `label` is taken against: RocksDB
-/// with blob files under the same codec for a blob arm, so the ratio compares
-/// the engines and not the codecs, plain RocksDB for every other arm.
+/// writing through its own synced log for our caller-kept-log arm, which does
+/// the same work; RocksDB with blob files under the same codec for a blob arm,
+/// so the ratio compares the engines and not the codecs; plain RocksDB for
+/// every other arm.
 fn baseline_of(label: &str) -> &'static str {
+    if label == "ours-deferred-wal" {
+        return "rocksdb-wal";
+    }
+    // An `overwrite_parts` arm against the arm it differs from in one part
+    // (see `PARTS`).
+    if label == "no-sync-no-filter" {
+        return "no-sync";
+    }
+    if PARTS.iter().any(|&(part, _)| part == label) {
+        return "full";
+    }
     blob_codec_of(label)
         .map_or(Engine::RocksDb, Engine::RocksDbBlob)
         .label()
@@ -3609,7 +3913,7 @@ fn check_rocksdb_blob_levels() {
         let Some(level) = codec.zstd_level() else {
             continue;
         };
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = state_dir();
         drop(
             rocksdb::DB::open(
                 &rocksdb_options(Compression::None, false, Some(codec)),
@@ -3645,7 +3949,14 @@ fn check_rocksdb_blob_levels() {
 }
 
 fn main() {
+    // Arguments first: `--list` and `--help` exit the process, which runs no
+    // destructor, so a state root made before them would stay on disk.
     let mut run = Run::from_args();
+    // Removed when the run ends, with every state still under it.
+    let root = make_state_root();
+    STATE_ROOT
+        .set(root.path().to_path_buf())
+        .expect("the state root is set once");
     check_rocksdb_blob_levels();
     let mode = if run.measuring {
         "measurement"

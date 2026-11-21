@@ -73,6 +73,11 @@ Beyond the preset, every engine gets the same work:
   seeks its `raw_iterator`, both zero-copy, the way our engine hands out values.
 - **Matched block options.** Block size, a 10-bit bloom filter and a 16 MiB LRU
   block cache on both sides, compaction scenarios included; no WAL.
+- **Logged writes against a logged RocksDB.** The overwrite group's
+  `ours-deferred-wal` arm keeps a caller's log: the batch is written to it in
+  one call and synced once, then put in the memtable. It is set against
+  `rocksdb-wal`, RocksDB writing the same batch through its own log with a
+  sync. Neither flushes in the timed window.
 - **The same cores.** Both engines compress a table's blocks on four threads
   wherever they compress (ours through `compaction_threads`, RocksDB through
   `compression_options_parallel_threads`). At their defaults ours would use
@@ -98,14 +103,27 @@ engine:
 - **the ratio to RocksDB**: the median over the rounds of this engine's time
   over RocksDB's in the same round, with a distribution-free 95% confidence
   interval (the order statistics a Binomial(rounds, 1/2) count bounds). Our
-  tree with blob files is taken against RocksDB with blob files, every other
-  engine against plain RocksDB, and the page shows the two value layouts one
+  tree with blob files is taken against RocksDB with blob files, our
+  caller-log arm against `rocksdb-wal`, every other engine against plain
+  RocksDB, and the page shows the two value layouts one
   at a time;
 - **the time per operation**: the median over the rounds, with the same kind
   of interval.
 
+Every state a run writes lies under one folder with copy-on-write turned
+off (`chattr +C`), which both engines' files inherit. Our engine turns it off
+for its own files by default and the parity preset leaves that off, as
+RocksDB has no such setting; set on the folder, it holds for both. On Btrfs it
+also keeps the file system from compressing the files when it writes them
+back, work a sync would otherwise time inside either engine. A file system
+without the flag (ext4) refuses it and the run goes on.
+
 An arm runs as many iterations per sample as fill 20 ms, and a group runs as
-many rounds as fit a 4-second budget, between ten and forty (ten is the fewest
+many rounds as fit a 4-second budget, both in wall time: an iteration costs
+its whole call, the setup it does outside the clock included (a write group
+copies its starting state and syncs that copy before each timed
+write), while a sample records only the timed part. Between ten and forty
+rounds (ten is the fewest
 for which a 95% interval of the median exists at ranks 2 and 9), rounded to a
 multiple of the group's engine count so every engine takes every position
 equally often. Two runs of
