@@ -16,11 +16,14 @@
 //! | route | `tree` (`Tree::insert`, through the thread's insert gate shard) or `direct` (the active memtable itself) |
 //!
 //! The two routes store a value differently, so their times differ by more
-//! than the insert gate. `tree` hands the memtable borrowed bytes, which it
-//! copies into its value arena when they are longer than an inline value and
-//! at most 64 KiB. `direct` goes through the memtable's public insert, which
-//! takes an owned `InternalValue`, so every insert there also allocates its
-//! value on the heap.
+//! than the insert gate. On the default backend a value up to the inline size
+//! (20 bytes on 64-bit targets, 16 on 32-bit) is held inline by both routes and
+//! allocates nothing. Past it, `tree` hands the memtable borrowed bytes, which
+//! it copies into its value arena up to 64 KiB, while `direct` goes through the
+//! memtable's public insert of an owned `InternalValue` and allocates the value
+//! on the heap. With `bytes_1` there is no value arena and no inline value:
+//! both routes allocate every non-empty value, so they differ only by the
+//! insert gate.
 //!
 //! Per configuration it prints the median over the rounds of the time per
 //! insert seen by a writer, the inserts per second over all of them, the
@@ -193,10 +196,12 @@ fn open(comparator: Option<Arc<CountingComparator>>) -> lsm_tree::Result<AnyTree
 #[derive(Clone, Copy)]
 enum Route {
     /// `Tree::insert`: the thread's insert gate shard, then the memtable,
-    /// which copies the borrowed value into its value arena.
+    /// which copies a borrowed value past the inline size and up to 64 KiB
+    /// into its value arena (default backend; see the module docs).
     Tree,
     /// The active memtable directly, through its public insert of an owned
-    /// `InternalValue`: no insert gate, but a heap allocation per value.
+    /// `InternalValue`: no insert gate, but a heap allocation for a value past
+    /// the inline size (see the module docs).
     Memtable,
 }
 
