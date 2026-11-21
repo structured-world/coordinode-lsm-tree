@@ -1325,10 +1325,7 @@ impl SkipMap {
         if !crate::comparator::same_user_key(self.node_user_key_bytes(node), key) {
             return None;
         }
-        Some(InternalValue {
-            key: self.node_internal_key(node),
-            value: self.node_value(node),
-        })
+        Some(self.node_entry(node))
     }
 
     /// Finds the first node whose key > `target`, or UNSET.
