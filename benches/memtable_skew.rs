@@ -15,6 +15,13 @@
 //! | writers | 1, 4, 16, 32 threads, each taking its share of the versions |
 //! | route | `tree` (`Tree::insert`, through the thread's insert gate shard) or `direct` (the active memtable itself) |
 //!
+//! The two routes store a value differently, so their times differ by more
+//! than the insert gate. `tree` hands the memtable borrowed bytes, which it
+//! copies into its value arena when they are longer than an inline value and
+//! at most 64 KiB. `direct` goes through the memtable's public insert, which
+//! takes an owned `InternalValue`, so every insert there also allocates its
+//! value on the heap.
+//!
 //! Per configuration it prints the median over the rounds of the time per
 //! insert seen by a writer, the inserts per second over all of them, the
 //! memtable bytes per version, and the P50/P99/P999 latency of one insert,
@@ -185,9 +192,11 @@ fn open(comparator: Option<Arc<CountingComparator>>) -> lsm_tree::Result<AnyTree
 /// How a write reaches the memtable.
 #[derive(Clone, Copy)]
 enum Route {
-    /// `Tree::insert`: the thread's insert gate shard, then the memtable.
+    /// `Tree::insert`: the thread's insert gate shard, then the memtable,
+    /// which copies the borrowed value into its value arena.
     Tree,
-    /// The active memtable directly: its own cost alone.
+    /// The active memtable directly, through its public insert of an owned
+    /// `InternalValue`: no insert gate, but a heap allocation per value.
     Memtable,
 }
 
