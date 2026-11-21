@@ -32,7 +32,8 @@
 //!
 //! `MEMTABLE_SKEW_VERSIONS` (default 400000) sets the versions per
 //! configuration, `MEMTABLE_SKEW_KEYS` (default 100000) the key space of the
-//! skewed orders, `MEMTABLE_SKEW_ROUNDS` (default 5) the rounds.
+//! skewed orders, `MEMTABLE_SKEW_ROUNDS` (default 5) the rounds,
+//! `MEMTABLE_SKEW_VALUE_SIZE` (default 256) the bytes of every value.
 //! `MEMTABLE_SKEW_ORDERS`, `MEMTABLE_SKEW_PREFIXES` and `MEMTABLE_SKEW_WRITERS`
 //! (comma-separated, e.g. `uniform`, `0`, `1`) run only the configurations they
 //! name, so one can be profiled alone; unset, each axis runs in full.
@@ -51,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-/// Bytes per value, as in the head-to-head harness.
+/// Bytes per value by default, as in the head-to-head harness.
 const VALUE_SIZE: usize = 256;
 
 /// Every this many inserts of a writer one is timed alone, for the latency
@@ -208,13 +209,13 @@ struct Writes {
 }
 
 impl Writes {
-    fn new(order: KeyOrder, prefix: usize, versions: usize, keys: usize) -> Self {
+    fn new(order: KeyOrder, prefix: usize, versions: usize, keys: usize, value: usize) -> Self {
         Self {
             keys: key_indices(order, versions, keys)
                 .into_iter()
                 .map(|i| key(order, prefix, i))
                 .collect(),
-            value: vec![b'v'; VALUE_SIZE],
+            value: vec![b'v'; value],
         }
     }
 
@@ -353,6 +354,7 @@ fn main() -> lsm_tree::Result<()> {
     } else {
         (2_000, 500, 1)
     };
+    let value_size = env_or("MEMTABLE_SKEW_VALUE_SIZE", VALUE_SIZE);
     for order in KeyOrder::ALL {
         if !picked("MEMTABLE_SKEW_ORDERS", order.label()) {
             continue;
@@ -361,7 +363,7 @@ fn main() -> lsm_tree::Result<()> {
             if !picked("MEMTABLE_SKEW_PREFIXES", &prefix.to_string()) {
                 continue;
             }
-            let writes = Writes::new(order, prefix, versions, keys);
+            let writes = Writes::new(order, prefix, versions, keys, value_size);
             for writers in WRITERS {
                 if !picked("MEMTABLE_SKEW_WRITERS", &writers.to_string()) {
                     continue;
