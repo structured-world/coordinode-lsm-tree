@@ -71,8 +71,25 @@ Beyond the preset, every engine gets the same work:
   spans enough tables to split.
 - **Reads without copies.** Point reads use RocksDB's `get_pinned`, scans and
   seeks its `raw_iterator`, both zero-copy, the way our engine hands out values.
-- **Matched block options.** Block size, a 10-bit bloom filter and a 16 MiB LRU
-  block cache on both sides, compaction scenarios included; no WAL.
+- **RocksDB tuned for reads.** RocksDB runs with one configuration in every
+  group, set up the way a read-tuned deployment would set it up:
+  - a 16 MiB `HyperClockCache`, its lock-free block cache;
+  - a Ribbon filter at 10 Bloom-equivalent bits per key, the same false
+    positive rate as our 10-bit Bloom filter in less memory;
+  - `optimize_filters_for_hits`, because every read in the harness looks up a
+    stored key;
+  - `async_io` in the read options of every read;
+  - on Linux, a build with io_uring.
+
+  Reads stay buffered rather than direct: with direct reads RocksDB would
+  have only its 16 MiB block cache while our engine keeps the OS page cache,
+  and every read past the cache, blob reads included, would go to the device.
+- **Matched capacities.** Both engines get the same block size and 16 MiB of
+  block cache, in the compaction scenarios too. RocksDB's HyperClockCache
+  does not hold its capacity strictly: in `multi_get` with 1 and 4 MiB values
+  stored in the tables, it keeps a batch's blocks past 16 MiB (64 MiB
+  measured), and the group note says so. No scenario writes a WAL apart from
+  the two logged overwrite arms below.
 - **Logged writes against a logged RocksDB.** The overwrite group's
   `ours-deferred-wal` arm keeps a caller's log: the batch is written to it in
   one call and synced once, then put in the memtable. It is set against
@@ -137,7 +154,13 @@ published page is drawn from.
 ## Running
 
 The harness links RocksDB through `librocksdb-sys`, whose `bindgen` build step
-needs `libclang`.
+needs `libclang`. On Linux, RocksDB is built with io_uring, which also needs
+liburing through pkg-config (`liburing-devel` on Fedora, `liburing-dev` on
+Debian and Ubuntu). On x86_64 Linux the harness's own
+`tools/compare-rocksdb/.cargo/config.toml`, read when cargo runs from that
+directory, compiles RocksDB's C++ for the host CPU, the way RocksDB's own Makefile does
+by default. Without it, `librocksdb-sys` targets baseline x86-64, and RocksDB
+computes CRC32C in software.
 
 ```sh
 # Linux: the distro libclang.so is found automatically.

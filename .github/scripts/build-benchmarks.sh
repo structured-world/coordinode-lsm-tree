@@ -27,7 +27,10 @@ plain=$!
 cargo build --release --manifest-path tools/db_bench/Cargo.toml --features counters \
   --target-dir tools/db_bench/target/counters &
 counters=$!
-cargo bench --manifest-path tools/compare-rocksdb/Cargo.toml --bench compare --no-run &
+# From the harness directory, where the workflow runs it too: its own
+# `.cargo/config.toml` sets RocksDB's C++ flags, and a build that did not read
+# it would be rebuilt by the run.
+(cd tools/compare-rocksdb && cargo bench --bench compare --no-run) &
 compare=$!
 
 # Wait for all three before reporting, so one failure does not leave the other

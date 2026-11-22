@@ -61,6 +61,12 @@ serde_json = "1"
 smallvec = "1"
 tempfile = "3"
 
+# RocksDB as a tuned deployment builds it on Linux: with io_uring, which its
+# batched reads and async reads go through. Needs liburing (pkg-config) on the
+# host. Other targets have no io_uring.
+[target.'cfg(target_os = "linux")'.dependencies]
+rocksdb = { version = "0.25", default-features = false, features = ["zstd", "io-uring"] }
+
 [features]
 # Diagnostics only: prints what the engine did per operation in the sustained
 # scenario. The counters cost atomics on the read and write paths, so the

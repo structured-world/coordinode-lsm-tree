@@ -729,18 +729,27 @@ impl WorkloadInputs {
     }
 }
 
-/// RocksDB `Options` configured to match our engine's defaults so the
-/// head-to-head stays apples-to-apples:
+/// RocksDB `Options` as a read-tuned deployment sets them, the one RocksDB
+/// configuration of the whole harness, with our engine's capacities:
 ///
 /// - **No compression** — our default `data_block_compression_policy`
 ///   writes L0 with `None`.
-/// - **10-bits/key bloom filter** — `Config::default()` gives our engine
-///   `Bloom(BitsPerKey(10.0))`. RocksDB has NO filter policy by default,
-///   so without this it would skip the bloom construction our engine
-///   pays at flush (write side) and the bloom probe per lookup (read
-///   side).
-/// - **16 MiB block cache** — matches our default per-tree cache
-///   capacity, so neither engine gets an unfair cache-size edge.
+/// - **Ribbon filter, 10 Bloom-equivalent bits per key** — the same false
+///   positive rate as our `Bloom(BitsPerKey(10.0))` in less memory.
+/// - **`optimize_filters_for_hits`** — no filter on the last level: every
+///   read of the harness looks up a stored key, where that filter can only
+///   answer "maybe".
+/// - **16 MiB `HyperClockCache`** — RocksDB's lock-free block cache, at our
+///   default per-tree cache capacity, so neither engine gets a cache-size
+///   edge. `estimated_entry_charge = 0` picks the auto-sized table.
+/// - **Buffered reads, not `use_direct_reads`** — direct reads leave RocksDB
+///   only its block cache, sized here like ours at 16 MiB, while our engine
+///   keeps the OS page cache: on Linux a 70k point read then took ~100 µs
+///   against ~1.6 µs at 10k, and every blob read went to the device. Direct
+///   reads pay off with a block cache sized to replace the page cache, which
+///   matched capacities rule out.
+/// - Reads pass [`rocksdb_read_options`] (`async_io`), and on Linux RocksDB is
+///   built with io_uring (`Cargo.toml`).
 /// - **[`COMPRESSION_THREADS`] block-compression threads**, as ours gets in
 ///   [`open_ours`].
 ///
@@ -762,11 +771,9 @@ fn rocksdb_options(
     blob_files: Option<BlobCodec>,
 ) -> rocksdb::Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
-    let cache = rocksdb::Cache::new_lru_cache(16 * 1024 * 1024);
+    let cache = rocksdb::Cache::new_hyper_clock_cache(16 * 1024 * 1024, 0);
     block_opts.set_block_cache(&cache);
-    // bits_per_key = 10.0, block_based = false → modern full-block filter,
-    // the closest match to our `BitsPerKey(10.0)` policy.
-    block_opts.set_bloom_filter(10.0, false);
+    block_opts.set_ribbon_filter(10.0);
     if hash_index {
         // Data-block hash index: a point get resolves a key to its in-block
         // offset by hash instead of binary-searching the restart array. The
@@ -786,6 +793,7 @@ fn rocksdb_options(
             .expect("rocksdb: blob compression level");
     }
     opts.create_if_missing(true);
+    opts.set_optimize_filters_for_hits(true);
     match compression {
         Compression::None => opts.set_compression_type(rocksdb::DBCompressionType::None),
         Compression::Zstd22 => {
@@ -805,6 +813,20 @@ fn rocksdb_options(
         set_blob_files(&mut opts, codec);
     }
     opts
+}
+
+/// How [`rocksdb_options`] and [`rocksdb_read_options`] set RocksDB up, as the
+/// published page states it.
+const ROCKSDB_TUNING: &str = "16 MiB HyperClockCache, Ribbon filter at 10 bits per key, \
+    optimize_filters_for_hits, async_io reads, io_uring on Linux";
+
+/// The read options of every RocksDB read in the harness: `async_io`, so
+/// iterators prefetch asynchronously and batched reads issue their block reads
+/// together. Built once per arm, outside the timed window.
+fn rocksdb_read_options() -> rocksdb::ReadOptions {
+    let mut read_opts = rocksdb::ReadOptions::default();
+    read_opts.set_async_io(true);
+    read_opts
 }
 
 /// RocksDB's blob files as the blob arms use them: values at or above
@@ -1335,9 +1357,12 @@ fn cold_reads(
         }
         Engine::RocksDb | Engine::RocksDbBlob(_) => {
             let db = open_rocksdb(dir, compression, false, engine.blob_files());
+            let read_opts = rocksdb_read_options();
             for key in &inputs.keys {
                 time(&mut || {
-                    let got = db.get_pinned(key).expect("rocksdb cold: get");
+                    let got = db
+                        .get_pinned_opt(key, &read_opts)
+                        .expect("rocksdb cold: get");
                     assert!(got.is_some(), "rocksdb cold: key unexpectedly missing");
                     std::hint::black_box(got);
                 });
@@ -1402,18 +1427,23 @@ impl ColdSample {
 fn verify_point_reads(warm: &WarmEngine, inputs: &WorkloadInputs) {
     match warm {
         WarmEngine::Ours { tree, .. } => {
-            for key in &inputs.keys {
+            for (key, value) in inputs.keys.iter().zip(&inputs.values) {
                 assert!(
-                    tree.get(key, MAX_SEQNO).expect("ours: verify").is_some(),
-                    "ours: key unexpectedly missing"
+                    tree.get(key, MAX_SEQNO).expect("ours: verify").as_deref()
+                        == Some(value.as_slice()),
+                    "ours: key missing or holding other bytes"
                 );
             }
         }
         WarmEngine::RocksDb { db, .. } => {
-            for key in &inputs.keys {
+            let read_opts = rocksdb_read_options();
+            for (key, value) in inputs.keys.iter().zip(&inputs.values) {
                 assert!(
-                    db.get_pinned(key).expect("rocksdb: verify").is_some(),
-                    "rocksdb: key unexpectedly missing"
+                    db.get_pinned_opt(key, &read_opts)
+                        .expect("rocksdb: verify")
+                        .as_deref()
+                        == Some(value.as_slice()),
+                    "rocksdb: key missing or holding other bytes"
                 );
             }
         }
@@ -1463,12 +1493,13 @@ fn point_read_routine<'a>(warm: &'a WarmEngine, inputs: &'a WorkloadInputs) -> p
             start.elapsed()
         }),
         WarmEngine::RocksDb { db, .. } if std::env::var_os("COMPARE_HOLD").is_some() => {
+            let read_opts = rocksdb_read_options();
             Box::new(move |iters| {
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
                     let mut held = Vec::with_capacity(inputs.keys.len());
                     for key in &inputs.keys {
-                        held.push(db.get_pinned(key).expect("rocksdb: get"));
+                        held.push(db.get_pinned_opt(key, &read_opts).expect("rocksdb: get"));
                     }
                     std::hint::black_box(held);
                 }
@@ -1478,16 +1509,19 @@ fn point_read_routine<'a>(warm: &'a WarmEngine, inputs: &'a WorkloadInputs) -> p
         // `get_pinned` hands back a view of the block, as our `get` does;
         // plain `get` would copy every value into a fresh `Vec` and charge
         // RocksDB an allocation ours never pays.
-        WarmEngine::RocksDb { db, .. } => Box::new(move |iters| {
-            let start = std::time::Instant::now();
-            for _ in 0..iters {
-                for key in &inputs.keys {
-                    let got = db.get_pinned(key).expect("rocksdb: get");
-                    std::hint::black_box(got);
+        WarmEngine::RocksDb { db, .. } => {
+            let read_opts = rocksdb_read_options();
+            Box::new(move |iters| {
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    for key in &inputs.keys {
+                        let got = db.get_pinned_opt(key, &read_opts).expect("rocksdb: get");
+                        std::hint::black_box(got);
+                    }
                 }
-            }
-            start.elapsed()
-        }),
+                start.elapsed()
+            })
+        }
         WarmEngine::SurrealKv { tree, .. } => {
             // One read snapshot for the whole arm, the closest analogue of the
             // other engines' direct warm reads (a consistent view, no per-get
@@ -2002,7 +2036,7 @@ fn multi_get_variant(
     }
 }
 
-/// One-time "every key present" contract check OUTSIDE the timed window
+/// One-time "every key present with its bytes" contract check OUTSIDE the timed window
 /// (mirrors [`verify_point_reads`]), so a setup regression can't quietly
 /// become a miss-read benchmark. Cardinality before presence: a batched API
 /// that dropped positions would otherwise pass the presence check while the
@@ -2019,23 +2053,33 @@ fn verify_multi_get(warm: &WarmEngine, inputs: &WorkloadInputs) {
                 "ours: multi_get must return one result per input key"
             );
             assert!(
-                probe.iter().all(Option::is_some),
-                "ours: key unexpectedly missing"
+                probe
+                    .iter()
+                    .zip(&inputs.values)
+                    .all(|(got, value)| got.as_deref() == Some(value.as_slice())),
+                "ours: key missing or holding other bytes"
             );
         }
         WarmEngine::RocksDb { db, .. } => {
             let cf = db
                 .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
                 .expect("rocksdb: default cf");
-            let probe = db.batched_multi_get_cf(&cf, inputs.keys.iter(), false);
+            let probe = db.batched_multi_get_cf_opt(
+                &cf,
+                inputs.keys.iter(),
+                false,
+                &rocksdb_read_options(),
+            );
             assert_eq!(
                 probe.len(),
                 inputs.keys.len(),
                 "rocksdb: batched_multi_get_cf must return one result per input key"
             );
             assert!(
-                probe.iter().all(|r| matches!(r, Ok(Some(_)))),
-                "rocksdb: key unexpectedly missing"
+                probe.iter().zip(&inputs.values).all(|(got, value)| {
+                    matches!(got, Ok(Some(got)) if got.as_ref() == value.as_slice())
+                }),
+                "rocksdb: key missing or holding other bytes"
             );
         }
         WarmEngine::SurrealKv { .. } => {
@@ -2067,10 +2111,18 @@ fn multi_get_routine<'a>(warm: &'a WarmEngine, inputs: &'a WorkloadInputs) -> pa
             let cf = db
                 .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
                 .expect("rocksdb: default cf");
+            let read_opts = rocksdb_read_options();
             Box::new(move |iters| {
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    let got = db.batched_multi_get_cf(&cf, inputs.keys.iter(), false);
+                    let got =
+                        db.batched_multi_get_cf_opt(&cf, inputs.keys.iter(), false, &read_opts);
+                    // Every result is checked, as ours fails on any `Err`: a
+                    // key answered with an error costs RocksDB no value read.
+                    assert!(
+                        got.iter().all(|r| matches!(r, Ok(Some(_)))),
+                        "rocksdb: batched_multi_get_cf answered a key with an error or nothing"
+                    );
                     std::hint::black_box(got);
                 }
                 start.elapsed()
@@ -2170,7 +2222,7 @@ fn range_scan_routine<'a>(
         WarmEngine::RocksDb { db, .. } => Box::new(move |iters| {
             let start = std::time::Instant::now();
             for _ in 0..iters {
-                let mut it = db.raw_iterator();
+                let mut it = db.raw_iterator_opt(rocksdb_read_options());
                 it.seek_to_first();
                 while it.valid() {
                     std::hint::black_box(it.value());
@@ -2250,7 +2302,8 @@ fn seek_random_routine<'a>(
             let start = std::time::Instant::now();
             for _ in 0..iters {
                 for key in &inputs.keys {
-                    let mut it = db.raw_iterator();
+                    // `raw_iterator` builds default read options per call too.
+                    let mut it = db.raw_iterator_opt(rocksdb_read_options());
                     it.seek(key);
                     std::hint::black_box(it.value());
                     it.status().expect("rocksdb: seek");
@@ -3170,8 +3223,12 @@ fn sustained_rocksdb(
     let stop = AtomicBool::new(false);
     let (elapsed, disk, mut reads) = std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
+            let read_opts = rocksdb_read_options();
             read_while(&stop, keys, |key| {
-                std::hint::black_box(db.get_pinned(key).expect("rocksdb sustained: get"));
+                std::hint::black_box(
+                    db.get_pinned_opt(key, &read_opts)
+                        .expect("rocksdb sustained: get"),
+                );
             })
         });
         let _stop = RaiseOnDrop(&stop);
@@ -3401,7 +3458,8 @@ impl SkewInputs {
 
 /// Times `put` over every write of `inputs` on `writers` threads, write `i`
 /// on thread `i % writers`, so concurrent writers keep the order the writes
-/// were drawn in as a shared sequence would. One writer runs on the calling
+/// were drawn in as a shared sequence would. `put` gets each key with its
+/// index, which the mixed groups also use to pick a read. One writer runs on the calling
 /// thread. The threads start together; the time runs from their start to the
 /// last one's end.
 fn time_writers(writers: usize, inputs: &SkewInputs, put: impl Fn(&[u8], u64) + Sync) -> Duration {
@@ -3578,6 +3636,162 @@ fn bench_overwrite_skew(run: &mut Run) {
             let inputs = SkewInputs::new(&shape, skew, prefix);
             skew_group(run, &group, &shape, &inputs, 1, &pool);
         }
+    }
+}
+
+/// Threads of the high-concurrency mixed groups.
+const MIXED_THREADS: &[usize] = &[32, 64, 128];
+/// Reads per hundred operations of a mixed group: YCSB-B's 95, YCSB-A's 50.
+const MIXED_READS: &[u64] = &[95, 50];
+
+/// Whether operation `i` of a mixed group with `read_percent` reads: a fixed
+/// scatter of the index, so both engines run the same sequence of reads and
+/// overwrites.
+fn mixed_reads(i: u64, read_percent: u64) -> bool {
+    (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % 100 < read_percent
+}
+
+/// One high-concurrency mixed group, ours against RocksDB: each iteration
+/// opens an empty engine, writes and flushes the held set, then times the
+/// operations of `inputs` on `threads` threads, reads and overwrites as
+/// [`mixed_reads`] splits them. Neither engine writes a log or flushes in the
+/// timed window, as in [`skew_group`].
+fn mixed_group(
+    run: &mut Run,
+    group: &str,
+    shape: &SkewShape,
+    inputs: &SkewInputs,
+    threads: usize,
+    read_percent: u64,
+    pool: &ValuePool,
+) {
+    if !run.wants(group) {
+        return;
+    }
+    let held = shape.keys;
+    let arms = run
+        .engines_of(&[Engine::Ours, Engine::RocksDb])
+        .into_iter()
+        .map(|engine| {
+            paired::Arm::new(engine.label(), move |iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let dir = state_dir();
+                    // A benchmark binary: a setup I/O failure ends the run with
+                    // the failed step named, as every group's setup does; there
+                    // is no measurement to fall back to.
+                    match engine {
+                        Engine::Ours => {
+                            let tree = ours_config(
+                                dir.path(),
+                                Compression::None,
+                                None,
+                                IndexStrategy::Binary,
+                                false,
+                            )
+                            .open()
+                            .expect("ours mixed: open");
+                            for (seqno, key) in (0..).zip(inputs.held()) {
+                                tree.insert(key, pool.value(seqno), seqno);
+                            }
+                            tree.flush_active_memtable(0).expect("ours mixed: flush");
+                            for (seqno, key) in (0..).zip(inputs.held()) {
+                                assert!(
+                                    tree.get(key, MAX_SEQNO)
+                                        .expect("ours mixed: verify")
+                                        .as_deref()
+                                        == Some(pool.value(seqno)),
+                                    "ours mixed: held key missing or holding other bytes"
+                                );
+                            }
+                            let seqno = AtomicU64::new(held);
+                            total += time_writers(threads, inputs, |key, i| {
+                                if mixed_reads(i, read_percent) {
+                                    let got = tree.get(key, MAX_SEQNO).expect("ours mixed: get");
+                                    // Every key is held, so a miss is a setup
+                                    // fault that would time a cheaper read.
+                                    assert!(got.is_some(), "ours mixed: held key missing");
+                                    std::hint::black_box(got);
+                                } else {
+                                    let seqno = seqno.fetch_add(1, Ordering::Relaxed);
+                                    tree.insert(key, pool.value(held + i), seqno);
+                                }
+                            });
+                            drop(tree);
+                        }
+                        Engine::RocksDb => {
+                            let mut opts = rocksdb_options(Compression::None, false, None);
+                            opts.set_write_buffer_size(SkewShape::WRITE_BUFFER);
+                            let db =
+                                rocksdb::DB::open(&opts, dir.path()).expect("rocksdb mixed: open");
+                            let mut write_opts = rocksdb::WriteOptions::default();
+                            write_opts.disable_wal(true);
+                            for (seqno, key) in (0..).zip(inputs.held()) {
+                                db.put_opt(key, pool.value(seqno), &write_opts)
+                                    .expect("rocksdb mixed: held put");
+                            }
+                            db.flush().expect("rocksdb mixed: flush");
+                            let read_opts = rocksdb_read_options();
+                            for (seqno, key) in (0..).zip(inputs.held()) {
+                                assert!(
+                                    db.get_pinned_opt(key, &read_opts)
+                                        .expect("rocksdb mixed: verify")
+                                        .as_deref()
+                                        == Some(pool.value(seqno)),
+                                    "rocksdb mixed: held key missing or holding other bytes"
+                                );
+                            }
+                            total += time_writers(threads, inputs, |key, i| {
+                                if mixed_reads(i, read_percent) {
+                                    let got = db
+                                        .get_pinned_opt(key, &read_opts)
+                                        .expect("rocksdb mixed: get");
+                                    assert!(got.is_some(), "rocksdb mixed: held key missing");
+                                    std::hint::black_box(got);
+                                } else {
+                                    db.put_opt(key, pool.value(held + i), &write_opts)
+                                        .expect("rocksdb mixed: put");
+                                }
+                            });
+                            drop(db);
+                        }
+                        _ => unreachable!("the mixed groups run ours and rocksdb only"),
+                    }
+                    drop(dir);
+                    settle_removal();
+                }
+                total
+            })
+        })
+        .collect();
+    run.measure(group, shape.writes, arms);
+}
+
+/// The high-concurrency mixed groups, `concurrent_mixed_r<reads>_t<threads>`:
+/// Zipf(0.99) operations over a flushed key set, each read share on each
+/// thread count.
+fn bench_concurrent_mixed(run: &mut Run) {
+    let groups: Vec<(String, u64, usize)> = MIXED_READS
+        .iter()
+        .flat_map(|&reads| {
+            MIXED_THREADS.iter().map(move |&threads| {
+                (
+                    format!("concurrent_mixed_r{reads}_t{threads}"),
+                    reads,
+                    threads,
+                )
+            })
+        })
+        .filter(|(group, ..)| run.wants(group))
+        .collect();
+    if groups.is_empty() {
+        return;
+    }
+    let shape = SkewShape::new(run.measuring);
+    let pool = ValuePool::new();
+    let inputs = SkewInputs::new(&shape, Skew::Zipf, 0);
+    for (group, reads, threads) in groups {
+        mixed_group(run, &group, &shape, &inputs, threads, reads, &pool);
     }
 }
 
@@ -3936,6 +4150,10 @@ const GROUP_NOTES: &[(&str, &str)] = &[
         "200,000 writes into a memtable that already holds 100,000 keys, timed without a flush: the insert path alone. No write-ahead log on either; RocksDB's write buffer holds every write. Keys drawn in increasing order past the held set (append), uniformly from it, by Zipf(0.99) over it, or one key every time (hot). _w<N>: on N writer threads, 8-byte keys. _prefix<N>: one writer, keys behind an N-byte shared prefix.",
     ),
     (
+        "concurrent_mixed",
+        "Both engines hold 100,000 flushed keys; T threads run 200,000 operations on keys drawn by Zipf(0.99) over them, each a read with probability P% and an overwrite otherwise. _r<P>_t<T>: P = 95 (YCSB-B) or 50 (YCSB-A), T = 32, 64 or 128. No write-ahead log on either and no flush in the timed window; RocksDB's write buffer holds every write. Time per operation across all threads.",
+    ),
+    (
         "point_read",
         "One get per stored key on a warm engine. Also our hash index, ribbon locator and row cache, and RocksDB's hash index, on the same chart.",
     ),
@@ -3945,7 +4163,7 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "multi_get",
-        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf).",
+        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf). With 1 and 4 MiB values in the tables, RocksDB's HyperClockCache keeps a batch's blocks after the call past its 16 MiB capacity (64 MiB measured), so every later batch is all cache hits; ours keeps a batch's blocks within its 16 MiB cache and reads the rest again.",
     ),
     (
         "range_scan",
@@ -4250,6 +4468,7 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
         .collect();
     let summary = serde_json::json!({
         "preset": active_preset().label(),
+        "rocksdb": ROCKSDB_TUNING,
         "baselines": Layout::ALL
             .iter()
             .map(|layout| (layout.label().to_owned(), layout.baselines().into()))
@@ -4335,6 +4554,7 @@ fn main() {
     bench_seeded(&mut run);
     bench_overwrite_sustained(&mut run);
     bench_overwrite_skew(&mut run);
+    bench_concurrent_mixed(&mut run);
     bench_compaction(&mut run);
     bench_subcompaction(&mut run);
     if !run.measuring {
