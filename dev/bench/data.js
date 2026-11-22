@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795382140892,
+  "lastUpdate": 1795382145469,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -121926,6 +121926,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.406751774,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d6bd5166817aba2a544e17d0cd95c12c8061eaa7",
+          "message": "bench: measure against read-tuned rocksdb (#1101)\n\n## Summary\n\n- The head-to-head harness runs RocksDB in one configuration, tuned for\nreads, in every group: HyperClockCache, Ribbon filter,\n`optimize_filters_for_hits`, `async_io`, io_uring on Linux, and C/C++\nbuilt for the host CPU on x86_64 Linux.\n- A new `concurrent_mixed_r<P>_t<T>` group runs Zipf reads and\noverwrites on 32, 64 and 128 threads at 95% and 50% reads.\n- The harness checks every read value byte for byte before timing, and\nRocksDB's batched MultiGet results inside the timed loop.\n\n## Changes\n\n- `rocksdb_options`: 16 MiB HyperClockCache (auto-sized), Ribbon filter\nat 10 bits per key, `optimize_filters_for_hits`; reads stay buffered\n(with direct reads RocksDB would have only its 16 MiB cache while ours\nkeeps the page cache). Every RocksDB read uses `ReadOptions` with\n`async_io`, built outside the timed window.\n- `tools/compare-rocksdb/Cargo.toml`: RocksDB with `io-uring` on Linux\n(needs liburing). `tools/compare-rocksdb/.cargo/config.toml`:\n`-march=native` for RocksDB's C and C++ on x86_64 Linux, harness-only;\nwithout it RocksDB computes CRC32C in software.\n- CI: the benchmark build runs from the harness directory so it reads\nthat config, the RocksDB build cache is keyed per runner, and the\nprerequisite step checks for liburing.\n- `concurrent_mixed` group, its note, and a \"Mixed, many threads\" kind\non the page.\n- Point read, `multi_get` and `concurrent_mixed` check values against\nthe written bytes before timing; RocksDB's timed MultiGet fails on an\nerror result, and a timed mixed read fails on a miss. The `multi_get`\nnote states that with 1 and 4 MiB values in the tables RocksDB's\nHyperClockCache keeps a batch's blocks past its capacity (64 MiB\nmeasured against 16 MiB).\n- Page: the RocksDB setup in the run line; ratio axes labelled at round\nratios only, spanning at least x0.8 to x1.25, bars growing from x1.\n- `docs/BENCHMARKING.md` and the README describe the RocksDB setup and\nthe liburing prerequisite.\n\n## Testing\n\nClippy (`-D warnings`) and fmt on the harness; `cargo test --release\n--bench compare` (every group once) green on a Linux runner; a full\nmeasurement of every group on the Linux bench host, results in #1097.\nThe page was checked in a browser against the published summary.\n\nCloses #1097",
+          "timestamp": "2026-11-22T21:45:49+02:00",
+          "tree_id": "866d9c73c275394ce2f63a5d925a6adc26a155e0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d6bd5166817aba2a544e17d0cd95c12c8061eaa7"
+        },
+        "date": 1795382144394,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 626.396,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 158.546165ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 258.77099999999996,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 213.793167ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1377.236,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 243.650474ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5085.677000000001,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 26005.333,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.391,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 52.068351,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.415548411,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.807,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 51.806207,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.4067205,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
