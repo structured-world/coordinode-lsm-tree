@@ -299,7 +299,8 @@
                   const wide = axis.max / axis.min > 10;
                   axis.ticks = RATIO_TICKS
                     .filter(function (v) { return v >= axis.min && v <= axis.max && !(wide && (v === 0.8 || v === 1.25)); })
-                    .map(function (v) { return { value: v }; });
+                    // Parity is major, so the axis's own label skipping keeps it.
+                    .map(function (v) { return { value: v, major: v === 1 }; });
                 },
                 // Parity with RocksDB stands out from the other grid lines.
                 grid: { color: function (ctx) { return ctx.tick && ctx.tick.value === 1 ? "#8b949e" : "#21262d"; } },

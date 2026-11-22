@@ -85,7 +85,11 @@ Beyond the preset, every engine gets the same work:
   have only its 16 MiB block cache while our engine keeps the OS page cache,
   and every read past the cache, blob reads included, would go to the device.
 - **Matched capacities.** Both engines get the same block size and 16 MiB of
-  block cache, in the compaction scenarios too. No scenario writes a WAL.
+  block cache, in the compaction scenarios too. RocksDB's HyperClockCache
+  does not hold its capacity strictly: in `multi_get` with 1 and 4 MiB values
+  stored in the tables, it keeps a batch's blocks past 16 MiB (64 MiB
+  measured), and the group note says so. No scenario writes a WAL apart from
+  the two logged overwrite arms below.
 - **Logged writes against a logged RocksDB.** The overwrite group's
   `ours-deferred-wal` arm keeps a caller's log: the batch is written to it in
   one call and synced once, then put in the memtable. It is set against

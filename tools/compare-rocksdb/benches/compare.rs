@@ -3677,6 +3677,9 @@ fn mixed_group(
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     let dir = state_dir();
+                    // A benchmark binary: a setup I/O failure ends the run with
+                    // the failed step named, as every group's setup does; there
+                    // is no measurement to fall back to.
                     match engine {
                         Engine::Ours => {
                             let tree = ours_config(
@@ -3692,10 +3695,22 @@ fn mixed_group(
                                 tree.insert(key, pool.value(seqno), seqno);
                             }
                             tree.flush_active_memtable(0).expect("ours mixed: flush");
+                            for (seqno, key) in (0..).zip(inputs.held()) {
+                                assert!(
+                                    tree.get(key, MAX_SEQNO)
+                                        .expect("ours mixed: verify")
+                                        .as_deref()
+                                        == Some(pool.value(seqno)),
+                                    "ours mixed: held key missing or holding other bytes"
+                                );
+                            }
                             let seqno = AtomicU64::new(held);
                             total += time_writers(threads, inputs, |key, i| {
                                 if mixed_reads(i, read_percent) {
                                     let got = tree.get(key, MAX_SEQNO).expect("ours mixed: get");
+                                    // Every key is held, so a miss is a setup
+                                    // fault that would time a cheaper read.
+                                    assert!(got.is_some(), "ours mixed: held key missing");
                                     std::hint::black_box(got);
                                 } else {
                                     let seqno = seqno.fetch_add(1, Ordering::Relaxed);
@@ -3717,11 +3732,21 @@ fn mixed_group(
                             }
                             db.flush().expect("rocksdb mixed: flush");
                             let read_opts = rocksdb_read_options();
+                            for (seqno, key) in (0..).zip(inputs.held()) {
+                                assert!(
+                                    db.get_pinned_opt(key, &read_opts)
+                                        .expect("rocksdb mixed: verify")
+                                        .as_deref()
+                                        == Some(pool.value(seqno)),
+                                    "rocksdb mixed: held key missing or holding other bytes"
+                                );
+                            }
                             total += time_writers(threads, inputs, |key, i| {
                                 if mixed_reads(i, read_percent) {
                                     let got = db
                                         .get_pinned_opt(key, &read_opts)
                                         .expect("rocksdb mixed: get");
+                                    assert!(got.is_some(), "rocksdb mixed: held key missing");
                                     std::hint::black_box(got);
                                 } else {
                                     db.put_opt(key, pool.value(held + i), &write_opts)
