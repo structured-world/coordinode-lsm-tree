@@ -742,7 +742,12 @@ impl WorkloadInputs {
 /// - **16 MiB `HyperClockCache`** — RocksDB's lock-free block cache, at our
 ///   default per-tree cache capacity, so neither engine gets a cache-size
 ///   edge. `estimated_entry_charge = 0` picks the auto-sized table.
-/// - **`use_direct_reads`** — table reads bypass the OS page cache.
+/// - **Buffered reads, not `use_direct_reads`** — direct reads leave RocksDB
+///   only its block cache, sized here like ours at 16 MiB, while our engine
+///   keeps the OS page cache: on Linux a 70k point read then took ~100 µs
+///   against ~1.6 µs at 10k, and every blob read went to the device. Direct
+///   reads pay off with a block cache sized to replace the page cache, which
+///   matched capacities rule out.
 /// - Reads pass [`rocksdb_read_options`] (`async_io`), and on Linux RocksDB is
 ///   built with io_uring (`Cargo.toml`).
 /// - **[`COMPRESSION_THREADS`] block-compression threads**, as ours gets in
@@ -789,7 +794,6 @@ fn rocksdb_options(
     }
     opts.create_if_missing(true);
     opts.set_optimize_filters_for_hits(true);
-    opts.set_use_direct_reads(true);
     match compression {
         Compression::None => opts.set_compression_type(rocksdb::DBCompressionType::None),
         Compression::Zstd22 => {
@@ -814,7 +818,7 @@ fn rocksdb_options(
 /// How [`rocksdb_options`] and [`rocksdb_read_options`] set RocksDB up, as the
 /// published page states it.
 const ROCKSDB_TUNING: &str = "16 MiB HyperClockCache, Ribbon filter at 10 bits per key, \
-    optimize_filters_for_hits, direct reads, async_io reads, io_uring on Linux";
+    optimize_filters_for_hits, async_io reads, io_uring on Linux";
 
 /// The read options of every RocksDB read in the harness: `async_io`, so
 /// iterators prefetch asynchronously and batched reads issue their block reads

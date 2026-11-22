@@ -78,9 +78,12 @@ Beyond the preset, every engine gets the same work:
     positive rate as our 10-bit Bloom filter in less memory;
   - `optimize_filters_for_hits`, because every read in the harness looks up a
     stored key;
-  - direct reads;
   - `async_io` in the read options of every read;
   - on Linux, a build with io_uring.
+
+  Reads stay buffered rather than direct: with direct reads RocksDB would
+  have only its 16 MiB block cache while our engine keeps the OS page cache,
+  and every read past the cache, blob reads included, would go to the device.
 - **Matched capacities.** Both engines get the same block size and 16 MiB of
   block cache, in the compaction scenarios too. No scenario writes a WAL.
 - **Logged writes against a logged RocksDB.** The overwrite group's
