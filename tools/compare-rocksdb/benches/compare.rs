@@ -4138,7 +4138,7 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "multi_get",
-        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf).",
+        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf). With 1 and 4 MiB values in the tables, RocksDB's HyperClockCache keeps a batch's blocks after the call past its 16 MiB capacity (64 MiB measured), so every later batch is all cache hits; ours keeps a batch's blocks within its 16 MiB cache and reads the rest again.",
     ),
     (
         "range_scan",
