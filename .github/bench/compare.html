@@ -108,6 +108,8 @@
   };
   // Three significant digits from 1 up (×10.5 rather than ×10, which would hide
   // up to 5%), two below.
+  // The ratios a log axis labels.
+  const RATIO_TICKS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 0.8, 1, 1.25, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
   const fmtRatio = function (x) { return "×" + (x >= 1 ? x.toPrecision(3) : x.toPrecision(2)); };
 
   Promise.all([
@@ -200,6 +202,8 @@
             label: engine,
             backgroundColor: color,
             borderColor: color,
+            // A ratio bar grows from parity, up when slower, down when faster.
+            base: ratio ? 1 : undefined,
             data: sizes.map(function (n) {
               const r = engines[engine][n];
               return r && pick(r) ? pick(r).median : null;
@@ -283,7 +287,20 @@
               x: { ticks: { color: "#8b949e" }, grid: { display: false } },
               y: ratio ? {
                 type: "logarithmic",
+                // At least ×0.8 to ×1.25, so a ratio near parity is drawn
+                // against a scale rather than filling the chart.
+                suggestedMin: 0.8,
+                suggestedMax: 1.25,
                 ticks: { color: "#8b949e", callback: function (v) { return fmtRatio(v); } },
+                // Only round ratios: the log scale's own minor ticks crowd
+                // into one smear of labels on a narrow range.
+                afterBuildTicks: function (axis) {
+                  // ×0.8 and ×1.25 sit on top of ×1 once the axis spans a decade.
+                  const wide = axis.max / axis.min > 10;
+                  axis.ticks = RATIO_TICKS
+                    .filter(function (v) { return v >= axis.min && v <= axis.max && !(wide && (v === 0.8 || v === 1.25)); })
+                    .map(function (v) { return { value: v }; });
+                },
                 // Parity with RocksDB stands out from the other grid lines.
                 grid: { color: function (ctx) { return ctx.tick && ctx.tick.value === 1 ? "#8b949e" : "#21262d"; } },
                 title: {
