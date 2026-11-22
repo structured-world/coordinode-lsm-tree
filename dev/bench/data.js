@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795344710437,
+  "lastUpdate": 1795382136040,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104146,6 +104146,90 @@ window.BENCHMARK_DATA = {
             "value": 425869.63404394186,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 7.3us | P99.9: 41.3us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d6bd5166817aba2a544e17d0cd95c12c8061eaa7",
+          "message": "bench: measure against read-tuned rocksdb (#1101)\n\n## Summary\n\n- The head-to-head harness runs RocksDB in one configuration, tuned for\nreads, in every group: HyperClockCache, Ribbon filter,\n`optimize_filters_for_hits`, `async_io`, io_uring on Linux, and C/C++\nbuilt for the host CPU on x86_64 Linux.\n- A new `concurrent_mixed_r<P>_t<T>` group runs Zipf reads and\noverwrites on 32, 64 and 128 threads at 95% and 50% reads.\n- The harness checks every read value byte for byte before timing, and\nRocksDB's batched MultiGet results inside the timed loop.\n\n## Changes\n\n- `rocksdb_options`: 16 MiB HyperClockCache (auto-sized), Ribbon filter\nat 10 bits per key, `optimize_filters_for_hits`; reads stay buffered\n(with direct reads RocksDB would have only its 16 MiB cache while ours\nkeeps the page cache). Every RocksDB read uses `ReadOptions` with\n`async_io`, built outside the timed window.\n- `tools/compare-rocksdb/Cargo.toml`: RocksDB with `io-uring` on Linux\n(needs liburing). `tools/compare-rocksdb/.cargo/config.toml`:\n`-march=native` for RocksDB's C and C++ on x86_64 Linux, harness-only;\nwithout it RocksDB computes CRC32C in software.\n- CI: the benchmark build runs from the harness directory so it reads\nthat config, the RocksDB build cache is keyed per runner, and the\nprerequisite step checks for liburing.\n- `concurrent_mixed` group, its note, and a \"Mixed, many threads\" kind\non the page.\n- Point read, `multi_get` and `concurrent_mixed` check values against\nthe written bytes before timing; RocksDB's timed MultiGet fails on an\nerror result, and a timed mixed read fails on a miss. The `multi_get`\nnote states that with 1 and 4 MiB values in the tables RocksDB's\nHyperClockCache keeps a batch's blocks past its capacity (64 MiB\nmeasured against 16 MiB).\n- Page: the RocksDB setup in the run line; ratio axes labelled at round\nratios only, spanning at least x0.8 to x1.25, bars growing from x1.\n- `docs/BENCHMARKING.md` and the README describe the RocksDB setup and\nthe liburing prerequisite.\n\n## Testing\n\nClippy (`-D warnings`) and fmt on the harness; `cargo test --release\n--bench compare` (every group once) green on a Linux runner; a full\nmeasurement of every group on the Linux bench host, results in #1097.\nThe page was checked in a browser against the published summary.\n\nCloses #1097",
+          "timestamp": "2026-11-22T21:45:49+02:00",
+          "tree_id": "866d9c73c275394ce2f63a5d925a6adc26a155e0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d6bd5166817aba2a544e17d0cd95c12c8061eaa7"
+        },
+        "date": 1795382134802,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 150745.49230886408,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.2us | P99.9: 29.9us\nthreads: 1 | elapsed: 3.55s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3102702.1883249935,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 937355.8698180672,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.0us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 491951.2435092168,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.8us | P99.9: 21.4us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3227547.97403102,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 327597.4594456663,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.4us | P99.9: 22.7us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 188114.16594554356,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 9.9us | P99.9: 21.2us\nthreads: 1 | elapsed: 1.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 979905.3504522472,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1069666.7824848376,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 457167.16171660426,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.9us | P99.9: 34.1us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
