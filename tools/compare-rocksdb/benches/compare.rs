@@ -1427,21 +1427,23 @@ impl ColdSample {
 fn verify_point_reads(warm: &WarmEngine, inputs: &WorkloadInputs) {
     match warm {
         WarmEngine::Ours { tree, .. } => {
-            for key in &inputs.keys {
+            for (key, value) in inputs.keys.iter().zip(&inputs.values) {
                 assert!(
-                    tree.get(key, MAX_SEQNO).expect("ours: verify").is_some(),
-                    "ours: key unexpectedly missing"
+                    tree.get(key, MAX_SEQNO).expect("ours: verify").as_deref()
+                        == Some(value.as_slice()),
+                    "ours: key missing or holding other bytes"
                 );
             }
         }
         WarmEngine::RocksDb { db, .. } => {
             let read_opts = rocksdb_read_options();
-            for key in &inputs.keys {
+            for (key, value) in inputs.keys.iter().zip(&inputs.values) {
                 assert!(
                     db.get_pinned_opt(key, &read_opts)
                         .expect("rocksdb: verify")
-                        .is_some(),
-                    "rocksdb: key unexpectedly missing"
+                        .as_deref()
+                        == Some(value.as_slice()),
+                    "rocksdb: key missing or holding other bytes"
                 );
             }
         }
@@ -2034,7 +2036,7 @@ fn multi_get_variant(
     }
 }
 
-/// One-time "every key present" contract check OUTSIDE the timed window
+/// One-time "every key present with its bytes" contract check OUTSIDE the timed window
 /// (mirrors [`verify_point_reads`]), so a setup regression can't quietly
 /// become a miss-read benchmark. Cardinality before presence: a batched API
 /// that dropped positions would otherwise pass the presence check while the
@@ -2051,8 +2053,11 @@ fn verify_multi_get(warm: &WarmEngine, inputs: &WorkloadInputs) {
                 "ours: multi_get must return one result per input key"
             );
             assert!(
-                probe.iter().all(Option::is_some),
-                "ours: key unexpectedly missing"
+                probe
+                    .iter()
+                    .zip(&inputs.values)
+                    .all(|(got, value)| got.as_deref() == Some(value.as_slice())),
+                "ours: key missing or holding other bytes"
             );
         }
         WarmEngine::RocksDb { db, .. } => {
@@ -2071,8 +2076,10 @@ fn verify_multi_get(warm: &WarmEngine, inputs: &WorkloadInputs) {
                 "rocksdb: batched_multi_get_cf must return one result per input key"
             );
             assert!(
-                probe.iter().all(|r| matches!(r, Ok(Some(_)))),
-                "rocksdb: key unexpectedly missing"
+                probe.iter().zip(&inputs.values).all(|(got, value)| {
+                    matches!(got, Ok(Some(got)) if got.as_ref() == value.as_slice())
+                }),
+                "rocksdb: key missing or holding other bytes"
             );
         }
         WarmEngine::SurrealKv { .. } => {
