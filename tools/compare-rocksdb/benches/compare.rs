@@ -2117,6 +2117,12 @@ fn multi_get_routine<'a>(warm: &'a WarmEngine, inputs: &'a WorkloadInputs) -> pa
                 for _ in 0..iters {
                     let got =
                         db.batched_multi_get_cf_opt(&cf, inputs.keys.iter(), false, &read_opts);
+                    // Every result is checked, as ours fails on any `Err`: a
+                    // key answered with an error costs RocksDB no value read.
+                    assert!(
+                        got.iter().all(|r| matches!(r, Ok(Some(_)))),
+                        "rocksdb: batched_multi_get_cf answered a key with an error or nothing"
+                    );
                     std::hint::black_box(got);
                 }
                 start.elapsed()
