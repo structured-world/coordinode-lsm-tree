@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795223855163,
+  "lastUpdate": 1795307221655,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -103978,6 +103978,90 @@ window.BENCHMARK_DATA = {
             "value": 365935.07128035533,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 11.9us | P99.9: 91.1us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0df92f1fe2cc3b4c4d0a839b1e4e17cc617d3b99",
+          "message": "perf(memtable)!: keep written values in the memtable arena and trim the flush (#1094)\n\n## Summary\n\n- Written values are copied into the memtable's own arena instead of\neach taking a heap buffer, and arena blocks are reused across memtables\nand trees, so a write allocates nothing per value and a fresh memtable\nwrites into memory already mapped.\n- `insert` / `merge` take `V: InsertValue`: plain bytes are copied, a\n`Slice`, `ByteView` or `bytes::Bytes` is kept without a copy (under\n`bytes_1`, which keeps no value in the arena, an owned `Vec<u8>` or\n`String` too).\n- Flush does less work per entry (BuRR back-substitution at a constant\nfingerprint width, `MarkOverwritten` without a buffer, one write per\ndata block entry head), and a memtable search compares each node once.\n\nAgainst main, RocksDB paired in the same rounds (ratio ours/RocksDB,\nlower is better), at 70,000 keys: overwrite 0.577 vs 0.717, bulk write\n0.552 vs 0.683; at 1,000 and 10,000 keys within 3%. Sustained overwrite:\nwriter 0.680 vs 0.866, read p50 6.49 vs 7.71 us, p99 37.5 vs 40.5 us;\nwith the writer paced to one rate on both sides, read p50 5.64 vs 5.52\nus.\n\n## Changes\n\n- `InsertValue` / `InsertBytes`: the value bound of `insert`, `merge`,\n`try_insert`, `try_merge`.\n- Memtable skiplist: borrowed values past the inline size and up to 64\nKiB live in a second arena beside the nodes (shorter ones stay inline in\ntheir slot), so searches walk packed nodes; reads return zero-copy views\nof the arena block. An insert holds its value slot as a reservation that\nleaves an empty value if the insert unwinds before writing it.\n- Arena blocks: a process-wide pool, bounded by the largest memtable\ndropped lately and lowered slowly; a single-block arena does not shrink\nit.\n- Iteration and point reads build an entry from one read of the node\nheader.\n- BuRR builder: back-substitution kernels at constant widths 1..=16.\n- Flush: `MarkOverwritten` passes entries through when there is nothing\nto mark; data block entry heads are encoded in one write.\n- Skiplist search: each level stops at the node the level above stopped\nat, without comparing it again.\n- `structured-zstd` 0.4.3 required.\n- `memtable_skew` bench: `MEMTABLE_SKEW_VALUE_SIZE` sets the value size.\n- compare-rocksdb harness: `overwrite_skew_*` groups (key skew, writer\ncount, shared prefix length) and `COMPARE_SUSTAINED_WRITE_NS` to pace\nthe sustained writer.\n\n## Testing\n\nfmt, clippy (default and all features), nextest (default and all\nfeatures), doc tests, docs and the no-std check pass on macOS.\n\nBREAKING CHANGE: `AbstractTree::insert`, `merge`, `try_insert` and\n`try_merge` bound their value on `InsertValue` instead of\n`Into<UserValue>`.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Insert and merge operations now accept a wider range of value types,\nincluding borrowed bytes and shared buffers.\n  * Added configurable value sizes to memtable skew benchmarks.\n* **Performance**\n* Improved memory reuse and reduced copying for large values during\ninsertion.\n  * Optimized data encoding and filter-building operations.\n* **Bug Fixes**\n* Improved correctness when handling overwritten entries and interrupted\nvalue writes.\n* **Benchmarks**\n* Added overwrite-heavy workload comparisons and configurable write\npacing.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-21T23:06:19Z",
+          "tree_id": "5c40d0164602dd4f19202970bf01bf24c235e958",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0df92f1fe2cc3b4c4d0a839b1e4e17cc617d3b99"
+        },
+        "date": 1795307220487,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 151471.3900806437,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.2us | P99.9: 28.8us\nthreads: 1 | elapsed: 3.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2994998.9358020034,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 948801.0042033924,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 12.8us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 516949.66550539265,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.6us | P99.9: 21.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3182682.895060659,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 332716.74100531853,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.1us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 191334.4158964429,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.2us | P99.9: 20.9us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1001288.7286840272,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.8us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1081300.2927971964,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 453036.6838254764,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.9us | P99.9: 20.8us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
