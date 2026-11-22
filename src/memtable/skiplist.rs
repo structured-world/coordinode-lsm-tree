@@ -1178,6 +1178,22 @@ impl SkipMap {
     /// point lookups can search without materializing an [`InternalKey`]
     /// (which would heap-copy the probe key on the slice backend).
     #[expect(
+        clippy::inline_always,
+        reason = "every search step; out of line it costs a call per step"
+    )]
+    #[inline(always)]
+    fn compare_key_parts(&self, node: u32, target_uk: &[u8], target_seqno: SeqNo) -> CmpOrdering {
+        self.compare_key_from(node, target_uk, target_seqno, 0).0
+    }
+
+    /// [`Self::compare_key_parts`] for a node whose user key shares its first
+    /// `shared` bytes with `target_uk`, which the comparison then skips; also
+    /// returns the length of the two user keys' common prefix.
+    ///
+    /// A custom comparator orders keys its own way, so with one `shared` must
+    /// be 0 and the prefix returned is always 0: a search never skips bytes it
+    /// has not compared.
+    #[expect(
         clippy::indexing_slicing,
         reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
     )]
@@ -1190,7 +1206,13 @@ impl SkipMap {
         reason = "every search step; out of line it costs a call per step"
     )]
     #[inline(always)]
-    fn compare_key_parts(&self, node: u32, target_uk: &[u8], target_seqno: SeqNo) -> CmpOrdering {
+    fn compare_key_from(
+        &self,
+        node: u32,
+        target_uk: &[u8],
+        target_seqno: SeqNo,
+        shared: usize,
+    ) -> (CmpOrdering, usize) {
         #[cfg(test)]
         if let Some(compared) = self
             .compared
@@ -1218,19 +1240,20 @@ impl SkipMap {
         // This search visits O(log n) nodes per insert/lookup and is the
         // dominant memtable-write cost, so the call per visit matters. Custom
         // comparators still go through the trait.
-        let uk_ord = if self.is_lexicographic {
-            lexicographic(node_uk, target_uk)
+        let (uk_ord, prefix) = if self.is_lexicographic {
+            lexicographic_from(node_uk, target_uk, shared)
         } else {
-            self.comparator.compare(node_uk, target_uk)
+            debug_assert_eq!(shared, 0, "a custom comparator has no shared prefix");
+            (self.comparator.compare(node_uk, target_uk), 0)
         };
 
         match uk_ord {
             CmpOrdering::Equal => {
                 // Reverse seqno: higher seqno sorts first.
                 let node_seq = u64::from_ne_bytes(m[16..24].try_into().expect("8 bytes"));
-                target_seqno.cmp(&node_seq)
+                (target_seqno.cmp(&node_seq), prefix)
             }
-            other => other,
+            other => (other, prefix),
         }
     }
 
@@ -1268,7 +1291,7 @@ impl SkipMap {
         // Same inline comparison as `compare_key` for the default comparator
         // (avoids the `dyn` vtable call per comparison).
         let uk_ord = if self.is_lexicographic {
-            lexicographic(a_uk, b_uk)
+            lexicographic_from(a_uk, b_uk, 0).0
         } else {
             self.comparator.compare(a_uk, b_uk)
         };
@@ -1286,9 +1309,67 @@ impl SkipMap {
     // Internal: search helpers
     // -----------------------------------------------------------------------
 
+    /// Whether a search for `target_uk` skips the prefix its bounds share with
+    /// it (see [`Self::find_splice_skipping`]).
+    ///
+    /// Only past [`PREFIX_SKIP_MIN_LEN`] bytes: a shorter key mostly parts from
+    /// its neighbours in its first word, where tracking the shared prefix
+    /// costs every search step more than it saves. A custom comparator orders
+    /// keys its own way and shares no prefix.
+    #[inline]
+    fn skips_prefix(&self, target_uk: &[u8]) -> bool {
+        self.is_lexicographic && target_uk.len() > PREFIX_SKIP_MIN_LEN
+    }
+
+    /// One search step: compares `node` with the target, starting past the
+    /// shorter of the prefixes the target shares with the step's two bounds
+    /// when `SKIP`, and returns the order and (when `SKIP`) the prefix the
+    /// node shares with the target.
+    #[expect(
+        clippy::inline_always,
+        reason = "every search step; out of line it costs a call per step"
+    )]
+    #[inline(always)]
+    fn search_step<const SKIP: bool>(
+        &self,
+        node: u32,
+        target_uk: &[u8],
+        target_seqno: SeqNo,
+        low: usize,
+        high: usize,
+    ) -> (CmpOrdering, usize) {
+        if SKIP {
+            self.compare_key_from(node, target_uk, target_seqno, low.min(high))
+        } else {
+            (self.compare_key_parts(node, target_uk, target_seqno), 0)
+        }
+    }
+
     /// Populates `preds` and `succs` arrays with the splice point for `key`.
-    #[expect(clippy::indexing_slicing, reason = "level < list_h <= MAX_HEIGHT")]
     fn find_splice(
+        &self,
+        key: &InternalKey,
+        preds: &mut [u32; MAX_HEIGHT],
+        succs: &mut [u32; MAX_HEIGHT],
+    ) {
+        if self.skips_prefix(&key.user_key) {
+            self.find_splice_skipping::<true>(key, preds, succs);
+        } else {
+            self.find_splice_skipping::<false>(key, preds, succs);
+        }
+    }
+
+    /// [`Self::find_splice`], skipping shared prefixes when `SKIP`.
+    ///
+    /// Every node met lies between the current predecessor (sorting before
+    /// the key) and the successor the level above stopped at (sorting at or
+    /// after it), so its user key shares at least the shorter of the two
+    /// bounds' common prefixes with the key, and the comparison starts past
+    /// it. The head and the list's end bound nothing and share no prefix;
+    /// nodes are never unlinked and keys never change, so a node a concurrent
+    /// insert links in between still lies between the bounds.
+    #[expect(clippy::indexing_slicing, reason = "level < list_h <= MAX_HEIGHT")]
+    fn find_splice_skipping<const SKIP: bool>(
         &self,
         key: &InternalKey,
         preds: &mut [u32; MAX_HEIGHT],
@@ -1301,15 +1382,23 @@ impl SkipMap {
         // comparing it a second time. A node linked in between since is met
         // first and compared.
         let mut above = UNSET;
+        // The user-key prefixes the key shares with `node` and with `above`.
+        let (mut low, mut high) = (0, 0);
 
         for level in (0..list_h).rev() {
             // Track the successor from the comparison loop — do NOT re-read
             // from the list, as a concurrent insert could return a node that
             // sorts before our key, leading to an out-of-order CAS.
             let mut next = self.next_at(node, level);
-            while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less
-            {
+            while next != UNSET && next != above {
+                let (ord, prefix) =
+                    self.search_step::<SKIP>(next, &key.user_key, key.seqno, low, high);
+                if ord != CmpOrdering::Less {
+                    high = prefix;
+                    break;
+                }
                 node = next;
+                low = prefix;
                 next = self.next_at(node, level);
             }
             preds[level] = node;
@@ -1320,11 +1409,27 @@ impl SkipMap {
 
     /// Re-searches at a single `level` starting from the stored predecessor
     /// (or a higher-level predecessor as fallback).
+    fn find_splice_for_level(
+        &self,
+        key: &InternalKey,
+        preds: &mut [u32; MAX_HEIGHT],
+        succs: &mut [u32; MAX_HEIGHT],
+        level: usize,
+    ) {
+        if self.skips_prefix(&key.user_key) {
+            self.find_splice_for_level_skipping::<true>(key, preds, succs, level);
+        } else {
+            self.find_splice_for_level_skipping::<false>(key, preds, succs, level);
+        }
+    }
+
+    /// [`Self::find_splice_for_level`], skipping shared prefixes when `SKIP`
+    /// as [`Self::find_splice_skipping`] does.
     #[expect(
         clippy::indexing_slicing,
         reason = "level < MAX_HEIGHT; preds/succs are [u32; MAX_HEIGHT]"
     )]
-    fn find_splice_for_level(
+    fn find_splice_for_level_skipping<const SKIP: bool>(
         &self,
         key: &InternalKey,
         preds: &mut [u32; MAX_HEIGHT],
@@ -1337,31 +1442,34 @@ impl SkipMap {
         // Starting from head is safe and still O(log n) via the walk-down.
         let mut node = self.head;
         let list_h = self.height.load(Ordering::Acquire);
-        // The successor the level above stopped at, as in `find_splice`.
+        // The successor the level above stopped at, and the prefixes the key
+        // shares with it and with `node`, as in `find_splice`.
         let mut above = UNSET;
+        let (mut low, mut high) = (0, 0);
 
-        // Walk down from the list height, narrowing the search at each level.
-        // Every node reached via next_at(node, lv) was linked at level lv,
-        // so its height > lv — tower reads are always in-bounds.
-        for lv in (level + 1..list_h).rev() {
+        // Walk down from the list height to the target level, narrowing the
+        // search at each; the target level is searched even when it is not
+        // below the height read (a tower being raised links above it). Every
+        // node reached via next_at(node, lv) was linked at level lv, so its
+        // height > lv — tower reads are always in-bounds.
+        for lv in (level..list_h.max(level + 1)).rev() {
             let mut next = self.next_at(node, lv);
-            while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less
-            {
+            while next != UNSET && next != above {
+                let (ord, prefix) =
+                    self.search_step::<SKIP>(next, &key.user_key, key.seqno, low, high);
+                if ord != CmpOrdering::Less {
+                    high = prefix;
+                    break;
+                }
                 node = next;
+                low = prefix;
                 next = self.next_at(node, lv);
             }
             above = next;
         }
 
-        // Final search at the target level.
-        let mut next = self.next_at(node, level);
-        while next != UNSET && next != above && self.compare_key(next, key) == CmpOrdering::Less {
-            node = next;
-            next = self.next_at(node, level);
-        }
-
         preds[level] = node;
-        succs[level] = next;
+        succs[level] = above;
     }
 
     /// Finds the first node whose key >= `target`, or UNSET.
@@ -1372,9 +1480,22 @@ impl SkipMap {
 
     /// [`Self::seek_ge`] against a borrowed `(user_key, seqno)` pair.
     fn seek_ge_parts(&self, target_uk: &[u8], target_seqno: SeqNo) -> u32 {
+        if self.skips_prefix(target_uk) {
+            self.seek_ge_skipping::<true>(target_uk, target_seqno)
+        } else {
+            self.seek_ge_skipping::<false>(target_uk, target_seqno)
+        }
+    }
+
+    /// [`Self::seek_ge_parts`], skipping the prefix the target shares with
+    /// both bounds when `SKIP`, as [`Self::find_splice_skipping`] does.
+    fn seek_ge_skipping<const SKIP: bool>(&self, target_uk: &[u8], target_seqno: SeqNo) -> u32 {
         let mut node = self.head;
         let mut next = UNSET;
         let list_h = self.height.load(Ordering::Acquire);
+        // The prefixes the target shares with `node` and with the successor
+        // the level above stopped at.
+        let (mut low, mut high) = (0, 0);
 
         for level in (0..list_h).rev() {
             // `next` still holds the successor the level above stopped at,
@@ -1386,9 +1507,13 @@ impl SkipMap {
                 if next == UNSET || next == above {
                     break;
                 }
-                if self.compare_key_parts(next, target_uk, target_seqno) == CmpOrdering::Less {
+                let (ord, prefix) =
+                    self.search_step::<SKIP>(next, target_uk, target_seqno, low, high);
+                if ord == CmpOrdering::Less {
                     node = next;
+                    low = prefix;
                 } else {
+                    high = prefix;
                     break;
                 }
             }
@@ -1607,45 +1732,63 @@ fn node_height(seed: u64, value_idx: u32) -> usize {
     (1 + tz / 2).min(MAX_HEIGHT)
 }
 
-/// Longest key [`lexicographic`] compares in words: past it two keys may share
-/// a run of bytes long enough that `memcmp`'s vector loop costs less than a
-/// word per eight bytes. Measured on 80-byte keys the two cost the same.
-const WORD_COMPARE_MAX: usize = 64;
+/// Longest user key a search compares from its first byte at every step; a
+/// longer one skips the prefix the search's bounds share with it (see
+/// [`SkipMap::skips_prefix`]). Callgrind of the skewed overwrite with
+/// prefix tracking on every key: 8-byte keys +12.8% instructions, 16-byte
+/// +5.8%, 72-byte -16%.
+const PREFIX_SKIP_MIN_LEN: usize = 32;
 
-/// The byte-lexicographic order of `a` and `b`, as `<[u8]>::cmp` gives it.
+/// The byte-lexicographic order of `a` and `b`, as `<[u8]>::cmp` gives it,
+/// and the length of their common prefix, for two keys known to share their
+/// first `from` bytes.
 ///
-/// When either key is at most [`WORD_COMPARE_MAX`] bytes the keys are compared
-/// eight bytes at a time as big-endian words: `<[u8]>::cmp` calls `memcmp` on
-/// every search step, which costs more than the few word compares it replaces.
-/// Two longer keys go to `<[u8]>::cmp` from the start.
+/// A search passes the prefix its bounds already share with the target (see
+/// [`SkipMap::find_splice`]), so keys behind a long common prefix are compared
+/// from where they can differ instead of from their first byte; only the first
+/// steps of a descent, before a bound shares anything, read a long prefix. The
+/// rest is compared as big-endian words: `<[u8]>::cmp` would call `memcmp` on
+/// every search step and could not report where the keys part.
 #[expect(
     clippy::inline_always,
     reason = "runs at every search step of every insert and lookup"
 )]
 #[inline(always)]
-fn lexicographic(a: &[u8], b: &[u8]) -> CmpOrdering {
-    // The compare walks at most the shorter key, so only two long keys can
-    // share a long run.
-    if a.len() > WORD_COMPARE_MAX && b.len() > WORD_COMPARE_MAX {
-        return a.cmp(b);
-    }
-    let (a_words, _) = a.as_chunks::<8>();
-    let (b_words, _) = b.as_chunks::<8>();
+fn lexicographic_from(a: &[u8], b: &[u8], from: usize) -> (CmpOrdering, usize) {
+    debug_assert!(from <= a.len() && from <= b.len());
+    debug_assert_eq!(a.get(..from), b.get(..from));
+    // SAFETY: a search passes only a prefix length it measured on both keys
+    // against the same target (asserted above), so `from` is within both.
+    let (a, b) = unsafe { (a.get_unchecked(from..), b.get_unchecked(from..)) };
+    let common = a.len().min(b.len());
+    let words = common / 8;
     let mut at = 0;
-    for (x, y) in a_words.iter().zip(b_words) {
-        let (x, y) = (u64::from_be_bytes(*x), u64::from_be_bytes(*y));
+    while at < words * 8 {
+        // SAFETY: `at + 8 <= common`, within both keys.
+        let (x, y) = unsafe {
+            (
+                u64::from_be_bytes(*a.as_ptr().add(at).cast::<[u8; 8]>()),
+                u64::from_be_bytes(*b.as_ptr().add(at).cast::<[u8; 8]>()),
+            )
+        };
         if x != y {
-            return x.cmp(&y);
+            // The first differing byte is the highest differing one of the
+            // big-endian words.
+            let same = (x ^ y).leading_zeros() as usize / 8;
+            return (x.cmp(&y), from + at + same);
         }
         at += 8;
     }
     // Fewer than eight bytes of the shorter key are left.
-    for (x, y) in a.iter().skip(at).zip(b.iter().skip(at)) {
+    while at < common {
+        // SAFETY: `at < common`, within both keys.
+        let (x, y) = unsafe { (*a.get_unchecked(at), *b.get_unchecked(at)) };
         if x != y {
-            return x.cmp(y);
+            return (x.cmp(&y), from + at);
         }
+        at += 1;
     }
-    a.len().cmp(&b.len())
+    (a.len().cmp(&b.len()), from + common)
 }
 
 // ---------------------------------------------------------------------------
