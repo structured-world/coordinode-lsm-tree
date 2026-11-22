@@ -294,8 +294,10 @@ jobs:
       # (15-25 minutes): its target is restored here and saved by the step
       # right after the build (CARGO_HOME already persists on the self-hosted
       # runner). The engine and db_bench build in minutes and are removed by
-      # the last step instead. The key moves with the harness manifest and the
-      # toolchain; the prefix restores the nearest older build, whose compiled
+      # the last step instead. The key moves with the harness manifest, the
+      # toolchain and the cargo config (which sets RocksDB's C++ flags), and
+      # stays with the runner, since RocksDB is compiled for its CPU; the
+      # prefix restores the nearest older build, whose compiled
       # RocksDB cargo reuses when its version did not change.
       - name: Restore the compare-rocksdb build
         id: compare-cache
@@ -304,8 +306,8 @@ jobs:
           path: |
             tools/compare-rocksdb/target
             !tools/compare-rocksdb/target/head-to-head
-          key: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/compare-rocksdb/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-
+          key: compare-rocksdb-${{ runner.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/compare-rocksdb/Cargo.toml', 'rust-toolchain.toml', 'tools/compare-rocksdb/.cargo/config.toml') }}
+          restore-keys: compare-rocksdb-${{ runner.name }}-${{ runner.os }}-${{ runner.arch }}-
 
       # librocksdb-sys builds C bindings via bindgen -> clang-sys, which needs
       # libclang on the host. When it is absent the raw failure is a deep,
@@ -316,7 +318,7 @@ jobs:
       # the step also exports LIBCLANG_PATH when it locates an LLVM install.
       # Its failure fails the head-to-head step, not this one, so a host that
       # cannot build RocksDB still measures and publishes the db_bench trend.
-      - name: Verify libclang toolchain (compare-rocksdb prerequisite)
+      - name: Verify libclang and liburing (compare-rocksdb prerequisites)
         id: libclang
         continue-on-error: true
         run: |
@@ -359,6 +361,12 @@ jobs:
              && ! ls /usr/lib*/libclang.so* /usr/lib*/*/libclang.so* >/dev/null 2>&1 \
              && ! { command -v ldconfig >/dev/null 2>&1 && ldconfig -p | grep -q libclang; }; then
             echo "::error::libclang/llvm-config not found on the bench runner. compare-rocksdb (librocksdb-sys -> bindgen -> clang-sys) cannot build. Install LLVM dev tools on the runner host: Fedora 'dnf install -y clang clang-devel llvm llvm-devel', Debian/Ubuntu 'apt-get install -y clang libclang-dev llvm-dev', or set LIBCLANG_PATH/LLVM_CONFIG_PATH."
+            exit 1
+          fi
+          # On Linux the harness builds RocksDB with io_uring, which links
+          # liburing found through pkg-config.
+          if ! pkg-config --exists liburing; then
+            echo "::error::liburing not found by pkg-config on the bench runner. compare-rocksdb builds RocksDB with io_uring on Linux. Install it on the runner host: Fedora 'dnf install -y liburing-devel', Debian/Ubuntu 'apt-get install -y liburing-dev'."
             exit 1
           fi
 
@@ -440,7 +448,7 @@ jobs:
         # run that fails before writing its own cannot publish the old one.
         run: |
           if [ "$LIBCLANG_OUTCOME" != success ]; then
-            echo "::error::compare-rocksdb needs the libclang check to pass, and it ended '$LIBCLANG_OUTCOME'; see the 'Verify libclang toolchain' step, or the step that failed before it"
+            echo "::error::compare-rocksdb needs the libclang check to pass, and it ended '$LIBCLANG_OUTCOME'; see the 'Verify libclang and liburing' step, or the step that failed before it"
             exit 1
           fi
           cd tools/compare-rocksdb

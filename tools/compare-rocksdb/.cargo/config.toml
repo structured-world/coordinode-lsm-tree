@@ -1,0 +1,12 @@
+# Read with this directory as the working directory, as every build and run of
+# the harness does, on top of the repository's own config.
+#
+# C and C++ compiled for x86_64 Linux target the CPU they are built on: the
+# harness compiles RocksDB (and its zstd) and runs it on the same host.
+# RocksDB's own Makefile builds this way by default (PORTABLE=0). Without it,
+# librocksdb-sys builds for baseline x86-64, without SSE4.2, and RocksDB's
+# CRC32C falls back to software. Rust code is untouched and keeps its runtime
+# CPU dispatch.
+[env]
+CFLAGS_x86_64_unknown_linux_gnu = "-march=native"
+CXXFLAGS_x86_64_unknown_linux_gnu = "-march=native"

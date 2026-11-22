@@ -147,7 +147,13 @@ published page is drawn from.
 ## Running
 
 The harness links RocksDB through `librocksdb-sys`, whose `bindgen` build step
-needs `libclang`.
+needs `libclang`. On Linux, RocksDB is built with io_uring, which also needs
+liburing through pkg-config (`liburing-devel` on Fedora, `liburing-dev` on
+Debian and Ubuntu). On x86_64 Linux the harness's own
+`tools/compare-rocksdb/.cargo/config.toml`, read when cargo runs from that
+directory, compiles RocksDB's C++ for the host CPU, the way RocksDB's own Makefile does
+by default. Without it, `librocksdb-sys` targets baseline x86-64, and RocksDB
+computes CRC32C in software.
 
 ```sh
 # Linux: the distro libclang.so is found automatically.
