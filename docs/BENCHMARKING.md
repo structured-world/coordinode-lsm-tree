@@ -71,8 +71,18 @@ Beyond the preset, every engine gets the same work:
   spans enough tables to split.
 - **Reads without copies.** Point reads use RocksDB's `get_pinned`, scans and
   seeks its `raw_iterator`, both zero-copy, the way our engine hands out values.
-- **Matched block options.** Block size, a 10-bit bloom filter and a 16 MiB LRU
-  block cache on both sides, compaction scenarios included; no WAL.
+- **RocksDB tuned for reads.** RocksDB runs with one configuration in every
+  group, set up the way a read-tuned deployment would set it up:
+  - a 16 MiB `HyperClockCache`, its lock-free block cache;
+  - a Ribbon filter at 10 Bloom-equivalent bits per key, the same false
+    positive rate as our 10-bit Bloom filter in less memory;
+  - `optimize_filters_for_hits`, because every read in the harness looks up a
+    stored key;
+  - direct reads;
+  - `async_io` in the read options of every read;
+  - on Linux, a build with io_uring.
+- **Matched capacities.** Both engines get the same block size and 16 MiB of
+  block cache, in the compaction scenarios too. No scenario writes a WAL.
 - **Logged writes against a logged RocksDB.** The overwrite group's
   `ours-deferred-wal` arm keeps a caller's log: the batch is written to it in
   one call and synced once, then put in the memtable. It is set against

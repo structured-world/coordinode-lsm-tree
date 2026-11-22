@@ -71,6 +71,7 @@
       <option value="all">All</option>
       <option value="write">Writes</option>
       <option value="read">Reads</option>
+      <option value="mixed">Mixed, many threads</option>
       <option value="compaction">Compaction</option>
     </select></label>
   </div>
@@ -93,8 +94,9 @@
     write_throughput: "write", overwrite: "write", overwrite_sustained: "write",
     point_read: "read", multi_get: "read", range_scan: "read", seek_random: "read",
     major_compact_zstd3: "compaction", subcompaction_zstd3: "compaction",
+    overwrite_skew: "write", concurrent_mixed: "mixed",
   };
-  const KIND_TITLE = { write: "Writes", read: "Reads", compaction: "Compaction" };
+  const KIND_TITLE = { write: "Writes", read: "Reads", mixed: "Mixed, many threads", compaction: "Compaction" };
   // How a value layout's baselines read in an axis title: a blob arm is taken
   // against RocksDB with blob files under its own codec.
   const BASELINE_TITLE = { inline: "RocksDB", separated: "RocksDB with blob files, same codec" };
@@ -127,7 +129,8 @@
       a.href = "https://github.com/" + meta.repo + "/commit/" + meta.sha;
       a.textContent = meta.sha.slice(0, 9);
       m.appendChild(a);
-      m.appendChild(document.createTextNode(", runner " + meta.runner + ", preset " + summary.preset + "."));
+      m.appendChild(document.createTextNode(", runner " + meta.runner + ", preset " + summary.preset
+        + ". RocksDB: " + summary.rocksdb + "."));
     }
     const notes = {};
     summary.groups.forEach(function (g) { notes[g.name] = g.note; });
@@ -140,8 +143,11 @@
       (groups[r.group][r.engine] = groups[r.group][r.engine] || {})[r.n] = r;
       layoutOf[r.engine] = r.values;
     });
-    // A group's scenario, without its codec or blob-size suffix.
+    // A group without its codec or blob-size suffix.
     const base = function (group) { return group.replace(/_zstd22$/, "").replace(/_blobs_\d+mib$/, ""); };
+    // The scenario a group's kind and note belong to: its base without an
+    // axis suffix (key draw, threads, read share).
+    const scenario = function (group) { return base(group).replace(/^(overwrite_skew|concurrent_mixed)_.+$/, "$1"); };
     const codecOf = function (group) { return /_zstd22$/.test(group) ? "zstd22" : "none"; };
     const blobsOf = function (group) {
       const m = /_blobs_(\d+)mib$/.exec(group);
@@ -149,7 +155,7 @@
     };
     const ordered = Object.keys(groups).sort(function (a, b) {
       const order = Object.keys(KIND);
-      return order.indexOf(base(a)) - order.indexOf(base(b)) || codecOf(a).localeCompare(codecOf(b))
+      return order.indexOf(scenario(a)) - order.indexOf(scenario(b)) || codecOf(a).localeCompare(codecOf(b))
         || blobsOf(a).localeCompare(blobsOf(b), undefined, { numeric: true });
     });
 
@@ -168,7 +174,7 @@
       const layoutBaselines = baselines[layout] || [];
       const grids = {};
       ordered.forEach(function (group) {
-        const kind = KIND[base(group)] || "other";
+        const kind = KIND[scenario(group)] || "other";
         if (codecSel.value !== "all" && codecSel.value !== codecOf(group) && kind !== "compaction") { return; }
         if (kindSel.value !== "all" && kindSel.value !== kind) { return; }
         // Only the engines of the chosen layout, each group without one left out.
@@ -177,9 +183,9 @@
           if (layoutOf[e] === layout) { engines[e] = groups[group][e]; }
         });
         if (!Object.keys(engines).length) { return; }
-        // A group's size counts keys, but the sustained scenario's counts the
-        // rewrites of its hot set.
-        const unit = base(group) === "overwrite_sustained" ? "writes" : "keys";
+        // A group's size counts keys, but the sustained and skewed scenarios'
+        // count their timed writes and the mixed one's its operations.
+        const unit = { overwrite_sustained: "writes", overwrite_skew: "writes", concurrent_mixed: "operations" }[scenario(group)] || "keys";
         const sizes = [];
         Object.keys(engines).forEach(function (e) {
           Object.keys(engines[e]).forEach(function (n) { if (sizes.indexOf(Number(n)) < 0) { sizes.push(Number(n)); } });
@@ -219,7 +225,7 @@
         const h3 = document.createElement("h3");
         h3.textContent = base(group) + (codecOf(group) === "zstd22" ? " · tables zstd-22" : kind === "compaction" ? "" : " · tables uncompressed") + blobsOf(group);
         const p = document.createElement("p");
-        p.textContent = notes[base(group)] || "";
+        p.textContent = notes[scenario(group)] || "";
         const wrap = document.createElement("div");
         wrap.className = "chart";
         const canvas = document.createElement("canvas");
