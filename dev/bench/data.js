@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795344705527,
+  "lastUpdate": 1795344710437,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -120906,6 +120906,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.397222647,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "03a985a72bfeb0b407e42787fca6602039cfdaa3",
+          "message": "perf(memtable): skip shared key prefixes in skiplist searches (#1096)\n\n## Summary\n- Memtable skiplist searches no longer re-read the key prefix a node\nshares with its search bounds. Writes and seeks over keys with long\ncommon prefixes get cheaper, and short keys do not pay for it.\n\n## Changes\n- `find_splice`, `find_splice_for_level` and `seek_ge` track the common\nprefix the target shares with the predecessor and with the successor the\nlevel above stopped at, and compare each node from the shorter of the\ntwo. Every node between those bounds shares at least that prefix with\nthe target; nodes are never unlinked and keys never change, so this\nholds under concurrent inserts.\n- The comparison reads 8-byte big-endian words and then a byte tail, and\nreturns the order together with the common prefix length. The old path,\nwhich sent keys longer than 64 bytes to `memcmp`, is gone.\n- Each search picks its loop once through a const generic: the prefix\nskip is on for a lexicographic comparator and a target longer than 32\nbytes. Shorter keys compare from the first byte, as before, because\ntracking the prefix costs each step more than such a key saves.\n- Tests: the comparison is checked exhaustively against `Ord` for every\nstarting offset, and the searches are checked against a plain walk of\neach level over keys sharing 0, 40 and 100-byte prefixes.\n\n## Measurements\nCallgrind instructions for a whole skewed-overwrite run, before and\nafter:\n\n| key | before | after |\n|---|---|---|\n| 8 B | 1.981G | 1.894G (-4.4%) |\n| 16 B | 2.138G | 2.052G (-4.0%) |\n| 40 B | 2.627G | 2.345G (-10.7%) |\n| 72 B | 2.955G | 2.453G (-17.0%) |\n\nTimed A/B on a dedicated Linux host, `overwrite_skew`, ns per write,\nratio to RocksDB from the same rounds in brackets:\n\n| arm | before | after |\n|---|---|---|\n| uniform, 8 B keys | 1311 (0.423) | 1232 (0.414) |\n| one hot key | 308 (0.247) | 228 (0.179) |\n| uniform, 64 B prefix | 2101 (0.609) | 1944 (0.591) |\n| zipf, 64 B prefix | 1657 (0.540) | 1503 (0.517) |\n\nThe other arms stay within noise.\n\n## Testing\nFormatting, clippy with all features and the memtable tests pass locally\non macOS; CI runs the full suite on every platform.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved lookup efficiency for long keys with shared prefixes, while\npreserving the existing search results and ordering behavior. Short keys\nand custom comparison behavior remain unchanged.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-22T11:29:15+02:00",
+          "tree_id": "4106a577a8c5d29ae7ceee11c00133b2b13f2e5d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/03a985a72bfeb0b407e42787fca6602039cfdaa3"
+        },
+        "date": 1795344708855,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 631.209,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 176.437121ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 237.395,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 207.381658ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1461.873,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 280.09565ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5781.419,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 24973.255999999998,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.879,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.217535,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.407680708,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.247,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 51.937279,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.406751774,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
