@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795307231556,
+  "lastUpdate": 1795344699870,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104062,6 +104062,90 @@ window.BENCHMARK_DATA = {
             "value": 453036.6838254764,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.9us | P99.9: 20.8us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "03a985a72bfeb0b407e42787fca6602039cfdaa3",
+          "message": "perf(memtable): skip shared key prefixes in skiplist searches (#1096)\n\n## Summary\n- Memtable skiplist searches no longer re-read the key prefix a node\nshares with its search bounds. Writes and seeks over keys with long\ncommon prefixes get cheaper, and short keys do not pay for it.\n\n## Changes\n- `find_splice`, `find_splice_for_level` and `seek_ge` track the common\nprefix the target shares with the predecessor and with the successor the\nlevel above stopped at, and compare each node from the shorter of the\ntwo. Every node between those bounds shares at least that prefix with\nthe target; nodes are never unlinked and keys never change, so this\nholds under concurrent inserts.\n- The comparison reads 8-byte big-endian words and then a byte tail, and\nreturns the order together with the common prefix length. The old path,\nwhich sent keys longer than 64 bytes to `memcmp`, is gone.\n- Each search picks its loop once through a const generic: the prefix\nskip is on for a lexicographic comparator and a target longer than 32\nbytes. Shorter keys compare from the first byte, as before, because\ntracking the prefix costs each step more than such a key saves.\n- Tests: the comparison is checked exhaustively against `Ord` for every\nstarting offset, and the searches are checked against a plain walk of\neach level over keys sharing 0, 40 and 100-byte prefixes.\n\n## Measurements\nCallgrind instructions for a whole skewed-overwrite run, before and\nafter:\n\n| key | before | after |\n|---|---|---|\n| 8 B | 1.981G | 1.894G (-4.4%) |\n| 16 B | 2.138G | 2.052G (-4.0%) |\n| 40 B | 2.627G | 2.345G (-10.7%) |\n| 72 B | 2.955G | 2.453G (-17.0%) |\n\nTimed A/B on a dedicated Linux host, `overwrite_skew`, ns per write,\nratio to RocksDB from the same rounds in brackets:\n\n| arm | before | after |\n|---|---|---|\n| uniform, 8 B keys | 1311 (0.423) | 1232 (0.414) |\n| one hot key | 308 (0.247) | 228 (0.179) |\n| uniform, 64 B prefix | 2101 (0.609) | 1944 (0.591) |\n| zipf, 64 B prefix | 1657 (0.540) | 1503 (0.517) |\n\nThe other arms stay within noise.\n\n## Testing\nFormatting, clippy with all features and the memtable tests pass locally\non macOS; CI runs the full suite on every platform.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved lookup efficiency for long keys with shared prefixes, while\npreserving the existing search results and ordering behavior. Short keys\nand custom comparison behavior remain unchanged.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-22T11:29:15+02:00",
+          "tree_id": "4106a577a8c5d29ae7ceee11c00133b2b13f2e5d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/03a985a72bfeb0b407e42787fca6602039cfdaa3"
+        },
+        "date": 1795344698537,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 150952.11024222246,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 15.8us | P99.9: 28.5us\nthreads: 1 | elapsed: 3.55s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3103293.095155795,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 883968.2736007684,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 500165.3108873146,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.7us | P99.9: 20.8us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3230766.9816583702,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 328661.6727752492,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.3us | P99.9: 26.8us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 190031.1245517845,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 14.2us | P99.9: 32.9us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 866956.3873081191,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1082774.6635644522,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 425869.63404394186,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 7.3us | P99.9: 41.3us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
           }
         ]
       }
