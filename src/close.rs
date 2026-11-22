@@ -62,7 +62,7 @@ fn run(callback: impl FnOnce()) {
 
 /// A tree's liveness: held, as an `Arc`, by everything of the tree that owns
 /// a file of its directory. Its last drop closes the tree.
-pub struct Life {
+pub(crate) struct Life {
     signal: Arc<Signal>,
     /// The tree's directory lock (`None` when the config disables it). The
     /// folder stays the tree's while any part of it still owns a file there
@@ -75,7 +75,7 @@ pub struct Life {
 
 impl Life {
     /// The liveness of a tree being opened, holding its directory lock.
-    pub fn new(
+    pub(crate) fn new(
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -91,7 +91,7 @@ impl Life {
     }
 
     /// A handle on the signal, holding no liveness itself.
-    pub fn signal(&self) -> TreeClose {
+    pub(crate) fn signal(&self) -> TreeClose {
         TreeClose {
             signal: Arc::clone(&self.signal),
         }
@@ -290,7 +290,7 @@ impl core::fmt::Debug for WeakTree {
 
 /// Gives up `tree`'s handle and returns its closing signal: from here no weak
 /// handle raises the tree again.
-pub fn close(tree: Tree) -> TreeClose {
+pub(crate) fn close(tree: Tree) -> TreeClose {
     let signal = tree.life.signal();
     tree.closing.store(true, Ordering::SeqCst);
     drop(tree);
