@@ -5,20 +5,19 @@ fn new_map() -> SkipMap {
     SkipMap::new(crate::comparator::default_comparator())
 }
 
-/// Longest key the exhaustive pairs below reach: past two 32-byte runs, so a
-/// difference falls in a skipped run, in a word after the runs and in the
-/// byte tail.
+/// Longest key the exhaustive pairs below reach: several words and a byte
+/// tail, so a difference falls in every word position and in the tail.
 const LONGEST_EXHAUSTIVE_KEY: usize = 76;
 
 /// The prefix-skipping comparison orders every pair of keys as `<[u8]>::cmp`
 /// does and reports their exact common prefix, from every starting point a
-/// search can pass (any length up to that prefix): every length up to past
-/// two 32-byte runs, a difference at each position on either side of a run
-/// and word boundary, a key that is a prefix of the other, a short key
-/// against a long one, and pseudo-random pairs behind long shared runs.
-/// Guards against a compare that reads the bytes in the wrong order, lets the
-/// length decide too early, skips a run that differs, or misreports where two
-/// keys part, which would make a later comparison skip bytes it must read.
+/// search can pass (any length up to that prefix): every length up to several
+/// words, a difference at each position on either side of a word boundary, a
+/// key that is a prefix of the other, a short key against a long one, and
+/// pseudo-random pairs behind long shared runs. Guards against a compare that
+/// reads the bytes in the wrong order, lets the length decide too early, or
+/// misreports where two keys part, which would make a later comparison skip
+/// bytes it must read.
 #[test]
 fn the_prefix_skipping_comparison_orders_keys_and_finds_their_common_prefix() {
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();

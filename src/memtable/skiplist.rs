@@ -1665,10 +1665,10 @@ fn node_height(seed: u64, value_idx: u32) -> usize {
 ///
 /// A search passes the prefix its bounds already share with the target (see
 /// [`SkipMap::find_splice`]), so keys behind a long common prefix are compared
-/// from where they can differ instead of from their first byte. The rest is
-/// skipped 32 bytes at a time while it matches, then compared as big-endian
-/// words: `<[u8]>::cmp` would call `memcmp` on every search step and could
-/// not report where the keys part.
+/// from where they can differ instead of from their first byte; only the first
+/// steps of a descent, before a bound shares anything, read a long prefix. The
+/// rest is compared as big-endian words: `<[u8]>::cmp` would call `memcmp` on
+/// every search step and could not report where the keys part.
 #[expect(
     clippy::inline_always,
     reason = "runs at every search step of every insert and lookup"
@@ -1680,21 +1680,17 @@ fn lexicographic_from(a: &[u8], b: &[u8], from: usize) -> (CmpOrdering, usize) {
     // SAFETY: a search passes only a prefix length it measured on both keys
     // against the same target (asserted above), so `from` is within both.
     let (a, b) = unsafe { (a.get_unchecked(from..), b.get_unchecked(from..)) };
+    let common = a.len().min(b.len());
+    let words = common / 8;
     let mut at = 0;
-    let (a_runs, _) = a.as_chunks::<32>();
-    let (b_runs, _) = b.as_chunks::<32>();
-    for (x, y) in a_runs.iter().zip(b_runs) {
-        if x != y {
-            break;
-        }
-        at += 32;
-    }
-    // SAFETY: `at` counts whole 32-byte runs of both keys.
-    let (a_rest, b_rest) = unsafe { (a.get_unchecked(at..), b.get_unchecked(at..)) };
-    let (a_words, _) = a_rest.as_chunks::<8>();
-    let (b_words, _) = b_rest.as_chunks::<8>();
-    for (x, y) in a_words.iter().zip(b_words) {
-        let (x, y) = (u64::from_be_bytes(*x), u64::from_be_bytes(*y));
+    while at < words * 8 {
+        // SAFETY: `at + 8 <= common`, within both keys.
+        let (x, y) = unsafe {
+            (
+                u64::from_be_bytes(*a.as_ptr().add(at).cast::<[u8; 8]>()),
+                u64::from_be_bytes(*b.as_ptr().add(at).cast::<[u8; 8]>()),
+            )
+        };
         if x != y {
             // The first differing byte is the highest differing one of the
             // big-endian words.
@@ -1704,13 +1700,15 @@ fn lexicographic_from(a: &[u8], b: &[u8], from: usize) -> (CmpOrdering, usize) {
         at += 8;
     }
     // Fewer than eight bytes of the shorter key are left.
-    for (x, y) in a.iter().skip(at).zip(b.iter().skip(at)) {
+    while at < common {
+        // SAFETY: `at < common`, within both keys.
+        let (x, y) = unsafe { (*a.get_unchecked(at), *b.get_unchecked(at)) };
         if x != y {
-            return (x.cmp(y), from + at);
+            return (x.cmp(&y), from + at);
         }
         at += 1;
     }
-    (a.len().cmp(&b.len()), from + at)
+    (a.len().cmp(&b.len()), from + common)
 }
 
 // ---------------------------------------------------------------------------
