@@ -111,7 +111,8 @@ pub struct TreeInner {
     /// Unique tree ID
     pub id: TreeId,
 
-    /// The tree's liveness, which every tree handle holds through this.
+    /// The tree's liveness, which every tree handle holds through this, and
+    /// with it the directory lock, released once the tree is closed.
     pub(crate) life: Arc<crate::close::Life>,
 
     /// Set by `close`: no weak handle raises the tree from then on.
@@ -181,19 +182,6 @@ pub struct TreeInner {
     /// Whether the backend syncs files one at a time, shared with the version
     /// history and read here without its lock.
     pub(crate) serial_syncs: Arc<crate::version::SerialSyncs>,
-
-    /// Holds the cross-process exclusive directory lock for this tree's
-    /// lifetime: the locked `LOCK` file handle acquired by `Config::open` (via
-    /// `acquire_directory_lock`). Dropping it on tree close releases the OS
-    /// advisory lock so another process can open the directory. `None` when the
-    /// lock is disabled via
-    /// [`Config::with_directory_lock`](crate::Config::with_directory_lock). Its
-    /// sole job is to keep the lock held. Shared: a pin holds it too, so the
-    /// folder stays locked while a pin lists its files, after the tree drops.
-    // std-only: cross-process file locking needs real OS files; a no_std build
-    // is single-context and has nothing to guard against.
-    #[cfg(feature = "std")]
-    pub(crate) directory_lock: Option<Arc<dyn crate::fs::FsFile>>,
 
     /// Tree-wide gate that defers SST / blob-file deletions while a
     /// [`Tree::create_checkpoint`](crate::AbstractTree::create_checkpoint) is in
@@ -371,7 +359,7 @@ impl TreeInner {
     pub(crate) fn create_new(
         mut config: Config,
         // The cross-process directory lock acquired by `Tree::open` before the
-        // manifest probe; held for the tree's lifetime.
+        // manifest probe; held by the tree's `Life` until it is closed.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
     ) -> crate::Result<Self> {
         let version = Version::new(
@@ -404,7 +392,10 @@ impl TreeInner {
 
         let comparator = config.comparator.clone();
         let sync_mode = config.sync_mode;
-        let life = crate::close::Life::new();
+        let life = crate::close::Life::new(
+            #[cfg(feature = "std")]
+            directory_lock,
+        );
         let table_id_counter = SequenceNumberCounter::default();
         let table_files = Arc::new(crate::table::file_pool::TableFilePools::for_tree(
             table_id_counter.clone(),
@@ -480,8 +471,6 @@ impl TreeInner {
             flush_lock: Mutex::default(),
             flush_seqs,
             serial_syncs,
-            #[cfg(feature = "std")]
-            directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
             filter_budget,

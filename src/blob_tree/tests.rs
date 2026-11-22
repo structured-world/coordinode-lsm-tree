@@ -576,7 +576,9 @@ fn a_batched_read_of_a_chunked_value_falls_back_to_its_own_path() -> crate::Resu
 
     // A point read caching what it reads leaves the head and every chunk
     // cached: the value's own path assembles it from them, with no read.
-    drop(tree);
+    // The version and the blob source hold the tree open, and with it the
+    // folder's lock, until they go too.
+    drop((version, source, tree));
     let crate::AnyTree::Blob(tree) = open(crate::config::BlobCacheFill::Always)? else {
         panic!("a tree with kv separation opens as a blob tree");
     };
