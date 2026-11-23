@@ -8278,13 +8278,14 @@ mod locality_relocation {
         Ok(())
     }
 
-    /// Relocation copies frames verbatim, one output file per source codec, so
-    /// interleaved files of two codecs collapse to one file per codec and no
-    /// further. A compaction after that has nothing to gain and rewrites
-    /// nothing, rather than rewriting the same two files over and over.
+    /// Relocation copies frames as stored only under the codec the tree writes
+    /// now and writes the others anew under it, so interleaved files of two
+    /// codecs collapse to one file of the tree's codec. A compaction after
+    /// that has nothing to gain and rewrites nothing, rather than rewriting
+    /// the same file over and over.
     #[cfg(feature = "lz4")]
     #[test]
-    fn locality_relocation_stops_at_one_file_per_codec() -> crate::Result<()> {
+    fn locality_relocation_collapses_two_codecs_into_the_trees_one() -> crate::Result<()> {
         let folder = tempfile::tempdir()?;
         let Some(max_depth) = NonZeroU64::new(1) else {
             panic!("one is not zero");
@@ -8314,10 +8315,26 @@ mod locality_relocation {
             tree.flush_active_memtable(0)?;
         }
 
+        let current = if (FILES - 1).is_multiple_of(2) {
+            crate::CompressionType::None
+        } else {
+            crate::CompressionType::Lz4
+        };
         tree.major_compact(u64::MAX, u64::MAX)?;
         let collapsed = blob_ids(&tree);
-        assert_eq!(collapsed.len(), 2, "one file per codec: {collapsed:?}");
-        assert_eq!(tree.storage_stats()?.blob_references.depth, 2);
+        assert_eq!(
+            collapsed.len(),
+            1,
+            "one file of the tree's codec: {collapsed:?}"
+        );
+        assert!(
+            blob.current_version()
+                .blob_files
+                .iter()
+                .all(|file| file.compression() == current),
+            "every value is under the codec the tree writes now",
+        );
+        assert_eq!(tree.storage_stats()?.blob_references.depth, 1);
 
         tree.major_compact(u64::MAX, u64::MAX)?;
         assert_eq!(blob_ids(&tree), collapsed, "nothing left to gain");
