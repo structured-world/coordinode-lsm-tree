@@ -126,77 +126,10 @@ fn secret_for(seed: u64) -> [u8; SECRET_LEN] {
 fn long_acc(kernel: Kernel, input: &[u8], secret: &[u8; SECRET_LEN]) -> Acc {
     debug_assert!(input.len() > MID_SIZE_MAX);
     let mut acc = INITIAL_ACC;
-    // Every stripe but the last whole one before the input's end; that one
-    // overlaps the stripes before it and takes its own secret.
-    let stripes = (input.len() - 1) / STRIPE_LEN;
-    consume(kernel, &mut acc, input.as_ptr(), stripes, 0, secret);
-    last_stripe(kernel, &mut acc, input.as_ptr(), input.len(), secret);
+    // SAFETY: `input` holds its `len() > STRIPE_LEN` bytes and `secret` its
+    // 192; the kernel is one the CPU runs.
+    unsafe { (kernel.long)(&mut acc, input.as_ptr(), input.len(), secret.as_ptr()) };
     acc
-}
-
-/// Accumulates the last 64 bytes of the `len` bytes at `input` into `acc`.
-fn last_stripe(
-    kernel: Kernel,
-    acc: &mut Acc,
-    input: *const u8,
-    len: usize,
-    secret: &[u8; SECRET_LEN],
-) {
-    debug_assert!(len >= STRIPE_LEN);
-    // SAFETY: `len >= STRIPE_LEN` bytes from `input`, so its last stripe lies
-    // within them; its secret, 64 bytes from SECRET_LEN - 64 - 7, within
-    // the secret.
-    unsafe {
-        (kernel.stripes)(
-            acc,
-            input.add(len - STRIPE_LEN),
-            secret
-                .as_ptr()
-                .add(SECRET_LEN - STRIPE_LEN - LAST_STRIPE_BACK),
-            1,
-        );
-    }
-}
-
-/// Accumulates `stripes` stripes from `input` into `acc`, `done` stripes of
-/// the current block already in it, scrambling at each block's end, and
-/// returns how many of the block the last one leaves done.
-///
-/// `input` must be valid for `stripes * STRIPE_LEN` bytes.
-fn consume(
-    kernel: Kernel,
-    acc: &mut Acc,
-    input: *const u8,
-    stripes: usize,
-    done: usize,
-    secret: &[u8; SECRET_LEN],
-) -> usize {
-    debug_assert!(done < STRIPES_PER_BLOCK);
-    let secret_at = |stripe: usize| {
-        // SAFETY: a stripe's secret starts at most 8 * 15 bytes in, and its
-        // 64 bytes end within the secret's 192.
-        unsafe { secret.as_ptr().add(stripe * 8) }
-    };
-    if done + stripes < STRIPES_PER_BLOCK {
-        // SAFETY: `input` holds `stripes` stripes, by the caller; their
-        // secrets end at (done + stripes - 1) * 8 + 64 < 192.
-        unsafe { (kernel.stripes)(acc, input, secret_at(done), stripes) };
-        return done + stripes;
-    }
-    let to_end = STRIPES_PER_BLOCK - done;
-    let blocks = (stripes - to_end) / STRIPES_PER_BLOCK;
-    let rest = stripes - to_end - blocks * STRIPES_PER_BLOCK;
-    // SAFETY: `to_end + blocks * 16 + rest == stripes` stripes from `input`,
-    // which the caller keeps valid; each call's secret as above.
-    unsafe {
-        (kernel.stripes)(acc, input, secret_at(done), to_end);
-        (kernel.scramble)(acc, secret.as_ptr());
-        let input = input.add(to_end * STRIPE_LEN);
-        (kernel.blocks)(acc, input, blocks, secret.as_ptr());
-        let input = input.add(blocks * STRIPES_PER_BLOCK * STRIPE_LEN);
-        (kernel.stripes)(acc, input, secret.as_ptr(), rest);
-    }
-    rest
 }
 
 /// The little-endian `u64` at `at` of `secret`.
@@ -336,15 +269,17 @@ impl Hasher {
             // last stripe is not the input's last.
             let (fill, rest) = input.split_at(room);
             put(buffer, *buffered, fill);
-            // The whole buffer is written now.
-            *done = consume(
-                kernel,
-                acc,
-                buffer.as_ptr().cast::<u8>(),
-                BUFFER_LEN / STRIPE_LEN,
-                *done,
-                secret,
-            );
+            // SAFETY: the whole buffer is written now, its four stripes; the
+            // secret holds its 192 bytes and `done` stays below a block.
+            *done = unsafe {
+                (kernel.consume)(
+                    acc,
+                    buffer.as_ptr().cast::<u8>(),
+                    BUFFER_LEN / STRIPE_LEN,
+                    *done,
+                    secret.as_ptr(),
+                )
+            };
             *buffered = 0;
             input = rest;
         }
@@ -353,7 +288,16 @@ impl Hasher {
             // leaving 1 to 256 bytes for the buffer, as a buffer at a time
             // would.
             let len = (input.len() - 1) / BUFFER_LEN * BUFFER_LEN;
-            *done = consume(kernel, acc, input.as_ptr(), len / STRIPE_LEN, *done, secret);
+            // SAFETY: `len < input.len()` bytes, whole stripes; as above.
+            *done = unsafe {
+                (kernel.consume)(
+                    acc,
+                    input.as_ptr(),
+                    len / STRIPE_LEN,
+                    *done,
+                    secret.as_ptr(),
+                )
+            };
             // The last stripe accumulated, for a digest whose own last
             // stripe reaches back into it.
             let (consumed, rest) = input.split_at(len);
@@ -374,15 +318,22 @@ impl Hasher {
         let buffered = self.buffered();
         if buffered.len() >= STRIPE_LEN {
             let stripes = (buffered.len() - 1) / STRIPE_LEN;
-            consume(
-                kernel,
-                &mut acc,
-                buffered.as_ptr(),
-                stripes,
-                self.done,
-                secret,
-            );
-            last_stripe(kernel, &mut acc, buffered.as_ptr(), buffered.len(), secret);
+            // SAFETY: the buffered bytes hold `stripes` whole stripes and end
+            // with the last one; the secret holds its 192 bytes.
+            unsafe {
+                (kernel.consume)(
+                    &mut acc,
+                    buffered.as_ptr(),
+                    stripes,
+                    self.done,
+                    secret.as_ptr(),
+                );
+                (kernel.last)(
+                    &mut acc,
+                    buffered.as_ptr().add(buffered.len() - STRIPE_LEN),
+                    secret.as_ptr(),
+                );
+            }
         } else {
             // The last stripe reaches back into the bytes accumulated before
             // the buffer was refilled, which its end still holds.
@@ -401,7 +352,8 @@ impl Hasher {
             let (head, tail) = stripe.split_at_mut(back);
             head.copy_from_slice(old);
             tail.copy_from_slice(buffered);
-            last_stripe(kernel, &mut acc, stripe.as_ptr(), STRIPE_LEN, secret);
+            // SAFETY: `stripe` is 64 bytes; the secret holds its 192.
+            unsafe { (kernel.last)(&mut acc, stripe.as_ptr(), secret.as_ptr()) };
         }
         acc
     }

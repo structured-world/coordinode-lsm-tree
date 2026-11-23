@@ -2,13 +2,16 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! The stripe loop of xxh3's long inputs, in one kernel per instruction set,
-//! chosen once per call from what the CPU runs.
+//! chosen once per process from what the CPU runs.
 //!
 //! Every kernel computes the accumulators xxh3 defines, bit for bit: they
 //! differ only in how many lanes one instruction covers. The scalar kernel is
-//! the reference the others are tested against.
+//! the reference the others are tested against. A kernel's entry points each
+//! run a whole pass over their input, compiled with its instruction set and
+//! the stripe, block and scramble steps inlined in it: a hash makes one
+//! indirect call, and its loop none.
 
-use super::{PRIME32_1, SECRET_LEN, STRIPE_LEN, STRIPES_PER_BLOCK};
+use super::{LAST_STRIPE_BACK, PRIME32_1, SECRET_LEN, STRIPE_LEN, STRIPES_PER_BLOCK};
 
 /// The accumulators of a long input.
 pub(super) type Acc = [u64; 8];
@@ -24,29 +27,113 @@ const SCRAMBLE_AT: usize = SECRET_LEN - STRIPE_LEN;
 /// instruction set the CPU has.
 #[derive(Clone, Copy)]
 pub(super) struct Kernel {
-    /// Accumulates `blocks` whole blocks of [`STRIPES_PER_BLOCK`] stripes
-    /// from `input` into `acc`, scrambling after each.
+    /// Accumulates `stripes` stripes from `input` into `acc`, `done` stripes
+    /// of the current block already in it, scrambling at each block's end,
+    /// and returns how many of the block the last one leaves done.
     ///
     /// # Safety
     ///
-    /// `input` is valid for `blocks * STRIPES_PER_BLOCK * STRIPE_LEN` bytes
-    /// and `secret` for [`SECRET_LEN`].
-    pub(super) blocks: unsafe fn(acc: &mut Acc, input: *const u8, blocks: usize, secret: *const u8),
-    /// Accumulates `stripes` stripes from `input` into `acc`, the secret of
-    /// each starting 8 bytes after the previous one's, the first at `secret`.
+    /// `input` is valid for `stripes * STRIPE_LEN` bytes, `secret` for
+    /// [`SECRET_LEN`], and `done < STRIPES_PER_BLOCK`.
+    pub(super) consume: unsafe fn(
+        acc: &mut Acc,
+        input: *const u8,
+        stripes: usize,
+        done: usize,
+        secret: *const u8,
+    ) -> usize,
+    /// Accumulates the whole of `input`, `len` bytes, longer than one
+    /// stripe, into `acc`: every stripe but the last whole one, then the
+    /// last 64 bytes under their own secret.
     ///
     /// # Safety
     ///
-    /// `input` is valid for `stripes * STRIPE_LEN` bytes and `secret` for
-    /// `(stripes - 1) * 8 + STRIPE_LEN` bytes (none when `stripes` is zero).
-    pub(super) stripes:
-        unsafe fn(acc: &mut Acc, input: *const u8, secret: *const u8, stripes: usize),
-    /// Scrambles `acc` with the secret's last stripe.
+    /// `input` is valid for `len >= STRIPE_LEN` bytes and `secret` for
+    /// [`SECRET_LEN`].
+    pub(super) long: unsafe fn(acc: &mut Acc, input: *const u8, len: usize, secret: *const u8),
+    /// Accumulates the 64 bytes at `stripe` into `acc` as an input's last.
     ///
     /// # Safety
     ///
-    /// `secret` is valid for [`SECRET_LEN`] bytes.
-    pub(super) scramble: unsafe fn(acc: &mut Acc, secret: *const u8),
+    /// `stripe` is valid for [`STRIPE_LEN`] bytes and `secret` for
+    /// [`SECRET_LEN`].
+    pub(super) last: unsafe fn(acc: &mut Acc, stripe: *const u8, secret: *const u8),
+}
+
+/// A kernel's entry points over its module's `stripes`, `scramble` and
+/// `blocks`, with `$attr` (its `#[target_feature]`) on each, so those steps
+/// inline into them.
+macro_rules! entry_points {
+    ($(#[$attr:meta])*) => {
+        /// # Safety
+        ///
+        /// As `Kernel::consume`, and the CPU runs this instruction set.
+        $(#[$attr])*
+        pub(in super::super) unsafe fn consume(
+            acc: &mut Acc,
+            input: *const u8,
+            stripes_n: usize,
+            done: usize,
+            secret: *const u8,
+        ) -> usize {
+            debug_assert!(done < STRIPES_PER_BLOCK);
+            // SAFETY: the caller keeps `input` valid for `stripes_n` stripes
+            // and `secret` for its 192 bytes. A stripe's secret starts at
+            // most 8 * 15 bytes in, and its 64 bytes end within them.
+            unsafe {
+                if done + stripes_n < STRIPES_PER_BLOCK {
+                    stripes(acc, input, secret.add(done * 8), stripes_n);
+                    return done + stripes_n;
+                }
+                let to_end = STRIPES_PER_BLOCK - done;
+                let whole = (stripes_n - to_end) / STRIPES_PER_BLOCK;
+                let rest = stripes_n - to_end - whole * STRIPES_PER_BLOCK;
+                stripes(acc, input, secret.add(done * 8), to_end);
+                scramble(acc, secret);
+                let input = input.add(to_end * STRIPE_LEN);
+                blocks(acc, input, whole, secret);
+                let input = input.add(whole * STRIPES_PER_BLOCK * STRIPE_LEN);
+                stripes(acc, input, secret, rest);
+                rest
+            }
+        }
+
+        /// # Safety
+        ///
+        /// As `Kernel::last`, and the CPU runs this instruction set.
+        $(#[$attr])*
+        pub(in super::super) unsafe fn last(acc: &mut Acc, stripe: *const u8, secret: *const u8) {
+            // SAFETY: the last stripe's secret, 64 bytes from
+            // SECRET_LEN - 64 - 7, lies within the secret.
+            unsafe {
+                stripes(
+                    acc,
+                    stripe,
+                    secret.add(SECRET_LEN - STRIPE_LEN - LAST_STRIPE_BACK),
+                    1,
+                )
+            };
+        }
+
+        /// # Safety
+        ///
+        /// As `Kernel::long`, and the CPU runs this instruction set.
+        $(#[$attr])*
+        pub(in super::super) unsafe fn long(
+            acc: &mut Acc,
+            input: *const u8,
+            len: usize,
+            secret: *const u8,
+        ) {
+            debug_assert!(len >= STRIPE_LEN);
+            // SAFETY: every stripe but the last whole one lies within `len`,
+            // and the last one is its final 64 bytes.
+            unsafe {
+                consume(acc, input, (len - 1) / STRIPE_LEN, 0, secret);
+                last(acc, input.add(len - STRIPE_LEN), secret);
+            }
+        }
+    };
 }
 
 impl Kernel {
@@ -60,23 +147,18 @@ impl Kernel {
         ))
     ))]
     pub(super) const SCALAR: Self = Self {
-        blocks: scalar::blocks,
-        stripes: scalar::stripes,
-        scramble: scalar::scramble,
+        consume: scalar::consume,
+        long: scalar::long,
+        last: scalar::last,
     };
 
-    /// The widest kernel this CPU runs.
+    /// The widest kernel this CPU runs, found on the first call and kept.
     #[must_use]
+    #[inline]
     pub(super) fn get() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            // No AVX-512 kernel: the loop is bound by its multiplies, and
-            // 512-bit ones lower the clock on the CPUs that have them.
-            if cpu_avx2::get() {
-                return x86::AVX2;
-            }
-            // SSE2 is part of every x86-64 CPU.
-            x86::SSE2
+            x86::active()
         }
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         {
@@ -131,7 +213,11 @@ cpufeatures::new!(cpu_avx2, "avx2");
     ))
 ))]
 mod scalar {
-    use super::{Acc, PRIME32_1, SCRAMBLE_AT, STRIPE_LEN, STRIPES_PER_BLOCK};
+    use super::{
+        Acc, LAST_STRIPE_BACK, PRIME32_1, SCRAMBLE_AT, SECRET_LEN, STRIPE_LEN, STRIPES_PER_BLOCK,
+    };
+
+    entry_points!();
 
     /// The little-endian `u64` at `at`.
     ///
@@ -175,19 +261,16 @@ mod scalar {
         }
     }
 
-    pub(super) unsafe fn stripes(
-        acc: &mut Acc,
-        input: *const u8,
-        secret: *const u8,
-        stripes: usize,
-    ) {
+    #[inline]
+    unsafe fn stripes(acc: &mut Acc, input: *const u8, secret: *const u8, stripes: usize) {
         for stripe in 0..stripes {
             // SAFETY: within the bounds the caller keeps, by stripe.
             unsafe { accumulate(acc, input.add(stripe * STRIPE_LEN), secret.add(stripe * 8)) };
         }
     }
 
-    pub(super) unsafe fn scramble(acc: &mut Acc, secret: *const u8) {
+    #[inline]
+    unsafe fn scramble(acc: &mut Acc, secret: *const u8) {
         for (lane, value) in acc.iter_mut().enumerate() {
             // SAFETY: SCRAMBLE_AT + 64 is the secret's length.
             let key = unsafe { read(secret.add(SCRAMBLE_AT + lane * 8)) };
@@ -195,7 +278,8 @@ mod scalar {
         }
     }
 
-    pub(super) unsafe fn blocks(acc: &mut Acc, input: *const u8, blocks: usize, secret: *const u8) {
+    #[inline]
+    unsafe fn blocks(acc: &mut Acc, input: *const u8, blocks: usize, secret: *const u8) {
         for block in 0..blocks {
             // SAFETY: within the bounds the caller keeps, by block.
             unsafe {
@@ -214,7 +298,10 @@ mod scalar {
 /// The x86-64 kernels: SSE2 (16 bytes a lane) and AVX2 (32).
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{Acc, Kernel, PRIME32_1, SCRAMBLE_AT, STRIPE_LEN, STRIPES_PER_BLOCK};
+    use super::{
+        Acc, Kernel, LAST_STRIPE_BACK, PRIME32_1, SCRAMBLE_AT, SECRET_LEN, STRIPE_LEN,
+        STRIPES_PER_BLOCK,
+    };
     use core::arch::x86_64::{
         __m128i, __m256i, _mm_add_epi64, _mm_loadu_si128, _mm_mul_epu32, _mm_set1_epi32,
         _mm_shuffle_epi32, _mm_slli_epi64, _mm_srli_epi64, _mm_storeu_si128, _mm_xor_si128,
@@ -313,11 +400,19 @@ mod x86 {
                     };
                 }
 
+                entry_points!(#[target_feature(enable = $feature)]);
+
+                /// Accumulates `stripes` stripes from `input` into `acc`, the
+                /// secret of each starting 8 bytes after the previous one's.
+                ///
                 /// # Safety
                 ///
-                /// As [`Kernel::stripes`], and the CPU runs this instruction set.
+                /// `input` is valid for `stripes * STRIPE_LEN` bytes, `secret`
+                /// for `(stripes - 1) * 8 + STRIPE_LEN`, and the CPU runs this
+                /// instruction set.
+                #[inline]
                 #[target_feature(enable = $feature)]
-                pub(in super::super) unsafe fn stripes(
+                unsafe fn stripes(
                     acc: &mut Acc,
                     input: *const u8,
                     secret: *const u8,
@@ -333,21 +428,31 @@ mod x86 {
                     store_acc!(acc, lanes);
                 }
 
+                /// Scrambles `acc` with the secret's last stripe.
+                ///
                 /// # Safety
                 ///
-                /// As [`Kernel::scramble`], and the CPU runs this instruction set.
+                /// `secret` is valid for [`SECRET_LEN`] bytes, and the CPU runs
+                /// this instruction set.
+                #[inline]
                 #[target_feature(enable = $feature)]
-                pub(in super::super) unsafe fn scramble(acc: &mut Acc, secret: *const u8) {
+                unsafe fn scramble(acc: &mut Acc, secret: *const u8) {
                     let mut lanes = load_acc!(acc);
                     scramble!(lanes, secret);
                     store_acc!(acc, lanes);
                 }
 
+                /// Accumulates `blocks` whole blocks from `input` into `acc`,
+                /// scrambling after each.
+                ///
                 /// # Safety
                 ///
-                /// As [`Kernel::blocks`], and the CPU runs this instruction set.
+                /// `input` is valid for `blocks * STRIPES_PER_BLOCK *
+                /// STRIPE_LEN` bytes, `secret` for [`SECRET_LEN`], and the CPU
+                /// runs this instruction set.
+                #[inline]
                 #[target_feature(enable = $feature)]
-                pub(in super::super) unsafe fn blocks(
+                unsafe fn blocks(
                     acc: &mut Acc,
                     input: *const u8,
                     blocks: usize,
@@ -402,22 +507,58 @@ mod x86 {
         _mm256_shuffle_epi32,
         _mm256_set1_epi32
     );
-    pub(super) const SSE2: Kernel = Kernel {
-        blocks: sse2::blocks,
-        stripes: sse2::stripes,
-        scramble: sse2::scramble,
+    pub(super) static SSE2: Kernel = Kernel {
+        consume: sse2::consume,
+        long: sse2::long,
+        last: sse2::last,
     };
-    pub(super) const AVX2: Kernel = Kernel {
-        blocks: avx2::blocks,
-        stripes: avx2::stripes,
-        scramble: avx2::scramble,
+    pub(super) static AVX2: Kernel = Kernel {
+        consume: avx2::consume,
+        long: avx2::long,
+        last: avx2::last,
     };
+
+    /// The kernel found on the first call, null before it: one of the
+    /// statics above.
+    static ACTIVE: core::sync::atomic::AtomicPtr<Kernel> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+    /// The widest kernel this CPU runs: asked of the CPU on the first call,
+    /// a load after it.
+    #[inline]
+    pub(super) fn active() -> Kernel {
+        use core::sync::atomic::Ordering::Relaxed;
+        let found = ACTIVE.load(Relaxed);
+        if !found.is_null() {
+            // SAFETY: only the address of a static kernel is stored.
+            return unsafe { *found };
+        }
+        detect()
+    }
+
+    #[cold]
+    fn detect() -> Kernel {
+        // No AVX-512 kernel: the loop is bound by its multiplies, and 512-bit
+        // ones lower the clock on the CPUs that have them. SSE2 is part of
+        // every x86-64 CPU. Two threads finding it at once store the same.
+        let kernel: &'static Kernel = if super::cpu_avx2::get() { &AVX2 } else { &SSE2 };
+        ACTIVE.store(
+            core::ptr::from_ref(kernel).cast_mut(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        *kernel
+    }
 }
 
 /// The NEON kernel: 16 bytes a lane.
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 mod neon {
-    use super::{Acc, Kernel, PRIME32_1, SCRAMBLE_AT, STRIPE_LEN, STRIPES_PER_BLOCK};
+    use super::{
+        Acc, Kernel, LAST_STRIPE_BACK, PRIME32_1, SCRAMBLE_AT, SECRET_LEN, STRIPE_LEN,
+        STRIPES_PER_BLOCK,
+    };
+
+    entry_points!(#[target_feature(enable = "neon")]);
     use core::arch::aarch64::{
         uint64x2_t, vaddq_u64, veorq_u64, vextq_u64, vld1q_u8, vld1q_u64, vmovn_u64, vmull_n_u32,
         vmull_u32, vreinterpretq_u64_u8, vshlq_n_u64, vshrn_n_u64, vshrq_n_u64, vst1q_u64,
@@ -490,9 +631,14 @@ mod neon {
         };
     }
 
+    /// Accumulates `stripes` stripes from `input` into `acc`, the secret of
+    /// each starting 8 bytes after the previous one's.
+    ///
     /// # Safety
     ///
-    /// As [`Kernel::stripes`].
+    /// `input` is valid for `stripes * STRIPE_LEN` bytes and `secret` for
+    /// `(stripes - 1) * 8 + STRIPE_LEN`.
+    #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn stripes(acc: &mut Acc, input: *const u8, secret: *const u8, stripes: usize) {
         let mut lanes = load_acc!(acc);
@@ -504,9 +650,12 @@ mod neon {
         store_acc!(acc, lanes);
     }
 
+    /// Scrambles `acc` with the secret's last stripe.
+    ///
     /// # Safety
     ///
-    /// As [`Kernel::scramble`].
+    /// `secret` is valid for [`SECRET_LEN`] bytes.
+    #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn scramble(acc: &mut Acc, secret: *const u8) {
         let mut lanes = load_acc!(acc);
@@ -514,9 +663,14 @@ mod neon {
         store_acc!(acc, lanes);
     }
 
+    /// Accumulates `blocks` whole blocks from `input` into `acc`, scrambling
+    /// after each.
+    ///
     /// # Safety
     ///
-    /// As [`Kernel::blocks`].
+    /// `input` is valid for `blocks * STRIPES_PER_BLOCK * STRIPE_LEN` bytes
+    /// and `secret` for [`SECRET_LEN`].
+    #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn blocks(acc: &mut Acc, input: *const u8, blocks: usize, secret: *const u8) {
         let mut lanes = load_acc!(acc);
@@ -535,8 +689,8 @@ mod neon {
     }
 
     pub(super) const NEON: Kernel = Kernel {
-        blocks,
-        stripes,
-        scramble,
+        consume,
+        long,
+        last,
     };
 }

@@ -1023,6 +1023,10 @@ pub(crate) struct VerbatimSource {
 pub(crate) enum CopyCheck {
     /// Each block's payload against its checksum: a salvage, which copies
     /// only the blocks that hold.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "a salvage, the one copy that verifies, needs std")
+    )]
     Verify,
     /// Nothing: a compaction's copy carries each block's checksum with its
     /// unchanged bytes, and a read of the copy checks them as a read of the
