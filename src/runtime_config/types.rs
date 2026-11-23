@@ -142,7 +142,7 @@ impl ChecksumAlgorithm {
     pub(crate) fn compute_chunks(self, chunks: &[&[u8]]) -> Option<u64> {
         match self {
             Self::Xxh3_64 | Self::Xxh3Low32 => {
-                let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                let mut hasher = crate::xxh3::Hasher::new();
                 for chunk in chunks {
                     hasher.update(chunk);
                 }

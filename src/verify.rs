@@ -145,7 +145,7 @@ pub(crate) fn stream_checksum_from(
     if start != 0 {
         reader.seek(SeekFrom::Start(start))?;
     }
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    let mut hasher = crate::xxh3::Hasher::new();
     let mut buf = vec![0u8; 64 * 1024];
 
     loop {

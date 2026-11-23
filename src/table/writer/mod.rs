@@ -4717,7 +4717,7 @@ impl Writer {
             self.created_at
                 .unwrap_or_else(|| crate::time::now_on(self.clock.as_ref()).as_nanos())
         });
-        let mut seed = xxhash_rust::xxh3::Xxh3::default();
+        let mut seed = crate::xxh3::Hasher::default();
         seed.update(&self.table_id.to_le_bytes());
         seed.update(&age.to_le_bytes());
         seed.update(&batch.row_count.to_le_bytes());

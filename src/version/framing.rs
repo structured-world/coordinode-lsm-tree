@@ -130,7 +130,7 @@ pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()
         reason = "the explicit MAX_FRAME_PAYLOAD guard above ensures payload.len() fits in u32"
     )]
     let len = payload.len() as u32;
-    let digest = xxhash_rust::xxh3::xxh3_64(payload);
+    let digest = crate::xxh3::hash64(payload);
 
     writer.write_u32::<LittleEndian>(len)?;
     writer.write_u64::<LittleEndian>(digest)?;
@@ -314,7 +314,7 @@ pub fn read_framed_record<R: Read>(
         Err(e) => return Err(e.into()),
     }
 
-    let digest_actual = xxhash_rust::xxh3::xxh3_64(payload_scratch);
+    let digest_actual = crate::xxh3::hash64(payload_scratch);
     if digest_actual == digest_expected {
         Ok(FramedRecordOutcome::Ok)
     } else {

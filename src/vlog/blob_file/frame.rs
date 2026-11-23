@@ -192,7 +192,7 @@ fn header_crc(
     out.bytes(&entries_len.to_le_bytes());
     out.bytes(&raw_len.to_le_bytes());
     out.bytes(&disk_len.to_le_bytes());
-    xxhash_rust::xxh3::xxh3_64(&fields) as u32
+    crate::xxh3::hash64(&fields) as u32
 }
 
 /// Bytes written into a fixed buffer in order.
@@ -223,13 +223,13 @@ impl<'b> Put<'b> {
 /// Blob layout 5 is in no release yet, so changing how it is checksummed keeps
 /// its version: no supported store holds frames checksummed the other way.
 pub(crate) fn frame_checksum(stored: &[u8], header_crc: u32) -> u128 {
-    xxhash_rust::xxh3::xxh3_128_with_seed(stored, u64::from(header_crc))
+    crate::xxh3::hash128_with_seed(stored, u64::from(header_crc))
 }
 
 /// [`frame_checksum`] over `entries` followed by `payload`, where the writer
 /// holds them apart.
 fn frame_checksum_parts(entries: &[u8], payload: &[u8], header_crc: u32) -> u128 {
-    let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(u64::from(header_crc));
+    let mut hasher = crate::xxh3::Hasher::with_seed(u64::from(header_crc));
     hasher.update(entries);
     hasher.update(payload);
     hasher.digest128()
@@ -697,7 +697,7 @@ pub(crate) fn head_payload(chunk_size: u32, chunks: &[ChunkSpec]) -> Vec<u8> {
 /// The checksum a chunk carries in its head's table.
 #[must_use]
 pub(crate) fn chunk_checksum(stored: &[u8]) -> u128 {
-    xxhash_rust::xxh3::xxh3_128(stored)
+    crate::xxh3::hash128(stored)
 }
 
 /// Checks `stored` against `spec`: its length and its checksum.

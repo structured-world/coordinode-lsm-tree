@@ -113,7 +113,7 @@ pub(crate) fn encode_record(
     out.push(flags);
     out.extend_from_slice(key);
     out.extend_from_slice(stored);
-    let checksum = xxhash_rust::xxh3::xxh3_64(out.get(start + 8..).unwrap_or_default());
+    let checksum = crate::xxh3::hash64(out.get(start + 8..).unwrap_or_default());
     if let Some(slot) = out.get_mut(start..start + 8) {
         slot.copy_from_slice(&checksum.to_le_bytes());
     }
@@ -129,7 +129,7 @@ pub(crate) fn encode_record(
 pub(crate) fn parse_record(bytes: &[u8]) -> crate::Result<Record> {
     let record = record_fields(bytes)?;
     let rest = bytes.get(8..record.len).unwrap_or_default();
-    let got = xxhash_rust::xxh3::xxh3_64(rest);
+    let got = crate::xxh3::hash64(rest);
     if got != record.checksum {
         return Err(crate::Error::ChecksumMismatch {
             got: crate::Checksum::from_raw(u128::from(got)),

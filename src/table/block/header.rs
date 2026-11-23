@@ -19,14 +19,14 @@ use std::io::{Read, Write};
 
 struct ChecksummedReader<R: Read> {
     inner: R,
-    hasher: xxhash_rust::xxh3::Xxh3Default,
+    hasher: crate::xxh3::Hasher,
 }
 
 impl<R: Read> ChecksummedReader<R> {
     pub(crate) fn new(reader: R) -> Self {
         Self {
             inner: reader,
-            hasher: xxhash_rust::xxh3::Xxh3Default::new(),
+            hasher: crate::xxh3::Hasher::new(),
         }
     }
 

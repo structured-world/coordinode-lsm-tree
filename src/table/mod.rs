@@ -4023,7 +4023,7 @@ impl Table {
     ) -> crate::Result<(u128, crate::HashSet<u64>)> {
         use std::io::{Read, Seek, SeekFrom};
 
-        let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+        let mut hasher = crate::xxh3::Hasher::new();
         let mut offsets = crate::HashSet::default();
         // A dedicated sequential reader for the digest stream: it walks forward
         // from `heal_start` while `file` still serves the per-block scrub reads.
@@ -4036,7 +4036,7 @@ impl Table {
         // Reads exactly `count` bytes from `rdr`, hashing them when `hash` is set
         // and discarding them (the region a correction replaces) otherwise.
         let consume = |rdr: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
-                       hasher: &mut xxhash_rust::xxh3::Xxh3Default,
+                       hasher: &mut crate::xxh3::Hasher,
                        buf: &mut [u8],
                        mut count: u64,
                        hash: bool|
