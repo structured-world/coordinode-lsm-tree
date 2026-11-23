@@ -6,8 +6,9 @@
 //! An input longer than 240 bytes runs xxh3's stripe loop, which a SIMD
 //! kernel covers 16 or 32 bytes per instruction; one chosen when the crate is
 //! compiled can only use what every CPU of the target has (SSE2 on x86-64).
-//! Here the loop runs through [`kernel::Kernel::get`], asked at run time.
-//! Shorter inputs take xxh3's short paths, which no vector speeds up, from
+//! Here the loop runs through [`kernel::Kernel::get`], found at run time.
+//! Inputs up to 240 bytes take xxh3's short paths, which no vector speeds up,
+//! and one-shot inputs up to 1 KiB the baseline loop, both from
 //! `xxhash-rust`. Every digest is the one xxh3 defines, so nothing a file
 //! holds depends on the CPU that wrote it.
 
@@ -27,6 +28,11 @@ const SECRET_LEN: usize = 192;
 const STRIPES_PER_BLOCK: usize = (SECRET_LEN - STRIPE_LEN) / 8;
 /// The longest input xxh3's short paths take.
 const MID_SIZE_MAX: usize = 240;
+/// The longest input a one-shot hash leaves to `xxhash-rust`'s own loop,
+/// compiled for the baseline CPU: a few stripes gain little from a wider
+/// kernel, and the 256-bit multiplies of a short hash on every record read
+/// slow the core for what runs after it.
+const INLINE_MAX: usize = 1024;
 /// Where the secret of the last stripe starts, counted back from the end.
 const LAST_STRIPE_BACK: usize = 7;
 /// Where the secret of the final merge starts.
@@ -73,7 +79,7 @@ const DEFAULT_SECRET: [u8; SECRET_LEN] = [
 /// The xxh3-64 of `input`.
 #[must_use]
 pub(crate) fn hash64(input: &[u8]) -> u64 {
-    if input.len() <= MID_SIZE_MAX {
+    if input.len() <= INLINE_MAX {
         return xxhash_rust::xxh3::xxh3_64(input);
     }
     let acc = long_acc(Kernel::get(), input, &DEFAULT_SECRET);
@@ -83,7 +89,7 @@ pub(crate) fn hash64(input: &[u8]) -> u64 {
 /// The xxh3-64 of `input` under `seed`.
 #[must_use]
 pub(crate) fn hash64_with_seed(input: &[u8], seed: u64) -> u64 {
-    if input.len() <= MID_SIZE_MAX {
+    if input.len() <= INLINE_MAX {
         return xxhash_rust::xxh3::xxh3_64_with_seed(input, seed);
     }
     let secret = secret_for(seed);
@@ -100,7 +106,7 @@ pub(crate) fn hash128(input: &[u8]) -> u128 {
 /// The xxh3-128 of `input` under `seed`.
 #[must_use]
 pub(crate) fn hash128_with_seed(input: &[u8], seed: u64) -> u128 {
-    if input.len() <= MID_SIZE_MAX {
+    if input.len() <= INLINE_MAX {
         return xxhash_rust::xxh3::xxh3_128_with_seed(input, seed);
     }
     let secret = secret_for(seed);
