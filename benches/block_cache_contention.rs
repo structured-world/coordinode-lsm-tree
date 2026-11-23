@@ -6,7 +6,7 @@
 //!
 //! | axis | values |
 //! |---|---|
-//! | cache | `warm` (holds every block, so readers only share read locks) or `tight` (a fifth of the data, so misses take write locks to evict) |
+//! | cache | `warm` (holds every block, so readers only share read locks), `tight` (a fifth of the data, so misses take write locks to evict) or `off` (capacity zero, so every block read is refused by the cache) |
 //! | order | `uniform` or `skew` (a few keys take most reads, so their shards are the contended ones) |
 //! | threads | 1, 4, 8, 16, 32 |
 //!
@@ -190,7 +190,11 @@ fn main() -> lsm_tree::Result<()> {
     } else {
         1
     };
-    for (cache, cache_bytes) in [("warm", WARM_CACHE_BYTES), ("tight", TIGHT_CACHE_BYTES)] {
+    for (cache, cache_bytes) in [
+        ("warm", WARM_CACHE_BYTES),
+        ("tight", TIGHT_CACHE_BYTES),
+        ("off", 0),
+    ] {
         if !picked("CACHE_CONTENTION_CACHES", cache) {
             continue;
         }
