@@ -185,13 +185,14 @@ impl<'a> Reader<'a> {
                 for (spec, chunk) in frame.chunks()?.zip(all) {
                     let bytes = self.read_frame_bytes(chunk)?;
                     read += bytes.len() as u64;
-                    // Copied as stored: the row's length and checksum prove
-                    // it, no decode.
+                    // Copied as stored, neither decoded nor hashed: its
+                    // checksum is the row of the checked table the copy
+                    // carries, which a read of the copy checks it by. Its
+                    // length places the copy's frames, so that is checked.
                     let spec = spec?;
-                    if !spec.fits(compression) {
+                    if !spec.fits(compression) || bytes.len() != spec.stored_len as usize {
                         return Err(crate::Error::InvalidHeader("Blob"));
                     }
-                    super::frame::check_chunk(&spec, &bytes)?;
                     frames.push(bytes);
                 }
                 CopySource::Frames { frames, value_len }

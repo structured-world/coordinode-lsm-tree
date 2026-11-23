@@ -17,7 +17,8 @@
 //!
 //! ```text
 //! [magic "BLO5"; 4][kind; 1][flags; 1][count; 2]
-//! [entries_len; 4][raw_len; 4][disk_len; 4][header_crc; 4][checksum; 16]
+//! [entries_len; 4][raw_len; 4][disk_len; 4][header_crc; 4]
+//! [entries_checksum; 8][payload_checksum; 16]
 //! [entries; entries_len][payload; disk_len]
 //! ```
 //!
@@ -38,10 +39,13 @@
 //! Each chunk's flags read as a frame's do, and its checksum is xxh3-128 over
 //! the chunk as stored; a chunk holds the chunk size of the value, the last
 //! what is left.
-//! `header_crc` covers the fixed fields after the magic; `checksum` is
-//! xxh3-128 over the entries and the payload as stored, which lie back to
-//! back, seeded with `header_crc`; a packed block has no entries, and its
-//! payload is its records (see [`super::packed`]).
+//! `header_crc` covers the fixed fields after the magic. `entries_checksum` is
+//! xxh3-64 over the entries and `payload_checksum` xxh3-128 over the payload
+//! as stored, both seeded with `header_crc`. Each read checks what it reads:
+//! a read of a value both, a copy of a frame as stored the entries alone,
+//! since its payload goes on with its checksum, and relisting a value at
+//! another seqno rewrites the entries' checksum alone. A packed block has no
+//! entries, and its payload is its records (see [`super::packed`]).
 
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
@@ -56,8 +60,15 @@ use super::writer::MAX_DECOMPRESSION_SIZE;
 /// under any other magic, the earlier `BLO4` record among them, is not one.
 pub(crate) const FRAME_MAGIC: [u8; 4] = *b"BLO5";
 
-/// The fixed part of a frame, magic to checksum.
-pub(crate) const FRAME_HEADER_LEN: usize = 4 + 1 + 1 + 2 + 4 + 4 + 4 + 4 + 16;
+/// The fixed part of a frame, magic to payload checksum.
+pub(crate) const FRAME_HEADER_LEN: usize = 4 + 1 + 1 + 2 + 4 + 4 + 4 + 4 + 8 + 16;
+
+/// Where the entries' checksum lies in a header.
+const ENTRIES_CHECKSUM_AT: usize = 24;
+
+/// Where the payload's checksum lies in a header, its last field.
+#[cfg(test)]
+const PAYLOAD_CHECKSUM_AT: usize = ENTRIES_CHECKSUM_AT + 8;
 
 /// The fixed part of an entry, before its key.
 pub(crate) const ENTRY_HEADER_LEN: usize = 8 + 2 + 4;
@@ -155,7 +166,8 @@ pub(crate) struct FrameHeader {
     pub(crate) raw_len: u32,
     pub(crate) disk_len: u32,
     pub(crate) header_crc: u32,
-    pub(crate) checksum: u128,
+    pub(crate) entries_checksum: u64,
+    pub(crate) payload_checksum: u128,
 }
 
 impl FrameHeader {
@@ -216,23 +228,43 @@ impl<'b> Put<'b> {
     }
 }
 
-/// The checksum of a frame's entries and stored payload, `stored` the two as
-/// they lie back to back, seeded with `header_crc` so a header recomputed
-/// after tampering is still caught.
+/// The checksum of a frame's entries, seeded with `header_crc` so a header
+/// recomputed after tampering is still caught.
 ///
 /// Blob layout 5 is in no release yet, so changing how it is checksummed keeps
 /// its version: no supported store holds frames checksummed the other way.
-pub(crate) fn frame_checksum(stored: &[u8], header_crc: u32) -> u128 {
+pub(crate) fn entries_checksum(entries: &[u8], header_crc: u32) -> u64 {
+    crate::xxh3::hash64_with_seed(entries, u64::from(header_crc))
+}
+
+/// The checksum of a frame's payload as stored, seeded with `header_crc` as
+/// [`entries_checksum`] is.
+pub(crate) fn payload_checksum(stored: &[u8], header_crc: u32) -> u128 {
     crate::xxh3::hash128_with_seed(stored, u64::from(header_crc))
 }
 
-/// [`frame_checksum`] over `entries` followed by `payload`, where the writer
-/// holds them apart.
-fn frame_checksum_parts(entries: &[u8], payload: &[u8], header_crc: u32) -> u128 {
-    let mut hasher = crate::xxh3::Hasher::with_seed(u64::from(header_crc));
-    hasher.update(entries);
-    hasher.update(payload);
-    hasher.digest128()
+/// Fails unless `entries` are the ones `header` lists, by their checksum.
+fn check_entries(header: &FrameHeader, entries: &[u8]) -> crate::Result<()> {
+    let checksum = entries_checksum(entries, header.header_crc);
+    if checksum != header.entries_checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: crate::Checksum::from_raw(u128::from(checksum)),
+            expected: crate::Checksum::from_raw(u128::from(header.entries_checksum)),
+        });
+    }
+    Ok(())
+}
+
+/// Fails unless `stored` is the payload `header` covers, by its checksum.
+pub(crate) fn check_payload(header: &FrameHeader, stored: &[u8]) -> crate::Result<()> {
+    let checksum = payload_checksum(stored, header.header_crc);
+    if checksum != header.payload_checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: crate::Checksum::from_raw(checksum),
+            expected: crate::Checksum::from_raw(header.payload_checksum),
+        });
+    }
+    Ok(())
 }
 
 /// Reads and checks a frame's fixed fields from the start of `bytes`.
@@ -259,7 +291,8 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
         Some(raw_len),
         Some(disk_len),
         Some(stored_crc),
-        Some(checksum),
+        Some(entries_checksum),
+        Some(payload_checksum),
     ) = (
         fields.u8(),
         fields.u8(),
@@ -268,6 +301,7 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
         fields.u32(),
         fields.u32(),
         fields.u32(),
+        fields.u64(),
         fields.u128(),
     )
     else {
@@ -295,10 +329,11 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
     let count64 = u64::from(count);
     let entries_max = count64 * (ENTRY_HEADER_LEN as u64 + u64::from(u16::MAX));
     let entries_min = count64 * (ENTRY_HEADER_LEN as u64 + 1);
-    // A packed block lists its values in its records, its entries empty.
+    // A packed block lists its values in its records, its entries empty and
+    // their checksum zero: a field no check would read is held to one value.
     let packed = flags == super::packed::FLAG_PACKED;
     let entries_ok = if packed {
-        kind == FrameKind::Block && count >= 1 && entries_len == 0
+        kind == FrameKind::Block && count >= 1 && entries_len == 0 && entries_checksum == 0
     } else {
         (entries_min..=entries_max).contains(&u64::from(entries_len))
     };
@@ -331,7 +366,8 @@ pub(crate) fn parse_header(bytes: &[u8]) -> crate::Result<FrameHeader> {
         raw_len,
         disk_len,
         header_crc: stored_crc,
-        checksum,
+        entries_checksum,
+        payload_checksum,
     })
 }
 
@@ -821,22 +857,24 @@ pub(crate) fn verify_frame(bytes: &[u8]) -> crate::Result<FrameHeader> {
     check_frame(bytes).map(|(header, _)| header)
 }
 
-/// [`verify_frame`]'s checks, the frame kept with its payload not decoded:
-/// `payload` is empty, so [`DecodedFrame::value`] has nothing to give and the
-/// header's `raw_len` is the payload's length. For a frame a consumer copies
-/// as stored, whose decompression would buy nothing; a payload stored as it
-/// is under `compression` is checked to be the length it declares, as a
-/// decode checks it.
+/// The frame kept with its payload not decoded: `payload` is empty, so
+/// [`DecodedFrame::value`] has nothing to give and the header's `raw_len` is
+/// the payload's length. For a frame a consumer copies as stored, whose
+/// decompression would buy nothing. Its header and entries are checked, and a
+/// head's payload, the table its chunks are found by; any other payload is
+/// not hashed, since the copy carries it with its checksum and a read of the
+/// copy checks it. A payload stored as it is under `compression` is checked
+/// to be the length it declares, as a decode checks it.
 ///
 /// # Errors
 ///
-/// As [`verify_frame`], and a payload stored as it is whose length is not
-/// the one declared.
+/// As [`verify_frame`] short of a value's payload, and a payload stored as it
+/// is whose length is not the one declared.
 pub(crate) fn undecoded_frame(
     bytes: &Slice,
     compression: CompressionType,
 ) -> crate::Result<DecodedFrame> {
-    let (header, list) = check_frame(bytes)?;
+    let (header, list) = check_frame_with(parse_header(bytes)?, bytes, Check::Listing)?;
     if (header.is_raw() || compression == CompressionType::None)
         && header.disk_len != header.raw_len
     {
@@ -853,13 +891,25 @@ pub(crate) fn undecoded_frame(
 
 /// [`verify_frame`]'s checks, the entries parsed kept.
 pub(crate) fn check_frame(bytes: &[u8]) -> crate::Result<(FrameHeader, FrameEntries)> {
-    check_frame_with(parse_header(bytes)?, bytes)
+    check_frame_with(parse_header(bytes)?, bytes, Check::Whole)
 }
 
-/// [`check_frame`] of `bytes` whose header, `header`, is parsed already.
+/// What a check of a frame covers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Header, entries and payload: a read of the frame's values.
+    Whole,
+    /// Header and entries, and a head's chunk table: a copy as stored, whose
+    /// payload goes on with its checksum.
+    Listing,
+}
+
+/// [`check_frame`] of `bytes` whose header, `header`, is parsed already,
+/// covering what `check` says.
 fn check_frame_with(
     header: FrameHeader,
     bytes: &[u8],
+    check: Check,
 ) -> crate::Result<(FrameHeader, FrameEntries)> {
     if header.frame_len() != bytes.len() as u64 {
         return Err(crate::Error::InvalidHeader("BlobFrame"));
@@ -870,18 +920,15 @@ fn check_frame_with(
         return Ok((header, list));
     }
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
-    let (Some(entries), Some(checked)) = (
+    let (Some(entries), Some(stored)) = (
         bytes.get(FRAME_HEADER_LEN..entries_end),
-        bytes.get(FRAME_HEADER_LEN..),
+        bytes.get(entries_end..),
     ) else {
         return Err(crate::Error::InvalidHeader("BlobFrame"));
     };
-    let checksum = frame_checksum(checked, header.header_crc);
-    if checksum != header.checksum {
-        return Err(crate::Error::ChecksumMismatch {
-            got: crate::Checksum::from_raw(checksum),
-            expected: crate::Checksum::from_raw(header.checksum),
-        });
+    check_entries(&header, entries)?;
+    if check == Check::Whole || header.kind == FrameKind::Head {
+        check_payload(&header, stored)?;
     }
     let list = parse_entries(&header, entries)?;
     Ok((header, list))
@@ -918,7 +965,7 @@ pub(crate) fn decode_frame(
             decoded,
         );
     }
-    let (header, list) = check_frame_with(header, bytes)?;
+    let (header, list) = check_frame_with(header, bytes, Check::Whole)?;
     let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
     let entries = bytes.slice(FRAME_HEADER_LEN..entries_end);
     let stored = bytes.slice(entries_end..bytes.len());
@@ -1092,7 +1139,8 @@ pub(crate) fn decode_chunk(
             raw_len: spec.raw_len,
             disk_len: spec.stored_len,
             header_crc: 0,
-            checksum: spec.checksum,
+            entries_checksum: 0,
+            payload_checksum: spec.checksum,
         },
         entries: Slice::empty(),
         list: FrameEntries::Many(Vec::new()),
@@ -1324,22 +1372,23 @@ pub(crate) fn decompress_payload(
     )
 }
 
-/// The header of a frame of `kind` and `flags` listing `count` values whose
-/// entries take `entries_len` bytes, `raw_len` decoded, its payload
-/// `disk_len` stored, its checksum what `checksum` computes from the header's
-/// CRC.
+/// The header of a frame of `kind` and `flags` listing `count` values in
+/// `entries`, `raw_len` decoded, its payload `stored`.
 #[must_use]
-pub(crate) fn stamp_header(
+fn stamp_header(
     kind: FrameKind,
     flags: u8,
     count: u16,
-    entries_len: u32,
+    entries: &[u8],
     raw_len: u32,
-    disk_len: u32,
-    checksum: impl FnOnce(u32) -> u128,
+    stored: &[u8],
 ) -> [u8; FRAME_HEADER_LEN] {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "entries are bounded by u16::MAX keys of u16::MAX bytes, the payload by the value cap"
+    )]
+    let (entries_len, disk_len) = (entries.len() as u32, stored.len() as u32);
     let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
-    let checksum = checksum(crc);
     let mut header = [0_u8; FRAME_HEADER_LEN];
     let mut put = Put::new(&mut header);
     put.bytes(&FRAME_MAGIC);
@@ -1349,8 +1398,34 @@ pub(crate) fn stamp_header(
     put.bytes(&raw_len.to_le_bytes());
     put.bytes(&disk_len.to_le_bytes());
     put.bytes(&crc.to_le_bytes());
-    put.bytes(&checksum.to_le_bytes());
+    // A packed block lists its values in its records: no entries to sum.
+    let entries_sum = if flags & super::packed::FLAG_PACKED == 0 {
+        entries_checksum(entries, crc)
+    } else {
+        0
+    };
+    put.bytes(&entries_sum.to_le_bytes());
+    put.bytes(&payload_checksum(stored, crc).to_le_bytes());
     header
+}
+
+/// The header of a packed block of `count` records, `raw_len` value bytes
+/// decoded, whose payload is `records`: no entries, its records listing its
+/// values.
+#[must_use]
+pub(crate) fn stamp_packed_header(
+    count: u16,
+    raw_len: u32,
+    records: &[u8],
+) -> [u8; FRAME_HEADER_LEN] {
+    stamp_header(
+        FrameKind::Block,
+        super::packed::FLAG_PACKED,
+        count,
+        &[],
+        raw_len,
+        records,
+    )
 }
 
 /// One value a frame lists: its key, sequence number and length.
@@ -1477,30 +1552,17 @@ pub(crate) fn encode_frame_parts_compressed<'e, E: core::borrow::Borrow<EntrySpe
 
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "entries are bounded by u16::MAX keys of u16::MAX bytes, the payload by the value cap"
+        reason = "the payload is bounded by the value cap"
     )]
-    let (entries_len, raw_len, disk_len) = (
-        (entries_end - FRAME_HEADER_LEN) as u32,
-        payload.len() as u32,
-        stored.len() as u32,
-    );
-    let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
-    let checksum = frame_checksum_parts(
+    let raw_len = payload.len() as u32;
+    let header = stamp_header(
+        kind,
+        flags,
+        count,
         out.get(FRAME_HEADER_LEN..entries_end).unwrap_or_default(),
+        raw_len,
         stored,
-        crc,
     );
-
-    let mut header = [0_u8; FRAME_HEADER_LEN];
-    let mut put = Put::new(&mut header);
-    put.bytes(&FRAME_MAGIC);
-    put.bytes(&[kind as u8, flags]);
-    put.bytes(&count.to_le_bytes());
-    put.bytes(&entries_len.to_le_bytes());
-    put.bytes(&raw_len.to_le_bytes());
-    put.bytes(&disk_len.to_le_bytes());
-    put.bytes(&crc.to_le_bytes());
-    put.bytes(&checksum.to_le_bytes());
     // `out` was laid out with room for the header first.
     let (slot, _) = out.split_at_mut(FRAME_HEADER_LEN);
     slot.copy_from_slice(&header);
@@ -1509,11 +1571,11 @@ pub(crate) fn encode_frame_parts_compressed<'e, E: core::borrow::Borrow<EntrySpe
 
 /// Relists the value `frame` lists, a single or head frame listing one, at
 /// `seqno`: `prefix` is filled with the frame's header and entries, the entry
-/// rewritten and the checksum recomputed over the same stored payload, and
-/// the offset the payload starts at in `frame` is returned. The relisted
-/// frame is `prefix` followed by `frame` from that offset, so the payload is
-/// neither decoded nor copied. `None` for a frame listed at `seqno` already,
-/// which is written as it is.
+/// rewritten and the entries' checksum recomputed, and the offset the payload
+/// starts at in `frame` is returned. The relisted frame is `prefix` followed
+/// by `frame` from that offset, so the payload is neither decoded, copied nor
+/// hashed: the header's fields are the same, so its checksum still holds.
+/// `None` for a frame listed at `seqno` already, which is written as it is.
 ///
 /// # Errors
 ///
@@ -1543,21 +1605,21 @@ pub(crate) fn relist_prefix(
     }
     // The lengths were checked above: the header and the entries lie within
     // `frame`, the entry's seqno within the entries.
-    let (head_and_entries, payload) = frame.split_at(entries_end);
+    let (head_and_entries, _) = frame.split_at(entries_end);
     prefix.clear();
     prefix.extend_from_slice(head_and_entries);
     let (head, entries) = prefix.split_at_mut(FRAME_HEADER_LEN);
     let (listed_seqno, _) = entries.split_at_mut(8);
     listed_seqno.copy_from_slice(&seqno.to_le_bytes());
-    let checksum = frame_checksum_parts(entries, payload, header.header_crc);
-    // The checksum is the header's last field.
-    let (_, stored_checksum) = head.split_at_mut(FRAME_HEADER_LEN - 16);
+    let checksum = entries_checksum(entries, header.header_crc);
+    let (_, stored_checksum) = head.split_at_mut(ENTRIES_CHECKSUM_AT);
+    let (stored_checksum, _) = stored_checksum.split_at_mut(8);
     stored_checksum.copy_from_slice(&checksum.to_le_bytes());
     Ok(Some(entries_end))
 }
 
 /// A frame header of `kind` with these fields under a header CRC that holds
-/// and a zero checksum: what a forged frame inside a value's bytes looks like.
+/// and zero checksums: what a forged frame inside a value's bytes looks like.
 #[cfg(test)]
 pub(crate) fn forged_header(
     kind: FrameKind,
@@ -1602,17 +1664,26 @@ pub(crate) fn restamp_header_crc(frame: &mut [u8]) {
 }
 
 /// Seals `frame`, its entries or payload edited in place, as a writer would:
-/// its header CRC and its checksum over what it now holds.
+/// its header CRC and its checksums over what it now holds.
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code")]
 pub(crate) fn reseal(frame: &mut [u8]) {
     restamp_header_crc(frame);
     let header = parse_header(frame).unwrap();
-    let checksum = frame_checksum(frame.get(FRAME_HEADER_LEN..).unwrap(), header.header_crc);
+    let entries_end = FRAME_HEADER_LEN + header.entries_len as usize;
+    let entries = entries_checksum(
+        frame.get(FRAME_HEADER_LEN..entries_end).unwrap(),
+        header.header_crc,
+    );
+    let payload = payload_checksum(frame.get(entries_end..).unwrap(), header.header_crc);
     frame
-        .get_mut(FRAME_HEADER_LEN - 16..FRAME_HEADER_LEN)
+        .get_mut(ENTRIES_CHECKSUM_AT..PAYLOAD_CHECKSUM_AT)
         .unwrap()
-        .copy_from_slice(&checksum.to_le_bytes());
+        .copy_from_slice(&entries.to_le_bytes());
+    frame
+        .get_mut(PAYLOAD_CHECKSUM_AT..FRAME_HEADER_LEN)
+        .unwrap()
+        .copy_from_slice(&payload.to_le_bytes());
 }
 
 /// A frame holding `values` under `keys` at seqno 0, uncompressed and

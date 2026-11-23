@@ -8095,8 +8095,8 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     }
 
     // Overwrite the compressed payload with same-length garbage and RE-STAMP
-    // the frame checksum (xxh3-128 over the entries and the stored payload,
-    // seeded with the header CRC), so the frame verifies while the payload no longer
+    // the payload checksum (xxh3-128 over the stored payload, seeded with the
+    // header CRC), so the frame verifies while the payload no longer
     // decompresses.
     let entry = crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
         .next()
@@ -8111,22 +8111,14 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
     assert!(!header.is_raw(), "fixture: the payload is compressed");
     let entries_end = crate::vlog::blob_file::frame::FRAME_HEADER_LEN + header.entries_len as usize;
     let garbage = vec![0xA5u8; frame_bytes.len() - entries_end];
-    let restamped = {
-        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(u64::from(header.header_crc));
-        hasher.update(
-            frame_bytes
-                .get(crate::vlog::blob_file::frame::FRAME_HEADER_LEN..entries_end)
-                .expect("the frame holds its entries"),
-        );
-        hasher.update(&garbage);
-        hasher.digest128()
-    };
+    let restamped = xxhash_rust::xxh3::xxh3_128_with_seed(&garbage, u64::from(header.header_crc));
     {
         let mut f = memfs.open(
             &path,
             &crate::fs::FsOpenOptions::new().read(true).write(true),
         )?;
-        f.seek(SeekFrom::Start(entry.offset + 24))?;
+        // The payload checksum, the header's last field.
+        f.seek(SeekFrom::Start(entry.offset + 32))?;
         f.write_all(&restamped.to_le_bytes())?;
         f.seek(SeekFrom::Start(entry.offset + entries_end as u64))?;
         f.write_all(&garbage)?;

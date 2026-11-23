@@ -58,8 +58,9 @@ enum Decode {
     /// Every frame, so a scan proves each value round-trips (repair, salvage).
     All,
     /// The blocks alone, whose values are taken one by one: a frame a value
-    /// has to itself, single or chunk, is checked as stored, the form a copy
-    /// writes, without decompressing it for nothing.
+    /// has to itself, single or chunk, goes to a copy as stored, its header
+    /// and entries checked and its payload neither decompressed nor hashed,
+    /// carried with its checksum.
     Blocks,
 }
 
@@ -551,11 +552,13 @@ impl Scanner {
                 let (Some(entry), Some(_)) = (decoded.list.first(), decoded.key(0)) else {
                     return failed(self, crate::Error::InvalidHeader("BlobFrame"));
                 };
-                // Each chunk checked against its row as it lies: every consumer
-                // copies the value as its stored frames. A scan that decodes
-                // (repair, salvage) decodes each chunk too, as a read of the
-                // value would: a checksum proves the bytes are the ones
-                // written, not that they decode.
+                // A scan that decodes (repair, salvage) checks and decodes each
+                // chunk, as a read of the value would: a checksum proves the
+                // bytes are the ones written, not that they decode. A scan of
+                // blocks alone hands the chunks to a copy as stored, which
+                // carries each with its row in the head's checked table: one
+                // written anew under another codec is decoded, and checked,
+                // by the copy; one copied as stored is checked by its read.
                 let mut stored = Vec::with_capacity(specs.len() + 1);
                 stored.push(bytes);
                 let mut decoded_chunk = Vec::new();
@@ -578,7 +581,7 @@ impl Scanner {
                             &mut 0,
                         )
                     } else {
-                        super::frame::check_chunk(spec, &chunk)
+                        Ok(())
                     };
                     if let Err(e) = checked {
                         return failed(self, e);

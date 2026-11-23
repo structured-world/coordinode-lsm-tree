@@ -1,5 +1,7 @@
 use super::kernel::Kernel;
-use super::{DEFAULT_SECRET, Hasher, MID_SIZE_MAX, hash64, hash128, hash128_with_seed};
+use super::{
+    DEFAULT_SECRET, Hasher, MID_SIZE_MAX, hash64, hash64_with_seed, hash128, hash128_with_seed,
+};
 
 /// Bytes no two lengths or offsets share a pattern of.
 fn corpus(len: usize) -> alloc::vec::Vec<u8> {
@@ -69,6 +71,11 @@ fn one_shot_digests_match_xxh3_at_every_length() {
             "{len} bytes"
         );
         for seed in SEEDS {
+            assert_eq!(
+                hash64_with_seed(input, seed),
+                xxhash_rust::xxh3::xxh3_64_with_seed(input, seed),
+                "{len} bytes, seed {seed:#x}"
+            );
             assert_eq!(
                 hash128_with_seed(input, seed),
                 xxhash_rust::xxh3::xxh3_128_with_seed(input, seed),

@@ -382,11 +382,22 @@ fn a_copying_scan_leaves_frames_of_their_own_undecoded() -> crate::Result<()> {
         proven[2],
     );
 
+    // The copy carries the payload with its checksum, unhashed: a flipped
+    // byte of it goes on, for the copy's read to refuse.
     edit(&path, |bytes| bytes[index[2] - 1] ^= 1)?;
+    let carried: Vec<_> = Scanner::of_paced(&file, None, None)?.collect();
+    assert!(
+        carried[2].is_ok(),
+        "a payload goes over unhashed: {:?}",
+        carried[2]
+    );
+    edit(&path, |bytes| bytes[index[2] - 1] ^= 1)?;
+    // Its entries, which the copy relies on, are checked.
+    edit(&path, |bytes| bytes[index[1] + FRAME_HEADER_LEN] ^= 1)?;
     let damaged: Vec<_> = Scanner::of_paced(&file, None, None)?.collect();
     assert!(
         matches!(damaged[2], Err(crate::Error::ChecksumMismatch { .. })),
-        "the stored bytes are still checked: {:?}",
+        "the entries are still checked: {:?}",
         damaged[2],
     );
     Ok(())

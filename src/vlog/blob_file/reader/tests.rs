@@ -316,11 +316,12 @@ fn a_head_holds_no_value_and_a_range_past_the_value_is_refused() -> crate::Resul
     Ok(())
 }
 
-/// A copy of a chunked value checks each chunk it takes against its row in
-/// the head's table: bytes the row's checksum does not match, though of the
-/// row's length, are refused rather than carried along.
+/// A copy of a chunked value carries each chunk as stored with its row in
+/// the head's table, hashing none: bytes the row's checksum does not match,
+/// though of the row's length, go on, and the read of the chunk refuses them,
+/// as it would have in the source.
 #[test]
-fn a_copy_refuses_a_chunk_its_row_does_not_check() -> crate::Result<()> {
+fn a_copy_carries_a_chunk_its_row_does_not_check_and_a_read_refuses_it() -> crate::Result<()> {
     use crate::vlog::blob_file::frame::{FRAME_HEADER_LEN, parse_header, reseal};
 
     let folder = tempfile::tempdir()?;
@@ -346,8 +347,11 @@ fn a_copy_refuses_a_chunk_its_row_does_not_check() -> crate::Result<()> {
 
     let file = File::open(&blob_file.0.path)?;
     let reader = Reader::new(&blob_file, &file);
+    let (source, _) = reader.copy_source(b"big", &handles[0])?;
+    assert!(matches!(source, CopySource::Frames { ref frames, .. } if frames.len() == 4));
+    let head = reader.read_frame(handles[0].frame, &mut 0)?;
     assert!(matches!(
-        reader.copy_source(b"big", &handles[0]),
+        read_chunk(&reader, &blob_file, &head, handles[0].frame + 1, 1),
         Err(crate::Error::ChecksumMismatch { .. })
     ));
     Ok(())

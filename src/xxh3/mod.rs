@@ -80,6 +80,17 @@ pub(crate) fn hash64(input: &[u8]) -> u64 {
     merge64(&acc, &DEFAULT_SECRET, input.len() as u64)
 }
 
+/// The xxh3-64 of `input` under `seed`.
+#[must_use]
+pub(crate) fn hash64_with_seed(input: &[u8], seed: u64) -> u64 {
+    if input.len() <= MID_SIZE_MAX {
+        return xxhash_rust::xxh3::xxh3_64_with_seed(input, seed);
+    }
+    let secret = secret_for(seed);
+    let acc = long_acc(Kernel::get(), input, &secret);
+    merge64(&acc, &secret, input.len() as u64)
+}
+
 /// The xxh3-128 of `input`.
 #[must_use]
 pub(crate) fn hash128(input: &[u8]) -> u128 {
