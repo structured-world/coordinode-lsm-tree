@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795400718306,
+  "lastUpdate": 1795433774056,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104314,6 +104314,90 @@ window.BENCHMARK_DATA = {
             "value": 384811.24687985185,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 8.4us | P99.9: 43.6us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "750657baf284c723f4d5e590e6c82bcca88ae247",
+          "message": "feat(cache): resize a live block cache (#1104)\n\n## Summary\n\n- `Cache::set_capacity` changes the byte capacity of a block cache that\ntrees already share, so a process moving memory between the cache and\nother consumers keeps what the cache holds instead of dropping and\nrebuilding it.\n\n## Changes\n\n- `ShardedCache::set_capacity`: stores the new total and per-shard\ncapacity, then sets each shard under its write lock; a shard that shrank\nevicts down to the new limit in its S3-FIFO order (read entries and\nhigh-priority metadata outlive cold data), and the evicted values are\ndropped after the lock. Growing evicts nothing.\n- The total and per-shard capacity are atomics read at use, so\n`capacity()`, `max_entry_weight()` and the read-ahead, prefetch and\nblock-size limits derived from them follow a resize. Racing resizes are\nserialised by a lock held only by resizes.\n- An entry heavier than its shard is still refused before the shard\nlock, on a relaxed load of the per-shard capacity, and checked again\nunder the lock, so a resize between weighing and inserting is honoured.\n- `Cache::capacity` documents that it reports the target.\n- The `block_cache_contention` bench gains an `off` cache (capacity\nzero), where every block read takes the refusal path.\n\n## Measurement\n\n`block_cache_contention` on a Linux benchmark host, `main` against this\nbranch in one run, alternating main, branch, main, branch; reads per\nsecond in thousands, mean of the two passes of each side. `warm` only\nhits the cache (its path is unchanged here), `tight` inserts and evicts\non every miss, `off` refuses every insert.\n\n| cache / order | t1 main → branch | t8 main → branch | t32 main →\nbranch |\n|---|---|---|---|\n| warm / uniform | 494 → 496 | 3812 → 3747 | 3826 → 3773 |\n| warm / skew | 525 → 535 | 4013 → 3990 | 4084 → 3981 |\n| tight / uniform | 189 → 189 | 1233 → 1233 | 1212 → 1196 |\n| tight / skew | 224 → 220 | 1422 → 1508 | 1475 → 1434 |\n| off / uniform | 197 → 202 | 1454 → 1482 | 1438 → 1441 |\n| off / skew | 205 → 203 | 1481 → 1507 | 1433 → 1460 |\n\nEvery difference is within the spread between the two passes of the same\nside (up to 7%, e.g. warm/uniform t8 on `main`: 3934 and 3691), and the\n`warm` arms, whose code is unchanged, move as much as the others. The\ninsert and refusal paths show no change beyond that noise.\n\n## Testing\n\nUnit tests for shrink (weight within the new capacity, hot and index\nentries kept over cold data), grow (refills to the new capacity),\nrefusal after a shrink, drops of evicted values, and resizes racing\nreads, inserts and coordinated cold loads; an integration test resizes a\ncache shared by two open trees. Tests, clippy (default and all\nfeatures), formatting, doc build, doc tests and the no-std check pass\nlocally on macOS; Linux and Windows run in CI.\n\nCloses #972",
+          "timestamp": "2026-11-23T12:08:54+02:00",
+          "tree_id": "3af3444414b5ab6a254e1c96adca85d5643b21d5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/750657baf284c723f4d5e590e6c82bcca88ae247"
+        },
+        "date": 1795433772842,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 133430.15517059516,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 21.9us | P99.9: 38.0us\nthreads: 1 | elapsed: 4.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3136163.2711688275,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 1.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 859680.1071862913,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.4us | P99.9: 12.2us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 467710.1768690232,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.9us | P99.9: 27.2us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3169364.4666766203,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 313692.01790458674,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.3us | P99.9: 16.5us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 196300.3864874882,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 9.7us | P99.9: 21.0us\nthreads: 1 | elapsed: 1.02s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 895080.2024084246,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.3us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1069925.7804255302,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.6us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 321734.6573718296,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 18.0us | P99.9: 103.4us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
           }
         ]
       }
