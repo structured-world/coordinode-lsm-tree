@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795400713400,
+  "lastUpdate": 1795400718306,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -122946,6 +122946,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.4067205,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ed3c1347e051fecd34829b081a01731b7aa0e5ba",
+          "message": "fix(close): hold the directory lock until the tree is closed (#1103)\n\n## Summary\n\n- A tree's directory lock is held until the tree is closed, not until\nits last handle drops: iterators, snapshots, pins and the background\nremoval of compacted-away tables keep it, so no second opener works in\nthe folder beside them.\n- This removes the race behind the flaky `NotFound` on a reopen right\nafter a drop: the new open swept the old tree's replaced tables as\norphans, or adopted one the old deleter had already truncated into its\nown table file pool, under that deleter's unlink.\n\n## Changes\n\n- `close::Life` owns the lock and releases it when the last part of the\ntree goes, before the closing signal fires, so a callback may reopen the\nfolder at once. `TreeInner::directory_lock` is gone; the pin and the\nopen-batch rollback hold the `Life` instead of their own clone of the\nlock.\n- A reopen while the tree is still open in the same process fails with\n`Error::Locked`.\n- Two tests that reopened a folder while holding a snapshot or a table\nof the dropped tree release it first, or read the table detached from\nany tree; the filter advisor test closes each tree before the next open.\n- `Config::with_directory_lock` and the README say how long the lock is\nheld.\n\nNo hot path changes: the lock moves between owners only at open and\nclose.\n\n## Testing\n\nA regression test\n(`a_reopen_while_an_iterator_keeps_the_tree_open_is_locked_out`) fails\nbefore the fix and passes after. Formatting, clippy (default and all\nfeatures), the no-std check, docs, doc tests and the full suite under\ndefault and all features pass locally on macOS; Linux and Windows run in\nCI.\n\nCloses #1091\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* A folder remains locked until its tree is fully closed. Reopening it\nwhile an iterator, snapshot, pin, or other live operation keeps the tree\nopen fails with a locked error. Once closure completes, reopening\nsucceeds. This behavior applies when directory locking is enabled.\n* **Documentation**\n* Clarified when folders can be safely removed or reopened, how\noutstanding tree operations affect the directory lock, and when the lock\nis released.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-23T03:01:04+02:00",
+          "tree_id": "e07b4fcd42080e00b8795fffd48de56fbd9ac6d4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ed3c1347e051fecd34829b081a01731b7aa0e5ba"
+        },
+        "date": 1795400716932,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 822.1650000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 160.236539ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 241.01,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 197.26495ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1396.5049999999999,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 258.427142ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5536.0380000000005,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 21368.794,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.135,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.709055,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.411272275,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.935,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.428799,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.405204334,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
