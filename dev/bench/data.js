@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795382145469,
+  "lastUpdate": 1795400707266,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104230,6 +104230,90 @@ window.BENCHMARK_DATA = {
             "value": 457167.16171660426,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 6.9us | P99.9: 34.1us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ed3c1347e051fecd34829b081a01731b7aa0e5ba",
+          "message": "fix(close): hold the directory lock until the tree is closed (#1103)\n\n## Summary\n\n- A tree's directory lock is held until the tree is closed, not until\nits last handle drops: iterators, snapshots, pins and the background\nremoval of compacted-away tables keep it, so no second opener works in\nthe folder beside them.\n- This removes the race behind the flaky `NotFound` on a reopen right\nafter a drop: the new open swept the old tree's replaced tables as\norphans, or adopted one the old deleter had already truncated into its\nown table file pool, under that deleter's unlink.\n\n## Changes\n\n- `close::Life` owns the lock and releases it when the last part of the\ntree goes, before the closing signal fires, so a callback may reopen the\nfolder at once. `TreeInner::directory_lock` is gone; the pin and the\nopen-batch rollback hold the `Life` instead of their own clone of the\nlock.\n- A reopen while the tree is still open in the same process fails with\n`Error::Locked`.\n- Two tests that reopened a folder while holding a snapshot or a table\nof the dropped tree release it first, or read the table detached from\nany tree; the filter advisor test closes each tree before the next open.\n- `Config::with_directory_lock` and the README say how long the lock is\nheld.\n\nNo hot path changes: the lock moves between owners only at open and\nclose.\n\n## Testing\n\nA regression test\n(`a_reopen_while_an_iterator_keeps_the_tree_open_is_locked_out`) fails\nbefore the fix and passes after. Formatting, clippy (default and all\nfeatures), the no-std check, docs, doc tests and the full suite under\ndefault and all features pass locally on macOS; Linux and Windows run in\nCI.\n\nCloses #1091\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* A folder remains locked until its tree is fully closed. Reopening it\nwhile an iterator, snapshot, pin, or other live operation keeps the tree\nopen fails with a locked error. Once closure completes, reopening\nsucceeds. This behavior applies when directory locking is enabled.\n* **Documentation**\n* Clarified when folders can be safely removed or reopened, how\noutstanding tree operations affect the directory lock, and when the lock\nis released.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-23T03:01:04+02:00",
+          "tree_id": "e07b4fcd42080e00b8795fffd48de56fbd9ac6d4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ed3c1347e051fecd34829b081a01731b7aa0e5ba"
+        },
+        "date": 1795400705914,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 147333.1878893854,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.5us | P99.9: 30.0us\nthreads: 1 | elapsed: 3.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3100960.2898777677,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 930561.7389444438,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 512449.9287416595,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.7us | P99.9: 20.0us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3098243.376559818,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 326404.80064691347,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.4us | P99.9: 15.0us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 194875.3608810332,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 9.6us | P99.9: 20.3us\nthreads: 1 | elapsed: 1.03s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 954122.7170312174,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1062449.6256110792,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 384811.24687985185,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 8.4us | P99.9: 43.6us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
           }
         ]
       }
