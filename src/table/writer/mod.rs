@@ -1013,6 +1013,21 @@ pub(crate) struct VerbatimSource {
     pub table_id: TableId,
     /// The source offset of the extent's first block.
     pub offset: u64,
+    /// What the copy proves of the blocks before re-stamping them.
+    pub check: CopyCheck,
+}
+
+/// What a verbatim copy proves of the blocks it copies before it re-stamps
+/// their checksums for their new place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyCheck {
+    /// Each block's payload against its checksum: a salvage, which copies
+    /// only the blocks that hold.
+    Verify,
+    /// Nothing: a compaction's copy carries each block's checksum with its
+    /// unchanged bytes, and a read of the copy checks them as a read of the
+    /// source would have.
+    Carry,
 }
 
 /// How the table a carried data block comes from wrote its blocks, as its
@@ -3790,9 +3805,10 @@ impl Writer {
                 PageOut::Prepared(prepared) => prepared.write_to(&mut self.file_writer, at)?,
                 PageOut::Copied(copied) => {
                     // The page's checksum is bound to the place it lay; the
-                    // payload is written as it is.
+                    // payload is written as it is, unhashed: the checksum
+                    // goes with it, and a read of the copy checks it.
                     let mut frame = copied.frame.to_vec();
-                    super::block::Header::rebind_verified_frame(&mut frame, copied.at, at)?;
+                    super::block::Header::rebind_frame(&mut frame, copied.at, at)?;
                     #[cfg(not(feature = "std"))]
                     use crate::io::Write;
                     #[cfg(feature = "std")]
@@ -4767,11 +4783,14 @@ impl Writer {
                 ));
             }
             let relative = at as u64;
-            Header::rebind_verified_frame(
-                frame,
+            let (from, to) = (
                 ChecksumAt::table(source.table_id, source.offset + relative),
                 ChecksumAt::table(self.table_id, dest + relative),
-            )?;
+            );
+            match source.check {
+                CopyCheck::Verify => Header::rebind_verified_frame(frame, from, to)?,
+                CopyCheck::Carry => Header::rebind_frame(frame, from, to)?,
+            }
             at += len;
         }
         Ok(out)

@@ -567,6 +567,7 @@ fn raw_group(
         crate::table::writer::VerbatimSource {
             table_id: candidate.table.id(),
             offset: candidate.group.offset().0,
+            check: crate::table::writer::CopyCheck::Carry,
         },
     ))
 }

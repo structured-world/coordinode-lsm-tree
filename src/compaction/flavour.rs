@@ -2595,6 +2595,7 @@ impl StandardCompaction {
         let source = crate::table::writer::VerbatimSource {
             table_id: table.id(),
             offset: candidate.group.offset().0,
+            check: crate::table::writer::CopyCheck::Carry,
         };
         let shape = crate::table::writer::CarriedBlockShape {
             restart_interval: table.metadata.data_block_restart_interval,
@@ -2638,6 +2639,7 @@ impl StandardCompaction {
         let source = crate::table::writer::VerbatimSource {
             table_id: table.id(),
             offset: candidate.group.offset().0,
+            check: crate::table::writer::CopyCheck::Carry,
         };
         if !self.table_writer.carry_row_group(
             (&raw, source),
@@ -2747,6 +2749,7 @@ impl StandardCompaction {
             source: crate::table::writer::VerbatimSource {
                 table_id: table.id(),
                 offset,
+                check: crate::table::writer::CopyCheck::Carry,
             },
             directory: &directory,
             directory_len,

@@ -1789,6 +1789,7 @@ fn a_key_running_from_a_verbatim_block_into_written_rows_keeps_its_hash() -> cra
             VerbatimSource {
                 table_id: id,
                 offset,
+                check: super::CopyCheck::Verify,
             },
         ),
         header,
@@ -1814,6 +1815,107 @@ fn a_key_running_from_a_verbatim_block_into_written_rows_keeps_its_hash() -> cra
             "the version at seqno {seqno} reads back",
         );
     }
+    Ok(())
+}
+
+/// A block copied as it is carries its checksum: a compaction's copy
+/// ([`super::CopyCheck::Carry`]) does not hash the payload, so a damaged one
+/// goes on and the read of the copy refuses it, as a read of the source
+/// would; a salvage's copy ([`super::CopyCheck::Verify`]) refuses it at once.
+#[test]
+fn a_carried_block_takes_its_checksum_and_a_salvaged_one_is_checked() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let key = b"the-one-key";
+    let version = |seqno: u64| {
+        InternalValue::from_components(
+            key.to_vec(),
+            format!("value-{seqno:04}").into_bytes(),
+            seqno,
+            ValueType::Value,
+        )
+    };
+    let writer = |path: crate::path::PathBuf| -> crate::Result<Writer> {
+        Ok(Writer::new(path, 1, 0, Arc::new(StdFs))?.use_data_block_size(256))
+    };
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("source");
+    let mut w = writer(source.clone())?;
+    for seqno in (1..=60).rev() {
+        w.write(version(seqno))?;
+    }
+    let Some((id, checksum)) = w.finish()? else {
+        panic!("the source table is written");
+    };
+    let table = crate::Table::recover(crate::table::RecoverParams::new(
+        source.clone(),
+        checksum,
+        id,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
+    ))?;
+    let Some(first) = table.data_block_handles().find_map(Result::ok) else {
+        panic!("the source table has a data block");
+    };
+    let offset = *first.as_ref().offset();
+    let copied: Vec<InternalValue> = (first.seqno()..=60).rev().map(version).collect();
+    let bytes = std::fs::read(&source)?;
+    let Some(frame) = bytes.get(usize::try_from(offset).unwrap_or(usize::MAX)..) else {
+        panic!("the first block lies within the file");
+    };
+    let header = Header::decode_from(&mut &frame[..])?;
+    let Some(raw) = frame.get(..header.on_disk_size_with(None) as usize) else {
+        panic!("the first block's frame lies within the file");
+    };
+    let mut raw = raw.to_vec();
+    // The payload's last byte, past the header.
+    if let Some(last) = raw.last_mut() {
+        *last ^= 1;
+    }
+
+    let copy = |check: super::CopyCheck, path: crate::path::PathBuf| {
+        let mut w = writer(path)?;
+        w.append_verbatim_data_block(
+            (
+                &raw,
+                VerbatimSource {
+                    table_id: id,
+                    offset,
+                    check,
+                },
+            ),
+            header,
+            Vec::new(),
+            &copied,
+            None,
+            &crate::comparator::default_comparator(),
+        )?;
+        w.finish()
+    };
+
+    assert!(matches!(
+        copy(super::CopyCheck::Verify, dir.path().join("salvaged")),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+
+    let carried = dir.path().join("carried");
+    let Some((id, checksum)) = copy(super::CopyCheck::Carry, carried.clone())? else {
+        panic!("the carried copy is written");
+    };
+    let table = crate::Table::recover(crate::table::RecoverParams::new(
+        carried,
+        checksum,
+        id,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
+    ))?;
+    assert!(matches!(
+        table.get(key, 61, crate::hash::hash64(key)),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
     Ok(())
 }
 

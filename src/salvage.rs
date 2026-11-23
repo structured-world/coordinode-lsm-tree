@@ -2592,6 +2592,7 @@ fn salvage_blocks(
                                                 crate::table::writer::VerbatimSource {
                                                     table_id: table.id(),
                                                     offset,
+                                                    check: crate::table::writer::CopyCheck::Verify,
                                                 },
                                             ),
                                             uncompressed,
@@ -2851,6 +2852,7 @@ fn salvage_blocks(
                                         let source = crate::table::writer::VerbatimSource {
                                             table_id: table.id(),
                                             offset,
+                                            check: crate::table::writer::CopyCheck::Verify,
                                         };
                                         writer
                                             .append_verbatim_data_block(
