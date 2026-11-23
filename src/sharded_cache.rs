@@ -752,6 +752,12 @@ where
     /// churn (see the enum docs).
     pub(crate) fn insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
+        // Refused before the lock, so a cache too small for the entry (or one
+        // of capacity zero) costs its readers no write lock; the shard checks
+        // again under it, for a resize that lands in between.
+        if weight > self.max_entry_weight() {
+            return;
+        }
         let (h, shard) = self.locate(&key);
         let mut evicted = Evicted::new();
         let mut core = shard.write();
@@ -763,6 +769,9 @@ where
     /// shard's lock is free now: a caller that must not wait drops the entry.
     pub(crate) fn try_insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
+        if weight > self.max_entry_weight() {
+            return;
+        }
         let (h, shard) = self.locate(&key);
         if let Some(mut core) = shard.try_write() {
             let mut evicted = Evicted::new();
