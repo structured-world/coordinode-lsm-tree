@@ -4,7 +4,7 @@
 //! xxh3, 64 and 128 bits, through the widest kernel the CPU runs.
 //!
 //! An input longer than 240 bytes runs xxh3's stripe loop, which a SIMD
-//! kernel covers 16 to 64 bytes per instruction; one chosen when the crate is
+//! kernel covers 16 or 32 bytes per instruction; one chosen when the crate is
 //! compiled can only use what every CPU of the target has (SSE2 on x86-64).
 //! Here the loop runs through [`kernel::Kernel::get`], asked at run time.
 //! Shorter inputs take xxh3's short paths, which no vector speeds up, from

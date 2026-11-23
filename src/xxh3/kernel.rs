@@ -70,9 +70,8 @@ impl Kernel {
     pub(super) fn get() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            if cpu_avx512f::get() {
-                return x86::AVX512;
-            }
+            // No AVX-512 kernel: the loop is bound by its multiplies, and
+            // 512-bit ones lower the clock on the CPUs that have them.
             if cpu_avx2::get() {
                 return x86::AVX2;
             }
@@ -111,9 +110,6 @@ impl Kernel {
             if cpu_avx2::get() {
                 kernels.push(("avx2", x86::AVX2));
             }
-            if cpu_avx512f::get() {
-                kernels.push(("avx512", x86::AVX512));
-            }
         }
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         kernels.push(("neon", neon::NEON));
@@ -125,8 +121,6 @@ impl Kernel {
 // saves the AVX state, and works without `std`.
 #[cfg(target_arch = "x86_64")]
 cpufeatures::new!(cpu_avx2, "avx2");
-#[cfg(target_arch = "x86_64")]
-cpufeatures::new!(cpu_avx512f, "avx512f");
 
 /// The reference kernel: one 64-bit lane at a time.
 #[cfg(any(
@@ -217,18 +211,16 @@ mod scalar {
     }
 }
 
-/// The x86-64 kernels: SSE2 (16 bytes a lane), AVX2 (32) and AVX-512 (64).
+/// The x86-64 kernels: SSE2 (16 bytes a lane) and AVX2 (32).
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::{Acc, Kernel, PRIME32_1, SCRAMBLE_AT, STRIPE_LEN, STRIPES_PER_BLOCK};
     use core::arch::x86_64::{
-        __m128i, __m256i, __m512i, _mm_add_epi64, _mm_loadu_si128, _mm_mul_epu32, _mm_set1_epi32,
+        __m128i, __m256i, _mm_add_epi64, _mm_loadu_si128, _mm_mul_epu32, _mm_set1_epi32,
         _mm_shuffle_epi32, _mm_slli_epi64, _mm_srli_epi64, _mm_storeu_si128, _mm_xor_si128,
         _mm256_add_epi64, _mm256_loadu_si256, _mm256_mul_epu32, _mm256_set1_epi32,
         _mm256_shuffle_epi32, _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
-        _mm256_xor_si256, _mm512_add_epi64, _mm512_loadu_si512, _mm512_mul_epu32,
-        _mm512_set1_epi32, _mm512_shuffle_epi32, _mm512_slli_epi64, _mm512_srli_epi64,
-        _mm512_storeu_si512, _mm512_xor_si512,
+        _mm256_xor_si256,
     };
 
     /// Swaps the two 64-bit halves of every 128-bit lane: the data a lane
@@ -410,22 +402,6 @@ mod x86 {
         _mm256_shuffle_epi32,
         _mm256_set1_epi32
     );
-    simd_kernel!(
-        avx512,
-        "avx512f",
-        __m512i,
-        64,
-        _mm512_loadu_si512,
-        _mm512_storeu_si512,
-        _mm512_add_epi64,
-        _mm512_mul_epu32,
-        _mm512_xor_si512,
-        _mm512_srli_epi64,
-        _mm512_slli_epi64,
-        _mm512_shuffle_epi32,
-        _mm512_set1_epi32
-    );
-
     pub(super) const SSE2: Kernel = Kernel {
         blocks: sse2::blocks,
         stripes: sse2::stripes,
@@ -435,11 +411,6 @@ mod x86 {
         blocks: avx2::blocks,
         stripes: avx2::stripes,
         scramble: avx2::scramble,
-    };
-    pub(super) const AVX512: Kernel = Kernel {
-        blocks: avx512::blocks,
-        stripes: avx512::stripes,
-        scramble: avx512::scramble,
     };
 }
 
