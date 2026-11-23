@@ -62,13 +62,22 @@ fn run(callback: impl FnOnce()) {
 
 /// A tree's liveness: held, as an `Arc`, by everything of the tree that owns
 /// a file of its directory. Its last drop closes the tree.
-pub struct Life {
+pub(crate) struct Life {
     signal: Arc<Signal>,
+    /// The tree's directory lock (`None` when the config disables it). The
+    /// folder stays the tree's while any part of it still owns a file there
+    /// (the deleter with files to remove, an iterator, a snapshot, a pin), so
+    /// a second opener cannot sweep or reuse those files under it.
+    // std-only: cross-process file locking needs real OS files.
+    #[cfg(feature = "std")]
+    directory_lock: Option<Box<dyn crate::fs::FsFile>>,
 }
 
 impl Life {
-    /// The liveness of a tree being opened.
-    pub fn new() -> Arc<Self> {
+    /// The liveness of a tree being opened, holding its directory lock.
+    pub(crate) fn new(
+        #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             signal: Arc::new(Signal {
                 closed: AtomicBool::new(false),
@@ -76,11 +85,13 @@ impl Life {
                 #[cfg(feature = "std")]
                 settled: parking_lot::Condvar::new(),
             }),
+            #[cfg(feature = "std")]
+            directory_lock,
         })
     }
 
     /// A handle on the signal, holding no liveness itself.
-    pub fn signal(&self) -> TreeClose {
+    pub(crate) fn signal(&self) -> TreeClose {
         TreeClose {
             signal: Arc::clone(&self.signal),
         }
@@ -89,6 +100,10 @@ impl Life {
 
 impl Drop for Life {
     fn drop(&mut self) {
+        // The lock goes first: a callback of the signal may open the folder
+        // again at once.
+        #[cfg(feature = "std")]
+        drop(self.directory_lock.take());
         self.signal.fire();
     }
 }
@@ -275,7 +290,7 @@ impl core::fmt::Debug for WeakTree {
 
 /// Gives up `tree`'s handle and returns its closing signal: from here no weak
 /// handle raises the tree again.
-pub fn close(tree: Tree) -> TreeClose {
+pub(crate) fn close(tree: Tree) -> TreeClose {
     let signal = tree.life.signal();
     tree.closing.store(true, Ordering::SeqCst);
     drop(tree);

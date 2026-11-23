@@ -1316,14 +1316,15 @@ fn a_budget_nothing_fits_writes_the_narrowest_configured_width() -> crate::Resul
 #[test]
 fn a_lowered_budget_enters_the_over_budget_state_until_rewrites() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    {
-        let tree = open(folder.path(), None)?;
-        fill(&tree, &["hot", "old"], KEYS)?;
-    }
-    let existing = {
-        let tree = open(folder.path(), None)?;
-        tree.filter_size()
-    };
+    // Each tree is closed before the next opens the folder: its directory
+    // lock is held until then, the background removal of compacted-away
+    // files included.
+    let tree = open(folder.path(), None)?;
+    fill(&tree, &["hot", "old"], KEYS)?;
+    tree.close().wait();
+    let tree = open(folder.path(), None)?;
+    let existing = tree.filter_size();
+    tree.close().wait();
     // Room for the narrowest width, not for the static policy's.
     let budget = existing * 3 / 4;
     let tree = open(folder.path(), Some(FilterAdvisor::new(budget)))?;
@@ -1338,7 +1339,7 @@ fn a_lowered_budget_enters_the_over_budget_state_until_rewrites() -> crate::Resu
     let memory = tree.filter_memory();
     assert!(memory.serialised_bytes <= budget, "{memory:?}");
     assert!(tree.get(key("old", 0), SeqNo::MAX)?.is_some());
-    drop(tree);
+    tree.close().wait();
 
     // The next rewrite that finds the filters within the budget, with room
     // for its own, leaves the state.

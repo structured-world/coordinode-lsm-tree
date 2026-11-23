@@ -690,6 +690,31 @@ fn corrupt_parity_trailer_byte(
     Ok(())
 }
 
+/// The single table under `tables/`, opened with no tree around it and
+/// carrying `checksum` as its recorded digest.
+fn detached_table(
+    dir: &std::path::Path,
+    checksum: crate::Checksum,
+) -> crate::Result<crate::table::Table> {
+    use std::sync::Arc;
+
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
+    let mut params = crate::table::RecoverParams::new(
+        dir.join("tables").join("0"),
+        checksum,
+        0,
+        fs,
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+    );
+    #[cfg(feature = "metrics")]
+    {
+        params.metrics = Arc::new(crate::Metrics::default());
+    }
+    crate::table::Table::recover(params)
+}
+
 /// Rebuilds the manifest by hand, recording the digest of the CURRENT
 /// (possibly rotted) bytes of the single table under `tables/`. This seeds the
 /// state the reconcile tests need — a manifest digest that matches damaged
@@ -705,24 +730,7 @@ fn rebuild_manifest_over_current_bytes(dir: &std::path::Path) -> crate::Result<(
     let sst_path = dir.join("tables").join("0");
     let checksum =
         crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst_path)?);
-    #[cfg(feature = "metrics")]
-    let metrics = Arc::new(crate::Metrics::default());
-    let table = {
-        #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
-        let mut params = crate::table::RecoverParams::new(
-            sst_path,
-            checksum,
-            0,
-            Arc::clone(&fs),
-            crate::comparator::default_comparator(),
-            Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
-        );
-        #[cfg(feature = "metrics")]
-        {
-            params.metrics = metrics;
-        }
-        crate::table::Table::recover(params)?
-    };
+    let table = detached_table(dir, checksum)?;
 
     // Remove the prior snapshots so the hand-built one is the newest.
     let mut next_version_id = 0u64;
@@ -4209,7 +4217,7 @@ fn heal_attribution_compares_against_the_current_manifest_digest() -> crate::Res
     // Heal cycle one: rot, record the rotted digest, heal + refresh.
     corrupt_parity_trailer_byte(&sst_path, &block)?;
     rebuild_manifest_over_current_bytes(dir.path())?;
-    let stale_view = {
+    let stale_checksum = {
         let tree = open_ecc_tree(dir.path());
         let stale = {
             let binding = tree.version_history.read().latest_version();
@@ -4218,12 +4226,16 @@ fn heal_attribution_compares_against_the_current_manifest_digest() -> crate::Res
                 .iter_tables()
                 .next()
                 .expect("one table")
-                .clone()
+                .checksum()
         };
         let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
         assert!(report.is_ok(), "the first heal reconciles: {report:?}");
         stale
     };
+    // The view captured before the first heal, carrying the digest recorded
+    // then. Detached from that tree: a table of it would keep the tree, and
+    // its folder's lock, held past the reopen below.
+    let stale_view = detached_table(dir.path(), stale_checksum)?;
 
     // Rot a SECOND fault — in a DIFFERENT block, so the rotted digest
     // differs from the first cycle's — and re-record the manifest over the

@@ -1170,8 +1170,8 @@ pub struct Config {
 
     /// When `true` (the default), [`Config::open`] and [`Config::repair`]
     /// acquire an exclusive cross-process lock on a `LOCK` file in the tree
-    /// directory (an advisory OS file lock) and hold it for the lifetime of the
-    /// [`Tree`] (open) or the duration of the call (repair). A
+    /// directory (an advisory OS file lock) and hold it until the [`Tree`] is
+    /// closed (open) or for the duration of the call (repair). A
     /// second process attempting to open / repair the same directory fails fast
     /// with [`Error::Locked`](crate::Error::Locked) instead of racing on the
     /// manifest. Set `false` via [`Config::with_directory_lock`] only when the
@@ -2274,9 +2274,14 @@ impl Config {
     /// exclusive advisory lock on a `LOCK` file in the tree directory, so a
     /// second process opening / repairing the same directory fails fast with
     /// [`Error::Locked`](crate::Error::Locked) rather than corrupting the shared
-    /// manifest. Disable ONLY when exclusive directory ownership is already
-    /// guaranteed at a higher layer (e.g. an embedding keyspace / journal
-    /// manager that opens each directory at most once per host).
+    /// manifest. An open tree holds the lock until it is closed, not until its
+    /// handle drops: an iterator, a snapshot, a pin or the background removal
+    /// of compacted-away files keeps it, and an open in the same process
+    /// meanwhile fails with `Locked` too. To reopen at once, wait for
+    /// [`Tree::close`](crate::Tree::close) first. Disable ONLY when exclusive
+    /// directory ownership is already guaranteed at a higher layer (e.g. an
+    /// embedding keyspace / journal manager that opens each directory at most
+    /// once per host).
     #[must_use]
     pub fn with_directory_lock(mut self, enabled: bool) -> Self {
         self.directory_lock = enabled;

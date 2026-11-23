@@ -321,6 +321,34 @@ fn an_iterator_outliving_the_tree_keeps_it_open() -> crate::Result<()> {
     Ok(())
 }
 
+// The directory lock lasts as long as the tree does, not its handle: while an
+// iterator keeps a dropped tree open, its deleter still has the compacted-away
+// table to remove, so a second opener of the folder is refused. Let in, it
+// would sweep that table as an orphan, or take its emptied file into its own
+// table file pool while the old deleter is about to unlink it.
+#[test]
+fn a_reopen_while_an_iterator_keeps_the_tree_open_is_locked_out() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open_standard(folder.path())?;
+    let mut seqno = 0;
+    flush_tables(&tree, 1, &mut seqno)?;
+    let mut iter = tree.iter(seqno, None);
+    assert!(iter.next().is_some());
+    flush_tables(&tree, 1, &mut seqno)?;
+    tree.major_compact(u64::MAX, seqno)?;
+
+    let closed = tree.close();
+    assert!(
+        matches!(open_standard(folder.path()), Err(crate::Error::Locked(_))),
+        "the iterator keeps the folder the tree's"
+    );
+
+    drop(iter);
+    assert!(closed.wait_timeout(SETTLE));
+    open_standard(folder.path())?.close().wait();
+    Ok(())
+}
+
 // A snapshot of the version holds its tables the same way.
 #[test]
 fn a_snapshot_outliving_the_tree_keeps_it_open() -> crate::Result<()> {
