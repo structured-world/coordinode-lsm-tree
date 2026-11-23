@@ -527,3 +527,109 @@ fn partial_prefix_never_shrinks_whichever_read_records_last() {
     cache.insert_partial_block(id, offset, partial_entry(5, 2));
     assert_eq!(resident(&cache), (5, 2, crate::UserKey::from("upper-5")));
 }
+
+/// A block of `block_type` weighing about 1 KiB in the cache.
+fn kib_block(block_type: crate::table::block::BlockType) -> crate::table::Block {
+    crate::table::Block {
+        header: crate::table::block::Header {
+            uncompressed_length: 1_024,
+            ..crate::table::block::Header::test_dummy(block_type)
+        },
+        data: crate::Slice::from(&[0u8; 1_024][..]),
+    }
+}
+
+/// Shrinking a live cache evicts data blocks before the index blocks every
+/// seek walks, and leaves its weight within the new capacity: the trees
+/// sharing it keep their metadata through a memory squeeze.
+#[test]
+fn a_shrink_keeps_index_blocks_over_data_blocks() {
+    use crate::table::block::BlockType;
+
+    let cache = Cache::with_capacity_bytes(16 << 20);
+    let id = crate::table::GlobalTableId::from((0, 7));
+    let at = |n: u64| crate::table::BlockOffset(n * 4_096);
+    // 4 MiB of data blocks and 256 KiB of index blocks.
+    for n in 0..4_096 {
+        cache.insert_block(id, at(n), kib_block(BlockType::Data));
+    }
+    for n in 4_096..4_352 {
+        cache.insert_block(id, at(n), kib_block(BlockType::Index));
+    }
+
+    cache.set_capacity(1 << 20);
+    assert_eq!(cache.capacity(), 1 << 20);
+    assert!(cache.size() <= 1 << 20, "{} bytes left", cache.size());
+    let index_kept = (4_096..4_352)
+        .filter(|&n| cache.has_block(id, at(n)))
+        .count();
+    let data_kept = (0..4_096).filter(|&n| cache.has_block(id, at(n))).count();
+    assert_eq!(index_kept, 256, "an index block was evicted");
+    assert!(data_kept < 4_096 / 4, "{data_kept} data blocks kept");
+}
+
+/// Resizes racing cold loads of the same blocks leave no load ticket behind
+/// and hand no reader a block other than the one it asked for.
+#[cfg(feature = "std")]
+#[test]
+fn resizes_racing_cold_loads_strand_no_ticket() {
+    use super::{BlockClaim, LoadIdentity};
+    use crate::table::block::BlockType;
+    use std::sync::Arc;
+
+    let cache = Arc::new(
+        Cache::with_capacity_bytes(256 << 10)
+            .with_load_coalescing_after(core::time::Duration::ZERO),
+    );
+    let identity = LoadIdentity::Block {
+        block_type: BlockType::Data,
+        size: 1_024,
+        compression: crate::CompressionType::None,
+        encrypted: false,
+    };
+    let readers: Vec<_> = (0..6u64)
+        .map(|t| {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                for i in 0..4_000u64 {
+                    // The table id names the block, so a reader checks it got
+                    // the one it asked for.
+                    let n = (i * 31 + t) % 512;
+                    let tag = u8::try_from(n % 251).expect("below 251");
+                    let id = crate::table::GlobalTableId::from((0, n));
+                    let offset = crate::table::BlockOffset(0);
+                    let block = match cache.get_block(id, offset) {
+                        Some(block) => block,
+                        None => match cache.claim_block(id, offset, identity) {
+                            BlockClaim::Lead(lead) => {
+                                let mut block = kib_block(BlockType::Data);
+                                block.data = crate::Slice::from(vec![tag; 1_024]);
+                                cache.insert_block(id, offset, block.clone());
+                                lead.publish(&block);
+                                block
+                            }
+                            BlockClaim::Shared(block) => block,
+                            BlockClaim::Alone => continue,
+                        },
+                    };
+                    assert_eq!(block.data.first(), Some(&tag), "a torn block");
+                }
+            })
+        })
+        .collect();
+    let resizer = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            for i in 0..400u64 {
+                cache.set_capacity((32 << 10) + (i % 8) * (64 << 10));
+            }
+        })
+    };
+    resizer.join().expect("resizer panicked");
+    for reader in readers {
+        reader.join().expect("reader panicked");
+    }
+    assert_eq!(cache.loads_in_flight(), 0, "a load ticket was stranded");
+    assert_eq!(cache.load_waiters(), 0);
+    assert!(cache.size() <= cache.capacity());
+}

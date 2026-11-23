@@ -157,12 +157,18 @@ where
             small_bytes: 0,
             main_bytes: 0,
             capacity,
-            // S3-FIFO small queue target: 10% of capacity (at least 1 to stay
-            // meaningful for tiny shards).
-            small_target: (capacity / 10).max(1),
+            small_target: small_target(capacity),
             ghost_capacity,
             filled: false,
         }
+    }
+
+    /// Sets the shard's capacity, evicting down to it in the shard's own
+    /// order when it shrank.
+    fn set_capacity(&mut self, capacity: u64, evicted: &mut Evicted<V>) {
+        self.capacity = capacity;
+        self.small_target = small_target(capacity);
+        self.evict_to_capacity(evicted);
     }
 
     /// Lock-free-path read: returns the value (cloned) and bumps the frequency
@@ -220,6 +226,15 @@ where
         priority: Priority,
         evicted: &mut Evicted<V>,
     ) {
+        // An entry heavier than the shard can never stay resident: admitting
+        // it would evict the shard's whole population and then be evicted
+        // itself. Refused here, under the lock, so a resize between the
+        // caller's weighing and this insert is honored; the value is dropped
+        // with the evicted ones, after the lock.
+        if weight > self.capacity {
+            evicted.push(value);
+            return;
+        }
         if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
             // Replace in place: adjust the owning queue's byte tally by the
             // weight delta.
@@ -524,6 +539,19 @@ fn release<G, V>(guard: G, evicted: Evicted<V>) {
     drop(evicted);
 }
 
+/// One shard's part of `capacity` spread over `shards`, rounded up so the
+/// shards together never hold less than asked.
+fn shard_capacity(capacity: u64, shards: usize) -> u64 {
+    capacity.div_ceil(shards as u64)
+}
+
+/// The S3-FIFO small queue target of a shard of `capacity`: 10% of it, at
+/// least 1 to stay meaningful for tiny shards.
+const fn small_target(capacity: u64) -> u64 {
+    let target = capacity / 10;
+    if target == 0 { 1 } else { target }
+}
+
 /// Applies a weight replacement (`old` → `new`) to a running byte tally without
 /// risking underflow when `new > old`.
 #[inline]
@@ -540,10 +568,17 @@ pub(crate) struct ShardedCache<K, V, W, S> {
     shard_mask: u64,
     weighter: W,
     hasher: S,
-    capacity: u64,
-    /// One shard's byte capacity: the heaviest entry that can stay resident.
-    /// Anything heavier is refused at insert (see [`Self::max_entry_weight`]).
-    per_shard_capacity: u64,
+    /// The total capacity, changed live by [`Self::set_capacity`].
+    capacity: portable_atomic::AtomicU64,
+    /// One shard's capacity: the heaviest entry that can stay resident, read
+    /// by callers deciding whether to build one (see
+    /// [`Self::max_entry_weight`]). Each shard holds its own copy, set under
+    /// its lock, which is what an insert is checked against.
+    per_shard_capacity: portable_atomic::AtomicU64,
+    /// Held by a resize from its first store to its last shard, so the total,
+    /// the per-shard capacity and every shard end at the same resize's values
+    /// when two race.
+    resizing: spin::Mutex<()>,
 }
 
 impl<K, V, W, S> ShardedCache<K, V, W, S>
@@ -564,9 +599,7 @@ where
         hasher: S,
     ) -> Self {
         let shard_count = shard_count_hint.next_power_of_two().clamp(1, 256);
-        // Distribute capacity evenly; round up so the summed shard capacity is
-        // >= the requested total (never silently smaller).
-        let per_shard_cap = capacity.div_ceil(shard_count as u64);
+        let per_shard_cap = shard_capacity(capacity, shard_count);
         // Ghost queue holds roughly as many fingerprints as the shard is
         // expected to hold live entries (S3-FIFO sizes the ghost ~ main).
         let ghost_capacity = (est_items / shard_count).max(16);
@@ -585,8 +618,9 @@ where
             shard_mask: shard_count as u64 - 1,
             weighter,
             hasher,
-            capacity,
-            per_shard_capacity: per_shard_cap,
+            capacity: portable_atomic::AtomicU64::new(capacity),
+            per_shard_capacity: portable_atomic::AtomicU64::new(per_shard_cap),
+            resizing: spin::Mutex::new(()),
         }
     }
 
@@ -595,6 +629,26 @@ where
     /// callers producing large entries can skip building them entirely.
     pub(crate) fn max_entry_weight(&self) -> u64 {
         self.per_shard_capacity
+            .load(portable_atomic::Ordering::Relaxed)
+    }
+
+    /// Changes the total capacity of the live cache, split over its shards as
+    /// at construction. A shard that shrank evicts down to its new capacity
+    /// in its own S3-FIFO order before its lock is released; growing evicts
+    /// nothing.
+    pub(crate) fn set_capacity(&self, capacity: u64) {
+        let per_shard = shard_capacity(capacity, self.shards.len());
+        let _resizing = self.resizing.lock();
+        self.capacity
+            .store(capacity, portable_atomic::Ordering::Relaxed);
+        self.per_shard_capacity
+            .store(per_shard, portable_atomic::Ordering::Relaxed);
+        for shard in &self.shards {
+            let mut evicted = Evicted::new();
+            let mut core = shard.0.write();
+            core.set_capacity(per_shard, &mut evicted);
+            release(core, evicted);
+        }
     }
 
     /// Hashes `key` once and resolves both the owning shard and the hash that
@@ -698,12 +752,6 @@ where
     /// churn (see the enum docs).
     pub(crate) fn insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
-        // An entry heavier than its shard can never stay resident: admitting it
-        // would evict the shard's whole population and then be evicted itself.
-        // Refuse it at the door instead of paying that churn.
-        if weight > self.per_shard_capacity {
-            return;
-        }
         let (h, shard) = self.locate(&key);
         let mut evicted = Evicted::new();
         let mut core = shard.write();
@@ -715,9 +763,6 @@ where
     /// shard's lock is free now: a caller that must not wait drops the entry.
     pub(crate) fn try_insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
-        if weight > self.per_shard_capacity {
-            return;
-        }
         let (h, shard) = self.locate(&key);
         if let Some(mut core) = shard.try_write() {
             let mut evicted = Evicted::new();
@@ -739,9 +784,6 @@ where
             return;
         };
         let weight = self.weighter.weight(&key, &value);
-        if weight > self.per_shard_capacity {
-            return;
-        }
         let mut evicted = Evicted::new();
         core.insert(h, key, value, weight, Priority::Normal, &mut evicted);
         release(core, evicted);
@@ -764,9 +806,10 @@ where
             .sum()
     }
 
-    /// Total cache capacity (the value passed to [`Self::with_weighter`]).
+    /// Total cache capacity: the value passed to [`Self::with_weighter`], or
+    /// to the latest [`Self::set_capacity`].
     pub(crate) fn capacity(&self) -> u64 {
-        self.capacity
+        self.capacity.load(portable_atomic::Ordering::Relaxed)
     }
 
     /// Removes every entry whose key `doomed` picks. Walks every shard under

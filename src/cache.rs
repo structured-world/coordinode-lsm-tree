@@ -829,10 +829,41 @@ impl Cache {
         self.data.weight()
     }
 
-    /// Returns the cache capacity in bytes.
+    /// Returns the cache capacity in bytes: the target set at construction or
+    /// by the latest [`Self::set_capacity`].
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.data.capacity()
+    }
+
+    /// Changes the byte capacity of the live cache, for a process that moves
+    /// memory between the block cache and other consumers at run time: every
+    /// tree sharing the cache keeps what it holds, as far as the new capacity
+    /// allows.
+    ///
+    /// Shrinking evicts down to the new capacity before returning, in the
+    /// cache's own eviction order, so entries read often and metadata blocks
+    /// outlive cold data. A block or value a reader already holds stays
+    /// usable; it no longer counts against the cache. Growing evicts nothing
+    /// and loads nothing: the cache fills to the new capacity as reads come.
+    ///
+    /// Read-ahead, prefetch and block-size limits derived from the capacity
+    /// follow the new value from their next use. A table written while the
+    /// cache was larger can hold blocks heavier than the cache now keeps;
+    /// those are read without being cached until compaction rewrites them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::Cache;
+    ///
+    /// let cache = Cache::with_capacity_bytes(64 << 20);
+    /// cache.set_capacity(16 << 20);
+    /// assert_eq!(cache.capacity(), 16 << 20);
+    /// assert!(cache.size() <= cache.capacity());
+    /// ```
+    pub fn set_capacity(&self, bytes: u64) {
+        self.data.set_capacity(bytes);
     }
 
     /// The heaviest entry this cache can actually keep resident: one shard's

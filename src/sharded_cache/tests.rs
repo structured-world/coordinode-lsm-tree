@@ -445,6 +445,163 @@ fn concurrent_stress_keeps_invariants() {
     );
 }
 
+/// Shrinking a cache to a quarter of what it holds leaves its weight within
+/// the new capacity and keeps the entries read since they went in over the
+/// ones never read, as its S3-FIFO order ranks them. Its capacity reports the
+/// target at once, and the heaviest entry it takes follows it.
+#[test]
+fn shrinking_to_a_quarter_evicts_down_to_it_and_keeps_hot_entries() {
+    // Room to spare, so no shard evicts before the shrink however the keys
+    // spread over the four.
+    let c = ShardedCache::with_weighter(128_000, 4, 4_096, LenWeighter, FxBuildHasher);
+    for key in 0..640u64 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    assert_eq!(c.weight(), 64_000);
+    // Every eighth entry read: an eighth of the weight, inside the quarter.
+    let hot = |key: u64| key.is_multiple_of(8);
+    for key in (0..640u64).filter(|&key| hot(key)) {
+        assert!(c.get(&key).is_some());
+    }
+
+    c.set_capacity(16_000);
+    assert_eq!(c.capacity(), 16_000);
+    assert_eq!(c.max_entry_weight(), 4_000);
+    assert!(c.weight() <= 16_000, "{} bytes left", c.weight());
+
+    let (hot_kept, cold_kept) =
+        (0..640u64)
+            .filter(|key| c.contains(key))
+            .fold(
+                (0, 0),
+                |(h, k), key| if hot(key) { (h + 1, k) } else { (h, k + 1) },
+            );
+    assert_eq!(hot_kept, 80, "every hot entry fits and stays");
+    assert_eq!(hot_kept + cold_kept, c.len());
+    // The hot eighth all stays; of the cold rest, no more than the room the
+    // hot ones left (16,000 - 8,000 bytes).
+    assert!(cold_kept <= 80, "{cold_kept} of 560 cold entries kept");
+}
+
+/// Growing evicts nothing; the cache then fills to the new capacity as entries
+/// go in, and an entry heavier than the old shard but within the new one is
+/// taken.
+#[test]
+fn growing_evicts_nothing_and_the_cache_fills_to_the_new_capacity() {
+    let c = byte_cache(8_000);
+    for key in 0..200u64 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    let before = (c.weight(), c.len());
+    assert!(before.0 <= 8_000);
+
+    c.set_capacity(32_000);
+    assert_eq!((c.weight(), c.len()), before, "growing evicted");
+    assert_eq!(c.max_entry_weight(), 4_000);
+    for key in 1_000..2_000u64 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    // Each of the 8 shards fills to within one entry of its 4,000 bytes.
+    assert!(
+        c.weight() > 32_000 - 8 * 100 && c.weight() <= 32_000,
+        "{} bytes after filling",
+        c.weight()
+    );
+    c.insert(5_000, vec![0u8; 3_000]);
+    assert!(c.contains(&5_000), "an entry the grown shard can keep");
+}
+
+/// After a shrink, an entry heavier than the new shard is refused, and its
+/// key's former value stays where it was, as for any oversized insert.
+#[test]
+fn after_a_shrink_an_entry_heavier_than_the_new_shard_is_refused() {
+    let c = byte_cache(80_000);
+    c.insert(1, vec![1u8; 100]);
+    c.set_capacity(8_000);
+    c.insert(1, vec![2u8; 2_000]);
+    c.insert(2, vec![2u8; 2_000]);
+    assert_eq!(c.get(&1), Some(vec![1u8; 100]), "the old value stays");
+    assert_eq!(c.get(&2), None, "heavier than the 1,000-byte shard");
+}
+
+/// The values a shrink evicts are dropped once each, and those a reader
+/// holds outlive the eviction.
+#[test]
+fn a_shrink_drops_each_evicted_value_once_and_spares_what_readers_hold() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    let drops = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let c = ShardedCache::with_weighter(1_000, 1, 1024, CountedWeight, FxBuildHasher);
+    for key in 0..10 {
+        c.insert(
+            key,
+            alloc::sync::Arc::new(Counted {
+                weight: 100,
+                drops: alloc::sync::Arc::clone(&drops),
+            }),
+        );
+    }
+    let held = c.get(&0).expect("resident");
+
+    c.set_capacity(0);
+    assert_eq!((c.len(), c.weight()), (0, 0));
+    assert_eq!(drops.load(Ordering::Relaxed), 9, "all but the held one");
+    assert_eq!(held.weight, 100, "the reader's value is intact");
+    drop(held);
+    assert_eq!(drops.load(Ordering::Relaxed), 10);
+}
+
+/// Resizes racing each other and readers and writers leave every shard at
+/// the capacity stored last, within it, and with its tallies agreeing with
+/// what it holds.
+#[cfg(feature = "std")]
+#[test]
+fn resizes_racing_reads_and_inserts_settle_on_the_last_capacity() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let cache = Arc::new(byte_cache(64_000));
+    let workers: Vec<_> = (0..6u64)
+        .map(|t| {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                for i in 0..20_000u64 {
+                    let key = (t * 7_919 + i) % 3_000;
+                    if i % 3 == 0 {
+                        cache.insert(key, vec![0u8; 64]);
+                    } else if let Some(value) = cache.get(&key) {
+                        assert_eq!(value, vec![0u8; 64], "a torn entry");
+                    }
+                }
+            })
+        })
+        .collect();
+    let resizers: Vec<_> = (0..2u64)
+        .map(|t| {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                for i in 0..500u64 {
+                    cache.set_capacity(4_000 + ((i * 2 + t) % 16) * 4_000);
+                }
+            })
+        })
+        .collect();
+    for handle in resizers.into_iter().chain(workers) {
+        handle.join().expect("thread panicked");
+    }
+
+    assert_eq!(cache.max_entry_weight(), cache.capacity().div_ceil(8));
+    for shard in &cache.shards {
+        let (capacity, resident) = {
+            let core = shard.0.read();
+            (core.capacity, core.resident_bytes())
+        };
+        assert_eq!(capacity, cache.max_entry_weight());
+        assert!(resident <= capacity);
+    }
+    assert_eq!(cache.weight(), cache.len() as u64 * 64);
+}
+
 /// A value of some weight that counts its drops.
 struct Counted {
     weight: u64,
