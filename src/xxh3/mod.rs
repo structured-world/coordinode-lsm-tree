@@ -78,8 +78,10 @@ const DEFAULT_SECRET: [u8; SECRET_LEN] = [
     0x45, 0xcb, 0x3a, 0x8f, 0x95, 0x16, 0x04, 0x28, 0xaf, 0xd7, 0xfb, 0xca, 0xbb, 0x4b, 0x40, 0x7e,
 ];
 
-// The short paths inline into their callers; the long ones stay out of
-// line, so a short hash pays no frame for the long path's state.
+// The short paths inline into their callers. A long input makes one call:
+// into the baseline kernel's digest, which holds the loop and the merge
+// (a `#[target_feature]` function inlines only into its like), or on x86-64
+// into the wide path.
 
 /// The xxh3-64 of `input`.
 #[must_use]
@@ -95,7 +97,12 @@ pub(crate) fn hash64_with_seed(input: &[u8], seed: u64) -> u64 {
     if input.len() <= MID_SIZE_MAX {
         return short::hash64(input, seed);
     }
-    long64(input, seed)
+    #[cfg(target_arch = "x86_64")]
+    if input.len() >= WIDE_MIN {
+        return wide64(input, seed);
+    }
+    // SAFETY: `input` holds its `len() > MID_SIZE_MAX` bytes.
+    unsafe { kernel::baseline::digest64(input.as_ptr(), input.len(), seed) }
 }
 
 /// The xxh3-128 of `input`.
@@ -112,29 +119,40 @@ pub(crate) fn hash128_with_seed(input: &[u8], seed: u64) -> u128 {
     if input.len() <= MID_SIZE_MAX {
         return short::hash128(input, seed);
     }
-    long128(input, seed)
+    #[cfg(target_arch = "x86_64")]
+    if input.len() >= WIDE_MIN {
+        return wide128(input, seed);
+    }
+    // SAFETY: `input` holds its `len() > MID_SIZE_MAX` bytes.
+    unsafe { kernel::baseline::digest128(input.as_ptr(), input.len(), seed) }
 }
 
-/// [`hash64_with_seed`] of an input longer than [`MID_SIZE_MAX`].
+/// [`hash64_with_seed`] of an input of at least `WIDE_MIN` bytes.
+#[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn long64(input: &[u8], seed: u64) -> u64 {
-    let len = input.len() as u64;
-    if seed == 0 {
-        return merge64(&long_acc(input, &DEFAULT_SECRET), &DEFAULT_SECRET, len);
-    }
-    let secret = secret_for(seed);
-    merge64(&long_acc(input, &secret), &secret, len)
+fn wide64(input: &[u8], seed: u64) -> u64 {
+    let derived;
+    let secret = if seed == 0 {
+        &DEFAULT_SECRET
+    } else {
+        derived = secret_for(seed);
+        &derived
+    };
+    merge64(&wide_acc(input, secret), secret, input.len() as u64)
 }
 
-/// [`hash128_with_seed`] of an input longer than [`MID_SIZE_MAX`].
+/// [`hash128_with_seed`] of an input of at least `WIDE_MIN` bytes.
+#[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn long128(input: &[u8], seed: u64) -> u128 {
-    let len = input.len() as u64;
-    if seed == 0 {
-        return merge128(&long_acc(input, &DEFAULT_SECRET), &DEFAULT_SECRET, len);
-    }
-    let secret = secret_for(seed);
-    merge128(&long_acc(input, &secret), &secret, len)
+fn wide128(input: &[u8], seed: u64) -> u128 {
+    let derived;
+    let secret = if seed == 0 {
+        &DEFAULT_SECRET
+    } else {
+        derived = secret_for(seed);
+        &derived
+    };
+    merge128(&wide_acc(input, secret), secret, input.len() as u64)
 }
 
 /// The secret `seed` derives from the default one: the default itself for
@@ -151,22 +169,16 @@ fn secret_for(seed: u64) -> [u8; SECRET_LEN] {
     secret
 }
 
-/// The accumulators of `input`, longer than [`MID_SIZE_MAX`], under `secret`.
+/// The accumulators of `input`, longer than [`MID_SIZE_MAX`], under
+/// `secret`, through the widest kernel the CPU runs.
+#[cfg(target_arch = "x86_64")]
 #[inline]
-fn long_acc(input: &[u8], secret: &[u8; SECRET_LEN]) -> Acc {
+fn wide_acc(input: &[u8], secret: &[u8; SECRET_LEN]) -> Acc {
     debug_assert!(input.len() > MID_SIZE_MAX);
     let mut acc = INITIAL_ACC;
     // SAFETY: `input` holds its `len() > STRIPE_LEN` bytes and `secret` its
-    // 192; the wide kernel is one the CPU runs, the baseline one every CPU
-    // of the target.
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        if input.len() >= WIDE_MIN {
-            (Kernel::wide().long)(&mut acc, input.as_ptr(), input.len(), secret.as_ptr());
-            return acc;
-        }
-        kernel::baseline::long(&mut acc, input.as_ptr(), input.len(), secret.as_ptr());
-    }
+    // 192; the wide kernel is one the CPU runs.
+    unsafe { (Kernel::wide().long)(&mut acc, input.as_ptr(), input.len(), secret.as_ptr()) };
     acc
 }
 

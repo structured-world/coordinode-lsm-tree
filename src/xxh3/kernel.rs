@@ -121,15 +121,116 @@ macro_rules! entry_points {
     };
 }
 
-/// A SIMD kernel's `long`: one pass with the accumulators held in vectors
-/// from the first stripe to the last, over its module's `load_acc!`,
-/// `accumulate!`, `scramble!` and `store_acc!`, with `$attr` (its
-/// `#[target_feature]`) on it.
+/// The scalar kernel's whole digests of a long input over its `$long`, as
+/// `register_long!` gives a SIMD kernel's.
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_endian = "little")
+)))]
+macro_rules! register_digest {
+    ($long:path, $(#[$attr:meta])*) => {
+        /// The xxh3-64 of the `len > MID_SIZE_MAX` bytes at `input` under
+        /// `seed`.
+        ///
+        /// # Safety
+        ///
+        /// `input` is valid for `len` bytes, and the CPU runs this
+        /// instruction set.
+        #[inline]
+        $(#[$attr])*
+        pub(in super::super) unsafe fn digest64(input: *const u8, len: usize, seed: u64) -> u64 {
+            let derived;
+            let secret = if seed == 0 {
+                &crate::xxh3::DEFAULT_SECRET
+            } else {
+                derived = crate::xxh3::secret_for(seed);
+                &derived
+            };
+            let mut acc = crate::xxh3::INITIAL_ACC;
+            // SAFETY: as the caller keeps; the secret holds its 192 bytes.
+            unsafe { $long(&mut acc, input, len, secret.as_ptr()) };
+            crate::xxh3::merge64(&acc, secret, len as u64)
+        }
+
+        /// The xxh3-128 of the `len > MID_SIZE_MAX` bytes at `input` under
+        /// `seed`.
+        ///
+        /// # Safety
+        ///
+        /// As `digest64`.
+        #[inline]
+        $(#[$attr])*
+        pub(in super::super) unsafe fn digest128(input: *const u8, len: usize, seed: u64) -> u128 {
+            let derived;
+            let secret = if seed == 0 {
+                &crate::xxh3::DEFAULT_SECRET
+            } else {
+                derived = crate::xxh3::secret_for(seed);
+                &derived
+            };
+            let mut acc = crate::xxh3::INITIAL_ACC;
+            // SAFETY: as the caller keeps; the secret holds its 192 bytes.
+            unsafe { $long(&mut acc, input, len, secret.as_ptr()) };
+            crate::xxh3::merge128(&acc, secret, len as u64)
+        }
+    };
+}
+
+/// A SIMD kernel's pass over a whole long input, `$len >= STRIPE_LEN` bytes
+/// at `$input`, into `$lanes` under `$secret`, over its module's
+/// `accumulate!` and `scramble!`: every stripe in vectors, the last one too.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_endian = "little")
+))]
+macro_rules! long_loop {
+    ($lanes:ident, $input:ident, $len:ident, $secret:ident) => {{
+        debug_assert!($len >= STRIPE_LEN);
+        let stripes_n = ($len - 1) / STRIPE_LEN;
+        let whole = stripes_n / STRIPES_PER_BLOCK;
+        // SAFETY (every `add` below): every stripe but the last whole one
+        // lies within `$len`, whole blocks first, and the last one is its
+        // final 64 bytes; a stripe's secret starts at most 8 * 15 bytes in and
+        // the last one's at SECRET_LEN - 64 - 7, all within the secret. The
+        // macros read 64 bytes at each.
+        for block in 0..whole {
+            let at = unsafe { $input.add(block * STRIPES_PER_BLOCK * STRIPE_LEN) };
+            for stripe in 0..STRIPES_PER_BLOCK {
+                let (data, key) = unsafe { (at.add(stripe * STRIPE_LEN), $secret.add(stripe * 8)) };
+                accumulate!($lanes, data, key);
+            }
+            scramble!($lanes, $secret);
+        }
+        let at = unsafe { $input.add(whole * STRIPES_PER_BLOCK * STRIPE_LEN) };
+        for stripe in 0..stripes_n - whole * STRIPES_PER_BLOCK {
+            let (data, key) = unsafe { (at.add(stripe * STRIPE_LEN), $secret.add(stripe * 8)) };
+            accumulate!($lanes, data, key);
+        }
+        let (data, key) = unsafe {
+            (
+                $input.add($len - STRIPE_LEN),
+                $secret.add(SECRET_LEN - STRIPE_LEN - LAST_STRIPE_BACK),
+            )
+        };
+        accumulate!($lanes, data, key);
+    }};
+}
+
+/// A SIMD kernel's `long` and its whole digests of a long input, with `$attr`
+/// (its `#[target_feature]`) on them: one pass with the accumulators held in
+/// vectors from the first stripe to the last, and in a digest the secret and
+/// the merge in the same function, which a `#[target_feature]` loop does not
+/// inline into otherwise.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_endian = "little")
+))]
 macro_rules! register_long {
     ($(#[$attr:meta])*) => {
         /// # Safety
         ///
         /// As `Kernel::long`, and the CPU runs this instruction set.
+        #[cfg(any(test, target_arch = "x86_64"))]
         #[inline]
         $(#[$attr])*
         pub(in super::super) unsafe fn long(
@@ -138,36 +239,58 @@ macro_rules! register_long {
             len: usize,
             secret: *const u8,
         ) {
-            debug_assert!(len >= STRIPE_LEN);
-            let stripes_n = (len - 1) / STRIPE_LEN;
-            let whole = stripes_n / STRIPES_PER_BLOCK;
             let mut lanes = load_acc!(acc);
-            // SAFETY (every `add` below): every stripe but the last whole one
-            // lies within `len`, whole blocks first, and the last one is its
-            // final 64 bytes; a stripe's secret starts at most 8 * 15 bytes in
-            // and the last one's at SECRET_LEN - 64 - 7, all within the
-            // secret. The macros read 64 bytes at each.
-            for block in 0..whole {
-                let at = unsafe { input.add(block * STRIPES_PER_BLOCK * STRIPE_LEN) };
-                for stripe in 0..STRIPES_PER_BLOCK {
-                    let (data, key) = unsafe { (at.add(stripe * STRIPE_LEN), secret.add(stripe * 8)) };
-                    accumulate!(lanes, data, key);
-                }
-                scramble!(lanes, secret);
-            }
-            let at = unsafe { input.add(whole * STRIPES_PER_BLOCK * STRIPE_LEN) };
-            for stripe in 0..stripes_n - whole * STRIPES_PER_BLOCK {
-                let (data, key) = unsafe { (at.add(stripe * STRIPE_LEN), secret.add(stripe * 8)) };
-                accumulate!(lanes, data, key);
-            }
-            let (data, key) = unsafe {
-                (
-                    input.add(len - STRIPE_LEN),
-                    secret.add(SECRET_LEN - STRIPE_LEN - LAST_STRIPE_BACK),
-                )
-            };
-            accumulate!(lanes, data, key);
+            long_loop!(lanes, input, len, secret);
             store_acc!(acc, lanes);
+        }
+
+        /// The xxh3-64 of the `len > MID_SIZE_MAX` bytes at `input` under
+        /// `seed`.
+        ///
+        /// # Safety
+        ///
+        /// `input` is valid for `len` bytes, and the CPU runs this
+        /// instruction set.
+        #[inline]
+        $(#[$attr])*
+        pub(in super::super) unsafe fn digest64(input: *const u8, len: usize, seed: u64) -> u64 {
+            let derived;
+            let secret_bytes = if seed == 0 {
+                &crate::xxh3::DEFAULT_SECRET
+            } else {
+                derived = crate::xxh3::secret_for(seed);
+                &derived
+            };
+            let secret = secret_bytes.as_ptr();
+            let mut acc = crate::xxh3::INITIAL_ACC;
+            let mut lanes = load_acc!(&acc);
+            long_loop!(lanes, input, len, secret);
+            store_acc!(&mut acc, lanes);
+            crate::xxh3::merge64(&acc, secret_bytes, len as u64)
+        }
+
+        /// The xxh3-128 of the `len > MID_SIZE_MAX` bytes at `input` under
+        /// `seed`.
+        ///
+        /// # Safety
+        ///
+        /// As `digest64`.
+        #[inline]
+        $(#[$attr])*
+        pub(in super::super) unsafe fn digest128(input: *const u8, len: usize, seed: u64) -> u128 {
+            let derived;
+            let secret_bytes = if seed == 0 {
+                &crate::xxh3::DEFAULT_SECRET
+            } else {
+                derived = crate::xxh3::secret_for(seed);
+                &derived
+            };
+            let secret = secret_bytes.as_ptr();
+            let mut acc = crate::xxh3::INITIAL_ACC;
+            let mut lanes = load_acc!(&acc);
+            long_loop!(lanes, input, len, secret);
+            store_acc!(&mut acc, lanes);
+            crate::xxh3::merge128(&acc, secret_bytes, len as u64)
         }
     };
 }
@@ -222,16 +345,40 @@ pub(super) mod baseline {
     use super::Acc;
 
     #[cfg(target_arch = "x86_64")]
-    use super::x86::sse2 as chosen;
+    use super::{x86::sse2 as chosen, x86::sse2 as digests};
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    use super::neon as chosen;
+    use super::{neon as chosen, neon as digests};
 
     #[cfg(not(any(
         target_arch = "x86_64",
         all(target_arch = "aarch64", target_endian = "little")
     )))]
-    use super::scalar as chosen;
+    use super::{scalar as chosen, scalar as digests};
+
+    /// The xxh3-64 of the `len > MID_SIZE_MAX` bytes at `input` under
+    /// `seed`, loop and merge in one function.
+    ///
+    /// # Safety
+    ///
+    /// `input` is valid for `len` bytes.
+    #[inline]
+    pub(in super::super) unsafe fn digest64(input: *const u8, len: usize, seed: u64) -> u64 {
+        // SAFETY: as the caller keeps; every CPU of the target runs it.
+        unsafe { digests::digest64(input, len, seed) }
+    }
+
+    /// The xxh3-128 of the `len > MID_SIZE_MAX` bytes at `input` under
+    /// `seed`, loop and merge in one function.
+    ///
+    /// # Safety
+    ///
+    /// `input` is valid for `len` bytes.
+    #[inline]
+    pub(in super::super) unsafe fn digest128(input: *const u8, len: usize, seed: u64) -> u128 {
+        // SAFETY: as the caller keeps; every CPU of the target runs it.
+        unsafe { digests::digest128(input, len, seed) }
+    }
 
     /// As [`super::Kernel::consume`].
     ///
@@ -248,22 +395,6 @@ pub(super) mod baseline {
     ) -> usize {
         // SAFETY: as the caller keeps; every CPU of the target runs it.
         unsafe { chosen::consume(acc, input, stripes, done, secret) }
-    }
-
-    /// As [`super::Kernel::long`].
-    ///
-    /// # Safety
-    ///
-    /// As [`super::Kernel::long`]; the instruction set is the target's.
-    #[inline]
-    pub(in super::super) unsafe fn long(
-        acc: &mut Acc,
-        input: *const u8,
-        len: usize,
-        secret: *const u8,
-    ) {
-        // SAFETY: as the caller keeps; every CPU of the target runs it.
-        unsafe { chosen::long(acc, input, len, secret) }
     }
 
     /// As [`super::Kernel::last`].
@@ -297,6 +428,12 @@ mod scalar {
     };
 
     entry_points!();
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )))]
+    register_digest!(long,);
 
     /// # Safety
     ///
@@ -414,13 +551,15 @@ mod x86 {
     /// Expands one ISA's three kernel functions. `$width` is the bytes one
     /// vector covers, `$load`/`$store` move a vector, and the rest are that
     /// ISA's 64-bit add, 32x32 multiply, xor, shifts, dword shuffle and
-    /// broadcast. The stripe and scramble bodies are written once here and
-    /// expanded into each `#[target_feature]` function, which keeps them
-    /// inlined where `#[inline(always)]` may not join `#[target_feature]`.
+    /// broadcast; `$fattr` is the `#[target_feature]` every function carries,
+    /// which its intrinsics need even where the build enables the set. The
+    /// stripe and scramble bodies are written once here and expanded into
+    /// each function, which keeps them inlined where `#[inline(always)]` may
+    /// not join `#[target_feature]`.
     macro_rules! simd_kernel {
         (
             $(#[$mod_attr:meta])*
-            $name:ident, $feature:literal, $vec:ty, $width:literal,
+            $name:ident, [$(#[$fattr:meta])*], $vec:ty, $width:literal,
             $load:ident, $store:ident, $add:ident, $mul:ident, $xor:ident,
             $srli:ident, $slli:ident, $shuffle:ident, $set1:ident
         ) => {
@@ -499,8 +638,8 @@ mod x86 {
                     };
                 }
 
-                entry_points!(#[target_feature(enable = $feature)]);
-                register_long!(#[target_feature(enable = $feature)]);
+                entry_points!($(#[$fattr])*);
+                register_long!($(#[$fattr])*);
 
                 /// Accumulates `stripes` stripes from `input` into `acc`, the
                 /// secret of each starting 8 bytes after the previous one's.
@@ -511,7 +650,7 @@ mod x86 {
                 /// for `(stripes - 1) * 8 + STRIPE_LEN`, and the CPU runs this
                 /// instruction set.
                 #[inline]
-                #[target_feature(enable = $feature)]
+                $(#[$fattr])*
                 unsafe fn stripes(
                     acc: &mut Acc,
                     input: *const u8,
@@ -535,7 +674,7 @@ mod x86 {
                 /// `secret` is valid for [`SECRET_LEN`] bytes, and the CPU runs
                 /// this instruction set.
                 #[inline]
-                #[target_feature(enable = $feature)]
+                $(#[$fattr])*
                 unsafe fn scramble(acc: &mut Acc, secret: *const u8) {
                     let mut lanes = load_acc!(acc);
                     scramble!(lanes, secret);
@@ -551,7 +690,7 @@ mod x86 {
                 /// STRIPE_LEN` bytes, `secret` for [`SECRET_LEN`], and the CPU
                 /// runs this instruction set.
                 #[inline]
-                #[target_feature(enable = $feature)]
+                $(#[$fattr])*
                 unsafe fn blocks(
                     acc: &mut Acc,
                     input: *const u8,
@@ -579,7 +718,7 @@ mod x86 {
 
     simd_kernel!(
         sse2,
-        "sse2",
+        [#[target_feature(enable = "sse2")]],
         __m128i,
         16,
         _mm_loadu_si128,
@@ -593,16 +732,13 @@ mod x86 {
         _mm_set1_epi32
     );
     simd_kernel!(
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "a stream's last stripe is short and goes to the baseline kernel; \
-                          the tests check this one's"
-            )
+        #[expect(
+            dead_code,
+            reason = "the wide kernel takes long runs only: short inputs, their digests and a \
+                      stream's last stripe go to the baseline one"
         )]
         avx2,
-        "avx2",
+        [#[target_feature(enable = "avx2")]],
         __m256i,
         32,
         _mm256_loadu_si256,

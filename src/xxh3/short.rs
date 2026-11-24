@@ -143,10 +143,29 @@ pub(super) fn hash64(input: &[u8], seed: u64) -> u64 {
     let len64 = len as u64;
     // SAFETY (every read below): each branch reads only offsets its length
     // bound keeps within `input`.
+    // The bounds are tested longest first, as xxh3's reference does: a
+    // longer input takes fewer branches.
     unsafe {
-        match len {
-            0 => avalanche64(seed ^ key64(56) ^ key64(64)),
-            1..=3 => {
+        if len <= 16 {
+            if len > 8 {
+                let flip_low = (key64(24) ^ key64(32)).wrapping_add(seed);
+                let flip_high = (key64(40) ^ key64(48)).wrapping_sub(seed);
+                let low = read64(input, 0) ^ flip_low;
+                let high = read64(input, len - 8) ^ flip_high;
+                avalanche(
+                    len64
+                        .wrapping_add(low.swap_bytes())
+                        .wrapping_add(high)
+                        .wrapping_add(fold(low, high)),
+                )
+            } else if len >= 4 {
+                let seed = seed ^ (u64::from(low32(seed).swap_bytes()) << 32);
+                let first = read32(input, 0);
+                let last = read32(input, len - 4);
+                let flip = (key64(8) ^ key64(16)).wrapping_sub(seed);
+                let joined = u64::from(last).wrapping_add(u64::from(first) << 32);
+                rrmxmx(joined ^ flip, len64)
+            } else if len > 0 {
                 let (first, middle, last) = (
                     *input.get_unchecked(0),
                     *input.get_unchecked(len >> 1),
@@ -158,62 +177,38 @@ pub(super) fn hash64(input: &[u8], seed: u64) -> u64 {
                     | (low32(len64) << 8);
                 let flip = u64::from(key32(0) ^ key32(4)).wrapping_add(seed);
                 avalanche64(u64::from(combined) ^ flip)
+            } else {
+                avalanche64(seed ^ key64(56) ^ key64(64))
             }
-            4..=8 => {
-                let seed = seed ^ (u64::from(low32(seed).swap_bytes()) << 32);
-                let first = read32(input, 0);
-                let last = read32(input, len - 4);
-                let flip = (key64(8) ^ key64(16)).wrapping_sub(seed);
-                let joined = u64::from(last).wrapping_add(u64::from(first) << 32);
-                rrmxmx(joined ^ flip, len64)
-            }
-            9..=16 => {
-                let flip_low = (key64(24) ^ key64(32)).wrapping_add(seed);
-                let flip_high = (key64(40) ^ key64(48)).wrapping_sub(seed);
-                let low = read64(input, 0) ^ flip_low;
-                let high = read64(input, len - 8) ^ flip_high;
-                avalanche(
-                    len64
-                        .wrapping_add(low.swap_bytes())
-                        .wrapping_add(high)
-                        .wrapping_add(fold(low, high)),
-                )
-            }
-            17..=128 => {
-                let mut acc = len64.wrapping_mul(PRIME64_1);
-                if len > 32 {
-                    if len > 64 {
-                        if len > 96 {
-                            acc = acc.wrapping_add(mix16(input, 48, 96, seed));
-                            acc = acc.wrapping_add(mix16(input, len - 64, 112, seed));
-                        }
-                        acc = acc.wrapping_add(mix16(input, 32, 64, seed));
-                        acc = acc.wrapping_add(mix16(input, len - 48, 80, seed));
+        } else if len <= 128 {
+            let mut acc = len64.wrapping_mul(PRIME64_1);
+            if len > 32 {
+                if len > 64 {
+                    if len > 96 {
+                        acc = acc.wrapping_add(mix16(input, 48, 96, seed));
+                        acc = acc.wrapping_add(mix16(input, len - 64, 112, seed));
                     }
-                    acc = acc.wrapping_add(mix16(input, 16, 32, seed));
-                    acc = acc.wrapping_add(mix16(input, len - 32, 48, seed));
+                    acc = acc.wrapping_add(mix16(input, 32, 64, seed));
+                    acc = acc.wrapping_add(mix16(input, len - 48, 80, seed));
                 }
-                acc = acc.wrapping_add(mix16(input, 0, 0, seed));
-                acc = acc.wrapping_add(mix16(input, len - 16, 16, seed));
-                avalanche(acc)
+                acc = acc.wrapping_add(mix16(input, 16, 32, seed));
+                acc = acc.wrapping_add(mix16(input, len - 32, 48, seed));
             }
-            _ => {
-                let mut acc = len64.wrapping_mul(PRIME64_1);
-                for round in 0..8 {
-                    acc = acc.wrapping_add(mix16(input, 16 * round, 16 * round, seed));
-                }
-                acc = avalanche(acc);
-                for round in 8..len / 16 {
-                    acc = acc.wrapping_add(mix16(
-                        input,
-                        16 * round,
-                        16 * (round - 8) + MID_START,
-                        seed,
-                    ));
-                }
-                acc = acc.wrapping_add(mix16(input, len - 16, MID_LAST, seed));
-                avalanche(acc)
+            acc = acc.wrapping_add(mix16(input, 0, 0, seed));
+            acc = acc.wrapping_add(mix16(input, len - 16, 16, seed));
+            avalanche(acc)
+        } else {
+            let mut acc = len64.wrapping_mul(PRIME64_1);
+            for round in 0..8 {
+                acc = acc.wrapping_add(mix16(input, 16 * round, 16 * round, seed));
             }
+            acc = avalanche(acc);
+            for round in 8..len / 16 {
+                acc =
+                    acc.wrapping_add(mix16(input, 16 * round, 16 * (round - 8) + MID_START, seed));
+            }
+            acc = acc.wrapping_add(mix16(input, len - 16, MID_LAST, seed));
+            avalanche(acc)
         }
     }
 }
@@ -236,13 +231,37 @@ pub(super) fn hash128(input: &[u8], seed: u64) -> u128 {
     };
     // SAFETY (every read below): each branch reads only offsets its length
     // bound keeps within `input`.
+    // Longest bounds first, as in `hash64`.
     unsafe {
-        match len {
-            0 => join(
-                avalanche64(seed ^ key64(64) ^ key64(72)),
-                avalanche64(seed ^ key64(80) ^ key64(88)),
-            ),
-            1..=3 => {
+        if len <= 16 {
+            if len > 8 {
+                let flip_low = (key64(32) ^ key64(40)).wrapping_sub(seed);
+                let flip_high = (key64(48) ^ key64(56)).wrapping_add(seed);
+                let first = read64(input, 0);
+                let last = read64(input, len - 8);
+                let (low, high) = widen(first ^ last ^ flip_low, PRIME64_1);
+                let low = low.wrapping_add((len64 - 1) << 54);
+                let last = last ^ flip_high;
+                let high = high
+                    .wrapping_add(last)
+                    .wrapping_add(u64::from(low32(last)) * u64::from(PRIME32_2 - 1));
+                let low = low ^ high.swap_bytes();
+                let (out_low, out_high) = widen(low, PRIME64_2);
+                let out_high = out_high.wrapping_add(high.wrapping_mul(PRIME64_2));
+                join(avalanche(out_low), avalanche(out_high))
+            } else if len >= 4 {
+                let seed = seed ^ (u64::from(low32(seed).swap_bytes()) << 32);
+                let first = read32(input, 0);
+                let last = read32(input, len - 4);
+                let joined = u64::from(first).wrapping_add(u64::from(last) << 32);
+                let flip = (key64(16) ^ key64(24)).wrapping_add(seed);
+                let (low, high) = widen(joined ^ flip, PRIME64_1.wrapping_add(len64 << 2));
+                let high = high.wrapping_add(low << 1);
+                let low = low ^ (high >> 3);
+                let low = (low ^ (low >> 35)).wrapping_mul(PRIME_MX2);
+                let low = low ^ (low >> 28);
+                join(low, avalanche(high))
+            } else if len > 0 {
                 let (first, middle, last) = (
                     *input.get_unchecked(0),
                     *input.get_unchecked(len >> 1),
@@ -259,74 +278,48 @@ pub(super) fn hash128(input: &[u8], seed: u64) -> u128 {
                     avalanche64(u64::from(combined_low) ^ flip_low),
                     avalanche64(u64::from(combined_high) ^ flip_high),
                 )
+            } else {
+                join(
+                    avalanche64(seed ^ key64(64) ^ key64(72)),
+                    avalanche64(seed ^ key64(80) ^ key64(88)),
+                )
             }
-            4..=8 => {
-                let seed = seed ^ (u64::from(low32(seed).swap_bytes()) << 32);
-                let first = read32(input, 0);
-                let last = read32(input, len - 4);
-                let joined = u64::from(first).wrapping_add(u64::from(last) << 32);
-                let flip = (key64(16) ^ key64(24)).wrapping_add(seed);
-                let (low, high) = widen(joined ^ flip, PRIME64_1.wrapping_add(len64 << 2));
-                let high = high.wrapping_add(low << 1);
-                let low = low ^ (high >> 3);
-                let low = (low ^ (low >> 35)).wrapping_mul(PRIME_MX2);
-                let low = low ^ (low >> 28);
-                join(low, avalanche(high))
-            }
-            9..=16 => {
-                let flip_low = (key64(32) ^ key64(40)).wrapping_sub(seed);
-                let flip_high = (key64(48) ^ key64(56)).wrapping_add(seed);
-                let first = read64(input, 0);
-                let last = read64(input, len - 8);
-                let (low, high) = widen(first ^ last ^ flip_low, PRIME64_1);
-                let low = low.wrapping_add((len64 - 1) << 54);
-                let last = last ^ flip_high;
-                let high = high
-                    .wrapping_add(last)
-                    .wrapping_add(u64::from(low32(last)) * u64::from(PRIME32_2 - 1));
-                let low = low ^ high.swap_bytes();
-                let (out_low, out_high) = widen(low, PRIME64_2);
-                let out_high = out_high.wrapping_add(high.wrapping_mul(PRIME64_2));
-                join(avalanche(out_low), avalanche(out_high))
-            }
-            17..=128 => {
-                let mut acc = (len64.wrapping_mul(PRIME64_1), 0);
-                if len > 32 {
-                    if len > 64 {
-                        if len > 96 {
-                            acc = mix32(acc, input, 48, len - 64, 96, seed);
-                        }
-                        acc = mix32(acc, input, 32, len - 48, 64, seed);
+        } else if len <= 128 {
+            let mut acc = (len64.wrapping_mul(PRIME64_1), 0);
+            if len > 32 {
+                if len > 64 {
+                    if len > 96 {
+                        acc = mix32(acc, input, 48, len - 64, 96, seed);
                     }
-                    acc = mix32(acc, input, 16, len - 32, 32, seed);
+                    acc = mix32(acc, input, 32, len - 48, 64, seed);
                 }
-                finish(mix32(acc, input, 0, len - 16, 0, seed))
+                acc = mix32(acc, input, 16, len - 32, 32, seed);
             }
-            _ => {
-                let mut acc = (len64.wrapping_mul(PRIME64_1), 0);
-                for round in 0..4 {
-                    acc = mix32(acc, input, 32 * round, 32 * round + 16, 32 * round, seed);
-                }
-                acc = (avalanche(acc.0), avalanche(acc.1));
-                for round in 4..len / 32 {
-                    acc = mix32(
-                        acc,
-                        input,
-                        32 * round,
-                        32 * round + 16,
-                        MID_START + 32 * (round - 4),
-                        seed,
-                    );
-                }
-                finish(mix32(
+            finish(mix32(acc, input, 0, len - 16, 0, seed))
+        } else {
+            let mut acc = (len64.wrapping_mul(PRIME64_1), 0);
+            for round in 0..4 {
+                acc = mix32(acc, input, 32 * round, 32 * round + 16, 32 * round, seed);
+            }
+            acc = (avalanche(acc.0), avalanche(acc.1));
+            for round in 4..len / 32 {
+                acc = mix32(
                     acc,
                     input,
-                    len - 16,
-                    len - 32,
-                    MID_LAST - 16,
-                    0u64.wrapping_sub(seed),
-                ))
+                    32 * round,
+                    32 * round + 16,
+                    MID_START + 32 * (round - 4),
+                    seed,
+                );
             }
+            finish(mix32(
+                acc,
+                input,
+                len - 16,
+                len - 32,
+                MID_LAST - 16,
+                0u64.wrapping_sub(seed),
+            ))
         }
     }
 }
