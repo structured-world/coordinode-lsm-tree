@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795433785899,
+  "lastUpdate": 1795550618367,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104398,6 +104398,90 @@ window.BENCHMARK_DATA = {
             "value": 321734.6573718296,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 18.0us | P99.9: 103.4us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "67cc695d1fd438929dc7c2829c05a6a360159b72",
+          "message": "ci(deps): bump cargo-bins/cargo-binstall from 1.27.0 to 1.28.0 (#1106)\n\nBumps\n[cargo-bins/cargo-binstall](https://github.com/cargo-bins/cargo-binstall)\nfrom 1.27.0 to 1.28.0.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/cargo-bins/cargo-binstall/releases\">cargo-bins/cargo-binstall's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v1.28.0</h2>\n<p><em>Binstall is a tool to fetch and install Rust-based executables as\nbinaries. It aims to be a drop-in replacement for <code>cargo\ninstall</code> in most cases. Install it today with <code>cargo install\ncargo-binstall</code>, from the binaries below, or if you already have\nit, upgrade with <code>cargo binstall cargo-binstall</code>.</em></p>\n<h4>In this release:</h4>\n<ul>\n<li>Release binaries are about 40% smaller (18.9 MB → 11.4 MB on x86_64\nLinux) (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2792\">#2792</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2797\">#2797</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2777\">#2777</a>)</li>\n<li>Automatically try <code>arm64</code>/<code>amd64</code> when\n<code>pkg-url</code> uses <code>{ target-arch }</code>, with no extra\nmetadata needed (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2126\">#2126</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2782\">#2782</a>)</li>\n<li>Support single binaries compressed without a tar: <code>pkg-fmt =\n&quot;gz&quot;</code>, <code>&quot;bz2&quot;</code>,\n<code>&quot;xz&quot;</code> and <code>&quot;zst&quot;</code> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2119\">#2119</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2785\">#2785</a>)</li>\n<li><code>bin-dir</code> can now name the directory holding the\nbinaries, which are then looked up inside it as <code>{ bin }{\nbinary-ext }</code> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/380\">#380</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2783\">#2783</a>)</li>\n<li>Guess <code>{ name }-v{ version }</code> and <code>{ name }-{\nversion }</code> GitHub release tags, as made by release-plz,\ncargo-release and release-please in workspaces, thank you <a\nhref=\"https://github.com/kixelated\"><code>@​kixelated</code></a> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2749\">#2749</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2752\">#2752</a>)</li>\n<li>Symlink aliases for installed binaries, via\n<code>[package.metadata.binstall.binary.NAME] aliases =\n[&quot;...&quot;]</code> or <code>--aliases BIN:ALIAS</code>, thank you\n<a href=\"https://github.com/ChrisJr404\"><code>@​ChrisJr404</code></a>\n(<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2643\">#2643</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2767\">#2767</a>)</li>\n<li>Add opt-in <code>--min-publish-age</code> (env\n<code>BINSTALL_MIN_PUBLISH_AGE</code>, e.g. <code>7 days</code>) to skip\nversions published too recently (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2757\">#2757</a>)</li>\n<li>Remember where the last install found the package, so updates\nusually need one or two requests instead of probing every guess (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/853\">#853</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2800\">#2800</a>)</li>\n<li>Keep <code>.crates2.json</code> in sync with\n<code>.crates.toml</code>, so tools that read it, such as cargo-update,\nsee binstall's installs (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/1552\">#1552</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2786\">#2786</a>)</li>\n<li>Detect Linux targets by running tiny probe executables instead of\nmatching version strings. This fixes glibc detection on Gentoo and also\ndetects hard-float ARM, multilib (e.g. i686 on x86_64) and qemu-binfmt\ntargets, thank you <a\nhref=\"https://github.com/passcod\"><code>@​passcod</code></a> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/1999\">#1999</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2582\">#2582</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2772\">#2772</a>)</li>\n<li>Resume downloads that drop partway with a <code>Range</code> request\ninstead of failing, thank you <a\nhref=\"https://github.com/passcod\"><code>@​passcod</code></a> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2641\">#2641</a>)</li>\n<li>Add <code>--no-default-features</code> and\n<code>--all-features</code> for the <code>cargo install</code> fallback,\nthank you <a href=\"https://github.com/zchee\"><code>@​zchee</code></a>\n(<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2458\">#2458</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2576\">#2576</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2768\">#2768</a>)</li>\n<li>Warn when an installed binary is shadowed by another one earlier in\n<code>PATH</code> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2054\">#2054</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2771\">#2771</a>)</li>\n<li>Warn when <code>--git</code> or <code>--manifest-path</code> ignores\nthe requested version requirement (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2358\">#2358</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2770\">#2770</a>)</li>\n</ul>\n<h4>Fixed</h4>\n<ul>\n<li>Reject bins that are symlinks, or sit under symlinked dirs, pointing\noutside the extracted package (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2745\">#2745</a>)</li>\n<li>Check that a quickinstall signature was made for this crate, version\nand target, not just that it is valid (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2773\">#2773</a>)</li>\n<li>Don't wait for GitHub API rate limits to reset; public repos fall\nback to plain HTTP checks instead. Together with the next fix, this\nstops cargo-update from looking hung (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2798\">#2798</a>)</li>\n<li>Only hold the install manifest lock while installing, so parallel\nbinstalls (as cargo-update runs them) no longer wait on each other's\nresolution; a message is printed while waiting for the lock (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2799\">#2799</a>)</li>\n<li>Retry HTTP 500 and 502 responses like other transient errors (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2796\">#2796</a>)</li>\n<li>Windows: when a symlink can't be created, copy the binary instead of\nmoving it, so the versioned binary is kept (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2746\">#2746</a>)</li>\n<li>Cancelling binstall (e.g. Ctrl-C) now kills the whole <code>cargo\ninstall</code> process tree, including rustc and build scripts (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2765\">#2765</a>)</li>\n<li>Fix building on illumos (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2758\">#2758</a>)</li>\n<li>Unix install script only prints each command when <code>CI</code> or\n<code>BINSTALL_DEBUG</code> is set, thank you <a\nhref=\"https://github.com/maia-yeager\"><code>@​maia-yeager</code></a> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2594\">#2594</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2766\">#2766</a>)</li>\n<li>Windows install one-liner passes <code>-UseBasicParsing</code> to\n<code>iwr</code> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2399\">#2399</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2769\">#2769</a>)</li>\n</ul>\n<h4>Other changes:</h4>\n<ul>\n<li>cargo-binstall now needs Rust 1.100 to build from source (was\n1.96.1), and the library crates moved to edition 2024 (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2756\">#2756</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2765\">#2765</a>)</li>\n<li>upgrade dependencies</li>\n</ul>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/4b6fa09d0d1ef9740a0c332e31b9ae336f97efa0\"><code>4b6fa09</code></a>\nrelease: cargo-binstall v1.28.0 (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2804\">#2804</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/f027dceb0f90c3371f26047a160578b8b4bdc877\"><code>f027dce</code></a>\nchore: release (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2751\">#2751</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/d7ae02b6617241d18acec0f24bbde41f695f0457\"><code>d7ae02b</code></a>\ndep: Upgrade transitive dependencies (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2803\">#2803</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/c8c9583424e7077fbbae668cba1c1db11bbdb342\"><code>c8c9583</code></a>\nfix: only hold the manifest lock while installing (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2799\">#2799</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/a14e8230da66e36d373704d54684d67d1acfc2ba\"><code>a14e823</code></a>\nfeat: try the pkg-url of the last install first when updating (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2800\">#2800</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/c47f61e73bafb2ad944d6f7995fe631826ec85dc\"><code>c47f61e</code></a>\nfix: stop waiting on GitHub API rate limits (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2798\">#2798</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/7ca0cdcbf53077dc257ec5e16b727b32740c2285\"><code>7ca0cdc</code></a>\nfeat(manifests): keep .crates2.json in sync with .crates.toml (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2786\">#2786</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/6eff33267b0ea27f5ea5841ff3b14dabf6834965\"><code>6eff332</code></a>\nfeat: Support single binaries compressed without a tar (gz/bz2/xz/zst)\n(<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2785\">#2785</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/07d0f554663bde8d2aaa505578268113e854f3c4\"><code>07d0f55</code></a>\nfeat: Let <code>bin-dir</code> name the dir holding the binaries (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2783\">#2783</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/a5786a8e82d850e1f3944732043b2328cf21d9d2\"><code>a5786a8</code></a>\nperf: Replace globwalker with glob in cargo-toml-workspace (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2797\">#2797</a>)</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/cargo-bins/cargo-binstall/compare/5885714d0a40a14b2535c6ffc051fd8e49aa9665...4b6fa09d0d1ef9740a0c332e31b9ae336f97efa0\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=cargo-bins/cargo-binstall&package-manager=github_actions&previous-version=1.27.0&new-version=1.28.0)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-11-24T18:35:12Z",
+          "tree_id": "3047fcad7b81ebf53bbd31d545d19751ca3ef623",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/67cc695d1fd438929dc7c2829c05a6a360159b72"
+        },
+        "date": 1795550617099,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 147980.1551788517,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.9us | P99.9: 30.6us\nthreads: 1 | elapsed: 3.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3066461.677792122,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 905821.4002724356,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.2us | P99.9: 12.2us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 490752.58825798216,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.8us | P99.9: 23.3us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3105690.2254440724,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 320393.0951584249,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.1us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 194866.9661782979,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 9.6us | P99.9: 20.9us\nthreads: 1 | elapsed: 1.03s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 952399.2157697232,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.2us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1067936.9078466722,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 462296.4203456645,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.9us | P99.9: 26.7us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
