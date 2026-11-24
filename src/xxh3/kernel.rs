@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! The stripe loop of xxh3's long inputs, in one kernel per instruction set,
-//! chosen once per process from what the CPU runs.
+//! The stripe loop of xxh3's long inputs, in one kernel per instruction set.
 //!
 //! Every kernel computes the accumulators xxh3 defines, bit for bit: they
 //! differ only in how many lanes one instruction covers. The scalar kernel is
 //! the reference the others are tested against. A kernel's entry points each
 //! run a whole pass over their input, compiled with its instruction set and
-//! the stripe, block and scramble steps inlined in it: a hash makes one
-//! indirect call, and its loop none.
+//! the stripe, block and scramble steps inlined in it. The target's baseline
+//! kernel ([`baseline`]) is called directly; on x86-64 a wider one, found once
+//! per process, is reached through `Kernel::wide`.
 
 use super::{LAST_STRIPE_BACK, PRIME32_1, SECRET_LEN, STRIPE_LEN, STRIPES_PER_BLOCK};
 
@@ -23,8 +23,9 @@ const SCRAMBLE_AT: usize = SECRET_LEN - STRIPE_LEN;
 ///
 /// Every function takes raw pointers its caller keeps in bounds, as its
 /// safety section says, and is `unsafe` because a SIMD kernel also needs its
-/// instruction set present: [`Kernel::get`] hands out only a kernel whose
+/// instruction set present: `Kernel::wide` hands out only a kernel whose
 /// instruction set the CPU has.
+#[cfg(any(test, target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 pub(super) struct Kernel {
     /// Accumulates `stripes` stripes from `input` into `acc`, `done` stripes
@@ -56,7 +57,9 @@ pub(super) struct Kernel {
     /// # Safety
     ///
     /// `stripe` is valid for [`STRIPE_LEN`] bytes and `secret` for
-    /// [`SECRET_LEN`].
+    /// [`SECRET_LEN`]. A stream's last stripe is short, so the baseline
+    /// kernel takes it; the tests check every kernel's.
+    #[cfg(test)]
     pub(super) last: unsafe fn(acc: &mut Acc, stripe: *const u8, secret: *const u8),
 }
 
@@ -136,16 +139,10 @@ macro_rules! entry_points {
     };
 }
 
+#[cfg(any(test, target_arch = "x86_64"))]
 impl Kernel {
-    /// The scalar kernel, which every CPU runs: the one taken where no SIMD
-    /// kernel exists, and the reference every SIMD kernel is tested against.
-    #[cfg(any(
-        test,
-        not(any(
-            target_arch = "x86_64",
-            all(target_arch = "aarch64", target_endian = "little")
-        ))
-    ))]
+    /// The scalar kernel, the reference every SIMD kernel is tested against.
+    #[cfg(test)]
     pub(super) const SCALAR: Self = Self {
         consume: scalar::consume,
         long: scalar::long,
@@ -153,25 +150,11 @@ impl Kernel {
     };
 
     /// The widest kernel this CPU runs, found on the first call and kept.
+    #[cfg(target_arch = "x86_64")]
     #[must_use]
     #[inline]
-    pub(super) fn get() -> Self {
-        #[cfg(target_arch = "x86_64")]
-        {
-            x86::active()
-        }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        {
-            // NEON is part of every ARMv8-A CPU.
-            neon::NEON
-        }
-        #[cfg(not(any(
-            target_arch = "x86_64",
-            all(target_arch = "aarch64", target_endian = "little")
-        )))]
-        {
-            Self::SCALAR
-        }
+    pub(super) fn wide() -> Self {
+        x86::active()
     }
 
     /// Every kernel this CPU runs, the scalar one first, for the tests that
@@ -196,6 +179,69 @@ impl Kernel {
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         kernels.push(("neon", neon::NEON));
         kernels
+    }
+}
+
+/// The kernel every CPU of the target runs, called directly so it inlines
+/// into the hash: SSE2 on x86-64 and NEON on `AArch64`, both part of their
+/// architecture's baseline, the scalar one elsewhere.
+pub(super) mod baseline {
+    use super::Acc;
+
+    #[cfg(target_arch = "x86_64")]
+    use super::x86::sse2 as chosen;
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    use super::neon as chosen;
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )))]
+    use super::scalar as chosen;
+
+    /// As [`super::Kernel::consume`].
+    ///
+    /// # Safety
+    ///
+    /// As [`super::Kernel::consume`]; the instruction set is the target's.
+    #[inline]
+    pub(in super::super) unsafe fn consume(
+        acc: &mut Acc,
+        input: *const u8,
+        stripes: usize,
+        done: usize,
+        secret: *const u8,
+    ) -> usize {
+        // SAFETY: as the caller keeps; every CPU of the target runs it.
+        unsafe { chosen::consume(acc, input, stripes, done, secret) }
+    }
+
+    /// As [`super::Kernel::long`].
+    ///
+    /// # Safety
+    ///
+    /// As [`super::Kernel::long`]; the instruction set is the target's.
+    #[inline]
+    pub(in super::super) unsafe fn long(
+        acc: &mut Acc,
+        input: *const u8,
+        len: usize,
+        secret: *const u8,
+    ) {
+        // SAFETY: as the caller keeps; every CPU of the target runs it.
+        unsafe { chosen::long(acc, input, len, secret) }
+    }
+
+    /// As [`super::Kernel::last`].
+    ///
+    /// # Safety
+    ///
+    /// As [`super::Kernel::last`]; the instruction set is the target's.
+    #[inline]
+    pub(in super::super) unsafe fn last(acc: &mut Acc, stripe: *const u8, secret: *const u8) {
+        // SAFETY: as the caller keeps; every CPU of the target runs it.
+        unsafe { chosen::last(acc, stripe, secret) }
     }
 }
 
@@ -510,11 +556,13 @@ mod x86 {
     pub(super) static SSE2: Kernel = Kernel {
         consume: sse2::consume,
         long: sse2::long,
+        #[cfg(test)]
         last: sse2::last,
     };
     pub(super) static AVX2: Kernel = Kernel {
         consume: avx2::consume,
         long: avx2::long,
+        #[cfg(test)]
         last: avx2::last,
     };
 
@@ -553,9 +601,10 @@ mod x86 {
 /// The NEON kernel: 16 bytes a lane.
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 mod neon {
+    #[cfg(test)]
+    use super::Kernel;
     use super::{
-        Acc, Kernel, LAST_STRIPE_BACK, PRIME32_1, SCRAMBLE_AT, SECRET_LEN, STRIPE_LEN,
-        STRIPES_PER_BLOCK,
+        Acc, LAST_STRIPE_BACK, PRIME32_1, SCRAMBLE_AT, SECRET_LEN, STRIPE_LEN, STRIPES_PER_BLOCK,
     };
 
     entry_points!(#[target_feature(enable = "neon")]);
@@ -688,6 +737,7 @@ mod neon {
         store_acc!(acc, lanes);
     }
 
+    #[cfg(test)]
     pub(super) const NEON: Kernel = Kernel {
         consume,
         long,

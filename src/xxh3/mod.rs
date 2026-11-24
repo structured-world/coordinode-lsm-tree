@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! xxh3, 64 and 128 bits, through the widest kernel the CPU runs.
+//! xxh3, 64 and 128 bits.
 //!
-//! An input longer than 240 bytes runs xxh3's stripe loop, which a SIMD
-//! kernel covers 16 or 32 bytes per instruction; one chosen when the crate is
-//! compiled can only use what every CPU of the target has (SSE2 on x86-64).
-//! Here the loop runs through [`kernel::Kernel::get`], found at run time.
-//! Inputs up to 240 bytes take xxh3's short paths, which no vector speeds up,
-//! and one-shot inputs up to 1 KiB the baseline loop, both from
-//! `xxhash-rust`. Every digest is the one xxh3 defines, so nothing a file
-//! holds depends on the CPU that wrote it.
+//! Inputs up to 240 bytes take xxh3's short paths ([`short`]), which no
+//! vector speeds up. Longer ones run its stripe loop through the kernel
+//! every CPU of the target runs (SSE2 on x86-64, NEON on `AArch64`), called
+//! directly; on x86-64 an input of at least `WIDE_MIN` bytes runs the
+//! widest kernel the CPU has, found once per process. Every digest is the
+//! one xxh3 defines, so nothing a file holds depends on the CPU that wrote
+//! it.
 
 mod kernel;
+mod short;
 
-use kernel::{Acc, Kernel};
+use kernel::Acc;
+#[cfg(target_arch = "x86_64")]
+use kernel::Kernel;
 
 #[cfg(test)]
 #[expect(clippy::indexing_slicing, reason = "test code")]
@@ -28,11 +30,11 @@ const SECRET_LEN: usize = 192;
 const STRIPES_PER_BLOCK: usize = (SECRET_LEN - STRIPE_LEN) / 8;
 /// The longest input xxh3's short paths take.
 const MID_SIZE_MAX: usize = 240;
-/// The longest input a one-shot hash leaves to `xxhash-rust`'s own loop,
-/// compiled for the baseline CPU: a few stripes gain little from a wider
-/// kernel, and the 256-bit multiplies of a short hash on every record read
-/// slow the core for what runs after it.
-const INLINE_MAX: usize = 1024;
+/// The shortest run of input the wide kernel takes: below it the 256-bit
+/// multiplies cost the core more clock, for what runs after the hash too,
+/// than their wider loop saves, as on a table block or a record.
+#[cfg(target_arch = "x86_64")]
+const WIDE_MIN: usize = 64 * 1024;
 /// Where the secret of the last stripe starts, counted back from the end.
 const LAST_STRIPE_BACK: usize = 7;
 /// Where the secret of the final merge starts.
@@ -78,40 +80,58 @@ const DEFAULT_SECRET: [u8; SECRET_LEN] = [
 
 /// The xxh3-64 of `input`.
 #[must_use]
+#[inline]
 pub(crate) fn hash64(input: &[u8]) -> u64 {
-    if input.len() <= INLINE_MAX {
-        return xxhash_rust::xxh3::xxh3_64(input);
+    if input.len() <= MID_SIZE_MAX {
+        return short::hash64(input, 0);
     }
-    let acc = long_acc(Kernel::get(), input, &DEFAULT_SECRET);
-    merge64(&acc, &DEFAULT_SECRET, input.len() as u64)
+    merge64(
+        &long_acc(input, &DEFAULT_SECRET),
+        &DEFAULT_SECRET,
+        input.len() as u64,
+    )
 }
 
 /// The xxh3-64 of `input` under `seed`.
 #[must_use]
+#[inline]
 pub(crate) fn hash64_with_seed(input: &[u8], seed: u64) -> u64 {
-    if input.len() <= INLINE_MAX {
-        return xxhash_rust::xxh3::xxh3_64_with_seed(input, seed);
+    if input.len() <= MID_SIZE_MAX {
+        return short::hash64(input, seed);
+    }
+    if seed == 0 {
+        return hash64(input);
     }
     let secret = secret_for(seed);
-    let acc = long_acc(Kernel::get(), input, &secret);
-    merge64(&acc, &secret, input.len() as u64)
+    merge64(&long_acc(input, &secret), &secret, input.len() as u64)
 }
 
 /// The xxh3-128 of `input`.
 #[must_use]
+#[inline]
 pub(crate) fn hash128(input: &[u8]) -> u128 {
-    hash128_with_seed(input, 0)
+    if input.len() <= MID_SIZE_MAX {
+        return short::hash128(input, 0);
+    }
+    merge128(
+        &long_acc(input, &DEFAULT_SECRET),
+        &DEFAULT_SECRET,
+        input.len() as u64,
+    )
 }
 
 /// The xxh3-128 of `input` under `seed`.
 #[must_use]
+#[inline]
 pub(crate) fn hash128_with_seed(input: &[u8], seed: u64) -> u128 {
-    if input.len() <= INLINE_MAX {
-        return xxhash_rust::xxh3::xxh3_128_with_seed(input, seed);
+    if input.len() <= MID_SIZE_MAX {
+        return short::hash128(input, seed);
+    }
+    if seed == 0 {
+        return hash128(input);
     }
     let secret = secret_for(seed);
-    let acc = long_acc(Kernel::get(), input, &secret);
-    merge128(&acc, &secret, input.len() as u64)
+    merge128(&long_acc(input, &secret), &secret, input.len() as u64)
 }
 
 /// The secret `seed` derives from the default one: the default itself for
@@ -129,13 +149,47 @@ fn secret_for(seed: u64) -> [u8; SECRET_LEN] {
 }
 
 /// The accumulators of `input`, longer than [`MID_SIZE_MAX`], under `secret`.
-fn long_acc(kernel: Kernel, input: &[u8], secret: &[u8; SECRET_LEN]) -> Acc {
+#[inline]
+fn long_acc(input: &[u8], secret: &[u8; SECRET_LEN]) -> Acc {
     debug_assert!(input.len() > MID_SIZE_MAX);
     let mut acc = INITIAL_ACC;
     // SAFETY: `input` holds its `len() > STRIPE_LEN` bytes and `secret` its
-    // 192; the kernel is one the CPU runs.
-    unsafe { (kernel.long)(&mut acc, input.as_ptr(), input.len(), secret.as_ptr()) };
+    // 192; the wide kernel is one the CPU runs, the baseline one every CPU
+    // of the target.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        if input.len() >= WIDE_MIN {
+            (Kernel::wide().long)(&mut acc, input.as_ptr(), input.len(), secret.as_ptr());
+            return acc;
+        }
+        kernel::baseline::long(&mut acc, input.as_ptr(), input.len(), secret.as_ptr());
+    }
     acc
+}
+
+/// Accumulates `stripes` stripes from `input` as [`kernel::baseline::consume`]
+/// does: on x86-64 a run of at least `WIDE_MIN` bytes through the wide
+/// kernel, which leaves the same accumulators.
+///
+/// # Safety
+///
+/// As [`kernel::baseline::consume`].
+#[inline]
+unsafe fn consume(
+    acc: &mut Acc,
+    input: *const u8,
+    stripes: usize,
+    done: usize,
+    secret: &[u8; SECRET_LEN],
+) -> usize {
+    // SAFETY: as the caller keeps; the wide kernel is one the CPU runs.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        if stripes * STRIPE_LEN >= WIDE_MIN {
+            return (Kernel::wide().consume)(acc, input, stripes, done, secret.as_ptr());
+        }
+        kernel::baseline::consume(acc, input, stripes, done, secret.as_ptr())
+    }
 }
 
 /// The little-endian `u64` at `at` of `secret`.
@@ -268,7 +322,6 @@ impl Hasher {
             *buffered += input.len();
             return;
         }
-        let kernel = Kernel::get();
         let secret = seeded.as_ref().unwrap_or(&DEFAULT_SECRET);
         if *buffered > 0 {
             // Fill the buffer and accumulate it: more input follows, so its
@@ -278,12 +331,12 @@ impl Hasher {
             // SAFETY: the whole buffer is written now, its four stripes; the
             // secret holds its 192 bytes and `done` stays below a block.
             *done = unsafe {
-                (kernel.consume)(
+                consume(
                     acc,
                     buffer.as_ptr().cast::<u8>(),
                     BUFFER_LEN / STRIPE_LEN,
                     *done,
-                    secret.as_ptr(),
+                    secret,
                 )
             };
             *buffered = 0;
@@ -295,15 +348,7 @@ impl Hasher {
             // would.
             let len = (input.len() - 1) / BUFFER_LEN * BUFFER_LEN;
             // SAFETY: `len < input.len()` bytes, whole stripes; as above.
-            *done = unsafe {
-                (kernel.consume)(
-                    acc,
-                    input.as_ptr(),
-                    len / STRIPE_LEN,
-                    *done,
-                    secret.as_ptr(),
-                )
-            };
+            *done = unsafe { consume(acc, input.as_ptr(), len / STRIPE_LEN, *done, secret) };
             // The last stripe accumulated, for a digest whose own last
             // stripe reaches back into it.
             let (consumed, rest) = input.split_at(len);
@@ -318,7 +363,6 @@ impl Hasher {
 
     /// The accumulators of everything hashed, as a digest of it finds them.
     fn long_acc(&self) -> Acc {
-        let kernel = Kernel::get();
         let secret = self.secret();
         let mut acc = self.acc;
         let buffered = self.buffered();
@@ -327,14 +371,14 @@ impl Hasher {
             // SAFETY: the buffered bytes hold `stripes` whole stripes and end
             // with the last one; the secret holds its 192 bytes.
             unsafe {
-                (kernel.consume)(
+                kernel::baseline::consume(
                     &mut acc,
                     buffered.as_ptr(),
                     stripes,
                     self.done,
                     secret.as_ptr(),
                 );
-                (kernel.last)(
+                kernel::baseline::last(
                     &mut acc,
                     buffered.as_ptr().add(buffered.len() - STRIPE_LEN),
                     secret.as_ptr(),
@@ -359,7 +403,7 @@ impl Hasher {
             head.copy_from_slice(old);
             tail.copy_from_slice(buffered);
             // SAFETY: `stripe` is 64 bytes; the secret holds its 192.
-            unsafe { (kernel.last)(&mut acc, stripe.as_ptr(), secret.as_ptr()) };
+            unsafe { kernel::baseline::last(&mut acc, stripe.as_ptr(), secret.as_ptr()) };
         }
         acc
     }
@@ -368,7 +412,7 @@ impl Hasher {
     #[must_use]
     pub(crate) fn digest(&self) -> u64 {
         if self.total <= MID_SIZE_MAX as u64 {
-            return xxhash_rust::xxh3::xxh3_64_with_seed(self.buffered(), self.seed);
+            return short::hash64(self.buffered(), self.seed);
         }
         merge64(&self.long_acc(), self.secret(), self.total)
     }
@@ -377,7 +421,7 @@ impl Hasher {
     #[must_use]
     pub(crate) fn digest128(&self) -> u128 {
         if self.total <= MID_SIZE_MAX as u64 {
-            return xxhash_rust::xxh3::xxh3_128_with_seed(self.buffered(), self.seed);
+            return short::hash128(self.buffered(), self.seed);
         }
         merge128(&self.long_acc(), self.secret(), self.total)
     }

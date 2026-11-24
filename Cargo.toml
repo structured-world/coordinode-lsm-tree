@@ -268,12 +268,11 @@ tempfile = { version = "3.20.0", optional = true }
 # Only the std build reads varints through it; without std the crate's own
 # `io` varints serve.
 varint-rs = { version = "2.2.1", default-features = false, optional = true }
-xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # CRC32C (Castagnoli) for the optional `Crc32c` checksum algorithm.
 # Hardware-accelerated (SSE4.2 `_mm_crc32` on x86, CRC32 instructions on
 # ARM) with a safe scalar fallback; runtime-detected by the crate. Only
-# pulled in behind the `crc32c` feature — the default `Xxh3_64` algorithm
-# needs only `xxhash-rust`.
+# pulled in behind the `crc32c` feature; the default `Xxh3_64` algorithm is
+# the crate's own.
 crc32c = { version = "0.6", optional = true }
 # The 0.11 surface we depend on:
 #   - aes_gcm::aead::{AeadInOut, Generate, Nonce, Tag}
@@ -365,6 +364,9 @@ test-log = "0.2.18"
 # reach consumers, so none of them pays for `fastrand` (and the `std` it
 # forces) for a capability they do not use.
 structured-zstd = { version = "0.4.3", features = ["dict-builder", "lsm"] }
+# The reference the crate's own xxh3 is checked against, digest for digest,
+# and the fixtures that stamp checksums independently of it.
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

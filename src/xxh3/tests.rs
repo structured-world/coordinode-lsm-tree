@@ -37,7 +37,32 @@ fn every_kernel_digests_as_xxh3_defines() {
             let input = &data[..len];
             for seed in SEEDS {
                 let secret = super::secret_for(seed);
-                let acc = super::long_acc(kernel, input, &secret);
+                let mut acc = super::INITIAL_ACC;
+                // SAFETY: `input` holds `len > STRIPE_LEN` bytes, the secret
+                // its 192; `available` lists only kernels this CPU runs.
+                unsafe { (kernel.long)(&mut acc, input.as_ptr(), len, secret.as_ptr()) };
+                // The streaming steps, run over the same input, reach the
+                // same accumulators: a stream mixes kernels by run length.
+                let mut streamed = super::INITIAL_ACC;
+                // SAFETY: as above; the stripes end before the last 64 bytes.
+                unsafe {
+                    (kernel.consume)(
+                        &mut streamed,
+                        input.as_ptr(),
+                        (len - 1) / super::STRIPE_LEN,
+                        0,
+                        secret.as_ptr(),
+                    );
+                    (kernel.last)(
+                        &mut streamed,
+                        input.as_ptr().add(len - super::STRIPE_LEN),
+                        secret.as_ptr(),
+                    );
+                }
+                assert_eq!(
+                    streamed, acc,
+                    "{name}: streamed, {len} bytes, seed {seed:#x}"
+                );
                 assert_eq!(
                     super::merge128(&acc, &secret, len as u64),
                     xxhash_rust::xxh3::xxh3_128_with_seed(input, seed),
@@ -97,8 +122,9 @@ fn a_seed_derives_its_own_secret_and_zero_keeps_the_default() {
 
 /// Hashing input in parts gives the digest of the parts joined, whatever the
 /// cut: parts that fill the buffer exactly, overflow it by one, cross a
-/// block, and come one byte at a time; and digests taken midway do not
-/// disturb the ones after.
+/// block, come one byte at a time, or one run long enough for the wide
+/// kernel before the baseline one takes the rest; and digests taken midway
+/// do not disturb the ones after.
 #[test]
 fn streamed_digests_equal_the_digest_of_the_whole() {
     let data = corpus(70_000);
@@ -113,6 +139,7 @@ fn streamed_digests_equal_the_digest_of_the_whole() {
         &[1_000, 24, 1_025],
         &[5_000],
         &[17, 4_096, 3],
+        &[66_000, 1_000],
     ];
     for seed in SEEDS {
         for pattern in cuts {
