@@ -195,8 +195,17 @@ macro_rules! long_loop {
         // macros read 64 bytes at each.
         for block in 0..whole {
             let at = unsafe { $input.add(block * STRIPES_PER_BLOCK * STRIPE_LEN) };
-            for stripe in 0..STRIPES_PER_BLOCK {
+            // Four stripes a turn: the block's 16 in four, the loop's
+            // counter and branch a quarter as often.
+            for quad in 0..STRIPES_PER_BLOCK / 4 {
+                let stripe = quad * 4;
                 let (data, key) = unsafe { (at.add(stripe * STRIPE_LEN), $secret.add(stripe * 8)) };
+                accumulate!($lanes, data, key);
+                let (data, key) = unsafe { (data.add(STRIPE_LEN), key.add(8)) };
+                accumulate!($lanes, data, key);
+                let (data, key) = unsafe { (data.add(STRIPE_LEN), key.add(8)) };
+                accumulate!($lanes, data, key);
+                let (data, key) = unsafe { (data.add(STRIPE_LEN), key.add(8)) };
                 accumulate!($lanes, data, key);
             }
             scramble!($lanes, $secret);

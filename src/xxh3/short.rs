@@ -198,19 +198,31 @@ pub(super) fn hash64(input: &[u8], seed: u64) -> u64 {
             acc = acc.wrapping_add(mix16(input, len - 16, 16, seed));
             avalanche(acc)
         } else {
-            let mut acc = len64.wrapping_mul(PRIME64_1);
-            for round in 0..8 {
-                acc = acc.wrapping_add(mix16(input, 16 * round, 16 * round, seed));
-            }
-            acc = avalanche(acc);
-            for round in 8..len / 16 {
-                acc =
-                    acc.wrapping_add(mix16(input, 16 * round, 16 * (round - 8) + MID_START, seed));
-            }
-            acc = acc.wrapping_add(mix16(input, len - 16, MID_LAST, seed));
-            avalanche(acc)
+            mid64(input, seed)
         }
     }
+}
+
+/// [`hash64`] of 129 to 240 bytes: out of line, so the paths up to 128
+/// bytes inline into a caller without this loop.
+#[inline(never)]
+fn mid64(input: &[u8], seed: u64) -> u64 {
+    let len = input.len();
+    debug_assert!((129..=MID_SIZE_MAX).contains(&len));
+    let mut acc = (len as u64).wrapping_mul(PRIME64_1);
+    // SAFETY: every round reads 16 bytes within the first `len / 16 * 16`,
+    // and the last the final 16.
+    unsafe {
+        for round in 0..8 {
+            acc = acc.wrapping_add(mix16(input, 16 * round, 16 * round, seed));
+        }
+        acc = avalanche(acc);
+        for round in 8..len / 16 {
+            acc = acc.wrapping_add(mix16(input, 16 * round, 16 * (round - 8) + MID_START, seed));
+        }
+        acc = acc.wrapping_add(mix16(input, len - 16, MID_LAST, seed));
+    }
+    avalanche(acc)
 }
 
 /// The xxh3-128 of `input`, at most [`MID_SIZE_MAX`] bytes, under `seed`.
@@ -219,16 +231,6 @@ pub(super) fn hash128(input: &[u8], seed: u64) -> u128 {
     let len = input.len();
     debug_assert!(len <= MID_SIZE_MAX);
     let len64 = len as u64;
-    let join = |low: u64, high: u64| u128::from(low) | (u128::from(high) << 64);
-    // The 17 to 240 byte paths' final mix of their 128-bit state.
-    let finish = |(low, high): (u64, u64)| {
-        let out_low = low.wrapping_add(high);
-        let out_high = low
-            .wrapping_mul(PRIME64_1)
-            .wrapping_add(high.wrapping_mul(PRIME64_4))
-            .wrapping_add(len64.wrapping_sub(seed).wrapping_mul(PRIME64_2));
-        join(avalanche(out_low), 0u64.wrapping_sub(avalanche(out_high)))
-    };
     // SAFETY (every read below): each branch reads only offsets its length
     // bound keeps within `input`.
     // Longest bounds first, as in `hash64`.
@@ -295,31 +297,61 @@ pub(super) fn hash128(input: &[u8], seed: u64) -> u128 {
                 }
                 acc = mix32(acc, input, 16, len - 32, 32, seed);
             }
-            finish(mix32(acc, input, 0, len - 16, 0, seed))
+            finish128(mix32(acc, input, 0, len - 16, 0, seed), len64, seed)
         } else {
-            let mut acc = (len64.wrapping_mul(PRIME64_1), 0);
-            for round in 0..4 {
-                acc = mix32(acc, input, 32 * round, 32 * round + 16, 32 * round, seed);
-            }
-            acc = (avalanche(acc.0), avalanche(acc.1));
-            for round in 4..len / 32 {
-                acc = mix32(
-                    acc,
-                    input,
-                    32 * round,
-                    32 * round + 16,
-                    MID_START + 32 * (round - 4),
-                    seed,
-                );
-            }
-            finish(mix32(
-                acc,
-                input,
-                len - 16,
-                len - 32,
-                MID_LAST - 16,
-                0u64.wrapping_sub(seed),
-            ))
+            mid128(input, seed)
         }
     }
+}
+
+/// [`hash128`] of 129 to 240 bytes, out of line as [`mid64`] is.
+#[inline(never)]
+fn mid128(input: &[u8], seed: u64) -> u128 {
+    let len = input.len();
+    debug_assert!((129..=MID_SIZE_MAX).contains(&len));
+    let mut acc = ((len as u64).wrapping_mul(PRIME64_1), 0);
+    // SAFETY: every round reads 32 bytes within the first `len / 32 * 32`,
+    // and the last the final 32.
+    unsafe {
+        for round in 0..4 {
+            acc = mix32(acc, input, 32 * round, 32 * round + 16, 32 * round, seed);
+        }
+        acc = (avalanche(acc.0), avalanche(acc.1));
+        for round in 4..len / 32 {
+            acc = mix32(
+                acc,
+                input,
+                32 * round,
+                32 * round + 16,
+                MID_START + 32 * (round - 4),
+                seed,
+            );
+        }
+        acc = mix32(
+            acc,
+            input,
+            len - 16,
+            len - 32,
+            MID_LAST - 16,
+            0u64.wrapping_sub(seed),
+        );
+    }
+    finish128(acc, len as u64, seed)
+}
+
+/// The two halves of a 128-bit digest.
+#[inline]
+fn join(low: u64, high: u64) -> u128 {
+    u128::from(low) | (u128::from(high) << 64)
+}
+
+/// The 17 to 240 byte paths' final mix of their 128-bit state.
+#[inline]
+fn finish128((low, high): (u64, u64), len: u64, seed: u64) -> u128 {
+    let out_low = low.wrapping_add(high);
+    let out_high = low
+        .wrapping_mul(PRIME64_1)
+        .wrapping_add(high.wrapping_mul(PRIME64_4))
+        .wrapping_add(len.wrapping_sub(seed).wrapping_mul(PRIME64_2));
+    join(avalanche(out_low), 0u64.wrapping_sub(avalanche(out_high)))
 }
