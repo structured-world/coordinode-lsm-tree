@@ -118,9 +118,19 @@ macro_rules! entry_points {
             };
         }
 
+    };
+}
+
+/// A SIMD kernel's `long`: one pass with the accumulators held in vectors
+/// from the first stripe to the last, over its module's `load_acc!`,
+/// `accumulate!`, `scramble!` and `store_acc!`, with `$attr` (its
+/// `#[target_feature]`) on it.
+macro_rules! register_long {
+    ($(#[$attr:meta])*) => {
         /// # Safety
         ///
         /// As `Kernel::long`, and the CPU runs this instruction set.
+        #[inline]
         $(#[$attr])*
         pub(in super::super) unsafe fn long(
             acc: &mut Acc,
@@ -129,12 +139,35 @@ macro_rules! entry_points {
             secret: *const u8,
         ) {
             debug_assert!(len >= STRIPE_LEN);
-            // SAFETY: every stripe but the last whole one lies within `len`,
-            // and the last one is its final 64 bytes.
-            unsafe {
-                consume(acc, input, (len - 1) / STRIPE_LEN, 0, secret);
-                last(acc, input.add(len - STRIPE_LEN), secret);
+            let stripes_n = (len - 1) / STRIPE_LEN;
+            let whole = stripes_n / STRIPES_PER_BLOCK;
+            let mut lanes = load_acc!(acc);
+            // SAFETY (every `add` below): every stripe but the last whole one
+            // lies within `len`, whole blocks first, and the last one is its
+            // final 64 bytes; a stripe's secret starts at most 8 * 15 bytes in
+            // and the last one's at SECRET_LEN - 64 - 7, all within the
+            // secret. The macros read 64 bytes at each.
+            for block in 0..whole {
+                let at = unsafe { input.add(block * STRIPES_PER_BLOCK * STRIPE_LEN) };
+                for stripe in 0..STRIPES_PER_BLOCK {
+                    let (data, key) = unsafe { (at.add(stripe * STRIPE_LEN), secret.add(stripe * 8)) };
+                    accumulate!(lanes, data, key);
+                }
+                scramble!(lanes, secret);
             }
+            let at = unsafe { input.add(whole * STRIPES_PER_BLOCK * STRIPE_LEN) };
+            for stripe in 0..stripes_n - whole * STRIPES_PER_BLOCK {
+                let (data, key) = unsafe { (at.add(stripe * STRIPE_LEN), secret.add(stripe * 8)) };
+                accumulate!(lanes, data, key);
+            }
+            let (data, key) = unsafe {
+                (
+                    input.add(len - STRIPE_LEN),
+                    secret.add(SECRET_LEN - STRIPE_LEN - LAST_STRIPE_BACK),
+                )
+            };
+            accumulate!(lanes, data, key);
+            store_acc!(acc, lanes);
         }
     };
 }
@@ -265,6 +298,24 @@ mod scalar {
 
     entry_points!();
 
+    /// # Safety
+    ///
+    /// As `Kernel::long`.
+    pub(in super::super) unsafe fn long(
+        acc: &mut Acc,
+        input: *const u8,
+        len: usize,
+        secret: *const u8,
+    ) {
+        debug_assert!(len >= STRIPE_LEN);
+        // SAFETY: every stripe but the last whole one lies within `len`, and
+        // the last one is its final 64 bytes.
+        unsafe {
+            consume(acc, input, (len - 1) / STRIPE_LEN, 0, secret);
+            last(acc, input.add(len - STRIPE_LEN), secret);
+        }
+    }
+
     /// The little-endian `u64` at `at`.
     ///
     /// # Safety
@@ -368,10 +419,12 @@ mod x86 {
     /// inlined where `#[inline(always)]` may not join `#[target_feature]`.
     macro_rules! simd_kernel {
         (
+            $(#[$mod_attr:meta])*
             $name:ident, $feature:literal, $vec:ty, $width:literal,
             $load:ident, $store:ident, $add:ident, $mul:ident, $xor:ident,
             $srli:ident, $slli:ident, $shuffle:ident, $set1:ident
         ) => {
+            $(#[$mod_attr])*
             pub(super) mod $name {
                 use super::*;
 
@@ -447,6 +500,7 @@ mod x86 {
                 }
 
                 entry_points!(#[target_feature(enable = $feature)]);
+                register_long!(#[target_feature(enable = $feature)]);
 
                 /// Accumulates `stripes` stripes from `input` into `acc`, the
                 /// secret of each starting 8 bytes after the previous one's.
@@ -539,6 +593,14 @@ mod x86 {
         _mm_set1_epi32
     );
     simd_kernel!(
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "a stream's last stripe is short and goes to the baseline kernel; \
+                          the tests check this one's"
+            )
+        )]
         avx2,
         "avx2",
         __m256i,
@@ -736,6 +798,8 @@ mod neon {
         }
         store_acc!(acc, lanes);
     }
+
+    register_long!(#[target_feature(enable = "neon")]);
 
     #[cfg(test)]
     pub(super) const NEON: Kernel = Kernel {

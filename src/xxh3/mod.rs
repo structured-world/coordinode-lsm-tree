@@ -78,18 +78,14 @@ const DEFAULT_SECRET: [u8; SECRET_LEN] = [
     0x45, 0xcb, 0x3a, 0x8f, 0x95, 0x16, 0x04, 0x28, 0xaf, 0xd7, 0xfb, 0xca, 0xbb, 0x4b, 0x40, 0x7e,
 ];
 
+// The short paths inline into their callers; the long ones stay out of
+// line, so a short hash pays no frame for the long path's state.
+
 /// The xxh3-64 of `input`.
 #[must_use]
 #[inline]
 pub(crate) fn hash64(input: &[u8]) -> u64 {
-    if input.len() <= MID_SIZE_MAX {
-        return short::hash64(input, 0);
-    }
-    merge64(
-        &long_acc(input, &DEFAULT_SECRET),
-        &DEFAULT_SECRET,
-        input.len() as u64,
-    )
+    hash64_with_seed(input, 0)
 }
 
 /// The xxh3-64 of `input` under `seed`.
@@ -99,25 +95,14 @@ pub(crate) fn hash64_with_seed(input: &[u8], seed: u64) -> u64 {
     if input.len() <= MID_SIZE_MAX {
         return short::hash64(input, seed);
     }
-    if seed == 0 {
-        return hash64(input);
-    }
-    let secret = secret_for(seed);
-    merge64(&long_acc(input, &secret), &secret, input.len() as u64)
+    long64(input, seed)
 }
 
 /// The xxh3-128 of `input`.
 #[must_use]
 #[inline]
 pub(crate) fn hash128(input: &[u8]) -> u128 {
-    if input.len() <= MID_SIZE_MAX {
-        return short::hash128(input, 0);
-    }
-    merge128(
-        &long_acc(input, &DEFAULT_SECRET),
-        &DEFAULT_SECRET,
-        input.len() as u64,
-    )
+    hash128_with_seed(input, 0)
 }
 
 /// The xxh3-128 of `input` under `seed`.
@@ -127,11 +112,29 @@ pub(crate) fn hash128_with_seed(input: &[u8], seed: u64) -> u128 {
     if input.len() <= MID_SIZE_MAX {
         return short::hash128(input, seed);
     }
+    long128(input, seed)
+}
+
+/// [`hash64_with_seed`] of an input longer than [`MID_SIZE_MAX`].
+#[inline(never)]
+fn long64(input: &[u8], seed: u64) -> u64 {
+    let len = input.len() as u64;
     if seed == 0 {
-        return hash128(input);
+        return merge64(&long_acc(input, &DEFAULT_SECRET), &DEFAULT_SECRET, len);
     }
     let secret = secret_for(seed);
-    merge128(&long_acc(input, &secret), &secret, input.len() as u64)
+    merge64(&long_acc(input, &secret), &secret, len)
+}
+
+/// [`hash128_with_seed`] of an input longer than [`MID_SIZE_MAX`].
+#[inline(never)]
+fn long128(input: &[u8], seed: u64) -> u128 {
+    let len = input.len() as u64;
+    if seed == 0 {
+        return merge128(&long_acc(input, &DEFAULT_SECRET), &DEFAULT_SECRET, len);
+    }
+    let secret = secret_for(seed);
+    merge128(&long_acc(input, &secret), &secret, len)
 }
 
 /// The secret `seed` derives from the default one: the default itself for
