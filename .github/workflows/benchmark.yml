@@ -231,7 +231,7 @@ jobs:
       # Installed the way the release workflow's release-plz action installs
       # it (prebuilt binary through cargo-binstall), at the version that action
       # runs, so both compute the same next version.
-      - uses: cargo-bins/cargo-binstall@5885714d0a40a14b2535c6ffc051fd8e49aa9665  # v1.27.0
+      - uses: cargo-bins/cargo-binstall@4b6fa09d0d1ef9740a0c332e31b9ae336f97efa0  # v1.28.0
         env:
           BINSTALL_VERSION: 1.23.0
 
