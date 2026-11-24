@@ -687,8 +687,15 @@ required-features = ["std", "metrics"]
 # percent on commits that never touch the measured path (bisected to exactly
 # that: a functionally inert commit "regressed" seekrandom 3-4% until the A/B
 # was rebuilt with these settings, where the delta collapsed to zero). One
-# codegen unit removes the layout lottery; thin LTO restores the cross-unit
+# codegen unit removes the layout lottery; LTO restores the cross-unit
 # inlining a single unit would otherwise lose.
+#
+# Fat rather than thin LTO: thin left the placement of the read path in the
+# hands of whatever else the binary held. An xxh3 change that the warm seek
+# loop never executes (same retired instructions, L1 icache misses +30-50%)
+# moved seek_random by x1.04-1.08 under thin, RocksDB's seeks in the same
+# binary by up to x1.10; built fat, the same pair is within x1.01-1.03 on
+# both engines.
 #
 # Pinned on the bench profile only, which is what every criterion harness in
 # this crate builds with; the two standalone harnesses under tools/ carry the
@@ -697,7 +704,7 @@ required-features = ["std", "metrics"]
 # single codegen unit with LTO more than doubles that build, past the job's
 # time budget, for binaries nothing measures.
 [profile.bench]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 # Line tables keep file and line in backtraces and panics while dropping the

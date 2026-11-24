@@ -83,9 +83,9 @@ path = "benches/compare.rs"
 # ours-vs-rocksdb ratios by several percent on commits that never touch the
 # measured path. See the same section in the crate root Cargo.toml.
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 [profile.bench]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
