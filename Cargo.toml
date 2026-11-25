@@ -308,7 +308,8 @@ libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 # path so the AVX-512 / AVX2 SIMD lanes light up under `no_std` too. Target-gated
 # to x86 because the crate `compile_error!`s on other arches (e.g. the
 # `thumbv7em-none-eabihf` no-std-check target); the key-comparison dispatch only
-# references it under the same `cfg`. Used by: `table::util`.
+# references it where the vector kernels are compiled, so a soft-float x86
+# target links it and detects nothing. Used by: `table::util`, `xxh3`.
 cpufeatures = "0.3"
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
@@ -375,6 +376,8 @@ unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(io_uring_fs)',
   'cfg(xxh3_sse2)',
   'cfg(xxh3_neon)',
+  'cfg(lsp_x86)',
+  'cfg(lsp_neon)',
 ] }
 
 [package.metadata.cargo-all-features]

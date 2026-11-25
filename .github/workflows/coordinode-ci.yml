@@ -45,6 +45,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every x86 build of the crate in this workflow carries the vector
+  # longest-prefix kernels, and its build script fails when it left them out;
+  # the soft-float checks, which must not carry them, say so themselves.
+  LSM_TREE_EXPECT_LSP_X86: "1"
 
 # Every job reads the repository and writes nothing through the
 # token; a job that needs more says so in its own block.
@@ -578,12 +582,34 @@ jobs:
         # Installed explicitly rather than through the action's `targets:`
         # input, so the no-std check can never fail for a target-not-installed
         # reason (which would hide a real std leak behind a setup error).
-        run: rustup target add thumbv7em-none-eabihf
+        run: >-
+          rustup target add thumbv7em-none-eabihf x86_64-unknown-none
+          aarch64-unknown-none-softfloat i686-unknown-uefi i586-unknown-linux-gnu
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           prefix-key: ubuntu-cargo-no-std
       - name: Check (no_std + alloc)
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc
+      - name: Check (no_std + alloc, targets with and without vector registers)
+        # A soft-float target's ABI leaves the vector registers out, and the
+        # compiler refuses a function that enables them there: the vector
+        # kernels must stay out of these builds, which the Thumb target above,
+        # with no vector kernel of its own, cannot show. A 32-bit x86 target
+        # with no SSE2 in its baseline keeps them, chosen at run time. Each
+        # x86 target states which it expects (`LSM_TREE_EXPECT_LSP_X86`), so
+        # kernels left out where they belong fail the build instead of
+        # passing as a slower one.
+        run: |
+          set -euo pipefail
+          check() {
+            echo "::group::$1"
+            cargo check --target "$1" --no-default-features --features alloc
+            echo "::endgroup::"
+          }
+          LSM_TREE_EXPECT_LSP_X86=0 check x86_64-unknown-none
+          LSM_TREE_EXPECT_LSP_X86=0 check i686-unknown-uefi
+          LSM_TREE_EXPECT_LSP_X86=1 check i586-unknown-linux-gnu
+          check aarch64-unknown-none-softfloat
       - name: Check (no_std + alloc, each feature that keeps it)
         # The features that do not bring `std`, each alone and all together:
         # one that builds only beside another, or only with `std`, fails here
