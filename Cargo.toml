@@ -373,6 +373,8 @@ unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(coverage,coverage_nightly)',
   'cfg(zstd_any)',
   'cfg(io_uring_fs)',
+  'cfg(xxh3_sse2)',
+  'cfg(xxh3_neon)',
 ] }
 
 [package.metadata.cargo-all-features]

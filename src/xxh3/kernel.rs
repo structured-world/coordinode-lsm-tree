@@ -25,7 +25,7 @@ const SCRAMBLE_AT: usize = SECRET_LEN - STRIPE_LEN;
 /// safety section says, and is `unsafe` because a SIMD kernel also needs its
 /// instruction set present: `Kernel::wide` hands out only a kernel whose
 /// instruction set the CPU has.
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(any(test, xxh3_sse2))]
 #[derive(Clone, Copy)]
 pub(super) struct Kernel {
     /// Accumulates `stripes` stripes from `input` into `acc`, `done` stripes
@@ -123,10 +123,7 @@ macro_rules! entry_points {
 
 /// The scalar kernel's whole digests of a long input over its `$long`, as
 /// `register_long!` gives a SIMD kernel's.
-#[cfg(not(any(
-    target_arch = "x86_64",
-    all(target_arch = "aarch64", target_endian = "little")
-)))]
+#[cfg(not(any(xxh3_sse2, xxh3_neon)))]
 macro_rules! register_digest {
     ($long:path, $(#[$attr:meta])*) => {
         /// The xxh3-64 of the `len > MID_SIZE_MAX` bytes at `input` under
@@ -179,10 +176,7 @@ macro_rules! register_digest {
 /// A SIMD kernel's pass over a whole long input, `$len >= STRIPE_LEN` bytes
 /// at `$input`, into `$lanes` under `$secret`, over its module's
 /// `accumulate!` and `scramble!`: every stripe in vectors, the last one too.
-#[cfg(any(
-    target_arch = "x86_64",
-    all(target_arch = "aarch64", target_endian = "little")
-))]
+#[cfg(any(xxh3_sse2, xxh3_neon))]
 macro_rules! long_loop {
     ($lanes:ident, $input:ident, $len:ident, $secret:ident) => {{
         debug_assert!($len >= STRIPE_LEN);
@@ -230,16 +224,13 @@ macro_rules! long_loop {
 /// vectors from the first stripe to the last, and in a digest the secret and
 /// the merge in the same function, which a `#[target_feature]` loop does not
 /// inline into otherwise.
-#[cfg(any(
-    target_arch = "x86_64",
-    all(target_arch = "aarch64", target_endian = "little")
-))]
+#[cfg(any(xxh3_sse2, xxh3_neon))]
 macro_rules! register_long {
     ($(#[$attr:meta])*) => {
         /// # Safety
         ///
         /// As `Kernel::long`, and the CPU runs this instruction set.
-        #[cfg(any(test, target_arch = "x86_64"))]
+        #[cfg(any(test, xxh3_sse2))]
         #[inline]
         $(#[$attr])*
         pub(in super::super) unsafe fn long(
@@ -304,7 +295,7 @@ macro_rules! register_long {
     };
 }
 
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(any(test, xxh3_sse2))]
 impl Kernel {
     /// The scalar kernel, the reference every SIMD kernel is tested against.
     #[cfg(test)]
@@ -315,7 +306,7 @@ impl Kernel {
     };
 
     /// The widest kernel this CPU runs, found on the first call and kept.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(xxh3_sse2)]
     #[must_use]
     #[inline]
     pub(super) fn wide() -> Self {
@@ -327,42 +318,38 @@ impl Kernel {
     #[cfg(test)]
     pub(super) fn available() -> alloc::vec::Vec<(&'static str, Self)> {
         #[cfg_attr(
-            not(any(
-                target_arch = "x86_64",
-                all(target_arch = "aarch64", target_endian = "little")
-            )),
+            not(any(xxh3_sse2, xxh3_neon)),
             expect(unused_mut, reason = "only the scalar kernel on this target")
         )]
         let mut kernels = alloc::vec![("scalar", Self::SCALAR)];
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(xxh3_sse2)]
         {
             kernels.push(("sse2", x86::SSE2));
             if cpu_avx2::get() {
                 kernels.push(("avx2", x86::AVX2));
             }
         }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        #[cfg(xxh3_neon)]
         kernels.push(("neon", neon::NEON));
         kernels
     }
 }
 
 /// The kernel every CPU of the target runs, called directly so it inlines
-/// into the hash: SSE2 on x86-64 and NEON on `AArch64`, both part of their
-/// architecture's baseline, the scalar one elsewhere.
+/// into the hash: SSE2 on x86-64 and NEON on little-endian `AArch64`, both in
+/// their architecture's baseline, where the target's ABI carries the vector
+/// registers (`xxh3_sse2`, `xxh3_neon`, set by the build script); the scalar
+/// one elsewhere, a soft-float target included.
 pub(super) mod baseline {
     use super::Acc;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(xxh3_sse2)]
     use super::{x86::sse2 as chosen, x86::sse2 as digests};
 
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(xxh3_neon)]
     use super::{neon as chosen, neon as digests};
 
-    #[cfg(not(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_endian = "little")
-    )))]
+    #[cfg(not(any(xxh3_sse2, xxh3_neon)))]
     use super::{scalar as chosen, scalar as digests};
 
     /// The xxh3-64 of the `len > MID_SIZE_MAX` bytes at `input` under
@@ -420,17 +407,11 @@ pub(super) mod baseline {
 
 // Cached once per process by `cpufeatures`, which also checks that the OS
 // saves the AVX state, and works without `std`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(xxh3_sse2)]
 cpufeatures::new!(cpu_avx2, "avx2");
 
 /// The reference kernel: one 64-bit lane at a time.
-#[cfg(any(
-    test,
-    not(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_endian = "little")
-    ))
-))]
+#[cfg(any(test, not(any(xxh3_sse2, xxh3_neon))))]
 mod scalar {
     use super::{
         Acc, LAST_STRIPE_BACK, PRIME32_1, SCRAMBLE_AT, SECRET_LEN, STRIPE_LEN, STRIPES_PER_BLOCK,
@@ -438,10 +419,7 @@ mod scalar {
 
     entry_points!();
 
-    #[cfg(not(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_endian = "little")
-    )))]
+    #[cfg(not(any(xxh3_sse2, xxh3_neon)))]
     register_digest!(long,);
 
     /// # Safety
@@ -539,7 +517,7 @@ mod scalar {
 }
 
 /// The x86-64 kernels: SSE2 (16 bytes a lane) and AVX2 (32).
-#[cfg(target_arch = "x86_64")]
+#[cfg(xxh3_sse2)]
 mod x86 {
     use super::{
         Acc, Kernel, LAST_STRIPE_BACK, PRIME32_1, SCRAMBLE_AT, SECRET_LEN, STRIPE_LEN,
@@ -806,7 +784,7 @@ mod x86 {
 }
 
 /// The NEON kernel: 16 bytes a lane.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(xxh3_neon)]
 mod neon {
     #[cfg(test)]
     use super::Kernel;

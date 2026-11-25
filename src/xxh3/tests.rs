@@ -25,6 +25,25 @@ fn lengths() -> impl Iterator<Item = usize> {
 
 const SEEDS: [u64; 4] = [0, 1, 0xC0FF_EE00_1234_5678, u64::MAX];
 
+/// A target whose ABI carries the vector registers gets its vector kernel:
+/// the build script's `xxh3_sse2` / `xxh3_neon` follow the target's own
+/// features, so a build that lost them would hash through the scalar kernel
+/// everywhere, correct and slow, and nothing else would notice.
+#[test]
+fn a_target_with_vector_registers_lists_its_vector_kernel() {
+    let names: alloc::vec::Vec<&str> = Kernel::available().iter().map(|(name, _)| *name).collect();
+    if cfg!(all(target_arch = "x86_64", target_feature = "sse2")) {
+        assert!(names.contains(&"sse2"), "{names:?}");
+    }
+    if cfg!(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "neon"
+    )) {
+        assert!(names.contains(&"neon"), "{names:?}");
+    }
+}
+
 /// Every kernel this CPU runs gives the digests xxh3 defines, at every length
 /// around the loop's boundaries, under the default secret and seeded ones.
 /// A kernel that drops or misplaces one lane, stripe or scramble differs at

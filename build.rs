@@ -19,6 +19,22 @@ fn main() {
     let on = |name: &str, values: &[&str]| {
         std::env::var(name).is_ok_and(|value| values.contains(&value.as_str()))
     };
+    // xxh3's vector kernels, only where the target's ABI carries the vector
+    // registers: a soft-float target (`x86_64-unknown-none`,
+    // `aarch64-unknown-none-softfloat`) leaves them off, and hashes through
+    // the scalar kernel.
+    let features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let has = |feature: &str| features.split(',').any(|f| f == feature);
+    if on("CARGO_CFG_TARGET_ARCH", &["x86_64"]) && has("sse2") {
+        println!("cargo:rustc-cfg=xxh3_sse2");
+    }
+    if on("CARGO_CFG_TARGET_ARCH", &["aarch64"])
+        && on("CARGO_CFG_TARGET_ENDIAN", &["little"])
+        && has("neon")
+    {
+        println!("cargo:rustc-cfg=xxh3_neon");
+    }
+
     if std::env::var("CARGO_FEATURE_IO_URING").is_ok()
         && on("CARGO_CFG_TARGET_OS", &["linux"])
         && on(

@@ -5,9 +5,10 @@
 //!
 //! Inputs up to 240 bytes take xxh3's short paths ([`short`]), which no
 //! vector speeds up. Longer ones run its stripe loop through the kernel
-//! every CPU of the target runs (SSE2 on x86-64, NEON on `AArch64`), called
-//! directly; on x86-64 an input of at least `WIDE_MIN` bytes runs the
-//! widest kernel the CPU has, found once per process. Every digest is the
+//! every CPU of the target runs (SSE2 on x86-64, NEON on `AArch64`, scalar on
+//! a soft-float target), called directly; on x86-64 with SSE2 an input of at
+//! least `WIDE_MIN` bytes runs the widest kernel the CPU has, found once per
+//! process. Every digest is the
 //! one xxh3 defines, so nothing a file holds depends on the CPU that wrote
 //! it.
 
@@ -15,7 +16,7 @@ mod kernel;
 mod short;
 
 use kernel::Acc;
-#[cfg(target_arch = "x86_64")]
+#[cfg(xxh3_sse2)]
 use kernel::Kernel;
 
 #[cfg(test)]
@@ -33,7 +34,7 @@ const MID_SIZE_MAX: usize = 240;
 /// The shortest run of input the wide kernel takes: below it the 256-bit
 /// multiplies cost the core more clock, for what runs after the hash too,
 /// than their wider loop saves, as on a table block or a record.
-#[cfg(target_arch = "x86_64")]
+#[cfg(xxh3_sse2)]
 const WIDE_MIN: usize = 64 * 1024;
 /// Where the secret of the last stripe starts, counted back from the end.
 const LAST_STRIPE_BACK: usize = 7;
@@ -101,7 +102,7 @@ pub(crate) fn hash64_with_seed(input: &[u8], seed: u64) -> u64 {
     if input.len() <= MID_SIZE_MAX {
         return short::hash64(input, seed);
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(xxh3_sse2)]
     if input.len() >= WIDE_MIN {
         return wide64(input, seed);
     }
@@ -127,7 +128,7 @@ pub(crate) fn hash128_with_seed(input: &[u8], seed: u64) -> u128 {
     if input.len() <= MID_SIZE_MAX {
         return short::hash128(input, seed);
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(xxh3_sse2)]
     if input.len() >= WIDE_MIN {
         return wide128(input, seed);
     }
@@ -136,7 +137,7 @@ pub(crate) fn hash128_with_seed(input: &[u8], seed: u64) -> u128 {
 }
 
 /// [`hash64_with_seed`] of an input of at least `WIDE_MIN` bytes.
-#[cfg(target_arch = "x86_64")]
+#[cfg(xxh3_sse2)]
 #[inline(never)]
 fn wide64(input: &[u8], seed: u64) -> u64 {
     let derived;
@@ -150,7 +151,7 @@ fn wide64(input: &[u8], seed: u64) -> u64 {
 }
 
 /// [`hash128_with_seed`] of an input of at least `WIDE_MIN` bytes.
-#[cfg(target_arch = "x86_64")]
+#[cfg(xxh3_sse2)]
 #[inline(never)]
 fn wide128(input: &[u8], seed: u64) -> u128 {
     let derived;
@@ -179,7 +180,7 @@ fn secret_for(seed: u64) -> [u8; SECRET_LEN] {
 
 /// The accumulators of `input`, longer than [`MID_SIZE_MAX`], under
 /// `secret`, through the widest kernel the CPU runs.
-#[cfg(target_arch = "x86_64")]
+#[cfg(xxh3_sse2)]
 #[inline]
 fn wide_acc(input: &[u8], secret: &[u8; SECRET_LEN]) -> Acc {
     debug_assert!(input.len() > MID_SIZE_MAX);
@@ -207,7 +208,7 @@ unsafe fn consume(
 ) -> usize {
     // SAFETY: as the caller keeps; the wide kernel is one the CPU runs.
     unsafe {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(xxh3_sse2)]
         if stripes * STRIPE_LEN >= WIDE_MIN {
             return (Kernel::wide().consume)(acc, input, stripes, done, secret.as_ptr());
         }
