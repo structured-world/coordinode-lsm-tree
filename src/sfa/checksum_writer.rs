@@ -4,20 +4,20 @@
 
 use crate::sfa::Checksum;
 
-pub struct ChecksummedWriter<W: crate::io::Write> {
+pub(crate) struct ChecksummedWriter<W: crate::io::Write> {
     inner: W,
     hasher: crate::xxh3::Hasher,
 }
 
 impl<W: crate::io::Write> ChecksummedWriter<W> {
-    pub fn new(writer: W) -> Self {
+    pub(crate) fn new(writer: W) -> Self {
         Self {
             inner: writer,
             hasher: crate::xxh3::Hasher::new(),
         }
     }
 
-    pub fn checksum(&self) -> Checksum {
+    pub(crate) fn checksum(&self) -> Checksum {
         Checksum::from_raw(self.hasher.digest128())
     }
 }
