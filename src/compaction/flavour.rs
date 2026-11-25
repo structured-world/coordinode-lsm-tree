@@ -2746,11 +2746,8 @@ impl StandardCompaction {
             row_pages,
             copied,
             raw: &raw,
-            source: crate::table::writer::VerbatimSource {
-                table_id: table.id(),
-                offset,
-                check: crate::table::writer::CopyCheck::Carry,
-            },
+            table_id: table.id(),
+            offset,
             directory: &directory,
             directory_len,
         };

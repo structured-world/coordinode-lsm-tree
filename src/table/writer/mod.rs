@@ -1059,8 +1059,13 @@ pub(crate) struct PageCarry<'a> {
     pub copied: Vec<bool>,
     /// The source group's bytes on disk.
     pub raw: &'a [u8],
-    /// Where they lay.
-    pub source: VerbatimSource,
+    /// The source table's id. A page carry is a compaction's copy only: each
+    /// copied page's checksum goes with its unchanged bytes and a read of the
+    /// copy checks it, so there is no verifying variant to ask for here (a
+    /// salvage, the one copy that verifies, copies whole blocks instead).
+    pub table_id: TableId,
+    /// The source offset of the group's first byte.
+    pub offset: u64,
     /// The source group's directory and its on-disk length.
     pub directory: &'a crate::table::column_page::PageDirectory,
     /// The on-disk length of that directory, its header included.
@@ -1113,10 +1118,7 @@ impl<'a> PageCarry<'a> {
         Some(CopiedPage {
             frame,
             header,
-            at: crate::table::block::ChecksumAt::table(
-                self.source.table_id,
-                self.source.offset + start as u64,
-            ),
+            at: crate::table::block::ChecksumAt::table(self.table_id, self.offset + start as u64),
         })
     }
 }
