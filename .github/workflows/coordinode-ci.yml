@@ -45,6 +45,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every x86 build of the crate in this workflow carries the vector
+  # longest-prefix kernels, and its build script fails when it left them out;
+  # the soft-float checks, which must not carry them, say so themselves.
+  LSM_TREE_EXPECT_LSP_X86: "1"
 
 # Every job reads the repository and writes nothing through the
 # token; a job that needs more says so in its own block.
