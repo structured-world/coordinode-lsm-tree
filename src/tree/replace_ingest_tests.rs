@@ -338,6 +338,19 @@ fn a_replace_that_returned_survives_a_power_loss() -> crate::Result<()> {
             ));
         }
         replace(&tree, &[("new", "1"), ("shared", "new")])?;
+        // The power goes now: the tree, dropped after it, writes nothing more,
+        // so the reopen sees the replace only if it was durable on return.
+        for op in [
+            FaultOp::Open,
+            FaultOp::Write,
+            FaultOp::Rename,
+            FaultOp::SyncDirectory,
+        ] {
+            fs.injector().arm(FaultRule::new(
+                op,
+                Fault::Error(crate::io::ErrorKind::Other),
+            ));
+        }
         crash.crash();
         drop(tree);
 
