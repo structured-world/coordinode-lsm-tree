@@ -187,8 +187,13 @@ fn assert_kernel_matches_reference<F: Fn(&[u8], &[u8]) -> usize>(label: &str, ke
 #[cfg(lsp_x86)]
 #[test]
 fn lsp_sse2_on_boundaries_matches_reference() {
-    // SAFETY: the kernel is compiled only for a target whose own features
-    // include SSE2.
+    // On x86_64 SSE2 is the mandatory ISA baseline; on 32-bit x86 it is not
+    // guaranteed (pre-Pentium-4 lacks it), so runtime-detect before calling.
+    #[cfg(target_arch = "x86")]
+    if !std::is_x86_feature_detected!("sse2") {
+        return;
+    }
+    // SAFETY: SSE2 is the x86_64 baseline / runtime-verified on x86 above.
     assert_kernel_matches_reference("sse2", |a, b| unsafe { lsp_sse2(a, b) });
 }
 
@@ -226,42 +231,54 @@ fn lsp_avx512_on_boundaries_matches_reference() {
 /// Exhaustively covers the kernel-selection ladder on any x86 host: the
 /// runtime dispatch can only exercise the lane the test CPU exposes, but
 /// `select_lsp_kernel` is a pure function of the detected-feature flags, so
-/// every arm (AVX-512BW, AVX2, and SSE2, which the target guarantees) is
-/// reachable here.
+/// every arm (AVX-512BW, AVX2, SSE2, scalar fallback) is reachable here.
 #[cfg(lsp_x86)]
 #[test]
 fn select_lsp_kernel_picks_widest_available_lane() {
     use core::ptr::fn_addr_eq;
-    let pick = |avx512bw, avx2| select_lsp_kernel(LspCpuFeatures { avx512bw, avx2 });
-    assert!(fn_addr_eq(pick(true, true), lsp_avx512 as LspKernel));
-    assert!(fn_addr_eq(pick(false, true), lsp_avx2 as LspKernel));
-    assert!(fn_addr_eq(pick(false, false), lsp_sse2 as LspKernel));
-    // The widest available lane wins even when a narrower one is absent.
-    assert!(fn_addr_eq(pick(true, false), lsp_avx512 as LspKernel));
+    let pick = |avx512bw, avx2, sse2| {
+        select_lsp_kernel(LspCpuFeatures {
+            avx512bw,
+            avx2,
+            sse2,
+        })
+    };
+    assert!(fn_addr_eq(pick(true, true, true), lsp_avx512 as LspKernel));
+    assert!(fn_addr_eq(pick(false, true, true), lsp_avx2 as LspKernel));
+    assert!(fn_addr_eq(pick(false, false, true), lsp_sse2 as LspKernel));
+    assert!(fn_addr_eq(
+        pick(false, false, false),
+        lsp_scalar as LspKernel
+    ));
+    // The widest available lane wins even when narrower lanes are absent.
+    assert!(fn_addr_eq(
+        pick(true, false, false),
+        lsp_avx512 as LspKernel
+    ));
 }
 
 /// A target whose ABI carries the vector registers resolves a vector kernel:
-/// the build script's `lsp_x86` / `lsp_neon` follow the target's own features,
-/// so a build that lost them would compare prefixes through the scalar kernel
-/// everywhere, correct and slow, and nothing else would notice.
+/// `lsp_x86` / `lsp_neon` come from the build script, so a build that lost
+/// them would compare prefixes through the scalar kernel everywhere, correct
+/// and slow, and nothing else would notice. A target with SSE2 or NEON among
+/// its own features has those registers and a CPU that runs the kernel.
+#[cfg(any(
+    all(
+        any(target_arch = "x86_64", target_arch = "x86"),
+        target_feature = "sse2"
+    ),
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "neon"
+    )
+))]
 #[test]
 fn a_target_with_vector_registers_resolves_a_vector_kernel() {
-    use core::ptr::fn_addr_eq;
-    let vector_target = cfg!(any(
-        all(
-            any(target_arch = "x86_64", target_arch = "x86"),
-            target_feature = "sse2"
-        ),
-        all(
-            target_arch = "aarch64",
-            target_endian = "little",
-            target_feature = "neon"
-        )
+    assert!(!core::ptr::fn_addr_eq(
+        resolve_lsp_kernel(),
+        lsp_scalar as LspKernel
     ));
-    assert_eq!(
-        !fn_addr_eq(resolve_lsp_kernel(), lsp_scalar as LspKernel),
-        vector_target
-    );
 }
 
 /// Direct test for the NEON 16-byte kernel on LE aarch64. Required because
