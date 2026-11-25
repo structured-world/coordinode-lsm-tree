@@ -3,11 +3,11 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use crate::{
-    SeqNo, UserKey, UserValue, file::BLOBS_FOLDER, table::Table,
-    tree::ingest::Ingestion as TableIngestion, vlog::BlobFileWriter,
+    SeqNo, UserKey, UserValue, file::BLOBS_FOLDER, tree::ingest::Ingestion as TableIngestion,
+    vlog::BlobFileWriter,
 };
 #[cfg(not(feature = "std"))]
-use alloc::{string::ToString, vec::Vec};
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 /// Bulk ingestion for [`BlobTree`](crate::BlobTree)
@@ -342,82 +342,16 @@ impl<'a> BlobIngestion<'a> {
         // we just allocated. These tables contain indirections to the blob
         // files created above, so they must share the same sequence number
         // for MVCC correctness.
-        //
-        // The tables are installed as a new L0 run, so they pin their filter
-        // and index blocks by the L0 policy, as a flushed table does.
-        let pin_filter = index.config.filter_block_pinning_policy.get(0);
-        let pin_index = index.config.index_block_pinning_policy.get(0);
-        let table_folder = &self.table.folder;
-        let created_tables = written
-            .tables
-            .into_iter()
-            .map(|(table_id, checksum)| -> crate::Result<Table> {
-                let mut params = crate::table::RecoverParams::new(
-                    table_folder.join(table_id.to_string()),
-                    checksum,
-                    table_id,
-                    self.table.level_fs.clone(),
-                    index.config.comparator.clone(),
-                    index.config.cache.clone(),
-                );
-                params.global_seqno = global_seqno;
-                params.recency = Some(recency);
-                params.tree_id = index.id;
-                params.pin_filter = pin_filter;
-                params.pin_index = pin_index;
-                params
-                    .descriptor_table
-                    .clone_from(&index.config.descriptor_table);
-                params.encryption.clone_from(&index.config.encryption);
-                params
-                    .prefix_extractor
-                    .clone_from(&index.config.prefix_extractor);
-                #[cfg(zstd_any)]
-                {
-                    params.zstd_dictionaries = index.config.current_zstd_dictionaries();
-                }
-                #[cfg(feature = "metrics")]
-                {
-                    params.metrics = index.metrics.clone();
-                }
-                let table = Table::recover(params)?;
-                if entries_durable {
-                    table.mark_entry_durable();
-                }
-                Ok(table)
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-
-        // Bind every ingested table to the tree BEFORE the version edit makes
-        // it reachable — see the same step in the standard tree's ingest.
-        // Without it an ingested SST can never queue itself for a healing
-        // rewrite, and its in-place heal can race a checkpoint hard-link.
-        for table in &created_tables {
-            table.bind_to_tree(&crate::table::TableSinks {
-                deletion_pause: &index.deletion_pause,
-                heal_hints: &index.heal_hints,
-                read_budget: index.config.columnar_read_budget,
-                #[cfg(feature = "std")]
-                background_deleter: &index.background_deleter,
-                track_filter_probes: index.config.filter_advisor.is_some(),
-            });
-        }
-        // The blob files this ingestion wrote become reachable through the same
-        // version edit, so they carry the same obligation: an unbound file's
-        // `Drop` can unlink it while a checkpoint is capturing, and a
-        // tight-space prefix punch can zero bytes the checkpoint has already
-        // hard-linked.
-        for blob_file in &blob_files {
-            blob_file.bind_to_tree(&crate::table::TableSinks {
-                deletion_pause: &index.deletion_pause,
-                heal_hints: &index.heal_hints,
-                read_budget: index.config.columnar_read_budget,
-                #[cfg(feature = "std")]
-                background_deleter: &index.background_deleter,
-                // A blob file has no filter.
-                track_filter_probes: false,
-            });
-        }
+        let created_tables = TableIngestion::recover_run(
+            &index,
+            &self.table.folder,
+            &self.table.level_fs,
+            written.tables,
+            global_seqno,
+            recency,
+            entries_durable,
+        )?;
+        bind_blob_files(&index, &blob_files);
 
         // Upgrade the version with our ingested tables and blob files, using
         // the global_seqno we allocated earlier. This ensures the version,
@@ -461,9 +395,122 @@ impl<'a> BlobIngestion<'a> {
         Ok(())
     }
 
+    /// Finishes the ingestion by replacing the tree's whole content, index
+    /// tables and blob files alike, with what it wrote, in one version
+    /// install: see [`AnyIngestion::finish_replacing`](crate::AnyIngestion::finish_replacing)
+    /// for what a reader, a later write and a crash see. The earlier blob
+    /// files go with the earlier tables, once nothing holds them.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs; the tree then keeps its
+    /// earlier content.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, AnyTree, Config, KvSeparationOptions, SeqNo};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let AnyTree::Blob(tree) = Config::new(folder, Default::default(), Default::default())
+    ///     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    ///     .open()?
+    /// else {
+    ///     panic!("a key-value separated config opens a blob tree");
+    /// };
+    /// tree.insert("old", "gone", 0);
+    ///
+    /// let mut ingestion = lsm_tree::blob_tree::ingest::BlobIngestion::new(&tree)?;
+    /// ingestion.write("a".into(), "1".into())?;
+    /// ingestion.finish_replacing()?;
+    ///
+    /// assert!(tree.get("old", SeqNo::MAX)?.is_none());
+    /// assert_eq!(tree.get("a", SeqNo::MAX)?.as_deref(), Some(b"1".as_slice()));
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn finish_replacing(mut self) -> crate::Result<()> {
+        use crate::AbstractTree;
+
+        let index = self.index().clone();
+        // The hold on the ingestion's dictionaries stays here until its files
+        // are installed.
+        let write_pin = core::mem::take(&mut self.table.write_pin);
+        let written = if self.last_key.is_some() {
+            // The blob files first, which the index tables point into.
+            let blob_files = self.blob.finish()?;
+            let written = self.table.writer.finish()?;
+            Some((written.tables, written.entries_durable, blob_files))
+        } else {
+            None
+        };
+
+        #[cfg(all(test, feature = "std"))]
+        index.config.fire_before_output_install();
+
+        let prior = {
+            // The locks of an ingestion's install, as for a table ingestion's
+            // replacing finish: the memtables are not flushed, their content is
+            // what this install drops.
+            let _flush_lock = index.get_flush_lock();
+            let _compaction_state = index.compaction_state.lock();
+            let mut versions = index.version_history.write();
+
+            let (tables, blob_files) = match written {
+                Some((tables, entries_durable, blob_files)) => {
+                    let recency = index.table_id_counter.next();
+                    let tables = TableIngestion::recover_run(
+                        &index,
+                        &self.table.folder,
+                        &self.table.level_fs,
+                        tables,
+                        0,
+                        recency,
+                        entries_durable,
+                    )?;
+                    bind_blob_files(&index, &blob_files);
+                    (tables, blob_files)
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            let mut installed = crate::tree::InstalledCharge::default();
+            installed.add(
+                &tables,
+                &blob_files,
+                crate::fs::WriteOrigin::IngestTable,
+                crate::fs::WriteOrigin::IngestBlob,
+            )?;
+            let prior = index.install_replacing(&mut versions, &tables, &blob_files)?;
+            drop(versions);
+            installed.charge();
+            prior
+        };
+        // The installed files name their dictionaries from here on.
+        drop(write_pin);
+        crate::tree::reclaim_replaced(&prior);
+        Ok(())
+    }
+
     #[inline]
     fn index(&self) -> &crate::Tree {
         &self.tree.index
+    }
+}
+
+/// Binds the blob files an ingestion wrote to the tree BEFORE the version edit
+/// makes them reachable, as its tables are: an unbound file's `Drop` can
+/// unlink it while a checkpoint is capturing, and a tight-space prefix punch
+/// can zero bytes the checkpoint has already hard-linked.
+fn bind_blob_files(index: &crate::Tree, blob_files: &[crate::BlobFile]) {
+    for blob_file in blob_files {
+        blob_file.bind_to_tree(&crate::table::TableSinks {
+            deletion_pause: &index.deletion_pause,
+            heal_hints: &index.heal_hints,
+            read_budget: index.config.columnar_read_budget,
+            #[cfg(feature = "std")]
+            background_deleter: &index.background_deleter,
+            // A blob file has no filter.
+            track_filter_probes: false,
+        });
     }
 }
 

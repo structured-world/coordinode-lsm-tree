@@ -323,8 +323,8 @@ retry after the filesystem is fixed completes the drop.
 A live tree refuses a snapshot read at or below its *retention floor*
 (`Error::SnapshotBelowRetention`), and the manifest records that boundary with
 the version so the refusal holds across a reopen: a GC compaction raises it to its watermark minus one (capped at the
-compaction's own install seqno), a `clear`, a table drop or a compaction
-whose filter transformed rows to the install's own seqno. The lost manifest
+compaction's own install seqno), a `clear`, a replacing ingestion, a table
+drop or a compaction whose filter transformed rows to the install's own seqno. The lost manifest
 was the floor's only durable copy, and the tables cannot stand in for it: a
 GC compaction zeroes the seqnos of the rows it settles, so a table's highest
 seqno reads as `0` precisely on the trees where history was collected.
@@ -338,8 +338,8 @@ caller has just made whole. The floor is therefore **supplied by the caller**:
 and the reopened tree refuses every snapshot at or below `floor` exactly as it
 did before the manifest was lost. Record `AbstractTree::retention_floor()` in
 the deployment's own durable state (it folds in every operation that moved
-the boundary: GC compactions, `clear`, table drops, filtering compactions
-raise it, `lower_retention_floor` after a rebuild lowers it) and pass the
+the boundary: GC compactions, `clear`, replacing ingestions, table drops,
+filtering compactions raise it, `lower_retention_floor` after a rebuild lowers it) and pass the
 last recorded value; deriving it from GC watermarks
 alone would miss the drops. Left at the default `0`, a repaired tree serves
 every snapshot, which is correct only if history was never collected. No

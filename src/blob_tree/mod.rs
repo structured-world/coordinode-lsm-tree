@@ -2229,63 +2229,10 @@ impl AbstractTree for BlobTree {
     }
 
     fn clear(&self) -> crate::Result<()> {
-        let config = self.tree_config();
-        let mut versions = self.get_version_history_lock();
-
-        // Pre-clear snapshot: its tables AND blob files all become garbage once
-        // the new empty version is installed.
-        let prior = versions.latest_version();
-
-        // The blob dictionary counts here as much as the table one: the next
-        // blob file is compressed against it.
-        #[cfg(zstd_any)]
-        let still_written = self.index.write_referenced_dict_ids();
-        #[cfg(not(zstd_any))]
-        let still_written: Vec<crate::file::DictId> = Vec::new();
-
-        versions.upgrade_version(
-            &config.path,
-            |v| {
-                // Under the history's lock, which a flush takes to read the
-                // memtables it writes: every flush holding memtables this
-                // clear drops has taken its number. Its tables describe
-                // themselves, and an open after a power loss would install
-                // them, with the cleared data, unless this manifest decides
-                // that number.
-                self.index.flush_seqs.decide_taken();
-                let mut copy = v.clone();
-                copy.active_memtable = Arc::new(Memtable::new(
-                    self.index.memtable_id_counter.next(),
-                    config.comparator.clone(),
-                ));
-                copy.sealed_memtables = Arc::default();
-                copy.version = v.version.cleared(&still_written);
-                Ok(copy)
-            },
-            &config.seqno,
-            &config.visible_seqno,
-            &*config.fs,
-            self.index.0.runtime_config.load_full(),
-            self.index.0.config.encryption.clone(),
-            // Every table and blob file goes: no snapshot up to this install
-            // is servable.
-            crate::version::RetentionEffect::DropsData,
-        )?;
-
-        // Same MVCC-safe reclaim as the standard tree, plus the blob files:
-        // mark every obsolete table / blob file deleted and let Inner::Drop
-        // reclaim each once its last reference is released (a live reader's
-        // snapshot clone defers deletion).
-        drop(versions);
-
-        for table in prior.version.iter_tables() {
-            table.mark_as_deleted();
-        }
-        for blob_file in prior.version.blob_files.iter() {
-            blob_file.mark_as_deleted();
-        }
-
-        Ok(())
+        // The index's clear drops the blob files with its tables, and keeps
+        // the blob dictionary the next blob file is compressed against: the
+        // index counts the blob policy among the ones still written against.
+        self.index.clear()
     }
 
     fn major_compact(

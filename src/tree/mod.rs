@@ -556,6 +556,23 @@ impl InstalledCharge {
     }
 }
 
+/// Marks every table and blob file of `prior`, a version an install replaced
+/// whole, deleted, so each file is reclaimed (`Inner::Drop`) once its last
+/// reference is released.
+///
+/// A reader still holding the replaced snapshot keeps its own clone alive,
+/// deferring the deletion until it finishes: the version's `Arc` refcount is
+/// the MVCC guard, so a reclaim never races a live read. Files nothing else
+/// holds go as `prior` drops.
+pub(crate) fn reclaim_replaced(prior: &SuperVersion) {
+    for table in prior.version.iter_tables() {
+        table.mark_as_deleted();
+    }
+    for blob_file in prior.version.blob_files.iter() {
+        blob_file.mark_as_deleted();
+    }
+}
+
 /// The highest seqno the memtables of `snapshot` hold, active and sealed.
 fn highest_memtable_seqno(snapshot: &SuperVersion) -> Option<SeqNo> {
     let sealed = snapshot
@@ -1045,63 +1062,10 @@ impl AbstractTree for Tree {
     }
 
     fn clear(&self) -> crate::Result<()> {
-        let config = self.tree_config();
         let mut versions = self.get_version_history_lock();
-
-        // Pre-clear snapshot: every table + blob file it references becomes
-        // garbage the moment the new empty version is installed.
-        let prior = versions.latest_version();
-
-        #[cfg(zstd_any)]
-        let still_written = self.write_referenced_dict_ids();
-        #[cfg(not(zstd_any))]
-        let still_written: Vec<crate::file::DictId> = Vec::new();
-
-        versions.upgrade_version(
-            &config.path,
-            |v| {
-                // Under the history's lock, which a flush takes to read the
-                // memtables it writes: every flush holding memtables this
-                // clear drops has taken its number. Its tables describe
-                // themselves, and an open after a power loss would install
-                // them, with the cleared data, unless this manifest decides
-                // that number.
-                self.flush_seqs.decide_taken();
-                let mut copy = v.clone();
-                copy.active_memtable = Arc::new(Memtable::new(
-                    self.memtable_id_counter.next(),
-                    self.config.comparator.clone(),
-                ));
-                copy.sealed_memtables = Arc::default();
-                copy.version = v.version.cleared(&still_written);
-                Ok(copy)
-            },
-            &config.seqno,
-            &config.visible_seqno,
-            &*config.fs,
-            self.0.runtime_config.load_full(),
-            self.0.config.encryption.clone(),
-            // Every table goes: no snapshot up to this install is servable.
-            crate::version::RetentionEffect::DropsData,
-        )?;
-        // `prior` still holds the replaced version, so nothing reaches refcount
-        // zero yet.
+        let prior = self.install_replacing(&mut versions, &[], &[])?;
         drop(versions); // release the version-history lock before any fs work
-
-        // Mark every obsolete table / blob file deleted so the file is
-        // reclaimed (Inner::Drop) once its last reference is released. A
-        // concurrent reader still holding the pre-clear snapshot keeps its own
-        // clone alive, deferring physical deletion until it finishes — the
-        // version-history Arc refcount is the MVCC guard, so reclaim never
-        // races a live read. Tables with no other live reference are reclaimed
-        // as `prior` drops at the end of this call.
-        for table in prior.version.iter_tables() {
-            table.mark_as_deleted();
-        }
-        for blob_file in prior.version.blob_files.iter() {
-            blob_file.mark_as_deleted();
-        }
-
+        reclaim_replaced(&prior);
         Ok(())
     }
 
@@ -2661,6 +2625,75 @@ impl Tree {
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+
+    /// Installs a version holding `run`, with `blob_files`, and nothing else:
+    /// empty memtables, every earlier table and blob file dropped, and the
+    /// retention floor raised to the install. Returns the version it replaced,
+    /// whose files [`reclaim_replaced`] marks deleted once the caller has
+    /// released `versions`.
+    ///
+    /// `run` becomes the only L0 run; an empty one installs a cleared tree.
+    /// The dictionaries the new version keeps are the ones still written
+    /// against, which counts every snapshot a writer holds: a caller installing
+    /// files it wrote keeps its own pin until this returns, so the dictionaries
+    /// those files name stay registered.
+    ///
+    /// # Errors
+    ///
+    /// The manifest write of the new version failing.
+    pub(crate) fn install_replacing(
+        &self,
+        versions: &mut SuperVersions,
+        run: &[Table],
+        blob_files: &[crate::BlobFile],
+    ) -> crate::Result<SuperVersion> {
+        let config = self.tree_config();
+        // Every table and blob file it references becomes garbage the moment
+        // the new version is installed.
+        let prior = versions.latest_version();
+
+        #[cfg(zstd_any)]
+        let still_written = self.write_referenced_dict_ids();
+        #[cfg(not(zstd_any))]
+        let still_written: Vec<crate::file::DictId> = Vec::new();
+
+        versions.upgrade_version(
+            &config.path,
+            |v| {
+                // Under the history's lock, which a flush takes to read the
+                // memtables it writes: every flush holding memtables this
+                // install drops has taken its number. Its tables describe
+                // themselves, and an open after a power loss would install
+                // them, with the dropped data, unless this manifest decides
+                // that number.
+                self.flush_seqs.decide_taken();
+                let mut copy = v.clone();
+                copy.active_memtable = Arc::new(Memtable::new(
+                    self.memtable_id_counter.next(),
+                    self.config.comparator.clone(),
+                ));
+                copy.sealed_memtables = Arc::default();
+                let cleared = v.version.cleared(&still_written);
+                copy.version = if run.is_empty() && blob_files.is_empty() {
+                    cleared
+                } else {
+                    let ctx =
+                        crate::version::TransformContext::new(self.config.comparator.as_ref());
+                    cleared.with_new_l0_run(run, Some(blob_files), None, &ctx)
+                };
+                Ok(copy)
+            },
+            &config.seqno,
+            &config.visible_seqno,
+            &*config.fs,
+            self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
+            // Every earlier table and blob file goes: no snapshot up to this
+            // install is servable.
+            crate::version::RetentionEffect::DropsData,
+        )?;
+        Ok(prior)
     }
 
     /// Drops every dictionary nothing references any more, returning how many
@@ -8616,6 +8649,10 @@ mod open_batch_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod clear_race_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod replace_ingest_tests;
 
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
