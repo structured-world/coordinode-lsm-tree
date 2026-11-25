@@ -541,7 +541,7 @@ fn chunks_whose_head_is_damaged_are_passed_with_it() -> crate::Result<()> {
     let index = index_of(&path)?;
     // A key byte of the head, frame 0.
     edit(&path, |bytes| {
-        bytes[index[0] + FRAME_HEADER_LEN + 14] ^= 0x40
+        bytes[index[0] + FRAME_HEADER_LEN + 14] ^= 0x40;
     })?;
     let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
     assert_eq!(results.len(), 2, "the head, then the next value");
@@ -623,7 +623,7 @@ fn a_frame_inside_a_chunk_whose_head_is_damaged_is_not_a_value() -> crate::Resul
     let index = index_of(&path)?;
     // A key byte of the head, frame 0.
     edit(&path, |bytes| {
-        bytes[index[0] + FRAME_HEADER_LEN + 14] ^= 0x40
+        bytes[index[0] + FRAME_HEADER_LEN + 14] ^= 0x40;
     })?;
 
     let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
