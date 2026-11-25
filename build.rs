@@ -45,12 +45,32 @@ fn main() {
     // baseline: a 32-bit target without SSE2 in its baseline
     // (`i586-unknown-linux-gnu`) still runs them on a CPU that has it. The
     // target's features cannot tell that target from a soft-float one, which
-    // lists no SSE2 either, so the compiler is asked. Unanswered (no compiler
-    // to run), the target's own features decide.
-    if on("CARGO_CFG_TARGET_ARCH", &["x86_64", "x86"])
-        && target_accepts_feature("sse2").unwrap_or_else(|| has("sse2"))
-    {
-        println!("cargo:rustc-cfg=lsp_x86");
+    // lists no SSE2 either, so the compiler is asked. Unanswered (it could not
+    // be run, or compiles nothing here with the flags given), the target's
+    // own features decide, and the build says so.
+    println!("cargo:rerun-if-env-changed=LSM_TREE_EXPECT_LSP_X86");
+    if on("CARGO_CFG_TARGET_ARCH", &["x86_64", "x86"]) {
+        let vector = target_accepts_feature("sse2").unwrap_or_else(|| {
+            println!(
+                "cargo:warning=the compiler could not be asked whether the target carries \
+                 the vector registers; the x86 longest-prefix kernels follow the target's \
+                 own features"
+            );
+            has("sse2")
+        });
+        if vector {
+            println!("cargo:rustc-cfg=lsp_x86");
+        }
+        // A build that states what it expects (CI, per target) fails when the
+        // answer differs, so a wrong one cannot pass as a slower build.
+        if let Ok(expected) = std::env::var("LSM_TREE_EXPECT_LSP_X86") {
+            assert_eq!(
+                expected == "1",
+                vector,
+                "LSM_TREE_EXPECT_LSP_X86={expected}, but the x86 longest-prefix kernels are {}",
+                if vector { "compiled" } else { "left out" }
+            );
+        }
     }
 
     if std::env::var("CARGO_FEATURE_IO_URING").is_ok()
@@ -66,29 +86,43 @@ fn main() {
 
 /// Whether the compiler accepts, for the target being built, a function that
 /// enables `feature`: it refuses one on a target whose ABI leaves the
-/// registers of that feature out. `None` when the compiler could not be run.
+/// registers of that feature out.
+///
+/// `None` when the compiler gives no answer: it could not be run, or does not
+/// compile the same function without the attribute either (a flag of the
+/// build that clashes with the probe's own, a target whose `core` is not
+/// installed). Only a function that compiles without the attribute and not
+/// with it is a refusal of the feature.
 ///
 /// Compiled as the crate is: for the same target, with the same flags.
 fn target_accepts_feature(feature: &str) -> Option<bool> {
+    let enabling = format!("#[target_feature(enable = \"{feature}\")]\n");
+    if !probe_compiles(&format!("control_{feature}"), "")? {
+        return None;
+    }
+    probe_compiles(&format!("accepts_{feature}"), &enabling)
+}
+
+/// Whether the compiler builds, for the target and with the flags of this
+/// build, a `no_std` library of one function carrying `attribute`. `None`
+/// when the compiler could not be started.
+fn probe_compiles(name: &str, attribute: &str) -> Option<bool> {
     use std::process::{Command, Stdio};
 
     let rustc = std::env::var_os("RUSTC")?;
     let target = std::env::var_os("TARGET")?;
     let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR")?);
-    let source = out_dir.join(format!("accepts_{feature}.rs"));
+    let source = out_dir.join(format!("{name}.rs"));
     std::fs::write(
         &source,
-        format!(
-            "#![no_std]\n#![allow(warnings)]\n\
-             #[target_feature(enable = \"{feature}\")]\npub unsafe fn probe() {{}}\n"
-        ),
+        format!("#![no_std]\n#![allow(warnings)]\n{attribute}pub unsafe fn probe() {{}}\n"),
     )
     .ok()?;
 
     let mut compiler = Command::new(rustc);
     compiler
         .arg("--crate-name")
-        .arg(format!("accepts_{feature}"))
+        .arg(name)
         .arg("--crate-type=lib")
         .arg("--emit=metadata")
         .arg("--target")
