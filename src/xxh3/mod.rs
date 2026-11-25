@@ -323,10 +323,25 @@ impl Hasher {
 
     /// Hashes `input` after what came before it.
     pub(crate) fn update(&mut self, mut input: &[u8]) {
-        /// Writes `bytes` into `buffer` at `at`; every caller keeps them in it.
-        fn put(buffer: &mut [core::mem::MaybeUninit<u8>; BUFFER_LEN], at: usize, bytes: &[u8]) {
-            if let Some(place) = buffer.get_mut(at..at + bytes.len()) {
-                place.write_copy_of_slice(bytes);
+        /// Writes `bytes` into `buffer` at `at`.
+        ///
+        /// # Safety
+        ///
+        /// `at + bytes.len() <= BUFFER_LEN`.
+        unsafe fn put(
+            buffer: &mut [core::mem::MaybeUninit<u8>; BUFFER_LEN],
+            at: usize,
+            bytes: &[u8],
+        ) {
+            debug_assert!(at + bytes.len() <= BUFFER_LEN);
+            // SAFETY: in bounds by the caller; a `MaybeUninit<u8>` is laid out
+            // as a `u8`, and `bytes` cannot overlap the hasher's own buffer.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    buffer.as_mut_ptr().add(at).cast::<u8>(),
+                    bytes.len(),
+                );
             }
         }
 
@@ -342,7 +357,8 @@ impl Hasher {
         *total = total.wrapping_add(input.len() as u64);
         let room = BUFFER_LEN - *buffered;
         if input.len() <= room {
-            put(buffer, *buffered, input);
+            // SAFETY: `input` fits the room left after the buffered bytes.
+            unsafe { put(buffer, *buffered, input) };
             *buffered += input.len();
             return;
         }
@@ -351,7 +367,8 @@ impl Hasher {
             // Fill the buffer and accumulate it: more input follows, so its
             // last stripe is not the input's last.
             let (fill, rest) = input.split_at(room);
-            put(buffer, *buffered, fill);
+            // SAFETY: `fill` is exactly the room left after the buffered bytes.
+            unsafe { put(buffer, *buffered, fill) };
             // SAFETY: the whole buffer is written now, its four stripes; the
             // secret holds its 192 bytes and `done` stays below a block.
             *done = unsafe {
@@ -376,12 +393,15 @@ impl Hasher {
             // The last stripe accumulated, for a digest whose own last
             // stripe reaches back into it.
             let (consumed, rest) = input.split_at(len);
-            if let Some(last) = consumed.get(len - STRIPE_LEN..) {
-                put(buffer, BUFFER_LEN - STRIPE_LEN, last);
-            }
+            // `len` is at least one buffer, so it holds a whole last stripe.
+            let (_, last) = consumed.split_at(len - STRIPE_LEN);
+            // SAFETY: a stripe, in the buffer's last 64 bytes.
+            unsafe { put(buffer, BUFFER_LEN - STRIPE_LEN, last) };
             input = rest;
         }
-        put(buffer, 0, input);
+        // SAFETY: what is left is 1 to 256 bytes: input that fit the buffer
+        // returned above, and a longer run left at most a buffer's worth.
+        unsafe { put(buffer, 0, input) };
         *buffered = input.len();
     }
 
@@ -448,17 +468,5 @@ impl Hasher {
             return short::hash128(self.buffered(), self.seed);
         }
         merge128(&self.long_acc(), self.secret(), self.total)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::io::Write for Hasher {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.update(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
