@@ -1,4 +1,4 @@
-//! The crate's xxh3-64 against `xxhash-rust`'s, on the lengths the engine
+//! The crate's xxh3-64 and xxh3-128 against `xxhash-rust`'s, on the lengths the engine
 //! hashes: a key, a short entry, the end of xxh3's short paths, a packed
 //! record, a table block, and large values on either side of the wide
 //! kernel's threshold. Both run in one binary on one CPU, so their times
@@ -27,5 +27,24 @@ fn xxh3_64(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, xxh3_64);
+/// The same lengths through xxh3-128, the digest of a table block.
+fn xxh3_128(c: &mut Criterion) {
+    let data: Vec<u8> = (0..(1usize << 20))
+        .map(|at| (at.wrapping_mul(0x9E37_79B9) >> 7) as u8)
+        .collect();
+    let mut group = c.benchmark_group("xxh3_128");
+    for len in LENGTHS {
+        let input = &data[..len];
+        group.throughput(Throughput::Bytes(len as u64));
+        group.bench_with_input(BenchmarkId::new("ours", len), input, |b, input| {
+            b.iter(|| lsm_tree::hash::hash128(black_box(input)));
+        });
+        group.bench_with_input(BenchmarkId::new("xxhash_rust", len), input, |b, input| {
+            b.iter(|| xxhash_rust::xxh3::xxh3_128(black_box(input)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, xxh3_64, xxh3_128);
 criterion_main!(benches);
