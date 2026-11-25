@@ -17,24 +17,105 @@ fn codec<'d>(compression: CompressionType) -> Codec<'d> {
     }
 }
 
-/// The writer sums a frame's entries and payload as two parts, the reader as
-/// the one range they make: the two agree at every length, across the input
-/// sizes where xxh3 changes how it hashes, or a frame the writer stamps would
-/// fail its read.
+/// A single frame of a few KiB under key `k` at seqno 3, stored as it is.
+fn single_frame() -> Vec<u8> {
+    let payload: Vec<u8> = (0..4_096_u32).map(|at| (at * 31 + 7) as u8).collect();
+    let entry = EntrySpec {
+        key: b"k",
+        seqno: 3,
+        value_len: payload.len() as u32,
+    };
+    let mut out = Vec::new();
+    encode_frame(FrameKind::Single, &[entry], &payload, plain(), &mut out).unwrap();
+    out
+}
+
+/// The entries and the payload are checked apart: a flipped payload byte
+/// fails a read of the value, while a copy as stored, which carries the
+/// payload with its checksum, takes it; the copy's own read then fails as the
+/// original's would. Without the split a copy has to hash the whole payload.
 #[test]
-fn a_checksum_in_two_parts_is_the_checksum_of_the_whole() {
-    let bytes: Vec<u8> = (0..4_096_u32).map(|at| (at * 31 + 7) as u8).collect();
-    for len in [0, 1, 16, 17, 128, 129, 240, 241, 1_024, 4_096] {
-        let whole = &bytes[..len];
-        for split in [0, len / 3, len] {
-            let (entries, payload) = whole.split_at(split);
-            assert_eq!(
-                frame_checksum_parts(entries, payload, 0xdead_beef),
-                frame_checksum(whole, 0xdead_beef),
-                "{len} bytes split at {split}"
-            );
-        }
-    }
+fn a_damaged_payload_fails_a_read_but_not_a_copy_as_stored() {
+    let mut frame = single_frame();
+    let last = frame.len() - 1;
+    frame[last] ^= 1;
+    assert!(matches!(
+        decode(&frame, CompressionType::None),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+    let copied = undecoded_frame(&Slice::from(&frame[..]), CompressionType::None).unwrap();
+    assert_eq!(copied.key(0), Some(&b"k"[..]));
+}
+
+/// Damaged entries fail both a read and a copy as stored: the copy relies on
+/// the key and length they list.
+#[test]
+fn damaged_entries_fail_a_read_and_a_copy_as_stored() {
+    let mut frame = single_frame();
+    // The key, the entry's last byte.
+    frame[FRAME_HEADER_LEN + ENTRY_HEADER_LEN] ^= 1;
+    assert!(matches!(
+        decode(&frame, CompressionType::None),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+    assert!(matches!(
+        undecoded_frame(&Slice::from(&frame[..]), CompressionType::None),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+}
+
+/// A head's payload is the table its chunks are found by, so a copy as
+/// stored checks it too.
+#[test]
+fn a_copy_as_stored_checks_a_heads_chunk_table() {
+    let spec = ChunkSpec {
+        raw_len: 10,
+        stored_len: 10,
+        flags: FLAG_RAW,
+        checksum: chunk_checksum(&[0; 10]),
+    };
+    let entry = EntrySpec {
+        key: b"k",
+        seqno: 1,
+        value_len: 10,
+    };
+    let mut out = Vec::new();
+    encode_frame(
+        FrameKind::Head,
+        &[entry],
+        &head_payload(16, &[spec]),
+        plain(),
+        &mut out,
+    )
+    .unwrap();
+    let last = out.len() - 1;
+    out[last] ^= 1;
+    assert!(matches!(
+        undecoded_frame(&Slice::from(out), CompressionType::None),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+}
+
+/// Relisting a value at another seqno rewrites its entries' checksum and
+/// leaves the payload's as it was: the relisted frame reads back at the new
+/// seqno with the same payload checksum, so no byte of the payload was hashed.
+#[test]
+fn relisting_rewrites_the_entries_checksum_alone() {
+    let frame = single_frame();
+    let mut prefix = Vec::new();
+    let at = relist_prefix(&frame, 9, &mut prefix).unwrap().unwrap();
+    let mut relisted = prefix.clone();
+    relisted.extend_from_slice(&frame[at..]);
+    let before = parse_header(&frame).unwrap();
+    let after = parse_header(&relisted).unwrap();
+    assert_eq!(after.payload_checksum, before.payload_checksum);
+    assert_ne!(after.entries_checksum, before.entries_checksum);
+    let read = decode(&relisted, CompressionType::None).unwrap();
+    assert_eq!(read.list[0].seqno, 9);
+    assert_eq!(
+        read.value(0),
+        decode(&frame, CompressionType::None).unwrap().value(0)
+    );
 }
 
 /// A single frame lists its one entry in place: decoding a frame of one value
@@ -320,7 +401,6 @@ fn sealed(
     let entries_len = entries.len() as u32;
     let disk_len = stored.len() as u32;
     let crc = header_crc(kind, flags, count, entries_len, raw_len, disk_len);
-    let checksum = frame_checksum_parts(entries, stored, crc);
     let mut out = Vec::new();
     out.extend_from_slice(&FRAME_MAGIC);
     out.extend_from_slice(&[kind as u8, flags]);
@@ -329,7 +409,8 @@ fn sealed(
     out.extend_from_slice(&raw_len.to_le_bytes());
     out.extend_from_slice(&disk_len.to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&entries_checksum(entries, crc).to_le_bytes());
+    out.extend_from_slice(&payload_checksum(stored, crc).to_le_bytes());
     out.extend_from_slice(entries);
     out.extend_from_slice(stored);
     out
@@ -998,7 +1079,6 @@ fn forge(kind: FrameKind, stored: &[u8], raw_len: u32) -> Vec<u8> {
     entries.push(b'k');
     let (count, entries_len, disk_len) = (1_u16, entries.len() as u32, stored.len() as u32);
     let crc = header_crc(kind, 0, count, entries_len, raw_len, disk_len);
-    let checksum = frame_checksum_parts(&entries, stored, crc);
     let mut out = Vec::new();
     out.extend_from_slice(&FRAME_MAGIC);
     out.extend_from_slice(&[kind as u8, 0]);
@@ -1007,7 +1087,8 @@ fn forge(kind: FrameKind, stored: &[u8], raw_len: u32) -> Vec<u8> {
     out.extend_from_slice(&raw_len.to_le_bytes());
     out.extend_from_slice(&disk_len.to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&entries_checksum(&entries, crc).to_le_bytes());
+    out.extend_from_slice(&payload_checksum(stored, crc).to_le_bytes());
     out.extend_from_slice(&entries);
     out.extend_from_slice(stored);
     out

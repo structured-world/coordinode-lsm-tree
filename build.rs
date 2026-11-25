@@ -19,6 +19,26 @@ fn main() {
     let on = |name: &str, values: &[&str]| {
         std::env::var(name).is_ok_and(|value| values.contains(&value.as_str()))
     };
+    // xxh3's vector kernels, only where the target's ABI carries the vector
+    // registers: a soft-float target (`x86_64-unknown-none`,
+    // `aarch64-unknown-none-softfloat`) leaves them off, and hashes through
+    // the scalar kernel.
+    let features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let has = |feature: &str| features.split(',').any(|f| f == feature);
+    // (cfg, architecture, byte orders it runs in, the feature it needs).
+    let kernels = [
+        ("xxh3_sse2", "x86_64", &["little"][..], "sse2"),
+        ("xxh3_neon", "aarch64", &["little"][..], "neon"),
+    ];
+    for (cfg, arch, endians, feature) in kernels {
+        if on("CARGO_CFG_TARGET_ARCH", &[arch])
+            && on("CARGO_CFG_TARGET_ENDIAN", endians)
+            && has(feature)
+        {
+            println!("cargo:rustc-cfg={cfg}");
+        }
+    }
+
     if std::env::var("CARGO_FEATURE_IO_URING").is_ok()
         && on("CARGO_CFG_TARGET_OS", &["linux"])
         && on(

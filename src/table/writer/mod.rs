@@ -1013,6 +1013,25 @@ pub(crate) struct VerbatimSource {
     pub table_id: TableId,
     /// The source offset of the extent's first block.
     pub offset: u64,
+    /// What the copy proves of the blocks before re-stamping them.
+    pub check: CopyCheck,
+}
+
+/// What a verbatim copy proves of the blocks it copies before it re-stamps
+/// their checksums for their new place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyCheck {
+    /// Each block's payload against its checksum: a salvage, which copies
+    /// only the blocks that hold.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "a salvage, the one copy that verifies, needs std")
+    )]
+    Verify,
+    /// Nothing: a compaction's copy carries each block's checksum with its
+    /// unchanged bytes, and a read of the copy checks them as a read of the
+    /// source would have.
+    Carry,
 }
 
 /// How the table a carried data block comes from wrote its blocks, as its
@@ -1040,8 +1059,13 @@ pub(crate) struct PageCarry<'a> {
     pub copied: Vec<bool>,
     /// The source group's bytes on disk.
     pub raw: &'a [u8],
-    /// Where they lay.
-    pub source: VerbatimSource,
+    /// The source table's id. A page carry is a compaction's copy only: each
+    /// copied page's checksum goes with its unchanged bytes and a read of the
+    /// copy checks it, so there is no verifying variant to ask for here (a
+    /// salvage, the one copy that verifies, copies whole blocks instead).
+    pub table_id: TableId,
+    /// The source offset of the group's first byte.
+    pub offset: u64,
     /// The source group's directory and its on-disk length.
     pub directory: &'a crate::table::column_page::PageDirectory,
     /// The on-disk length of that directory, its header included.
@@ -1094,10 +1118,7 @@ impl<'a> PageCarry<'a> {
         Some(CopiedPage {
             frame,
             header,
-            at: crate::table::block::ChecksumAt::table(
-                self.source.table_id,
-                self.source.offset + start as u64,
-            ),
+            at: crate::table::block::ChecksumAt::table(self.table_id, self.offset + start as u64),
         })
     }
 }
@@ -3790,9 +3811,10 @@ impl Writer {
                 PageOut::Prepared(prepared) => prepared.write_to(&mut self.file_writer, at)?,
                 PageOut::Copied(copied) => {
                     // The page's checksum is bound to the place it lay; the
-                    // payload is written as it is.
+                    // payload is written as it is, unhashed: the checksum
+                    // goes with it, and a read of the copy checks it.
                     let mut frame = copied.frame.to_vec();
-                    super::block::Header::rebind_verified_frame(&mut frame, copied.at, at)?;
+                    super::block::Header::rebind_frame(&mut frame, copied.at, at)?;
                     #[cfg(not(feature = "std"))]
                     use crate::io::Write;
                     #[cfg(feature = "std")]
@@ -4717,7 +4739,7 @@ impl Writer {
             self.created_at
                 .unwrap_or_else(|| crate::time::now_on(self.clock.as_ref()).as_nanos())
         });
-        let mut seed = xxhash_rust::xxh3::Xxh3::default();
+        let mut seed = crate::xxh3::Hasher::default();
         seed.update(&self.table_id.to_le_bytes());
         seed.update(&age.to_le_bytes());
         seed.update(&batch.row_count.to_le_bytes());
@@ -4767,11 +4789,14 @@ impl Writer {
                 ));
             }
             let relative = at as u64;
-            Header::rebind_verified_frame(
-                frame,
+            let (from, to) = (
                 ChecksumAt::table(source.table_id, source.offset + relative),
                 ChecksumAt::table(self.table_id, dest + relative),
-            )?;
+            );
+            match source.check {
+                CopyCheck::Verify => Header::rebind_verified_frame(frame, from, to)?,
+                CopyCheck::Carry => Header::rebind_frame(frame, from, to)?,
+            }
             at += len;
         }
         Ok(out)

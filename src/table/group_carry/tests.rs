@@ -567,6 +567,7 @@ fn raw_group(
         crate::table::writer::VerbatimSource {
             table_id: candidate.table.id(),
             offset: candidate.group.offset().0,
+            check: crate::table::writer::CopyCheck::Carry,
         },
     ))
 }
@@ -677,7 +678,8 @@ fn a_partly_carried_group_is_refused_where_it_cannot_land() -> crate::Result<()>
         copied: vec![true; row_pages.len()],
         row_pages,
         raw: &raw,
-        source,
+        table_id: source.table_id,
+        offset: source.offset,
         directory: &directory,
         directory_len: Header::decode_from(&mut &raw[..])
             .map_or_default(|header| header.on_disk_size_with(None)),

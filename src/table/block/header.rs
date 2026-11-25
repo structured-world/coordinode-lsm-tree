@@ -19,14 +19,14 @@ use std::io::{Read, Write};
 
 struct ChecksummedReader<R: Read> {
     inner: R,
-    hasher: xxhash_rust::xxh3::Xxh3Default,
+    hasher: crate::xxh3::Hasher,
 }
 
 impl<R: Read> ChecksummedReader<R> {
     pub(crate) fn new(reader: R) -> Self {
         Self {
             inner: reader,
-            hasher: xxhash_rust::xxh3::Xxh3Default::new(),
+            hasher: crate::xxh3::Hasher::new(),
         }
     }
 
@@ -266,11 +266,10 @@ impl Header {
     }
 
     /// [`Self::rebind_frame`] for a whole block frame read as it lies, whose
-    /// payload is first checked against the checksum it was written under.
-    /// A block copied unread by any other path would move a mismatching
-    /// checksum along with damaged bytes into a new table, and the input that
-    /// held them would be retired; checked here, the copy fails instead, as a
-    /// read of the block would.
+    /// payload is first checked against the checksum it was written under:
+    /// for a salvage, which copies only the blocks that hold. A compaction's
+    /// copy carries the checksum with the unchanged bytes instead, and a read
+    /// of the copy checks them as a read of the source would have.
     ///
     /// # Errors
     ///

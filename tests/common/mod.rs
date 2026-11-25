@@ -231,14 +231,14 @@ impl lsm_tree::fs::Fs for BatchCountFs {
 /// bytes under `key` has of its own under the default frame sizes, what
 /// garbage accounting charges once it is dropped.
 ///
-/// A frame is a 40-byte header, an entry per value (14 bytes and the key)
+/// A frame is a 48-byte header, an entry per value (14 bytes and the key)
 /// and its payload. A value up to the 256 KiB chunk size is a frame of its
 /// own; a larger one is a head (its entry and a chunk table of 8 bytes and
 /// 21 per 256 KiB chunk) followed by the chunks, which carry no header. A
 /// value below the 8 KiB block size shares a block instead, see
 /// [`block_entry_len`].
 pub(crate) fn stored_len(key: &[u8], value_len: u64) -> u64 {
-    const HEADER: u64 = 40;
+    const HEADER: u64 = 48;
     const CHUNK: u64 = 256 * 1024;
     const CHUNK_ROW: u64 = 21;
     assert!(

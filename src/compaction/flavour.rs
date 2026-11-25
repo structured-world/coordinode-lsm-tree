@@ -2142,13 +2142,22 @@ impl RelocatingCompaction {
                     return Ok(None);
                 };
                 // A block a key domain splits (the policy set after it was
-                // written), or of a source past the ones the writer copies
-                // blocks of, keeps no fate and has its values written anew:
-                // copied whole, its file would span two domains, or one more
-                // file would be held open for its source.
-                if !self
-                    .blob_writer
-                    .can_copy_block(block_at.0, &block.first_key, &block.last_key)
+                // written), of a source past the ones the writer copies
+                // blocks of, or under a codec the tree no longer writes,
+                // keeps no fate and has its values written anew: copied
+                // whole, its file would span two domains, one more file would
+                // be held open for its source, or its values would stay under
+                // the codec the policy left.
+                let keeps_codec = self
+                    .rewriting_blob_files
+                    .get(output.1)
+                    .is_some_and(|source| self.blob_writer.keeps_codec(source));
+                if !keeps_codec
+                    || !self.blob_writer.can_copy_block(
+                        block_at.0,
+                        &block.first_key,
+                        &block.last_key,
+                    )
                 {
                     return Ok(None);
                 }
@@ -2586,6 +2595,7 @@ impl StandardCompaction {
         let source = crate::table::writer::VerbatimSource {
             table_id: table.id(),
             offset: candidate.group.offset().0,
+            check: crate::table::writer::CopyCheck::Carry,
         };
         let shape = crate::table::writer::CarriedBlockShape {
             restart_interval: table.metadata.data_block_restart_interval,
@@ -2629,6 +2639,7 @@ impl StandardCompaction {
         let source = crate::table::writer::VerbatimSource {
             table_id: table.id(),
             offset: candidate.group.offset().0,
+            check: crate::table::writer::CopyCheck::Carry,
         };
         if !self.table_writer.carry_row_group(
             (&raw, source),
@@ -2735,10 +2746,8 @@ impl StandardCompaction {
             row_pages,
             copied,
             raw: &raw,
-            source: crate::table::writer::VerbatimSource {
-                table_id: table.id(),
-                offset,
-            },
+            table_id: table.id(),
+            offset,
             directory: &directory,
             directory_len,
         };

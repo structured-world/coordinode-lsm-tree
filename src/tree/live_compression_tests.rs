@@ -209,10 +209,13 @@ fn compaction_filter_over_three_blob_codecs_reads_every_value() -> crate::Result
 }
 
 #[test]
-fn blob_relocation_after_a_policy_change_keeps_each_file_decodable() -> crate::Result<()> {
-    // GC relocation copies frames verbatim, so a file it writes out of a
-    // generation older than the current policy must record that generation's
-    // codec, a dictionary here, and still decode.
+fn blob_relocation_after_a_policy_change_rewrites_survivors_under_the_new_codec()
+-> crate::Result<()> {
+    // GC relocation copies frames as stored only under the codec the tree
+    // writes now: the survivors of a generation written under a dictionary
+    // are decoded and written anew once the policy has moved to no
+    // compression, so no file the pass writes keeps the old codec, and every
+    // value still reads back.
     let dir = tempfile::tempdir()?;
     let dict = Arc::new(ZstdDictionary::new(&training_corpus()));
     let with_dict = CompressionType::zstd_dict(3, dict.id())?;
@@ -275,8 +278,9 @@ fn blob_relocation_after_a_policy_change_keeps_each_file_decodable() -> crate::R
         tree.current_version()
             .blob_files
             .iter()
-            .any(|file| file.compression() == with_dict && !first_files.contains(&file.id())),
-        "the relocated survivors keep the codec they were written under",
+            .filter(|file| !first_files.contains(&file.id()))
+            .all(|file| file.compression() == CompressionType::None),
+        "the relocated survivors take the codec the policy moved to",
     );
 
     for i in 0u32..50 {

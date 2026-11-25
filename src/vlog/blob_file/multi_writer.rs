@@ -71,6 +71,12 @@ pub(crate) struct MultiWriter {
     compression: CompressionType,
     passthrough_compression: CompressionType,
 
+    /// The codec the tree writes its values under now, as
+    /// [`Self::use_passthrough_compression`] set it: a copied value stored
+    /// under another codec or level is decoded and written anew under this
+    /// one, so a changed policy reaches the values a compaction moves.
+    target_compression: CompressionType,
+
     /// How every file this writer produces sizes its frames.
     sizes: super::writer::FrameSizes,
 
@@ -209,6 +215,12 @@ fn without_dictionary(codec: CompressionType) -> CompressionType {
     codec
 }
 
+/// Whether `a` and `b` are one codec at one level, whatever dictionary
+/// either names: a value stored under one goes on under the other as it is.
+fn same_codec(a: CompressionType, b: CompressionType) -> bool {
+    without_dictionary(a) == without_dictionary(b)
+}
+
 /// The dictionary of its own `source` holds, which the file its frames are
 /// copied into holds as its own.
 fn own_dictionary(source: &BlobFile) -> Option<&OwnDictionary> {
@@ -298,6 +310,7 @@ impl MultiWriter {
 
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
+            target_compression: CompressionType::None,
             sizes: super::writer::FrameSizes::DEFAULT,
             dictionary_classes: crate::config::DictionaryClasses::DEFAULT,
             sync_mode: SyncMode::Normal,
@@ -472,10 +485,13 @@ impl MultiWriter {
     /// Sets the codec the files this writer produces hold, for a writer that
     /// copies the frames of files under that codec: a copied frame goes as it
     /// is, and a block's values, which are copied out of the block they shared,
-    /// are compressed into new blocks under the same codec.
+    /// are compressed into new blocks under the same codec. A source under
+    /// another codec is decoded and written anew under this one (see
+    /// [`Self::keeps_codec`]).
     pub(crate) fn use_passthrough_compression(mut self, compression: CompressionType) -> Self {
         assert_eq!(self.compression, CompressionType::None);
         self.passthrough_compression = compression;
+        self.target_compression = compression;
         self.restamp_active(compression, None);
         self
     }
@@ -626,7 +642,9 @@ impl MultiWriter {
     /// Each output holding a source's dictionary is a file held open until
     /// the pass ends, so at most [`MAX_COPY_SOURCES`] are: past them, a
     /// source's values are written anew, decoded, into an output of its
-    /// codec without the dictionary, and this returns `false`.
+    /// codec without the dictionary, and this returns `false`. A source
+    /// whose codec is no longer the tree's has its values written anew,
+    /// decoded, into an output of the tree's codec, and this returns `false`.
     ///
     /// # Errors
     ///
@@ -637,6 +655,10 @@ impl MultiWriter {
         source: &BlobFile,
         class: u8,
     ) -> crate::Result<bool> {
+        if !self.keeps_codec(source) {
+            self.select(self.target_compression, class, None, None)?;
+            return Ok(false);
+        }
         let own = own_dictionary(source);
         if own.is_some() && !self.holds_own_output(own) && self.own_outputs() >= MAX_COPY_SOURCES {
             self.select(without_dictionary(source.compression()), class, None, None)?;
@@ -727,6 +749,14 @@ impl MultiWriter {
     /// be copied whole: its keys lie in one key domain (always, without a
     /// domain policy), so its file spans none, and `source` is one of the
     /// sources this writer copies blocks of, or one more fits.
+    /// Whether `source`'s values may go on as they are stored: under the
+    /// codec and level the tree writes now. The dictionary is not compared:
+    /// a source's own goes with its frames into the file that copies them.
+    #[must_use]
+    pub(crate) fn keeps_codec(&self, source: &BlobFile) -> bool {
+        same_codec(source.compression(), self.target_compression)
+    }
+
     pub(crate) fn can_copy_block(
         &self,
         source: crate::vlog::BlobFileId,

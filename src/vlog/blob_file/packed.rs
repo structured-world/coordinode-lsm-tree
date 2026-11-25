@@ -4,7 +4,7 @@
 //! A packed block: small values compressed one by one under the file's codec
 //! (with the file's own dictionary once it has one), sharing one frame.
 //!
-//! The frame is a [`FrameKind::Block`] flagged [`FLAG_PACKED`], with no
+//! The frame is a [`super::frame::FrameKind::Block`] flagged [`FLAG_PACKED`], with no
 //! entries; its payload is records back to back:
 //!
 //! ```text
@@ -26,7 +26,6 @@
 
 use super::frame::{
     DecodedFrame, FLAG_PLAIN, FLAG_RAW, FRAME_HEADER_LEN, FrameEntries, FrameEntry, FrameHeader,
-    FrameKind,
 };
 use crate::{CompressionType, SeqNo, Slice};
 #[cfg(not(feature = "std"))]
@@ -113,7 +112,7 @@ pub(crate) fn encode_record(
     out.push(flags);
     out.extend_from_slice(key);
     out.extend_from_slice(stored);
-    let checksum = xxhash_rust::xxh3::xxh3_64(out.get(start + 8..).unwrap_or_default());
+    let checksum = crate::xxh3::hash64(out.get(start + 8..).unwrap_or_default());
     if let Some(slot) = out.get_mut(start..start + 8) {
         slot.copy_from_slice(&checksum.to_le_bytes());
     }
@@ -129,7 +128,7 @@ pub(crate) fn encode_record(
 pub(crate) fn parse_record(bytes: &[u8]) -> crate::Result<Record> {
     let record = record_fields(bytes)?;
     let rest = bytes.get(8..record.len).unwrap_or_default();
-    let got = xxhash_rust::xxh3::xxh3_64(rest);
+    let got = crate::xxh3::hash64(rest);
     if got != record.checksum {
         return Err(crate::Error::ChecksumMismatch {
             got: crate::Checksum::from_raw(u128::from(got)),
@@ -378,14 +377,7 @@ pub(crate) fn cached_value(cached: &Slice, key: &[u8]) -> crate::Result<Slice> {
 /// Fails unless `records` are the packed block's whose header is `header`,
 /// by the frame's checksum over them.
 fn check_records(header: &FrameHeader, records: &[u8]) -> crate::Result<()> {
-    let checksum = super::frame::frame_checksum(records, header.header_crc);
-    if checksum != header.checksum {
-        return Err(crate::Error::ChecksumMismatch {
-            got: crate::Checksum::from_raw(checksum),
-            expected: crate::Checksum::from_raw(header.checksum),
-        });
-    }
-    Ok(())
+    super::frame::check_payload(header, records)
 }
 
 /// Checks the records of the packed block whose header is `header` against
@@ -533,15 +525,9 @@ pub(crate) fn decode_packed(
 ///
 /// `records` longer than a frame holds: the writer closes a block first.
 pub(crate) fn packed_header(count: u16, raw_len: u32, records: &[u8]) -> [u8; FRAME_HEADER_LEN] {
-    #[expect(clippy::expect_used, reason = "the writer closes a block first")]
-    let records_len = u32::try_from(records.len()).expect("a packed block fits a frame");
-    super::frame::stamp_header(
-        FrameKind::Block,
-        FLAG_PACKED,
-        count,
-        0,
-        raw_len,
-        records_len,
-        |crc| super::frame::frame_checksum(records, crc),
-    )
+    assert!(
+        u32::try_from(records.len()).is_ok(),
+        "a packed block fits a frame"
+    );
+    super::frame::stamp_packed_header(count, raw_len, records)
 }

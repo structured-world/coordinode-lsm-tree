@@ -340,6 +340,8 @@ pub mod fs;
 
 pub mod hash;
 
+pub(crate) mod xxh3;
+
 /// Local I/O trait surface mirroring `std::io::{Read, Write, Seek}`.
 ///
 /// Provides `Error` / `ErrorKind` / `SeekFrom` plus the three trait

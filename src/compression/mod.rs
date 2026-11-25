@@ -372,7 +372,7 @@ impl core::fmt::Debug for ZstdDictionary {
 /// method returns only the lower 32 bits for backward-compatible display.
 #[cfg(zstd_any)]
 fn compute_dict_id(raw: &[u8]) -> u64 {
-    xxhash_rust::xxh3::xxh3_64(raw)
+    crate::xxh3::hash64(raw)
 }
 
 /// Every dictionary a tree can decompress against, keyed by the id its tables

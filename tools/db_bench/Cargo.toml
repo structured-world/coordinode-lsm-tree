@@ -43,7 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["registry"], optional = true
 # the published trend by several percent on commits that never touch the
 # measured path. See the same section in the crate root Cargo.toml.
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 # The same dev profiles as the crate root: this is a separate workspace and

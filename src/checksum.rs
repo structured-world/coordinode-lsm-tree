@@ -58,7 +58,7 @@ impl Checksum {
 
 pub struct ChecksummedWriter<W: crate::io::Write> {
     inner: W,
-    hasher: xxhash_rust::xxh3::Xxh3Default,
+    hasher: crate::xxh3::Hasher,
     /// The stream position the next write lands at, counted rather than asked
     /// for: asking a buffered writer flushes it.
     position: u64,
@@ -102,7 +102,7 @@ impl<W: crate::io::Write> ChecksummedWriter<W> {
     pub fn new(writer: W) -> Self {
         Self {
             inner: writer,
-            hasher: xxhash_rust::xxh3::Xxh3Default::new(),
+            hasher: crate::xxh3::Hasher::new(),
             position: 0,
         }
     }

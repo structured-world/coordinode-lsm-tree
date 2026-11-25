@@ -7,9 +7,9 @@
 //! half, so its first blob files are half garbage; a first merge learns that,
 //! and the timed merge relocates their live halves. The live values are
 //! copied as stored, so what the relocation reads it does not have to decode.
-//! One arm per codec, for plain values and for cell rows whose one cell holds
-//! the value, and arms whose values are split into chunks, each copied with
-//! its head; each iteration builds its tree outside the timer, and each arm
+//! One arm per codec, uncompressed among them, for plain values and for cell
+//! rows whose one cell holds the value, and arms whose values are split into
+//! chunks, each copied with its head; each iteration builds its tree outside the timer, and each arm
 //! prints the P50, P99 and P999 of its timed merges.
 
 use core::num::NonZeroU32;
@@ -124,6 +124,9 @@ fn bench_relocation(c: &mut Criterion) {
     // value.
     let (whole, chunked) = (1_024 * 1_024, 4_096);
     let arms = [
+        // Stored as they are: what a copy as stored hashes is all of the value.
+        ("none", CompressionType::None, false, whole),
+        ("chunked_none", CompressionType::None, false, chunked),
         ("lz4", CompressionType::Lz4, false, whole),
         ("zstd3", CompressionType::Zstd(3), false, whole),
         ("cells_lz4", CompressionType::Lz4, true, whole),

@@ -210,7 +210,7 @@ lz4_flex = { version = "0.14.0", optional = true, default-features = false, feat
 # SIMD kernels (dropping them leaves the scalar path), long-distance matching
 # and its hash. The trainer stays out, as the library only consumes finished
 # dictionaries; it would pull `fastrand` into every consumer.
-structured-zstd = { version = "0.4.3", optional = true, default-features = false, features = [
+structured-zstd = { version = "0.4.4", optional = true, default-features = false, features = [
     "hash",
     "ldm",
     "std",
@@ -268,12 +268,11 @@ tempfile = { version = "3.20.0", optional = true }
 # Only the std build reads varints through it; without std the crate's own
 # `io` varints serve.
 varint-rs = { version = "2.2.1", default-features = false, optional = true }
-xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # CRC32C (Castagnoli) for the optional `Crc32c` checksum algorithm.
 # Hardware-accelerated (SSE4.2 `_mm_crc32` on x86, CRC32 instructions on
 # ARM) with a safe scalar fallback; runtime-detected by the crate. Only
-# pulled in behind the `crc32c` feature — the default `Xxh3_64` algorithm
-# needs only `xxhash-rust`.
+# pulled in behind the `crc32c` feature; the default `Xxh3_64` algorithm is
+# the crate's own.
 crc32c = { version = "0.6", optional = true }
 # The 0.11 surface we depend on:
 #   - aes_gcm::aead::{AeadInOut, Generate, Nonce, Tag}
@@ -364,13 +363,18 @@ test-log = "0.2.18"
 # rather than to the normal dependency: a dev-dependency's features do not
 # reach consumers, so none of them pays for `fastrand` (and the `std` it
 # forces) for a capability they do not use.
-structured-zstd = { version = "0.4.3", features = ["dict-builder", "lsm"] }
+structured-zstd = { version = "0.4.4", features = ["dict-builder", "lsm"] }
+# The reference the crate's own xxh3 is checked against, digest for digest,
+# and the fixtures that stamp checksums independently of it.
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(coverage,coverage_nightly)',
   'cfg(zstd_any)',
   'cfg(io_uring_fs)',
+  'cfg(xxh3_sse2)',
+  'cfg(xxh3_neon)',
 ] }
 
 [package.metadata.cargo-all-features]
@@ -477,6 +481,12 @@ required-features = []
 name = "bloom"
 harness = false
 path = "benches/bloom.rs"
+required-features = []
+
+[[bench]]
+name = "xxh3"
+harness = false
+path = "benches/xxh3.rs"
 required-features = []
 
 [[bench]]
@@ -679,8 +689,13 @@ required-features = ["std", "metrics"]
 # percent on commits that never touch the measured path (bisected to exactly
 # that: a functionally inert commit "regressed" seekrandom 3-4% until the A/B
 # was rebuilt with these settings, where the delta collapsed to zero). One
-# codegen unit removes the layout lottery; thin LTO restores the cross-unit
+# codegen unit removes the layout lottery; LTO restores the cross-unit
 # inlining a single unit would otherwise lose.
+#
+# Fat rather than thin LTO, by its own measure on one source tree: built fat,
+# seek_random runs x0.957 / x0.969 / x0.960 of thin at 1000 / 10000 / 70000
+# keys (x0.96 under zstd too), point reads, multi_get, range scans and writes
+# level, and overwrite_sustained retires the same cycles at the same IPC.
 #
 # Pinned on the bench profile only, which is what every criterion harness in
 # this crate builds with; the two standalone harnesses under tools/ carry the
@@ -689,7 +704,7 @@ required-features = ["std", "metrics"]
 # single codegen unit with LTO more than doubles that build, past the job's
 # time budget, for binaries nothing measures.
 [profile.bench]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 # Line tables keep file and line in backtraces and panics while dropping the

@@ -23,14 +23,14 @@ use std::io::{Read, Seek, SeekFrom};
 
 struct ChecksummedReader<R: crate::io::Read> {
     inner: R,
-    hasher: xxhash_rust::xxh3::Xxh3Default,
+    hasher: crate::xxh3::Hasher,
 }
 
 impl<R: crate::io::Read> ChecksummedReader<R> {
     fn new(reader: R) -> Self {
         Self {
             inner: reader,
-            hasher: xxhash_rust::xxh3::Xxh3Default::new(),
+            hasher: crate::xxh3::Hasher::new(),
         }
     }
 

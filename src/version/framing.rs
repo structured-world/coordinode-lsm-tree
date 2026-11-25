@@ -56,7 +56,7 @@ use alloc::vec::Vec;
 use crate::io::{Read, Write};
 
 /// Size of the framing header in bytes (4 B `len` + 8 B `xxh3_64`).
-pub const FRAME_HEADER_LEN: usize = 4 + 8;
+pub(crate) const FRAME_HEADER_LEN: usize = 4 + 8;
 
 /// Hard cap on `len` — keeps an obviously-forged value from
 /// triggering an allocation that exceeds reasonable manifest
@@ -66,7 +66,7 @@ pub const FRAME_HEADER_LEN: usize = 4 + 8;
 /// `comparator_name` length cap upstream. 64 KiB is a generous
 /// ceiling that still cuts off any `len` that would otherwise
 /// trigger a multi-megabyte allocation on a corrupt header.
-pub const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
+pub(crate) const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 
 /// Writes a framed record. The closure-provided payload is
 /// assembled in a temporary `Vec<u8>` first so the `len` and
@@ -85,7 +85,7 @@ pub const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 /// produce a frame the reader always rejects as
 /// [`FramedRecordOutcome::BadHeader`], silently bricking
 /// recovery for that section.
-pub fn write_framed_record<W, F>(
+pub(crate) fn write_framed_record<W, F>(
     writer: &mut W,
     scratch: &mut Vec<u8>,
     payload_fn: F,
@@ -114,7 +114,7 @@ where
 /// Returns the I/O error from `writer` if any write fails, or
 /// [`crate::Error::Unrecoverable`] when the payload exceeds
 /// [`MAX_FRAME_PAYLOAD`], before any byte reaches `writer`.
-pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()> {
+pub(crate) fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()> {
     if payload.len() > MAX_FRAME_PAYLOAD as usize {
         log::error!(
             "write_frame refusing to emit oversized payload \
@@ -130,7 +130,7 @@ pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()
         reason = "the explicit MAX_FRAME_PAYLOAD guard above ensures payload.len() fits in u32"
     )]
     let len = payload.len() as u32;
-    let digest = xxhash_rust::xxh3::xxh3_64(payload);
+    let digest = crate::xxh3::hash64(payload);
 
     writer.write_u32::<LittleEndian>(len)?;
     writer.write_u64::<LittleEndian>(digest)?;
@@ -142,7 +142,7 @@ pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()
 /// Result of [`read_framed_record`] — exposes the per-record
 /// outcome so the caller can apply mode-specific recovery policy.
 #[derive(Debug)]
-pub enum FramedRecordOutcome {
+pub(crate) enum FramedRecordOutcome {
     /// The header decoded, payload was read in full into the
     /// caller-provided `payload_scratch`, and the XXH3-64 digest
     /// matched. The caller reads the payload bytes by slicing
@@ -230,7 +230,7 @@ pub enum FramedRecordOutcome {
 /// [`FramedRecordOutcome::TailTruncation`]). Decode-time errors
 /// (checksum mismatch, oversized header) are surfaced via the
 /// returned [`FramedRecordOutcome`] variant rather than `Err`.
-pub fn read_framed_record<R: Read>(
+pub(crate) fn read_framed_record<R: Read>(
     reader: &mut R,
     remaining_in_section: u64,
     expected_payload_len: Option<u32>,
@@ -314,7 +314,7 @@ pub fn read_framed_record<R: Read>(
         Err(e) => return Err(e.into()),
     }
 
-    let digest_actual = xxhash_rust::xxh3::xxh3_64(payload_scratch);
+    let digest_actual = crate::xxh3::hash64(payload_scratch);
     if digest_actual == digest_expected {
         Ok(FramedRecordOutcome::Ok)
     } else {

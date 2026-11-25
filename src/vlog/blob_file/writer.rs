@@ -201,7 +201,7 @@ pub(crate) fn encode_frame_index_marked(starts: &[u64], end: u64, chunks: &[u64]
         }
     }
     out.extend_from_slice(&end.to_le_bytes());
-    let digest = xxhash_rust::xxh3::xxh3_64(&out);
+    let digest = crate::xxh3::hash64(&out);
     out.extend_from_slice(&digest.to_le_bytes());
     out
 }
@@ -265,7 +265,7 @@ impl core::ops::Deref for FrameIndex {
 pub(crate) fn decode_frame_index(bytes: &[u8]) -> crate::Result<FrameIndex> {
     let malformed = || crate::Error::InvalidHeader("BlobFrameIndex");
     let (body, digest) = bytes.split_last_chunk::<8>().ok_or_else(malformed)?;
-    if xxhash_rust::xxh3::xxh3_64(body) != u64::from_le_bytes(*digest) {
+    if crate::xxh3::hash64(body) != u64::from_le_bytes(*digest) {
         return Err(malformed());
     }
     let (count, rest) = body.split_first_chunk::<4>().ok_or_else(malformed)?;

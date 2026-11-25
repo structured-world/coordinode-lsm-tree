@@ -330,7 +330,7 @@ pub(crate) fn checksum_from_with_overrides(
     if start != 0 {
         file.seek(SeekFrom::Start(start))?;
     }
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    let mut hasher = crate::xxh3::Hasher::new();
     let mut buf = alloc::vec![0u8; 256 * 1024];
     let mut chunk_start = start;
     loop {

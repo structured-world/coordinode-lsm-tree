@@ -24,7 +24,7 @@ const CHECKSUM_LEN: usize = 8;
 
 /// The id of the report `bytes` encode, as [`decode_owed`] gives it.
 pub(super) fn owed_id(bytes: &[u8]) -> u128 {
-    decode(bytes).map_or_else(|| xxhash_rust::xxh3::xxh3_128(bytes), |report| report.id)
+    decode(bytes).map_or_else(|| crate::xxh3::hash128(bytes), |report| report.id)
 }
 
 /// The report `bytes` encode, or, when they do not decode, a report that
@@ -41,7 +41,7 @@ pub(super) fn decode_owed(bytes: &[u8], tree: &Path) -> RepairReport {
         // The same for every hand-out of these bytes, and distinct from
         // another repair's damaged report, which a caller deduplicating by
         // id must not skip.
-        unscoped(tree, xxhash_rust::xxh3::xxh3_128(bytes))
+        unscoped(tree, crate::xxh3::hash128(bytes))
     })
 }
 
@@ -56,7 +56,7 @@ pub(super) fn unreadable_owed(tree: &Path, snapshot_id: u64) -> RepairReport {
     );
     let mut seed = b"unreadable owed report".to_vec();
     seed.extend_from_slice(&snapshot_id.to_le_bytes());
-    unscoped(tree, xxhash_rust::xxh3::xxh3_128(&seed))
+    unscoped(tree, crate::xxh3::hash128(&seed))
 }
 
 /// A report that leaves the loss unscoped, under `id`.
@@ -89,7 +89,7 @@ pub(super) fn id_for(
     let mut seed = encode(report);
     seed.extend_from_slice(&version_id.to_le_bytes());
     seed.extend_from_slice(&crate::time::now_on(clock).as_nanos().to_le_bytes());
-    xxhash_rust::xxh3::xxh3_128(&seed)
+    crate::xxh3::hash128(&seed)
 }
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
