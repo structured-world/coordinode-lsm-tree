@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795623531527,
+  "lastUpdate": 1795641660019,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104566,6 +104566,90 @@ window.BENCHMARK_DATA = {
             "value": 406466.76345358393,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 10.3us | P99.9: 72.5us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f98cc14983581b774cd594b23f78da68a3033c30",
+          "message": "feat(ingest): replace a tree's content with an ingestion (#1109)\n\n## Summary\n\n- Adds `AnyTree::replacing_ingestion` (with `Ingestion::new_replacing`\nand `BlobIngestion::new_replacing`): an ingestion whose `finish`\nreplaces the tree's whole content with what it wrote, in one version\ninstall, so a reader sees the old content or the new one, never neither.\n- The ingested rows sit at seqno 0, below every later write, so an entry\napplied after the replace at its commit timestamp (below the tree's\ncurrent seqno) reads over the ingested row.\n- The replacing tables are written without the bulk-ingested flag, since\ntheir offset is 0, so a repair that rebuilds a lost manifest keeps them.\n\n## Changes\n\n- `finish` of a replacing ingestion takes the flush, compaction state\nand version locks and installs, in one `upgrade_version`, an empty\nmemtable in place of the active and sealed ones (deciding the taken\nflush numbers), `Version::cleared` with the ingested tables as its only\nL0 run, and the ingested blob files. The retention effect is\n`DropsData`, as for `clear`.\n- The mode is chosen when the ingestion starts, because the\nbulk-ingested flag is written into each table before its first row.\n- `clear` and the replacing install share one install\n(`Tree::install_replacing`) and one reclaim of the replaced files. The\nblob tree's `clear` delegates to its index.\n- The ingestion keeps its dictionary pin through the install, so the\ndictionaries its files name survive the clear of the version's set.\n- Table recovery of an ingested run is shared by both finishes.\n- README, the retention-floor sections of `docs/INVARIANTS.md`,\n`docs/external-wal.md` and `docs/manifest-recovery.md`, and the known\nweak spots of manifest recovery describe the replacing ingestion.\n\n## Known limitation\n\nA repair that rebuilds a lost manifest cannot tell a replace's tables\nfrom the content around them. After a crash between the install and the\ndeletion of the earlier tables it adopts those tables beside the\nreplaced content; after a crash between writing the replacing tables and\ntheir install it adopts the uninstalled tables beside the content they\nwere to replace. Both need the manifest to be lost before the next open\ncleans up, and such a repair reports `FullHistory`. Closing them needs\nthe replacing tables to record what they supersede, a table format\nchange.\n\n## Testing\n\nTests, clippy (default and all features), formatting, docs with warnings\ndenied, doc tests and the no-std checks pass on macOS; CI runs the full\nmatrix.\n\n## Related\n\n- #1110: the repair telling a replace's content from earlier tables a\ncrash left\n\nCloses #1105\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n- **New Features**\n- Added replacing ingestion for standard and blob trees. Ingested data\nreplaces the tree’s existing contents when installed; readers see either\nthe earlier contents or the replacement.\n- Replacing ingestion can install an empty tree, and I/O errors leave\nthe earlier contents intact.\n- **Documentation**\n- Expanded guidance on replacement behavior, sequence numbers,\nretention, and recovery.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-25T21:55:40+02:00",
+          "tree_id": "db122648ded15be9828f0b5d136276963056fe4f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f98cc14983581b774cd594b23f78da68a3033c30"
+        },
+        "date": 1795641658909,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 153772.52791020367,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.2us | P99.9: 29.2us\nthreads: 1 | elapsed: 3.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3171225.819105827,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 974650.9325452812,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.0us | P99.9: 11.8us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 516007.03621002496,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.6us | P99.9: 21.2us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3199687.1473894767,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 331722.4724211327,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.1us | P99.9: 14.7us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 196001.325796088,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 9.7us | P99.9: 19.9us\nthreads: 1 | elapsed: 1.02s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 940395.8491002452,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.0us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1000477.4078094584,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 400896.62615101127,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 7.8us | P99.9: 38.0us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
           }
         ]
       }
