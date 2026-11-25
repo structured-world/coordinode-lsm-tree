@@ -37,6 +37,46 @@ impl<'a> BlobIngestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs.
     pub fn new(tree: &'a crate::BlobTree) -> crate::Result<Self> {
+        Self::open(tree, false)
+    }
+
+    /// Creates an ingestion whose [`finish`](Self::finish) replaces the tree's
+    /// whole content, index tables and blob files alike: see
+    /// [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion).
+    /// The earlier blob files go with the earlier tables, once nothing holds
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, AnyTree, Config, KvSeparationOptions, SeqNo};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let AnyTree::Blob(tree) = Config::new(folder, Default::default(), Default::default())
+    ///     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    ///     .open()?
+    /// else {
+    ///     panic!("a key-value separated config opens a blob tree");
+    /// };
+    /// tree.insert("old", "gone", 0);
+    ///
+    /// let mut ingestion = lsm_tree::blob_tree::ingest::BlobIngestion::new_replacing(&tree)?;
+    /// ingestion.write("a".into(), "1".into())?;
+    /// ingestion.finish()?;
+    ///
+    /// assert!(tree.get("old", SeqNo::MAX)?.is_none());
+    /// assert_eq!(tree.get("a", SeqNo::MAX)?.as_deref(), Some(b"1".as_slice()));
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn new_replacing(tree: &'a crate::BlobTree) -> crate::Result<Self> {
+        Self::open(tree, true)
+    }
+
+    fn open(tree: &'a crate::BlobTree, replacing: bool) -> crate::Result<Self> {
         #[expect(
             clippy::expect_used,
             reason = "cannot define blob tree without kv separation options"
@@ -57,7 +97,7 @@ impl<'a> BlobIngestion<'a> {
         let rc = tree.index.0.runtime_config.load_full();
         let blob_compression = rc.blob_compression;
 
-        let table = TableIngestion::with_runtime_snapshot(&tree.index, &rc)?;
+        let table = TableIngestion::with_runtime_snapshot(&tree.index, &rc, replacing)?;
         let blob = BlobFileWriter::new_for(
             tree.index.0.blob_file_id_counter.clone(),
             tree.index.config.path.join(BLOBS_FOLDER),
@@ -269,7 +309,9 @@ impl<'a> BlobIngestion<'a> {
         res
     }
 
-    /// Finishes the ingestion.
+    /// Finishes the ingestion: adds what it wrote to the tree, or, for one
+    /// created by [`new_replacing`](Self::new_replacing), replaces the tree's
+    /// content with it.
     ///
     /// # Errors
     ///
@@ -278,6 +320,9 @@ impl<'a> BlobIngestion<'a> {
     pub fn finish(mut self) -> crate::Result<()> {
         use crate::AbstractTree;
 
+        if self.table.replacing {
+            return self.finish_replacing();
+        }
         let index = self.index().clone();
 
         // CRITICAL SECTION: Atomic flush + seqno allocation + registration
@@ -395,40 +440,15 @@ impl<'a> BlobIngestion<'a> {
         Ok(())
     }
 
-    /// Finishes the ingestion by replacing the tree's whole content, index
-    /// tables and blob files alike, with what it wrote, in one version
-    /// install: see [`AnyIngestion::finish_replacing`](crate::AnyIngestion::finish_replacing)
-    /// for what a reader, a later write and a crash see. The earlier blob
-    /// files go with the earlier tables, once nothing holds them.
+    /// Finishes a replacing ingestion: replaces the tree's whole content,
+    /// index tables and blob files alike, with what it wrote, in one version
+    /// install.
     ///
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs; the tree then keeps its
     /// earlier content.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use lsm_tree::{AbstractTree, AnyTree, Config, KvSeparationOptions, SeqNo};
-    ///
-    /// let folder = tempfile::tempdir()?;
-    /// let AnyTree::Blob(tree) = Config::new(folder, Default::default(), Default::default())
-    ///     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
-    ///     .open()?
-    /// else {
-    ///     panic!("a key-value separated config opens a blob tree");
-    /// };
-    /// tree.insert("old", "gone", 0);
-    ///
-    /// let mut ingestion = lsm_tree::blob_tree::ingest::BlobIngestion::new(&tree)?;
-    /// ingestion.write("a".into(), "1".into())?;
-    /// ingestion.finish_replacing()?;
-    ///
-    /// assert!(tree.get("old", SeqNo::MAX)?.is_none());
-    /// assert_eq!(tree.get("a", SeqNo::MAX)?.as_deref(), Some(b"1".as_slice()));
-    /// # Ok::<(), lsm_tree::Error>(())
-    /// ```
-    pub fn finish_replacing(mut self) -> crate::Result<()> {
+    fn finish_replacing(mut self) -> crate::Result<()> {
         use crate::AbstractTree;
 
         let index = self.index().clone();

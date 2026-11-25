@@ -339,7 +339,7 @@ matching entry (and add one for a new subsystem).
   the appended edit-log field): a flush or compaction that collected a
   version under GC watermark `w` raises it to `w - 1` (capped at its own
   install seqno), a `clear`, a replacing ingestion
-  (`AnyIngestion::finish_replacing`), a table drop or a compaction whose
+  (`AnyTree::replacing_ingestion`), a table drop or a compaction whose
   filter removed or rewrote rows to its own install seqno; an ingest, move,
   blob relocation,
   a flush or compaction that collected nothing, or an empty drop leaves it

@@ -35,6 +35,9 @@ pub struct Ingestion<'a> {
     pub(crate) write_pin: crate::runtime_config::WritePin,
     seqno: SeqNo,
     last_key: Option<UserKey>,
+    /// Whether `finish` replaces the tree's content rather than adding to it
+    /// (see [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion)).
+    pub(crate) replacing: bool,
     /// Successive columnar batches with the same layout accumulate here into one
     /// rowgroup, flushed to a block once they reach the target row group size or
     /// the layout changes, so many small ingest batches become few large blocks.
@@ -61,12 +64,24 @@ impl<'a> Ingestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs.
     pub fn new(tree: &'a Tree) -> crate::Result<Self> {
-        Self::with_runtime_snapshot(tree, &tree.0.runtime_config.load_full())
+        Self::with_runtime_snapshot(tree, &tree.0.runtime_config.load_full(), false)
+    }
+
+    /// Creates an ingestion whose [`finish`](Self::finish) replaces the tree's
+    /// whole content: see
+    /// [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion).
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    pub fn new_replacing(tree: &'a Tree) -> crate::Result<Self> {
+        Self::with_runtime_snapshot(tree, &tree.0.runtime_config.load_full(), true)
     }
 
     /// Creates a new ingestion whose writer is configured from `rc`, so an
     /// ingestion that writes more than tables (a blob ingestion) takes one
-    /// snapshot for all of its files.
+    /// snapshot for all of its files. A `replacing` one replaces the tree's
+    /// content when it finishes.
     ///
     /// # Errors
     ///
@@ -75,6 +90,7 @@ impl<'a> Ingestion<'a> {
     pub(crate) fn with_runtime_snapshot(
         tree: &'a Tree,
         rc: &Arc<crate::runtime_config::RuntimeConfig>,
+        replacing: bool,
     ) -> crate::Result<Self> {
         // Ingested tables are placed at L0 (via with_new_l0_run), so use
         // the level-routed folder for level 0.
@@ -246,11 +262,14 @@ impl<'a> Ingestion<'a> {
         // The index of a blob tree takes rows written as cells, which its
         // columnar tables split into the columns of their fields.
         writer = writer.use_cell_rows(rc.columnar && tree.config.kv_separation_opts.is_some());
-        // Flag every ingested SST: its entries are written at local seqno 0 and
-        // rely on the `global_seqno` allocated at commit, so manifest repair must
-        // recognize the manifest-only offset (and fail closed when it is lost)
-        // rather than mistake the table for a normal flush at seqno 0.
-        writer = writer.use_bulk_ingested(true);
+        // Flag every adding ingestion's SST: its entries are written at local
+        // seqno 0 and rely on the `global_seqno` allocated at commit, so
+        // manifest repair must recognize the manifest-only offset (and fail
+        // closed when it is lost) rather than mistake the table for a normal
+        // flush at seqno 0. A replacing ingestion installs at offset 0, which
+        // is what a repair rebuilds an unflagged table at, so its tables are
+        // not flagged and a repair keeps them.
+        writer = writer.use_bulk_ingested(!replacing);
         writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
@@ -278,6 +297,7 @@ impl<'a> Ingestion<'a> {
                 .with_refills(refills),
             seqno: 0,
             last_key: None,
+            replacing,
             #[cfg(feature = "columnar")]
             pending_columnar: None,
         })
@@ -562,7 +582,9 @@ impl<'a> Ingestion<'a> {
         Ok(())
     }
 
-    /// Finishes the ingestion.
+    /// Finishes the ingestion: adds what it wrote to the tree, or, for one
+    /// created by [`new_replacing`](Self::new_replacing), replaces the tree's
+    /// content with it.
     ///
     /// # Errors
     ///
@@ -571,6 +593,9 @@ impl<'a> Ingestion<'a> {
     pub fn finish(mut self) -> crate::Result<()> {
         use crate::AbstractTree;
 
+        if self.replacing {
+            return self.finish_replacing();
+        }
         if self.last_key.is_none() {
             log::trace!("No data written to Ingestion, returning early");
             return Ok(());
@@ -689,16 +714,15 @@ impl<'a> Ingestion<'a> {
         Ok(())
     }
 
-    /// Finishes the ingestion by replacing the tree's whole content with what
-    /// it wrote, in one version install: see
-    /// [`AnyIngestion::finish_replacing`](crate::AnyIngestion::finish_replacing)
-    /// for what a reader, a later write and a crash see.
+    /// Finishes a replacing ingestion: replaces the tree's whole content with
+    /// what it wrote, in one version install (see
+    /// [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion)).
     ///
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs; the tree then keeps its
     /// earlier content.
-    pub fn finish_replacing(mut self) -> crate::Result<()> {
+    fn finish_replacing(mut self) -> crate::Result<()> {
         use crate::AbstractTree;
 
         // The hold on the ingestion's dictionaries stays here until its

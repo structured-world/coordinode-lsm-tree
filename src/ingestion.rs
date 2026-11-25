@@ -174,20 +174,25 @@ impl AnyIngestion<'_> {
         }
     }
 
-    /// Finalizes ingestion and registers created tables (and blob files if present).
+    /// Finalizes ingestion and registers created tables (and blob files if
+    /// present): added to the tree's content, or, for an ingestion started by
+    /// [`AnyTree::replacing_ingestion`], replacing it.
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
+    /// Will return `Err` if an IO error occurs; a replacing ingestion then
+    /// leaves the tree with its earlier content.
     pub fn finish(self) -> crate::Result<()> {
         match self {
             Self::Standard(i) => i.finish(),
             Self::Blob(b) => b.finish(),
         }
     }
+}
 
-    /// Finalizes ingestion by replacing the tree's whole content with the
-    /// created tables (and blob files if present), in one version install.
+impl AnyTree {
+    /// Starts an ingestion whose [`finish`](AnyIngestion::finish) replaces the
+    /// tree's whole content with what it wrote, in one version install.
     ///
     /// The install drops the active and sealed memtables and every table and
     /// blob file the tree held, and makes the ingested data its only content.
@@ -210,13 +215,19 @@ impl AnyIngestion<'_> {
     /// A write that took its seqno before the install is dropped with the
     /// memtable it went into; the caller orders its writes after this call.
     /// After a crash the tree opens with either the earlier content or this
-    /// ingestion's, never a mix: once the call returned, nothing of the earlier
-    /// content comes back, a flush of the dropped memtables included.
+    /// ingestion's, never a mix: once `finish` returned, nothing of the
+    /// earlier content comes back, a flush of the dropped memtables included.
+    ///
+    /// The mode is chosen here, before the first row, because it is written
+    /// into every table: the ingested tables are not marked bulk-ingested,
+    /// since they sit at seqno 0, so a repair that rebuilds a lost manifest
+    /// ([`Config::repair`](crate::Config::repair)) keeps them at seqno 0. Such a
+    /// repair cannot tell an earlier table a crash left on disk before its
+    /// deletion from the ingested ones, and reads it over them.
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs; the tree then keeps its
-    /// earlier content.
+    /// Will return `Err` if an IO error occurs.
     ///
     /// # Examples
     ///
@@ -227,23 +238,20 @@ impl AnyIngestion<'_> {
     /// let tree = Config::new(folder, Default::default(), Default::default()).open()?;
     /// tree.insert("old", "gone", 0);
     ///
-    /// let mut ingestion = tree.ingestion()?;
+    /// let mut ingestion = tree.replacing_ingestion()?;
     /// ingestion.write("a", "1")?;
-    /// ingestion.finish_replacing()?;
+    /// ingestion.finish()?;
     ///
     /// assert!(tree.get("old", SeqNo::MAX)?.is_none());
     /// assert_eq!(tree.get("a", SeqNo::MAX)?.as_deref(), Some(b"1".as_slice()));
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
-    pub fn finish_replacing(self) -> crate::Result<()> {
+    pub fn replacing_ingestion(&self) -> crate::Result<AnyIngestion<'_>> {
         match self {
-            Self::Standard(i) => i.finish_replacing(),
-            Self::Blob(b) => b.finish_replacing(),
+            Self::Standard(t) => Ok(AnyIngestion::Standard(Ingestion::new_replacing(t)?)),
+            Self::Blob(b) => Ok(AnyIngestion::Blob(BlobIngestion::new_replacing(b)?)),
         }
     }
-}
-
-impl AnyTree {
     /// Starts an ingestion for any tree type (standard or blob).
     ///
     /// # Errors

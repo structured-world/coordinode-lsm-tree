@@ -694,12 +694,12 @@ fn replacing_ingestion_with_its_policy_replaced_before_install_keeps_its_diction
 
     {
         let tree = open_with_data_dictionary(config(dir.path()), &dict)?;
-        let mut ingestion = crate::tree::ingest::Ingestion::new(&tree)?;
+        let mut ingestion = crate::tree::ingest::Ingestion::new_replacing(&tree)?;
         for i in 0u32..100 {
             ingestion.write(key(0, i).as_bytes().into(), value(0, i).into())?;
         }
         let reached = replace_policy_and_collect_before_install(&tree, disable_data_dictionary);
-        ingestion.finish_replacing()?;
+        ingestion.finish()?;
 
         window_reached(&reached)?;
         assert!(
@@ -723,13 +723,13 @@ fn replacing_blob_ingestion_with_its_policy_replaced_before_install_keeps_its_di
 
     {
         let tree = open_with_blob_dictionary(config(dir.path()), &dict)?;
-        let mut ingestion = crate::blob_tree::ingest::BlobIngestion::new(&tree)?;
+        let mut ingestion = crate::blob_tree::ingest::BlobIngestion::new_replacing(&tree)?;
         for i in 0u32..100 {
             ingestion.write(key(0, i).as_bytes().into(), value(0, i).into())?;
         }
         let reached =
             replace_policy_and_collect_before_install(&tree.index, disable_blob_dictionary);
-        ingestion.finish_replacing()?;
+        ingestion.finish()?;
 
         window_reached(&reached)?;
         assert!(

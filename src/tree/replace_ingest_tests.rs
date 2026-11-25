@@ -42,11 +42,18 @@ fn write_old(tree: &AnyTree) -> crate::Result<()> {
 }
 
 fn replace(tree: &AnyTree, keys: &[(&str, &str)]) -> crate::Result<()> {
-    let mut ingestion = tree.ingestion()?;
+    let mut ingestion = tree.replacing_ingestion()?;
     for (key, value) in keys {
         ingestion.write(*key, *value)?;
     }
-    ingestion.finish_replacing()
+    ingestion.finish()
+}
+
+/// Closes `tree` and waits until its table file pool and background deleter
+/// are done, so the files left are final and a reopen finds the folder
+/// unlocked.
+fn close(tree: AnyTree) {
+    tree.close().wait();
 }
 
 fn value(tree: &AnyTree, key: &str) -> crate::Result<Option<Vec<u8>>> {
@@ -89,7 +96,7 @@ fn a_replace_leaves_only_the_ingested_content() -> crate::Result<()> {
             blob,
             "self-check: blob files only in a blob tree"
         );
-        drop(tree);
+        close(tree);
         assert_eq!(
             files_in(folder.path(), crate::file::TABLES_FOLDER),
             tables,
@@ -120,7 +127,7 @@ fn an_empty_replace_empties_the_tree() -> crate::Result<()> {
         assert_eq!(tree.iter(SeqNo::MAX, None).count(), 0, "blob: {blob}");
         assert_eq!(tree.table_count(), 0);
         assert_eq!(tree.blob_file_count(), 0);
-        drop(tree);
+        close(tree);
 
         let tree = config(folder.path(), blob).open()?;
         assert_eq!(tree.iter(SeqNo::MAX, None).count(), 0, "blob: {blob}");
@@ -141,28 +148,38 @@ fn a_reader_never_sees_a_shared_key_absent() -> crate::Result<()> {
         tree.flush_active_memtable(0)?;
 
         let done = Arc::new(AtomicBool::new(false));
+        let (started, reading) = std::sync::mpsc::channel();
         let reader = {
             let tree = tree.clone();
             let done = Arc::clone(&done);
             std::thread::spawn(move || -> crate::Result<usize> {
                 let mut reads = 0;
-                while !done.load(Ordering::Acquire) {
+                loop {
                     assert!(
                         tree.get("shared", SeqNo::MAX)?.is_some(),
                         "the shared key read absent after {reads} reads"
                     );
                     reads += 1;
+                    if reads == 1 {
+                        // The replaces start once the reader runs.
+                        started.send(()).ok();
+                    }
+                    if done.load(Ordering::Acquire) {
+                        return Ok(reads);
+                    }
                 }
-                Ok(reads)
             })
         };
-        for round in 0..50 {
+        reading.recv().expect("the reader started");
+        let replaced = (0..50).try_for_each(|round| {
             let value = round.to_string();
-            replace(&tree, &[("other", "x"), ("shared", &value)])?;
-        }
+            replace(&tree, &[("other", "x"), ("shared", &value)])
+        });
+        // The reader stops before a failed replace is reported, so it does not
+        // outlive the test.
         done.store(true, Ordering::Release);
-        let reads = reader.join().expect("reader")?;
-        assert!(reads > 0, "self-check: the reader ran");
+        reader.join().expect("reader")?;
+        replaced?;
         assert_eq!(value(&tree, "shared")?.as_deref(), Some(b"49".as_slice()));
     }
     Ok(())
@@ -199,7 +216,7 @@ fn a_write_below_the_current_seqno_reads_over_the_ingested_row() -> crate::Resul
             value(&tree, "kept")?.as_deref(),
             Some(b"ingested".as_slice())
         );
-        drop(tree);
+        close(tree);
 
         let tree = config(folder.path(), blob).open()?;
         assert_eq!(value(&tree, "k")?.as_deref(), Some(b"later".as_slice()));
@@ -231,7 +248,7 @@ fn a_read_below_a_replace_is_refused() -> crate::Result<()> {
         };
         assert!(refused(&tree), "blob: {blob}");
         assert_eq!(value(&tree, "new")?.as_deref(), Some(b"1".as_slice()));
-        drop(tree);
+        close(tree);
         let tree = config(folder.path(), blob).open()?;
         assert!(refused(&tree), "after a reopen, blob: {blob}");
     }
@@ -250,10 +267,20 @@ fn an_iterator_opened_before_a_replace_reads_the_earlier_content() -> crate::Res
         }
         tree.flush_active_memtable(0)?;
         let mut before = tree.iter(SeqNo::MAX, None);
-        let first = before.next().expect("a first key").key()?;
+        let (first_key, first_value) = before.next().expect("a first key").into_inner()?;
         replace(&tree, &[("new", "1")])?;
-        assert_eq!(&*first, b"key000");
-        assert_eq!(before.count(), 99, "blob: {blob}");
+        assert_eq!(&*first_key, b"key000");
+        assert_eq!(&*first_value, [b'v'; 64].as_slice());
+        // Every row the earlier version held, key and value, read after the
+        // replace: a blob tree's values come from the earlier blob files.
+        let mut rows = 1;
+        for (i, guard) in (1..).zip(before) {
+            let (key, value) = guard.into_inner()?;
+            assert_eq!(&*key, format!("key{i:03}").as_bytes(), "blob: {blob}");
+            assert_eq!(&*value, [b'v'; 64].as_slice(), "blob: {blob}");
+            rows += 1;
+        }
+        assert_eq!(rows, 100, "blob: {blob}");
         assert_eq!(tree.iter(SeqNo::MAX, None).count(), 1, "blob: {blob}");
     }
     Ok(())
@@ -282,7 +309,7 @@ fn a_merge_across_a_replace_installs_nothing() -> crate::Result<()> {
         assert_eq!(value(&tree, "a")?, None, "blob: {blob}");
         assert_eq!(value(&tree, "b")?, None, "blob: {blob}");
         assert_eq!(tree.iter(SeqNo::MAX, None).count(), 1, "blob: {blob}");
-        drop(tree);
+        close(tree);
 
         let tree = config(folder.path(), blob).open()?;
         assert_eq!(tree.iter(SeqNo::MAX, None).count(), 1, "blob: {blob}");

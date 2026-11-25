@@ -286,3 +286,76 @@ fn repair_drops_a_bulk_ingested_table() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// Removes every manifest snapshot and edit log of the tree in `folder`.
+fn lose_the_manifest(folder: &std::path::Path) -> lsm_tree::Result<()> {
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_manifest = name
+            .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_manifest {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// A replacing ingestion installs its tables at seqno 0, the offset a repair
+/// rebuilds a lost manifest with, so the repair keeps them, index tables and
+/// blob files alike, and the tree reads the replaced content alone. Guards
+/// against the replacing tables being flagged as an adding ingestion's, whose
+/// offset a lost manifest takes with it and which the repair drops.
+#[test]
+fn repair_keeps_a_replacing_ingestion() -> lsm_tree::Result<()> {
+    for blob in [false, true] {
+        let folder = get_tmp_folder();
+        let seqno = SequenceNumberCounter::default();
+        let visible_seqno = SequenceNumberCounter::default();
+        let config = || {
+            let config = Config::new(&folder, seqno.clone(), visible_seqno.clone());
+            if blob {
+                config.with_kv_separation(Some(
+                    KvSeparationOptions::default().separation_threshold(1),
+                ))
+            } else {
+                config
+            }
+        };
+
+        {
+            let tree = config().open()?;
+            for x in 0..64u64 {
+                tree.insert(x.to_be_bytes(), b"old", seqno.next());
+            }
+            tree.flush_active_memtable(0)?;
+            let mut ingestion = tree.replacing_ingestion()?;
+            for x in 32..96u64 {
+                ingestion.write(x.to_be_bytes(), b"new")?;
+            }
+            ingestion.finish()?;
+            // The earlier tables are deleted before the manifest goes.
+            tree.close().wait();
+        }
+
+        lose_the_manifest(folder.path())?;
+        let report = config().repair()?;
+        assert_eq!(report.unreadable, 0, "blob: {blob}, {report:?}");
+        assert!(report.recovered > 0, "blob: {blob}, {report:?}");
+
+        let tree = config().open()?;
+        assert_eq!(tree.iter(SeqNo::MAX, None).count(), 64, "blob: {blob}");
+        for x in 32..96u64 {
+            assert_eq!(
+                tree.get(x.to_be_bytes(), SeqNo::MAX)?.as_deref(),
+                Some(b"new".as_slice()),
+                "blob: {blob}"
+            );
+        }
+        assert!(tree.get(0u64.to_be_bytes(), SeqNo::MAX)?.is_none());
+    }
+    Ok(())
+}

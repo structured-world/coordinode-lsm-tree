@@ -498,6 +498,18 @@ which requires the block index — out of reach for a path-based walk that holds
 only a filesystem reference and no open table. Callers that do hold a table
 pass the exact frontier in and are unaffected.
 
+**A replace's leftovers are not told from its content.** A replacing
+ingestion (`AnyTree::replacing_ingestion`) writes its tables unmarked at seqno
+0, the offset a repair rebuilds them with, so a repair keeps them; an adding
+ingestion's tables are marked bulk-ingested, and a repair drops them, since
+their offset lived in the manifest alone. When a crash after the replace's
+install left an earlier table on the disk before its deletion, and the
+manifest is lost after that, the repair has nothing to tell the earlier table
+from the replaced content: it adopts both, and the earlier table's rows, at
+their higher seqnos, read over the replaced ones. Closing this needs the
+replacing tables to name what they supersede, which the table format does not
+carry yet.
+
 **The publish phase is a sequence of renames, not one atomic act.** Publishing
 under fresh ids reduces this to "write new files, then commit the manifest",
 where only the commit is observable — but the file writes themselves are
