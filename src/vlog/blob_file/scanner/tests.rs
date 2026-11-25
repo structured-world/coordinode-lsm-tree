@@ -413,7 +413,7 @@ fn by_the_index_a_damaged_frame_costs_only_itself() -> crate::Result<()> {
     let index = index_of(&path)?;
     let pristine = std::fs::read(&path)?;
     // The magic, a length field, the header CRC, a key byte, a value byte.
-    for at in [0, 12, 20, 40 + 14, index[2] - index[1] - 1] {
+    for at in [0, 12, 20, FRAME_HEADER_LEN + 14, index[2] - index[1] - 1] {
         std::fs::write(&path, &pristine)?;
         edit(&path, |bytes| bytes[index[1] + at] ^= 0x40)?;
         let mut scanner = Scanner::new(&path, &StdFs, 0)?;
@@ -540,7 +540,9 @@ fn chunks_whose_head_is_damaged_are_passed_with_it() -> crate::Result<()> {
     let path = write(dir.path(), &[(b"big", &[9; 700]), (b"next", &[1; 120])])?;
     let index = index_of(&path)?;
     // A key byte of the head, frame 0.
-    edit(&path, |bytes| bytes[index[0] + 40 + 14] ^= 0x40)?;
+    edit(&path, |bytes| {
+        bytes[index[0] + FRAME_HEADER_LEN + 14] ^= 0x40
+    })?;
     let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
     assert_eq!(results.len(), 2, "the head, then the next value");
     assert!(matches!(
@@ -620,7 +622,9 @@ fn a_frame_inside_a_chunk_whose_head_is_damaged_is_not_a_value() -> crate::Resul
     let path = write(dir.path(), &[(b"big", &big), (b"next", &[1; 120])])?;
     let index = index_of(&path)?;
     // A key byte of the head, frame 0.
-    edit(&path, |bytes| bytes[index[0] + 40 + 14] ^= 0x40)?;
+    edit(&path, |bytes| {
+        bytes[index[0] + FRAME_HEADER_LEN + 14] ^= 0x40
+    })?;
 
     let results: Vec<_> = Scanner::new(&path, &StdFs, 0)?.collect();
     let keys: Vec<_> = results
@@ -649,7 +653,8 @@ fn rewrite_head_table(
     edit(path, |bytes| {
         let head = &mut bytes[index[0]..index[1]];
         // The entry's value length, after its seqno and key length.
-        head[40 + 10..40 + 14].copy_from_slice(&value_len.to_le_bytes());
+        head[FRAME_HEADER_LEN + 10..FRAME_HEADER_LEN + 14]
+            .copy_from_slice(&value_len.to_le_bytes());
         // The chunk table after the entry: the chunk size, then the count,
         // then a row per chunk, left as written.
         let entries_len = parse_header(head).expect("a head").entries_len as usize;
@@ -1009,9 +1014,10 @@ fn write_with_a_forged_header(
 
     // The forgery sits in frame 0's value, which starts after its header,
     // its entry and the key.
-    let forged_at = 40 + 14 + 3 + 10;
+    let forged_at = FRAME_HEADER_LEN + 14 + 3 + 10;
     let entries_len = 14 + 3;
-    let disk_len = u32::try_from(index[2] - forged_at - 40 - entries_len).expect("small") + past;
+    let disk_len =
+        u32::try_from(index[2] - forged_at - FRAME_HEADER_LEN - entries_len).expect("small") + past;
     let header = forged_header(FrameKind::Single, 1, entries_len as u32, disk_len, disk_len);
     let mut value = filler.to_vec();
     value[10..10 + header.len()].copy_from_slice(&header);
