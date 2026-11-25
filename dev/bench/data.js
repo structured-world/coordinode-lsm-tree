@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795641665180,
+  "lastUpdate": 1795641670248,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -127026,6 +127026,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.430142649,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f98cc14983581b774cd594b23f78da68a3033c30",
+          "message": "feat(ingest): replace a tree's content with an ingestion (#1109)\n\n## Summary\n\n- Adds `AnyTree::replacing_ingestion` (with `Ingestion::new_replacing`\nand `BlobIngestion::new_replacing`): an ingestion whose `finish`\nreplaces the tree's whole content with what it wrote, in one version\ninstall, so a reader sees the old content or the new one, never neither.\n- The ingested rows sit at seqno 0, below every later write, so an entry\napplied after the replace at its commit timestamp (below the tree's\ncurrent seqno) reads over the ingested row.\n- The replacing tables are written without the bulk-ingested flag, since\ntheir offset is 0, so a repair that rebuilds a lost manifest keeps them.\n\n## Changes\n\n- `finish` of a replacing ingestion takes the flush, compaction state\nand version locks and installs, in one `upgrade_version`, an empty\nmemtable in place of the active and sealed ones (deciding the taken\nflush numbers), `Version::cleared` with the ingested tables as its only\nL0 run, and the ingested blob files. The retention effect is\n`DropsData`, as for `clear`.\n- The mode is chosen when the ingestion starts, because the\nbulk-ingested flag is written into each table before its first row.\n- `clear` and the replacing install share one install\n(`Tree::install_replacing`) and one reclaim of the replaced files. The\nblob tree's `clear` delegates to its index.\n- The ingestion keeps its dictionary pin through the install, so the\ndictionaries its files name survive the clear of the version's set.\n- Table recovery of an ingested run is shared by both finishes.\n- README, the retention-floor sections of `docs/INVARIANTS.md`,\n`docs/external-wal.md` and `docs/manifest-recovery.md`, and the known\nweak spots of manifest recovery describe the replacing ingestion.\n\n## Known limitation\n\nA repair that rebuilds a lost manifest cannot tell a replace's tables\nfrom the content around them. After a crash between the install and the\ndeletion of the earlier tables it adopts those tables beside the\nreplaced content; after a crash between writing the replacing tables and\ntheir install it adopts the uninstalled tables beside the content they\nwere to replace. Both need the manifest to be lost before the next open\ncleans up, and such a repair reports `FullHistory`. Closing them needs\nthe replacing tables to record what they supersede, a table format\nchange.\n\n## Testing\n\nTests, clippy (default and all features), formatting, docs with warnings\ndenied, doc tests and the no-std checks pass on macOS; CI runs the full\nmatrix.\n\n## Related\n\n- #1110: the repair telling a replace's content from earlier tables a\ncrash left\n\nCloses #1105\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n- **New Features**\n- Added replacing ingestion for standard and blob trees. Ingested data\nreplaces the tree’s existing contents when installed; readers see either\nthe earlier contents or the replacement.\n- Replacing ingestion can install an empty tree, and I/O errors leave\nthe earlier contents intact.\n- **Documentation**\n- Expanded guidance on replacement behavior, sequence numbers,\nretention, and recovery.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-25T21:55:40+02:00",
+          "tree_id": "db122648ded15be9828f0b5d136276963056fe4f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f98cc14983581b774cd594b23f78da68a3033c30"
+        },
+        "date": 1795641668991,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 609.16,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 158.412056ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 295.571,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 213.667859ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1451.285,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 279.155904ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5528.8730000000005,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 26242.028000000002,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.199,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.020927,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.418119043,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.831,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.822015,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.406262964,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
