@@ -363,6 +363,47 @@ fn a_replace_that_returned_survives_a_power_loss() -> crate::Result<()> {
     Ok(())
 }
 
+/// A replace whose written tables do not open for the install fails and
+/// leaves the earlier content, memtable rows included: nothing is dropped
+/// before the new run is in hand. The tree takes a replace again afterwards.
+#[test]
+fn a_replace_whose_tables_do_not_open_keeps_the_earlier_content() -> crate::Result<()> {
+    for blob in [false, true] {
+        let fs = Arc::new(FaultFs::new(crate::fs::MemFs::new()));
+        let tree = config_on(fs.clone(), blob).open()?;
+        write_old(&tree)?;
+
+        // Armed once the ingestion's writer has finished its tables, so the
+        // open that fails is the install's.
+        let injector = fs.clone();
+        tree.tree_config().arm_before_output_install(move || {
+            injector.injector().arm(
+                FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::Other))
+                    .on_path(crate::file::TABLES_FOLDER),
+            );
+        });
+        assert!(
+            replace(&tree, &[("new", "1")]).is_err(),
+            "self-check: the replace fails, blob: {blob}"
+        );
+        fs.injector().clear();
+
+        for key in ["shared", "flushed", "sealed", "active"] {
+            assert_eq!(
+                value(&tree, key)?.as_deref(),
+                Some(b"old".as_slice()),
+                "{key}, blob: {blob}"
+            );
+        }
+        assert_eq!(value(&tree, "new")?, None, "blob: {blob}");
+
+        replace(&tree, &[("new", "2")])?;
+        assert_eq!(value(&tree, "new")?.as_deref(), Some(b"2".as_slice()));
+        assert_eq!(tree.iter(SeqNo::MAX, None).count(), 1, "blob: {blob}");
+    }
+    Ok(())
+}
+
 /// A replace whose manifest write fails leaves the earlier content, and a
 /// power loss after it opens the earlier content alone: the ingested files,
 /// named by no manifest, are not adopted.
