@@ -889,9 +889,11 @@ pub struct RuntimeConfig {
     ///
     /// Takes effect on the next blob file written: a flush, an ingestion, or a
     /// compaction filter that rewrites values. Each blob file records its own
-    /// codec, so earlier files keep theirs and stay readable, and GC relocation
-    /// copies frames verbatim under the codec they were written with; a change
-    /// therefore reaches existing values only as they are rewritten. A
+    /// codec, so earlier files keep theirs and stay readable. GC relocation
+    /// takes the change too: a value written under another codec or level is
+    /// decoded and written anew under this one, while a value already under it
+    /// is copied as stored, with its dictionary. Values nothing rewrites or
+    /// relocates keep the codec they were written with. A
     /// `ZstdDict` entry names a dictionary the tree must already hold, as for
     /// data blocks. Unused by a standard tree. Default: LZ4, or uncompressed
     /// without the `lz4` feature.
