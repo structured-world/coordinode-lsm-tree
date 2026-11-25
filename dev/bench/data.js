@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795623525880,
+  "lastUpdate": 1795623531527,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -126006,6 +126006,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.406810436,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9d925591a2b92432c26e44235f5a771b47acb373",
+          "message": "perf(checksum): own xxh3 with a run-time kernel, check blob frames in two parts (#1107)\n\n## Summary\n\n- The crate owns xxh3 whole: short paths inlined, the target's baseline\nkernel called directly, and on x86-64 the AVX2 kernel for inputs of 64\nKiB and more, chosen once per process. `xxhash-rust` stays a\ndev-dependency, the reference the tests and benches compare against.\n- A blob frame checks its entries and its payload apart, so a relocation\nthat copies a frame as stored hashes no payload; a relocated value under\nanother codec is written anew under the tree's.\n- Measured binaries build with fat LTO, for its own gain on seeks.\n\n## Changes\n\n- `src/xxh3`: xxh3-64 and xxh3-128, one-shot and streamed; SSE2, AVX2,\nNEON and scalar kernels; the 16-byte bound tested first. The vector\nkernels are built only where the target enables the vector registers\n(`xxh3_sse2` / `xxh3_neon` from the build script); a soft-float target\nhashes through the scalar kernel.\n- Blob frame header: an xxh3-64 of the entries and an xxh3-128 of the\npayload, both seeded with the header CRC; copy as stored carries the\npayload checksum; relisting rewrites the entries' checksum alone.\n- A table block a compaction copies as stored carries its checksum\nunhashed.\n- Relocation decodes and rewrites a value whose codec or level differs\nfrom the tree's.\n- `[profile.bench]` and the `compare-rocksdb` / `db_bench` profiles: fat\nLTO, one codegen unit.\n- Benches: `xxh3` (ours against `xxhash-rust`, 64 and 128 bits,\nthroughput and per-call P50/P99/P999), `blob_relocation` uncompressed\nvalues, blob flush of small values inline beside separated.\n- `structured-zstd` 0.4.4.\n\n## Measurements\n\nLinux benchmark host with AVX2, this branch against main, both built\nwith fat LTO, interleaved runs on one host.\n\n| Group (ours) | 1k | 10k | 70k |\n|---|---|---|---|\n| `point_read` (ours alone, 3 runs a side) | x0.988 | x0.995 | x0.998 |\n| `seek_random` | x0.999 | x0.992 | x1.006 |\n| `seek_random_zstd22` | x1.007 | x1.001 | x0.998 |\n| `multi_get` | x1.014 | x1.007 | x0.999 |\n| `multi_get_zstd22` | x1.006 | x1.007 | x0.951 |\n| `range_scan` | x1.016 | x1.017 | x1.003 |\n| `range_scan_zstd22` | x1.009 | x1.009 | x0.982 |\n| `write_throughput` | x0.981 | x0.970 | x0.973 |\n| `write_throughput_zstd22` | x0.986 | x0.961 | x0.992 |\n\n| Group (ours) | branch / main | against RocksDB |\n|---|---|---|\n| `point_read_blobs_1mib` | x0.923 | 0.95 |\n| `point_read_blobs_4mib` | x0.876 | 0.83 |\n| `range_scan_blobs_1mib` | x0.870 | 0.62 |\n| `range_scan_blobs_4mib` | x0.830 | 0.68 |\n| `write_throughput_blobs_1mib` / `_4mib` | x0.915 / x0.912 | |\n| `major_compact_zstd3` 10k / 40k (ours alone, 4 runs a side) | x0.996 /\nx1.004 | |\n\n- `overwrite`, `overwrite_sustained`, `concurrent_mixed` and\n`subcompaction` are within their run-to-run spread of main.\n`overwrite_skew_*` times memtable inserts with no flush, a path that\nruns no xxh3.\n- Fat against thin LTO on main alone: `seek_random` x0.957 / x0.969 /\nx0.960, the other groups level, `overwrite_sustained` the same cycles at\nthe same IPC.\n- Against `xxhash-rust` in one binary: level from 16 bytes to 32 KiB,\nx0.55 to x0.61 from 64 KiB to 1 MiB.\n\n## Testing\n\nfmt, clippy (default and all features, macOS and x86-64 Linux), the\nno-std check on `thumbv7em-none-eabihf`, `cargo doc` with warnings\ndenied, doc tests, the full nextest suite (macOS; Linux under the CI\nprofile), the `v5-to-v6` converter tests and the `sst-dump` build pass.\n\n## Related\n\n- #1108: the longest-prefix kernels of `table::util` still stop a\nsoft-float build; out of scope here.\n\nCloses #1070\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved hashing performance, including hardware-accelerated\nprocessing on supported systems.\n* **Data Integrity**\n* Blob relocation now rewrites values when their compression settings\ndiffer from the tree’s current settings.\n* Stored values can be copied without checking payload checksums;\nchecksum errors are still reported when affected data is read. Entry and\nchunk-table checks remain validated during copying.\n* **Benchmarks**\n* Added hashing benchmarks and expanded coverage for blob writes and\nrelocation.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-25T16:51:13+02:00",
+          "tree_id": "ae6637e9b254b405e0fd030563174ce348a3db5c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9d925591a2b92432c26e44235f5a771b47acb373"
+        },
+        "date": 1795623530315,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 743.86,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 179.279217ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 253.92600000000002,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 187.013666ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1386.167,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 241.059232ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 7381.0830000000005,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 22410.449999999997,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.391,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 51.412991,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.43061082,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.583,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 53.280767,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.430142649,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
