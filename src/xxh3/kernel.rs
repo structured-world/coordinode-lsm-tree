@@ -325,9 +325,7 @@ impl Kernel {
         #[cfg(xxh3_sse2)]
         {
             kernels.push(("sse2", x86::SSE2));
-            if cpu_avx2::get() {
-                kernels.push(("avx2", x86::AVX2));
-            }
+            kernels.extend(cpu_avx2::get().then_some(("avx2", x86::AVX2)));
         }
         #[cfg(xxh3_neon)]
         kernels.push(("neon", neon::NEON));

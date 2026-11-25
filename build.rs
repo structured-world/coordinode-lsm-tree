@@ -25,14 +25,18 @@ fn main() {
     // the scalar kernel.
     let features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
     let has = |feature: &str| features.split(',').any(|f| f == feature);
-    if on("CARGO_CFG_TARGET_ARCH", &["x86_64"]) && has("sse2") {
-        println!("cargo:rustc-cfg=xxh3_sse2");
-    }
-    if on("CARGO_CFG_TARGET_ARCH", &["aarch64"])
-        && on("CARGO_CFG_TARGET_ENDIAN", &["little"])
-        && has("neon")
-    {
-        println!("cargo:rustc-cfg=xxh3_neon");
+    // (cfg, architecture, byte orders it runs in, the feature it needs).
+    let kernels = [
+        ("xxh3_sse2", "x86_64", &["little"][..], "sse2"),
+        ("xxh3_neon", "aarch64", &["little"][..], "neon"),
+    ];
+    for (cfg, arch, endians, feature) in kernels {
+        if on("CARGO_CFG_TARGET_ARCH", &[arch])
+            && on("CARGO_CFG_TARGET_ENDIAN", endians)
+            && has(feature)
+        {
+            println!("cargo:rustc-cfg={cfg}");
+        }
     }
 
     if std::env::var("CARGO_FEATURE_IO_URING").is_ok()
