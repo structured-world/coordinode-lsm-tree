@@ -506,9 +506,15 @@ their offset lived in the manifest alone. When a crash after the replace's
 install left an earlier table on the disk before its deletion, and the
 manifest is lost after that, the repair has nothing to tell the earlier table
 from the replaced content: it adopts both, and the earlier table's rows, at
-their higher seqnos, read over the replaced ones. Closing this needs the
-replacing tables to name what they supersede, which the table format does not
-carry yet.
+their higher seqnos, read over the replaced ones. The window before the
+install has the same cause: a crash after the replacing tables were written
+and before `finish` installed them leaves them on the disk beside the content
+they were to replace, named by no manifest. An open removes them; a manifest
+lost before that open leaves the repair unable to tell a table that was never
+installed from committed content, and it adopts them as well, at seqno 0
+under the earlier rows. Closing either needs the replacing tables to name what
+they supersede and the install to be told from the tables alone, which the
+table format does not carry yet.
 
 **The publish phase is a sequence of renames, not one atomic act.** Publishing
 under fresh ids reduces this to "write new files, then commit the manifest",
