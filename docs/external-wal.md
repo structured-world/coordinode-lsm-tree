@@ -285,6 +285,7 @@ observe the repaired-but-not-yet-reconciled state.
 **Snapshots below the retention boundary stay refused.** A live tree refuses
 a snapshot read at or below its retention floor
 (`Error::SnapshotBelowRetention`): a compaction's GC watermark, a `clear`, a
+replacing ingestion, a
 table drop (the tables a range tombstone spans, FIFO eviction) or a
 filtering compaction each raise
 that boundary, and the manifest carries it across a normal reopen. A repair

@@ -222,9 +222,9 @@ matching entry (and add one for a new subsystem).
   only. Every manifest snapshot and edit records the flush watermark, the
   highest number whose outcome it decides: a flush up to it is in the tree if
   the manifest names its tables, gone if not (a compaction consumed it, a clear
-  dropped it). The flush being written stays above every watermark written
-  meanwhile, except a clear's, which decides it, since the clear drops what it
-  writes. On open, the tables of the level-0 folder above the watermark are
+  or a replacing ingestion dropped it). The flush being written stays above
+  every watermark written meanwhile, except a clear's or a replacing
+  ingestion's, which decides it, since that install drops what it writes. On open, the tables of the level-0 folder above the watermark are
   read and grouped by flush; a flush is installed when every place of its run
   is present and every data and filter block of it reads, and every frame of
   every blob file its tables refer to that the manifest does not already name
@@ -338,8 +338,10 @@ matching entry (and add one for a new subsystem).
   edit (`Version::retention_floor`, the `retention_floor` manifest section and
   the appended edit-log field): a flush or compaction that collected a
   version under GC watermark `w` raises it to `w - 1` (capped at its own
-  install seqno), a `clear`, a table drop or a compaction whose filter removed
-  or rewrote rows to its own install seqno; an ingest, move, blob relocation,
+  install seqno), a `clear`, a replacing ingestion
+  (`AnyTree::replacing_ingestion`), a table drop or a compaction whose
+  filter removed or rewrote rows to its own install seqno; an ingest, move,
+  blob relocation,
   a flush or compaction that collected nothing, or an empty drop leaves it
   alone. The one exception to "collected nothing, raises nothing" is the
   tight-space slice loop, which records `GcBelow(w)` for every slice whether

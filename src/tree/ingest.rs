@@ -35,6 +35,9 @@ pub struct Ingestion<'a> {
     pub(crate) write_pin: crate::runtime_config::WritePin,
     seqno: SeqNo,
     last_key: Option<UserKey>,
+    /// Whether `finish` replaces the tree's content rather than adding to it
+    /// (see [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion)).
+    pub(crate) replacing: bool,
     /// Successive columnar batches with the same layout accumulate here into one
     /// rowgroup, flushed to a block once they reach the target row group size or
     /// the layout changes, so many small ingest batches become few large blocks.
@@ -61,12 +64,24 @@ impl<'a> Ingestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs.
     pub fn new(tree: &'a Tree) -> crate::Result<Self> {
-        Self::with_runtime_snapshot(tree, &tree.0.runtime_config.load_full())
+        Self::with_runtime_snapshot(tree, &tree.0.runtime_config.load_full(), false)
+    }
+
+    /// Creates an ingestion whose [`finish`](Self::finish) replaces the tree's
+    /// whole content: see
+    /// [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion).
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    pub fn new_replacing(tree: &'a Tree) -> crate::Result<Self> {
+        Self::with_runtime_snapshot(tree, &tree.0.runtime_config.load_full(), true)
     }
 
     /// Creates a new ingestion whose writer is configured from `rc`, so an
     /// ingestion that writes more than tables (a blob ingestion) takes one
-    /// snapshot for all of its files.
+    /// snapshot for all of its files. A `replacing` one replaces the tree's
+    /// content when it finishes.
     ///
     /// # Errors
     ///
@@ -75,6 +90,7 @@ impl<'a> Ingestion<'a> {
     pub(crate) fn with_runtime_snapshot(
         tree: &'a Tree,
         rc: &Arc<crate::runtime_config::RuntimeConfig>,
+        replacing: bool,
     ) -> crate::Result<Self> {
         // Ingested tables are placed at L0 (via with_new_l0_run), so use
         // the level-routed folder for level 0.
@@ -246,11 +262,14 @@ impl<'a> Ingestion<'a> {
         // The index of a blob tree takes rows written as cells, which its
         // columnar tables split into the columns of their fields.
         writer = writer.use_cell_rows(rc.columnar && tree.config.kv_separation_opts.is_some());
-        // Flag every ingested SST: its entries are written at local seqno 0 and
-        // rely on the `global_seqno` allocated at commit, so manifest repair must
-        // recognize the manifest-only offset (and fail closed when it is lost)
-        // rather than mistake the table for a normal flush at seqno 0.
-        writer = writer.use_bulk_ingested(true);
+        // Flag every adding ingestion's SST: its entries are written at local
+        // seqno 0 and rely on the `global_seqno` allocated at commit, so
+        // manifest repair must recognize the manifest-only offset (and fail
+        // closed when it is lost) rather than mistake the table for a normal
+        // flush at seqno 0. A replacing ingestion installs at offset 0, which
+        // is what a repair rebuilds an unflagged table at, so its tables are
+        // not flagged and a repair keeps them.
+        writer = writer.use_bulk_ingested(!replacing);
         writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
@@ -278,6 +297,7 @@ impl<'a> Ingestion<'a> {
                 .with_refills(refills),
             seqno: 0,
             last_key: None,
+            replacing,
             #[cfg(feature = "columnar")]
             pending_columnar: None,
         })
@@ -562,15 +582,20 @@ impl<'a> Ingestion<'a> {
         Ok(())
     }
 
-    /// Finishes the ingestion.
+    /// Finishes the ingestion: adds what it wrote to the tree, or, for one
+    /// created by [`new_replacing`](Self::new_replacing), replaces the tree's
+    /// content with it.
     ///
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
     #[allow(clippy::significant_drop_tightening)]
     pub fn finish(mut self) -> crate::Result<()> {
-        use crate::{AbstractTree, Table};
+        use crate::AbstractTree;
 
+        if self.replacing {
+            return self.finish_replacing();
+        }
         if self.last_key.is_none() {
             log::trace!("No data written to Ingestion, returning early");
             return Ok(());
@@ -639,67 +664,15 @@ impl<'a> Ingestion<'a> {
         // Recover all created tables, assigning them the global_seqno we just
         // allocated. This ensures all ingested tables share the same sequence
         // number, which is critical for MVCC correctness.
-        //
-        // The tables are installed as a new L0 run below, so they pin their
-        // filter and index blocks by the L0 policy, as a flushed table does.
-        let pin_filter = self.tree.config.filter_block_pinning_policy.get(0);
-        let pin_index = self.tree.config.index_block_pinning_policy.get(0);
-        let created_tables = written
-            .tables
-            .into_iter()
-            .map(|(table_id, checksum)| -> crate::Result<Table> {
-                let mut params = crate::table::RecoverParams::new(
-                    self.folder.join(table_id.to_string()),
-                    checksum,
-                    table_id,
-                    self.level_fs.clone(),
-                    self.tree.config.comparator.clone(),
-                    self.tree.config.cache.clone(),
-                );
-                params.global_seqno = global_seqno;
-                params.recency = Some(recency);
-                params.tree_id = self.tree.id;
-                params.pin_filter = pin_filter;
-                params.pin_index = pin_index;
-                params
-                    .descriptor_table
-                    .clone_from(&self.tree.config.descriptor_table);
-                params.encryption.clone_from(&self.tree.config.encryption);
-                params
-                    .prefix_extractor
-                    .clone_from(&self.tree.config.prefix_extractor);
-                #[cfg(zstd_any)]
-                {
-                    params.zstd_dictionaries = self.tree.config.current_zstd_dictionaries();
-                }
-                #[cfg(feature = "metrics")]
-                {
-                    params.metrics = self.tree.metrics.clone();
-                }
-                let table = Table::recover(params)?;
-                if entries_durable {
-                    table.mark_entry_durable();
-                }
-                Ok(table)
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-
-        // Bind every ingested table to the tree BEFORE the version edit makes
-        // it reachable. Ingest builds and publishes its tables itself rather
-        // than going through `register_tables`, so without this an ingested
-        // SST could never queue itself for a healing rewrite (its bitrot would
-        // be re-corrected on every read but never repaired on disk) and its
-        // in-place heal could race a checkpoint hard-link.
-        for table in &created_tables {
-            table.bind_to_tree(&crate::table::TableSinks {
-                deletion_pause: &self.tree.deletion_pause,
-                heal_hints: &self.tree.heal_hints,
-                read_budget: self.tree.config.columnar_read_budget,
-                #[cfg(feature = "std")]
-                background_deleter: &self.tree.background_deleter,
-                track_filter_probes: self.tree.config.filter_advisor.is_some(),
-            });
-        }
+        let created_tables = Self::recover_run(
+            self.tree,
+            &self.folder,
+            &self.level_fs,
+            written.tables,
+            global_seqno,
+            recency,
+            entries_durable,
+        )?;
 
         // Upgrade the version with our ingested tables, using the global_seqno
         // we allocated earlier. This ensures the version and all tables share
@@ -739,5 +712,155 @@ impl<'a> Ingestion<'a> {
         drop(write_pin);
 
         Ok(())
+    }
+
+    /// Finishes a replacing ingestion: replaces the tree's whole content with
+    /// what it wrote, in one version install (see
+    /// [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion)).
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs; the tree then keeps its
+    /// earlier content.
+    fn finish_replacing(mut self) -> crate::Result<()> {
+        use crate::AbstractTree;
+
+        // The hold on the ingestion's dictionaries stays here until its
+        // tables are installed.
+        let write_pin = core::mem::take(&mut self.write_pin);
+        let written = if self.last_key.is_some() {
+            #[cfg(feature = "columnar")]
+            self.flush_pending_columnar()?;
+            let written = self.writer.finish()?;
+            log::info!("Finished replacing ingestion writer");
+            Some((written.tables, written.entries_durable))
+        } else {
+            None
+        };
+
+        #[cfg(all(test, feature = "std"))]
+        self.tree.config.fire_before_output_install();
+
+        let prior = {
+            // The locks of an ingestion's install. The flush lock keeps the
+            // run's L0 recency below every flush installed after it: no flush
+            // is between taking its tables' ids and installing them while it
+            // is held. The memtables are not flushed first: their content is
+            // what this install drops.
+            let _flush_lock = self.tree.get_flush_lock();
+            let _compaction_state = self.tree.compaction_state.lock();
+            let mut versions = self.tree.version_history.write();
+
+            let tables = match written {
+                Some((tables, entries_durable)) => {
+                    let recency = self.tree.table_id_counter.next();
+                    Self::recover_run(
+                        self.tree,
+                        &self.folder,
+                        &self.level_fs,
+                        tables,
+                        0,
+                        recency,
+                        entries_durable,
+                    )?
+                }
+                None => Vec::new(),
+            };
+            let mut installed = crate::tree::InstalledCharge::default();
+            installed.add(
+                &tables,
+                &[],
+                crate::fs::WriteOrigin::IngestTable,
+                crate::fs::WriteOrigin::IngestBlob,
+            )?;
+            let prior = self.tree.install_replacing(&mut versions, &tables, &[])?;
+            drop(versions);
+            installed.charge();
+            prior
+        };
+        // The installed tables name their dictionary from here on.
+        drop(write_pin);
+        crate::tree::reclaim_replaced(&prior);
+        Ok(())
+    }
+
+    /// Recovers `tables`, which this ingestion's writer finished, at
+    /// `global_seqno` as an L0 run of recency `recency`, each bound to the tree
+    /// so it can queue a healing rewrite and pause its deletion for a
+    /// checkpoint.
+    ///
+    /// The run is installed in L0, so the tables pin their filter and index
+    /// blocks by the L0 policy, as a flushed table does.
+    ///
+    /// # Errors
+    ///
+    /// A table that does not open.
+    pub(crate) fn recover_run(
+        tree: &Tree,
+        folder: &crate::path::Path,
+        level_fs: &Arc<dyn Fs>,
+        tables: Vec<(crate::TableId, crate::Checksum)>,
+        global_seqno: SeqNo,
+        recency: crate::TableId,
+        entries_durable: bool,
+    ) -> crate::Result<Vec<crate::Table>> {
+        let pin_filter = tree.config.filter_block_pinning_policy.get(0);
+        let pin_index = tree.config.index_block_pinning_policy.get(0);
+        let tables = tables
+            .into_iter()
+            .map(|(table_id, checksum)| -> crate::Result<crate::Table> {
+                let mut params = crate::table::RecoverParams::new(
+                    folder.join(table_id.to_string()),
+                    checksum,
+                    table_id,
+                    level_fs.clone(),
+                    tree.config.comparator.clone(),
+                    tree.config.cache.clone(),
+                );
+                params.global_seqno = global_seqno;
+                params.recency = Some(recency);
+                params.tree_id = tree.id;
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
+                params
+                    .descriptor_table
+                    .clone_from(&tree.config.descriptor_table);
+                params.encryption.clone_from(&tree.config.encryption);
+                params
+                    .prefix_extractor
+                    .clone_from(&tree.config.prefix_extractor);
+                #[cfg(zstd_any)]
+                {
+                    params.zstd_dictionaries = tree.config.current_zstd_dictionaries();
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = tree.metrics.clone();
+                }
+                let table = crate::Table::recover(params)?;
+                if entries_durable {
+                    table.mark_entry_durable();
+                }
+                Ok(table)
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        // Bound BEFORE the version edit makes them reachable. Ingest builds
+        // and publishes its tables itself rather than going through
+        // `register_tables`, so without this an ingested SST could never queue
+        // itself for a healing rewrite (its bitrot would be re-corrected on
+        // every read but never repaired on disk) and its in-place heal could
+        // race a checkpoint hard-link.
+        for table in &tables {
+            table.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &tree.deletion_pause,
+                heal_hints: &tree.heal_hints,
+                read_budget: tree.config.columnar_read_budget,
+                #[cfg(feature = "std")]
+                background_deleter: &tree.background_deleter,
+                track_filter_probes: tree.config.filter_advisor.is_some(),
+            });
+        }
+        Ok(tables)
     }
 }
