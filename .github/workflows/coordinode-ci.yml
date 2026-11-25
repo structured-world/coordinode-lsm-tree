@@ -578,12 +578,24 @@ jobs:
         # Installed explicitly rather than through the action's `targets:`
         # input, so the no-std check can never fail for a target-not-installed
         # reason (which would hide a real std leak behind a setup error).
-        run: rustup target add thumbv7em-none-eabihf
+        run: rustup target add thumbv7em-none-eabihf x86_64-unknown-none aarch64-unknown-none-softfloat
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           prefix-key: ubuntu-cargo-no-std
       - name: Check (no_std + alloc)
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc
+      - name: Check (no_std + alloc, soft-float x86-64 and AArch64)
+        # A soft-float target's ABI leaves the vector registers out, and the
+        # compiler refuses a function that enables them there: the vector
+        # kernels must stay out of these builds, which the Thumb target above,
+        # with no vector kernel of its own, cannot show.
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-none aarch64-unknown-none-softfloat; do
+            echo "::group::$target"
+            cargo check --target "$target" --no-default-features --features alloc
+            echo "::endgroup::"
+          done
       - name: Check (no_std + alloc, each feature that keeps it)
         # The features that do not bring `std`, each alone and all together:
         # one that builds only beside another, or only with `std`, fails here

@@ -19,16 +19,23 @@ fn main() {
     let on = |name: &str, values: &[&str]| {
         std::env::var(name).is_ok_and(|value| values.contains(&value.as_str()))
     };
-    // xxh3's vector kernels, only where the target's ABI carries the vector
-    // registers: a soft-float target (`x86_64-unknown-none`,
-    // `aarch64-unknown-none-softfloat`) leaves them off, and hashes through
-    // the scalar kernel.
+    // The vector kernels (xxh3's, and the longest shared prefix's), only
+    // where the target's ABI carries the vector registers: a soft-float target
+    // (`x86_64-unknown-none`, `i686-unknown-uefi`,
+    // `aarch64-unknown-none-softfloat`) leaves them off, the compiler refuses
+    // a function that enables them there, and the scalar kernels run. The
+    // target's own features are the one sign of it a build script is given,
+    // so a 32-bit x86 target whose baseline has no SSE2 takes the scalar
+    // longest-prefix kernel too.
     let features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
     let has = |feature: &str| features.split(',').any(|f| f == feature);
     // (cfg, architecture, byte orders it runs in, the feature it needs).
     let kernels = [
         ("xxh3_sse2", "x86_64", &["little"][..], "sse2"),
         ("xxh3_neon", "aarch64", &["little"][..], "neon"),
+        ("lsp_x86", "x86_64", &["little"][..], "sse2"),
+        ("lsp_x86", "x86", &["little"][..], "sse2"),
+        ("lsp_neon", "aarch64", &["little"][..], "neon"),
     ];
     for (cfg, arch, endians, feature) in kernels {
         if on("CARGO_CFG_TARGET_ARCH", &[arch])

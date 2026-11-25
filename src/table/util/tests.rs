@@ -140,15 +140,11 @@ fn lsp_extreme_byte_patterns_match_reference() {
 /// at `mismatch_at == total_len`) and assert the kernel under test agrees
 /// with the byte-by-byte reference, both at full and asymmetric lengths.
 //
-// cfg-gated to mirror the union of its callers (SSE2/AVX2/AVX-512 on x86_64
-// and 32-bit x86, NEON on LE aarch64). On other targets (riscv64, powerpc64,
-// BE aarch64) no per-kernel test fires, so the helper would trip dead_code
-// without the cfg.
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "x86",
-    all(target_arch = "aarch64", target_endian = "little")
-))]
+// cfg-gated to mirror the union of its callers (SSE2/AVX2/AVX-512 on x86,
+// NEON on LE aarch64, where the target carries the vector registers). On
+// other targets (riscv64, powerpc64, BE aarch64) no per-kernel test fires, so
+// the helper would trip dead_code without the cfg.
+#[cfg(any(lsp_x86, lsp_neon))]
 fn assert_kernel_matches_reference<F: Fn(&[u8], &[u8]) -> usize>(label: &str, kernel: F) {
     for total_len in [
         0_usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 127, 128, 255, 256,
@@ -188,16 +184,11 @@ fn assert_kernel_matches_reference<F: Fn(&[u8], &[u8]) -> usize>(label: &str, ke
 /// have AVX2 → the dispatch path never hits `lsp_sse2` and coverage would be
 /// 0% even though all dispatched tests pass. Calling the kernel directly
 /// guarantees the SSE2-path exercise the boundary cases.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg(lsp_x86)]
 #[test]
 fn lsp_sse2_on_boundaries_matches_reference() {
-    // On x86_64 SSE2 is the mandatory ISA baseline; on 32-bit x86 it is not
-    // guaranteed (pre-Pentium-4 lacks it), so runtime-detect before calling.
-    #[cfg(target_arch = "x86")]
-    if !std::is_x86_feature_detected!("sse2") {
-        return;
-    }
-    // SAFETY: SSE2 is the x86_64 baseline / runtime-verified on x86 above.
+    // SAFETY: the kernel is compiled only for a target whose own features
+    // include SSE2.
     assert_kernel_matches_reference("sse2", |a, b| unsafe { lsp_sse2(a, b) });
 }
 
@@ -205,7 +196,7 @@ fn lsp_sse2_on_boundaries_matches_reference() {
 /// Without this, AVX2 lines are only exercised via the dispatched path, which
 /// is fine for coverage on AVX2-capable runners — but the direct test makes
 /// the AVX2 contract explicit (matches reference on every boundary case).
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg(lsp_x86)]
 #[test]
 fn lsp_avx2_on_boundaries_matches_reference() {
     if !std::is_x86_feature_detected!("avx2") {
@@ -221,7 +212,7 @@ fn lsp_avx2_on_boundaries_matches_reference() {
 /// dropped it; AMD Zen4+ and Intel server keep it), so the dispatched path can't
 /// be relied on to reach `lsp_avx512`. This direct test exercises it whenever the
 /// host supports AVX-512BW and is a no-op otherwise.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg(lsp_x86)]
 #[test]
 fn lsp_avx512_on_boundaries_matches_reference() {
     if !std::is_x86_feature_detected!("avx512bw") {
@@ -235,40 +226,53 @@ fn lsp_avx512_on_boundaries_matches_reference() {
 /// Exhaustively covers the kernel-selection ladder on any x86 host: the
 /// runtime dispatch can only exercise the lane the test CPU exposes, but
 /// `select_lsp_kernel` is a pure function of the detected-feature flags, so
-/// every arm (AVX-512BW, AVX2, SSE2, scalar fallback) is reachable here.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+/// every arm (AVX-512BW, AVX2, and SSE2, which the target guarantees) is
+/// reachable here.
+#[cfg(lsp_x86)]
 #[test]
 fn select_lsp_kernel_picks_widest_available_lane() {
     use core::ptr::fn_addr_eq;
-    let pick = |avx512bw, avx2, sse2| {
-        select_lsp_kernel(LspCpuFeatures {
-            avx512bw,
-            avx2,
-            sse2,
-        })
-    };
-    assert!(fn_addr_eq(pick(true, true, true), lsp_avx512 as LspKernel));
-    assert!(fn_addr_eq(pick(false, true, true), lsp_avx2 as LspKernel));
-    assert!(fn_addr_eq(pick(false, false, true), lsp_sse2 as LspKernel));
-    assert!(fn_addr_eq(
-        pick(false, false, false),
-        lsp_scalar as LspKernel
+    let pick = |avx512bw, avx2| select_lsp_kernel(LspCpuFeatures { avx512bw, avx2 });
+    assert!(fn_addr_eq(pick(true, true), lsp_avx512 as LspKernel));
+    assert!(fn_addr_eq(pick(false, true), lsp_avx2 as LspKernel));
+    assert!(fn_addr_eq(pick(false, false), lsp_sse2 as LspKernel));
+    // The widest available lane wins even when a narrower one is absent.
+    assert!(fn_addr_eq(pick(true, false), lsp_avx512 as LspKernel));
+}
+
+/// A target whose ABI carries the vector registers resolves a vector kernel:
+/// the build script's `lsp_x86` / `lsp_neon` follow the target's own features,
+/// so a build that lost them would compare prefixes through the scalar kernel
+/// everywhere, correct and slow, and nothing else would notice.
+#[test]
+fn a_target_with_vector_registers_resolves_a_vector_kernel() {
+    use core::ptr::fn_addr_eq;
+    let vector_target = cfg!(any(
+        all(
+            any(target_arch = "x86_64", target_arch = "x86"),
+            target_feature = "sse2"
+        ),
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "neon"
+        )
     ));
-    // The widest available lane wins even when narrower lanes are absent.
-    assert!(fn_addr_eq(
-        pick(true, false, false),
-        lsp_avx512 as LspKernel
-    ));
+    assert_eq!(
+        !fn_addr_eq(resolve_lsp_kernel(), lsp_scalar as LspKernel),
+        vector_target
+    );
 }
 
 /// Direct test for the NEON 16-byte kernel on LE aarch64. Required because
 /// CI codecov runs on `x86_64` Linux — the NEON kernel never executes there
 /// even when cross-compiling, but this test gates onto LE aarch64 runners
 /// (e.g. macos-latest on M1/M2) to keep the path covered.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(lsp_neon)]
 #[test]
 fn lsp_neon_on_boundaries_matches_reference() {
-    // SAFETY: NEON is mandatory in the ARMv8 baseline (`target_arch = "aarch64"`).
+    // SAFETY: the kernel is compiled only for a target whose own features
+    // include NEON.
     assert_kernel_matches_reference("neon", |a, b| unsafe { lsp_neon(a, b) });
 }
 
