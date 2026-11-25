@@ -475,9 +475,10 @@ impl<'a> BlobIngestion<'a> {
             let _compaction_state = index.compaction_state.lock();
             let mut versions = index.version_history.write();
 
+            // Taken with no flush under way, as a table ingestion's.
+            let recency = index.table_id_counter.next();
             let (tables, blob_files) = match written {
                 Some((tables, entries_durable, blob_files)) => {
-                    let recency = index.table_id_counter.next();
                     let tables = TableIngestion::recover_run(
                         &index,
                         &self.table.folder,
@@ -502,6 +503,7 @@ impl<'a> BlobIngestion<'a> {
             let prior = index.install_replacing(&mut versions, &tables, &blob_files)?;
             drop(versions);
             installed.charge();
+            index.mark_replaced(&tables, recency);
             prior
         };
         // The installed files name their dictionaries from here on.

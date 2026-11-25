@@ -2696,6 +2696,25 @@ impl Tree {
         Ok(prior)
     }
 
+    /// Leaves the mark of a replacing install of recency `bound` beside each
+    /// of `run`, the tables [`Self::install_replacing`] just made durable (see
+    /// [`crate::replace_mark`]). Called before the install's locks are
+    /// released, so no compaction has taken a table of the run yet.
+    ///
+    /// A failure is logged, not returned: the replace is installed and
+    /// durable, which is what the caller asked for, and the next open leaves
+    /// the marks the manifest still owes. Until then only a repair without a
+    /// manifest would miss them.
+    pub(crate) fn mark_replaced(&self, run: &[Table], bound: TableId) {
+        if let Err(e) = crate::replace_mark::publish(run, bound, self.config.sync_mode) {
+            log::error!(
+                "the tables of a replacing ingestion are installed but not marked ({e}): \
+                 the next open marks them, and a repair of a manifest lost before it \
+                 leaves them out",
+            );
+        }
+    }
+
     /// Drops every dictionary nothing references any more, returning how many
     /// files were removed.
     ///
@@ -7272,6 +7291,9 @@ impl Tree {
         // folder kept, adopted by the tree.
         let mut pooled: PooledFiles = Vec::new();
         let mut pooled_ids: Vec<TableId> = Vec::new();
+        // The replace marks found beside tables the manifest names, each
+        // with the bound it gives.
+        let mut replace_marks: crate::HashSet<(TableId, TableId)> = crate::HashSet::default();
         for (table_base_folder, folder_fs, dirents) in folder_scans {
             for dirent in dirents {
                 let crate::fs::FsDirEntry {
@@ -7345,6 +7367,21 @@ impl Tree {
                         if !manifest_ids.contains(&bound_id) {
                             log::warn!(
                                 "Removing orphaned restrict-bound sidecar (its table is gone): {}",
+                                table_file_path.display()
+                            );
+                            sweep.remove(folder_fs, &table_file_path);
+                        }
+                        continue;
+                    }
+                    // A LIVE table's replace mark is preserved (a repair
+                    // without a manifest reads the table's install from it);
+                    // one whose table left the manifest names nothing.
+                    crate::file::TableDirEntry::ReplaceMark(marked_id, bound) => {
+                        if manifest_ids.contains(&marked_id) {
+                            replace_marks.insert((marked_id, bound));
+                        } else {
+                            log::debug!(
+                                "Removing orphaned replace mark (its table is gone): {}",
                                 table_file_path.display()
                             );
                             sweep.remove(folder_fs, &table_file_path);
@@ -7872,6 +7909,12 @@ impl Tree {
         #[cfg(feature = "std")]
         Self::republish_missing_restriction_sidecars(&version, config)?;
 
+        // The same for the marks a replacing install leaves once its manifest
+        // is durable: an install the power cut before its marks, or one whose
+        // marks failed, is named by the manifest alone, and a repair of that
+        // manifest, lost later, would leave its tables out as never installed.
+        Self::republish_missing_replace_marks(&version, config, &replace_marks)?;
+
         // Everything of the generation read goes, now that it is superseded:
         // its snapshot and its log.
         Self::cleanup_orphaned_version(tree_path, version.id(), &config.fs, &mut sweep)?;
@@ -7955,6 +7998,36 @@ impl Tree {
                 table.id(),
             );
             table.write_restrict_sidecar(bound, config.sync_mode)?;
+        }
+        Ok(())
+    }
+
+    /// Leaves the replace mark of every table of a replacing ingestion in
+    /// `version` that has none among `found`, the marks the open's scan saw.
+    /// The manifest gives the bound: the recency the install recorded for the
+    /// table.
+    fn republish_missing_replace_marks(
+        version: &Version,
+        config: &Config,
+        found: &crate::HashSet<(TableId, TableId)>,
+    ) -> crate::Result<()> {
+        for table in version.iter_tables() {
+            let bound = table.l0_recency();
+            if !table.metadata.replacing || found.contains(&(table.id(), bound)) {
+                continue;
+            }
+            log::warn!(
+                "table {} of a replacing ingestion is installed without its mark; \
+                 marking it from the manifest",
+                table.id(),
+            );
+            crate::replace_mark::publish_one(
+                &*table.fs,
+                &table.path,
+                table.id(),
+                bound,
+                config.sync_mode,
+            )?;
         }
         Ok(())
     }

@@ -106,6 +106,65 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
     Ok(())
 }
 
+/// The relocated copy of a replacing ingestion's table records the place its
+/// source's install gave it: no mark of the ingestion names the copy's id, so
+/// a repair without a manifest reads the copy from itself. Guards against a
+/// copy that still reads as an ingested table whose place went with the
+/// manifest, which the repair leaves out.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_relocated_copy_of_a_replacing_table_records_its_place() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src_path = dir.path().join("src");
+    let out_path = dir.path().join("out");
+
+    let mut writer = Writer::new(src_path.clone(), 3, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_bulk_ingested(Some(true))
+        .use_replacing(true);
+    for i in 0..96u32 {
+        writer.write(InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"val",
+            0,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, src_checksum) = writer.finish()?.expect("source table written");
+    // As its install recovered it: at the run's recency, above its own id.
+    let mut params = crate::table::RecoverParams::new(
+        src_path,
+        src_checksum,
+        3,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+    );
+    params.recency = Some(40);
+    let source = Table::recover(params)?;
+    assert!(
+        source.metadata.replacing,
+        "self-check: the source is marked"
+    );
+    assert_eq!(source.metadata.recency, 3, "self-check: its own id on disk");
+
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(3);
+    let relocated = source.relocate_columnar_with_deletes(
+        || output_at(&out_path, 50),
+        &StdFs,
+        &bitmap,
+        SyncMode::Normal,
+        None,
+    )?;
+    let copy = recover_at(&out_path, relocated.checksum, 50)?;
+    assert!(!copy.metadata.replacing);
+    assert_eq!(copy.metadata.bulk_ingested, Some(false));
+    assert_eq!(copy.metadata.recency, 40);
+    Ok(())
+}
+
 /// A relocated copy records the files its own folder was writing below it
 /// when it was finished, not the ones its source recorded: a repair reads
 /// them to tell an output a power loss cut short from a table that lost its

@@ -403,6 +403,19 @@ pub(crate) fn link_tables(
             // `storage_stats_and_checkpoint_agree_on_a_restricted_tree`.
             bytes += target_fs.metadata(&dst_sidecar)?.len;
         }
+
+        // A table of a replacing ingestion keeps the mark of its install, so
+        // a checkpoint that later needs manifest repair still reads it as
+        // installed. An empty file: it adds nothing to the total.
+        if table.metadata.replacing {
+            crate::replace_mark::publish_one(
+                target_fs.as_ref(),
+                &dst,
+                table.id(),
+                table.l0_recency(),
+                sync_mode,
+            )?;
+        }
     }
     Ok((count, bytes))
 }

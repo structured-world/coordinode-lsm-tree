@@ -346,6 +346,54 @@ every snapshot, which is correct only if history was never collected. No
 resurrection question arises: the floor discards nothing, it only declines to
 answer what cannot be answered honestly.
 
+## Replacing ingestions
+
+A replacing ingestion (`AnyTree::replacing_ingestion`) writes its tables
+first and installs them afterwards, in one version that holds them and nothing
+else. Two things about that install are in no table: whether it happened, and
+which tables it dropped. A table of the ingestion is finished before the
+install, so it reads the same whether the install followed or the power went
+first; and the tables the install dropped are removed after it, so one still
+on the disk reads as any table does.
+
+The install records both beside its tables. Once the manifest naming them is
+durable, it leaves an empty file next to each, `{table id}.replaced-{bound}`:
+a **replace mark**. Its presence says the table was installed, at sequence
+offset 0 as every replacing install is. `bound` is the L0 recency the install
+gave its run, a number taken from the tree's table counter while no flush was
+under way. A flush takes its recency from the same counter when it starts, and
+a compaction output carries the highest recency among its inputs, so every
+table that was in the tree at the install has a recency below `bound`, and
+every table written after it (a later flush, a merge of the run with later
+tables) has one at or above it.
+
+A repair without a manifest reads the marks before any table:
+
+- A table of a replacing ingestion **with** a mark is recovered at offset 0
+  and at the mark's recency, the place its install recorded.
+- A table of a replacing ingestion **without** one was never installed: the
+  ingestion was cut short, or failed. It is left out, as an adding
+  ingestion's table is, whose offset went with the manifest. Each such table
+  says in its meta block that a replacing ingestion wrote it
+  (`descriptor#replacing`), so it is not mistaken for a flush at seqno 0.
+- Every table whose recency lies below the highest bound any mark gives was in
+  the tree before that install, which dropped it. It is left out and removed
+  once the rebuilt manifest is durable, with the blob files nothing else
+  refers to. Nothing is lost with it, so the report lists it among the
+  excluded files, not the unreadable ones.
+
+The mark is a fact about a committed install, written by the engine after the
+commit and never by a repair: an open keeps the mark of a table its manifest
+names, puts back one that is missing (the manifest holds the recency), and
+removes one whose table is gone; a table that is removed takes its mark along;
+a checkpoint makes the marks of the tables it links. A compaction output
+needs none: it records its own recency and is installed by its compaction. The
+same goes for a relocated copy of a marked table, which records the source's
+place itself.
+
+With a manifest that loads, none of this is consulted: the manifest names the
+live tables, and what it does not name goes before the scan.
+
 ## Blob frame validation and salvage
 
 Before a blob file's digest is recorded, its live frame range is walked frame
@@ -498,23 +546,21 @@ which requires the block index — out of reach for a path-based walk that holds
 only a filesystem reference and no open table. Callers that do hold a table
 pass the exact frontier in and are unaffected.
 
-**A replace's leftovers are not told from its content.** A replacing
-ingestion (`AnyTree::replacing_ingestion`) writes its tables unmarked at seqno
-0, the offset a repair rebuilds them with, so a repair keeps them; an adding
-ingestion's tables are marked bulk-ingested, and a repair drops them, since
-their offset lived in the manifest alone. When a crash after the replace's
-install left an earlier table on the disk before its deletion, and the
-manifest is lost after that, the repair has nothing to tell the earlier table
-from the replaced content: it adopts both, and the earlier table's rows, at
-their higher seqnos, read over the replaced ones. The window before the
-install has the same cause: a crash after the replacing tables were written
-and before `finish` installed them leaves them on the disk beside the content
-they were to replace, named by no manifest. An open removes them; a manifest
-lost before that open leaves the repair unable to tell a table that was never
-installed from committed content, and it adopts them as well, at seqno 0
-under the earlier rows. Closing either needs the replacing tables to name what
-they supersede and the install to be told from the tables alone, which the
-table format does not carry yet.
+**A replace is told from its marks, and only while one is left.** The bound
+that separates what a replacing install dropped lives in the marks beside the
+install's own tables (see *Replacing ingestions*). Once compactions have
+merged every one of those tables away, no mark is left, and an earlier table
+whose removal is still undone then (a removal the filesystem refused, in a
+tree that has not been reopened since) is rebuilt by a repair as any table is,
+its rows over the merged ones. The same holds from the start for a replacing
+ingestion that wrote nothing, and for `clear`: they install an empty tree, so
+there is no table to mark, and an earlier table left on the disk comes back
+with a manifest lost before the next open removes it.
+
+**A power loss between a replace's install and its marks.** The marks follow
+the durable install, so that window leaves installed tables without them. The manifest names the tables, and the next open marks them from it; a
+manifest lost before that open leaves the repair with tables no mark names,
+and it leaves them out as never installed. The ingestion had not returned.
 
 **The publish phase is a sequence of renames, not one atomic act.** Publishing
 under fresh ids reduces this to "write new files, then commit the manifest",

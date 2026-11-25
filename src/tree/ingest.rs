@@ -262,14 +262,14 @@ impl<'a> Ingestion<'a> {
         // The index of a blob tree takes rows written as cells, which its
         // columnar tables split into the columns of their fields.
         writer = writer.use_cell_rows(rc.columnar && tree.config.kv_separation_opts.is_some());
-        // Flag every adding ingestion's SST: its entries are written at local
-        // seqno 0 and rely on the `global_seqno` allocated at commit, so
-        // manifest repair must recognize the manifest-only offset (and fail
-        // closed when it is lost) rather than mistake the table for a normal
-        // flush at seqno 0. A replacing ingestion installs at offset 0, which
-        // is what a repair rebuilds an unflagged table at, so its tables are
-        // not flagged and a repair keeps them.
-        writer = writer.use_bulk_ingested(!replacing);
+        // Flag every ingestion's SST: its entries are written at local seqno 0
+        // and take their place in the tree (the `global_seqno` and the L0
+        // recency) from the install, so a repair without a manifest must not
+        // mistake the table for a flush at seqno 0. A replacing ingestion's
+        // tables say so too: their install leaves a mark beside each (see
+        // `replace_mark`), which gives a repair their place back, and one
+        // without a mark was never installed.
+        writer = writer.use_bulk_ingested(true).use_replacing(replacing);
         writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
@@ -751,19 +751,20 @@ impl<'a> Ingestion<'a> {
             let _compaction_state = self.tree.compaction_state.lock();
             let mut versions = self.tree.version_history.write();
 
+            // Taken with no flush under way: every table already in the tree
+            // has a recency below it, and every one written from here on a
+            // recency above it.
+            let recency = self.tree.table_id_counter.next();
             let tables = match written {
-                Some((tables, entries_durable)) => {
-                    let recency = self.tree.table_id_counter.next();
-                    Self::recover_run(
-                        self.tree,
-                        &self.folder,
-                        &self.level_fs,
-                        tables,
-                        0,
-                        recency,
-                        entries_durable,
-                    )?
-                }
+                Some((tables, entries_durable)) => Self::recover_run(
+                    self.tree,
+                    &self.folder,
+                    &self.level_fs,
+                    tables,
+                    0,
+                    recency,
+                    entries_durable,
+                )?,
                 None => Vec::new(),
             };
             let mut installed = crate::tree::InstalledCharge::default();
@@ -776,6 +777,7 @@ impl<'a> Ingestion<'a> {
             let prior = self.tree.install_replacing(&mut versions, &tables, &[])?;
             drop(versions);
             installed.charge();
+            self.tree.mark_replaced(&tables, recency);
             prior
         };
         // The installed tables name their dictionary from here on.
