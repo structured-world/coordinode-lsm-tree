@@ -94,6 +94,10 @@ pub(crate) fn hash64(input: &[u8]) -> u64 {
 #[must_use]
 #[inline]
 pub(crate) fn hash64_with_seed(input: &[u8], seed: u64) -> u64 {
+    // A key or a short entry, the commonest input, is tested for first.
+    if input.len() <= 16 {
+        return short::upto16_64(input, seed);
+    }
     if input.len() <= MID_SIZE_MAX {
         return short::hash64(input, seed);
     }
@@ -116,6 +120,10 @@ pub(crate) fn hash128(input: &[u8]) -> u128 {
 #[must_use]
 #[inline]
 pub(crate) fn hash128_with_seed(input: &[u8], seed: u64) -> u128 {
+    // As in `hash64_with_seed`.
+    if input.len() <= 16 {
+        return short::upto16_128(input, seed);
+    }
     if input.len() <= MID_SIZE_MAX {
         return short::hash128(input, seed);
     }
