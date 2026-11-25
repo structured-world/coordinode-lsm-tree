@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795550628953,
+  "lastUpdate": 1795623520642,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104482,6 +104482,90 @@ window.BENCHMARK_DATA = {
             "value": 462296.4203456645,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.9us | P99.9: 26.7us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9d925591a2b92432c26e44235f5a771b47acb373",
+          "message": "perf(checksum): own xxh3 with a run-time kernel, check blob frames in two parts (#1107)\n\n## Summary\n\n- The crate owns xxh3 whole: short paths inlined, the target's baseline\nkernel called directly, and on x86-64 the AVX2 kernel for inputs of 64\nKiB and more, chosen once per process. `xxhash-rust` stays a\ndev-dependency, the reference the tests and benches compare against.\n- A blob frame checks its entries and its payload apart, so a relocation\nthat copies a frame as stored hashes no payload; a relocated value under\nanother codec is written anew under the tree's.\n- Measured binaries build with fat LTO, for its own gain on seeks.\n\n## Changes\n\n- `src/xxh3`: xxh3-64 and xxh3-128, one-shot and streamed; SSE2, AVX2,\nNEON and scalar kernels; the 16-byte bound tested first. The vector\nkernels are built only where the target enables the vector registers\n(`xxh3_sse2` / `xxh3_neon` from the build script); a soft-float target\nhashes through the scalar kernel.\n- Blob frame header: an xxh3-64 of the entries and an xxh3-128 of the\npayload, both seeded with the header CRC; copy as stored carries the\npayload checksum; relisting rewrites the entries' checksum alone.\n- A table block a compaction copies as stored carries its checksum\nunhashed.\n- Relocation decodes and rewrites a value whose codec or level differs\nfrom the tree's.\n- `[profile.bench]` and the `compare-rocksdb` / `db_bench` profiles: fat\nLTO, one codegen unit.\n- Benches: `xxh3` (ours against `xxhash-rust`, 64 and 128 bits,\nthroughput and per-call P50/P99/P999), `blob_relocation` uncompressed\nvalues, blob flush of small values inline beside separated.\n- `structured-zstd` 0.4.4.\n\n## Measurements\n\nLinux benchmark host with AVX2, this branch against main, both built\nwith fat LTO, interleaved runs on one host.\n\n| Group (ours) | 1k | 10k | 70k |\n|---|---|---|---|\n| `point_read` (ours alone, 3 runs a side) | x0.988 | x0.995 | x0.998 |\n| `seek_random` | x0.999 | x0.992 | x1.006 |\n| `seek_random_zstd22` | x1.007 | x1.001 | x0.998 |\n| `multi_get` | x1.014 | x1.007 | x0.999 |\n| `multi_get_zstd22` | x1.006 | x1.007 | x0.951 |\n| `range_scan` | x1.016 | x1.017 | x1.003 |\n| `range_scan_zstd22` | x1.009 | x1.009 | x0.982 |\n| `write_throughput` | x0.981 | x0.970 | x0.973 |\n| `write_throughput_zstd22` | x0.986 | x0.961 | x0.992 |\n\n| Group (ours) | branch / main | against RocksDB |\n|---|---|---|\n| `point_read_blobs_1mib` | x0.923 | 0.95 |\n| `point_read_blobs_4mib` | x0.876 | 0.83 |\n| `range_scan_blobs_1mib` | x0.870 | 0.62 |\n| `range_scan_blobs_4mib` | x0.830 | 0.68 |\n| `write_throughput_blobs_1mib` / `_4mib` | x0.915 / x0.912 | |\n| `major_compact_zstd3` 10k / 40k (ours alone, 4 runs a side) | x0.996 /\nx1.004 | |\n\n- `overwrite`, `overwrite_sustained`, `concurrent_mixed` and\n`subcompaction` are within their run-to-run spread of main.\n`overwrite_skew_*` times memtable inserts with no flush, a path that\nruns no xxh3.\n- Fat against thin LTO on main alone: `seek_random` x0.957 / x0.969 /\nx0.960, the other groups level, `overwrite_sustained` the same cycles at\nthe same IPC.\n- Against `xxhash-rust` in one binary: level from 16 bytes to 32 KiB,\nx0.55 to x0.61 from 64 KiB to 1 MiB.\n\n## Testing\n\nfmt, clippy (default and all features, macOS and x86-64 Linux), the\nno-std check on `thumbv7em-none-eabihf`, `cargo doc` with warnings\ndenied, doc tests, the full nextest suite (macOS; Linux under the CI\nprofile), the `v5-to-v6` converter tests and the `sst-dump` build pass.\n\n## Related\n\n- #1108: the longest-prefix kernels of `table::util` still stop a\nsoft-float build; out of scope here.\n\nCloses #1070\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved hashing performance, including hardware-accelerated\nprocessing on supported systems.\n* **Data Integrity**\n* Blob relocation now rewrites values when their compression settings\ndiffer from the tree’s current settings.\n* Stored values can be copied without checking payload checksums;\nchecksum errors are still reported when affected data is read. Entry and\nchunk-table checks remain validated during copying.\n* **Benchmarks**\n* Added hashing benchmarks and expanded coverage for blob writes and\nrelocation.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-25T16:51:13+02:00",
+          "tree_id": "ae6637e9b254b405e0fd030563174ce348a3db5c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9d925591a2b92432c26e44235f5a771b47acb373"
+        },
+        "date": 1795623519381,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 151190.4911268733,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.0us | P99.9: 28.9us\nthreads: 1 | elapsed: 3.54s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3127145.1238316633,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 949457.2119274422,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.1us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 508077.2585632682,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.6us | P99.9: 21.2us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3186217.290651744,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 325586.249461228,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.2us | P99.9: 17.5us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 194743.28951747264,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 9.8us | P99.9: 21.1us\nthreads: 1 | elapsed: 1.03s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 960694.325299668,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1063163.890365668,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 406466.76345358393,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 10.3us | P99.9: 72.5us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
           }
         ]
       }
