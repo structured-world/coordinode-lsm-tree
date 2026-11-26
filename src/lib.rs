@@ -362,7 +362,6 @@ pub(crate) mod xxh3;
 /// surface arrives once those two follow-ups land.
 pub mod io;
 
-mod heap;
 mod ingestion;
 mod io_policy;
 pub use io_policy::IoPolicy;
