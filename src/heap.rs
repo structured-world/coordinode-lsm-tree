@@ -223,13 +223,19 @@ impl MergeHeap {
         reason = "`order` only holds numbers of slots"
     )]
     fn order_against(&self, slot: u32, word: u64, held: u32) -> Ordering {
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::MERGE_WORD_COMPARES, 1);
         match word.cmp(&self.words[held as usize]) {
-            Ordering::Equal => compare(
-                occupied(&self.slots, slot),
-                occupied(&self.slots, held),
-                self.lexicographic,
-                &self.comparator,
-            ),
+            Ordering::Equal => {
+                #[cfg(feature = "diagnostics")]
+                crate::diagnostics::add(&crate::diagnostics::MERGE_KEY_COMPARES, 1);
+                compare(
+                    occupied(&self.slots, slot),
+                    occupied(&self.slots, held),
+                    self.lexicographic,
+                    &self.comparator,
+                )
+            }
             order => order,
         }
     }
@@ -293,6 +299,8 @@ impl MergeHeap {
         let rest = self.order[2..]
             .partition_point(|&held| self.order_against(slot, word, held) == Ordering::Greater);
         let end = 2 + rest;
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::MERGE_SLIDES, end - 1);
         self.order.copy_within(1..end, 0);
         self.order[end - 1] = slot;
 
@@ -334,6 +342,8 @@ impl MergeHeap {
         // entry.
         let pos = self.order[..last - 1]
             .partition_point(|&held| self.order_against(slot, word, held) != Ordering::Less);
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::MERGE_SLIDES, last - pos);
         self.order.copy_within(pos..last, pos + 1);
         self.order[pos] = slot;
 

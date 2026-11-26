@@ -18,6 +18,9 @@ pub(crate) static NEW_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SLICES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REFS_UP: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REFS_DOWN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MERGE_WORD_COMPARES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MERGE_KEY_COMPARES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MERGE_SLIDES: AtomicU64 = AtomicU64::new(0);
 
 /// Adds `by` to `counter`.
 #[inline]
@@ -42,6 +45,12 @@ pub struct Counts {
     pub refs_up: u64,
     /// Atomic reference count decrements.
     pub refs_down: u64,
+    /// Comparisons of two key words the merge heap made to place an entry.
+    pub merge_word_compares: u64,
+    /// Comparisons of two whole keys it made where their words tied.
+    pub merge_key_compares: u64,
+    /// Slot numbers it moved to make room for a replaced entry.
+    pub merge_slides: u64,
 }
 
 impl Counts {
@@ -57,6 +66,9 @@ impl Counts {
             slices: read(&SLICES),
             refs_up: read(&REFS_UP),
             refs_down: read(&REFS_DOWN),
+            merge_word_compares: read(&MERGE_WORD_COMPARES),
+            merge_key_compares: read(&MERGE_KEY_COMPARES),
+            merge_slides: read(&MERGE_SLIDES),
         }
     }
 
@@ -71,6 +83,9 @@ impl Counts {
             slices: self.slices - before.slices,
             refs_up: self.refs_up - before.refs_up,
             refs_down: self.refs_down - before.refs_down,
+            merge_word_compares: self.merge_word_compares - before.merge_word_compares,
+            merge_key_compares: self.merge_key_compares - before.merge_key_compares,
+            merge_slides: self.merge_slides - before.merge_slides,
         }
     }
 }
