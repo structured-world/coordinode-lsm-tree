@@ -516,8 +516,28 @@ impl<'a> Values<'a> {
     /// [`Error::InvalidHeader`] for an encoding that is malformed, uses an
     /// operator the type has no use for, or does not fill `bytes` exactly.
     pub(crate) fn parse(type_tag: TypeTag, n: u32, bytes: &'a [u8]) -> Result<Self> {
+        Self::parse_whole(type_tag, n, bytes, true)
+    }
+
+    /// [`Self::parse`] for values that are only read a row at a time
+    /// ([`Self::rows`]): a bytes column's offset table is not walked to check
+    /// every row's framing, since each row read checks its own two offsets
+    /// against the payload. A read of a few rows of a page then costs those
+    /// rows, not the page's row count. Values parsed this way must not be
+    /// decoded or viewed whole.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse`], but for a bytes column's row framing.
+    pub(crate) fn parse_for_rows(type_tag: TypeTag, n: u32, bytes: &'a [u8]) -> Result<Self> {
+        Self::parse_whole(type_tag, n, bytes, false)
+    }
+
+    /// The values of `n` rows filling `bytes`, a bytes column's row framing
+    /// checked when `framed` asks for it.
+    fn parse_whole(type_tag: TypeTag, n: u32, bytes: &'a [u8], framed: bool) -> Result<Self> {
         let mut rest = bytes;
-        let values = Self::parse_from(&mut rest, type_tag, n, 0, true)?;
+        let values = Self::parse_from(&mut rest, type_tag, n, 0, true, framed)?;
         if !rest.is_empty() {
             return Err(MALFORMED);
         }
@@ -526,12 +546,14 @@ impl<'a> Values<'a> {
 
     /// Reads a values expression off the front of `rest`. `outer` is false
     /// for a run's or a dictionary's values, which may not nest those again.
+    /// `framed` is whether a bytes column's row framing is checked here.
     fn parse_from(
         rest: &mut &'a [u8],
         type_tag: TypeTag,
         n: u32,
         depth: u8,
         outer: bool,
+        framed: bool,
     ) -> Result<Self> {
         if depth > MAX_DEPTH {
             return Err(MALFORMED);
@@ -556,7 +578,9 @@ impl<'a> Values<'a> {
                 };
                 let payload = u32::from_le_bytes(*last) as usize;
                 let data = bytes(rest, table.checked_add(payload).ok_or(MALFORMED)?)?;
-                check_bytes_framing(data, n)?;
+                if framed {
+                    check_bytes_framing(data, n)?;
+                }
                 Ok(Self::Plain(data))
             }
             (CONSTANT, Some(width)) if outer => {
@@ -571,7 +595,7 @@ impl<'a> Values<'a> {
                 if runs == 0 || runs > n {
                     return Err(MALFORMED);
                 }
-                let values = Self::parse_from(rest, type_tag, runs, depth + 1, false)?;
+                let values = Self::parse_from(rest, type_tag, runs, depth + 1, false, framed)?;
                 let (ends, stored_ends) = parse_ends(rest, runs, n, depth + 1)?;
                 Ok(Self::Rle {
                     values: Box::new(values),
@@ -584,7 +608,7 @@ impl<'a> Values<'a> {
                 if size == 0 || size > n {
                     return Err(MALFORMED);
                 }
-                let values = Self::parse_from(rest, type_tag, size, depth + 1, false)?;
+                let values = Self::parse_from(rest, type_tag, size, depth + 1, false, framed)?;
                 let codes = Ints::parse(rest, n, depth + 1)?;
                 Ok(Self::Dict {
                     values: Box::new(values),

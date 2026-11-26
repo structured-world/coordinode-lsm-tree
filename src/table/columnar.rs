@@ -473,6 +473,46 @@ impl Column {
         raw.parse(row_count, bytes)
     }
 
+    /// [`Self::parse_page`] for a read of a few of the page's rows: the
+    /// column comes back for row reads only, and a bytes column's offset
+    /// table is not walked to check every row, since each row read checks its
+    /// own. The stamp, the header and the page's extent are checked as there.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse_page`], but for a bytes column's row framing, which a
+    /// read of a malformed row reports.
+    pub(crate) fn parse_page_for_rows(
+        bytes: &crate::Slice,
+        row_count: u32,
+        expected: crate::table::column_page::PageStamp,
+    ) -> Result<RowColumn<'_>> {
+        use crate::table::column_page::PageStamp;
+
+        let mut cur = Cursor::new(bytes);
+        if PageStamp::decode(cur.read_array::<{ PageStamp::LEN }>()?) != expected {
+            return Err(Error::InvalidHeader(
+                "columnar: page belongs to another row group, column part or row page",
+            ));
+        }
+        let raw = RawColumn::read(&mut cur, row_count)?;
+        if !cur.is_empty() {
+            return Err(Error::InvalidHeader(
+                "columnar: trailing bytes after the page's column",
+            ));
+        }
+        if let Some(v) = raw.validity {
+            check_validity(v, row_count)?;
+        }
+        Ok(RowColumn {
+            page: bytes,
+            column_id: raw.column_id,
+            type_tag: raw.type_tag,
+            validity: raw.validity,
+            values: Values::parse_for_rows(raw.type_tag, row_count, raw.values)?,
+        })
+    }
+
     /// Decodes a column page's payload for a group of `row_count` rows,
     /// refusing it unless it carries `expected` as its stamp.
     ///
@@ -599,6 +639,37 @@ pub(crate) struct PageColumn<'a> {
     pub(crate) validity: Option<&'a [u8]>,
     /// Its values, parsed.
     pub(crate) values: Values<'a>,
+}
+
+/// One column of one page parsed for reads of a few of its rows: its values
+/// are read a row at a time and never decoded or viewed whole, so a bytes
+/// column's row framing is checked by each row read, not when the page is
+/// parsed.
+pub(crate) struct RowColumn<'a> {
+    /// The page the column was read from, which a value is served as a view
+    /// of.
+    page: &'a crate::Slice,
+    /// The column's id.
+    pub(crate) column_id: u16,
+    /// The column's type.
+    pub(crate) type_tag: TypeTag,
+    /// Its validity bitmap, checked for its length and padding.
+    pub(crate) validity: Option<&'a [u8]>,
+    /// Its values, parsed for row reads.
+    pub(crate) values: Values<'a>,
+}
+
+impl<'a> From<PageColumn<'a>> for RowColumn<'a> {
+    /// A column whose framing was checked whole can be read by rows.
+    fn from(column: PageColumn<'a>) -> Self {
+        Self {
+            page: column.page,
+            column_id: column.column_id,
+            type_tag: column.type_tag,
+            validity: column.validity,
+            values: column.values,
+        }
+    }
 }
 
 impl PageColumn<'_> {
@@ -823,6 +894,16 @@ impl DecodeBudget {
     ///
     /// As [`Self::hold`].
     pub(crate) fn parsed<'a>(&mut self, column: PageColumn<'a>) -> Result<PageColumn<'a>> {
+        self.hold(column.values.held_rows())?;
+        Ok(column)
+    }
+
+    /// [`Self::parsed`] for a column parsed for row reads.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hold`].
+    pub(crate) fn parsed_for_rows<'a>(&mut self, column: RowColumn<'a>) -> Result<RowColumn<'a>> {
         self.hold(column.values.held_rows())?;
         Ok(column)
     }
@@ -2304,7 +2385,7 @@ impl<'a> PointPage<'a> {
     /// [`Error::InvalidHeader`] for a column out of that order or a value
     /// sub-column id used twice; [`Error::DecompressedSizeTooLarge`] past
     /// `budget`.
-    pub(crate) fn add(&mut self, column: PageColumn<'a>, budget: &mut DecodeBudget) -> Result<()> {
+    pub(crate) fn add(&mut self, column: RowColumn<'a>, budget: &mut DecodeBudget) -> Result<()> {
         let rows = self.rows;
         let intrinsic = |id: u16, tag: TypeTag| {
             if column.column_id != id || column.type_tag != tag || column.validity.is_some() {
@@ -2375,7 +2456,7 @@ impl<'a> PointPage<'a> {
     pub(crate) fn prepare(page: RowPageColumns<'a>, budget: &mut DecodeBudget) -> Result<Self> {
         let mut prepared = Self::new(page.rows)?;
         for column in page.columns {
-            prepared.add(column, budget)?;
+            prepared.add(column.into(), budget)?;
         }
         prepared.finish()?;
         Ok(prepared)
