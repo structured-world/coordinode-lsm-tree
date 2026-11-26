@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795651978153,
+  "lastUpdate": 1795689592816,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104734,6 +104734,90 @@ window.BENCHMARK_DATA = {
             "value": 334965.8334263715,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 16.5us | P99.9: 92.5us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2d0ffe0254f824e65a5bbc2ed156eb962326224c",
+          "message": "fix(repair): prove a replace's install by one mark (#1112)\n\n## Summary\n\n- A repair that rebuilds a lost manifest reads what a replacing\ningestion's install did: it keeps the installed tables, all of them or\nnone, leaves out an earlier table whose removal the install never\nfinished, and leaves out the tables of a replacing ingestion that never\ninstalled. The same holds after `clear`.\n- The install records itself in the tables folder, in one empty file\nmade after its manifest is durable. A table is finished before its\ninstall, so nothing written into it can prove the install.\n\n## Changes\n\n- A replacing ingestion takes an id of its own and writes it into each\nof its tables (`descriptor#replacing`, eight bytes, an optional key).\nIts tables are flagged ingested, like an adding ingestion's.\n- Replace mark: one file per install, `{ingestion id}.replaced-{bound}`.\n`bound` is the L0 recency of the run, taken from the table counter while\nno flush was under way: every table in the tree at the install has a\nlower recency, every later one a recency at or above it. One name and\none folder sync, whatever the number of tables, so no crash proves the\ninstall for part of its tables. An ingestion that wrote nothing leaves\nits mark too, and so does `clear`, under a number of its own.\n- Repair without a manifest: a table whose ingestion has a mark is\nrecovered at offset 0 and the mark's recency; a replacing ingestion's\ntable without one is left out; every table below the highest bound is\nleft out and reported among the excluded files.\n- The mark stays while the tree is open, past the last table of its\ningestion. An open removes every file its manifest does not name and\nthen the marks of ingestions it holds no table of; for an ingestion it\nholds a table of, it puts back a missing mark from the manifest and\nsyncs the folder of one that is there. A checkpoint takes one mark per\ningestion it links tables of.\n- A flush takes its L0 recency under the history lock, with the\nmemtables it writes, so a `clear` that lands while it writes takes a\nbound above it and the tables of the declined flush stay out of a\nrepair. A file made for the flush's first table takes that number as its\nid, so table ids are unchanged.\n- A relocated copy of a replacing ingestion's table records the source's\noffset and recency itself, under its new id.\n- An ingestion that finishes with nothing written finishes its writer\nall the same, which removes the table file it took: left empty in place,\na repair read it as a table that lost its bytes.\n- The files an install dropped are removed only once its mark is\ndurable. An install whose mark failed keeps them until the next open,\nwhich marks it and removes them.\n- `docs/manifest-recovery.md` describes the mark and names what stays\nopen: a replace whose mark is not durable when the manifest is lost\nbefore the next open is read as never made, and the repair rebuilds the\nearlier content.\n\nNo hot path changes: the mark is made in the install, read in the open's\nand the repair's directory scans, and a table's ingestion id is read\nwith its meta block when the table opens.\n\n## Testing\n\nTests, clippy (default and all features), formatting, docs with warnings\ndenied, the no-std check and the sst-dump build pass on macOS; CI runs\nthe full matrix.\n\nCloses #1110\nCloses #1114",
+          "timestamp": "2026-11-26T11:13:37+02:00",
+          "tree_id": "f980f45177ba3e3be6d3231de486c300f139cd96",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2d0ffe0254f824e65a5bbc2ed156eb962326224c"
+        },
+        "date": 1795689591682,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 149614.47117544466,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 15.7us | P99.9: 28.2us\nthreads: 1 | elapsed: 3.58s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3123282.682537523,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 903808.9632370778,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.2us | P99.9: 12.2us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 485265.37662764586,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.8us | P99.9: 20.5us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3223851.3417669283,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 319556.5388644016,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.6us | P99.9: 16.4us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 192550.115124366,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.9us | P99.9: 23.1us\nthreads: 1 | elapsed: 1.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 941794.1279851884,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.0us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1089877.1912212528,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 386103.2475875821,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 10.4us | P99.9: 90.0us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
           }
         ]
       }
