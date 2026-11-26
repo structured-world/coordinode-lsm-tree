@@ -10312,6 +10312,59 @@ fn requested(metrics: &crate::metrics::Metrics) -> (u64, u64) {
     )
 }
 
+/// A read that wants the entry, not only its value, is placed by the
+/// table's locator as a value read is: at the restart head or at the entry
+/// the locator names. Every key is found with its own value and seqno at
+/// either precision, and a key between two present ones reads absent.
+#[test]
+fn an_entry_read_placed_by_the_locator_finds_every_key() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+
+    for precision in [LocatorPrecision::Restart, LocatorPrecision::Entry] {
+        let dir = tempdir()?;
+        let file = dir.path().join("table");
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+            .use_data_block_size(256)
+            .use_locator(LocatorPolicyEntry::Enabled {
+                precision,
+                block_id_bits: None,
+                slot_bits: None,
+            });
+        // Even rows only, so an odd one lies between two present keys.
+        for i in (0..400u32).step_by(2) {
+            writer.write(InternalValue::from_components(
+                alloc::format!("key{i:05}").as_bytes(),
+                alloc::format!("value{i:05}").as_bytes(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("written");
+        let table = Table::recover(test_recover_params(file, checksum))?;
+        assert!(
+            table.metadata.data_block_count > 4,
+            "self-check: several data blocks"
+        );
+        for i in 0..400u32 {
+            let key = alloc::format!("key{i:05}").into_bytes();
+            let entry = table.get(&key, SeqNo::MAX, hash64(&key))?;
+            if i % 2 == 0 {
+                let entry = entry.expect("a present key");
+                assert_eq!(&*entry.key.user_key, &key[..], "{precision:?}");
+                assert_eq!(entry.key.seqno, u64::from(i) + 1, "{precision:?}");
+                assert_eq!(
+                    &*entry.value,
+                    alloc::format!("value{i:05}").as_bytes(),
+                    "{precision:?}"
+                );
+            } else {
+                assert!(entry.is_none(), "{precision:?}: key {i} is absent");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Bisecting a group's key zones selects exactly the row pages that reading
 /// every row page's zone selects, for keys present, between two present
 /// keys, below every key and above every key. Two tables: short keys, whose

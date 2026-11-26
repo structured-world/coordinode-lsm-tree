@@ -1624,6 +1624,177 @@ fn page_match_version_fails_closed_when_a_delete_mask_position_overflows() {
     );
 }
 
+/// Prepares a row page for point reads from the columns of `batch` at the
+/// indexes `order` names, in that order, and hands the outcome to `check`.
+fn prepare_columns<R>(
+    batch: &ColumnBatch,
+    order: &[usize],
+    check: impl FnOnce(crate::Result<super::PointPage<'_>>) -> R,
+) -> R {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let stamp = |column_id| PageStamp {
+        group_tag: 1,
+        id: PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let rows = batch.row_count;
+    let pages: Vec<(Slice, u16)> = order
+        .iter()
+        .map(|&at| {
+            let column = &batch.columns[at];
+            let page = column
+                .encode_page(rows, stamp(column.column_id), ColumnEncoding::Auto)
+                .expect("page");
+            (Slice::from(page), column.column_id)
+        })
+        .collect();
+    let mut budget = super::DecodeBudget::default();
+    let columns = pages
+        .iter()
+        .map(|(page, column_id)| budget.parsed(Column::parse_page(page, rows, stamp(*column_id))?))
+        .collect::<crate::Result<crate::table::row_group::PageColumns<_>>>();
+    check(columns.and_then(|columns| {
+        super::PointPage::prepare(
+            RowPageColumns {
+                ordinal: 0,
+                start: 0,
+                rows,
+                columns,
+            },
+            &mut budget,
+        )
+    }))
+}
+
+/// A row page is prepared for point reads from its seqnos, its value types
+/// and its value columns, in that order, each value column once: any other
+/// set of columns is a malformed page and is refused, each for its reason.
+/// The batch's columns are the key, the seqnos, the value types, the value.
+#[test]
+fn a_row_page_of_the_wrong_columns_is_refused_for_point_reads() {
+    let batch = entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("batch");
+    let refused = |order: &[usize]| -> String {
+        prepare_columns(&batch, order, |page| match page {
+            Err(crate::Error::InvalidHeader(reason)) => reason.into(),
+            Err(other) => panic!("columns {order:?}: {other:?}"),
+            Ok(_) => panic!("columns {order:?} must be refused"),
+        })
+    };
+    assert!(
+        refused(&[2, 1, 3]).contains("unexpected intrinsic column layout"),
+        "the value types before the seqnos"
+    );
+    assert!(
+        refused(&[1, 3, 3]).contains("unexpected intrinsic column layout"),
+        "a value column where the value types belong"
+    );
+    assert!(
+        refused(&[1, 2, 3, 3]).contains("must be unique"),
+        "a value column twice"
+    );
+    assert!(
+        refused(&[1]).contains("missing the intrinsic columns"),
+        "no value types"
+    );
+    assert!(
+        refused(&[1, 2]).contains("carries no value column"),
+        "no value column"
+    );
+    prepare_columns(&batch, &[1, 2, 3], |page| {
+        assert!(page.is_ok(), "the page's own columns are taken");
+    });
+}
+
+/// A row page read before its columns were added, and a read given another
+/// number of pages than of key runs, are refused: neither serves a row.
+#[test]
+fn a_point_read_of_an_unfilled_page_or_of_mismatched_runs_is_refused() {
+    let unfilled = super::PointPage::new(1).expect("a page of one row");
+    let read = unfilled.version(0..1, b"k", crate::SeqNo::MAX, None, &mut 0);
+    assert!(
+        matches!(read, Err(crate::Error::InvalidHeader(m)) if m.contains("missing the intrinsic columns")),
+        "a page with no column added must be refused, got {read:?}",
+    );
+
+    let batch = entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("batch");
+    prepare_columns(&batch, &[1, 2, 3], |page| {
+        let page = page.expect("prepared");
+        let read = super::point_version(
+            core::slice::from_ref(&page),
+            &[],
+            b"k",
+            crate::SeqNo::MAX,
+            None,
+            &mut 0,
+        );
+        assert!(
+            matches!(read, Err(crate::Error::InvalidHeader(m)) if m.contains("differ from the pages")),
+            "one page and no run must be refused, got {read:?}",
+        );
+    });
+}
+
+/// A value whose one column is nullable is framed with its presence bits,
+/// and counted as built: it is not a view of the page.
+#[test]
+fn a_point_read_of_a_nullable_value_frames_it_and_counts_it() {
+    let mut batch =
+        entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"value")]).expect("batch");
+    // One row, its cell present.
+    batch.columns.last_mut().expect("a value column").validity = Some(alloc::vec![1u8]);
+
+    let mut copied = 0;
+    let found = match_as_pages(&batch, b"k", None, &mut copied).expect("a read");
+    let framed =
+        frame_value_cells_nullable(&[(TypeTag::Bytes, Some(&b"value"[..]))]).expect("framed");
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        &*found[0].value,
+        &framed[..],
+        "the cell framed with its presence"
+    );
+    assert_eq!(
+        copied,
+        framed.len(),
+        "the framed value is built, and counted"
+    );
+}
+
+/// A value read from a column stored by its ordinals is rebuilt, not viewed:
+/// the read counts its bytes as built. Sixty-four rows of small numbers,
+/// which the page stores bit-packed.
+#[test]
+fn a_point_read_of_a_value_stored_by_its_ordinal_rebuilds_and_counts_it() {
+    let entries: Vec<_> = (0..64u32)
+        .map(|i| {
+            entry(
+                alloc::format!("k{i:03}").as_bytes(),
+                5,
+                ValueType::Value,
+                b"",
+            )
+        })
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("batch");
+    let number = TypeTag::Number(super::Number::U64_LE);
+    let value = batch.columns.last_mut().expect("a value column");
+    value.type_tag = number;
+    value.data = (0..64u64)
+        .flat_map(|i| (i + 1_000).to_le_bytes())
+        .collect::<Vec<u8>>()
+        .into();
+
+    let mut copied = 0;
+    let found = match_as_pages(&batch, b"k007", None, &mut copied).expect("a read");
+    assert_eq!(found.len(), 1);
+    assert_eq!(&*found[0].value, &1_007u64.to_le_bytes()[..]);
+    assert_eq!(
+        copied, 8,
+        "the number is rebuilt from its ordinal, and counted"
+    );
+}
+
 /// A tombstone carries no value, whatever its row's value cells are: here
 /// its one value column is nullable and null, which framed as a value would
 /// be the presence bits of its cells. A point read returns the tombstone

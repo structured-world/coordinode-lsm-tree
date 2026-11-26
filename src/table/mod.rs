@@ -2510,7 +2510,7 @@ impl Table {
                     Located::Absent => {
                         at += 1;
                         if at >= count {
-                            return Ok(());
+                            break;
                         }
                         located = locate(key_at(at), false)?;
                         continue;
@@ -2571,7 +2571,7 @@ impl Table {
                     }
                     at += 1;
                     if at >= count {
-                        return Ok(());
+                        break 'answered;
                     }
                     match locate(key_at(at), false)? {
                         Located::Rows(next, next_runs) if next == row_pages => runs = next_runs,
