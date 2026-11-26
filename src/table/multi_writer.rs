@@ -225,6 +225,10 @@ pub(crate) struct MultiWriter {
     /// [`Writer::use_bulk_ingested`]).
     bulk_ingested: bool,
 
+    /// Preserved across writer rotation: every table of a replacing ingestion
+    /// names it (see [`Writer::use_replacing`]).
+    replacing: Option<TableId>,
+
     /// L0 recency key stamped on every successor [`Writer`], preserved across
     /// rotation (see [`Writer::use_recency`]): a compaction sets its inputs'
     /// highest recency so manifest repair can place each output where its
@@ -412,6 +416,9 @@ pub(crate) struct TableFiles {
     origin: WriteOrigin,
     /// The write a refill an output's claim reserves is held for, if any.
     held_for: Option<super::file_pool::HoldId>,
+    /// The id the first output takes when its file is made for it (see
+    /// [`Self::first_made_as`]).
+    first_id: Option<TableId>,
 }
 
 impl TableFiles {
@@ -430,7 +437,17 @@ impl TableFiles {
             opened: false,
             origin,
             held_for,
+            first_id: None,
         }
+    }
+
+    /// Gives the first output the id `id` when its file is made for it,
+    /// rather than one taken then: a number the write took from the tree's
+    /// counter before it came here. A pooled file keeps its own.
+    #[must_use]
+    pub(crate) fn first_made_as(mut self, id: Option<TableId>) -> Self {
+        self.first_id = id;
+        self
     }
 
     /// A writer for the next output in `folder`, and whether its file's
@@ -443,13 +460,14 @@ impl TableFiles {
     ) -> crate::Result<(Writer, bool)> {
         let may_refill = !self.opened;
         self.opened = true;
-        let claimed = self.pools.claim_as(
+        let claimed = self.pools.claim_made_as(
             folder,
             fs,
             self.above,
             may_refill,
             self.origin,
             self.held_for,
+            self.first_id.take(),
         )?;
         let durable = claimed.durable_entry;
         Ok((Writer::into_claimed(claimed, level, fs.clone())?, durable))
@@ -590,6 +608,7 @@ impl MultiWriter {
             value_layout: None,
             cell_rows: false,
             bulk_ingested: false,
+            replacing: None,
             recency: None,
             lineage: None,
             inherited_age: None,
@@ -1509,6 +1528,15 @@ impl MultiWriter {
         self
     }
 
+    /// Marks every table in this run as a replacing ingestion's (re-applied to
+    /// each rotated successor). See [`Writer::use_replacing`].
+    #[must_use]
+    pub(crate) fn use_replacing(mut self, replacing: Option<TableId>) -> Self {
+        self.replacing = replacing;
+        self.writer = self.writer.use_replacing(replacing);
+        self
+    }
+
     /// The first output's id when its file was made as this writer started:
     /// taken from the tree's counter then, it stands for when the write
     /// began. `None` for a pooled file.
@@ -1906,6 +1934,7 @@ impl MultiWriter {
         new_writer = new_writer.use_columnar(self.use_columnar);
         new_writer = new_writer.use_cell_rows(self.cell_rows);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
+        new_writer = new_writer.use_replacing(self.replacing);
         if let Some(recency) = self.recency {
             new_writer = new_writer.use_recency(recency);
         }

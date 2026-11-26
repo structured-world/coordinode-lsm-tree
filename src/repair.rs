@@ -4810,6 +4810,13 @@ struct TableScan {
     /// the rebuilt manifest decides every flush the scan found, so a table
     /// it leaves out is not installed by an open from its own description.
     highest_flush: u64,
+    /// The recency of the latest replacing install a mark tells of (see
+    /// [`crate::replace_mark`]): every table whose recency lies below it was
+    /// in the tree before that install, which dropped it.
+    replace_bound: Option<TableId>,
+    /// Every replace mark found, as `(ingestion, bound, path, fs)`, judged
+    /// against the FINAL rebuilt set as the open judges them.
+    replace_marks: Vec<(TableId, TableId, PathBuf, Arc<dyn crate::fs::Fs>)>,
 }
 
 /// The tables that opened in one folder: each id with the ids below it its
@@ -4915,6 +4922,29 @@ fn scan_table_folders(
     // flush found, a set-aside one included: the scan does not open a
     // set-aside table, and below that watermark it no longer names a flush.
     let mut highest_flush: u64 = manifest_referenced.map_or(0, |manifest| manifest.flush_watermark);
+    // The marks replacing installs left, in any folder, read before any
+    // table: a mark gives every table of its ingestion the place the install
+    // recorded in the lost manifest (see `replace_mark`), and its bound holds
+    // whether a table of that ingestion is still there or not.
+    let mut replace_bound: Option<TableId> = None;
+    let mut replace_runs: crate::HashMap<TableId, TableId> = crate::HashMap::default();
+    let mut replace_marks: Vec<(TableId, TableId, PathBuf, Arc<dyn crate::fs::Fs>)> = Vec::new();
+    for (folder, folder_fs) in config.all_tables_folders() {
+        if !folder_fs.exists(&folder)? {
+            continue;
+        }
+        for dirent in folder_fs.read_dir(&folder)? {
+            if let crate::file::TableDirEntry::ReplaceMark(run, bound) =
+                crate::file::TableDirEntry::classify(&dirent.file_name)
+                && !dirent.is_dir
+            {
+                let highest = replace_runs.entry(run).or_insert(bound);
+                *highest = (*highest).max(bound);
+                replace_bound = replace_bound.max(Some(bound));
+                replace_marks.push((run, bound, dirent.path, Arc::clone(&folder_fs)));
+            }
+        }
+    }
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
@@ -5000,6 +5030,9 @@ fn scan_table_folders(
                     live_sidecars.push((id, table_path, Arc::clone(&folder_fs)));
                     continue;
                 }
+                // Read before the tables, and judged against the rebuilt set
+                // as a live sidecar is, by the ingestion it names.
+                TableDirEntry::ReplaceMark(..) => continue,
                 // The disposable `.tmp` shapes are crash leftovers no state
                 // references; the open sweeps them unconditionally, so repair
                 // removes them itself (post-commit) for the same reason.
@@ -5103,7 +5136,8 @@ fn scan_table_folders(
             // Reusing it keeps a healthy bulk-ingested SST (and its real
             // sequence and L0 position) where the manifest-loss rule would have
             // to fail closed.
-            let manifest_position: Option<ManifestPosition> = manifest_referenced
+            //
+            let recorded_position: Option<ManifestPosition> = manifest_referenced
                 .as_ref()
                 .and_then(|m| m.tables.get(&table_id))
                 .map(ManifestPosition::of_record);
@@ -5123,6 +5157,45 @@ fn scan_table_folders(
                 // A fault in the ENVIRONMENT is not evidence about these bytes.
                 Err(e) if is_environmental(&e) => return Err(e),
                 Err(e) => Err(e),
+            };
+            // Without a record, the mark of a replacing install stands in for
+            // it: made once that install was durable, it proves every table of
+            // its ingestion was installed, at offset 0 as every replacing
+            // install is, and names the recency of the run. The table names
+            // its ingestion in its meta block, so it is opened once for that,
+            // and only where a mark was found at all. The open reads the
+            // trailer, the meta block and the index, and checks no digest, so
+            // it is made whether the file hashed or not: a table with a data
+            // block that does not read still names its ingestion, and its
+            // salvage needs the place as much as a whole table does. A
+            // replacing ingestion's table with neither was never installed,
+            // and fails closed below as any ingested table without a
+            // recoverable offset does.
+            let manifest_position: Option<ManifestPosition> = match recorded_position {
+                Some(position) => Some(position),
+                None if !replace_runs.is_empty() => {
+                    match Table::recover(repair_recover_params(
+                        config,
+                        table_path.clone(),
+                        crate::Checksum::from_raw(0),
+                        table_id,
+                        folder_fs.clone(),
+                        None,
+                    )) {
+                        Ok(table) => table
+                            .metadata
+                            .replacing
+                            .and_then(|run| replace_runs.get(&run))
+                            .map(|&bound| ManifestPosition {
+                                global_seqno: 0,
+                                recency: bound,
+                            }),
+                        Err(e) if is_environmental(&e) => return Err(e),
+                        // Graded below, where the table is opened to keep.
+                        Err(_) => None,
+                    }
+                }
+                None => None,
             };
             let committed_digest = manifest_referenced
                 .as_ref()
@@ -5982,6 +6055,8 @@ fn scan_table_folders(
         live_sidecars,
         scanned_table_ids,
         highest_flush,
+        replace_bound,
+        replace_marks,
     })
 }
 
@@ -6017,6 +6092,8 @@ fn rebuild_from_scan(
         live_sidecars,
         scanned_table_ids,
         highest_flush,
+        replace_bound,
+        replace_marks,
     } = scan;
 
     // Collect the best copy per id, carrying each candidate's completeness so
@@ -6052,6 +6129,52 @@ fn rebuild_from_scan(
     // scan's order.
     recovered_tables
         .sort_by_key(|(t, ..)| (std::cmp::Reverse(t.l0_recency()), std::cmp::Reverse(t.id())));
+
+    // A replacing install drops every table the tree holds, and the removal
+    // of their files follows it: one still on the disk when the manifest was
+    // lost is a file that removal never reached. The install's mark tells
+    // them apart by recency (see `replace_mark`): the install took its own
+    // with no flush under way, so a table below it was flushed before the
+    // install, or merged from tables that were, and a table at or above it is
+    // the install's own run, a later flush, or a merge of those. Left out
+    // here, before anything is rebuilt around them: their rows, at the seqnos
+    // they were written at, would read over the replaced ones. Nothing is
+    // lost with them, so they are reported left out, not unreadable.
+    //
+    // A manifest that loaded names the live tables itself, and what it does
+    // not name went before the scan.
+    if manifest_referenced.is_none()
+        && let Some(bound) = replace_bound
+    {
+        let candidates = core::mem::take(&mut recovered_tables);
+        for candidate in candidates {
+            if candidate.0.l0_recency() >= bound {
+                recovered_tables.push(candidate);
+                continue;
+            }
+            let (table, _, path, fs) = candidate;
+            log::info!(
+                "repair: table {} was in the tree before the replacing ingestion \
+                 installed at {bound}, which dropped it; leaving it out",
+                table.id(),
+            );
+            drop(table);
+            let reason = "in the tree before a replacing ingestion, which dropped it";
+            // A salvaged copy of it waits at its temp name for the commit:
+            // it goes too, where the swap would have put it back.
+            let mut index = 0;
+            while let Some((_, _, dest, _)) = swap_after_commit.get(index) {
+                if *dest == path {
+                    let (temp_fs, temp, ..) = swap_after_commit.swap_remove(index);
+                    discard_after_commit.push((temp_fs, temp, reason.to_string()));
+                } else {
+                    index += 1;
+                }
+            }
+            excluded_files.push((path.clone(), reason.to_string()));
+            discard_after_commit.push((fs, path, reason.to_string()));
+        }
+    }
 
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and
@@ -6894,6 +7017,24 @@ fn rebuild_from_scan(
                 fs,
                 path,
                 "orphaned sidecar; its table did not survive the rebuild".to_string(),
+            ));
+        }
+        // A replace mark the same way, by the ingestion it names: the open
+        // keeps the mark of an ingestion the tree holds a table of and
+        // removes every other. Queued after the tables its bound left out,
+        // so it goes once they are gone.
+        let held: crate::HashSet<(TableId, TableId)> = recovered_tables
+            .iter()
+            .filter_map(|(t, ..)| t.metadata.replacing.map(|run| (run, t.l0_recency())))
+            .collect();
+        for (run, bound, path, fs) in replace_marks {
+            if held.contains(&(run, bound)) {
+                continue;
+            }
+            discard_after_commit.push((
+                fs,
+                path,
+                "replace mark of an ingestion no rebuilt table belongs to".to_string(),
             ));
         }
     }

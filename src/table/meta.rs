@@ -365,6 +365,14 @@ pub struct ParsedMeta {
     /// SST alone.
     pub bulk_ingested: Option<bool>,
 
+    /// The replacing ingestion that wrote this table, by the id it took when
+    /// it started (`descriptor#replacing`); `None` for every other table. Such
+    /// a table is written before the install that keeps it, at local seqno 0
+    /// like any ingested one, so the file alone does not say whether it was
+    /// installed: the manifest does, and the mark the install leaves under
+    /// this id, which a repair without a manifest reads.
+    pub replacing: Option<TableId>,
+
     /// L0 recency key from the required `recency` property: an id a flush
     /// takes when it starts, an ingested table's own id (its install records
     /// a later one in the manifest), a compaction output's highest recency
@@ -707,6 +715,17 @@ impl ParsedMeta {
             },
         };
 
+        // Optional: the id of the replacing ingestion that wrote the table.
+        let replacing = match block.point_read(b"descriptor#replacing", SeqNo::MAX, &cmp)? {
+            None => None,
+            Some(v) => Some(TableId::from_le_bytes(
+                v.value
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?,
+            )),
+        };
+
         let id = read_u64!(block, b"table_id", &cmp);
         // Cross-check the payload's stored id against the caller's durable
         // expected id (manifest entry / SST path). A mismatch means a swapped
@@ -1037,6 +1056,7 @@ impl ParsedMeta {
             value_layout,
             group_shape,
             bulk_ingested,
+            replacing,
             recency,
             lineage,
             lineage_prev,

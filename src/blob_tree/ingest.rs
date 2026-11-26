@@ -320,8 +320,8 @@ impl<'a> BlobIngestion<'a> {
     pub fn finish(mut self) -> crate::Result<()> {
         use crate::AbstractTree;
 
-        if self.table.replacing {
-            return self.finish_replacing();
+        if let Some(run) = self.table.replacing {
+            return self.finish_replacing(run);
         }
         let index = self.index().clone();
 
@@ -448,21 +448,23 @@ impl<'a> BlobIngestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs; the tree then keeps its
     /// earlier content.
-    fn finish_replacing(mut self) -> crate::Result<()> {
+    fn finish_replacing(mut self, run: crate::TableId) -> crate::Result<()> {
         use crate::AbstractTree;
 
         let index = self.index().clone();
         // The hold on the ingestion's dictionaries stays here until its files
         // are installed.
         let write_pin = core::mem::take(&mut self.table.write_pin);
-        let written = if self.last_key.is_some() {
-            // The blob files first, which the index tables point into.
-            let blob_files = self.blob.finish()?;
-            let written = self.table.writer.finish()?;
-            Some((written.tables, written.entries_durable, blob_files))
-        } else {
-            None
-        };
+        // The blob files first, which the index tables point into. Both
+        // writers are finished with nothing written too: each then gives up
+        // the file it took.
+        let blob_files = self.blob.finish()?;
+        let written = self.table.writer.finish()?;
+        let written = (!written.tables.is_empty()).then_some((
+            written.tables,
+            written.entries_durable,
+            blob_files,
+        ));
 
         #[cfg(all(test, feature = "std"))]
         index.config.fire_before_output_install();
@@ -475,9 +477,10 @@ impl<'a> BlobIngestion<'a> {
             let _compaction_state = index.compaction_state.lock();
             let mut versions = index.version_history.write();
 
+            // Taken with no flush under way, as a table ingestion's.
+            let recency = index.table_id_counter.next();
             let (tables, blob_files) = match written {
                 Some((tables, entries_durable, blob_files)) => {
-                    let recency = index.table_id_counter.next();
                     let tables = TableIngestion::recover_run(
                         &index,
                         &self.table.folder,
@@ -502,11 +505,17 @@ impl<'a> BlobIngestion<'a> {
             let prior = index.install_replacing(&mut versions, &tables, &blob_files)?;
             drop(versions);
             installed.charge();
-            prior
+            let marked = index.mark_replaced(run, recency);
+            (prior, marked)
         };
         // The installed files name their dictionaries from here on.
         drop(write_pin);
-        crate::tree::reclaim_replaced(&prior);
+        // Unmarked, the install reads to a repair as never made: the earlier
+        // files stay for it until the next open.
+        let (prior, marked) = prior;
+        if marked {
+            crate::tree::reclaim_replaced(&prior);
+        }
         Ok(())
     }
 

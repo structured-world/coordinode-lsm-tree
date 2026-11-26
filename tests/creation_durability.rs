@@ -203,6 +203,21 @@ fn a_reopened_kv_separated_tree_keeps_its_blobs_through_a_power_loss() {
     );
 }
 
+/// Removes the mark a clear left in `tables`, the only file there, so the
+/// tree's edit log is the only state the folder holds.
+fn lose_the_clears_mark(mem: &MemFs, tables: &std::path::Path) {
+    use lsm_tree::fs::Fs;
+    let left = mem.read_dir(tables).expect("tables");
+    assert!(
+        left.iter()
+            .all(|entry| entry.file_name.contains(".replaced-")),
+        "self-check: no table is left"
+    );
+    for entry in left {
+        mem.remove_file(&entry.path).expect("lose the mark");
+    }
+}
+
 /// A tree that lived holds its history in its edit log even when no table is
 /// left (a clear, the retention floor it raised): a lost snapshot
 /// over that log is refused, never taken for a fresh folder and created over.
@@ -233,10 +248,7 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
     // The tree's path as the tree spells it: absolute (on Windows, with a
     // drive).
     let db = std::path::absolute(DB).expect("absolute path");
-    assert!(
-        mem.read_dir(&db.join("tables")).expect("tables").is_empty(),
-        "self-check: no table is left"
-    );
+    lose_the_clears_mark(&mem, &db.join("tables"));
     let mut logs_with_edits = 0;
     for entry in mem.read_dir(&db).expect("tree folder") {
         if entry.file_name.starts_with('v') {
@@ -527,10 +539,7 @@ fn an_open_without_a_snapshot_refuses_a_rotated_generations_empty_log() {
         tree.clear().expect("clear");
     }
     let db = std::path::absolute(DB).expect("absolute path");
-    assert!(
-        mem.read_dir(&db.join("tables")).expect("tables").is_empty(),
-        "self-check: no table is left"
-    );
+    lose_the_clears_mark(&mem, &db.join("tables"));
     let mut rotated_logs = 0;
     for entry in mem.read_dir(&db).expect("tree folder") {
         if entry.file_name.starts_with('v') {

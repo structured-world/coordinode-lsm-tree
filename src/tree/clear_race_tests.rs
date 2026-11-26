@@ -153,6 +153,85 @@ fn a_flush_a_clear_declined_stays_out_after_a_power_loss() -> crate::Result<()> 
     Ok(())
 }
 
+/// The tables of a flush a clear declined, left on the disk by a power loss,
+/// stay out of a repair of the manifest lost with it: the clear's mark gives
+/// the recency below which everything it dropped lies, and the flush took its
+/// own with the memtables it wrote, before the clear. Guards against cleared
+/// keys returning through a repair that keeps the flushes no manifest names.
+#[test]
+fn a_flush_a_clear_declined_stays_out_of_a_repair() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    for blob in [false, true] {
+        let crash = crate::fs::CrashFs::new(crate::fs::MemFs::new());
+        let config = |fs: Arc<dyn Fs>| {
+            let config = Config::new(
+                "/db",
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(fs);
+            if blob {
+                config.with_kv_separation(Some(
+                    crate::KvSeparationOptions::default().separation_threshold(1),
+                ))
+            } else {
+                config
+            }
+        };
+        let fs = Arc::new(FaultFs::new(crash.clone()));
+        let tree = config(fs.clone()).open()?;
+        let root = tree.tree_config().path.clone();
+        let (tables, _) = tree.tree_config().tables_folder_for_level(0);
+        write_keys(&tree, 1);
+        clear_before_install(&tree);
+        // The declined files stay where the flush synced them, as when the
+        // power goes before their removal.
+        for op in [FaultOp::RemoveFile, FaultOp::SetLen, FaultOp::Rename] {
+            fs.injector().arm(FaultRule::new(
+                op,
+                Fault::Error(crate::io::ErrorKind::Other),
+            ));
+        }
+        tree.flush_active_memtable(0)?;
+        crash.crash();
+        drop(tree);
+
+        let mut left = 0;
+        for entry in crash.read_dir(&tables)? {
+            if matches!(
+                crate::file::TableDirEntry::classify(&entry.file_name),
+                crate::file::TableDirEntry::Table(_)
+            ) && crash.metadata(&entry.path)?.len > 0
+            {
+                left += 1;
+            }
+        }
+        assert!(
+            left > 0,
+            "self-check: the flush's table is on disk, blob: {blob}"
+        );
+        for entry in crash.read_dir(&root)? {
+            let manifest = entry
+                .file_name
+                .strip_prefix('v')
+                .or_else(|| entry.file_name.strip_prefix("edits-"))
+                .is_some_and(|rest| rest.parse::<u64>().is_ok());
+            if manifest {
+                crash.remove_file(&entry.path)?;
+            }
+        }
+        config(Arc::new(crash.clone())).repair()?;
+
+        let tree = config(Arc::new(crash)).open()?;
+        assert_eq!(
+            tree.iter(SeqNo::MAX, None).count(),
+            0,
+            "cleared keys came back through a repair, blob: {blob}"
+        );
+    }
+    Ok(())
+}
+
 /// A flush that returned survives a power loss after a clear that failed while
 /// it was written, and a manifest written before its install. The failed clear
 /// left the flush's memtables in place, so the flush installs; guards against

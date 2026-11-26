@@ -963,6 +963,7 @@ fn meta_mirrors_diverge(
             // authenticates them against each other, so the salvage refuses
             // to choose.
             let non_derivable_disagree = t.bulk_ingested != m.bulk_ingested
+                || t.replacing != m.replacing
                 || t.recency != m.recency
                 || t.lineage != m.lineage
                 || t.lineage_prev != m.lineage_prev

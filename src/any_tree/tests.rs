@@ -93,6 +93,7 @@ fn forwards_to_the_tree_it_holds(blob: bool) -> crate::Result<()> {
         1,
         None,
         None,
+        None,
     )?;
     let (tables, _, _, _) = written.expect("one entry writes a table");
     assert_eq!(tables.len(), 1);

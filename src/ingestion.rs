@@ -219,11 +219,13 @@ impl AnyTree {
     /// earlier content comes back, a flush of the dropped memtables included.
     ///
     /// The mode is chosen here, before the first row, because it is written
-    /// into every table: the ingested tables are not marked bulk-ingested,
-    /// since they sit at seqno 0, so a repair that rebuilds a lost manifest
-    /// ([`Config::repair`](crate::Config::repair)) keeps them at seqno 0. Such a
-    /// repair cannot tell an earlier table a crash left on disk before its
-    /// deletion from the ingested ones, and reads it over them.
+    /// into every table. Once the install is durable it leaves one mark in
+    /// the tables folder, and a repair that rebuilds a lost manifest
+    /// ([`Config::repair`](crate::Config::repair)) reads the install from
+    /// it: it keeps the ingested tables at seqno 0, all of them or none,
+    /// leaves out an earlier table a crash left on disk before its deletion,
+    /// and leaves out the tables of a replacing ingestion that never
+    /// installed. An ingestion that wrote nothing leaves its mark too.
     ///
     /// # Errors
     ///

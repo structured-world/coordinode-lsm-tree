@@ -72,6 +72,351 @@ fn files_in(path: &std::path::Path, folder: &str) -> usize {
     })
 }
 
+/// The replace marks in the tables folder under `path`, as
+/// `(ingestion, bound)`, in order.
+fn marks(path: &std::path::Path) -> Vec<(u64, u64)> {
+    let mut marks: Vec<(u64, u64)> = std::fs::read_dir(path.join(crate::file::TABLES_FOLDER))
+        .expect("the tables folder")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            match crate::file::TableDirEntry::classify(&entry.file_name().to_string_lossy()) {
+                crate::file::TableDirEntry::ReplaceMark(run, bound) => Some((run, bound)),
+                _ => None,
+            }
+        })
+        .collect();
+    marks.sort_unstable();
+    marks
+}
+
+/// The replace marks in the tables folder of `tree`, read through `fs`: the
+/// folder is the one the tree itself resolved, whatever the platform makes of
+/// its path.
+fn marks_on(fs: &dyn crate::fs::Fs, tree: &AnyTree) -> crate::Result<Vec<(u64, u64)>> {
+    let (folder, _) = tree.tree_config().tables_folder_for_level(0);
+    let mut marks: Vec<(u64, u64)> = fs
+        .read_dir(&folder)?
+        .into_iter()
+        .filter_map(
+            |entry| match crate::file::TableDirEntry::classify(&entry.file_name) {
+                crate::file::TableDirEntry::ReplaceMark(run, bound) => Some((run, bound)),
+                _ => None,
+            },
+        )
+        .collect();
+    marks.sort_unstable();
+    Ok(marks)
+}
+
+/// The table files holding bytes in the tables folder of `tree`, read through
+/// `fs`.
+fn tables_on(fs: &dyn crate::fs::Fs, tree: &AnyTree) -> crate::Result<usize> {
+    let (folder, _) = tree.tree_config().tables_folder_for_level(0);
+    let mut tables = 0;
+    for entry in fs.read_dir(&folder)? {
+        if matches!(
+            crate::file::TableDirEntry::classify(&entry.file_name),
+            crate::file::TableDirEntry::Table(_)
+        ) && fs.metadata(&entry.path)?.len > 0
+        {
+            tables += 1;
+        }
+    }
+    Ok(tables)
+}
+
+/// The install of a replace leaves one mark for all of its tables; an open
+/// puts back a mark that is missing, and a checkpoint takes it along. The
+/// mark stays while the tree is open, past the last table of its run, and the
+/// next open, which removes what the install dropped, removes it. A repair
+/// without a manifest reads the install from the mark, so a run without one
+/// reads as never installed.
+#[test]
+fn a_replace_leaves_one_mark_until_an_open_finds_its_run_gone() -> crate::Result<()> {
+    for blob in [false, true] {
+        let folder = tempfile::tempdir()?;
+        let open = || config(folder.path(), blob).table_target_size(4_096).open();
+        let tree = open()?;
+        write_old(&tree)?;
+        assert!(marks(folder.path()).is_empty(), "blob: {blob}");
+
+        let mut ingestion = tree.replacing_ingestion()?;
+        for x in 0..20_000u64 {
+            ingestion.write(x.to_be_bytes(), b"new")?;
+        }
+        ingestion.finish()?;
+        assert!(
+            tree.table_count() > 1,
+            "self-check: several tables, blob: {blob}"
+        );
+        let marked = marks(folder.path());
+        let [(run, bound)] = marked[..] else {
+            panic!("one mark for the install, blob: {blob}: {marked:?}");
+        };
+        assert!(run < bound, "the bound is taken at the install: {marked:?}");
+        close(tree);
+
+        // An install the power cut before its mark: the open leaves it.
+        std::fs::remove_file(
+            folder
+                .path()
+                .join(crate::file::TABLES_FOLDER)
+                .join(format!("{run}.replaced-{bound}")),
+        )?;
+        let tree = open()?;
+        assert_eq!(marks(folder.path()), marked, "blob: {blob}");
+
+        let target = tempfile::tempdir()?;
+        let checkpoint = target.path().join("checkpoint");
+        tree.create_checkpoint(&checkpoint)?;
+        assert_eq!(marks(&checkpoint), marked, "blob: {blob}");
+
+        tree.insert("later", "x", 5);
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(u64::MAX, 0)?;
+        close(tree);
+        assert_eq!(
+            marks(folder.path()),
+            marked,
+            "the bound holds while the tree is open, blob: {blob}"
+        );
+
+        close(open()?);
+        assert!(
+            marks(folder.path()).is_empty(),
+            "an open found the run gone and kept its mark, blob: {blob}"
+        );
+    }
+    Ok(())
+}
+
+/// A replace that ingested nothing leaves its mark too: the install dropped
+/// the earlier tables all the same. The next open removes it.
+#[test]
+fn an_empty_replace_leaves_its_mark() -> crate::Result<()> {
+    for blob in [false, true] {
+        let folder = tempfile::tempdir()?;
+        let tree = config(folder.path(), blob).open()?;
+        write_old(&tree)?;
+        replace(&tree, &[])?;
+        assert_eq!(marks(folder.path()).len(), 1, "blob: {blob}");
+        close(tree);
+        close(config(folder.path(), blob).open()?);
+        assert!(marks(folder.path()).is_empty(), "blob: {blob}");
+    }
+    Ok(())
+}
+
+/// A replace that fails at its install marks nothing: a mark says the install
+/// is durable.
+#[test]
+fn a_replace_that_failed_leaves_no_mark() -> crate::Result<()> {
+    for blob in [false, true] {
+        let fs = Arc::new(FaultFs::new(crate::fs::MemFs::new()));
+        let tree = config_on(fs.clone(), blob).open()?;
+        tree.insert("a", "old", 1);
+        tree.flush_active_memtable(0)?;
+        tree.persist_flushes()?;
+
+        fs.injector().arm(
+            FaultRule::new(FaultOp::Write, Fault::Error(crate::io::ErrorKind::Other))
+                .on_path("edits"),
+        );
+        assert!(
+            replace(&tree, &[("new", "1")]).is_err(),
+            "self-check: the replace fails"
+        );
+        fs.injector().clear();
+        assert!(marks_on(&*fs, &tree)?.is_empty(), "blob: {blob}");
+    }
+    Ok(())
+}
+
+/// A mark that cannot be made does not fail the replace, which is installed
+/// and durable by then: the replace returns and reads the new content. The
+/// earlier table stays on the disk, for a repair that would read the install
+/// as never made, until the next open leaves the mark the manifest owes and
+/// removes it. A `clear` whose mark fails keeps the earlier table the same
+/// way.
+#[test]
+fn a_replace_whose_mark_fails_is_marked_by_the_next_open() -> crate::Result<()> {
+    for (blob, clear) in [(false, false), (true, false), (false, true)] {
+        let fs = Arc::new(FaultFs::new(crate::fs::MemFs::new()));
+        let tree = config_on(fs.clone(), blob).open()?;
+        write_old(&tree)?;
+        let earlier = tables_on(&*fs, &tree)?;
+        assert!(earlier > 0, "self-check: an earlier table");
+
+        fs.injector().arm(
+            FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::Other))
+                .on_path(".replaced-"),
+        );
+        if clear {
+            tree.clear()?;
+        } else {
+            replace(&tree, &[("new", "1")])?;
+        }
+        fs.injector().clear();
+        let expected = (!clear).then_some(b"1".as_slice());
+        assert_eq!(value(&tree, "new")?.as_deref(), expected);
+        assert_eq!(value(&tree, "flushed")?, None, "blob: {blob}");
+        assert!(marks_on(&*fs, &tree)?.is_empty(), "blob: {blob}");
+        let kept = tree.table_count();
+        assert_eq!(
+            tables_on(&*fs, &tree)?,
+            earlier + kept,
+            "the earlier table went before a mark was durable, blob: {blob}, clear: {clear}"
+        );
+        close(tree);
+
+        // The open marks the install it holds a table of, and removes the
+        // earlier table, which no manifest names.
+        let tree = config_on(fs.clone(), blob).open()?;
+        assert_eq!(marks_on(&*fs, &tree)?.len(), usize::from(!clear));
+        assert_eq!(tables_on(&*fs, &tree)?, kept, "blob: {blob}");
+        assert_eq!(value(&tree, "new")?.as_deref(), expected);
+    }
+    Ok(())
+}
+
+/// An open that removes a stale mark first syncs the folders it removed the
+/// install's dropped files from, so a power loss cannot keep the mark's
+/// removal and bring one of those files back. When such a folder does not
+/// sync, the open fails and the mark stays; the next open finishes both.
+#[test]
+fn an_open_keeps_a_stale_mark_when_its_removals_do_not_sync() -> crate::Result<()> {
+    for blob in [false, true] {
+        let fault = Arc::new(FaultFs::new(crate::fs::MemFs::new()));
+        let tree = config_on(fault.clone(), blob).open()?;
+        write_old(&tree)?;
+        let (folder, _) = tree.tree_config().tables_folder_for_level(0);
+        // The earlier table as it lies, put back after the replace as when
+        // its removal failed.
+        let mut earlier = Vec::new();
+        for entry in crate::fs::Fs::read_dir(&*fault, &folder)? {
+            if crate::fs::Fs::metadata(&*fault, &entry.path)?.len > 0 {
+                let mut bytes = Vec::new();
+                let mut file = crate::fs::Fs::open(
+                    &*fault,
+                    &entry.path,
+                    &crate::fs::FsOpenOptions::new().read(true),
+                )?;
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                earlier.push((entry.path, bytes));
+            }
+        }
+        assert!(!earlier.is_empty(), "self-check: an earlier table");
+        replace(&tree, &[])?;
+        close(tree);
+        for (path, bytes) in &earlier {
+            let mut file = crate::fs::Fs::open(
+                &*fault,
+                path,
+                &crate::fs::FsOpenOptions::new().write(true).create(true),
+            )?;
+            std::io::Write::write_all(&mut file, bytes)?;
+        }
+        let marked = |fs: &FaultFs<crate::fs::MemFs>| -> crate::Result<usize> {
+            Ok(crate::fs::Fs::read_dir(fs, &folder)?
+                .into_iter()
+                .filter(|entry| {
+                    matches!(
+                        crate::file::TableDirEntry::classify(&entry.file_name),
+                        crate::file::TableDirEntry::ReplaceMark(..)
+                    )
+                })
+                .count())
+        };
+        assert_eq!(marked(&fault)?, 1, "self-check: the mark, blob: {blob}");
+
+        // The folder the earlier table is removed from does not sync: the
+        // open fails before the mark goes.
+        fault.injector().arm(
+            FaultRule::new(
+                FaultOp::SyncDirectory,
+                Fault::Error(crate::io::ErrorKind::Other),
+            )
+            .on_path(crate::file::TABLES_FOLDER),
+        );
+        assert!(
+            config_on(fault.clone(), blob).open().is_err(),
+            "self-check: the open fails on the sync, blob: {blob}"
+        );
+        fault.injector().clear();
+        assert_eq!(
+            marked(&fault)?,
+            1,
+            "the mark went before the removals were durable, blob: {blob}"
+        );
+
+        let tree = config_on(fault.clone(), blob).open()?;
+        assert_eq!(marked(&fault)?, 0, "blob: {blob}");
+        assert_eq!(tables_on(&*fault, &tree)?, 0, "blob: {blob}");
+    }
+    Ok(())
+}
+
+/// A mark an open finds is not taken as durable: the sync after its making
+/// may be the one that failed. The open syncs its folder, so the mark is
+/// there after a power loss. Guards against an open that leaves a mark it
+/// found as it is, which a power loss then takes back.
+#[test]
+fn an_open_makes_the_mark_it_finds_durable() -> crate::Result<()> {
+    use crate::fs::Fs;
+    for blob in [false, true] {
+        let crash = crate::fs::CrashFs::new(crate::fs::MemFs::new());
+        let fs: Arc<dyn Fs> = Arc::new(crash.clone());
+        let tree = config_on(Arc::clone(&fs), blob).open()?;
+        write_old(&tree)?;
+        replace(&tree, &[("new", "1")])?;
+        let marked = marks_on(&*fs, &tree)?;
+        let [(run, bound)] = marked[..] else {
+            panic!("one mark for the install, blob: {blob}: {marked:?}");
+        };
+        let (folder, _) = tree.tree_config().tables_folder_for_level(0);
+        close(tree);
+
+        // The mark as a failed folder sync leaves it: there, and not durable.
+        let mark = crate::replace_mark::mark_path(&folder, run, bound);
+        fs.remove_file(&mark)?;
+        fs.sync_directory(&folder)?;
+        drop(fs.open(
+            &mark,
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?);
+
+        let tree = config_on(Arc::clone(&fs), blob).open()?;
+        crash.crash();
+        assert_eq!(marks_on(&*fs, &tree)?, marked, "blob: {blob}");
+    }
+    Ok(())
+}
+
+/// A name is a replace mark only in the spelling the engine writes: anything
+/// else in the folder is an operator's file, which no scan removes.
+#[test]
+fn a_replace_mark_name_is_owned_in_the_engines_spelling_alone() {
+    use crate::file::TableDirEntry;
+    assert_eq!(
+        TableDirEntry::classify("5.replaced-9"),
+        TableDirEntry::ReplaceMark(5, 9)
+    );
+    for foreign in [
+        "5.replaced-",
+        ".replaced-9",
+        "05.replaced-9",
+        "5.replaced-09",
+        "5.replaced-backup",
+        "5.replaced-9.tmp",
+    ] {
+        assert_eq!(
+            TableDirEntry::classify(foreign),
+            TableDirEntry::Foreign,
+            "{foreign}"
+        );
+    }
+}
+
 /// After a replace the tree holds the ingested keys alone: none of the
 /// flushed, sealed or active content stays, and the earlier tables and blob
 /// files are deleted once nothing holds them, as the reopen confirms.

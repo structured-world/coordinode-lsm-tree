@@ -899,6 +899,12 @@ pub trait AbstractTree: sealed::Sealed {
         // table names, so a number a failed flush took never counts.
         let flush_seq = self.begin_synced_flush();
         let _give_back = flush_seq.map(|(seq, _)| GiveBack(move || self.end_synced_flush(seq)));
+        // The flush's L0 recency, taken under the history's lock too, with
+        // the memtables it writes: a clear installs under that lock and takes
+        // the recency below which everything it dropped lies, so a flush that
+        // chose its memtables before the clear carries a lower one, whenever
+        // it writes them.
+        let recency = self.take_flush_recency();
 
         let sealed_ids = latest
             .sealed_memtables
@@ -1020,6 +1026,7 @@ pub trait AbstractTree: sealed::Sealed {
             flushed.hashes,
             marks,
             self_described.as_ref(),
+            Some(recency),
         )? {
             // A writer given range tombstones and no key writes a table around
             // them, so a flush that acknowledges a deletion has put it on disk.
@@ -1324,7 +1331,7 @@ pub trait AbstractTree: sealed::Sealed {
             .size_hint()
             .1
             .map_or(0, |upper| u64::try_from(upper).unwrap_or(u64::MAX));
-        self.flush_to_tables_with_rt(stream, Vec::new(), keys, keys, None, None)
+        self.flush_to_tables_with_rt(stream, Vec::new(), keys, keys, None, None, None)
     }
 
     /// Like [`AbstractTree::flush_to_tables`], but also writes range tombstones.
@@ -1333,7 +1340,9 @@ pub trait AbstractTree: sealed::Sealed {
     /// for every table the flush writes by them. `overwritten`, when given,
     /// names the keys of `stream` its source held more than one version of.
     /// `self_described`, when given, makes the tables describe themselves as
-    /// the synced flush it names.
+    /// the synced flush it names. `recency` is the L0 recency of the tables,
+    /// from [`Self::take_flush_recency`]; without one the flush takes it as
+    /// it starts to write.
     ///
     /// This is an internal extension hook on the crate's sealed tree types and
     /// is hidden from generated documentation.
@@ -1342,6 +1351,10 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Will return `Err` if an IO error occurs.
     #[doc(hidden)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the flush's inputs, each from the caller's own state"
+    )]
     fn flush_to_tables_with_rt(
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
@@ -1350,7 +1363,13 @@ pub trait AbstractTree: sealed::Sealed {
         hashes: u64,
         overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
         self_described: Option<&FlushSelf>,
+        recency: Option<TableId>,
     ) -> crate::Result<Option<FlushToTablesResult>>;
+
+    /// Takes the L0 recency of a flush about to write its tables: a number
+    /// from the counter table ids come from, above every one taken before.
+    #[doc(hidden)]
+    fn take_flush_recency(&self) -> TableId;
 
     /// Takes the sequence number of a synced flush about to write its tables,
     /// whose tables then describe themselves so the flush needs no manifest

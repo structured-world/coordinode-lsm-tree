@@ -865,6 +865,11 @@ pub struct Writer {
     /// Default `Some(false)`.
     bulk_ingested: Option<bool>,
 
+    /// The replacing ingestion that writes this table, if one does (see
+    /// [`ParsedMeta::replacing`](crate::table::meta::ParsedMeta::replacing)).
+    /// Persisted as `descriptor#replacing`.
+    replacing: Option<TableId>,
+
     /// L0 recency key, persisted as `recency`: the table's own id by default,
     /// as a flush or ingest table's is, or the highest
     /// [`Table::l0_recency`](crate::table::Table::l0_recency) among a
@@ -1449,6 +1454,7 @@ impl Writer {
             value_layout: None,
             cell_shapes: CellShapes::default(),
             bulk_ingested: Some(false),
+            replacing: None,
             recency: table_id,
             lineage: None,
             lineage_prev: None,
@@ -1789,7 +1795,10 @@ impl Writer {
                 row_group_size: self.row_group_size,
                 page_size: self.columnar_page_size,
             },
-            bulk_ingested: self.bulk_ingested,
+            ingested: Ingested {
+                bulk: self.bulk_ingested,
+                replacing: self.replacing,
+            },
             recency: self.recency,
             lineage: self.lineage.clone(),
             lineage_prev: self.lineage_prev,
@@ -2532,6 +2541,9 @@ impl Writer {
             // manifest-only global_seqno offset. A legacy source of unknown
             // provenance (`None`) re-emits unflagged (we do not guess).
             .use_bulk_ingested(meta.bulk_ingested)
+            // The copy takes the source's id and name, so the mark beside the
+            // source stays the copy's.
+            .use_replacing(meta.replacing)
             // A rewrite keeps the source's L0 recency key AND its compaction
             // lineage: the copy carries the same content, so it belongs at the
             // same position and stays recognizable as the same derived output
@@ -2772,6 +2784,15 @@ impl Writer {
     pub(crate) fn use_bulk_ingested(mut self, bulk_ingested: Option<bool>) -> Self {
         self.assert_not_started("use_bulk_ingested");
         self.bulk_ingested = bulk_ingested;
+        self
+    }
+
+    /// Names the replacing ingestion that writes the table (see
+    /// [`Self::replacing`] field). Must be set before the first key is written.
+    #[must_use]
+    pub(crate) fn use_replacing(mut self, replacing: Option<TableId>) -> Self {
+        self.assert_not_started("use_replacing");
+        self.replacing = replacing;
         self
     }
 
@@ -5811,6 +5832,17 @@ fn indexed_extractor(
         .map(PrefixExtractor::name)
 }
 
+/// What a table's meta block says of the ingestion that wrote it.
+#[derive(Clone, Copy)]
+struct Ingested {
+    /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
+    /// `None` omits it (unknown provenance).
+    bulk: Option<bool>,
+    /// `Some(run)` writes `descriptor#replacing`: the table of the replacing
+    /// ingestion `run`.
+    replacing: Option<TableId>,
+}
+
 /// Parameters bundle for [`write_meta_section`]. Free-standing struct
 /// (not a `Writer` method) because `finish()` calls this AFTER
 /// `index_writer.finish()` / `filter_writer.finish()` have consumed
@@ -5883,9 +5915,8 @@ struct MetaSectionParams<'a> {
     /// How the row groups were cut and encoded; written only for a columnar
     /// table.
     group_shape: crate::table::meta::GroupShape,
-    /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
-    /// `None` omits it (unknown provenance, preserving a legacy SST's absence).
-    bulk_ingested: Option<bool>,
+    /// What the table says of the ingestion that wrote it, if one did.
+    ingested: Ingested,
     /// L0 recency key, written as `recency` on every table.
     recency: TableId,
     /// Compaction lineage: `Some(_)` writes `lineage` (the sorted input ids a
@@ -6176,8 +6207,16 @@ fn encode_meta_payload(
     // and applies its seqno heuristic, rather than a stamped "not ingested" that
     // would wrongly keep a bulk-ingested table with global_seqno 0. Inserted out
     // of order, then the whole list is sorted below.
-    if let Some(flag) = p.bulk_ingested {
+    if let Some(flag) = p.ingested.bulk {
         meta_items.push(meta("descriptor#bulk_ingested", &[u8::from(flag)]));
+    }
+    // A replacing ingestion's table: its place in the tree is recorded by the
+    // install that kept it, in the manifest and in the mark the install
+    // leaves under the ingestion's id, which is all this names. Eight bytes
+    // in the tables of a replacing ingestion alone, read by an open and a
+    // repair, never by a read or a write of rows.
+    if let Some(run) = p.ingested.replacing {
+        meta_items.push(meta("descriptor#replacing", &run.to_le_bytes()));
     }
 
     // How a columnar table stores each row's value: the whole value and a

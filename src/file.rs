@@ -216,9 +216,17 @@ pub enum TableDirEntry {
     /// follows the temp's: a committed swap renames it into place, an
     /// abandoned build's companion is disposable.
     RepairTmpCompanion(crate::TableId),
+    /// `{run}.replaced-{bound}`: the mark the install of the replacing
+    /// ingestion `{run}` left, with the recency it gave its tables. A repair
+    /// without a manifest reads the install from it.
+    ReplaceMark(crate::TableId, crate::TableId),
     /// None of the shapes the engine owns.
     Foreign,
 }
+
+/// What joins a replacing ingestion's id and the bound in the name of its
+/// replace mark.
+pub(crate) const REPLACE_MARK_INFIX: &str = ".replaced-";
 
 impl TableDirEntry {
     /// Classifies a file name in a `tables/` folder.
@@ -258,6 +266,14 @@ impl TableDirEntry {
         }
         if let Some(rest) = file_name.strip_suffix(REPAIR_TMP_SUFFIX) {
             return owned_id(rest, Self::RepairTmp);
+        }
+        if let Some((run, bound)) = file_name.split_once(REPLACE_MARK_INFIX) {
+            // BOTH halves must parse, in the spelling the engine writes:
+            // `5.replaced-backup` and `05.replaced-7` are not owned.
+            return match (canonical_id(run), canonical_id(bound)) {
+                (Some(run), Some(bound)) => Self::ReplaceMark(run, bound),
+                _ => Self::Foreign,
+            };
         }
         file_name
             .parse::<crate::TableId>()

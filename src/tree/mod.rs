@@ -1063,9 +1063,22 @@ impl AbstractTree for Tree {
 
     fn clear(&self) -> crate::Result<()> {
         let mut versions = self.get_version_history_lock();
+        // The recency this install drops everything below, taken with the
+        // history locked. A flush takes its own under the same lock, with the
+        // memtables it writes, so one with a lower number chose them before
+        // this install, installs nothing after it, and what it wrote reads to
+        // a repair as dropped; a table of a flush that chose its memtables
+        // after this install carries a higher one. No flush lock: a clear
+        // lands in the middle of a flush.
+        let bound = self.table_id_counter.next();
         let prior = self.install_replacing(&mut versions, &[], &[])?;
         drop(versions); // release the version-history lock before any fs work
-        reclaim_replaced(&prior);
+        // The mark of an install that kept no table, under a number of its
+        // own: a repair of a manifest lost before the next open leaves out
+        // what this dropped (see `replace_mark`).
+        if self.mark_replaced(bound, bound) {
+            reclaim_replaced(&prior);
+        }
         Ok(())
     }
 
@@ -1147,6 +1160,10 @@ impl AbstractTree for Tree {
             .len()
     }
 
+    fn take_flush_recency(&self) -> TableId {
+        self.table_id_counter.next()
+    }
+
     fn flush_to_tables_with_rt(
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
@@ -1156,6 +1173,7 @@ impl AbstractTree for Tree {
         // A standard tree separates no values, so it has nothing to place.
         _overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
         self_described: Option<&crate::abstract_tree::FlushSelf>,
+        recency: Option<TableId>,
     ) -> crate::Result<Option<crate::abstract_tree::FlushToTablesResult>> {
         use crate::table::multi_writer::MultiWriter;
         use crate::time::Instant;
@@ -1210,7 +1228,10 @@ impl AbstractTree for Tree {
                 refills
                     .as_ref()
                     .map(crate::table::file_pool::RefillHold::id),
-            ),
+            )
+            // A file made for the first table takes the recency the flush
+            // took already as its id, the number it would have taken here.
+            .first_made_as(recency),
             self.config.table_target_size,
             0,
             level_fs.clone(),
@@ -1222,14 +1243,18 @@ impl AbstractTree for Tree {
             None => table_writer,
         };
         let written = (move || -> crate::Result<_> {
-            // The flush's L0 recency, taken once its first file is: flushes are
-            // serialized, so it is above every table already flushed and below
-            // every one flushed later. A pooled file's id was taken when its batch
-            // was made and says nothing about when the table was written; a file
-            // made now carries an id taken now, which serves.
-            let recency = table_writer
-                .first_made_now()
-                .unwrap_or_else(|| self.table_id_counter.next());
+            // The flush's L0 recency: flushes are serialized, so it is above
+            // every table already flushed and below every one flushed later.
+            // The tree's own flush took it with its memtables. A caller that
+            // gave none gets it here, once the first file is taken: a pooled
+            // file's id was taken when its batch was made and says nothing
+            // about when the table was written; a file made now carries an id
+            // taken now, which serves.
+            let recency = recency.unwrap_or_else(|| {
+                table_writer
+                    .first_made_now()
+                    .unwrap_or_else(|| self.table_id_counter.next())
+            });
             let mut table_writer = table_writer
                 .set_comparator(self.config.comparator.clone())
                 .use_recency(Some(recency))
@@ -2694,6 +2719,34 @@ impl Tree {
             crate::version::RetentionEffect::DropsData,
         )?;
         Ok(prior)
+    }
+
+    /// Leaves the mark of the replacing ingestion `run`, which
+    /// [`Self::install_replacing`] just installed durably at recency `bound`
+    /// (see [`crate::replace_mark`]), in the folder its tables were written
+    /// to. Called before the earlier tables are reclaimed.
+    ///
+    /// Returns whether the mark is durable. A failure is logged, not
+    /// returned as an error: the replace is installed and durable, which is
+    /// what the caller asked for, and the next open leaves the mark the
+    /// manifest still owes. Until then a repair without a manifest reads the
+    /// install as never made, the whole of it, so the caller keeps the
+    /// earlier files where they lie (the open that marks the install removes
+    /// them): that repair then rebuilds the earlier content, not an empty
+    /// tree.
+    #[must_use]
+    pub(crate) fn mark_replaced(&self, run: TableId, bound: TableId) -> bool {
+        let (folder, fs) = self.config.tables_folder_for_level(0);
+        match crate::replace_mark::publish(&*fs, &folder, run, bound, self.config.sync_mode) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!(
+                    "a replacing install is durable but not marked ({e}): the files it \
+                     dropped stay until the next open, which marks it and removes them",
+                );
+                false
+            }
+        }
     }
 
     /// Drops every dictionary nothing references any more, returning how many
@@ -7272,6 +7325,9 @@ impl Tree {
         // folder kept, adopted by the tree.
         let mut pooled: PooledFiles = Vec::new();
         let mut pooled_ids: Vec<TableId> = Vec::new();
+        // The replace marks found, judged once the tables are recovered: a
+        // mark names an ingestion, which only a table's meta block ties to it.
+        let mut replace_marks: Vec<FoundReplaceMark> = Vec::new();
         for (table_base_folder, folder_fs, dirents) in folder_scans {
             for dirent in dirents {
                 let crate::fs::FsDirEntry {
@@ -7349,6 +7405,19 @@ impl Tree {
                             );
                             sweep.remove(folder_fs, &table_file_path);
                         }
+                        continue;
+                    }
+                    // Kept or removed once the recovered tables say which
+                    // ingestions are still in the tree (see
+                    // `settle_replace_marks`).
+                    crate::file::TableDirEntry::ReplaceMark(run, bound) => {
+                        replace_marks.push(FoundReplaceMark {
+                            run,
+                            bound,
+                            folder: table_base_folder.clone(),
+                            fs: Arc::clone(folder_fs),
+                            path: table_file_path,
+                        });
                         continue;
                     }
                     // A repair's replacement still at its temp name. The manifest
@@ -7872,6 +7941,12 @@ impl Tree {
         #[cfg(feature = "std")]
         Self::republish_missing_restriction_sidecars(&version, config)?;
 
+        // The same for the mark a replacing install leaves once its manifest
+        // is durable: an install the power cut before its mark, or one whose
+        // mark failed, is named by the manifest alone, and a repair of that
+        // manifest, lost later, would leave its tables out as never installed.
+        let stale_marks = Self::settle_replace_marks(&version, config, replace_marks)?;
+
         // Everything of the generation read goes, now that it is superseded:
         // its snapshot and its log.
         Self::cleanup_orphaned_version(tree_path, version.id(), &config.fs, &mut sweep)?;
@@ -7908,7 +7983,31 @@ impl Tree {
             sweep.remove(&config.fs, &blob_file_path);
         }
 
+        // A mark whose ingestion left the tree still tells a repair which of
+        // the files the manifest does not name its install dropped, so it
+        // goes last, and only once their removal is durable: the folders they
+        // lay in are synced first, or a power loss could keep the mark's
+        // removal and bring one of them back. Only an open that has such a
+        // mark to remove pays for the syncs.
+        let swept = if stale_marks.is_empty() {
+            Vec::new()
+        } else {
+            sweep.folders()
+        };
         sweep.finish()?;
+        for (fs, folder) in swept {
+            fs.sync_directory_with(&folder, config.sync_mode)?;
+        }
+        // The mark's own removal is made durable before the open returns: the
+        // table counter starts from the tables the tree holds, which may lie
+        // below the bound of a mark just removed, and a mark a power loss
+        // brought back would then read the tables written from here on as
+        // dropped by its install.
+        let marks = stale_marks.folders();
+        stale_marks.finish()?;
+        for (fs, folder) in marks {
+            fs.sync_directory_with(&folder, config.sync_mode)?;
+        }
         Ok((version, pooled, flush_watermark))
     }
 
@@ -7957,6 +8056,58 @@ impl Tree {
             table.write_restrict_sidecar(bound, config.sync_mode)?;
         }
         Ok(())
+    }
+
+    /// Leaves the replace mark of every replacing ingestion `version` still
+    /// holds a table of, durably, and returns the removal of every other mark
+    /// among `found`, the ones the open's scan saw.
+    ///
+    /// The manifest gives the bound: the recency the install recorded for the
+    /// ingestion's tables. A mark that is there is synced again, since the
+    /// sync that followed its making may be the one that failed. A mark whose
+    /// ingestion the tree no longer holds a table of goes: what it told a
+    /// repair, which files its install dropped, ends with those files, which
+    /// this open removes first.
+    fn settle_replace_marks(
+        version: &Version,
+        config: &Config,
+        found: Vec<FoundReplaceMark>,
+    ) -> crate::Result<OpenSweep> {
+        let mut held: Vec<(TableId, TableId)> = Vec::new();
+        for table in version.iter_tables() {
+            if let Some(run) = table.metadata.replacing {
+                let mark = (run, table.l0_recency());
+                if !held.contains(&mark) {
+                    held.push(mark);
+                }
+            }
+        }
+        for &(run, bound) in &held {
+            let seen = found
+                .iter()
+                .find(|mark| mark.run == run && mark.bound == bound);
+            let (folder, fs) = if let Some(mark) = seen {
+                (mark.folder.clone(), Arc::clone(&mark.fs))
+            } else {
+                log::warn!(
+                    "replacing ingestion {run} is installed without its mark; \
+                     marking it from the manifest",
+                );
+                config.tables_folder_for_level(0)
+            };
+            crate::replace_mark::publish(&*fs, &folder, run, bound, config.sync_mode)?;
+        }
+        let mut stale = OpenSweep::default();
+        for mark in found {
+            if !held.contains(&(mark.run, mark.bound)) {
+                log::debug!(
+                    "Removing the replace mark of an ingestion the tree holds no table of: {}",
+                    mark.path.display()
+                );
+                stale.remove(&mark.fs, &mark.path);
+            }
+        }
+        Ok(stale)
     }
 
     /// Removes stale manifest files left by older generations: every `v{id}`
@@ -8442,6 +8593,26 @@ impl OpenSweep {
         self.pending.push((Arc::clone(fs), path.to_path_buf()));
     }
 
+    /// Whether nothing is queued.
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// The folders the queued files lie in, each once.
+    fn folders(&self) -> Vec<(Arc<dyn Fs>, crate::path::PathBuf)> {
+        let mut folders: Vec<(Arc<dyn Fs>, crate::path::PathBuf)> = Vec::new();
+        for (fs, path) in &self.pending {
+            if let Some(folder) = path.parent()
+                && !folders
+                    .iter()
+                    .any(|(seen_fs, seen)| Arc::ptr_eq(seen_fs, fs) && seen == folder)
+            {
+                folders.push((Arc::clone(fs), folder.to_path_buf()));
+            }
+        }
+        folders
+    }
+
     /// Removes every queued file, a file already gone included, and fails
     /// with the first removal that failed. Each removal is tried: one file
     /// that cannot go must not keep the others, the generation an open
@@ -8459,6 +8630,16 @@ impl OpenSweep {
         }
         first.map_or(Ok(()), |e| Err(e.into()))
     }
+}
+
+/// A replace mark an open's scan found (see [`crate::replace_mark`]).
+struct FoundReplaceMark {
+    run: TableId,
+    bound: TableId,
+    /// The tables folder it lies in, on `fs`.
+    folder: crate::path::PathBuf,
+    fs: Arc<dyn Fs>,
+    path: crate::path::PathBuf,
 }
 
 /// The folders that gain a new entry when `folder` is made on `fs`: each one

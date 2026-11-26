@@ -35,9 +35,11 @@ pub struct Ingestion<'a> {
     pub(crate) write_pin: crate::runtime_config::WritePin,
     seqno: SeqNo,
     last_key: Option<UserKey>,
-    /// Whether `finish` replaces the tree's content rather than adding to it
-    /// (see [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion)).
-    pub(crate) replacing: bool,
+    /// Set when `finish` replaces the tree's content rather than adding to it
+    /// (see [`AnyTree::replacing_ingestion`](crate::AnyTree::replacing_ingestion)):
+    /// the id this ingestion took for itself, which its tables and the mark of
+    /// its install name (see [`crate::replace_mark`]).
+    pub(crate) replacing: Option<crate::TableId>,
     /// Successive columnar batches with the same layout accumulate here into one
     /// rowgroup, flushed to a block once they reach the target row group size or
     /// the layout changes, so many small ingest batches become few large blocks.
@@ -262,14 +264,15 @@ impl<'a> Ingestion<'a> {
         // The index of a blob tree takes rows written as cells, which its
         // columnar tables split into the columns of their fields.
         writer = writer.use_cell_rows(rc.columnar && tree.config.kv_separation_opts.is_some());
-        // Flag every adding ingestion's SST: its entries are written at local
-        // seqno 0 and rely on the `global_seqno` allocated at commit, so
-        // manifest repair must recognize the manifest-only offset (and fail
-        // closed when it is lost) rather than mistake the table for a normal
-        // flush at seqno 0. A replacing ingestion installs at offset 0, which
-        // is what a repair rebuilds an unflagged table at, so its tables are
-        // not flagged and a repair keeps them.
-        writer = writer.use_bulk_ingested(!replacing);
+        // Flag every ingestion's SST: its entries are written at local seqno 0
+        // and take their place in the tree (the `global_seqno` and the L0
+        // recency) from the install, so a repair without a manifest must not
+        // mistake the table for a flush at seqno 0. A replacing ingestion's
+        // tables name it too, by an id of its own: its install leaves a mark
+        // under that id (see `replace_mark`), which gives a repair their place
+        // back, and a table whose ingestion has no mark was never installed.
+        let replacing = replacing.then(|| tree.table_id_counter.next());
+        writer = writer.use_bulk_ingested(true).use_replacing(replacing);
         writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
@@ -593,11 +596,16 @@ impl<'a> Ingestion<'a> {
     pub fn finish(mut self) -> crate::Result<()> {
         use crate::AbstractTree;
 
-        if self.replacing {
-            return self.finish_replacing();
+        if let Some(run) = self.replacing {
+            return self.finish_replacing(run);
         }
         if self.last_key.is_none() {
             log::trace!("No data written to Ingestion, returning early");
+            // The writer still gives up the file it took and wrote nothing
+            // into: left empty where it lies, a repair without a manifest
+            // would read it as a table that lost its bytes once a later
+            // table is finished above it.
+            self.writer.finish()?;
             return Ok(());
         }
 
@@ -722,21 +730,22 @@ impl<'a> Ingestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs; the tree then keeps its
     /// earlier content.
-    fn finish_replacing(mut self) -> crate::Result<()> {
+    fn finish_replacing(mut self, run: crate::TableId) -> crate::Result<()> {
         use crate::AbstractTree;
 
         // The hold on the ingestion's dictionaries stays here until its
         // tables are installed.
         let write_pin = core::mem::take(&mut self.write_pin);
-        let written = if self.last_key.is_some() {
-            #[cfg(feature = "columnar")]
+        #[cfg(feature = "columnar")]
+        if self.last_key.is_some() {
             self.flush_pending_columnar()?;
-            let written = self.writer.finish()?;
-            log::info!("Finished replacing ingestion writer");
-            Some((written.tables, written.entries_durable))
-        } else {
-            None
-        };
+        }
+        // Finished with nothing written too: the writer then gives up the
+        // file it took, which would otherwise lie empty below later tables.
+        let written = self.writer.finish()?;
+        log::info!("Finished replacing ingestion writer");
+        let written =
+            (!written.tables.is_empty()).then_some((written.tables, written.entries_durable));
 
         #[cfg(all(test, feature = "std"))]
         self.tree.config.fire_before_output_install();
@@ -751,19 +760,20 @@ impl<'a> Ingestion<'a> {
             let _compaction_state = self.tree.compaction_state.lock();
             let mut versions = self.tree.version_history.write();
 
+            // Taken with no flush under way: every table already in the tree
+            // has a recency below it, and every one written from here on a
+            // recency above it.
+            let recency = self.tree.table_id_counter.next();
             let tables = match written {
-                Some((tables, entries_durable)) => {
-                    let recency = self.tree.table_id_counter.next();
-                    Self::recover_run(
-                        self.tree,
-                        &self.folder,
-                        &self.level_fs,
-                        tables,
-                        0,
-                        recency,
-                        entries_durable,
-                    )?
-                }
+                Some((tables, entries_durable)) => Self::recover_run(
+                    self.tree,
+                    &self.folder,
+                    &self.level_fs,
+                    tables,
+                    0,
+                    recency,
+                    entries_durable,
+                )?,
                 None => Vec::new(),
             };
             let mut installed = crate::tree::InstalledCharge::default();
@@ -776,11 +786,17 @@ impl<'a> Ingestion<'a> {
             let prior = self.tree.install_replacing(&mut versions, &tables, &[])?;
             drop(versions);
             installed.charge();
-            prior
+            let marked = self.tree.mark_replaced(run, recency);
+            (prior, marked)
         };
         // The installed tables name their dictionary from here on.
         drop(write_pin);
-        crate::tree::reclaim_replaced(&prior);
+        // Unmarked, the install reads to a repair as never made: the earlier
+        // files stay for it until the next open.
+        let (prior, marked) = prior;
+        if marked {
+            crate::tree::reclaim_replaced(&prior);
+        }
         Ok(())
     }
 
