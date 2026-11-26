@@ -16,15 +16,26 @@ pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = IterItem> + Send
 /// loses to any that holds one.
 const EMPTY: u128 = 1 << 64;
 
+/// How long the winning input has been winning.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// It took over from another input, or nothing is known.
+    None,
+    /// It won again once, through its games.
+    Repeated,
+    /// It won again twice: its runner-up is known.
+    Chased,
+}
+
 /// Merges multiple KV iterators into a single sorted stream, front to back.
 ///
 /// The inputs' current entries play a tournament: `tree[0]` names the slot of
 /// the smallest, and every other node the slot that lost the game played
 /// there. Taking the smallest replaces it with its input's next entry and
 /// plays again only the games between its leaf and the root, one per level,
-/// whichever input the next entry comes from. An input that wins twice in a
-/// row has its runner-up found, and each further entry of its run costs one
-/// game against that runner-up.
+/// whichever input the next entry comes from. An input that wins again twice
+/// in a row has its runner-up found, and each further entry of its run costs
+/// one game against that runner-up.
 ///
 /// Most games are settled by a slot's rank alone: eight bytes of its key past
 /// the prefix every key shares, as an integer. Whole keys are compared only
@@ -47,11 +58,12 @@ pub struct Merger<I> {
     tree: Vec<u32>,
     /// Slots that hold an entry.
     live: usize,
-    /// While `chased`: the best of the slots that lost to the winner on its
-    /// path. A next entry of the winning input that comes before this slot's
-    /// wins again with the tree as it stands, so no game is replayed for it.
+    /// While the run is [`Run::Chased`]: the best of the slots that lost to
+    /// the winner on its path. A next entry of the winning input that comes
+    /// before this slot's wins again with the tree as it stands, so no game
+    /// is replayed for it.
     runner_up: u32,
-    chased: bool,
+    run: Run,
     /// Errors the inputs' first entries gave, yielded before any entry.
     failed: Vec<crate::Error>,
     /// The tournament is built and no error waits.
@@ -97,7 +109,7 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
             tree: Vec::new(),
             live: 0,
             runner_up: 0,
-            chased: false,
+            run: Run::None,
             failed: Vec::new(),
             ready: false,
             comparator,
@@ -253,7 +265,7 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
     fn retire(&mut self, slot: usize) {
         self.ranks[slot] = EMPTY;
         self.live -= 1;
-        self.chased = false;
+        self.run = Run::None;
         self.replay(slot);
     }
 
@@ -337,18 +349,24 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
         };
         // Ahead of the runner-up, the input's next entry is ahead of every
         // slot that lost on its path: the tree stands.
-        if self.chased && self.beats(slot, self.runner_up as usize) {
+        if self.run == Run::Chased && self.beats(slot, self.runner_up as usize) {
             return taken.map(Ok);
         }
-        self.chased = false;
+        let before = self.run;
         self.replay(slot);
-        // The same input won again through its games: its runner-up is worth
-        // one walk of the path, after which a run of its entries costs one
-        // game each. A run that just ended left the runner-up the winner.
-        if self.tree[0] as usize == slot {
+        // The same input winning through its games twice in a row is a run:
+        // its runner-up is then worth one walk of the path, after which each
+        // entry of the run costs one game. Once is not: inputs that take
+        // turns by chance repeat that often, and the walk would be wasted. A
+        // run that just ended left the runner-up the winner.
+        self.run = if self.tree[0] as usize != slot {
+            Run::None
+        } else if before == Run::None {
+            Run::Repeated
+        } else {
             self.runner_up = self.path_best(slot);
-            self.chased = true;
-        }
+            Run::Chased
+        };
         taken.map(Ok)
     }
 }
