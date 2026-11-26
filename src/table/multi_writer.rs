@@ -416,6 +416,9 @@ pub(crate) struct TableFiles {
     origin: WriteOrigin,
     /// The write a refill an output's claim reserves is held for, if any.
     held_for: Option<super::file_pool::HoldId>,
+    /// The id the first output takes when its file is made for it (see
+    /// [`Self::first_made_as`]).
+    first_id: Option<TableId>,
 }
 
 impl TableFiles {
@@ -434,7 +437,17 @@ impl TableFiles {
             opened: false,
             origin,
             held_for,
+            first_id: None,
         }
+    }
+
+    /// Gives the first output the id `id` when its file is made for it,
+    /// rather than one taken then: a number the write took from the tree's
+    /// counter before it came here. A pooled file keeps its own.
+    #[must_use]
+    pub(crate) fn first_made_as(mut self, id: Option<TableId>) -> Self {
+        self.first_id = id;
+        self
     }
 
     /// A writer for the next output in `folder`, and whether its file's
@@ -447,13 +460,14 @@ impl TableFiles {
     ) -> crate::Result<(Writer, bool)> {
         let may_refill = !self.opened;
         self.opened = true;
-        let claimed = self.pools.claim_as(
+        let claimed = self.pools.claim_made_as(
             folder,
             fs,
             self.above,
             may_refill,
             self.origin,
             self.held_for,
+            self.first_id.take(),
         )?;
         let durable = claimed.durable_entry;
         Ok((Writer::into_claimed(claimed, level, fs.clone())?, durable))

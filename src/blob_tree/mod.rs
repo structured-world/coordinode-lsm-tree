@@ -2339,6 +2339,10 @@ impl AbstractTree for BlobTree {
         self.index.end_synced_flush(seq);
     }
 
+    fn take_flush_recency(&self) -> TableId {
+        self.index.table_id_counter.next()
+    }
+
     #[expect(clippy::too_many_lines, reason = "flush logic is inherently complex")]
     fn flush_to_tables_with_rt(
         &self,
@@ -2348,6 +2352,7 @@ impl AbstractTree for BlobTree {
         hashes: u64,
         overwritten: Option<&overwritten::OverwrittenKeys>,
         self_described: Option<&crate::abstract_tree::FlushSelf>,
+        recency: Option<TableId>,
     ) -> crate::Result<Option<crate::abstract_tree::FlushToTablesResult>> {
         use crate::{file::BLOBS_FOLDER, table::multi_writer::MultiWriter};
 
@@ -2399,7 +2404,10 @@ impl AbstractTree for BlobTree {
                 refills
                     .as_ref()
                     .map(crate::table::file_pool::RefillHold::id),
-            ),
+            )
+            // As the standard tree's flush: a file made for the first table
+            // takes the recency the flush took already as its id.
+            .first_made_as(recency),
             self.index.config.table_target_size,
             0,
             level_fs.clone(),
@@ -2414,9 +2422,11 @@ impl AbstractTree for BlobTree {
             // The flush's L0 recency, taken as the standard tree's flush takes
             // it: a pooled file's id says nothing about when it was written, a
             // file made now carries an id taken now.
-            let recency = table_writer
-                .first_made_now()
-                .unwrap_or_else(|| self.index.table_id_counter.next());
+            let recency = recency.unwrap_or_else(|| {
+                table_writer
+                    .first_made_now()
+                    .unwrap_or_else(|| self.index.table_id_counter.next())
+            });
             let mut table_writer = table_writer
                 .set_comparator(self.index.config.comparator.clone())
                 .use_recency(Some(recency))

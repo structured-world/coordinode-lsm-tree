@@ -1064,10 +1064,12 @@ impl AbstractTree for Tree {
     fn clear(&self) -> crate::Result<()> {
         let mut versions = self.get_version_history_lock();
         // The recency this install drops everything below, taken with the
-        // history locked. A flush takes its own after it chose its memtables,
-        // so one that took a lower number chose them before this install and
-        // installs nothing after it; a table installed from here on carries a
-        // higher one. No flush lock: a clear lands in the middle of a flush.
+        // history locked. A flush takes its own under the same lock, with the
+        // memtables it writes, so one with a lower number chose them before
+        // this install, installs nothing after it, and what it wrote reads to
+        // a repair as dropped; a table of a flush that chose its memtables
+        // after this install carries a higher one. No flush lock: a clear
+        // lands in the middle of a flush.
         let bound = self.table_id_counter.next();
         let prior = self.install_replacing(&mut versions, &[], &[])?;
         drop(versions); // release the version-history lock before any fs work
@@ -1158,6 +1160,10 @@ impl AbstractTree for Tree {
             .len()
     }
 
+    fn take_flush_recency(&self) -> TableId {
+        self.table_id_counter.next()
+    }
+
     fn flush_to_tables_with_rt(
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
@@ -1167,6 +1173,7 @@ impl AbstractTree for Tree {
         // A standard tree separates no values, so it has nothing to place.
         _overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
         self_described: Option<&crate::abstract_tree::FlushSelf>,
+        recency: Option<TableId>,
     ) -> crate::Result<Option<crate::abstract_tree::FlushToTablesResult>> {
         use crate::table::multi_writer::MultiWriter;
         use crate::time::Instant;
@@ -1221,7 +1228,10 @@ impl AbstractTree for Tree {
                 refills
                     .as_ref()
                     .map(crate::table::file_pool::RefillHold::id),
-            ),
+            )
+            // A file made for the first table takes the recency the flush
+            // took already as its id, the number it would have taken here.
+            .first_made_as(recency),
             self.config.table_target_size,
             0,
             level_fs.clone(),
@@ -1233,14 +1243,18 @@ impl AbstractTree for Tree {
             None => table_writer,
         };
         let written = (move || -> crate::Result<_> {
-            // The flush's L0 recency, taken once its first file is: flushes are
-            // serialized, so it is above every table already flushed and below
-            // every one flushed later. A pooled file's id was taken when its batch
-            // was made and says nothing about when the table was written; a file
-            // made now carries an id taken now, which serves.
-            let recency = table_writer
-                .first_made_now()
-                .unwrap_or_else(|| self.table_id_counter.next());
+            // The flush's L0 recency: flushes are serialized, so it is above
+            // every table already flushed and below every one flushed later.
+            // The tree's own flush took it with its memtables. A caller that
+            // gave none gets it here, once the first file is taken: a pooled
+            // file's id was taken when its batch was made and says nothing
+            // about when the table was written; a file made now carries an id
+            // taken now, which serves.
+            let recency = recency.unwrap_or_else(|| {
+                table_writer
+                    .first_made_now()
+                    .unwrap_or_else(|| self.table_id_counter.next())
+            });
             let mut table_writer = table_writer
                 .set_comparator(self.config.comparator.clone())
                 .use_recency(Some(recency))
@@ -7984,7 +7998,16 @@ impl Tree {
         for (fs, folder) in swept {
             fs.sync_directory_with(&folder, config.sync_mode)?;
         }
+        // The mark's own removal is made durable before the open returns: the
+        // table counter starts from the tables the tree holds, which may lie
+        // below the bound of a mark just removed, and a mark a power loss
+        // brought back would then read the tables written from here on as
+        // dropped by its install.
+        let marks = stale_marks.folders();
         stale_marks.finish()?;
+        for (fs, folder) in marks {
+            fs.sync_directory_with(&folder, config.sync_mode)?;
+        }
         Ok((version, pooled, flush_watermark))
     }
 

@@ -433,6 +433,7 @@ impl AbstractTree for AnyTree {
         hashes: u64,
         overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
         self_described: Option<&crate::abstract_tree::FlushSelf>,
+        recency: Option<TableId>,
     ) -> crate::Result<Option<FlushToTablesResult>> {
         forward!(self.flush_to_tables_with_rt(
             stream,
@@ -440,8 +441,14 @@ impl AbstractTree for AnyTree {
             keys,
             hashes,
             overwritten,
-            self_described
+            self_described,
+            recency
         ))
+    }
+
+    #[inline]
+    fn take_flush_recency(&self) -> TableId {
+        forward!(self.take_flush_recency())
     }
 
     #[inline]

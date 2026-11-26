@@ -385,7 +385,38 @@ impl TableFilePools {
     /// # Errors
     ///
     /// An I/O error creating or opening a file, or syncing the folder.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "without std every claim comes through a writer's files"
+        )
+    )]
     pub(crate) fn claim_as(
+        &self,
+        folder: &Path,
+        fs: &Arc<dyn Fs>,
+        above: Option<TableId>,
+        may_refill: bool,
+        origin: WriteOrigin,
+        held_for: Option<HoldId>,
+    ) -> crate::Result<ClaimedFile> {
+        self.claim_made_as(folder, fs, above, may_refill, origin, held_for, None)
+    }
+
+    /// [`Self::claim_as`], with the id a file made for the table takes: a
+    /// number the caller took from the tree's counter already (a flush's
+    /// recency, taken with its memtables), so the file carries the id it
+    /// would have taken here. A pooled file keeps its own id.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error creating or opening a file, or syncing the folder.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a claim's own surface, plus the id of a file made for it"
+    )]
+    pub(crate) fn claim_made_as(
         &self,
         folder: &Path,
         fs: &Arc<dyn Fs>,
@@ -397,6 +428,7 @@ impl TableFilePools {
             expect(unused_variables, reason = "without std no refill is held")
         )]
         held_for: Option<HoldId>,
+        made_as: Option<TableId>,
     ) -> crate::Result<ClaimedFile> {
         // Held across the refill and the open, so two claims never take one
         // file.
@@ -441,7 +473,12 @@ impl TableFilePools {
         // is shared: a file is made for the table. It takes its id, listed,
         // before a batch reserved now, so every pooled id stays above the
         // tables written into the folder.
-        let pooled = claimed?.ok_or_else(|| Writing::new(&pool.writing, self.pools.ids.next()));
+        let pooled = claimed?.ok_or_else(|| {
+            Writing::new(
+                &pool.writing,
+                made_as.unwrap_or_else(|| self.pools.ids.next()),
+            )
+        });
         let refill = due.then(|| self.pools.reserve(pool, at, folder, fs));
         // Held under the pools' lock, with the reservation: a claim that finds
         // the pool dry sees the refill it waits on.
