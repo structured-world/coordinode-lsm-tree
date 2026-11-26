@@ -1624,6 +1624,29 @@ fn page_match_version_fails_closed_when_a_delete_mask_position_overflows() {
     );
 }
 
+/// A tombstone carries no value, whatever its row's value cells are: here
+/// its one value column is nullable and null, which framed as a value would
+/// be the presence bits of its cells. A point read returns the tombstone
+/// with an empty value, as a row table's does.
+#[test]
+fn a_point_read_of_a_tombstone_returns_no_value_whatever_its_cells() {
+    let mut batch = entries_to_column_batch(&[entry(b"gone", 5, ValueType::Tombstone, b"")])
+        .expect("a tombstone row");
+    let value = batch.columns.last_mut().expect("a value column");
+    assert!(value.column_id >= COL_VALUE, "self-check: the value column");
+    // One row, its cell null.
+    value.validity = Some(alloc::vec![0u8]);
+
+    let found = match_as_pages(&batch, b"gone", None, &mut 0).expect("a read");
+    assert_eq!(found.len(), 1, "the tombstone is found");
+    assert_eq!(found[0].key.value_type, ValueType::Tombstone);
+    assert!(
+        found[0].value.is_empty(),
+        "a tombstone has no value, got {:?}",
+        found[0].value
+    );
+}
+
 /// A page parsed for row reads does not walk a bytes column's offset table,
 /// so a row read is what refuses a malformed row: here one offset of a key
 /// page points past the payload. The whole-page parse refuses the page; the
@@ -1765,6 +1788,49 @@ fn a_point_read_answered_by_the_first_row_still_rejects_an_overflowing_run() {
     assert!(
         matches!(across, Err(crate::Error::InvalidHeader(m)) if m.contains("position exceeds u32::MAX")),
         "the read over the run's pages must reject it, got {across:?}",
+    );
+
+    // A run over two row pages whose first page lies wholly at valid
+    // positions: its one row is at `u32::MAX`, and it answers the read. The
+    // second page starts past `u32::MAX`, which only the check across the
+    // pages sees.
+    let second = {
+        let columns = pages
+            .iter()
+            .zip(&batch.columns)
+            .skip(1)
+            .map(|(page, c)| {
+                budget.parsed(Column::parse_page(
+                    page,
+                    batch.row_count,
+                    stamp(c.column_id),
+                )?)
+            })
+            .collect::<crate::Result<crate::table::row_group::PageColumns<_>>>()
+            .expect("columns");
+        super::PointPage::prepare(
+            RowPageColumns {
+                ordinal: 1,
+                start: batch.row_count,
+                rows: batch.row_count,
+                columns,
+            },
+            &mut budget,
+        )
+        .expect("prepared")
+    };
+    let two_pages = [page, second];
+    let over_two = super::point_version(
+        &two_pages,
+        &[0..1, 0..1],
+        b"dup",
+        crate::SeqNo::MAX,
+        deletes,
+        &mut 0,
+    );
+    assert!(
+        matches!(over_two, Err(crate::Error::InvalidHeader(m)) if m.contains("position exceeds u32::MAX")),
+        "a later page past u32::MAX must reject the read, got {over_two:?}",
     );
 }
 

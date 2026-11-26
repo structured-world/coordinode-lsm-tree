@@ -2455,9 +2455,17 @@ impl Table {
             // answer `first` whole, and a later key as long as it lies within
             // their keys: one past their last key, or whose run reaches the
             // end of their last page and may go on, has pages of its own.
+            //
+            // That holds only where the keys ascend in byte order: the pages
+            // in hand then lie side by side, and a key within their keys is
+            // on one of them or nowhere. Under another order a zone, which
+            // is byte-wise, selects row pages that need not be neighbours,
+            // and a key between two of them is on a page not in hand: every
+            // key then loads the pages of its own zone.
             let locate = |key: &[u8], loaded_for_it: bool| -> crate::Result<Located> {
                 if !loaded_for_it
-                    && self.comparator.compare(key, first) != core::cmp::Ordering::Greater
+                    && (!byte_ordered
+                        || self.comparator.compare(key, first) != core::cmp::Ordering::Greater)
                 {
                     return Ok(Located::Elsewhere);
                 }

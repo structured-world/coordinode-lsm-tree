@@ -2572,6 +2572,10 @@ impl<'a> PointPage<'a> {
                 let value = cells::row_value(value_type, &borrowed)?;
                 *copied += value.len();
                 value
+            } else if value_type.is_tombstone() {
+                // A tombstone has no value, whatever its row's cells hold: a
+                // null cell framed as a value would be its presence bits.
+                Slice::empty()
             } else if let (false, [(_, type_tag, _, access, page)]) = (nullable, values.as_slice())
             {
                 // One value column without nulls, the common shape: its cell is
