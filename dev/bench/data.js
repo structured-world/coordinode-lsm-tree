@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795689603153,
+  "lastUpdate": 1795694758969,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104818,6 +104818,90 @@ window.BENCHMARK_DATA = {
             "value": 386103.2475875821,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 10.4us | P99.9: 90.0us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9b4789f56da0c6c6d713ce3153592dee57dee90f",
+          "message": "fix(version): leave the visible seqno to the writer (#1115)\n\n## Summary\n\n- A write whose seqno the caller has not published stays invisible to a\nsnapshot at the visible seqno while the tree flushes and compacts, in\nthat tree and in every tree sharing the counter pair. A version install\nno longer moves the visible seqno past its own seqno.\n\n## Changes\n\n- `SuperVersions::install` moves the visible seqno only past a retention\nfloor it raises, when the floor reaches it. A drop (`clear`, a replacing\ningestion, a dropped range, FIFO) raises the floor to its own seqno, so\nit always does; a collection does only under a watermark above the\nvisible seqno. The current version serves every snapshot above the\nfloor, so an install that keeps the tree's content has nothing to\npublish.\n- The install of an ingestion that adds to the tree publishes its own\nseqno, as before: its rows are a write the tree makes at a seqno no\ncaller can publish.\n- The docs of `clear`, of an ingestion's `finish` and of `WriteBatch`\nsay which installs publish, and that a write in flight across one of\nthem is published with it.\n\nNo hot path changes: a version install does one atomic update less, or\nthe same one.\n\n## Testing\n\nTests, clippy (default and all features), formatting, doc tests, docs\nwith warnings denied and the no-std check pass on macOS; CI runs the\nfull matrix.\n\nCloses #1113\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Flushes and compactions that preserve tree contents no longer advance\nthe visible sequence number. This prevents partially applied batches\nfrom becoming visible through installs.\n* Clears, ingestions, and dropped-range installs advance visibility when\nthey change reader-visible data or raise the retention floor. In-flight\nwrites are published with these operations.\n* **Documentation**\n* Clarified when clears, ingestions, batch application, and installs\nadvance the visible sequence number and how callers should order writes\naround clears.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-26T12:09:13+02:00",
+          "tree_id": "c8a892187c8a94bdf2f58c84f109f9c110774db7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9b4789f56da0c6c6d713ce3153592dee57dee90f"
+        },
+        "date": 1795694757702,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 150223.80430719422,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 15.9us | P99.9: 27.7us\nthreads: 1 | elapsed: 3.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3166258.7258924227,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 881245.6689529264,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 12.2us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 467822.8058995786,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.8us | P99.9: 22.2us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3176363.1823169575,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 333190.4978987891,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.1us | P99.9: 14.7us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 192923.63588992815,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.8us | P99.9: 20.8us\nthreads: 1 | elapsed: 1.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 846521.5894580567,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.4us | P99.9: 12.5us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1078740.732652982,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.2us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 329618.03757975576,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 16.7us | P99.9: 90.1us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
           }
         ]
       }
