@@ -18,6 +18,12 @@
 //! (via `visible_seqno.fetch_max(batch_seqno + 1)`) only **after**
 //! [`AbstractTree::apply_batch`](crate::AbstractTree::apply_batch) returns. This is the same pattern used by
 //! fjall's keyspace for single-writer batches.
+//!
+//! The tree leaves the visible seqno to the caller meanwhile: a flush or a
+//! compaction that installs while a batch is being applied does not move it.
+//! Only an install that changes what a reader sees does (a clear, an
+//! ingestion, a dropped range), and a collection under a watermark above the
+//! visible seqno, which raises the retention floor past it.
 
 use crate::{UserKey, UserValue, ValueType, value::InternalValue};
 #[cfg(not(feature = "std"))]

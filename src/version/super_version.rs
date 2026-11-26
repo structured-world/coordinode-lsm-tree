@@ -797,10 +797,14 @@ impl SuperVersions {
         )
     }
 
-    /// Like `upgrade_version`, but takes an already-allocated sequence number.
+    /// Like `upgrade_version`, but takes an already-allocated sequence number,
+    /// and publishes it: the install of an ingestion that adds to the tree,
+    /// whose tables are recovered with the same seqno.
     ///
-    /// This is useful when the seqno must be coordinated with other operations
-    /// (e.g., bulk ingestion where tables are recovered with the same seqno).
+    /// The ingested rows are a write the engine makes at a seqno it took
+    /// itself, which no caller can publish for it, so the visible seqno is
+    /// moved past that seqno here. A write in flight across the ingestion is
+    /// published with it, as across an install that drops data.
     #[expect(
         clippy::too_many_arguments,
         reason = "version upgrade with pre-allocated seqno: tree_path, mutator, seqno, \
@@ -830,7 +834,9 @@ impl SuperVersions {
             encryption,
             retention,
             NewFiles::Synced,
-        )
+        )?;
+        visible_seqno.fetch_max(seqno.saturating_add(1).min(MAX_SEQNO));
+        Ok(())
     }
 
     /// Like `upgrade_version`, with `files` saying who syncs the files the
@@ -980,9 +986,24 @@ impl SuperVersions {
         #[cfg(feature = "std")]
         drop(closed);
 
-        // Clamp to stay below the reserved MSB range.
-        let next_visible = seqno.saturating_add(1).min(MAX_SEQNO);
-        visible_seqno.fetch_max(next_visible);
+        // The visible seqno is the caller's to advance: it publishes a write
+        // once every part of it is applied, and a snapshot at the visible
+        // seqno then reads the whole write or none of it. An install that
+        // keeps the tree's content needs no publication, since the current
+        // version serves every snapshot above the floor; advancing the visible
+        // seqno to its own, taken after a write still being applied took its
+        // seqno, would publish the part of that write already applied.
+        //
+        // An install that raises the floor is another matter: a snapshot at
+        // or below the floor is refused, so the visible seqno is moved past
+        // the floor when the floor reaches it. A drop (a clear, a replacing
+        // ingestion, a dropped range) always does, and so publishes with it a
+        // write in flight across it; a collection does only under a watermark
+        // above the visible seqno, which the caller chose.
+        if let Some(floor) = floor {
+            // The floor is an install seqno at most, below the reserved range.
+            visible_seqno.fetch_max(floor.saturating_add(1).min(MAX_SEQNO));
+        }
 
         Ok(())
     }
