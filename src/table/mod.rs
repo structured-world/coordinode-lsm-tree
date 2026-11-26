@@ -8493,6 +8493,11 @@ impl Table {
     /// [`Self::decode_special_block`], or through the table's own load path in
     /// a job.
     ///
+    /// A columnar group whose directory is not cached is taken in one
+    /// request however few of the batch's keys fall in it: reading its
+    /// directory and then the pages of those keys takes fewer bytes but more
+    /// time a group, in requests that wait on one another.
+    ///
     /// A columnar group goes through the load path when its directory is
     /// cached (its pages may be too, which that path takes from the cache),
     /// when it is wider than one request, or when it carries Page-ECC, whose
