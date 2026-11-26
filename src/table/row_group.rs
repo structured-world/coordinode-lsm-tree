@@ -561,16 +561,29 @@ impl GroupRead<'_> {
         earlier: &RowGroupBlocks,
         want: &PageWant<'_>,
     ) -> crate::Result<RowGroupBlocks> {
+        self.load_after_within(earlier, want, &Slice::empty())
+    }
+
+    /// [`Self::load_after`] with `front`, the group's first bytes as an
+    /// earlier read brought them in (the whole group's, when one request took
+    /// it): a zone block the selection needs is cut out of them rather than
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_after`].
+    pub(crate) fn load_after_within(
+        &self,
+        earlier: &RowGroupBlocks,
+        want: &PageWant<'_>,
+        front: &Slice,
+    ) -> crate::Result<RowGroupBlocks> {
         let directory = Arc::clone(&earlier.directory);
         let directory_len = indexed_directory_len(self.group)?;
         let zones = match want.zone_block_column(&directory) {
-            Some(column_id) => Some(self.zone_block(
-                &directory,
-                directory_len,
-                column_id,
-                &Slice::empty(),
-                true,
-            )?),
+            Some(column_id) => {
+                Some(self.zone_block(&directory, directory_len, column_id, front, true)?)
+            }
             None => None,
         };
         let wanted = want.resolve(&directory, zones.as_ref())?;

@@ -2291,6 +2291,7 @@ impl Table {
         let mut version = None;
         self.columnar_point_versions(
             handle,
+            None,
             1,
             |_| needle,
             seqno,
@@ -2311,10 +2312,20 @@ impl Table {
     /// rows lie on the same ones; a key past them loads its own. Keys that
     /// fall together in a group therefore cost a key search and a row read
     /// each, and a key apart from the others what a point read costs.
+    ///
+    /// `whole` is the group with every page of it in hand and the bytes it
+    /// was read as, when the caller read it in one request: the pages and
+    /// the zone block that selects among them are then taken from those, and
+    /// nothing is read.
     #[cfg(feature = "columnar")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the one read of a group's keys, for every caller of it"
+    )]
     fn columnar_point_versions<'k>(
         &self,
         handle: &BlockHandle,
+        whole: Option<(&crate::table::row_group::RowGroupBlocks, &crate::Slice)>,
         count: usize,
         key_at: impl Fn(usize) -> &'k [u8],
         seqno: SeqNo,
@@ -2322,8 +2333,9 @@ impl Table {
         mut found: impl FnMut(usize, crate::table::columnar::KeyVersion),
     ) -> crate::Result<()> {
         let mut built = 0usize;
-        let read =
-            self.read_columnar_points(handle, count, &key_at, seqno, fd, &mut found, &mut built);
+        let read = self.read_columnar_points(
+            handle, whole, count, &key_at, seqno, fd, &mut found, &mut built,
+        );
         // `built` is the bytes of the values that had to be built from their
         // columns (what decoding the pages copied was charged by
         // `load_row_group`), charged whether the read then succeeded or not:
@@ -2346,6 +2358,7 @@ impl Table {
     fn read_columnar_points<'k>(
         &self,
         handle: &BlockHandle,
+        whole: Option<(&crate::table::row_group::RowGroupBlocks, &crate::Slice)>,
         count: usize,
         key_at: &impl Fn(usize) -> &'k [u8],
         seqno: SeqNo,
@@ -2387,14 +2400,18 @@ impl Table {
             // byte-wise zone of the row page holding it, whatever the key
             // order.
             let first = key_at(at);
-            let key_blocks = group.load(&PageWant::projected(
+            let key_pages = PageWant::projected(
                 &[COL_USER_KEY],
                 RowPageSelect::Zone {
                     column_id: COL_USER_KEY,
                     lower: Some(first),
                     upper: Some(first),
                 },
-            ))?;
+            );
+            let key_blocks = match whole {
+                Some((whole, frame)) => group.load_after_within(whole, &key_pages, frame)?,
+                None => group.load(&key_pages)?,
+            };
             // The key pages as stored: the search reads the keys it compares
             // and decodes no page whole. What the key pages and the row pages
             // read beside them hold decoded is the group's.
@@ -2484,7 +2501,7 @@ impl Table {
                 // the directory and key pages already in hand. The key search
                 // placed the key's rows, so the key pages are not read again.
                 let blocks = group.load_after(
-                    &key_blocks,
+                    whole.map_or(&key_blocks, |(whole, _)| whole),
                     &PageWant {
                         columns: None,
                         row_pages: RowPageSelect::Range(row_pages.clone()),
@@ -2564,22 +2581,83 @@ impl Table {
         key_at: impl Fn(usize) -> &'k [u8],
         table_seqno: SeqNo,
         fd: &LookupFd,
+        found: impl FnMut(usize, InternalValue),
+    ) -> crate::Result<()> {
+        self.columnar_entries(handle, None, count, key_at, table_seqno, fd, found)
+    }
+
+    /// [`Self::columnar_point_entries`] for a group a batched read took in
+    /// one request, as `frame`: the group is checked and its pages admitted
+    /// as the load path does it, and the keys are read through those pages.
+    /// No block is built, and nothing more is read.
+    ///
+    /// # Errors
+    ///
+    /// A check of the group fails, or a point read of it does.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn columnar_frame_entries<'k>(
+        &self,
+        handle: &BlockHandle,
+        frame: &crate::Slice,
+        count: usize,
+        key_at: impl Fn(usize) -> &'k [u8],
+        table_seqno: SeqNo,
+        found: impl FnMut(usize, InternalValue),
+    ) -> crate::Result<()> {
+        let fd = LookupFd::default();
+        let whole = self
+            .group_read(handle, ReadCharge::Foreground, &fd)
+            .load_whole(frame)?;
+        self.columnar_entries(
+            handle,
+            Some((&whole, frame)),
+            count,
+            key_at,
+            table_seqno,
+            &fd,
+            found,
+        )
+    }
+
+    /// The body of [`Self::columnar_point_entries`] and
+    /// [`Self::columnar_frame_entries`].
+    #[cfg(feature = "columnar")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the one read of a group's keys, for every caller of it"
+    )]
+    fn columnar_entries<'k>(
+        &self,
+        handle: &BlockHandle,
+        whole: Option<(&crate::table::row_group::RowGroupBlocks, &crate::Slice)>,
+        count: usize,
+        key_at: impl Fn(usize) -> &'k [u8],
+        table_seqno: SeqNo,
+        fd: &LookupFd,
         mut found: impl FnMut(usize, InternalValue),
     ) -> crate::Result<()> {
         let global_seqno = self.global_seqno();
-        self.columnar_point_versions(handle, count, &key_at, table_seqno, fd, |at, version| {
-            found(
-                at,
-                InternalValue {
-                    key: crate::key::InternalKey {
-                        user_key: crate::Slice::from(key_at(at)),
-                        seqno: apply_global_seqno(version.seqno, global_seqno),
-                        value_type: version.value_type,
+        self.columnar_point_versions(
+            handle,
+            whole,
+            count,
+            &key_at,
+            table_seqno,
+            fd,
+            |at, version| {
+                found(
+                    at,
+                    InternalValue {
+                        key: crate::key::InternalKey {
+                            user_key: crate::Slice::from(key_at(at)),
+                            seqno: apply_global_seqno(version.seqno, global_seqno),
+                            value_type: version.value_type,
+                        },
+                        value: version.value,
                     },
-                    value: version.value,
-                },
-            );
-        })
+                );
+            },
+        )
     }
 
     /// [`Self::columnar_point_version`] as an entry: its key is a copy of
@@ -8564,11 +8642,11 @@ impl Table {
         BlockType::Data
     }
 
-    /// The data block at `handle` of this Page-ECC or columnar table, from the
-    /// `frame` [`Self::batched_special_read`] asked for: checked, recovered
-    /// and reconstructed exactly as the load path does it, cached (a row block
-    /// while it fits in `room`), and `None` when a columnar block's delete
-    /// mask removes every row.
+    /// The data block at `handle` of this Page-ECC table, from the `frame`
+    /// [`Self::batched_special_read`] asked for: checked and recovered
+    /// exactly as the load path does it, and cached while it fits in `room`.
+    /// A columnar group's frame is read through its pages instead
+    /// ([`Self::columnar_frame_entries`]).
     ///
     /// # Errors
     ///
@@ -8581,14 +8659,6 @@ impl Table {
         frame: &crate::Slice,
         room: &mut u64,
     ) -> crate::Result<Option<DataBlock>> {
-        #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            let fd = LookupFd::default();
-            let blocks = self
-                .group_read(handle, ReadCharge::Foreground, &fd)
-                .load_whole(frame)?;
-            return self.columnar_data_block_from(handle, &blocks, ReadCharge::Foreground);
-        }
         let compression = self.metadata.data_block_compression;
         let transform = crate::table::util::build_block_transform(
             compression,

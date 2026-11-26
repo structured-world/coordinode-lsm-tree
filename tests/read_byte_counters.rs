@@ -1598,11 +1598,10 @@ fn a_multi_get_caching_a_chunked_head_detaches_it_from_the_whole_value_read() {
 }
 
 #[test]
-fn a_multi_get_of_a_split_value_counts_the_values_it_rebuilds_and_the_blocks() {
-    // The row path over a split-value block rebuilds every row's value from
-    // its sub-columns and then encodes the rows into a row-major block. The
-    // rebuild is a gather of its own, as large as the values; charging only
-    // the encoded block drops it.
+fn a_multi_get_of_a_split_value_counts_the_values_it_frames_and_nothing_else() {
+    // A batch read of a value split over sub-columns frames each value from
+    // its cells, once, and that is all it copies: the group is read through
+    // its pages and not rebuilt into a row block.
     let n = 200;
     let (_folder, tree, framed) = wide_subcolumn_segment(n);
     let m = tree.metrics();
@@ -1612,11 +1611,10 @@ fn a_multi_get_of_a_split_value_counts_the_values_it_rebuilds_and_the_blocks() {
     let got = tree.multi_get(&keys, SeqNo::MAX).expect("multi_get");
     assert!(got.iter().all(Option::is_some), "every key is present");
     let values = u64::from(n) * framed.len() as u64;
-    let copied = m.bytes_copied() - before;
-    assert!(
-        copied >= 2 * values,
-        "every value was rebuilt ({values} B) and then encoded into blocks at \
-         least as large, but only {copied} B were charged",
+    assert_eq!(
+        m.bytes_copied() - before,
+        values,
+        "each value is framed once and nothing else is copied",
     );
 }
 
