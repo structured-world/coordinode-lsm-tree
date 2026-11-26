@@ -1,11 +1,25 @@
 use super::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, RowPageColumns,
     TypeTag, column_batch_into_entries, column_batch_to_entries, entries_to_column_batch,
-    frame_value_cells, frame_value_cells_nullable, page_match_version, unframe_value_cells,
+    frame_value_cells, frame_value_cells_nullable, unframe_value_cells,
     unframe_value_cells_nullable, unframe_value_cells_with_defaults,
     validate_columnar_ingest_batch,
 };
 use crate::{Slice, ValueType, config::ColumnEncoding, key::InternalKey, value::InternalValue};
+
+/// One point read of one row page: the page prepared, then read for the
+/// version of `needle` a read at `seqno` sees among the rows of `run`.
+fn page_match_version(
+    page: RowPageColumns<'_>,
+    run: core::ops::Range<u32>,
+    needle: &[u8],
+    seqno: crate::SeqNo,
+    deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    copied: &mut usize,
+    budget: &mut super::DecodeBudget,
+) -> crate::Result<Option<super::KeyVersion>> {
+    super::PointPage::prepare(page, budget)?.version(run, needle, seqno, deletes, copied)
+}
 
 #[test]
 fn fixed_only_value_framing_has_no_overhead_and_round_trips() {
@@ -1607,6 +1621,82 @@ fn page_match_version_fails_closed_when_a_delete_mask_position_overflows() {
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("position exceeds u32::MAX")),
         "expected an overflow InvalidHeader, got {err:?}",
+    );
+}
+
+/// A read whose answer is the run's first row, at a valid position, still
+/// fails when a later row of the run lies past `u32::MAX`: the start row is
+/// corrupt, and which row answers does not make it less so. One read, at a
+/// seqno that sees the first row; a read that returned on that row before
+/// looking at the rest of the run would hand the value out.
+#[test]
+fn a_point_read_answered_by_the_first_row_still_rejects_an_overflowing_run() {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let batch = entries_to_column_batch(&[
+        entry(b"dup", 5, ValueType::Value, b"v0"),
+        entry(b"dup", 3, ValueType::Value, b"v1"),
+    ])
+    .expect("two-row same-key batch");
+    let stamp = |column_id| PageStamp {
+        group_tag: 1,
+        id: PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let pages = batch
+        .columns
+        .iter()
+        .map(|c| {
+            c.encode_page(batch.row_count, stamp(c.column_id), ColumnEncoding::Auto)
+                .map(Slice::from)
+        })
+        .collect::<crate::Result<Vec<_>>>()
+        .expect("pages");
+    let mut budget = super::DecodeBudget::default();
+    // Every column but the key's, as the read prepares a row page.
+    let columns = pages
+        .iter()
+        .zip(&batch.columns)
+        .skip(1)
+        .map(|(page, c)| {
+            budget.parsed(Column::parse_page(
+                page,
+                batch.row_count,
+                stamp(c.column_id),
+            )?)
+        })
+        .collect::<crate::Result<crate::table::row_group::PageColumns<_>>>()
+        .expect("columns");
+    let page = super::PointPage::prepare(
+        RowPageColumns {
+            ordinal: 0,
+            start: 0,
+            rows: batch.row_count,
+            columns,
+        },
+        &mut budget,
+    )
+    .expect("prepared");
+    let bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
+    let deletes = Some((&bitmap, u32::MAX));
+
+    let on_page = page.version(0..2, b"dup", crate::SeqNo::MAX, deletes, &mut 0);
+    assert!(
+        matches!(on_page, Err(crate::Error::InvalidHeader(m)) if m.contains("position exceeds u32::MAX")),
+        "one page's read must reject the run, got {on_page:?}",
+    );
+    let run = 0..2;
+    let across = super::point_version(
+        core::slice::from_ref(&page),
+        core::slice::from_ref(&run),
+        b"dup",
+        crate::SeqNo::MAX,
+        deletes,
+        &mut 0,
+    );
+    assert!(
+        matches!(across, Err(crate::Error::InvalidHeader(m)) if m.contains("position exceeds u32::MAX")),
+        "the read over the run's pages must reject it, got {across:?}",
     );
 }
 

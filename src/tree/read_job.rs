@@ -258,16 +258,18 @@ impl Job {
                         #[cfg(feature = "columnar")]
                         if !keys.is_empty() {
                             let mut entries = Vec::with_capacity(keys.len());
-                            for idx in keys {
-                                if let Some(item) = table.point_read_pages_translated(
-                                    &handle,
-                                    ctx.key(idx),
-                                    seqno,
-                                    &fd,
-                                )? {
-                                    entries.push((idx, item));
-                                }
-                            }
+                            table.columnar_point_entries(
+                                &handle,
+                                keys.len(),
+                                |n| keys.get(n).map_or(&[][..], |&idx| ctx.key(idx)),
+                                seqno,
+                                &fd,
+                                |n, item| {
+                                    if let Some(&idx) = keys.get(n) {
+                                        entries.push((idx, item));
+                                    }
+                                },
+                            )?;
                             return Ok(Loaded::Entries(entries));
                         }
                         let _ = (seqno, keys);

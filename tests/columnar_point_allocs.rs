@@ -9,6 +9,10 @@
 //! and the row cache is off, so the counts are the read path's own work:
 //! finding the key's rows in the row group and handing its value out.
 
+// Without `columnar` a tree asked for the columnar layout writes row tables,
+// and the counts below would be a row table's under a columnar label.
+#![cfg(feature = "columnar")]
+
 use lsm_tree::config::BlockSizePolicy;
 use lsm_tree::{AbstractTree, AnyTree, Cache, Config, SeqNo, SequenceNumberCounter};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -172,12 +176,15 @@ fn warm_reads(tree: &AnyTree, key_len: usize, value_len: usize) -> lsm_tree::Res
     let batches = READS / BATCH;
     let batch = counted(batches, batches * BATCH, |i| {
         match tree.multi_get(&sorted[i * BATCH..(i + 1) * BATCH], SeqNo::MAX) {
-            Ok(values) => assert!(
-                values
-                    .iter()
-                    .all(|value| value.as_ref().is_some_and(|v| v.len() == value_len)),
-                "a present key read absent or short"
-            ),
+            Ok(values) => {
+                assert_eq!(values.len(), BATCH, "an answer for every key");
+                assert!(
+                    values
+                        .iter()
+                        .all(|value| value.as_ref().is_some_and(|v| v.len() == value_len)),
+                    "a present key read absent or short"
+                );
+            }
             Err(e) => failed = Some(e),
         }
     });

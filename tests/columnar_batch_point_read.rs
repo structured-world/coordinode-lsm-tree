@@ -76,6 +76,7 @@ fn a_batch_read_of_a_columnar_table_answers_as_point_reads_do() -> lsm_tree::Res
                 let picked: Vec<&Vec<u8>> = keys.iter().step_by(stride).collect();
                 for (at, chunk) in picked.chunks(batch).enumerate() {
                     let got = tree.multi_get(chunk, seqno)?;
+                    assert_eq!(got.len(), chunk.len(), "an answer for every key");
                     for (offset, (key, value)) in chunk.iter().zip(&got).enumerate() {
                         let index = (at * batch + offset) * stride;
                         assert_eq!(
