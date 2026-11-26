@@ -22,7 +22,9 @@ const EMPTY: u128 = 1 << 64;
 /// the smallest, and every other node the slot that lost the game played
 /// there. Taking the smallest replaces it with its input's next entry and
 /// plays again only the games between its leaf and the root, one per level,
-/// whichever input the next entry comes from.
+/// whichever input the next entry comes from. An input that wins twice in a
+/// row has its runner-up found, and each further entry of its run costs one
+/// game against that runner-up.
 ///
 /// Most games are settled by a slot's rank alone: eight bytes of its key past
 /// the prefix every key shares, as an integer. Whole keys are compared only
@@ -45,11 +47,15 @@ pub struct Merger<I> {
     tree: Vec<u32>,
     /// Slots that hold an entry.
     live: usize,
+    /// While `chased`: the best of the slots that lost to the winner on its
+    /// path. A next entry of the winning input that comes before this slot's
+    /// wins again with the tree as it stands, so no game is replayed for it.
+    runner_up: u32,
+    chased: bool,
     /// Errors the inputs' first entries gave, yielded before any entry.
     failed: Vec<crate::Error>,
     /// The tournament is built and no error waits.
     ready: bool,
-    built: bool,
     comparator: SharedComparator,
     /// The comparator orders keys as their bytes do, so keys are compared
     /// directly rather than through it. See
@@ -90,9 +96,10 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
             ranks: Vec::new(),
             tree: Vec::new(),
             live: 0,
+            runner_up: 0,
+            chased: false,
             failed: Vec::new(),
             ready: false,
-            built: false,
             comparator,
             lexicographic,
             common_prefix: 0,
@@ -104,7 +111,7 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
     /// ignored under any other.
     #[must_use]
     pub fn with_common_prefix(mut self, len: usize) -> Self {
-        debug_assert!(!self.built, "set before the first entry is taken");
+        debug_assert!(self.tree.is_empty(), "set before the first entry is taken");
         self.common_prefix = len;
         self
     }
@@ -190,7 +197,6 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
             winners[node] = winner;
         }
         self.tree[0] = winners[1];
-        self.built = true;
     }
 
     /// Plays again the games between `leaf` and the root.
@@ -219,11 +225,33 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
         self.tree[0] = winner as u32;
     }
 
+    /// The best of the slots that lost on the path from `leaf` to the root:
+    /// the slot that wins once `leaf`'s input stops winning.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a node between a leaf and the root is below the tree's length"
+    )]
+    fn path_best(&self, leaf: usize) -> u32 {
+        let mut node = usize::midpoint(self.tree.len(), leaf);
+        let mut best = self.tree[node];
+        node >>= 1;
+        while node != 0 {
+            let loser = self.tree[node];
+            if self.beats(loser as usize, best as usize) {
+                best = loser;
+            }
+            node >>= 1;
+        }
+        best
+    }
+
     /// Builds the tournament at the first call, and yields the errors the
     /// inputs' first entries gave, one a call.
     #[cold]
     fn prepare(&mut self) -> Option<crate::Error> {
-        if !self.built {
+        // Built once: the tree of a built tournament has its two nodes at
+        // least.
+        if self.tree.is_empty() {
             self.build();
         }
         let failed = self.failed.pop();
@@ -258,7 +286,26 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
         let taken = match self.iterators[slot].next() {
             Some(Ok(next)) => {
                 self.ranks[slot] = self.rank_of(&next);
-                self.entries[slot].replace(next).map(Ok)
+                let taken = self.entries[slot].replace(next).map(Ok);
+                if self.chased {
+                    // Ahead of the runner-up, the entry is ahead of every
+                    // slot that lost on its path: the tree stands.
+                    if self.beats(slot, self.runner_up as usize) {
+                        return taken;
+                    }
+                    self.chased = false;
+                    self.replay(slot);
+                } else {
+                    self.replay(slot);
+                    // The same input won again through its games: its
+                    // runner-up is worth one walk of the path, after which a
+                    // run of its entries costs one game each.
+                    if self.tree[0] as usize == slot {
+                        self.runner_up = self.path_best(slot);
+                        self.chased = true;
+                    }
+                }
+                return taken;
             }
             // The entry the input stood at is dropped with it, so the next
             // call makes progress on another input instead of asking this one
@@ -275,6 +322,7 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
                 self.entries[slot].take().map(Ok)
             }
         };
+        self.chased = false;
         self.replay(slot);
         taken
     }

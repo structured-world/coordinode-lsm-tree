@@ -255,6 +255,68 @@ fn merge_of_uneven_inputs_is_their_sort() {
     }
 }
 
+/// Inputs that win in runs merge to their sort too: a run is taken against the
+/// runner-up alone, and ends where the runner-up's entry comes first, where
+/// an equal entry of an earlier input must come first, and where the input
+/// runs out. An entry equal to the runner-up's from an earlier input stays
+/// ahead of it; from a later input it goes behind.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test assertions")]
+fn merge_of_inputs_that_win_in_runs_is_their_sort() {
+    let entry = |key: u32, seqno: u64| {
+        InternalValue::from_components(format!("key-{key:04}"), b"", seqno, Value)
+    };
+    // Two long runs with a gap, the gap's keys, and a sparse input whose
+    // entries equal ones of the first (same key and seqno) or lie between.
+    let first: Vec<InternalValue> = (0..50).chain(100..150).map(|k| entry(k, 9)).collect();
+    let gap: Vec<InternalValue> = (50..100).map(|k| entry(k, 9)).collect();
+    let sparse: Vec<InternalValue> = (0..150).step_by(7).map(|k| entry(k, 9)).collect();
+    let older: Vec<InternalValue> = (40..60).map(|k| entry(k, 3)).collect();
+    for inputs in [
+        vec![first.clone(), gap.clone(), sparse.clone(), older.clone()],
+        vec![sparse.clone(), older.clone(), first.clone(), gap.clone()],
+        vec![gap.clone(), first.clone()],
+        vec![older, sparse, gap, first, Vec::new()],
+    ] {
+        // Stable, so equal entries keep the order of their inputs.
+        let mut expected: Vec<(usize, InternalValue)> = inputs
+            .iter()
+            .enumerate()
+            .flat_map(|(input, held)| held.iter().cloned().map(move |entry| (input, entry)))
+            .collect();
+        expected.sort_by(|a, b| a.1.key.cmp(&b.1.key));
+
+        // Each entry's value names its input, so equal entries are told apart.
+        let merged: Vec<(usize, InternalValue)> = Merger::new(
+            inputs
+                .into_iter()
+                .enumerate()
+                .map(|(input, held)| {
+                    held.into_iter().map(move |mut entry| {
+                        entry.value = [u8::try_from(input).unwrap()].into();
+                        Ok(entry)
+                    })
+                })
+                .collect(),
+            comparator::default_comparator(),
+        )
+        .with_common_prefix(4)
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (usize::from(entry.value.first().copied().unwrap()), entry)
+        })
+        .collect();
+        assert_eq!(merged.len(), expected.len());
+        for (at, (got, want)) in merged.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                (got.0, &got.1.key),
+                (want.0, &want.1.key),
+                "entry {at} of the merge"
+            );
+        }
+    }
+}
+
 /// An input's error comes out in the place of its next entry, the entry it
 /// stood at is dropped with the input, and the other inputs go on in order.
 #[test]
