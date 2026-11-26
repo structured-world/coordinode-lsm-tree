@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795694771177,
+  "lastUpdate": 1795726115146,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -104902,6 +104902,90 @@ window.BENCHMARK_DATA = {
             "value": 329618.03757975576,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 16.7us | P99.9: 90.1us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fe003ae8663f54b95e7679cfa7325d25df6a9e0f",
+          "message": "perf(columnar): hand a point read its value as a page view (#1116)\n\n## Summary\n\n- A warm point read of a columnar table allocates nothing, as a row\ntable's does: its value is a view of the page that holds it.\n- A batch read of a columnar table reads its keys through the pages of\neach group, prepared once for all the keys that fall in it, and no\nlonger rebuilds a group into a row block, cached or not. Batches whose\nkeys fall together now cost what a row table's do.\n\n## Measurements\n\n`benches/columnar.rs`, `main` against this branch on one benchmark host:\nmedians of three interleaved rounds, 100,000 keys, row cache off. The\nsteps behind these and the comparison with `v7.6.0` are in #963.\n\nWarm block cache, a columnar table:\n\n| read | main | branch | change | row table |\n|---|---|---|---|---|\n| point, value 32 | 4.25 us | 3.30 us | -22% | 1.55 us |\n| point, value 1024 | 5.78 us | 4.39 us | -24% | 1.59 us |\n| batch, 4 keys in one group | 33.7 us | 7.57 us | -78% | 5.71 us |\n| batch, 16 keys in one group | 50.2 us | 20.1 us | -60% | 17.8 us |\n| batch, 64 keys in one group | 111.8 us | 62.3 us | -44% | 62.8 us |\n| batch, 256 keys in one group | 345.2 us | 227.3 us | -34% | 241.7 us |\n| batch, 1024 keys | 1.319 ms | 0.892 ms | -32% | 0.944 ms |\n| batch, 16 keys, every 64th | 287.2 us | 65.8 us | -77% | 38.4 us |\n| batch, 16 keys, every 2048th | 431.7 us | 76.6 us | -82% | 37.5 us |\n\nA 256 KiB block cache, so a batch finds its groups not cached (the OS\npage cache is warm: the engine's cost, not a device's latency), a\ncolumnar table:\n\n| batch | main | branch | change | row table |\n|---|---|---|---|---|\n| 1 key | 74.2 us | 73.9 us | 0 | 4.97 us |\n| 4 keys in one group | 101.9 us | 89.6 us | -12% | 60.8 us |\n| 16 keys in one group | 121.0 us | 105.8 us | -13% | 77.4 us |\n| 4 keys, one a group | 251.7 us | 187.0 us | -26% | 81.0 us |\n| 16 keys, one a group | 962.5 us | 667.2 us | -31% | 140.2 us |\n\nThe last row's branch figure is from a later run of the same bench,\nafter the key zones were kept on a cold group's directory (737.9 us\nbefore that, in the run the other rows come from; the other shapes did\nnot move).\n\nA row table reads the same on both sides, within the noise of the run:\nits point read 1.52 to 1.55 us and 1.61 to 1.59 us, its batches within\n2% warm and within 6% over the cold cache.\n\nAllocations of a warm columnar point read: 21 to 24 calls and 2.4 to 7.7\nKB a hit on `main`, none on the branch.\n\n## Changes\n\n- The columnar point read returns the newest visible version of the key\nstraight from the pages. A value one column stores whole and without\nnulls is a view of its page; a value framed from several columns is\nbuilt once; a tombstone has none. The key is the one asked for. The rows\nfound are no longer copied into entries, encoded into a row block,\nhashed and searched again.\n- The read takes the keys of a batch that fall in one group together:\nthe key pages loaded for one key answer every later key within them, and\nthe row pages prepared for one key are read for every later key whose\nrows lie on the same ones. That reuse holds where the keys ascend in\nbyte order; under another comparator, whose zones select row pages that\nneed not be neighbours, each key loads the pages of its own zone. A\nsingle point read is that read of one key. Both batch paths use it, the\nstaged one and the per-table one.\n- A group a batch finds not cached is still taken in one request, and\nits keys are read through its pages out of those bytes: the group is not\nrebuilt. Its key zones are kept on its directory when it is admitted, so\neach key bisects them.\n- A group's pages are handed to the read as they are parsed and a row\npage is filled in place: no list of pages or columns is built, where the\nlists held inline cost about 12 KB of copies a read.\n- Where the keys ascend in byte order a key's row page is found by\nbisecting the key zones, not by reading every row page's zone.\n- A run of a key's rows whose later positions overflow `u32` under a\ndelete mask is refused whichever row answers the read: the run's last\nposition is checked once before any row is read.\n- The pinned read, which returns a block with its entry, encodes the one\nentry it found.\n- CI runs the new allocation-counting test in the step that runs without\n`mimalloc`.\n- `benches/columnar.rs` times warm point and batch lookups with the row\ncache off, and batch lookups over a cold block cache; the existing point\nlookup group times the row cache after its first pass.\n\nThe per-read vector of value offsets the audit expected does not exist:\na bytes column is read in place through its stored offsets.\n\nMeasured and not taken: reading a cold group page by page instead of in\none request (fewer bytes, more time where a batch lands a key in each\ngroup), and checking a bytes page's row framing only for the rows read\n(no gain).\n\nStill open, in #963: a single columnar point read takes about twice a\nrow table's, and a cold columnar group about five times a cold row\nblock.\n\n## Testing\n\nTests, lints (all features and default), formatting, doc tests, the docs\nbuild, the no-std check and the `sst-dump` build pass on macOS; the\nplatform matrix runs in CI.\n\nNew tests: allocation counts of warm point and batch reads, row beside\ncolumnar; a batch read against point reads over versions that straddle\npages and groups, deleted and absent keys, at several snapshots, at tree\nand table level, and under a comparator that is not the byte order; the\npoint read's version selection and page-view value; a tombstone's empty\nvalue; a read answered by a run's first row that still refuses an\noverflowing later position, on its page and on the next; the bisection\nof the key zones against a scan of them.\n\nCloses #963\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved point and batch reads for columnar tables, reducing\nunnecessary data reconstruction and copying.\n* Repeated reads can reuse loaded pages, helping make lookups more\nefficient.\n\n* **Bug Fixes**\n* Improved columnar read handling across snapshots, including version\nvisibility, deleted entries, missing keys, and batches spanning row\ngroups.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-26T21:23:45+02:00",
+          "tree_id": "73e46cd620d4c5f791108fa394530c7901cc4aff",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/fe003ae8663f54b95e7679cfa7325d25df6a9e0f"
+        },
+        "date": 1795726113851,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 150288.99283944326,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 16.1us | P99.9: 29.3us\nthreads: 1 | elapsed: 3.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3192886.9120803624,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1018124.8209627502,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.7us | P99.9: 11.1us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 503469.51288320206,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.5us | P99.9: 21.0us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3234771.6211609505,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 333576.1801282285,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.1us | P99.9: 15.5us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 193533.50131144543,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 9.6us | P99.9: 20.9us\nthreads: 1 | elapsed: 1.03s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 993247.1953939672,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.8us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1099719.7496184467,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 1.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 443006.97344808024,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.7us | P99.9: 25.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
