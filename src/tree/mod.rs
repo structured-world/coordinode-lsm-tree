@@ -1063,8 +1063,18 @@ impl AbstractTree for Tree {
 
     fn clear(&self) -> crate::Result<()> {
         let mut versions = self.get_version_history_lock();
+        // The recency this install drops everything below, taken with the
+        // history locked. A flush takes its own after it chose its memtables,
+        // so one that took a lower number chose them before this install and
+        // installs nothing after it; a table installed from here on carries a
+        // higher one. No flush lock: a clear lands in the middle of a flush.
+        let bound = self.table_id_counter.next();
         let prior = self.install_replacing(&mut versions, &[], &[])?;
         drop(versions); // release the version-history lock before any fs work
+        // The mark of an install that kept no table, under a number of its
+        // own: a repair of a manifest lost before the next open leaves out
+        // what this dropped (see `replace_mark`).
+        self.mark_replaced(bound, bound);
         reclaim_replaced(&prior);
         Ok(())
     }

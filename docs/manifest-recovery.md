@@ -364,7 +364,8 @@ mark**. Its presence says every table of that ingestion was installed, at
 sequence offset 0 as every replacing install is. One name in one folder is
 there or is not, so the install is proven for all of its tables or for none:
 no crash leaves a repair with part of the replaced content. An ingestion that
-wrote no table leaves its mark all the same, for the bound alone.
+wrote no table leaves its mark all the same, for the bound alone, and so does
+`clear`, which installs an empty tree the same way, under a number of its own.
 
 `bound` is the L0 recency the install gave its run, a number taken from the
 tree's table counter while no flush was under way. A flush takes its recency
@@ -555,12 +556,6 @@ Resolving that needs the restriction's key bound mapped onto block offsets,
 which requires the block index — out of reach for a path-based walk that holds
 only a filesystem reference and no open table. Callers that do hold a table
 pass the exact frontier in and are unaffected.
-
-**`clear` leaves no replace mark.** A replacing ingestion's install tells a
-repair which tables it dropped (see *Replacing ingestions*); `clear` installs
-an empty tree without one. An earlier table whose removal is still undone (a
-removal the filesystem refused, in a tree that has not been reopened since)
-comes back with a manifest lost before the next open removes it.
 
 **A replace whose mark is not durable.** The mark follows the durable install,
 so a power loss between the two leaves an install without it. The manifest

@@ -455,14 +455,16 @@ impl<'a> BlobIngestion<'a> {
         // The hold on the ingestion's dictionaries stays here until its files
         // are installed.
         let write_pin = core::mem::take(&mut self.table.write_pin);
-        let written = if self.last_key.is_some() {
-            // The blob files first, which the index tables point into.
-            let blob_files = self.blob.finish()?;
-            let written = self.table.writer.finish()?;
-            Some((written.tables, written.entries_durable, blob_files))
-        } else {
-            None
-        };
+        // The blob files first, which the index tables point into. Both
+        // writers are finished with nothing written too: each then gives up
+        // the file it took.
+        let blob_files = self.blob.finish()?;
+        let written = self.table.writer.finish()?;
+        let written = (!written.tables.is_empty()).then_some((
+            written.tables,
+            written.entries_durable,
+            blob_files,
+        ));
 
         #[cfg(all(test, feature = "std"))]
         index.config.fire_before_output_install();

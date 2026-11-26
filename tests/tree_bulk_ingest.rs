@@ -668,6 +668,63 @@ fn repair_after_an_empty_replace_drops_an_earlier_table_left_on_the_disk() -> ls
     Ok(())
 }
 
+/// `clear` installs an empty tree as a replacing ingestion that wrote nothing
+/// does, and leaves its mark as well: an earlier table whose removal it left
+/// undone stays out of a repair of the manifest lost after it. The repair
+/// reports no file as damaged: the empty ingestion and the clear left no
+/// unused table file behind for it to mistake for a table that lost its bytes.
+#[test]
+fn repair_after_a_clear_drops_an_earlier_table_left_on_the_disk() -> lsm_tree::Result<()> {
+    for (blob, empty_ingestion) in [(false, false), (true, false), (false, true), (true, true)] {
+        let folder = get_tmp_folder();
+        let seqno = SequenceNumberCounter::default();
+        seqno.fetch_max(1);
+        let config = || config_at(folder.path(), &seqno, blob);
+
+        let mut left = Vec::new();
+        {
+            let tree = config().open()?;
+            for x in 0..64u64 {
+                tree.insert(x.to_be_bytes(), b"old", seqno.next());
+            }
+            tree.flush_active_memtable(0)?;
+            left.extend(files_with_bytes(folder.path(), "tables")?);
+            left.extend(files_with_bytes(folder.path(), "blobs")?);
+            if empty_ingestion {
+                tree.replacing_ingestion()?.finish()?;
+                // An adding ingestion that writes nothing leaves no file.
+                tree.ingestion()?.finish()?;
+            } else {
+                tree.clear()?;
+            }
+            tree.insert(200u64.to_be_bytes(), b"later", seqno.next());
+            tree.flush_active_memtable(0)?;
+            tree.close().wait();
+        }
+
+        for (path, bytes) in &left {
+            assert!(!path.exists(), "self-check: {} was removed", path.display());
+            std::fs::write(path, bytes)?;
+        }
+        lose_the_manifest(folder.path())?;
+        let report = config().repair()?;
+        assert_eq!(
+            report.unreadable, 0,
+            "blob: {blob}, empty ingestion: {empty_ingestion}, {report:?}"
+        );
+
+        let tree = config().open()?;
+        assert_eq!(tree.iter(SeqNo::MAX, None).count(), 1, "blob: {blob}");
+        assert!(tree.get(0u64.to_be_bytes(), SeqNo::MAX)?.is_none());
+        assert_eq!(
+            tree.get(200u64.to_be_bytes(), SeqNo::MAX)?.as_deref(),
+            Some(b"later".as_slice()),
+            "blob: {blob}"
+        );
+    }
+    Ok(())
+}
+
 /// The bound a replace's install gave holds past the last table of its run:
 /// after a compaction merged them all away, an earlier table whose removal is
 /// still undone stays out of a repair.

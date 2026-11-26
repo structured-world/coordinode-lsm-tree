@@ -601,6 +601,11 @@ impl<'a> Ingestion<'a> {
         }
         if self.last_key.is_none() {
             log::trace!("No data written to Ingestion, returning early");
+            // The writer still gives up the file it took and wrote nothing
+            // into: left empty where it lies, a repair without a manifest
+            // would read it as a table that lost its bytes once a later
+            // table is finished above it.
+            self.writer.finish()?;
             return Ok(());
         }
 
@@ -731,15 +736,16 @@ impl<'a> Ingestion<'a> {
         // The hold on the ingestion's dictionaries stays here until its
         // tables are installed.
         let write_pin = core::mem::take(&mut self.write_pin);
-        let written = if self.last_key.is_some() {
-            #[cfg(feature = "columnar")]
+        #[cfg(feature = "columnar")]
+        if self.last_key.is_some() {
             self.flush_pending_columnar()?;
-            let written = self.writer.finish()?;
-            log::info!("Finished replacing ingestion writer");
-            Some((written.tables, written.entries_durable))
-        } else {
-            None
-        };
+        }
+        // Finished with nothing written too: the writer then gives up the
+        // file it took, which would otherwise lie empty below later tables.
+        let written = self.writer.finish()?;
+        log::info!("Finished replacing ingestion writer");
+        let written =
+            (!written.tables.is_empty()).then_some((written.tables, written.entries_durable));
 
         #[cfg(all(test, feature = "std"))]
         self.tree.config.fire_before_output_install();
