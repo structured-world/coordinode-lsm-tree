@@ -130,7 +130,14 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
 
     /// Whether the entry in slot `a` comes before the one in slot `b`. An
     /// empty slot comes after every entry.
-    #[inline]
+    // Always inline: the ranks decide most games, and a game that stays a
+    // call from the replay loop costs more than it compares. Several callers
+    // would otherwise leave it one.
+    #[expect(
+        clippy::inline_always,
+        reason = "two integer loads and a compare, on every game of every replay"
+    )]
+    #[inline(always)]
     #[expect(
         clippy::indexing_slicing,
         reason = "the tree only holds numbers of slots"
@@ -142,6 +149,17 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
         if rank_a != rank_b {
             return rank_a < rank_b;
         }
+        self.beats_by_key(a, b)
+    }
+
+    /// [`Self::beats`] for two slots of one rank: by their keys, then by
+    /// their numbers.
+    #[inline]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the tree only holds numbers of slots"
+    )]
+    fn beats_by_key(&self, a: usize, b: usize) -> bool {
         let (Some(x), Some(y)) = (&self.entries[a], &self.entries[b]) else {
             // Two empty slots: neither comes first.
             return false;
@@ -225,6 +243,20 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
         self.tree[0] = winner as u32;
     }
 
+    /// Plays the tournament on without `slot`, whose input gave its last
+    /// entry.
+    #[cold]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the slot is an input's, below the ranks' length"
+    )]
+    fn retire(&mut self, slot: usize) {
+        self.ranks[slot] = EMPTY;
+        self.live -= 1;
+        self.chased = false;
+        self.replay(slot);
+    }
+
     /// The best of the slots that lost on the path from `leaf` to the root:
     /// the slot that wins once `leaf`'s input stops winning.
     #[expect(
@@ -263,6 +295,7 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
 impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
     type Item = IterItem;
 
+    #[inline]
     #[expect(
         clippy::indexing_slicing,
         reason = "the winning slot is an input's, below every per-slot length"
@@ -286,45 +319,37 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
         let taken = match self.iterators[slot].next() {
             Some(Ok(next)) => {
                 self.ranks[slot] = self.rank_of(&next);
-                let taken = self.entries[slot].replace(next).map(Ok);
-                if self.chased {
-                    // Ahead of the runner-up, the entry is ahead of every
-                    // slot that lost on its path: the tree stands.
-                    if self.beats(slot, self.runner_up as usize) {
-                        return taken;
-                    }
-                    self.chased = false;
-                    self.replay(slot);
-                } else {
-                    self.replay(slot);
-                    // The same input won again through its games: its
-                    // runner-up is worth one walk of the path, after which a
-                    // run of its entries costs one game each.
-                    if self.tree[0] as usize == slot {
-                        self.runner_up = self.path_best(slot);
-                        self.chased = true;
-                    }
-                }
-                return taken;
+                self.entries[slot].replace(next)
             }
             // The entry the input stood at is dropped with it, so the next
             // call makes progress on another input instead of asking this one
             // again.
             Some(Err(e)) => {
                 self.entries[slot] = None;
-                self.ranks[slot] = EMPTY;
-                self.live -= 1;
-                Some(Err(e))
+                self.retire(slot);
+                return Some(Err(e));
             }
             None => {
-                self.ranks[slot] = EMPTY;
-                self.live -= 1;
-                self.entries[slot].take().map(Ok)
+                let last = self.entries[slot].take();
+                self.retire(slot);
+                return last.map(Ok);
             }
         };
+        // Ahead of the runner-up, the input's next entry is ahead of every
+        // slot that lost on its path: the tree stands.
+        if self.chased && self.beats(slot, self.runner_up as usize) {
+            return taken.map(Ok);
+        }
         self.chased = false;
         self.replay(slot);
-        taken
+        // The same input won again through its games: its runner-up is worth
+        // one walk of the path, after which a run of its entries costs one
+        // game each. A run that just ended left the runner-up the winner.
+        if self.tree[0] as usize == slot {
+            self.runner_up = self.path_best(slot);
+            self.chased = true;
+        }
+        taken.map(Ok)
     }
 }
 
