@@ -111,10 +111,17 @@ pub(super) enum Job {
     /// Loads a Page-ECC or columnar table's data block through the table's
     /// own path, which heals a corrected ECC block and reconstructs a
     /// columnar one.
+    ///
+    /// `keys` is empty for that load. Not empty, it names the few keys of the
+    /// batch that fall in a columnar group, each with its index: they are
+    /// read through the group's pages at `seqno`, the table's own, and no
+    /// block is built.
     Load {
         index: usize,
         table: TableAt,
         handle: BlockHandle,
+        seqno: crate::SeqNo,
+        keys: Vec<usize>,
     },
     /// Resolves the keys of `remaining` against a level key by key, run by
     /// run: the level's staged resolve could not plan a table of it or read
@@ -166,6 +173,19 @@ pub(super) enum MergeLocated {
     },
 }
 
+/// What [`Job::Load`] brought back.
+pub(super) enum Loaded {
+    /// The block, for its keys to be read in: `None` when the table holds no
+    /// key there (a columnar block its delete mask removes whole).
+    Block(Option<DataBlock>),
+    /// The versions found of the keys the job named, by key index.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(dead_code, reason = "only a columnar group is read key by key")
+    )]
+    Entries(Vec<(usize, InternalValue)>),
+}
+
 /// A finished [`Job`].
 pub(super) enum JobDone {
     Opened {
@@ -179,7 +199,7 @@ pub(super) enum JobDone {
     },
     Loaded {
         index: usize,
-        block: crate::Result<Option<DataBlock>>,
+        loaded: crate::Result<Loaded>,
     },
     Serial {
         result: crate::Result<super::tables_read::SerialLevel>,
@@ -225,14 +245,33 @@ impl Job {
                 index,
                 table,
                 handle,
+                seqno,
+                keys,
             } => JobDone::Loaded {
                 index,
-                block: table
+                loaded: table
                     .table(version)
                     .ok_or_else(misplaced)
                     // One block per job: nothing else of the lookup shares its file here.
                     .and_then(|table| {
-                        table.load_data_block(&handle, &crate::table::util::LookupFd::default())
+                        let fd = crate::table::util::LookupFd::default();
+                        #[cfg(feature = "columnar")]
+                        if !keys.is_empty() {
+                            let mut entries = Vec::with_capacity(keys.len());
+                            for idx in keys {
+                                if let Some(item) = table.point_read_pages_translated(
+                                    &handle,
+                                    ctx.key(idx),
+                                    seqno,
+                                    &fd,
+                                )? {
+                                    entries.push((idx, item));
+                                }
+                            }
+                            return Ok(Loaded::Entries(entries));
+                        }
+                        let _ = (seqno, keys);
+                        table.load_data_block(&handle, &fd).map(Loaded::Block)
                     }),
             },
             Self::Serial { level, remaining } => JobDone::Serial {

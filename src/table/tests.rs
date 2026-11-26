@@ -7009,6 +7009,75 @@ fn batch_get_matches_per_key_get() -> crate::Result<()> {
     )
 }
 
+/// A columnar table's `batch_get` answers as `get` does for every key at
+/// every snapshot, whether a row group is read through its pages for the few
+/// keys of the batch in it or rebuilt for many: keys in three versions whose
+/// runs straddle row pages and groups, deleted keys, absent keys.
+#[cfg(feature = "columnar")]
+#[test]
+fn batch_get_of_a_columnar_table_matches_per_key_get() -> crate::Result<()> {
+    let mut items = Vec::new();
+    for i in 0u32..120 {
+        let key = format!("k-{:03}", i * 2);
+        for seqno in (0u64..3).rev() {
+            items.push(if seqno == 2 && i % 5 == 0 {
+                crate::InternalValue::new_tombstone(key.as_bytes(), seqno)
+            } else {
+                crate::InternalValue::from_components(
+                    key.as_bytes(),
+                    format!("v-{i:03}-{seqno}-{}", "x".repeat(60)).as_bytes(),
+                    seqno,
+                    crate::ValueType::Value,
+                )
+            });
+        }
+    }
+
+    test_with_table(
+        &items,
+        |table| {
+            assert!(table.metadata.columnar, "self-check: a columnar table");
+            assert!(
+                table.metadata.data_block_count > 4,
+                "self-check: several row groups"
+            );
+            let keys: Vec<Vec<u8>> = (0..250).map(|i| format!("k-{i:03}").into_bytes()).collect();
+            for seqno in [1, 2, 3, SeqNo::MAX] {
+                // Every key, then every seventh, then pairs: many keys in a
+                // group, one or two, and a batch of its own per group.
+                let dense: Vec<&Vec<u8>> = keys.iter().collect();
+                let sparse: Vec<&Vec<u8>> = keys.iter().step_by(7).collect();
+                let batches = core::iter::once(dense.as_slice())
+                    .chain(core::iter::once(sparse.as_slice()))
+                    .chain(dense.chunks(2));
+                for picked in batches {
+                    let batch: Vec<(&[u8], u64)> =
+                        picked.iter().map(|k| (k.as_slice(), hash64(k))).collect();
+                    let found = table.batch_get(&batch, seqno)?;
+                    assert_eq!(found.len(), batch.len());
+                    for (&(key, hash), found) in batch.iter().zip(&found) {
+                        assert_eq!(
+                            found,
+                            &table.get(key, seqno, hash)?,
+                            "key {} at seqno {seqno} in a batch of {}",
+                            String::from_utf8_lossy(key),
+                            batch.len(),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        },
+        None,
+        Some(|writer: Writer| {
+            writer
+                .use_columnar(true)
+                .use_row_group_size(1_024)
+                .use_columnar_page_size(256)
+        }),
+    )
+}
+
 #[test]
 fn batch_get_same_user_key_across_block_boundary_finds_older_visible_version() -> crate::Result<()>
 {

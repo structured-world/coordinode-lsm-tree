@@ -116,10 +116,19 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         let mut jobs = 0usize;
         for (index, ((task, block), bytes)) in chunk.iter().zip(cached).zip(&special).enumerate() {
             if matches!(block, TaskBlock::Load) && bytes.is_none() {
+                // A columnar group a few keys fall in is not rebuilt for
+                // them: the job reads each through the group's pages.
+                let keys = if task.table.reads_keys_through_pages(task.keys.len()) {
+                    task.keys.iter().map(|&(idx, _)| idx).collect()
+                } else {
+                    Vec::new()
+                };
                 out.job(Job::Load {
                     index,
                     table: task.at,
                     handle: task.handle,
+                    seqno: task.table_seqno,
+                    keys,
                 });
                 jobs += 1;
             }
@@ -231,8 +240,8 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         Ok(count)
     }
 
-    /// Takes back the load of task `index` of `chunk`: `None` when the table
-    /// holds no key there (a columnar block its delete mask removes whole).
+    /// Takes back the load of task `index` of `chunk`: its block, whose keys
+    /// are read here, or the versions the job found of them itself.
     ///
     /// # Errors
     ///
@@ -241,12 +250,21 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         &mut self,
         chunk: &[BlockTask<'_>],
         index: usize,
-        block: Option<crate::table::DataBlock>,
+        loaded: super::read_job::Loaded,
     ) -> crate::Result<()> {
-        let (Some(block), Some(task)) = (block, chunk.get(index)) else {
-            return Ok(());
-        };
-        Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
+        match loaded {
+            super::read_job::Loaded::Entries(entries) => {
+                self.hits
+                    .extend(entries.into_iter().map(|(key, item)| (index, key, item)));
+                Ok(())
+            }
+            super::read_job::Loaded::Block(block) => {
+                let (Some(block), Some(task)) = (block, chunk.get(index)) else {
+                    return Ok(());
+                };
+                Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
+            }
+        }
     }
 
     /// Takes back the read of task `index` of `chunk` as its on-disk `frame`:

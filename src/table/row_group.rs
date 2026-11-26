@@ -34,8 +34,26 @@ pub(crate) struct RowGroupBlocks {
     /// The row pages the read selected.
     pub row_pages: RowPageSet,
     /// One slot per page the read wanted, in the directory's order.
-    pub pages: Vec<PageSlot>,
+    pub pages: PageSlots,
 }
+
+/// The slots of the pages a read wanted. A point read wants a handful (the
+/// key page, then the row's other columns on the one or two row pages its
+/// key's versions lie on), held without an allocation; a scan's many spill
+/// to the heap.
+pub(crate) type PageSlots = smallvec::SmallVec<[PageSlot; 8]>;
+
+/// One item per row page a read selected, in row order: inline for the one
+/// or two row pages of a point read.
+pub(crate) type PerRowPage<T> = smallvec::SmallVec<[T; 2]>;
+
+/// Row page ordinals a read selected one by one: a point read's one or two,
+/// held without an allocation.
+pub(crate) type RowPageOrdinals = smallvec::SmallVec<[u16; 4]>;
+
+/// The columns of one row page, in write order: inline for a point read's
+/// few.
+pub(crate) type PageColumns<T> = smallvec::SmallVec<[T; 4]>;
 
 impl RowGroupBlocks {
     /// Every page of the group, `pages` holding one block per directory entry
@@ -86,7 +104,7 @@ pub(crate) enum RowPageSet {
     /// A run of consecutive row pages.
     Range(core::ops::Range<u16>),
     /// Row pages picked one by one, ascending.
-    Listed(Vec<u16>),
+    Listed(RowPageOrdinals),
 }
 
 impl RowPageSet {
@@ -273,9 +291,9 @@ impl Wanted<'_> {
     /// The directory proved its entries a grid, each part's pages one per row
     /// page in row page order, so a page's index is its part's times the row
     /// page count plus its row page, and only the parts are looked at.
-    fn slots(&self, directory: &PageDirectory) -> Vec<PageSlot> {
+    fn slots(&self, directory: &PageDirectory) -> PageSlots {
         let row_page_count = directory.row_pages().len();
-        let mut slots = Vec::new();
+        let mut slots = PageSlots::new();
         for (part, first) in directory
             .entries()
             .iter()
@@ -867,9 +885,9 @@ impl GroupRead<'_> {
         directory: &PageDirectory,
         directory_len: u32,
         front: &Slice,
-        mut pages: Vec<PageSlot>,
+        mut pages: PageSlots,
         with_directory: bool,
-    ) -> crate::Result<Vec<PageSlot>> {
+    ) -> crate::Result<PageSlots> {
         let entries = directory.entries();
         let io_buffer = self.budget.io_buffer() as usize;
         let leads = self.claim_pages(directory, directory_len, front, &mut pages, with_directory);
@@ -1387,9 +1405,15 @@ impl RowGroupBlocks {
         let mut batches = Vec::with_capacity(ordinals.len());
         for (columns, &ordinal) in columns.into_iter().zip(&ordinals) {
             let row_count = self.directory.row_page_rows(ordinal).ok_or_else(outside)?;
-            batches.push(ColumnBatch { row_count, columns });
+            batches.push(ColumnBatch {
+                row_count,
+                columns: columns.into_vec(),
+            });
         }
-        Ok(RowPages { ordinals, batches })
+        Ok(RowPages {
+            ordinals: ordinals.into_vec(),
+            batches,
+        })
     }
 
     /// The pages of the columns `want` names among those the read selected,
@@ -1407,7 +1431,7 @@ impl RowGroupBlocks {
         &self,
         want: impl Fn(u16) -> bool,
         budget: &mut crate::table::columnar::DecodeBudget,
-    ) -> crate::Result<Vec<crate::table::columnar::RowPageColumns<'_>>> {
+    ) -> crate::Result<PerRowPage<crate::table::columnar::RowPageColumns<'_>>> {
         use crate::table::columnar::{Column, RowPageColumns};
 
         let (ordinals, columns) = self.by_row_page(
@@ -1469,17 +1493,17 @@ impl RowGroupBlocks {
         want: impl Fn(u16) -> bool,
         mut read: impl FnMut(&'s crate::Slice, u32, PageStamp) -> crate::Result<T>,
         column_of: impl Fn(&T) -> u16,
-    ) -> crate::Result<(Vec<u16>, Vec<Vec<T>>)> {
+    ) -> crate::Result<(RowPageOrdinals, PerRowPage<PageColumns<T>>)> {
         self.check_readable()?;
         let entries = self.directory.entries();
-        let ordinals: Vec<u16> = self.row_pages.iter().collect();
+        let ordinals: RowPageOrdinals = self.row_pages.iter().collect();
         // One column list per row page read, sized for every column the read
         // fetched. The slots are in directory order, which is column-major,
         // so each row page's columns arrive in write order.
         let per_page = self.pages.len() / ordinals.len().max(1);
-        let mut columns: Vec<Vec<T>> = ordinals
+        let mut columns: PerRowPage<PageColumns<T>> = ordinals
             .iter()
-            .map(|_| Vec::with_capacity(per_page))
+            .map(|_| PageColumns::with_capacity(per_page))
             .collect();
         let unknown_row_page = || {
             crate::Error::InvalidHeader("columnar: page names a row page the group does not have")

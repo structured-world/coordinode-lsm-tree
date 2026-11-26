@@ -2267,11 +2267,13 @@ impl Table {
         }
     }
 
-    /// Point-read counterpart to [`Self::load_columnar_data_block`]: rebuilds
-    /// only `needle`'s rows (its MVCC versions, minus any masked by the
-    /// positional delete-bitmap) into a tiny row block, or `Ok(None)` when the
-    /// key is absent / wholly deleted. The caller runs the normal seqno-aware
-    /// point read on the result.
+    /// Point-read counterpart to [`Self::load_columnar_data_block`]: the
+    /// version of `needle` a read at `seqno` sees in the group at `handle`
+    /// (the newest below `seqno` the positional delete-bitmap does not mask),
+    /// or `Ok(None)` when the group holds none: the key is absent, wholly
+    /// deleted, or newer than `seqno` in every row. No row is rebuilt and no
+    /// block is encoded: a value one column stores whole is a view of its
+    /// page.
     ///
     /// Only the key pages of the row pages whose key zone holds `needle` are
     /// read first, and a key they do not hold ends the read there: a miss
@@ -2279,12 +2281,13 @@ impl Table {
     /// hold the key are read, the directory and key pages coming from the
     /// cache.
     #[cfg(feature = "columnar")]
-    fn load_columnar_point_block(
+    fn columnar_point_version(
         &self,
         handle: &BlockHandle,
         needle: &[u8],
+        seqno: SeqNo,
         fd: &LookupFd,
-    ) -> crate::Result<Option<DataBlock>> {
+    ) -> crate::Result<Option<crate::table::columnar::KeyVersion>> {
         use crate::table::columnar::{COL_USER_KEY, TypeTag};
         use crate::table::row_group::{PageWant, RowPageSelect};
 
@@ -2310,8 +2313,9 @@ impl Table {
         // the run is selected, since each holds the needle.
         let mut hit: Option<core::ops::Range<u16>> = None;
         // Each hit page's run of the needle's rows, so the second step reads
-        // those rows without searching the keys again.
-        let mut runs: Vec<core::ops::Range<u32>> = Vec::new();
+        // those rows without searching the keys again. Held inline: a key's
+        // versions seldom cross more than one row page boundary.
+        let mut runs: smallvec::SmallVec<[core::ops::Range<u32>; 2]> = smallvec::SmallVec::new();
         for page in key_pages {
             let (ordinal, row_count) = (page.ordinal, page.rows);
             let Some(key_col) = page
@@ -2379,50 +2383,126 @@ impl Table {
             )),
             None => None,
         };
-        let mut rows = 0usize;
-        let rebuilt = DataBlock::columnar_point_block(
+        let mut built = 0usize;
+        let version = crate::table::columnar::point_version(
             pages,
             &runs,
             needle,
-            self.metadata.data_block_restart_interval,
+            seqno,
             deletes,
-            &mut rows,
+            &mut built,
             &mut budget,
         );
-        // `rows` is the needle's keys and values copied out of the columns
-        // when it is present (what decoding the pages copied was charged by
-        // `load_row_group`); a miss or a refused group still did those copies,
-        // so they are charged either way. The small block encoded from the
-        // rows exists only on a hit.
+        // `built` is the bytes of a value that had to be built from its
+        // columns (what decoding the pages copied was charged by
+        // `load_row_group`), charged whether the read then succeeded or not:
+        // the copies were made. A value served as a view of its page copied
+        // nothing.
         #[cfg(feature = "metrics")]
-        self.metrics.record_gather(rows);
+        self.metrics.record_gather(built);
         #[cfg(not(feature = "metrics"))]
-        let _ = rows;
-        let rebuilt = rebuilt?;
-        #[cfg(feature = "metrics")]
-        if let Some(rebuilt) = &rebuilt {
-            self.metrics.record_gather(rebuilt.inner.data.len());
-        }
-        Ok(rebuilt)
+        let _ = built;
+        version
     }
 
-    /// Loads the data block to point-read for `needle`: for a columnar SST the
-    /// key-aware fast path that rebuilds only the matching key's rows; for a row
-    /// SST the whole block. `Ok(None)` means the block carries no row for `needle`
-    /// (columnar: absent / wholly deleted), so the caller moves on. The file is
-    /// taken through `fd`, the lookup's.
-    fn load_point_block(
+    /// [`Self::columnar_point_version`] as an entry: its key is a copy of
+    /// `key`, its value the version's.
+    #[cfg(feature = "columnar")]
+    fn columnar_point_entry(
         &self,
         handle: &BlockHandle,
-        needle: &[u8],
+        key: &[u8],
+        seqno: SeqNo,
         fd: &LookupFd,
-    ) -> crate::Result<Option<DataBlock>> {
+    ) -> crate::Result<Option<InternalValue>> {
+        Ok(self
+            .columnar_point_version(handle, key, seqno, fd)?
+            .map(|version| InternalValue {
+                key: crate::key::InternalKey {
+                    user_key: crate::Slice::from(key),
+                    seqno: version.seqno,
+                    value_type: version.value_type,
+                },
+                value: version.value,
+            }))
+    }
+
+    /// The most keys of one batch a columnar row group is read for one by
+    /// one, each through the pages that hold it, before the group is rebuilt
+    /// into a row block once and searched for all of them.
+    ///
+    /// A point read of a group touches the few cached pages its key lies on
+    /// and copies nothing; rebuilding a group decodes every column of every
+    /// row and encodes them again, several times the group's bytes moved. A
+    /// batch whose keys are spread over a table lands a key or two in each
+    /// group it touches, and rebuilt a whole group for each of them.
+    #[cfg(feature = "columnar")]
+    const COLUMNAR_BATCH_POINT_READS: usize = 16;
+
+    /// What a point read of `key` at `seqno` finds in the data block at
+    /// `handle`, as `(value type, seqno, value)`, or `Ok(None)` when the block
+    /// holds no version the read sees, so the caller moves on. A row block is
+    /// searched as stored, from `hint` when the locator gave one; a columnar
+    /// group is read through its pages for the one version, with no block
+    /// built. The file is taken through `fd`, the lookup's.
+    fn block_point_value(
+        &self,
+        handle: &BlockHandle,
+        key: &[u8],
+        key_hash: u64,
+        seqno: SeqNo,
+        hint: Option<(u64, bool)>,
+        fd: &LookupFd,
+    ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            return self.load_columnar_point_block(handle, needle, fd);
+            // A columnar group is narrowed to this key's rows by the key
+            // search, so the full-block slot hint does not apply.
+            return Ok(self
+                .columnar_point_version(handle, key, seqno, fd)?
+                .map(|version| (version.value_type, version.seqno, version.value)));
         }
-        let _ = needle;
-        self.load_data_block(handle, fd)
+        let Some(data_block) = self.load_data_block(handle, fd)? else {
+            return Ok(None);
+        };
+        match hint {
+            Some((slot, is_entry)) => {
+                data_block.point_read_value_at_slot(slot, is_entry, key, seqno, &self.comparator)
+            }
+            None => {
+                data_block.point_read_value_hashed(key, Some(key_hash), seqno, &self.comparator)
+            }
+        }
+    }
+
+    /// [`Self::block_point_value`] for a read that wants the entry: the entry,
+    /// and the row block it lies in. A columnar group has no such block, and
+    /// its entry's key is a copy of `key`.
+    fn block_point_entry(
+        &self,
+        handle: &BlockHandle,
+        key: &[u8],
+        key_hash: u64,
+        seqno: SeqNo,
+        hint: Option<(u64, bool)>,
+        fd: &LookupFd,
+    ) -> crate::Result<Option<(InternalValue, Option<DataBlock>)>> {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return Ok(self
+                .columnar_point_entry(handle, key, seqno, fd)?
+                .map(|entry| (entry, None)));
+        }
+        let Some(data_block) = self.load_data_block(handle, fd)? else {
+            return Ok(None);
+        };
+        let found = match hint {
+            Some((slot, is_entry)) => {
+                data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
+            }
+            None => data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?,
+        };
+        Ok(found.map(|item| (item, Some(data_block))))
     }
 
     /// Loads a columnar data block and decodes only the projected columns of
@@ -7392,29 +7472,9 @@ impl Table {
         // MVCC-correctness argument). A located-block miss falls through to the
         // index walk below.
         if let Some((handle, hint)) = self.locator_block(key_hash)?
-            && let Some(data_block) = self.load_point_block(&handle, key, fd)?
+            && let Some(found) = self.block_point_value(&handle, key, key_hash, seqno, hint, fd)?
         {
-            // A columnar block is narrowed to this key's rows by load_point_block,
-            // so the full-block slot hint does not apply.
-            let is_columnar = cfg!(feature = "columnar") && self.metadata.columnar;
-            let found = match hint {
-                Some((slot, is_entry)) if !is_columnar => data_block.point_read_value_at_slot(
-                    slot,
-                    is_entry,
-                    key,
-                    seqno,
-                    &self.comparator,
-                )?,
-                _ => data_block.point_read_value_hashed(
-                    key,
-                    Some(key_hash),
-                    seqno,
-                    &self.comparator,
-                )?,
-            };
-            if let Some(found) = found {
-                return Ok(Some(found));
-            }
+            return Ok(Some(found));
         }
 
         let Some(mut iter) = self.block_index.point_read_reader(key, seqno) else {
@@ -7424,25 +7484,16 @@ impl Table {
         while let Some(block_handle) = iter.next_with(fd) {
             let block_handle = block_handle?;
 
-            // A columnar block carrying no row for this key (absent / wholly
-            // deleted) returns None here; still honor the end-key cutoff before
-            // skipping, so an absent key below this block's end key stops the
-            // scan instead of probing every later candidate block.
-            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key, fd)? else {
-                if self.comparator.compare(block_handle.end_key(), key)
-                    == core::cmp::Ordering::Greater
-                {
-                    return Ok(None);
-                }
-                continue;
-            };
-
             if let Some(found) =
-                data_block.point_read_value_hashed(key, Some(key_hash), seqno, &self.comparator)?
+                self.block_point_value(block_handle.as_ref(), key, key_hash, seqno, None, fd)?
             {
                 return Ok(Some(found));
             }
 
+            // A block holding no version the read sees (the key absent from
+            // it, wholly deleted, or newer in every row) still ends the walk
+            // when its end key is past ours: an absent key stops there
+            // instead of probing every later candidate block.
             if self.comparator.compare(block_handle.end_key(), key) == core::cmp::Ordering::Greater
             {
                 return Ok(None);
@@ -7538,7 +7589,7 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
         fd: &LookupFd,
-    ) -> crate::Result<Option<(InternalValue, DataBlock)>> {
+    ) -> crate::Result<Option<(InternalValue, Option<DataBlock>)>> {
         // Fast path: a retrieval-ribbon locator resolves the key to its data
         // block in O(1), skipping the index-block binary search. The located
         // block holds the newest version (the run's highest-seqno prefix), so a
@@ -7546,20 +7597,9 @@ impl Table {
         // visible version lives in a later block) safely falls through to the
         // index walk below.
         if let Some((handle, hint)) = self.locator_block(key_hash)?
-            && let Some(data_block) = self.load_point_block(&handle, key, fd)?
+            && let Some(found) = self.block_point_entry(&handle, key, key_hash, seqno, hint, fd)?
         {
-            // A columnar block is narrowed to this key's rows by load_point_block,
-            // so the full-block slot hint does not apply.
-            let is_columnar = cfg!(feature = "columnar") && self.metadata.columnar;
-            let found = match hint {
-                Some((slot, is_entry)) if !is_columnar => {
-                    data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
-                }
-                _ => data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?,
-            };
-            if let Some(item) = found {
-                return Ok(Some((item, data_block)));
-            }
+            return Ok(Some(found));
         }
 
         // Borrowing point-read seek: avoids cloning the index block + reuses
@@ -7572,27 +7612,15 @@ impl Table {
         while let Some(block_handle) = iter.next_with(fd) {
             let block_handle = block_handle?;
 
-            // A columnar block carrying no row for this key (absent / wholly
-            // deleted) returns None here; still honor the end-key cutoff before
-            // skipping, so an absent key below this block's end key stops the
-            // scan instead of probing every later candidate block.
-            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key, fd)? else {
-                if self.comparator.compare(block_handle.end_key(), key)
-                    == core::cmp::Ordering::Greater
-                {
-                    return Ok(None);
-                }
-                continue;
-            };
-
-            if let Some(item) =
-                data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?
+            if let Some(found) =
+                self.block_point_entry(block_handle.as_ref(), key, key_hash, seqno, None, fd)?
             {
-                return Ok(Some((item, data_block)));
+                return Ok(Some(found));
             }
 
-            // NOTE: If the last block key is higher than ours,
-            // our key cannot be in the next block
+            // A block holding no version the read sees still ends the walk
+            // when its end key is past ours: our key cannot be in the next
+            // block.
             if self.comparator.compare(block_handle.end_key(), key) == core::cmp::Ordering::Greater
             {
                 return Ok(None);
@@ -7618,6 +7646,10 @@ impl Table {
     /// Holding on to the returned [`Block`] (e.g. for [`PinnableSlice`]) keeps the
     /// block data alive while the value is in use, but does not guarantee that the
     /// cache will retain its own entry for that block.
+    ///
+    /// A columnar group has no row block to return: the entry found is
+    /// encoded into one of its own, and the entry returned is read from it,
+    /// so its value lies in the block the caller keeps.
     fn point_read_with_block(
         &self,
         key: &[u8],
@@ -7625,8 +7657,28 @@ impl Table {
         key_hash: u64,
         fd: &LookupFd,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
-        self.point_read_inner(key, seqno, key_hash, fd)
-            .map(|opt| opt.map(|(iv, db)| (iv, db.inner)))
+        let Some((entry, block)) = self.point_read_inner(key, seqno, key_hash, fd)? else {
+            return Ok(None);
+        };
+        if let Some(block) = block {
+            return Ok(Some((entry, block.inner)));
+        }
+        #[cfg(feature = "columnar")]
+        {
+            let block = DataBlock::of_entry(&entry, self.metadata.data_block_restart_interval)?;
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(block.inner.data.len());
+            // The block holds that one entry, so a read past every seqno
+            // finds it.
+            let pinned = block.point_read(key, SeqNo::MAX, &self.comparator)?;
+            Ok(pinned.map(|entry| (entry, block.inner)))
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            // Only a columnar group is read without a row block.
+            let _ = entry;
+            Err(crate::Error::Unrecoverable)
+        }
     }
 
     /// Batch point-read variant of [`Table::get`].
@@ -7875,9 +7927,44 @@ impl Table {
                 continue;
             }
 
-            // A wholly-deleted columnar block carries no keys; skip it.
-            let Some(data_block) = self.load_data_block(block_handle.as_ref(), &fd)? else {
-                continue;
+            // A columnar group a few of the batch's keys fall in is read for
+            // each of them through its pages, with no block rebuilt (see
+            // `COLUMNAR_BATCH_POINT_READS`).
+            #[cfg(feature = "columnar")]
+            let through_pages = self.metadata.columnar
+                && passing
+                    .get(p..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take(Self::COLUMNAR_BATCH_POINT_READS + 1)
+                    .take_while(|&&i| {
+                        sorted_keys.get(i).is_some_and(|(key, _)| {
+                            self.comparator.compare(key, end_key) != core::cmp::Ordering::Greater
+                        })
+                    })
+                    .count()
+                    <= Self::COLUMNAR_BATCH_POINT_READS;
+            #[cfg(not(feature = "columnar"))]
+            let through_pages = false;
+            let data_block = if through_pages {
+                None
+            } else {
+                // A wholly-deleted columnar block carries no keys; skip it.
+                let Some(data_block) = self.load_data_block(block_handle.as_ref(), &fd)? else {
+                    continue;
+                };
+                Some(data_block)
+            };
+            let read = |key: &[u8], key_hash: u64| -> crate::Result<Option<InternalValue>> {
+                match &data_block {
+                    Some(block) => {
+                        block.point_read_hashed(key, Some(key_hash), table_seqno, &self.comparator)
+                    }
+                    #[cfg(feature = "columnar")]
+                    None => self.columnar_point_entry(block_handle.as_ref(), key, table_seqno, &fd),
+                    #[cfg(not(feature = "columnar"))]
+                    None => Ok(None),
+                }
             };
 
             // Drain passing keys that fall inside [..end_key].
@@ -7906,12 +7993,7 @@ impl Table {
                 match self.comparator.compare(key, end_key) {
                     core::cmp::Ordering::Greater => break,
                     core::cmp::Ordering::Less => {
-                        if let Some(mut item) = data_block.point_read_hashed(
-                            key,
-                            Some(key_hash),
-                            table_seqno,
-                            &self.comparator,
-                        )? {
+                        if let Some(mut item) = read(key, key_hash)? {
                             // Translate table-local seqno back to
                             // the global coordinate so callers can
                             // compare results across tables /
@@ -7923,12 +8005,7 @@ impl Table {
                         p += 1;
                     }
                     core::cmp::Ordering::Equal => {
-                        if let Some(mut item) = data_block.point_read_hashed(
-                            key,
-                            Some(key_hash),
-                            table_seqno,
-                            &self.comparator,
-                        )? {
+                        if let Some(mut item) = read(key, key_hash)? {
                             item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                             results[key_idx] = Some(item);
                             p += 1;
@@ -8563,6 +8640,47 @@ impl Table {
         let global_seqno = self.global_seqno();
         Ok(block
             .point_read_hashed(key, Some(key_hash), table_seqno, &self.comparator)?
+            .map(|mut item| {
+                item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
+                item
+            }))
+    }
+
+    /// Whether a batch with `keys` keys in one data block of this table reads
+    /// each through the pages that hold it, rather than loading the block:
+    /// a columnar table's few (see `COLUMNAR_BATCH_POINT_READS`).
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(clippy::unused_self, reason = "only a columnar table reads as pages")
+    )]
+    pub(crate) fn reads_keys_through_pages(&self, keys: usize) -> bool {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return keys <= Self::COLUMNAR_BATCH_POINT_READS;
+        }
+        let _ = keys;
+        false
+    }
+
+    /// Point-reads `key` in the columnar row group at `handle` through its
+    /// pages, with the seqno of a hit translated as
+    /// [`Self::point_read_translated`] translates it: the same answer as that
+    /// read of the loaded group gives, with no block built.
+    ///
+    /// # Errors
+    ///
+    /// As a point read of the group.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn point_read_pages_translated(
+        &self,
+        handle: &BlockHandle,
+        key: &[u8],
+        table_seqno: SeqNo,
+        fd: &LookupFd,
+    ) -> crate::Result<Option<InternalValue>> {
+        let global_seqno = self.global_seqno();
+        Ok(self
+            .columnar_point_entry(handle, key, table_seqno, fd)?
             .map(|mut item| {
                 item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                 item

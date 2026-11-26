@@ -474,8 +474,8 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
         let chunk = &self.tasks[self.start..current.end];
         let failure = match done {
             JobDone::Opened { tag, file } => file.map(|file| current.read.opened(tag, file)),
-            JobDone::Loaded { index, block } => {
-                block.and_then(|block| current.read.loaded(chunk, index, block))
+            JobDone::Loaded { index, loaded } => {
+                loaded.and_then(|loaded| current.read.loaded(chunk, index, loaded))
             }
             JobDone::Planned { .. }
             | JobDone::Serial { .. }
