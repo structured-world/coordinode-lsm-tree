@@ -172,6 +172,21 @@ fn bench_point_lookup(c: &mut Criterion) {
 /// read after the first pass does the read path's own work on cached blocks,
 /// none of it served from a cached row.
 fn build_warm_tree(columnar: bool, n: u64, value_len: usize) -> (TempDir, Tree) {
+    let (dir, tree) = build_cached_tree(columnar, n, value_len, 1_024 * 1_024 * 1_024);
+    // Bring every block into the cache.
+    let rows = tree.iter(SeqNo::MAX, None).count();
+    assert_eq!(rows as u64, n, "the warming scan must see every row");
+    (dir, tree)
+}
+
+/// A flushed single-run tree of `n` entries with values of `value_len` bytes,
+/// read through a block cache of `cache_bytes` and no row cache.
+fn build_cached_tree(
+    columnar: bool,
+    n: u64,
+    value_len: usize,
+    cache_bytes: u64,
+) -> (TempDir, Tree) {
     use lsm_tree::Cache;
     use std::sync::Arc;
 
@@ -184,7 +199,7 @@ fn build_warm_tree(columnar: bool, n: u64, value_len: usize) -> (TempDir, Tree) 
         SequenceNumberCounter::default(),
     )
     .use_cache(Arc::new(
-        Cache::with_capacity_bytes(1_024 * 1_024 * 1_024).with_row_cache(false),
+        Cache::with_capacity_bytes(cache_bytes).with_row_cache(false),
     ))
     .with_runtime_config(rc)
     .open()
@@ -200,10 +215,67 @@ fn build_warm_tree(columnar: bool, n: u64, value_len: usize) -> (TempDir, Tree) 
         tree.insert(format!("key{i:08}").as_bytes(), value, i);
     }
     tree.flush_active_memtable(0).expect("flush");
-    // Bring every block into the cache.
-    let rows = tree.iter(SeqNo::MAX, None).count();
-    assert_eq!(rows as u64, n, "the warming scan must see every row");
     (dir, tree)
+}
+
+/// Batch lookups over a block cache far smaller than the table, with no row
+/// cache: a batch finds the groups it reads not cached. The OS page cache is
+/// left as the writes warmed it, so the reads complete from memory and the
+/// figures are the engine's cost of a cold block cache (the requests it
+/// makes, the bytes it takes in and what it does with them), not a device's
+/// latency. Batches are shaped as in `columnar/warm_multi_get`.
+///
+/// With the `metrics` feature, prints the block requests and the bytes read
+/// per batch beside each shape.
+fn bench_cold_multi_get(c: &mut Criterion) {
+    let n = 100_000u64;
+    let value_len = 128;
+    let shapes: [(u64, u64); 5] = [(1, 1), (4, 1), (16, 1), (4, 2_048), (16, 2_048)];
+
+    let mut group = c.benchmark_group("columnar/cold_multi_get");
+    for (columnar, layout) in [(false, "row"), (true, "columnar")] {
+        let (_dir, tree) = build_cached_tree(columnar, n, value_len, 256 * 1_024);
+        for (keys, stride) in shapes {
+            let span = keys * stride;
+            // Many distinct batches, so one seldom finds what the last read
+            // of its groups left in the small cache.
+            let batches: Vec<Vec<Vec<u8>>> = (0..4_096u64)
+                .map(|at| {
+                    let start = at.wrapping_mul(2_654_435_761) % (n - span);
+                    (0..keys)
+                        .map(|k| format!("key{:08}", start + k * stride).into_bytes())
+                        .collect()
+                })
+                .collect();
+            let label = format!("{layout}/keys_{keys}_stride_{stride}");
+            #[cfg(feature = "metrics")]
+            {
+                let m = tree.metrics();
+                let (requests, bytes) = (m.block_io(), m.bytes_read());
+                for batch in &batches {
+                    std::hint::black_box(tree.multi_get(batch, SeqNo::MAX).expect("multi_get"));
+                }
+                let per = batches.len() as f64;
+                eprintln!(
+                    "{label}: requests={:.2} bytes_read={:.0} per batch",
+                    (m.block_io() - requests) as f64 / per,
+                    (m.bytes_read() - bytes) as f64 / per,
+                );
+            }
+            group.bench_function(&label, |b| {
+                let mut i = 0usize;
+                b.iter_custom(|iters| {
+                    timed_with_tail(&label, iters, || {
+                        let batch = &batches[i % batches.len()];
+                        i = i.wrapping_add(1);
+                        let v = tree.multi_get(batch, SeqNo::MAX).expect("multi_get");
+                        std::hint::black_box(v);
+                    })
+                });
+            });
+        }
+    }
+    group.finish();
 }
 
 /// Point lookups whose every block is cached and no row is: the cost of
@@ -334,6 +406,7 @@ criterion_group!(
     bench_point_lookup,
     bench_warm_point_lookup,
     bench_warm_multi_get,
+    bench_cold_multi_get,
     bench_filter_batch
 );
 criterion_main!(benches);

@@ -2448,7 +2448,9 @@ impl<'a> PointPage<'a> {
             {
                 // One value column without nulls, the common shape: its cell is
                 // the value, with no framing to build, and where the cell lies in
-                // the page the value is a view of it.
+                // the page the value is a view of it. A value short enough for
+                // the handle to hold inline is a view all the same and is not
+                // counted as copied, as the counter defines a view.
                 match access.get(*type_tag, rows, row)? {
                     expr::Cell::Borrowed(bytes) => expr::view_of(page, bytes),
                     rebuilt @ expr::Cell::Inline { .. } => {
