@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795651973176,
+  "lastUpdate": 1795651978153,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -128046,6 +128046,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.406262964,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8cff91586cb24ec157b75d42b0fe089b4e4a1651",
+          "message": "fix(table): build the longest-prefix kernels for soft-float targets (#1111)\n\n## Summary\n\n- The crate builds for soft-float targets (`x86_64-unknown-none`,\n`i686-unknown-uefi`, `aarch64-unknown-none-softfloat`): the vector\nlongest-shared-prefix kernels are compiled only where the compiler\naccepts them, and a target whose ABI leaves the vector registers out\ntakes the scalar kernel.\n- Every other target keeps the dispatch `main` has, a 32-bit x86 target\nwithout SSE2 in its baseline (`i586-unknown-linux-gnu`) included:\nAVX-512BW, AVX2 and SSE2 are chosen at run time there as before.\n\n## Changes\n\n- The build script asks the compiler whether it accepts, for the target\nbeing built and with the crate's own flags, a function that enables\nSSE2. It refuses one only where the ABI has no vector registers; the\ntarget's feature list cannot tell that from a baseline without SSE2. The\nanswer sets the cfg `lsp_x86`, which gates the SSE2, AVX2 and AVX-512\nkernels and their run-time dispatch in `table::util`.\n- The same function is compiled without the attribute first: only one\nthat builds without it and not with it counts as a refusal. When the\ncompiler gives no answer, the target's own features decide and the build\nprints a warning.\n- `lsp_neon` (a little-endian AArch64 target whose features include\nNEON) gates the NEON kernel, as `xxh3_neon` gates xxh3's.\n- A test checks that a target with vector registers resolves a vector\nkernel.\n- CI checks `x86_64-unknown-none`, `i686-unknown-uefi`,\n`i586-unknown-linux-gnu` and `aarch64-unknown-none-softfloat` in the\nno-std job. Each x86 target states whether it expects the kernels\n(`LSM_TREE_EXPECT_LSP_X86`), and a differing answer fails the build. The\nworkflow expects them in every other x86 build it makes.\n\n## Measurement\n\n`benches/lsp.rs`, the dispatched path, `main` (f98cc149) against this\nbranch (14b0f18b) on one host (Xeon E5-2697 v4, AVX2, Linux), three\nalternating rounds each, median of the rounds' estimates:\n\n| benchmark | main, ns | branch, ns | branch / main |\n|---|---|---|---|\n| full_match 16B | 16.313 | 16.172 | 0.991 |\n| quarter_match 16B | 8.719 | 8.780 | 1.007 |\n| full_match 32B | 5.823 | 5.829 | 1.001 |\n| quarter_match 32B | 7.211 | 5.840 | 0.810 |\n| full_match 64B | 6.578 | 6.704 | 1.019 |\n| quarter_match 64B | 5.891 | 5.843 | 0.992 |\n| full_match 128B | 8.768 | 8.742 | 0.997 |\n| quarter_match 128B | 6.718 | 6.582 | 0.980 |\n| full_match 256B | 11.646 | 11.624 | 0.998 |\n| quarter_match 256B | 7.502 | 7.412 | 0.988 |\n| full_match 1024B | 44.745 | 29.599 | 0.662 |\n| quarter_match 1024B | 12.870 | 11.655 | 0.906 |\n\nNo case is slower beyond 2%. The kernels and the dispatch are the same\nsource as on `main` for this target, so the two faster cases (1024B full\nmatch in all three rounds, 32B quarter match in two) are taken as code\nplacement in the binary, not as a gain of this change.\n\nThe `i586-unknown-linux-gnu` build compiles the same kernels and\ndispatch as `main` (the build script sets `lsp_x86` for it), so it has\nno measurement of its own.\n\n## Testing\n\nTests, clippy (default and all features, and the x86-64 build),\nformatting, docs with warnings denied and the no-std checks (Thumb, both\nsoft-float targets, `i686-unknown-uefi`, `i586-unknown-linux-gnu`) pass\non macOS; CI runs the full matrix.\n\nCloses #1108\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* Longest-prefix matching now selects available x86 or ARM vector\noptimizations across a wider range of build targets, while retaining\nscalar processing where vector support is unavailable.\n* Builds targeting additional no-standard-library platforms receive\nexpanded compatibility checks.\n* **Tests**\n* Added coverage for selecting optimized kernels on targets with SSE2 or\nsupported ARM NEON features.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-26T00:48:15+02:00",
+          "tree_id": "196cbf0445d2e2373bcd81108cfbf89cef603c23",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8cff91586cb24ec157b75d42b0fe089b4e4a1651"
+        },
+        "date": 1795651976892,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 651.3870000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 156.510876ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 234.989,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 192.75615ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1219.06,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 246.596386ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5938.405,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 23310.083,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.463,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 49.348607,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.405935689,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.871,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.133887,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.405766651,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
