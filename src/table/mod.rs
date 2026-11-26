@@ -2589,18 +2589,6 @@ impl Table {
             }))
     }
 
-    /// The most keys of one batch a columnar row group is read for one by
-    /// one, each through the pages that hold it, before the group is rebuilt
-    /// into a row block once and searched for all of them.
-    ///
-    /// A point read of a group touches the few cached pages its key lies on
-    /// and copies nothing; rebuilding a group decodes every column of every
-    /// row and encodes them again, several times the group's bytes moved. A
-    /// batch whose keys are spread over a table lands a key or two in each
-    /// group it touches, and rebuilt a whole group for each of them.
-    #[cfg(feature = "columnar")]
-    const COLUMNAR_BATCH_POINT_READS: usize = 16;
-
     /// What a point read of `key` at `seqno` finds in the data block at
     /// `handle`, as `(value type, seqno, value)`, or `Ok(None)` when the block
     /// holds no version the read sees, so the caller moves on. A row block is
@@ -8089,11 +8077,10 @@ impl Table {
                 continue;
             }
 
-            // A columnar group a few of the batch's keys fall in is read for
-            // each of them through its pages, with no block rebuilt (see
-            // `COLUMNAR_BATCH_POINT_READS`).
+            // The batch's keys in a columnar group are read through its
+            // pages, prepared once for all of them, with no block rebuilt.
             #[cfg(feature = "columnar")]
-            if self.metadata.columnar {
+            if self.reads_keys_through_pages() {
                 let here = passing.get(p..).unwrap_or_default();
                 let in_block = here
                     .iter()
@@ -8103,27 +8090,25 @@ impl Table {
                         })
                     })
                     .count();
-                if self.reads_keys_through_pages(in_block) {
-                    let here = here.get(..in_block).unwrap_or_default();
-                    self.columnar_point_entries(
-                        block_handle.as_ref(),
-                        here.len(),
-                        |n| sorted_keys[here[n]].0,
-                        table_seqno,
-                        &fd,
-                        |n, item| results[here[n]] = Some(item),
-                    )?;
-                    // A key equal to the block's end key that this block
-                    // holds no visible version of may continue in the next:
-                    // it stays for the next block, as in the drain below.
-                    let stays = here.last().is_some_and(|&last| {
-                        results[last].is_none()
-                            && self.comparator.compare(sorted_keys[last].0, end_key)
-                                == core::cmp::Ordering::Equal
-                    });
-                    p += in_block - usize::from(stays);
-                    continue;
-                }
+                let here = here.get(..in_block).unwrap_or_default();
+                self.columnar_point_entries(
+                    block_handle.as_ref(),
+                    here.len(),
+                    |n| sorted_keys[here[n]].0,
+                    table_seqno,
+                    &fd,
+                    |n, item| results[here[n]] = Some(item),
+                )?;
+                // A key equal to the block's end key that this block holds
+                // no visible version of may continue in the next: it stays
+                // for the next block, as in the drain below.
+                let stays = here.last().is_some_and(|&last| {
+                    results[last].is_none()
+                        && self.comparator.compare(sorted_keys[last].0, end_key)
+                            == core::cmp::Ordering::Equal
+                });
+                p += in_block - usize::from(stays);
+                continue;
             }
             // A wholly-deleted columnar block carries no keys; skip it.
             let Some(data_block) = self.load_data_block(block_handle.as_ref(), &fd)? else {
@@ -8812,20 +8797,13 @@ impl Table {
             }))
     }
 
-    /// Whether a batch with `keys` keys in one data block of this table reads
-    /// each through the pages that hold it, rather than loading the block:
-    /// a columnar table's few (see `COLUMNAR_BATCH_POINT_READS`).
-    #[cfg_attr(
-        not(feature = "columnar"),
-        expect(clippy::unused_self, reason = "only a columnar table reads as pages")
-    )]
-    pub(crate) fn reads_keys_through_pages(&self, keys: usize) -> bool {
-        #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            return keys <= Self::COLUMNAR_BATCH_POINT_READS;
-        }
-        let _ = keys;
-        false
+    /// Whether a batch reads its keys in one data block of this table through
+    /// the pages that hold them, rather than loading the block: a columnar
+    /// table's, whose group would have to be rebuilt into a row block. The
+    /// pages the keys share are prepared once, so the read costs less than
+    /// the rebuild however many of the batch's keys fall in the group.
+    pub(crate) fn reads_keys_through_pages(&self) -> bool {
+        cfg!(feature = "columnar") && self.metadata.columnar
     }
 
     /// Whether the table has a filter to probe.

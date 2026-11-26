@@ -116,9 +116,9 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         let mut jobs = 0usize;
         for (index, ((task, block), bytes)) in chunk.iter().zip(cached).zip(&special).enumerate() {
             if matches!(block, TaskBlock::Load) && bytes.is_none() {
-                // A columnar group a few keys fall in is not rebuilt for
-                // them: the job reads each through the group's pages.
-                let keys = if task.table.reads_keys_through_pages(task.keys.len()) {
+                // A columnar group is not rebuilt for the batch's keys: the
+                // job reads them through the group's pages.
+                let keys = if task.table.reads_keys_through_pages() {
                     task.keys.iter().map(|&(idx, _)| idx).collect()
                 } else {
                     Vec::new()
