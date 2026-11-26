@@ -12,6 +12,7 @@
 //! | `sorted` | the engine's [`Merger`]: slot numbers kept in sorted order, a replaced entry placed by binary search |
 //! | `binary` | a binary min-heap of slot numbers, the replaced top sifted down |
 //! | `loser` | a tournament tree that only moves forward: the replaced winner replays its path to the root |
+//! | `streak` | that tree, taking the next entry of an input that keeps winning with one comparison and no game |
 //!
 //! The two written here compare as the engine's does: by an eight-byte word of
 //! each key past the prefix every key shares, by the whole keys where the
@@ -466,14 +467,23 @@ impl Iterator for BinaryMerge {
 /// A tournament tree that only moves forward: `tree[0]` is the winning slot,
 /// `tree[node]` the slot that lost the game at `node`. An input that ran out
 /// leaves its slot empty, and an empty slot loses every game.
-struct LoserMerge {
+///
+/// With `STREAK`, an input that wins twice in a row has the best of the slots
+/// that lost to it on its path found, and while its next entries come before
+/// that slot's they are taken with one game and the tree left as it stands:
+/// replaying it would change nothing.
+struct LoserMerge<const STREAK: bool> {
     slots: Slots,
     sources: Vec<Source>,
     tree: Vec<u32>,
     live: usize,
+    /// The slot the winning input's next entry must come before to win again
+    /// unplayed, while `chased`.
+    runner_up: usize,
+    chased: bool,
 }
 
-impl LoserMerge {
+impl<const STREAK: bool> LoserMerge<STREAK> {
     fn new(
         mut sources: Vec<Source>,
         comparator: SharedComparator,
@@ -493,6 +503,8 @@ impl LoserMerge {
             sources,
             tree: vec![0; leaves],
             live,
+            runner_up: 0,
+            chased: false,
         };
         // The winner of each subtree, by node number: leaves from `leaves` up.
         let mut winners: Vec<u32> = (0..2 * leaves as u32)
@@ -538,9 +550,26 @@ impl LoserMerge {
         }
         self.tree[0] = winner as u32;
     }
+
+    /// The best of the slots that lost on the path from `leaf` to the root:
+    /// the entry that wins once `leaf`'s input stops winning.
+    #[inline]
+    fn path_best(&self, leaf: usize) -> usize {
+        let mut node = (self.tree.len() + leaf) / 2;
+        let mut best = self.tree[node] as usize;
+        node >>= 1;
+        while node >= 1 {
+            let loser = self.tree[node] as usize;
+            if self.beats(loser, best) {
+                best = loser;
+            }
+            node >>= 1;
+        }
+        best
+    }
 }
 
-impl Iterator for LoserMerge {
+impl<const STREAK: bool> Iterator for LoserMerge<STREAK> {
     type Item = Item;
 
     #[inline]
@@ -554,10 +583,25 @@ impl Iterator for LoserMerge {
             Some(Err(e)) => return Some(Err(e)),
             None => {
                 self.live -= 1;
+                self.chased = false;
                 self.slots.entries[slot].take()
             }
         };
-        self.replay(slot);
+        if STREAK && self.chased {
+            if self.beats(slot, self.runner_up) {
+                return old.map(Ok);
+            }
+            self.chased = false;
+            self.replay(slot);
+        } else {
+            self.replay(slot);
+            // The same input won again through its games: a streak may have
+            // started, and its runner-up is worth one walk of the path.
+            if STREAK && self.tree[0] as usize == slot && self.slots.entries[slot].is_some() {
+                self.runner_up = self.path_best(slot);
+                self.chased = true;
+            }
+        }
         old.map(Ok)
     }
 }
@@ -567,16 +611,18 @@ enum Arm {
     Sorted,
     Binary,
     Loser,
+    Streak,
 }
 
 impl Arm {
-    const ALL: [Self; 3] = [Self::Sorted, Self::Binary, Self::Loser];
+    const ALL: [Self; 4] = [Self::Sorted, Self::Binary, Self::Loser, Self::Streak];
 
     fn label(self) -> &'static str {
         match self {
             Self::Sorted => "sorted",
             Self::Binary => "binary",
             Self::Loser => "loser",
+            Self::Streak => "streak",
         }
     }
 }
@@ -631,7 +677,14 @@ fn merge(
             Ok(merge.slots.work())
         }
         Arm::Loser => {
-            let mut merge = LoserMerge::new(sources, Arc::clone(comparator), prefix)?;
+            let mut merge = LoserMerge::<false>::new(sources, Arc::clone(comparator), prefix)?;
+            for entry in merge.by_ref() {
+                each(entry?);
+            }
+            Ok(merge.slots.work())
+        }
+        Arm::Streak => {
+            let mut merge = LoserMerge::<true>::new(sources, Arc::clone(comparator), prefix)?;
             for entry in merge.by_ref() {
                 each(entry?);
             }
@@ -670,7 +723,7 @@ fn check_arms_agree(
         }),
         "{label}: the merged entries ascend, a key's newer version first"
     );
-    for arm in [Arm::Binary, Arm::Loser] {
+    for arm in [Arm::Binary, Arm::Loser, Arm::Streak] {
         assert!(
             output(arm)? == expected,
             "{label}: the {} merge yields what the engine's does",
