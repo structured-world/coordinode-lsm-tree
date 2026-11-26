@@ -505,12 +505,17 @@ impl<'a> BlobIngestion<'a> {
             let prior = index.install_replacing(&mut versions, &tables, &blob_files)?;
             drop(versions);
             installed.charge();
-            index.mark_replaced(run, recency);
-            prior
+            let marked = index.mark_replaced(run, recency);
+            (prior, marked)
         };
         // The installed files name their dictionaries from here on.
         drop(write_pin);
-        crate::tree::reclaim_replaced(&prior);
+        // Unmarked, the install reads to a repair as never made: the earlier
+        // files stay for it until the next open.
+        let (prior, marked) = prior;
+        if marked {
+            crate::tree::reclaim_replaced(&prior);
+        }
         Ok(())
     }
 

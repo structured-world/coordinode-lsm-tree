@@ -5163,17 +5163,21 @@ fn scan_table_folders(
             // its ingestion was installed, at offset 0 as every replacing
             // install is, and names the recency of the run. The table names
             // its ingestion in its meta block, so it is opened once for that,
-            // and only where a mark was found at all. A replacing ingestion's
-            // table with neither was never installed, and fails closed below
-            // as any ingested table without a recoverable offset does.
-            let manifest_position: Option<ManifestPosition> = match (recorded_position, &own_digest)
-            {
-                (Some(position), _) => Some(position),
-                (None, Ok(digest)) if !replace_runs.is_empty() => {
+            // and only where a mark was found at all. The open reads the
+            // trailer, the meta block and the index, and checks no digest, so
+            // it is made whether the file hashed or not: a table with a data
+            // block that does not read still names its ingestion, and its
+            // salvage needs the place as much as a whole table does. A
+            // replacing ingestion's table with neither was never installed,
+            // and fails closed below as any ingested table without a
+            // recoverable offset does.
+            let manifest_position: Option<ManifestPosition> = match recorded_position {
+                Some(position) => Some(position),
+                None if !replace_runs.is_empty() => {
                     match Table::recover(repair_recover_params(
                         config,
                         table_path.clone(),
-                        *digest,
+                        crate::Checksum::from_raw(0),
                         table_id,
                         folder_fs.clone(),
                         None,
@@ -5191,7 +5195,7 @@ fn scan_table_folders(
                         Err(_) => None,
                     }
                 }
-                (None, _) => None,
+                None => None,
             };
             let committed_digest = manifest_referenced
                 .as_ref()

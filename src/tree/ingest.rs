@@ -786,12 +786,17 @@ impl<'a> Ingestion<'a> {
             let prior = self.tree.install_replacing(&mut versions, &tables, &[])?;
             drop(versions);
             installed.charge();
-            self.tree.mark_replaced(run, recency);
-            prior
+            let marked = self.tree.mark_replaced(run, recency);
+            (prior, marked)
         };
         // The installed tables name their dictionary from here on.
         drop(write_pin);
-        crate::tree::reclaim_replaced(&prior);
+        // Unmarked, the install reads to a repair as never made: the earlier
+        // files stay for it until the next open.
+        let (prior, marked) = prior;
+        if marked {
+            crate::tree::reclaim_replaced(&prior);
+        }
         Ok(())
     }
 

@@ -562,12 +562,14 @@ so a power loss between the two leaves an install without it. The manifest
 names the tables, and the next open marks the ingestion from it; a manifest
 lost before that open leaves the repair with tables no mark proves, and it
 leaves all of them out as never installed. The earlier tables are removed
-after the mark, so they are still on the disk then, and the repair rebuilds
-the earlier content: the ingestion had not returned. A mark that could not be
-made at all (the filesystem refused it) does not fail the replace, which is
-installed and durable by then; the earlier tables are removed all the same,
-and a manifest lost before the next open leaves the repair with neither
-content.
+only once the mark is durable, so they are still on the disk then, and the
+repair rebuilds the earlier content: the ingestion had not returned. A mark
+that could not be made, or whose folder did not sync (the filesystem refused
+it), does not fail the replace, which is installed and durable by then; the
+earlier tables then stay on the disk until the next open, which marks the
+install and removes them, and a manifest lost before that open leaves the
+repair with the earlier content and whatever was written after the replace,
+without the replaced rows.
 
 **The publish phase is a sequence of renames, not one atomic act.** Publishing
 under fresh ids reduces this to "write new files, then commit the manifest",

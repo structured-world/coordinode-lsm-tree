@@ -1074,8 +1074,9 @@ impl AbstractTree for Tree {
         // The mark of an install that kept no table, under a number of its
         // own: a repair of a manifest lost before the next open leaves out
         // what this dropped (see `replace_mark`).
-        self.mark_replaced(bound, bound);
-        reclaim_replaced(&prior);
+        if self.mark_replaced(bound, bound) {
+            reclaim_replaced(&prior);
+        }
         Ok(())
     }
 
@@ -2711,20 +2712,26 @@ impl Tree {
     /// (see [`crate::replace_mark`]), in the folder its tables were written
     /// to. Called before the earlier tables are reclaimed.
     ///
-    /// A failure is logged, not returned: the replace is installed and
-    /// durable, which is what the caller asked for, and the next open leaves
-    /// the mark the manifest still owes. Until then only a repair without a
-    /// manifest would miss it, and it would miss the whole install, never a
-    /// part of it.
-    pub(crate) fn mark_replaced(&self, run: TableId, bound: TableId) {
+    /// Returns whether the mark is durable. A failure is logged, not
+    /// returned as an error: the replace is installed and durable, which is
+    /// what the caller asked for, and the next open leaves the mark the
+    /// manifest still owes. Until then a repair without a manifest reads the
+    /// install as never made, the whole of it, so the caller keeps the
+    /// earlier files where they lie (the open that marks the install removes
+    /// them): that repair then rebuilds the earlier content, not an empty
+    /// tree.
+    #[must_use]
+    pub(crate) fn mark_replaced(&self, run: TableId, bound: TableId) -> bool {
         let (folder, fs) = self.config.tables_folder_for_level(0);
-        if let Err(e) =
-            crate::replace_mark::publish(&*fs, &folder, run, bound, self.config.sync_mode)
-        {
-            log::error!(
-                "a replacing ingestion is installed but not marked ({e}): the next open \
-                 marks it, and a repair of a manifest lost before it leaves its tables out",
-            );
+        match crate::replace_mark::publish(&*fs, &folder, run, bound, self.config.sync_mode) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!(
+                    "a replacing install is durable but not marked ({e}): the files it \
+                     dropped stay until the next open, which marks it and removes them",
+                );
+                false
+            }
         }
     }
 
@@ -7962,10 +7969,21 @@ impl Tree {
             sweep.remove(&config.fs, &blob_file_path);
         }
 
+        // A mark whose ingestion left the tree still tells a repair which of
+        // the files the manifest does not name its install dropped, so it
+        // goes last, and only once their removal is durable: the folders they
+        // lay in are synced first, or a power loss could keep the mark's
+        // removal and bring one of them back. Only an open that has such a
+        // mark to remove pays for the syncs.
+        let swept = if stale_marks.is_empty() {
+            Vec::new()
+        } else {
+            sweep.folders()
+        };
         sweep.finish()?;
-        // Last, and only once every file the manifest does not name is gone:
-        // a mark whose ingestion left the tree still tells a repair which of
-        // those files its install dropped.
+        for (fs, folder) in swept {
+            fs.sync_directory_with(&folder, config.sync_mode)?;
+        }
         stale_marks.finish()?;
         Ok((version, pooled, flush_watermark))
     }
@@ -8550,6 +8568,26 @@ impl OpenSweep {
     /// Queues `path` on `fs` for removal.
     fn remove(&mut self, fs: &Arc<dyn Fs>, path: &Path) {
         self.pending.push((Arc::clone(fs), path.to_path_buf()));
+    }
+
+    /// Whether nothing is queued.
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// The folders the queued files lie in, each once.
+    fn folders(&self) -> Vec<(Arc<dyn Fs>, crate::path::PathBuf)> {
+        let mut folders: Vec<(Arc<dyn Fs>, crate::path::PathBuf)> = Vec::new();
+        for (fs, path) in &self.pending {
+            if let Some(folder) = path.parent()
+                && !folders
+                    .iter()
+                    .any(|(seen_fs, seen)| Arc::ptr_eq(seen_fs, fs) && seen == folder)
+            {
+                folders.push((Arc::clone(fs), folder.to_path_buf()));
+            }
+        }
+        folders
     }
 
     /// Removes every queued file, a file already gone included, and fails
