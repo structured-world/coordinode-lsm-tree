@@ -225,8 +225,8 @@ fn build_cached_tree(
 /// makes, the bytes it takes in and what it does with them), not a device's
 /// latency. Batches are shaped as in `columnar/warm_multi_get`.
 ///
-/// With the `metrics` feature, prints the block requests and the bytes read
-/// per batch beside each shape.
+/// With the `metrics` feature, prints the blocks loaded from the file and
+/// the bytes read per batch beside each shape.
 fn bench_cold_multi_get(c: &mut Criterion) {
     let n = 100_000u64;
     let value_len = 128;
@@ -251,14 +251,14 @@ fn bench_cold_multi_get(c: &mut Criterion) {
             #[cfg(feature = "metrics")]
             {
                 let m = tree.metrics();
-                let (requests, bytes) = (m.block_io(), m.bytes_read());
+                let (requests, bytes) = (m.block_load_io_count(), m.bytes_read());
                 for batch in &batches {
                     std::hint::black_box(tree.multi_get(batch, SeqNo::MAX).expect("multi_get"));
                 }
                 let per = batches.len() as f64;
                 eprintln!(
-                    "{label}: requests={:.2} bytes_read={:.0} per batch",
-                    (m.block_io() - requests) as f64 / per,
+                    "{label}: block_loads={:.2} bytes_read={:.0} per batch",
+                    (m.block_load_io_count() - requests) as f64 / per,
                     (m.bytes_read() - bytes) as f64 / per,
                 );
             }
