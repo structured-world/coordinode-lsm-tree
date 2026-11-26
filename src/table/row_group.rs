@@ -912,6 +912,11 @@ impl GroupRead<'_> {
         let directory_len = indexed_directory_len(self.group)?;
         self.check_block_len(directory_len)?;
         let directory = self.admit_directory(group, directory_len)?;
+        // The head zones, cut out of the same bytes, kept on the directory:
+        // a read that selects row pages by them next (a batch's keys, each
+        // by its own zone) finds them decoded, and the directory is cached
+        // with them.
+        let directory = self.with_head_zones(&directory, directory_len, group)?;
         // Every page: no zone selects among them.
         let wanted = PageWant::ALL.resolve(&directory, None)?;
         let mut pages = wanted.slots(&directory);

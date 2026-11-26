@@ -10349,6 +10349,16 @@ fn an_entry_read_placed_by_the_locator_finds_every_key() -> crate::Result<()> {
             let key = alloc::format!("key{i:05}").into_bytes();
             let entry = table.get(&key, SeqNo::MAX, hash64(&key))?;
             if i % 2 == 0 {
+                // The locator places the key itself: without that the read
+                // would find it through the block index all the same.
+                let (_, hint) = table
+                    .locator_block(hash64(&key))?
+                    .expect("the locator places a present key");
+                assert_eq!(
+                    hint.map(|(_, is_entry)| is_entry),
+                    Some(precision == LocatorPrecision::Entry),
+                    "{precision:?}: key {i} is placed at this precision's slot"
+                );
                 let entry = entry.expect("a present key");
                 assert_eq!(&*entry.key.user_key, &key[..], "{precision:?}");
                 assert_eq!(entry.key.seqno, u64::from(i) + 1, "{precision:?}");
