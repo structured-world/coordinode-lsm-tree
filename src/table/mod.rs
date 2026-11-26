@@ -2401,24 +2401,23 @@ impl Table {
             let mut budget = DecodeBudget::default();
             // Each key page's ordinal, rows and keys.
             let mut keyed: PerRowPage<_> = PerRowPage::new();
-            for page in key_blocks.page_columns(|_| true, &mut budget)? {
-                let (ordinal, row_count) = (page.ordinal, page.rows);
-                let Some(key_col) = page
-                    .columns
-                    .into_iter()
-                    .next()
-                    .filter(|c| c.column_id == COL_USER_KEY && c.type_tag == TypeTag::Bytes)
-                else {
-                    return Err(crate::Error::InvalidHeader(
-                        "columnar: row group has no user-key column",
+            key_blocks.each_page_column(
+                |_| true,
+                &mut budget,
+                |at, column, budget| {
+                    if column.column_id != COL_USER_KEY || column.type_tag != TypeTag::Bytes {
+                        return Err(crate::Error::InvalidHeader(
+                            "columnar: row group has no user-key column",
+                        ));
+                    }
+                    keyed.push((
+                        at.ordinal,
+                        at.rows,
+                        budget.rows(column.values, TypeTag::Bytes, at.rows)?,
                     ));
-                };
-                keyed.push((
-                    ordinal,
-                    row_count,
-                    budget.rows(key_col.values, TypeTag::Bytes, row_count)?,
-                ));
-            }
+                    Ok(())
+                },
+            )?;
             // A key's versions are one run of rows, sorted with the rest of
             // the group, so they sit on consecutive row pages: the first page
             // whose keys reach it through the page where the run ends.
@@ -2495,13 +2494,29 @@ impl Table {
                 let mut row_budget = budget.clone();
                 let mut pages: PerRowPage<PointPage<'_>> = PerRowPage::new();
                 let mut first_row = 0;
-                for page in
-                    blocks.page_columns(|column_id| column_id != COL_USER_KEY, &mut row_budget)?
-                {
-                    if pages.is_empty() {
-                        first_row = page.start;
-                    }
-                    pages.push(PointPage::prepare(page, &mut row_budget)?);
+                // A column's pages arrive in row order and the columns in
+                // write order, so the first column opens each page and the
+                // ones after it are added to the page in place.
+                blocks.each_page_column(
+                    |column_id| column_id != COL_USER_KEY,
+                    &mut row_budget,
+                    |at, column, budget| {
+                        if at.place == pages.len() {
+                            if at.place == 0 {
+                                first_row = at.start;
+                            }
+                            pages.push(PointPage::new(at.rows)?);
+                        }
+                        pages
+                            .get_mut(at.place)
+                            .ok_or(crate::Error::InvalidHeader(
+                                "columnar: page names a row page the group does not have",
+                            ))?
+                            .add(column, budget)
+                    },
+                )?;
+                for page in &mut pages {
+                    page.finish()?;
                 }
                 let deletes = match delete_start {
                     Some(start) => Some((

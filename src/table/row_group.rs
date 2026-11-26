@@ -43,6 +43,19 @@ pub(crate) struct RowGroupBlocks {
 /// to the heap.
 pub(crate) type PageSlots = smallvec::SmallVec<[PageSlot; 8]>;
 
+/// Where a page a read fetched lies among its row pages.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowPageAt {
+    /// The row page's place among the row pages the read selected.
+    pub(crate) place: usize,
+    /// Its ordinal in the group.
+    pub(crate) ordinal: u16,
+    /// The group row its first row is.
+    pub(crate) start: u32,
+    /// Its rows.
+    pub(crate) rows: u32,
+}
+
 /// One item per row page a read selected, in row order: inline for the one
 /// or two row pages of a point read.
 pub(crate) type PerRowPage<T> = smallvec::SmallVec<[T; 2]>;
@@ -1491,20 +1504,80 @@ impl RowGroupBlocks {
     fn by_row_page<'s, T>(
         &'s self,
         want: impl Fn(u16) -> bool,
-        mut read: impl FnMut(&'s crate::Slice, u32, PageStamp) -> crate::Result<T>,
+        read: impl FnMut(&'s crate::Slice, u32, PageStamp) -> crate::Result<T>,
         column_of: impl Fn(&T) -> u16,
     ) -> crate::Result<(RowPageOrdinals, PerRowPage<PageColumns<T>>)> {
-        self.check_readable()?;
-        let entries = self.directory.entries();
         let ordinals: RowPageOrdinals = self.row_pages.iter().collect();
         // One column list per row page read, sized for every column the read
-        // fetched. The slots are in directory order, which is column-major,
-        // so each row page's columns arrive in write order.
+        // fetched.
         let per_page = self.pages.len() / ordinals.len().max(1);
         let mut columns: PerRowPage<PageColumns<T>> = ordinals
             .iter()
             .map(|_| PageColumns::with_capacity(per_page))
             .collect();
+        self.each_page(want, read, column_of, |at, column| {
+            columns
+                .get_mut(at.place)
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar: page names a row page the group does not have",
+                ))?
+                .push(column);
+            Ok(())
+        })?;
+        Ok((ordinals, columns))
+    }
+
+    /// The pages of the columns `want` names among those the read selected,
+    /// parsed but not decoded, each handed to `visit` as it is parsed with
+    /// where its row page lies: what a point read takes them through, with
+    /// no list of them built. A row page's columns arrive in write order, and
+    /// a column's pages in row order. What the parses hold decoded is charged
+    /// to `budget`, the group's, which `visit` is handed to charge what it
+    /// prepares.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::page_columns`], and what `visit` returns.
+    pub(crate) fn each_page_column<'s>(
+        &'s self,
+        want: impl Fn(u16) -> bool,
+        budget: &mut crate::table::columnar::DecodeBudget,
+        mut visit: impl FnMut(
+            RowPageAt,
+            crate::table::columnar::PageColumn<'s>,
+            &mut crate::table::columnar::DecodeBudget,
+        ) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        use crate::table::columnar::Column;
+
+        self.each_page(
+            want,
+            Column::parse_page,
+            |column| column.column_id,
+            |at, column| {
+                let column = budget.parsed(column)?;
+                visit(at, column, budget)
+            },
+        )
+    }
+
+    /// Reads every fetched page of a column `want` names with `read` and
+    /// hands what it returns to `visit` with where its row page lies, in the
+    /// directory's order, which is column-major: a row page's columns arrive
+    /// in write order. `column_of` names the column a result holds, which
+    /// must be the one the directory filed its page under.
+    ///
+    /// The checks every reading of a group makes before trusting its pages
+    /// live here, so the decoded and the parsed readings cannot drift apart.
+    fn each_page<'s, T>(
+        &'s self,
+        want: impl Fn(u16) -> bool,
+        mut read: impl FnMut(&'s crate::Slice, u32, PageStamp) -> crate::Result<T>,
+        column_of: impl Fn(&T) -> u16,
+        mut visit: impl FnMut(RowPageAt, T) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        self.check_readable()?;
+        let entries = self.directory.entries();
         let unknown_row_page = || {
             crate::Error::InvalidHeader("columnar: page names a row page the group does not have")
         };
@@ -1536,12 +1609,18 @@ impl RowGroupBlocks {
                     .filter(|&place| place < range.len()),
                 RowPageSet::Listed(listed) => listed.binary_search(&entry.row_page).ok(),
             };
-            place
-                .and_then(|place| columns.get_mut(place))
-                .ok_or_else(unknown_row_page)?
-                .push(column);
+            let at = RowPageAt {
+                place: place.ok_or_else(unknown_row_page)?,
+                ordinal: entry.row_page,
+                start: self
+                    .directory
+                    .row_page_start(entry.row_page)
+                    .ok_or_else(unknown_row_page)?,
+                rows,
+            };
+            visit(at, column)?;
         }
-        Ok((ordinals, columns))
+        Ok(())
     }
 
     /// Each fetched page with the rows it holds, what its values were

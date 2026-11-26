@@ -2244,17 +2244,24 @@ pub(crate) struct KeyVersion {
 /// One row page prepared for point reads: every column but the key's, ready
 /// to be read a row at a time. Prepared once and read for each key of a batch
 /// whose rows lie on the page.
+///
+/// Filled in place, a column at a time as the group's pages are parsed, so
+/// nothing of it is built elsewhere and moved in: [`Self::new`], then
+/// [`Self::add`] for each column in write order, then [`Self::finish`].
 pub(crate) struct PointPage<'a> {
     /// The page's rows.
     rows: u32,
-    seqnos: expr::Rows<'a>,
-    types: expr::Rows<'a>,
+    /// The seqno column, the first added.
+    seqnos: Option<expr::Rows<'a>>,
+    /// The value type column, the second added.
+    types: Option<expr::Rows<'a>>,
     /// The value sub-columns, each id checked against the ones before it.
     /// Held inline for the usual one or two.
     values: smallvec::SmallVec<[ValueColumn<'a>; 2]>,
     /// Whether any value column carries nulls.
     nullable: bool,
-    /// Whether the value columns are the cells of a split row.
+    /// Whether the value columns are the cells of a split row; known once
+    /// the page is finished.
     holds_cells: bool,
 }
 
@@ -2264,16 +2271,12 @@ impl<'a> PointPage<'a> {
     /// The type of the value type column, checked when the page is prepared.
     const VALUE_TYPE: TypeTag = TypeTag::Fixed(1);
 
-    /// Prepares `page`, which carries every column but the key's, charging
-    /// what its row reads hold decoded to `budget`, the group's.
+    /// A page of `rows` rows with no column added yet.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHeader`] when the page does not carry the seqno and
-    /// value type columns in order, carries no value column or holds no row;
-    /// [`Error::DecompressedSizeTooLarge`] past `budget`.
-    pub(crate) fn prepare(page: RowPageColumns<'a>, budget: &mut DecodeBudget) -> Result<Self> {
-        let rows = page.rows;
+    /// [`Error::InvalidHeader`] for a page of no rows.
+    pub(crate) fn new(rows: u32) -> Result<Self> {
         if rows == 0 {
             // A zero-row page is malformed; fail closed like the scan path
             // rather than returning an empty match the caller reads as an
@@ -2282,61 +2285,100 @@ impl<'a> PointPage<'a> {
                 "columnar: empty reconstructed data block",
             ));
         }
-        let mut columns = page.columns.into_iter();
-        let (Some(seqno_column), Some(vt)) = (columns.next(), columns.next()) else {
-            return Err(Error::InvalidHeader(
-                "columnar: batch missing the intrinsic columns",
-            ));
+        Ok(Self {
+            rows,
+            seqnos: None,
+            types: None,
+            values: smallvec::SmallVec::new(),
+            nullable: false,
+            holds_cells: false,
+        })
+    }
+
+    /// Adds the page's next column in write order: the seqnos, the value
+    /// types, then the value sub-columns. Charges what its row reads hold
+    /// decoded to `budget`, the group's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHeader`] for a column out of that order or a value
+    /// sub-column id used twice; [`Error::DecompressedSizeTooLarge`] past
+    /// `budget`.
+    pub(crate) fn add(&mut self, column: PageColumn<'a>, budget: &mut DecodeBudget) -> Result<()> {
+        let rows = self.rows;
+        let intrinsic = |id: u16, tag: TypeTag| {
+            if column.column_id != id || column.type_tag != tag || column.validity.is_some() {
+                return Err(Error::InvalidHeader(
+                    "columnar: unexpected intrinsic column layout",
+                ));
+            }
+            Ok(())
         };
-        if seqno_column.column_id != COL_SEQNO
-            || seqno_column.type_tag != Self::SEQNO
-            || vt.column_id != COL_VALUE_TYPE
-            || vt.type_tag != Self::VALUE_TYPE
-            || seqno_column.validity.is_some()
-            || vt.validity.is_some()
-        {
-            return Err(Error::InvalidHeader(
-                "columnar: unexpected intrinsic column layout",
-            ));
-        }
-        let seqnos = budget.rows(seqno_column.values, Self::SEQNO, rows)?;
-        let types = budget.rows(vt.values, Self::VALUE_TYPE, rows)?;
-        let mut values: smallvec::SmallVec<[ValueColumn<'_>; 2]> = smallvec::SmallVec::new();
-        let mut nullable = false;
-        for c in columns {
-            if c.column_id < COL_VALUE || values.iter().any(|v| v.0 == c.column_id) {
+        if self.seqnos.is_none() {
+            intrinsic(COL_SEQNO, Self::SEQNO)?;
+            self.seqnos = Some(budget.rows(column.values, Self::SEQNO, rows)?);
+        } else if self.types.is_none() {
+            intrinsic(COL_VALUE_TYPE, Self::VALUE_TYPE)?;
+            self.types = Some(budget.rows(column.values, Self::VALUE_TYPE, rows)?);
+        } else {
+            if column.column_id < COL_VALUE || self.values.iter().any(|v| v.0 == column.column_id) {
                 return Err(Error::InvalidHeader(
                     "columnar: value sub-column ids must be unique and must not overlap intrinsic columns",
                 ));
             }
-            nullable |= c.validity.is_some();
-            values.push((
-                c.column_id,
-                c.type_tag,
-                c.validity,
-                budget.rows(c.values, c.type_tag, rows)?,
-                c.page,
+            self.nullable |= column.validity.is_some();
+            self.values.push((
+                column.column_id,
+                column.type_tag,
+                column.validity,
+                budget.rows(column.values, column.type_tag, rows)?,
+                column.page,
             ));
         }
-        if values.is_empty() {
+        Ok(())
+    }
+
+    /// Closes the page once its columns are added.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHeader`] when the page lacks the seqno or value type
+    /// column, carries no value column, or its value columns are not the
+    /// cells of one row shape.
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        if self.seqnos.is_none() || self.types.is_none() {
+            return Err(Error::InvalidHeader(
+                "columnar: batch missing the intrinsic columns",
+            ));
+        }
+        if self.values.is_empty() {
             return Err(Error::InvalidHeader(
                 "columnar: batch carries no value column",
             ));
         }
-        let holds_cells = cells::holds_cells(values.iter().map(|(id, ..)| id));
-        if holds_cells {
+        self.holds_cells = cells::holds_cells(self.values.iter().map(|(id, ..)| id));
+        if self.holds_cells {
             let shapes: Vec<(u16, TypeTag)> =
-                values.iter().map(|&(id, tag, ..)| (id, tag)).collect();
+                self.values.iter().map(|&(id, tag, ..)| (id, tag)).collect();
             cells::check_value_columns(&shapes)?;
         }
-        Ok(Self {
-            rows,
-            seqnos,
-            types,
-            values,
-            nullable,
-            holds_cells,
-        })
+        Ok(())
+    }
+
+    /// Prepares `page`, which carries every column but the key's, charging
+    /// what its row reads hold decoded to `budget`, the group's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`], [`Self::add`] and [`Self::finish`].
+    #[cfg(test)]
+    pub(crate) fn prepare(page: RowPageColumns<'a>, budget: &mut DecodeBudget) -> Result<Self> {
+        let mut prepared = Self::new(page.rows)?;
+        for column in page.columns {
+            prepared.add(column, budget)?;
+        }
+        prepared.finish()?;
+        Ok(prepared)
     }
 
     /// The page's rows.
@@ -2375,12 +2417,17 @@ impl<'a> PointPage<'a> {
     ) -> Result<Option<KeyVersion>> {
         let Self {
             rows,
-            seqnos,
-            types,
+            seqnos: Some(seqnos),
+            types: Some(types),
             values,
             nullable,
             holds_cells,
-        } = self;
+        } = self
+        else {
+            return Err(Error::InvalidHeader(
+                "columnar: batch missing the intrinsic columns",
+            ));
+        };
         let (rows, nullable, holds_cells) = (*rows, *nullable, *holds_cells);
         if run.start >= run.end || run.end > rows {
             return Err(Error::InvalidHeader(
