@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795694765736,
+  "lastUpdate": 1795694771177,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -130086,6 +130086,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.411089948,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9b4789f56da0c6c6d713ce3153592dee57dee90f",
+          "message": "fix(version): leave the visible seqno to the writer (#1115)\n\n## Summary\n\n- A write whose seqno the caller has not published stays invisible to a\nsnapshot at the visible seqno while the tree flushes and compacts, in\nthat tree and in every tree sharing the counter pair. A version install\nno longer moves the visible seqno past its own seqno.\n\n## Changes\n\n- `SuperVersions::install` moves the visible seqno only past a retention\nfloor it raises, when the floor reaches it. A drop (`clear`, a replacing\ningestion, a dropped range, FIFO) raises the floor to its own seqno, so\nit always does; a collection does only under a watermark above the\nvisible seqno. The current version serves every snapshot above the\nfloor, so an install that keeps the tree's content has nothing to\npublish.\n- The install of an ingestion that adds to the tree publishes its own\nseqno, as before: its rows are a write the tree makes at a seqno no\ncaller can publish.\n- The docs of `clear`, of an ingestion's `finish` and of `WriteBatch`\nsay which installs publish, and that a write in flight across one of\nthem is published with it.\n\nNo hot path changes: a version install does one atomic update less, or\nthe same one.\n\n## Testing\n\nTests, clippy (default and all features), formatting, doc tests, docs\nwith warnings denied and the no-std check pass on macOS; CI runs the\nfull matrix.\n\nCloses #1113\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Flushes and compactions that preserve tree contents no longer advance\nthe visible sequence number. This prevents partially applied batches\nfrom becoming visible through installs.\n* Clears, ingestions, and dropped-range installs advance visibility when\nthey change reader-visible data or raise the retention floor. In-flight\nwrites are published with these operations.\n* **Documentation**\n* Clarified when clears, ingestions, batch application, and installs\nadvance the visible sequence number and how callers should order writes\naround clears.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-26T12:09:13+02:00",
+          "tree_id": "c8a892187c8a94bdf2f58c84f109f9c110774db7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9b4789f56da0c6c6d713ce3153592dee57dee90f"
+        },
+        "date": 1795694769898,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 707.31,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 183.84086ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 305.20599999999996,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 247.978764ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1288.3700000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 248.910105ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5422.437,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 21037.697,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 24.367,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 53.903359,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.424865642,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 25.359,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 54.099967,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.417196919,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
