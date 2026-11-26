@@ -2393,19 +2393,31 @@ impl Table {
             .and_then(|starts| starts.get(&handle.offset().0))
             .copied();
 
+        let byte_ordered = self.comparator.is_lexicographic();
+
         let mut at = 0usize;
         while at < count {
             // A key equal to the needle is the needle's bytes (the comparator
             // contract makes equality byte equality), so it lies within the
             // byte-wise zone of the row page holding it, whatever the key
             // order.
+            //
+            // Where the keys ascend in byte order the zones ascend with
+            // them, and the row page is found by bisection.
             let first = key_at(at);
             let key_pages = PageWant::projected(
                 &[COL_USER_KEY],
-                RowPageSelect::Zone {
-                    column_id: COL_USER_KEY,
-                    lower: Some(first),
-                    upper: Some(first),
+                if byte_ordered {
+                    RowPageSelect::ZoneOfKey {
+                        column_id: COL_USER_KEY,
+                        key: first,
+                    }
+                } else {
+                    RowPageSelect::Zone {
+                        column_id: COL_USER_KEY,
+                        lower: Some(first),
+                        upper: Some(first),
+                    }
                 },
             );
             let key_blocks = match whole {

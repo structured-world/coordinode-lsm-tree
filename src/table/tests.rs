@@ -10312,6 +10312,97 @@ fn requested(metrics: &crate::metrics::Metrics) -> (u64, u64) {
     )
 }
 
+/// Bisecting a group's key zones selects exactly the row pages that reading
+/// every row page's zone selects, for keys present, between two present
+/// keys, below every key and above every key. Two tables: short keys, whose
+/// zone bounds are the keys themselves, and long keys that differ only past
+/// the length a zone bound is cut to, so many row pages carry the same lower
+/// bound and the same raised upper bound and a key's zone selects several.
+#[cfg(feature = "columnar")]
+#[test]
+fn bisecting_the_key_zones_selects_the_row_pages_a_scan_of_them_does() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+    use crate::table::row_group::{PageWant, RowPageSelect};
+
+    let short = |i: u32| alloc::format!("key{i:06}").into_bytes();
+    let long = |i: u32| {
+        let mut key = alloc::vec![b'p'; 200];
+        key.extend_from_slice(alloc::format!("{i:06}").as_bytes());
+        key
+    };
+    let key_of: [&dyn Fn(u32) -> Vec<u8>; 2] = [&short, &long];
+    for key_of in key_of {
+        let dir = tempdir()?;
+        let file = dir.path().join("table");
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+            .use_columnar(true)
+            .use_zone_map(true)
+            .use_row_group_size(64 * 1_024)
+            .use_columnar_page_size(1_024);
+        // Even rows only, so an odd one lies between two present keys.
+        for i in (0..600u32).step_by(2) {
+            writer.write(InternalValue::from_components(
+                key_of(i),
+                zoned_value(i),
+                1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("written");
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let group = first_row_group(&file, checksum)?;
+        let select = |row_pages| -> crate::Result<Vec<u16>> {
+            Ok(table
+                .load_row_group(
+                    &group,
+                    &PageWant::projected(&[COL_USER_KEY], row_pages),
+                    ReadCharge::Foreground,
+                )?
+                .ordinals)
+        };
+
+        let mut probes: Vec<Vec<u8>> = (0..600u32).step_by(7).map(key_of).collect();
+        probes.push(Vec::from(*b"a"));
+        probes.push(Vec::from(*b"zzzz"));
+        probes.push(alloc::vec![0xFF; 300]);
+        let mut past_the_first_page = false;
+        let mut several_pages = false;
+        for key in &probes {
+            let scanned = select(RowPageSelect::Zone {
+                column_id: COL_USER_KEY,
+                lower: Some(key),
+                upper: Some(key),
+            })?;
+            let bisected = select(RowPageSelect::ZoneOfKey {
+                column_id: COL_USER_KEY,
+                key,
+            })?;
+            assert_eq!(
+                bisected,
+                scanned,
+                "key {:?}",
+                String::from_utf8_lossy(key.get(..key.len().min(24)).unwrap_or(key)),
+            );
+            past_the_first_page |= scanned.first().is_some_and(|&first| first > 0);
+            several_pages |= scanned.len() > 1;
+        }
+        // The long keys share their zone bounds across row pages, so a key's
+        // zone selects several; a short key's selects the one page it is on.
+        if key_of(0).len() > 100 {
+            assert!(
+                several_pages,
+                "self-check: a long key's zone selects several row pages"
+            );
+        } else {
+            assert!(
+                past_the_first_page && !several_pages,
+                "self-check: a short key selects one row page, past the first for some"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A point read takes a row group's directory and its key zones in one
 /// request, exactly as many bytes as the index entry records for the two, and
 /// keeps the zones on the cached directory: a later point read of the group

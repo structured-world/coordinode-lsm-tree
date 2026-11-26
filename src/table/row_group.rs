@@ -162,6 +162,17 @@ pub(crate) enum RowPageSelect<'a> {
         /// Inclusive upper bound, or `None` for none.
         upper: Option<&'a [u8]>,
     },
+    /// The row pages whose zone for `column_id` may hold `key`, as
+    /// [`Self::Zone`] with both bounds `key` selects them, for a column the
+    /// group's rows ascend by in byte order: its zones ascend from row page
+    /// to row page, so the pages are found by bisection, not by reading
+    /// every row page's zone.
+    ZoneOfKey {
+        /// The column the rows ascend by.
+        column_id: u16,
+        /// The value looked for.
+        key: &'a [u8],
+    },
 }
 
 /// The pages a read of a row group wants: the columns it projects, times the
@@ -200,7 +211,9 @@ impl<'a> PageWant<'a> {
     /// The column this want selects row pages by, when it selects by zones.
     fn zone_column(&self) -> Option<u16> {
         match self.row_pages {
-            RowPageSelect::Zone { column_id, .. } => Some(column_id),
+            RowPageSelect::Zone { column_id, .. } | RowPageSelect::ZoneOfKey { column_id, .. } => {
+                Some(column_id)
+            }
             RowPageSelect::All | RowPageSelect::Range(_) => None,
         }
     }
@@ -243,26 +256,94 @@ impl<'a> PageWant<'a> {
                 column_id,
                 lower,
                 upper,
-            } => RowPageSet::Listed(
-                // A directory holds at most `u16::MAX` row pages, so the
-                // ordinals cover every one.
-                (0u16..)
-                    .zip(directory.row_pages())
-                    .filter(|&(ordinal, &rows)| {
-                        directory
-                            .head_zones()
-                            .zone(ordinal, *column_id)
-                            .or_else(|| block_zones.and_then(|z| z.zone(ordinal, *column_id)))
-                            .is_none_or(|zone| zone_may_match(zone, rows, *lower, *upper))
-                    })
-                    .map(|(ordinal, _)| ordinal)
-                    .collect(),
-            ),
+            } => Self::by_zones(directory, block_zones, *column_id, *lower, *upper),
+            RowPageSelect::ZoneOfKey { column_id, key } => {
+                match Self::bisect_zones(directory, *column_id, key) {
+                    Some(pages) if pages.is_empty() => RowPageSet::Listed(RowPageOrdinals::new()),
+                    Some(pages) => RowPageSet::Range(pages),
+                    // The directory keeps no zone of the column for some row
+                    // page: every row page's zone is read, as for any column.
+                    None => {
+                        Self::by_zones(directory, block_zones, *column_id, Some(key), Some(key))
+                    }
+                }
+            }
         };
         Ok(Wanted {
             columns: self.columns,
             row_pages,
         })
+    }
+
+    /// The row pages whose zone for `column_id` may hold a value within
+    /// `[lower, upper]`, each row page's zone read in turn. A row page the
+    /// column has no zone for is kept.
+    fn by_zones(
+        directory: &PageDirectory,
+        block_zones: Option<&PageZones>,
+        column_id: u16,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> RowPageSet {
+        RowPageSet::Listed(
+            // A directory holds at most `u16::MAX` row pages, so the
+            // ordinals cover every one.
+            (0u16..)
+                .zip(directory.row_pages())
+                .filter(|&(ordinal, &rows)| {
+                    directory
+                        .head_zones()
+                        .zone(ordinal, column_id)
+                        .or_else(|| block_zones.and_then(|z| z.zone(ordinal, column_id)))
+                        .is_none_or(|zone| zone_may_match(zone, rows, lower, upper))
+                })
+                .map(|(ordinal, _)| ordinal)
+                .collect(),
+        )
+    }
+
+    /// The row pages whose zone for `column_id`, a column the rows ascend by
+    /// in byte order, may hold `key`: the same pages [`Self::by_zones`]
+    /// selects for `[key, key]`, found by bisection. `None` when the
+    /// directory keeps no zone of the column for a row page it looked at.
+    ///
+    /// A zone's bounds are the first and last value of its row page cut to a
+    /// prefix (the upper one raised past the cut), so both ascend from row
+    /// page to row page as the values do: the pages whose upper bound is not
+    /// below `key` start at one row page, and the pages whose lower bound is
+    /// not above it end at one. A zone with no upper bound has none on any
+    /// row page after it either.
+    fn bisect_zones(
+        directory: &PageDirectory,
+        column_id: u16,
+        key: &[u8],
+    ) -> Option<core::ops::Range<u16>> {
+        let zones = directory.head_zones();
+        let count = u16::try_from(directory.row_pages().len()).ok()?;
+        let Some(last) = count.checked_sub(1) else {
+            return Some(0..0);
+        };
+        // Zones are kept row page by row page from the first, so one for the
+        // last row page means one for each: a row page without a zone would
+        // have to be kept, which a bisection that never looked at it cannot.
+        zones.zone(last, column_id)?;
+        // The first of `count` row pages `past` does not hold for, `past`
+        // holding for the row pages before one and for none from it on.
+        let first_not = |past: &dyn Fn(crate::table::column_page::Zone<'_>) -> bool| {
+            let (mut low, mut high) = (0u16, count);
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if past(zones.zone(middle, column_id)?) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            Some(low)
+        };
+        let start = first_not(&|zone| zone.max.is_some_and(|max| max < key))?;
+        let end = first_not(&|zone| zone.min <= key)?;
+        Some(start..end.max(start))
     }
 }
 
