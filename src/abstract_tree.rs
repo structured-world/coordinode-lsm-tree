@@ -1181,6 +1181,12 @@ pub trait AbstractTree: sealed::Sealed {
 
     /// Drops all tables and clears all memtables atomically.
     ///
+    /// The clear raises the retention floor to its own seqno and moves the
+    /// visible seqno past it, so a read at the visible seqno is served right
+    /// after it. A write that took its seqno before the clear and is still
+    /// being applied is published with it; the caller orders its writes
+    /// around this call.
+    ///
     /// # Errors
     ///
     /// Will return `Err` only if an IO error occurs.

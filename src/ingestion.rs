@@ -178,6 +178,12 @@ impl AnyIngestion<'_> {
     /// present): added to the tree's content, or, for an ingestion started by
     /// [`AnyTree::replacing_ingestion`], replacing it.
     ///
+    /// Either way the install moves the visible seqno past its own seqno, so
+    /// the ingested rows read at the visible seqno once this returns: the
+    /// rows of an adding ingestion sit at a seqno the tree took for them,
+    /// which no caller could publish. A write that took its seqno before and
+    /// is still being applied is published with the install.
+    ///
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs; a replacing ingestion then
