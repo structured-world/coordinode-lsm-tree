@@ -865,10 +865,10 @@ pub struct Writer {
     /// Default `Some(false)`.
     bulk_ingested: Option<bool>,
 
-    /// Whether a replacing ingestion writes this table (see
+    /// The replacing ingestion that writes this table, if one does (see
     /// [`ParsedMeta::replacing`](crate::table::meta::ParsedMeta::replacing)).
-    /// Persisted as the `descriptor#replacing` marker.
-    replacing: bool,
+    /// Persisted as `descriptor#replacing`.
+    replacing: Option<TableId>,
 
     /// L0 recency key, persisted as `recency`: the table's own id by default,
     /// as a flush or ingest table's is, or the highest
@@ -1454,7 +1454,7 @@ impl Writer {
             value_layout: None,
             cell_shapes: CellShapes::default(),
             bulk_ingested: Some(false),
-            replacing: false,
+            replacing: None,
             recency: table_id,
             lineage: None,
             lineage_prev: None,
@@ -2787,10 +2787,10 @@ impl Writer {
         self
     }
 
-    /// Marks the table as one a replacing ingestion writes (see
+    /// Names the replacing ingestion that writes the table (see
     /// [`Self::replacing`] field). Must be set before the first key is written.
     #[must_use]
-    pub(crate) fn use_replacing(mut self, replacing: bool) -> Self {
+    pub(crate) fn use_replacing(mut self, replacing: Option<TableId>) -> Self {
         self.assert_not_started("use_replacing");
         self.replacing = replacing;
         self
@@ -5838,9 +5838,9 @@ struct Ingested {
     /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
     /// `None` omits it (unknown provenance).
     bulk: Option<bool>,
-    /// `true` writes the `descriptor#replacing` marker: a replacing
-    /// ingestion's table.
-    replacing: bool,
+    /// `Some(run)` writes `descriptor#replacing`: the table of the replacing
+    /// ingestion `run`.
+    replacing: Option<TableId>,
 }
 
 /// Parameters bundle for [`write_meta_section`]. Free-standing struct
@@ -6211,10 +6211,12 @@ fn encode_meta_payload(
         meta_items.push(meta("descriptor#bulk_ingested", &[u8::from(flag)]));
     }
     // A replacing ingestion's table: its place in the tree is recorded by the
-    // install that kept it, in the manifest and in the mark beside the file.
-    // A presence marker, as the lineage ones are.
-    if p.ingested.replacing {
-        meta_items.push(meta("descriptor#replacing", &[]));
+    // install that kept it, in the manifest and in the mark the install
+    // leaves under the ingestion's id, which is all this names. Eight bytes
+    // in the tables of a replacing ingestion alone, read by an open and a
+    // repair, never by a read or a write of rows.
+    if let Some(run) = p.ingested.replacing {
+        meta_items.push(meta("descriptor#replacing", &run.to_le_bytes()));
     }
 
     // How a columnar table stores each row's value: the whole value and a

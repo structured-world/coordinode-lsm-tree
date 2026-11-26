@@ -436,8 +436,8 @@ pub mod repair;
 #[cfg(feature = "std")]
 pub mod restrict_bound;
 
-// The mark a replacing ingestion's install leaves beside each of its tables,
-// which a repair without a manifest reads the install from.
+// The mark a replacing ingestion's install leaves in the tables folder, which
+// a repair without a manifest reads the install from.
 pub(crate) mod replace_mark;
 
 // std-only: block-granular SST salvage; reads source blocks and writes a

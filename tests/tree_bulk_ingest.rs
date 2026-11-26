@@ -486,6 +486,235 @@ fn repair_after_a_replace_drops_an_earlier_table_left_on_the_disk() -> lsm_tree:
         let tree = config().open()?;
         assert_eq!(tree.iter(SeqNo::MAX, None).count(), 19_968, "blob: {blob}");
         assert!(tree.get(0u64.to_be_bytes(), SeqNo::MAX)?.is_none());
+        for x in (32..96u64).chain([19_999]) {
+            assert_eq!(
+                tree.get(x.to_be_bytes(), SeqNo::MAX)?.as_deref(),
+                Some(b"new".as_slice()),
+                "key {x} after the second repair, blob: {blob}"
+            );
+        }
+        assert_eq!(
+            tree.get(200u64.to_be_bytes(), SeqNo::MAX)?.as_deref(),
+            Some(b"later".as_slice()),
+            "after the second repair, blob: {blob}"
+        );
+    }
+    Ok(())
+}
+
+/// Removes every replace mark in the tables folder under `folder`, returning
+/// how many there were.
+fn remove_replace_marks(folder: &std::path::Path) -> lsm_tree::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(folder.join("tables"))? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().contains(".replaced-") {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// The install of a replace is proven for all of its tables or for none: one
+/// mark stands for the whole ingestion. With the mark gone, as when the power
+/// went before it was durable, and the manifest lost, a repair rebuilds the
+/// earlier content alone, and not a row of the replace. Guards against an
+/// install proven table by table, where a crash between two proofs leaves a
+/// repair with part of the replaced content.
+#[test]
+fn repair_takes_a_replace_whole_or_not_at_all() -> lsm_tree::Result<()> {
+    for blob in [false, true] {
+        let folder = get_tmp_folder();
+        let seqno = SequenceNumberCounter::default();
+        seqno.fetch_max(1);
+        let config = || config_at(folder.path(), &seqno, blob).table_target_size(4_096);
+
+        let mut left = Vec::new();
+        {
+            let tree = config().open()?;
+            for x in 0..64u64 {
+                tree.insert(x.to_be_bytes(), b"old", seqno.next());
+            }
+            tree.flush_active_memtable(0)?;
+            left.extend(files_with_bytes(folder.path(), "tables")?);
+            left.extend(files_with_bytes(folder.path(), "blobs")?);
+
+            let mut ingestion = tree.replacing_ingestion()?;
+            for x in 32..20_000u64 {
+                ingestion.write(x.to_be_bytes(), b"new")?;
+            }
+            ingestion.finish()?;
+            assert!(
+                tree.table_count() > 1,
+                "self-check: the run is several tables, blob: {blob}"
+            );
+            tree.close().wait();
+        }
+
+        assert_eq!(
+            remove_replace_marks(folder.path())?,
+            1,
+            "one mark for the whole install, blob: {blob}"
+        );
+        for (path, bytes) in &left {
+            std::fs::write(path, bytes)?;
+        }
+        lose_the_manifest(folder.path())?;
+        config().repair()?;
+
+        let tree = config().open()?;
+        assert_eq!(tree.iter(SeqNo::MAX, None).count(), 64, "blob: {blob}");
+        for x in 0..64u64 {
+            assert_eq!(
+                tree.get(x.to_be_bytes(), SeqNo::MAX)?.as_deref(),
+                Some(b"old".as_slice()),
+                "key {x}, blob: {blob}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A table of a marked replace that no longer opens does not say which
+/// ingestion wrote it: the repair reports it damaged and keeps the rest of the
+/// run where the install put it, and none of the earlier content.
+#[test]
+fn repair_keeps_the_rest_of_a_replace_beside_a_table_that_does_not_open() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    seqno.fetch_max(1);
+    let config = || config_at(folder.path(), &seqno, false).table_target_size(4_096);
+
+    let mut left = Vec::new();
+    {
+        let tree = config().open()?;
+        for x in 0..64u64 {
+            tree.insert(x.to_be_bytes(), b"old", seqno.next());
+        }
+        tree.flush_active_memtable(0)?;
+        left.extend(files_with_bytes(folder.path(), "tables")?);
+        let mut ingestion = tree.replacing_ingestion()?;
+        for x in 32..20_000u64 {
+            ingestion.write(x.to_be_bytes(), b"new")?;
+        }
+        ingestion.finish()?;
+        tree.close().wait();
+    }
+
+    // One table of the run cut down to a stub: no trailer, no meta block.
+    let run = files_with_bytes(folder.path(), "tables")?;
+    assert!(run.len() > 2, "self-check: the run is several tables");
+    let (damaged, _) = run.first().expect("a table of the run");
+    std::fs::write(damaged, b"not a table")?;
+    for (path, bytes) in &left {
+        std::fs::write(path, bytes)?;
+    }
+    lose_the_manifest(folder.path())?;
+    let report = config().repair()?;
+    assert_eq!(report.unreadable, 1, "{report:?}");
+
+    let tree = config().open()?;
+    let rows = tree.iter(SeqNo::MAX, None).count();
+    assert!(
+        rows > 0 && rows < 19_968,
+        "the readable tables of the run, {rows} rows"
+    );
+    assert!(tree.get(0u64.to_be_bytes(), SeqNo::MAX)?.is_none());
+    Ok(())
+}
+
+/// A replacing ingestion that wrote nothing empties the tree, and its install
+/// leaves its mark all the same: an earlier table whose removal it left
+/// undone stays out of a repair of the manifest lost after it.
+#[test]
+fn repair_after_an_empty_replace_drops_an_earlier_table_left_on_the_disk() -> lsm_tree::Result<()> {
+    for blob in [false, true] {
+        let folder = get_tmp_folder();
+        let seqno = SequenceNumberCounter::default();
+        seqno.fetch_max(1);
+        let config = || config_at(folder.path(), &seqno, blob);
+
+        let mut left = Vec::new();
+        {
+            let tree = config().open()?;
+            for x in 0..64u64 {
+                tree.insert(x.to_be_bytes(), b"old", seqno.next());
+            }
+            tree.flush_active_memtable(0)?;
+            left.extend(files_with_bytes(folder.path(), "tables")?);
+            left.extend(files_with_bytes(folder.path(), "blobs")?);
+            tree.replacing_ingestion()?.finish()?;
+            tree.insert(200u64.to_be_bytes(), b"later", seqno.next());
+            tree.flush_active_memtable(0)?;
+            tree.close().wait();
+        }
+
+        for (path, bytes) in &left {
+            assert!(!path.exists(), "self-check: {} was removed", path.display());
+            std::fs::write(path, bytes)?;
+        }
+        lose_the_manifest(folder.path())?;
+        config().repair()?;
+
+        let tree = config().open()?;
+        assert_eq!(tree.iter(SeqNo::MAX, None).count(), 1, "blob: {blob}");
+        assert_eq!(
+            tree.get(200u64.to_be_bytes(), SeqNo::MAX)?.as_deref(),
+            Some(b"later".as_slice()),
+            "blob: {blob}"
+        );
+    }
+    Ok(())
+}
+
+/// The bound a replace's install gave holds past the last table of its run:
+/// after a compaction merged them all away, an earlier table whose removal is
+/// still undone stays out of a repair.
+#[test]
+fn repair_after_a_replace_was_compacted_away_drops_an_earlier_table() -> lsm_tree::Result<()> {
+    for blob in [false, true] {
+        let folder = get_tmp_folder();
+        let seqno = SequenceNumberCounter::default();
+        seqno.fetch_max(1);
+        let config = || config_at(folder.path(), &seqno, blob);
+
+        let mut left = Vec::new();
+        {
+            let tree = config().open()?;
+            for x in 0..64u64 {
+                tree.insert(x.to_be_bytes(), b"old", seqno.next());
+            }
+            tree.flush_active_memtable(0)?;
+            left.extend(files_with_bytes(folder.path(), "tables")?);
+            left.extend(files_with_bytes(folder.path(), "blobs")?);
+            let mut ingestion = tree.replacing_ingestion()?;
+            for x in 32..96u64 {
+                ingestion.write(x.to_be_bytes(), b"new")?;
+            }
+            ingestion.finish()?;
+            tree.insert(200u64.to_be_bytes(), b"later", seqno.next());
+            tree.flush_active_memtable(0)?;
+            tree.major_compact(u64::MAX, 0)?;
+            tree.close().wait();
+        }
+
+        for (path, bytes) in &left {
+            assert!(!path.exists(), "self-check: {} was removed", path.display());
+            std::fs::write(path, bytes)?;
+        }
+        lose_the_manifest(folder.path())?;
+        let report = config().repair()?;
+        assert_eq!(report.unreadable, 0, "blob: {blob}, {report:?}");
+
+        let tree = config().open()?;
+        assert_eq!(tree.iter(SeqNo::MAX, None).count(), 65, "blob: {blob}");
+        assert!(tree.get(0u64.to_be_bytes(), SeqNo::MAX)?.is_none());
+        assert_eq!(
+            tree.get(40u64.to_be_bytes(), SeqNo::MAX)?.as_deref(),
+            Some(b"new".as_slice()),
+            "blob: {blob}"
+        );
     }
     Ok(())
 }

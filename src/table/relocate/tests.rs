@@ -107,8 +107,8 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
 }
 
 /// The relocated copy of a replacing ingestion's table records the place its
-/// source's install gave it: no mark of the ingestion names the copy's id, so
-/// a repair without a manifest reads the copy from itself. Guards against a
+/// source's install gave it: the ingestion's mark does not prove the copy's
+/// install, so a repair without a manifest reads the copy from itself. Guards against a
 /// copy that still reads as an ingested table whose place went with the
 /// manifest, which the repair leaves out.
 #[cfg(feature = "columnar")]
@@ -122,7 +122,7 @@ fn a_relocated_copy_of_a_replacing_table_records_its_place() -> crate::Result<()
         .use_columnar(true)
         .use_zone_map(true)
         .use_bulk_ingested(Some(true))
-        .use_replacing(true);
+        .use_replacing(Some(2));
     for i in 0..96u32 {
         writer.write(InternalValue::from_components(
             format!("k{i:04}").into_bytes(),
@@ -143,9 +143,10 @@ fn a_relocated_copy_of_a_replacing_table_records_its_place() -> crate::Result<()
     );
     params.recency = Some(40);
     let source = Table::recover(params)?;
-    assert!(
+    assert_eq!(
         source.metadata.replacing,
-        "self-check: the source is marked"
+        Some(2),
+        "self-check: the source names its ingestion"
     );
     assert_eq!(source.metadata.recency, 3, "self-check: its own id on disk");
 
@@ -159,7 +160,7 @@ fn a_relocated_copy_of_a_replacing_table_records_its_place() -> crate::Result<()
         None,
     )?;
     let copy = recover_at(&out_path, relocated.checksum, 50)?;
-    assert!(!copy.metadata.replacing);
+    assert_eq!(copy.metadata.replacing, None);
     assert_eq!(copy.metadata.bulk_ingested, Some(false));
     assert_eq!(copy.metadata.recency, 40);
     Ok(())

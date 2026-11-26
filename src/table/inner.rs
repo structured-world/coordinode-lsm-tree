@@ -406,17 +406,6 @@ impl Drop for Inner {
                 crate::restrict_bound::remove(&*self.fs, &self.path, crate::fs::SyncMode::Normal);
             }
 
-            // The mark a replacing install left beside the table goes with
-            // it. A checkpoint made its own.
-            if !pinned && self.metadata.replacing {
-                crate::replace_mark::remove(
-                    &*self.fs,
-                    &self.path,
-                    self.metadata.id,
-                    self.l0_recency,
-                );
-            }
-
             // Move the accessor and block index out so all file handles
             // (including clones held by the block index) are closed before
             // attempting deletion. On Windows, remove_file fails while any

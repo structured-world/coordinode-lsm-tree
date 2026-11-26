@@ -352,6 +352,8 @@ pub(crate) fn link_tables(
     let tables_dir = target_root.join(TABLES_FOLDER);
     let mut count = 0usize;
     let mut bytes: u64 = 0;
+    // The replacing ingestions whose mark the checkpoint already holds.
+    let mut marked: Vec<(crate::TableId, crate::TableId)> = Vec::new();
 
     for table in version.iter_tables() {
         let dst = tables_dir.join(table_link_name(table.id()));
@@ -404,17 +406,22 @@ pub(crate) fn link_tables(
             bytes += target_fs.metadata(&dst_sidecar)?.len;
         }
 
-        // A table of a replacing ingestion keeps the mark of its install, so
-        // a checkpoint that later needs manifest repair still reads it as
-        // installed. An empty file: it adds nothing to the total.
-        if table.metadata.replacing {
-            crate::replace_mark::publish_one(
-                target_fs.as_ref(),
-                &dst,
-                table.id(),
-                table.l0_recency(),
-                sync_mode,
-            )?;
+        // A table of a replacing ingestion takes the mark of that ingestion's
+        // install along, once for all of its tables, so a checkpoint that
+        // later needs manifest repair still reads them as installed. An empty
+        // file: it adds nothing to the total.
+        if let Some(run) = table.metadata.replacing {
+            let mark = (run, table.l0_recency());
+            if !marked.contains(&mark) {
+                crate::replace_mark::publish(
+                    target_fs.as_ref(),
+                    &tables_dir,
+                    mark.0,
+                    mark.1,
+                    sync_mode,
+                )?;
+                marked.push(mark);
+            }
         }
     }
     Ok((count, bytes))

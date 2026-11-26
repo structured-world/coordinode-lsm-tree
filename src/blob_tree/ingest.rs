@@ -320,8 +320,8 @@ impl<'a> BlobIngestion<'a> {
     pub fn finish(mut self) -> crate::Result<()> {
         use crate::AbstractTree;
 
-        if self.table.replacing {
-            return self.finish_replacing();
+        if let Some(run) = self.table.replacing {
+            return self.finish_replacing(run);
         }
         let index = self.index().clone();
 
@@ -448,7 +448,7 @@ impl<'a> BlobIngestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs; the tree then keeps its
     /// earlier content.
-    fn finish_replacing(mut self) -> crate::Result<()> {
+    fn finish_replacing(mut self, run: crate::TableId) -> crate::Result<()> {
         use crate::AbstractTree;
 
         let index = self.index().clone();
@@ -503,7 +503,7 @@ impl<'a> BlobIngestion<'a> {
             let prior = index.install_replacing(&mut versions, &tables, &blob_files)?;
             drop(versions);
             installed.charge();
-            index.mark_replaced(&tables, recency);
+            index.mark_replaced(run, recency);
             prior
         };
         // The installed files name their dictionaries from here on.

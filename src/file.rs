@@ -216,15 +216,16 @@ pub enum TableDirEntry {
     /// follows the temp's: a committed swap renames it into place, an
     /// abandoned build's companion is disposable.
     RepairTmpCompanion(crate::TableId),
-    /// `{id}.replaced-{bound}`: the mark the install of a replacing
-    /// ingestion left beside its table `{id}`, with the recency it gave the
-    /// run. A repair without a manifest reads the install from it.
+    /// `{run}.replaced-{bound}`: the mark the install of the replacing
+    /// ingestion `{run}` left, with the recency it gave its tables. A repair
+    /// without a manifest reads the install from it.
     ReplaceMark(crate::TableId, crate::TableId),
     /// None of the shapes the engine owns.
     Foreign,
 }
 
-/// What joins a table's name and the bound in the name of its replace mark.
+/// What joins a replacing ingestion's id and the bound in the name of its
+/// replace mark.
 pub(crate) const REPLACE_MARK_INFIX: &str = ".replaced-";
 
 impl TableDirEntry {
@@ -266,11 +267,11 @@ impl TableDirEntry {
         if let Some(rest) = file_name.strip_suffix(REPAIR_TMP_SUFFIX) {
             return owned_id(rest, Self::RepairTmp);
         }
-        if let Some((id, bound)) = file_name.split_once(REPLACE_MARK_INFIX) {
+        if let Some((run, bound)) = file_name.split_once(REPLACE_MARK_INFIX) {
             // BOTH halves must parse, in the spelling the engine writes:
             // `5.replaced-backup` and `05.replaced-7` are not owned.
-            return match (canonical_id(id), canonical_id(bound)) {
-                (Some(id), Some(bound)) => Self::ReplaceMark(id, bound),
+            return match (canonical_id(run), canonical_id(bound)) {
+                (Some(run), Some(bound)) => Self::ReplaceMark(run, bound),
                 _ => Self::Foreign,
             };
         }

@@ -226,8 +226,8 @@ pub(crate) struct MultiWriter {
     bulk_ingested: bool,
 
     /// Preserved across writer rotation: every table of a replacing ingestion
-    /// carries its marker (see [`Writer::use_replacing`]).
-    replacing: bool,
+    /// names it (see [`Writer::use_replacing`]).
+    replacing: Option<TableId>,
 
     /// L0 recency key stamped on every successor [`Writer`], preserved across
     /// rotation (see [`Writer::use_recency`]): a compaction sets its inputs'
@@ -594,7 +594,7 @@ impl MultiWriter {
             value_layout: None,
             cell_rows: false,
             bulk_ingested: false,
-            replacing: false,
+            replacing: None,
             recency: None,
             lineage: None,
             inherited_age: None,
@@ -1517,7 +1517,7 @@ impl MultiWriter {
     /// Marks every table in this run as a replacing ingestion's (re-applied to
     /// each rotated successor). See [`Writer::use_replacing`].
     #[must_use]
-    pub(crate) fn use_replacing(mut self, replacing: bool) -> Self {
+    pub(crate) fn use_replacing(mut self, replacing: Option<TableId>) -> Self {
         self.replacing = replacing;
         self.writer = self.writer.use_replacing(replacing);
         self

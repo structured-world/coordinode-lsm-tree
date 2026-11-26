@@ -2696,21 +2696,24 @@ impl Tree {
         Ok(prior)
     }
 
-    /// Leaves the mark of a replacing install of recency `bound` beside each
-    /// of `run`, the tables [`Self::install_replacing`] just made durable (see
-    /// [`crate::replace_mark`]). Called before the install's locks are
-    /// released, so no compaction has taken a table of the run yet.
+    /// Leaves the mark of the replacing ingestion `run`, which
+    /// [`Self::install_replacing`] just installed durably at recency `bound`
+    /// (see [`crate::replace_mark`]), in the folder its tables were written
+    /// to. Called before the earlier tables are reclaimed.
     ///
     /// A failure is logged, not returned: the replace is installed and
     /// durable, which is what the caller asked for, and the next open leaves
-    /// the marks the manifest still owes. Until then only a repair without a
-    /// manifest would miss them.
-    pub(crate) fn mark_replaced(&self, run: &[Table], bound: TableId) {
-        if let Err(e) = crate::replace_mark::publish(run, bound, self.config.sync_mode) {
+    /// the mark the manifest still owes. Until then only a repair without a
+    /// manifest would miss it, and it would miss the whole install, never a
+    /// part of it.
+    pub(crate) fn mark_replaced(&self, run: TableId, bound: TableId) {
+        let (folder, fs) = self.config.tables_folder_for_level(0);
+        if let Err(e) =
+            crate::replace_mark::publish(&*fs, &folder, run, bound, self.config.sync_mode)
+        {
             log::error!(
-                "the tables of a replacing ingestion are installed but not marked ({e}): \
-                 the next open marks them, and a repair of a manifest lost before it \
-                 leaves them out",
+                "a replacing ingestion is installed but not marked ({e}): the next open \
+                 marks it, and a repair of a manifest lost before it leaves its tables out",
             );
         }
     }
@@ -7291,9 +7294,9 @@ impl Tree {
         // folder kept, adopted by the tree.
         let mut pooled: PooledFiles = Vec::new();
         let mut pooled_ids: Vec<TableId> = Vec::new();
-        // The replace marks found beside tables the manifest names, each
-        // with the bound it gives.
-        let mut replace_marks: crate::HashSet<(TableId, TableId)> = crate::HashSet::default();
+        // The replace marks found, judged once the tables are recovered: a
+        // mark names an ingestion, which only a table's meta block ties to it.
+        let mut replace_marks: Vec<FoundReplaceMark> = Vec::new();
         for (table_base_folder, folder_fs, dirents) in folder_scans {
             for dirent in dirents {
                 let crate::fs::FsDirEntry {
@@ -7373,19 +7376,17 @@ impl Tree {
                         }
                         continue;
                     }
-                    // A LIVE table's replace mark is preserved (a repair
-                    // without a manifest reads the table's install from it);
-                    // one whose table left the manifest names nothing.
-                    crate::file::TableDirEntry::ReplaceMark(marked_id, bound) => {
-                        if manifest_ids.contains(&marked_id) {
-                            replace_marks.insert((marked_id, bound));
-                        } else {
-                            log::debug!(
-                                "Removing orphaned replace mark (its table is gone): {}",
-                                table_file_path.display()
-                            );
-                            sweep.remove(folder_fs, &table_file_path);
-                        }
+                    // Kept or removed once the recovered tables say which
+                    // ingestions are still in the tree (see
+                    // `settle_replace_marks`).
+                    crate::file::TableDirEntry::ReplaceMark(run, bound) => {
+                        replace_marks.push(FoundReplaceMark {
+                            run,
+                            bound,
+                            folder: table_base_folder.clone(),
+                            fs: Arc::clone(folder_fs),
+                            path: table_file_path,
+                        });
                         continue;
                     }
                     // A repair's replacement still at its temp name. The manifest
@@ -7909,11 +7910,11 @@ impl Tree {
         #[cfg(feature = "std")]
         Self::republish_missing_restriction_sidecars(&version, config)?;
 
-        // The same for the marks a replacing install leaves once its manifest
-        // is durable: an install the power cut before its marks, or one whose
-        // marks failed, is named by the manifest alone, and a repair of that
+        // The same for the mark a replacing install leaves once its manifest
+        // is durable: an install the power cut before its mark, or one whose
+        // mark failed, is named by the manifest alone, and a repair of that
         // manifest, lost later, would leave its tables out as never installed.
-        Self::republish_missing_replace_marks(&version, config, &replace_marks)?;
+        let stale_marks = Self::settle_replace_marks(&version, config, replace_marks)?;
 
         // Everything of the generation read goes, now that it is superseded:
         // its snapshot and its log.
@@ -7952,6 +7953,10 @@ impl Tree {
         }
 
         sweep.finish()?;
+        // Last, and only once every file the manifest does not name is gone:
+        // a mark whose ingestion left the tree still tells a repair which of
+        // those files its install dropped.
+        stale_marks.finish()?;
         Ok((version, pooled, flush_watermark))
     }
 
@@ -8002,34 +8007,56 @@ impl Tree {
         Ok(())
     }
 
-    /// Leaves the replace mark of every table of a replacing ingestion in
-    /// `version` that has none among `found`, the marks the open's scan saw.
+    /// Leaves the replace mark of every replacing ingestion `version` still
+    /// holds a table of, durably, and returns the removal of every other mark
+    /// among `found`, the ones the open's scan saw.
+    ///
     /// The manifest gives the bound: the recency the install recorded for the
-    /// table.
-    fn republish_missing_replace_marks(
+    /// ingestion's tables. A mark that is there is synced again, since the
+    /// sync that followed its making may be the one that failed. A mark whose
+    /// ingestion the tree no longer holds a table of goes: what it told a
+    /// repair, which files its install dropped, ends with those files, which
+    /// this open removes first.
+    fn settle_replace_marks(
         version: &Version,
         config: &Config,
-        found: &crate::HashSet<(TableId, TableId)>,
-    ) -> crate::Result<()> {
+        found: Vec<FoundReplaceMark>,
+    ) -> crate::Result<OpenSweep> {
+        let mut held: Vec<(TableId, TableId)> = Vec::new();
         for table in version.iter_tables() {
-            let bound = table.l0_recency();
-            if !table.metadata.replacing || found.contains(&(table.id(), bound)) {
-                continue;
+            if let Some(run) = table.metadata.replacing {
+                let mark = (run, table.l0_recency());
+                if !held.contains(&mark) {
+                    held.push(mark);
+                }
             }
-            log::warn!(
-                "table {} of a replacing ingestion is installed without its mark; \
-                 marking it from the manifest",
-                table.id(),
-            );
-            crate::replace_mark::publish_one(
-                &*table.fs,
-                &table.path,
-                table.id(),
-                bound,
-                config.sync_mode,
-            )?;
         }
-        Ok(())
+        for &(run, bound) in &held {
+            let seen = found
+                .iter()
+                .find(|mark| mark.run == run && mark.bound == bound);
+            let (folder, fs) = if let Some(mark) = seen {
+                (mark.folder.clone(), Arc::clone(&mark.fs))
+            } else {
+                log::warn!(
+                    "replacing ingestion {run} is installed without its mark; \
+                     marking it from the manifest",
+                );
+                config.tables_folder_for_level(0)
+            };
+            crate::replace_mark::publish(&*fs, &folder, run, bound, config.sync_mode)?;
+        }
+        let mut stale = OpenSweep::default();
+        for mark in found {
+            if !held.contains(&(mark.run, mark.bound)) {
+                log::debug!(
+                    "Removing the replace mark of an ingestion the tree holds no table of: {}",
+                    mark.path.display()
+                );
+                stale.remove(&mark.fs, &mark.path);
+            }
+        }
+        Ok(stale)
     }
 
     /// Removes stale manifest files left by older generations: every `v{id}`
@@ -8532,6 +8559,16 @@ impl OpenSweep {
         }
         first.map_or(Ok(()), |e| Err(e.into()))
     }
+}
+
+/// A replace mark an open's scan found (see [`crate::replace_mark`]).
+struct FoundReplaceMark {
+    run: TableId,
+    bound: TableId,
+    /// The tables folder it lies in, on `fs`.
+    folder: crate::path::PathBuf,
+    fs: Arc<dyn Fs>,
+    path: crate::path::PathBuf,
 }
 
 /// The folders that gain a new entry when `folder` is made on `fs`: each one

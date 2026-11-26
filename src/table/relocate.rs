@@ -298,17 +298,17 @@ impl Table {
                     hash_patched = true;
                 }
                 // The copy of a replacing ingestion's table is a compaction
-                // output, kept by the install of that compaction and under
-                // an id no mark of the ingestion names. Its place is the
+                // output, kept by the install of that compaction, which the
+                // mark of the ingestion does not prove. Its place is the
                 // source's, which the source's install recorded: offset 0,
                 // as every replacing install is, and the run's recency. The
                 // copy records both itself, so it reads as a table at offset
                 // 0, not as an ingested one whose place a lost manifest
                 // takes with it.
-                b"descriptor#bulk_ingested" if self.metadata.replacing => {
+                b"descriptor#bulk_ingested" if self.metadata.replacing.is_some() => {
                     entry.value = UserValue::from(&[0u8][..]);
                 }
-                b"recency" if self.metadata.replacing => {
+                b"recency" if self.metadata.replacing.is_some() => {
                     entry.value = UserValue::from(&self.l0_recency().to_le_bytes()[..]);
                 }
                 _ => {}
