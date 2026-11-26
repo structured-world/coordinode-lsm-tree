@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795689597934,
+  "lastUpdate": 1795689603153,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -129066,6 +129066,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.405766651,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2d0ffe0254f824e65a5bbc2ed156eb962326224c",
+          "message": "fix(repair): prove a replace's install by one mark (#1112)\n\n## Summary\n\n- A repair that rebuilds a lost manifest reads what a replacing\ningestion's install did: it keeps the installed tables, all of them or\nnone, leaves out an earlier table whose removal the install never\nfinished, and leaves out the tables of a replacing ingestion that never\ninstalled. The same holds after `clear`.\n- The install records itself in the tables folder, in one empty file\nmade after its manifest is durable. A table is finished before its\ninstall, so nothing written into it can prove the install.\n\n## Changes\n\n- A replacing ingestion takes an id of its own and writes it into each\nof its tables (`descriptor#replacing`, eight bytes, an optional key).\nIts tables are flagged ingested, like an adding ingestion's.\n- Replace mark: one file per install, `{ingestion id}.replaced-{bound}`.\n`bound` is the L0 recency of the run, taken from the table counter while\nno flush was under way: every table in the tree at the install has a\nlower recency, every later one a recency at or above it. One name and\none folder sync, whatever the number of tables, so no crash proves the\ninstall for part of its tables. An ingestion that wrote nothing leaves\nits mark too, and so does `clear`, under a number of its own.\n- Repair without a manifest: a table whose ingestion has a mark is\nrecovered at offset 0 and the mark's recency; a replacing ingestion's\ntable without one is left out; every table below the highest bound is\nleft out and reported among the excluded files.\n- The mark stays while the tree is open, past the last table of its\ningestion. An open removes every file its manifest does not name and\nthen the marks of ingestions it holds no table of; for an ingestion it\nholds a table of, it puts back a missing mark from the manifest and\nsyncs the folder of one that is there. A checkpoint takes one mark per\ningestion it links tables of.\n- A flush takes its L0 recency under the history lock, with the\nmemtables it writes, so a `clear` that lands while it writes takes a\nbound above it and the tables of the declined flush stay out of a\nrepair. A file made for the flush's first table takes that number as its\nid, so table ids are unchanged.\n- A relocated copy of a replacing ingestion's table records the source's\noffset and recency itself, under its new id.\n- An ingestion that finishes with nothing written finishes its writer\nall the same, which removes the table file it took: left empty in place,\na repair read it as a table that lost its bytes.\n- The files an install dropped are removed only once its mark is\ndurable. An install whose mark failed keeps them until the next open,\nwhich marks it and removes them.\n- `docs/manifest-recovery.md` describes the mark and names what stays\nopen: a replace whose mark is not durable when the manifest is lost\nbefore the next open is read as never made, and the repair rebuilds the\nearlier content.\n\nNo hot path changes: the mark is made in the install, read in the open's\nand the repair's directory scans, and a table's ingestion id is read\nwith its meta block when the table opens.\n\n## Testing\n\nTests, clippy (default and all features), formatting, docs with warnings\ndenied, the no-std check and the sst-dump build pass on macOS; CI runs\nthe full matrix.\n\nCloses #1110\nCloses #1114",
+          "timestamp": "2026-11-26T11:13:37+02:00",
+          "tree_id": "f980f45177ba3e3be6d3231de486c300f139cd96",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2d0ffe0254f824e65a5bbc2ed156eb962326224c"
+        },
+        "date": 1795689601833,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 663.238,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 175.399188ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 271.90299999999996,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 193.467588ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1251.5140000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 292.731772ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 7368.513,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 27246.034,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.351,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 50.003967,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.414398304,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 25.119,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.232191,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.411089948,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
