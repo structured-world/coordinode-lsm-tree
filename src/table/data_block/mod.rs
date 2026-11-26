@@ -793,64 +793,11 @@ impl DataBlock {
         Self::encode_entries_to_block(&entries, restart_interval)
     }
 
-    /// Point-read fast path for a columnar row group: reconstructs only the
-    /// rows of `needle` (skipping `deletes`-masked rows) into a tiny row
-    /// block, or `Ok(None)` when every one is deleted. The caller runs the
-    /// normal seqno-aware [`Self::point_read`] on the result. Reads those rows
-    /// through the pages as stored: no page is decoded whole, and no row is
-    /// re-encoded but the key's.
-    ///
-    /// `pages` are consecutive row pages of the group, `runs` the rows of
-    /// each that the key search found holding `needle`, one per page, and
-    /// `deletes` carries the position of the first page's first row: a key's
-    /// versions can run across a row page boundary.
-    ///
-    /// Also adds to `gathered` the matching rows' keys and values, which are
-    /// copied out of the columns before the encode copies them again, and
-    /// charges what reading them holds decoded to `budget`, the group's.
+    /// A row block holding the one entry a columnar point read found, for a
+    /// caller that keeps the block its value lies in: the pinned read.
     #[cfg(feature = "columnar")]
-    pub(crate) fn columnar_point_block(
-        pages: Vec<crate::table::columnar::RowPageColumns<'_>>,
-        runs: &[core::ops::Range<u32>],
-        needle: &[u8],
-        restart_interval: u8,
-        deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
-        gathered: &mut usize,
-        budget: &mut crate::table::columnar::DecodeBudget,
-    ) -> crate::Result<Option<Self>> {
-        let overflow = || crate::Error::InvalidHeader("columnar: row position exceeds u32::MAX");
-        if pages.len() != runs.len() {
-            return Err(crate::Error::InvalidHeader(
-                "columnar: row pages read differ from the pages the key search hit",
-            ));
-        }
-        let mut entries = Vec::new();
-        let mut offset = 0u32;
-        for (page, run) in pages.into_iter().zip(runs) {
-            let rows = page.rows;
-            let page_deletes = match deletes {
-                Some((bitmap, start)) => {
-                    Some((bitmap, start.checked_add(offset).ok_or_else(overflow)?))
-                }
-                None => None,
-            };
-            // The matcher adds each row's copies as it makes them, so rows
-            // copied before a later row fails are still counted.
-            crate::table::columnar::page_match_entries(
-                page,
-                run.clone(),
-                needle,
-                page_deletes,
-                gathered,
-                budget,
-                &mut entries,
-            )?;
-            offset = offset.checked_add(rows).ok_or_else(overflow)?;
-        }
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        Self::encode_entries_to_block(&entries, restart_interval).map(Some)
+    pub(crate) fn of_entry(entry: &InternalValue, restart_interval: u8) -> crate::Result<Self> {
+        Self::encode_entries_to_block(core::slice::from_ref(entry), restart_interval)
     }
 
     /// As [`Self::from_column_batch`], but drops rows whose global position is

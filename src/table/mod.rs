@@ -2267,11 +2267,13 @@ impl Table {
         }
     }
 
-    /// Point-read counterpart to [`Self::load_columnar_data_block`]: rebuilds
-    /// only `needle`'s rows (its MVCC versions, minus any masked by the
-    /// positional delete-bitmap) into a tiny row block, or `Ok(None)` when the
-    /// key is absent / wholly deleted. The caller runs the normal seqno-aware
-    /// point read on the result.
+    /// Point-read counterpart to [`Self::load_columnar_data_block`]: the
+    /// version of `needle` a read at `seqno` sees in the group at `handle`
+    /// (the newest below `seqno` the positional delete-bitmap does not mask),
+    /// or `Ok(None)` when the group holds none: the key is absent, wholly
+    /// deleted, or newer than `seqno` in every row. No row is rebuilt and no
+    /// block is encoded: a value one column stores whole is a view of its
+    /// page.
     ///
     /// Only the key pages of the row pages whose key zone holds `needle` are
     /// read first, and a key they do not hold ends the read there: a miss
@@ -2279,150 +2281,491 @@ impl Table {
     /// hold the key are read, the directory and key pages coming from the
     /// cache.
     #[cfg(feature = "columnar")]
-    fn load_columnar_point_block(
+    fn columnar_point_version(
         &self,
         handle: &BlockHandle,
         needle: &[u8],
+        seqno: SeqNo,
         fd: &LookupFd,
-    ) -> crate::Result<Option<DataBlock>> {
-        use crate::table::columnar::{COL_USER_KEY, TypeTag};
-        use crate::table::row_group::{PageWant, RowPageSelect};
-
-        // A key equal to the needle is the needle's bytes (the comparator
-        // contract makes equality byte equality), so it lies within the
-        // byte-wise zone of the row page holding it, whatever the key order.
-        let group = self.group_read(handle, ReadCharge::Foreground, fd);
-        let key_blocks = group.load(&PageWant::projected(
-            &[COL_USER_KEY],
-            RowPageSelect::Zone {
-                column_id: COL_USER_KEY,
-                lower: Some(needle),
-                upper: Some(needle),
-            },
-        ))?;
-        // The key pages as stored: the search reads the keys it compares and
-        // decodes no page whole. What both steps hold decoded is the group's.
-        let mut budget = crate::table::columnar::DecodeBudget::default();
-        let key_pages = key_blocks.page_columns(|_| true, &mut budget)?;
-        // The key's versions are one run of rows, sorted with the rest of the
-        // group, so they sit on consecutive row pages: the first page whose
-        // keys reach it through the page where the run ends. Every page of
-        // the run is selected, since each holds the needle.
-        let mut hit: Option<core::ops::Range<u16>> = None;
-        // Each hit page's run of the needle's rows, so the second step reads
-        // those rows without searching the keys again.
-        let mut runs: Vec<core::ops::Range<u32>> = Vec::new();
-        for page in key_pages {
-            let (ordinal, row_count) = (page.ordinal, page.rows);
-            let Some(key_col) = page
-                .columns
-                .into_iter()
-                .next()
-                .filter(|c| c.column_id == COL_USER_KEY && c.type_tag == TypeTag::Bytes)
-            else {
-                return Err(crate::Error::InvalidHeader(
-                    "columnar: row group has no user-key column",
-                ));
-            };
-            let keys = budget.rows(key_col.values, TypeTag::Bytes, row_count)?;
-            let rows =
-                crate::table::columnar::key_rows(row_count, needle, &self.comparator, |row| {
-                    keys.get(TypeTag::Bytes, row_count, row)
-                })?;
-            if rows.is_empty() {
-                // Every key of a page before the run is smaller than the
-                // needle, so the search stops at `row_count`; a run that has
-                // started, or a page past the needle, ends the search.
-                if hit.is_some() || rows.start < row_count {
-                    break;
-                }
-                continue;
-            }
-            let end = ordinal + 1;
-            hit = Some(hit.map_or(ordinal..end, |h| h.start..end));
-            let last = rows.end < row_count;
-            runs.push(rows);
-            if last {
-                break;
-            }
-        }
-        let Some(row_pages) = hit else {
-            return Ok(None);
-        };
-
-        // The rest of the row's columns on those row pages, through the
-        // directory and key pages the first step already has.
-        let blocks = group.load_after(
-            &key_blocks,
-            &PageWant {
-                columns: None,
-                row_pages: RowPageSelect::Range(row_pages),
-                whole: false,
-            },
+    ) -> crate::Result<Option<crate::table::columnar::KeyVersion>> {
+        let mut version = None;
+        self.columnar_point_versions(
+            handle,
+            None,
+            1,
+            |_| needle,
+            seqno,
+            fd,
+            |_, found| version = Some(found),
         )?;
-        // The key search already placed the needle's rows, whose key is the
-        // needle: the key pages are not read again.
-        let pages = blocks.page_columns(|column_id| column_id != COL_USER_KEY, &mut budget)?;
-        let first_row = pages.first().map_or(0, |page| page.start);
-        let deletes = match self
+        Ok(version)
+    }
+
+    /// [`Self::columnar_point_version`] for `count` keys of one batch that
+    /// fall in the group at `handle`, `key_at` naming each in ascending
+    /// order: `found` is called with a key's index and its version, for the
+    /// keys the read sees one of.
+    ///
+    /// The pages the keys share are loaded and prepared once. The key pages
+    /// loaded for one key answer every later key that lies within them, and
+    /// the row pages prepared for one key are read for every later key whose
+    /// rows lie on the same ones; a key past them loads its own. Keys that
+    /// fall together in a group therefore cost a key search and a row read
+    /// each, and a key apart from the others what a point read costs.
+    ///
+    /// `whole` is the group with every page of it in hand and the bytes it
+    /// was read as, when the caller read it in one request: the pages and
+    /// the zone block that selects among them are then taken from those, and
+    /// nothing is read.
+    #[cfg(feature = "columnar")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the one read of a group's keys, for every caller of it"
+    )]
+    fn columnar_point_versions<'k>(
+        &self,
+        handle: &BlockHandle,
+        whole: Option<(&crate::table::row_group::RowGroupBlocks, &crate::Slice)>,
+        count: usize,
+        key_at: impl Fn(usize) -> &'k [u8],
+        seqno: SeqNo,
+        fd: &LookupFd,
+        mut found: impl FnMut(usize, crate::table::columnar::KeyVersion),
+    ) -> crate::Result<()> {
+        let mut built = 0usize;
+        let read = self.read_columnar_points(
+            handle, whole, count, &key_at, seqno, fd, &mut found, &mut built,
+        );
+        // `built` is the bytes of the values that had to be built from their
+        // columns (what decoding the pages copied was charged by
+        // `load_row_group`), charged whether the read then succeeded or not:
+        // the copies were made. A value served as a view of its page copied
+        // nothing.
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(built);
+        #[cfg(not(feature = "metrics"))]
+        let _ = built;
+        read
+    }
+
+    /// The body of [`Self::columnar_point_versions`], adding to `built` the
+    /// bytes of the values it had to build.
+    #[cfg(feature = "columnar")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the one read of a group's keys, split from its accounting"
+    )]
+    fn read_columnar_points<'k>(
+        &self,
+        handle: &BlockHandle,
+        whole: Option<(&crate::table::row_group::RowGroupBlocks, &crate::Slice)>,
+        count: usize,
+        key_at: &impl Fn(usize) -> &'k [u8],
+        seqno: SeqNo,
+        fd: &LookupFd,
+        found: &mut impl FnMut(usize, crate::table::columnar::KeyVersion),
+        built: &mut usize,
+    ) -> crate::Result<()> {
+        use crate::table::columnar::{
+            COL_USER_KEY, DecodeBudget, PointPage, TypeTag, key_rows, point_version,
+        };
+        use crate::table::row_group::{PageWant, PerRowPage, RowPageSelect};
+
+        /// Each hit page's run of a key's rows. Held inline: a key's
+        /// versions seldom cross more than one row page boundary.
+        type Runs = smallvec::SmallVec<[core::ops::Range<u32>; 2]>;
+
+        /// Where the key pages in hand place a key.
+        enum Located {
+            /// On these row pages, in these rows of each.
+            Rows(core::ops::Range<u16>, Runs),
+            /// Nowhere in the group.
+            Absent,
+            /// Not within the key pages in hand: its own are to be loaded.
+            Elsewhere,
+        }
+
+        let overflow = || crate::Error::InvalidHeader("columnar: row position exceeds u32::MAX");
+        let group = self.group_read(handle, ReadCharge::Foreground, fd);
+        let delete_start = self
             .delete_block_starts
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
-        {
-            Some(&start) => Some((
-                self.delete_bitmap.as_ref(),
-                start
-                    .checked_add(first_row)
-                    .ok_or(crate::Error::InvalidHeader(
-                        "columnar: row position exceeds u32::MAX",
-                    ))?,
-            )),
-            None => None,
-        };
-        let mut rows = 0usize;
-        let rebuilt = DataBlock::columnar_point_block(
-            pages,
-            &runs,
-            needle,
-            self.metadata.data_block_restart_interval,
-            deletes,
-            &mut rows,
-            &mut budget,
-        );
-        // `rows` is the needle's keys and values copied out of the columns
-        // when it is present (what decoding the pages copied was charged by
-        // `load_row_group`); a miss or a refused group still did those copies,
-        // so they are charged either way. The small block encoded from the
-        // rows exists only on a hit.
-        #[cfg(feature = "metrics")]
-        self.metrics.record_gather(rows);
-        #[cfg(not(feature = "metrics"))]
-        let _ = rows;
-        let rebuilt = rebuilt?;
-        #[cfg(feature = "metrics")]
-        if let Some(rebuilt) = &rebuilt {
-            self.metrics.record_gather(rebuilt.inner.data.len());
+            .copied();
+
+        let byte_ordered = self.comparator.is_lexicographic();
+
+        let mut at = 0usize;
+        while at < count {
+            // A key equal to the needle is the needle's bytes (the comparator
+            // contract makes equality byte equality), so it lies within the
+            // byte-wise zone of the row page holding it, whatever the key
+            // order.
+            //
+            // Where the keys ascend in byte order the zones ascend with
+            // them, and the row page is found by bisection.
+            let first = key_at(at);
+            let key_pages = PageWant::projected(
+                &[COL_USER_KEY],
+                if byte_ordered {
+                    RowPageSelect::ZoneOfKey {
+                        column_id: COL_USER_KEY,
+                        key: first,
+                    }
+                } else {
+                    RowPageSelect::Zone {
+                        column_id: COL_USER_KEY,
+                        lower: Some(first),
+                        upper: Some(first),
+                    }
+                },
+            );
+            let key_blocks = match whole {
+                Some((whole, frame)) => group.load_after_within(whole, &key_pages, frame)?,
+                None => group.load(&key_pages)?,
+            };
+            // The key pages as stored: the search reads the keys it compares
+            // and decodes no page whole. What the key pages and the row pages
+            // read beside them hold decoded is the group's.
+            let mut budget = DecodeBudget::default();
+            // Each key page's ordinal, rows and keys.
+            let mut keyed: PerRowPage<_> = PerRowPage::new();
+            key_blocks.each_page_column(
+                |_| true,
+                &mut budget,
+                |at, column, budget| {
+                    if column.column_id != COL_USER_KEY || column.type_tag != TypeTag::Bytes {
+                        return Err(crate::Error::InvalidHeader(
+                            "columnar: row group has no user-key column",
+                        ));
+                    }
+                    keyed.push((
+                        at.ordinal,
+                        at.rows,
+                        budget.rows(column.values, TypeTag::Bytes, at.rows)?,
+                    ));
+                    Ok(())
+                },
+            )?;
+            // A key's versions are one run of rows, sorted with the rest of
+            // the group, so they sit on consecutive row pages: the first page
+            // whose keys reach it through the page where the run ends.
+            //
+            // The pages in hand are every page whose zone holds `first`. They
+            // answer `first` whole, and a later key as long as it lies within
+            // their keys: one past their last key, or whose run reaches the
+            // end of their last page and may go on, has pages of its own.
+            //
+            // That holds only where the keys ascend in byte order: the pages
+            // in hand then lie side by side, and a key within their keys is
+            // on one of them or nowhere. Under another order a zone, which
+            // is byte-wise, selects row pages that need not be neighbours,
+            // and a key between two of them is on a page not in hand: every
+            // key then loads the pages of its own zone.
+            let locate = |key: &[u8], loaded_for_it: bool| -> crate::Result<Located> {
+                if !loaded_for_it
+                    && (!byte_ordered
+                        || self.comparator.compare(key, first) != core::cmp::Ordering::Greater)
+                {
+                    return Ok(Located::Elsewhere);
+                }
+                let mut hit: Option<core::ops::Range<u16>> = None;
+                let mut runs = Runs::new();
+                let mut within = loaded_for_it;
+                for (ordinal, row_count, keys) in &keyed {
+                    let rows = key_rows(*row_count, key, &self.comparator, |row| {
+                        keys.get(TypeTag::Bytes, *row_count, row)
+                    })?;
+                    if rows.is_empty() {
+                        // Every key of a page before the run is smaller than
+                        // the needle, so the search stops at `row_count`; a
+                        // run that has started, or a page past the needle,
+                        // ends the search.
+                        if hit.is_some() || rows.start < *row_count {
+                            within = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    let end = ordinal + 1;
+                    hit = Some(hit.map_or(*ordinal..end, |h| h.start..end));
+                    let last = rows.end < *row_count;
+                    runs.push(rows);
+                    if last {
+                        within = true;
+                        break;
+                    }
+                }
+                Ok(match hit {
+                    _ if !within => Located::Elsewhere,
+                    Some(pages) => Located::Rows(pages, runs),
+                    None => Located::Absent,
+                })
+            };
+
+            let mut located = locate(first, true)?;
+            'answered: loop {
+                let (row_pages, mut runs) = match located {
+                    Located::Elsewhere => break,
+                    Located::Absent => {
+                        at += 1;
+                        if at >= count {
+                            break;
+                        }
+                        located = locate(key_at(at), false)?;
+                        continue;
+                    }
+                    Located::Rows(pages, runs) => (pages, runs),
+                };
+                // The rest of the row's columns on those row pages, through
+                // the directory and key pages already in hand. The key search
+                // placed the key's rows, so the key pages are not read again.
+                let blocks = group.load_after(
+                    whole.map_or(&key_blocks, |(whole, _)| whole),
+                    &PageWant {
+                        columns: None,
+                        row_pages: RowPageSelect::Range(row_pages.clone()),
+                        whole: false,
+                    },
+                )?;
+                let mut row_budget = budget.clone();
+                let mut pages: PerRowPage<PointPage<'_>> = PerRowPage::new();
+                let mut first_row = 0;
+                // A column's pages arrive in row order and the columns in
+                // write order, so the first column opens each page and the
+                // ones after it are added to the page in place.
+                blocks.each_page_column(
+                    |column_id| column_id != COL_USER_KEY,
+                    &mut row_budget,
+                    |at, column, budget| {
+                        if at.place == pages.len() {
+                            if at.place == 0 {
+                                first_row = at.start;
+                            }
+                            pages.push(PointPage::new(at.rows)?);
+                        }
+                        pages
+                            .get_mut(at.place)
+                            .ok_or(crate::Error::InvalidHeader(
+                                "columnar: page names a row page the group does not have",
+                            ))?
+                            .add(column, budget)
+                    },
+                )?;
+                for page in &mut pages {
+                    page.finish()?;
+                }
+                let deletes = match delete_start {
+                    Some(start) => Some((
+                        self.delete_bitmap.as_ref(),
+                        start.checked_add(first_row).ok_or_else(overflow)?,
+                    )),
+                    None => None,
+                };
+                // Every key whose rows lie on these row pages.
+                loop {
+                    if let Some(version) =
+                        point_version(&pages, &runs, key_at(at), seqno, deletes, built)?
+                    {
+                        found(at, version);
+                    }
+                    at += 1;
+                    if at >= count {
+                        break 'answered;
+                    }
+                    match locate(key_at(at), false)? {
+                        Located::Rows(next, next_runs) if next == row_pages => runs = next_runs,
+                        other => {
+                            located = other;
+                            continue 'answered;
+                        }
+                    }
+                }
+            }
         }
-        Ok(rebuilt)
+        Ok(())
     }
 
-    /// Loads the data block to point-read for `needle`: for a columnar SST the
-    /// key-aware fast path that rebuilds only the matching key's rows; for a row
-    /// SST the whole block. `Ok(None)` means the block carries no row for `needle`
-    /// (columnar: absent / wholly deleted), so the caller moves on. The file is
-    /// taken through `fd`, the lookup's.
-    fn load_point_block(
+    /// [`Self::columnar_point_versions`] as entries, each with its seqno
+    /// translated as [`Self::point_read_translated`] translates it: the same
+    /// answers as that read of the loaded group gives, with no block built.
+    ///
+    /// # Errors
+    ///
+    /// As a point read of the group.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn columnar_point_entries<'k>(
         &self,
         handle: &BlockHandle,
-        needle: &[u8],
+        count: usize,
+        key_at: impl Fn(usize) -> &'k [u8],
+        table_seqno: SeqNo,
         fd: &LookupFd,
-    ) -> crate::Result<Option<DataBlock>> {
+        found: impl FnMut(usize, InternalValue),
+    ) -> crate::Result<()> {
+        self.columnar_entries(handle, None, count, key_at, table_seqno, fd, found)
+    }
+
+    /// [`Self::columnar_point_entries`] for a group a batched read took in
+    /// one request, as `frame`: the group is checked and its pages admitted
+    /// as the load path does it, and the keys are read through those pages.
+    /// No block is built, and nothing more is read.
+    ///
+    /// # Errors
+    ///
+    /// A check of the group fails, or a point read of it does.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn columnar_frame_entries<'k>(
+        &self,
+        handle: &BlockHandle,
+        frame: &crate::Slice,
+        count: usize,
+        key_at: impl Fn(usize) -> &'k [u8],
+        table_seqno: SeqNo,
+        found: impl FnMut(usize, InternalValue),
+    ) -> crate::Result<()> {
+        let fd = LookupFd::default();
+        let whole = self
+            .group_read(handle, ReadCharge::Foreground, &fd)
+            .load_whole(frame)?;
+        self.columnar_entries(
+            handle,
+            Some((&whole, frame)),
+            count,
+            key_at,
+            table_seqno,
+            &fd,
+            found,
+        )
+    }
+
+    /// The body of [`Self::columnar_point_entries`] and
+    /// [`Self::columnar_frame_entries`].
+    #[cfg(feature = "columnar")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the one read of a group's keys, for every caller of it"
+    )]
+    fn columnar_entries<'k>(
+        &self,
+        handle: &BlockHandle,
+        whole: Option<(&crate::table::row_group::RowGroupBlocks, &crate::Slice)>,
+        count: usize,
+        key_at: impl Fn(usize) -> &'k [u8],
+        table_seqno: SeqNo,
+        fd: &LookupFd,
+        mut found: impl FnMut(usize, InternalValue),
+    ) -> crate::Result<()> {
+        let global_seqno = self.global_seqno();
+        self.columnar_point_versions(
+            handle,
+            whole,
+            count,
+            &key_at,
+            table_seqno,
+            fd,
+            |at, version| {
+                found(
+                    at,
+                    InternalValue {
+                        key: crate::key::InternalKey {
+                            user_key: crate::Slice::from(key_at(at)),
+                            seqno: apply_global_seqno(version.seqno, global_seqno),
+                            value_type: version.value_type,
+                        },
+                        value: version.value,
+                    },
+                );
+            },
+        )
+    }
+
+    /// [`Self::columnar_point_version`] as an entry: its key is a copy of
+    /// `key`, its value the version's.
+    #[cfg(feature = "columnar")]
+    fn columnar_point_entry(
+        &self,
+        handle: &BlockHandle,
+        key: &[u8],
+        seqno: SeqNo,
+        fd: &LookupFd,
+    ) -> crate::Result<Option<InternalValue>> {
+        Ok(self
+            .columnar_point_version(handle, key, seqno, fd)?
+            .map(|version| InternalValue {
+                key: crate::key::InternalKey {
+                    user_key: crate::Slice::from(key),
+                    seqno: version.seqno,
+                    value_type: version.value_type,
+                },
+                value: version.value,
+            }))
+    }
+
+    /// What a point read of `key` at `seqno` finds in the data block at
+    /// `handle`, as `(value type, seqno, value)`, or `Ok(None)` when the block
+    /// holds no version the read sees, so the caller moves on. A row block is
+    /// searched as stored, from `hint` when the locator gave one; a columnar
+    /// group is read through its pages for the one version, with no block
+    /// built. The file is taken through `fd`, the lookup's.
+    fn block_point_value(
+        &self,
+        handle: &BlockHandle,
+        key: &[u8],
+        key_hash: u64,
+        seqno: SeqNo,
+        hint: Option<(u64, bool)>,
+        fd: &LookupFd,
+    ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            return self.load_columnar_point_block(handle, needle, fd);
+            // A columnar group is narrowed to this key's rows by the key
+            // search, so the full-block slot hint does not apply.
+            return Ok(self
+                .columnar_point_version(handle, key, seqno, fd)?
+                .map(|version| (version.value_type, version.seqno, version.value)));
         }
-        let _ = needle;
-        self.load_data_block(handle, fd)
+        let Some(data_block) = self.load_data_block(handle, fd)? else {
+            return Ok(None);
+        };
+        match hint {
+            Some((slot, is_entry)) => {
+                data_block.point_read_value_at_slot(slot, is_entry, key, seqno, &self.comparator)
+            }
+            None => {
+                data_block.point_read_value_hashed(key, Some(key_hash), seqno, &self.comparator)
+            }
+        }
+    }
+
+    /// [`Self::block_point_value`] for a read that wants the entry: the entry,
+    /// and the row block it lies in. A columnar group has no such block, and
+    /// its entry's key is a copy of `key`.
+    fn block_point_entry(
+        &self,
+        handle: &BlockHandle,
+        key: &[u8],
+        key_hash: u64,
+        seqno: SeqNo,
+        hint: Option<(u64, bool)>,
+        fd: &LookupFd,
+    ) -> crate::Result<Option<(InternalValue, Option<DataBlock>)>> {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return Ok(self
+                .columnar_point_entry(handle, key, seqno, fd)?
+                .map(|entry| (entry, None)));
+        }
+        let Some(data_block) = self.load_data_block(handle, fd)? else {
+            return Ok(None);
+        };
+        let found = match hint {
+            Some((slot, is_entry)) => {
+                data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
+            }
+            None => data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?,
+        };
+        Ok(found.map(|item| (item, Some(data_block))))
     }
 
     /// Loads a columnar data block and decodes only the projected columns of
@@ -7392,29 +7735,9 @@ impl Table {
         // MVCC-correctness argument). A located-block miss falls through to the
         // index walk below.
         if let Some((handle, hint)) = self.locator_block(key_hash)?
-            && let Some(data_block) = self.load_point_block(&handle, key, fd)?
+            && let Some(found) = self.block_point_value(&handle, key, key_hash, seqno, hint, fd)?
         {
-            // A columnar block is narrowed to this key's rows by load_point_block,
-            // so the full-block slot hint does not apply.
-            let is_columnar = cfg!(feature = "columnar") && self.metadata.columnar;
-            let found = match hint {
-                Some((slot, is_entry)) if !is_columnar => data_block.point_read_value_at_slot(
-                    slot,
-                    is_entry,
-                    key,
-                    seqno,
-                    &self.comparator,
-                )?,
-                _ => data_block.point_read_value_hashed(
-                    key,
-                    Some(key_hash),
-                    seqno,
-                    &self.comparator,
-                )?,
-            };
-            if let Some(found) = found {
-                return Ok(Some(found));
-            }
+            return Ok(Some(found));
         }
 
         let Some(mut iter) = self.block_index.point_read_reader(key, seqno) else {
@@ -7424,25 +7747,16 @@ impl Table {
         while let Some(block_handle) = iter.next_with(fd) {
             let block_handle = block_handle?;
 
-            // A columnar block carrying no row for this key (absent / wholly
-            // deleted) returns None here; still honor the end-key cutoff before
-            // skipping, so an absent key below this block's end key stops the
-            // scan instead of probing every later candidate block.
-            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key, fd)? else {
-                if self.comparator.compare(block_handle.end_key(), key)
-                    == core::cmp::Ordering::Greater
-                {
-                    return Ok(None);
-                }
-                continue;
-            };
-
             if let Some(found) =
-                data_block.point_read_value_hashed(key, Some(key_hash), seqno, &self.comparator)?
+                self.block_point_value(block_handle.as_ref(), key, key_hash, seqno, None, fd)?
             {
                 return Ok(Some(found));
             }
 
+            // A block holding no version the read sees (the key absent from
+            // it, wholly deleted, or newer in every row) still ends the walk
+            // when its end key is past ours: an absent key stops there
+            // instead of probing every later candidate block.
             if self.comparator.compare(block_handle.end_key(), key) == core::cmp::Ordering::Greater
             {
                 return Ok(None);
@@ -7538,7 +7852,7 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
         fd: &LookupFd,
-    ) -> crate::Result<Option<(InternalValue, DataBlock)>> {
+    ) -> crate::Result<Option<(InternalValue, Option<DataBlock>)>> {
         // Fast path: a retrieval-ribbon locator resolves the key to its data
         // block in O(1), skipping the index-block binary search. The located
         // block holds the newest version (the run's highest-seqno prefix), so a
@@ -7546,20 +7860,9 @@ impl Table {
         // visible version lives in a later block) safely falls through to the
         // index walk below.
         if let Some((handle, hint)) = self.locator_block(key_hash)?
-            && let Some(data_block) = self.load_point_block(&handle, key, fd)?
+            && let Some(found) = self.block_point_entry(&handle, key, key_hash, seqno, hint, fd)?
         {
-            // A columnar block is narrowed to this key's rows by load_point_block,
-            // so the full-block slot hint does not apply.
-            let is_columnar = cfg!(feature = "columnar") && self.metadata.columnar;
-            let found = match hint {
-                Some((slot, is_entry)) if !is_columnar => {
-                    data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
-                }
-                _ => data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?,
-            };
-            if let Some(item) = found {
-                return Ok(Some((item, data_block)));
-            }
+            return Ok(Some(found));
         }
 
         // Borrowing point-read seek: avoids cloning the index block + reuses
@@ -7572,27 +7875,15 @@ impl Table {
         while let Some(block_handle) = iter.next_with(fd) {
             let block_handle = block_handle?;
 
-            // A columnar block carrying no row for this key (absent / wholly
-            // deleted) returns None here; still honor the end-key cutoff before
-            // skipping, so an absent key below this block's end key stops the
-            // scan instead of probing every later candidate block.
-            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key, fd)? else {
-                if self.comparator.compare(block_handle.end_key(), key)
-                    == core::cmp::Ordering::Greater
-                {
-                    return Ok(None);
-                }
-                continue;
-            };
-
-            if let Some(item) =
-                data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?
+            if let Some(found) =
+                self.block_point_entry(block_handle.as_ref(), key, key_hash, seqno, None, fd)?
             {
-                return Ok(Some((item, data_block)));
+                return Ok(Some(found));
             }
 
-            // NOTE: If the last block key is higher than ours,
-            // our key cannot be in the next block
+            // A block holding no version the read sees still ends the walk
+            // when its end key is past ours: our key cannot be in the next
+            // block.
             if self.comparator.compare(block_handle.end_key(), key) == core::cmp::Ordering::Greater
             {
                 return Ok(None);
@@ -7618,6 +7909,10 @@ impl Table {
     /// Holding on to the returned [`Block`] (e.g. for [`PinnableSlice`]) keeps the
     /// block data alive while the value is in use, but does not guarantee that the
     /// cache will retain its own entry for that block.
+    ///
+    /// A columnar group has no row block to return: the entry found is
+    /// encoded into one of its own, and the entry returned is read from it,
+    /// so its value lies in the block the caller keeps.
     fn point_read_with_block(
         &self,
         key: &[u8],
@@ -7625,8 +7920,28 @@ impl Table {
         key_hash: u64,
         fd: &LookupFd,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
-        self.point_read_inner(key, seqno, key_hash, fd)
-            .map(|opt| opt.map(|(iv, db)| (iv, db.inner)))
+        let Some((entry, block)) = self.point_read_inner(key, seqno, key_hash, fd)? else {
+            return Ok(None);
+        };
+        if let Some(block) = block {
+            return Ok(Some((entry, block.inner)));
+        }
+        #[cfg(feature = "columnar")]
+        {
+            let block = DataBlock::of_entry(&entry, self.metadata.data_block_restart_interval)?;
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(block.inner.data.len());
+            // The block holds that one entry, so a read past every seqno
+            // finds it.
+            let pinned = block.point_read(key, SeqNo::MAX, &self.comparator)?;
+            Ok(pinned.map(|entry| (entry, block.inner)))
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            // Only a columnar group is read without a row block.
+            let _ = entry;
+            Err(crate::Error::Unrecoverable)
+        }
     }
 
     /// Batch point-read variant of [`Table::get`].
@@ -7875,9 +8190,45 @@ impl Table {
                 continue;
             }
 
+            // The batch's keys in a columnar group are read through its
+            // pages, prepared once for all of them, with no block rebuilt.
+            #[cfg(feature = "columnar")]
+            if self.reads_keys_through_pages() {
+                let here = passing.get(p..).unwrap_or_default();
+                let in_block = here
+                    .iter()
+                    .take_while(|&&i| {
+                        sorted_keys.get(i).is_some_and(|(key, _)| {
+                            self.comparator.compare(key, end_key) != core::cmp::Ordering::Greater
+                        })
+                    })
+                    .count();
+                let here = here.get(..in_block).unwrap_or_default();
+                self.columnar_point_entries(
+                    block_handle.as_ref(),
+                    here.len(),
+                    |n| sorted_keys[here[n]].0,
+                    table_seqno,
+                    &fd,
+                    |n, item| results[here[n]] = Some(item),
+                )?;
+                // A key equal to the block's end key that this block holds
+                // no visible version of may continue in the next: it stays
+                // for the next block, as in the drain below.
+                let stays = here.last().is_some_and(|&last| {
+                    results[last].is_none()
+                        && self.comparator.compare(sorted_keys[last].0, end_key)
+                            == core::cmp::Ordering::Equal
+                });
+                p += in_block - usize::from(stays);
+                continue;
+            }
             // A wholly-deleted columnar block carries no keys; skip it.
             let Some(data_block) = self.load_data_block(block_handle.as_ref(), &fd)? else {
                 continue;
+            };
+            let read = |key: &[u8], key_hash: u64| -> crate::Result<Option<InternalValue>> {
+                data_block.point_read_hashed(key, Some(key_hash), table_seqno, &self.comparator)
             };
 
             // Drain passing keys that fall inside [..end_key].
@@ -7906,12 +8257,7 @@ impl Table {
                 match self.comparator.compare(key, end_key) {
                     core::cmp::Ordering::Greater => break,
                     core::cmp::Ordering::Less => {
-                        if let Some(mut item) = data_block.point_read_hashed(
-                            key,
-                            Some(key_hash),
-                            table_seqno,
-                            &self.comparator,
-                        )? {
+                        if let Some(mut item) = read(key, key_hash)? {
                             // Translate table-local seqno back to
                             // the global coordinate so callers can
                             // compare results across tables /
@@ -7923,12 +8269,7 @@ impl Table {
                         p += 1;
                     }
                     core::cmp::Ordering::Equal => {
-                        if let Some(mut item) = data_block.point_read_hashed(
-                            key,
-                            Some(key_hash),
-                            table_seqno,
-                            &self.comparator,
-                        )? {
+                        if let Some(mut item) = read(key, key_hash)? {
                             item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                             results[key_idx] = Some(item);
                             p += 1;
@@ -8265,6 +8606,11 @@ impl Table {
     /// [`Self::decode_special_block`], or through the table's own load path in
     /// a job.
     ///
+    /// A columnar group whose directory is not cached is taken in one
+    /// request however few of the batch's keys fall in it: reading its
+    /// directory and then the pages of those keys takes fewer bytes but more
+    /// time a group, in requests that wait on one another.
+    ///
     /// A columnar group goes through the load path when its directory is
     /// cached (its pages may be too, which that path takes from the cache),
     /// when it is wider than one request, or when it carries Page-ECC, whose
@@ -8316,11 +8662,11 @@ impl Table {
         BlockType::Data
     }
 
-    /// The data block at `handle` of this Page-ECC or columnar table, from the
-    /// `frame` [`Self::batched_special_read`] asked for: checked, recovered
-    /// and reconstructed exactly as the load path does it, cached (a row block
-    /// while it fits in `room`), and `None` when a columnar block's delete
-    /// mask removes every row.
+    /// The data block at `handle` of this Page-ECC table, from the `frame`
+    /// [`Self::batched_special_read`] asked for: checked and recovered
+    /// exactly as the load path does it, and cached while it fits in `room`.
+    /// A columnar group's frame is read through its pages instead
+    /// ([`Self::columnar_frame_entries`]).
     ///
     /// # Errors
     ///
@@ -8333,14 +8679,6 @@ impl Table {
         frame: &crate::Slice,
         room: &mut u64,
     ) -> crate::Result<Option<DataBlock>> {
-        #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            let fd = LookupFd::default();
-            let blocks = self
-                .group_read(handle, ReadCharge::Foreground, &fd)
-                .load_whole(frame)?;
-            return self.columnar_data_block_from(handle, &blocks, ReadCharge::Foreground);
-        }
         let compression = self.metadata.data_block_compression;
         let transform = crate::table::util::build_block_transform(
             compression,
@@ -8567,6 +8905,15 @@ impl Table {
                 item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                 item
             }))
+    }
+
+    /// Whether a batch reads its keys in one data block of this table through
+    /// the pages that hold them, rather than loading the block: a columnar
+    /// table's, whose group would have to be rebuilt into a row block. The
+    /// pages the keys share are prepared once, so the read costs less than
+    /// the rebuild however many of the batch's keys fall in the group.
+    pub(crate) fn reads_keys_through_pages(&self) -> bool {
+        cfg!(feature = "columnar") && self.metadata.columnar
     }
 
     /// Whether the table has a filter to probe.

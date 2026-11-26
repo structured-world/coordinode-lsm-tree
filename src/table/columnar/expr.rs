@@ -1339,7 +1339,7 @@ impl Values<'_> {
 
 /// A view of `page` over `data`, which the parse took from it; a copy if it
 /// did not, which no parse of `page` produces.
-fn view_of(page: &Slice, data: &[u8]) -> Slice {
+pub(crate) fn view_of(page: &Slice, data: &[u8]) -> Slice {
     let outer = page.as_ptr_range();
     let inner = data.as_ptr_range();
     if outer.start <= inner.start && inner.end <= outer.end {

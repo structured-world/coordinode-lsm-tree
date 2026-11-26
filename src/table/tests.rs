@@ -7009,6 +7009,75 @@ fn batch_get_matches_per_key_get() -> crate::Result<()> {
     )
 }
 
+/// A columnar table's `batch_get` answers as `get` does for every key at
+/// every snapshot, whether a row group is read through its pages for the few
+/// keys of the batch in it or rebuilt for many: keys in three versions whose
+/// runs straddle row pages and groups, deleted keys, absent keys.
+#[cfg(feature = "columnar")]
+#[test]
+fn batch_get_of_a_columnar_table_matches_per_key_get() -> crate::Result<()> {
+    let mut items = Vec::new();
+    for i in 0u32..120 {
+        let key = format!("k-{:03}", i * 2);
+        for seqno in (0u64..3).rev() {
+            items.push(if seqno == 2 && i % 5 == 0 {
+                crate::InternalValue::new_tombstone(key.as_bytes(), seqno)
+            } else {
+                crate::InternalValue::from_components(
+                    key.as_bytes(),
+                    format!("v-{i:03}-{seqno}-{}", "x".repeat(60)).as_bytes(),
+                    seqno,
+                    crate::ValueType::Value,
+                )
+            });
+        }
+    }
+
+    test_with_table(
+        &items,
+        |table| {
+            assert!(table.metadata.columnar, "self-check: a columnar table");
+            assert!(
+                table.metadata.data_block_count > 4,
+                "self-check: several row groups"
+            );
+            let keys: Vec<Vec<u8>> = (0..250).map(|i| format!("k-{i:03}").into_bytes()).collect();
+            for seqno in [1, 2, 3, SeqNo::MAX] {
+                // Every key, then every seventh, then pairs: many keys in a
+                // group, one or two, and a batch of its own per group.
+                let dense: Vec<&Vec<u8>> = keys.iter().collect();
+                let sparse: Vec<&Vec<u8>> = keys.iter().step_by(7).collect();
+                let batches = core::iter::once(dense.as_slice())
+                    .chain(core::iter::once(sparse.as_slice()))
+                    .chain(dense.chunks(2));
+                for picked in batches {
+                    let batch: Vec<(&[u8], u64)> =
+                        picked.iter().map(|k| (k.as_slice(), hash64(k))).collect();
+                    let found = table.batch_get(&batch, seqno)?;
+                    assert_eq!(found.len(), batch.len());
+                    for (&(key, hash), found) in batch.iter().zip(&found) {
+                        assert_eq!(
+                            found,
+                            &table.get(key, seqno, hash)?,
+                            "key {} at seqno {seqno} in a batch of {}",
+                            String::from_utf8_lossy(key),
+                            batch.len(),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        },
+        None,
+        Some(|writer: Writer| {
+            writer
+                .use_columnar(true)
+                .use_row_group_size(1_024)
+                .use_columnar_page_size(256)
+        }),
+    )
+}
+
 #[test]
 fn batch_get_same_user_key_across_block_boundary_finds_older_visible_version() -> crate::Result<()>
 {
@@ -10241,6 +10310,160 @@ fn requested(metrics: &crate::metrics::Metrics) -> (u64, u64) {
         metrics.index_block_io_requested.load(Relaxed),
         metrics.data_block_io_requested.load(Relaxed),
     )
+}
+
+/// A read that wants the entry, not only its value, is placed by the
+/// table's locator as a value read is: at the restart head or at the entry
+/// the locator names. Every key is found with its own value and seqno at
+/// either precision, and a key between two present ones reads absent.
+#[test]
+fn an_entry_read_placed_by_the_locator_finds_every_key() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+
+    for precision in [LocatorPrecision::Restart, LocatorPrecision::Entry] {
+        let dir = tempdir()?;
+        let file = dir.path().join("table");
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+            .use_data_block_size(256)
+            .use_locator(LocatorPolicyEntry::Enabled {
+                precision,
+                block_id_bits: None,
+                slot_bits: None,
+            });
+        // Even rows only, so an odd one lies between two present keys.
+        for i in (0..400u32).step_by(2) {
+            writer.write(InternalValue::from_components(
+                alloc::format!("key{i:05}").as_bytes(),
+                alloc::format!("value{i:05}").as_bytes(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("written");
+        let table = Table::recover(test_recover_params(file, checksum))?;
+        assert!(
+            table.metadata.data_block_count > 4,
+            "self-check: several data blocks"
+        );
+        for i in 0..400u32 {
+            let key = alloc::format!("key{i:05}").into_bytes();
+            let entry = table.get(&key, SeqNo::MAX, hash64(&key))?;
+            if i % 2 == 0 {
+                // The locator places the key itself: without that the read
+                // would find it through the block index all the same.
+                let (_, hint) = table
+                    .locator_block(hash64(&key))?
+                    .expect("the locator places a present key");
+                assert_eq!(
+                    hint.map(|(_, is_entry)| is_entry),
+                    Some(precision == LocatorPrecision::Entry),
+                    "{precision:?}: key {i} is placed at this precision's slot"
+                );
+                let entry = entry.expect("a present key");
+                assert_eq!(&*entry.key.user_key, &key[..], "{precision:?}");
+                assert_eq!(entry.key.seqno, u64::from(i) + 1, "{precision:?}");
+                assert_eq!(
+                    &*entry.value,
+                    alloc::format!("value{i:05}").as_bytes(),
+                    "{precision:?}"
+                );
+            } else {
+                assert!(entry.is_none(), "{precision:?}: key {i} is absent");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bisecting a group's key zones selects exactly the row pages that reading
+/// every row page's zone selects, for keys present, between two present
+/// keys, below every key and above every key. Two tables: short keys, whose
+/// zone bounds are the keys themselves, and long keys that differ only past
+/// the length a zone bound is cut to, so many row pages carry the same lower
+/// bound and the same raised upper bound and a key's zone selects several.
+#[cfg(feature = "columnar")]
+#[test]
+fn bisecting_the_key_zones_selects_the_row_pages_a_scan_of_them_does() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+    use crate::table::row_group::{PageWant, RowPageSelect};
+
+    let short = |i: u32| alloc::format!("key{i:06}").into_bytes();
+    let long = |i: u32| {
+        let mut key = alloc::vec![b'p'; 200];
+        key.extend_from_slice(alloc::format!("{i:06}").as_bytes());
+        key
+    };
+    let key_of: [&dyn Fn(u32) -> Vec<u8>; 2] = [&short, &long];
+    for key_of in key_of {
+        let dir = tempdir()?;
+        let file = dir.path().join("table");
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+            .use_columnar(true)
+            .use_zone_map(true)
+            .use_row_group_size(64 * 1_024)
+            .use_columnar_page_size(1_024);
+        // Even rows only, so an odd one lies between two present keys.
+        for i in (0..600u32).step_by(2) {
+            writer.write(InternalValue::from_components(
+                key_of(i),
+                zoned_value(i),
+                1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("written");
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let group = first_row_group(&file, checksum)?;
+        let select = |row_pages| -> crate::Result<Vec<u16>> {
+            Ok(table
+                .load_row_group(
+                    &group,
+                    &PageWant::projected(&[COL_USER_KEY], row_pages),
+                    ReadCharge::Foreground,
+                )?
+                .ordinals)
+        };
+
+        let mut probes: Vec<Vec<u8>> = (0..600u32).step_by(7).map(key_of).collect();
+        probes.push(Vec::from(*b"a"));
+        probes.push(Vec::from(*b"zzzz"));
+        probes.push(alloc::vec![0xFF; 300]);
+        let mut past_the_first_page = false;
+        let mut several_pages = false;
+        for key in &probes {
+            let scanned = select(RowPageSelect::Zone {
+                column_id: COL_USER_KEY,
+                lower: Some(key),
+                upper: Some(key),
+            })?;
+            let bisected = select(RowPageSelect::ZoneOfKey {
+                column_id: COL_USER_KEY,
+                key,
+            })?;
+            assert_eq!(
+                bisected,
+                scanned,
+                "key {:?}",
+                String::from_utf8_lossy(key.get(..key.len().min(24)).unwrap_or(key)),
+            );
+            past_the_first_page |= scanned.first().is_some_and(|&first| first > 0);
+            several_pages |= scanned.len() > 1;
+        }
+        // The long keys share their zone bounds across row pages, so a key's
+        // zone selects several; a short key's selects the one page it is on.
+        if key_of(0).len() > 100 {
+            assert!(
+                several_pages,
+                "self-check: a long key's zone selects several row pages"
+            );
+        } else {
+            assert!(
+                past_the_first_page && !several_pages,
+                "self-check: a short key selects one row page, past the first for some"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A point read takes a row group's directory and its key zones in one

@@ -1,11 +1,25 @@
 use super::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, RowPageColumns,
     TypeTag, column_batch_into_entries, column_batch_to_entries, entries_to_column_batch,
-    frame_value_cells, frame_value_cells_nullable, page_match_entries, unframe_value_cells,
+    frame_value_cells, frame_value_cells_nullable, unframe_value_cells,
     unframe_value_cells_nullable, unframe_value_cells_with_defaults,
     validate_columnar_ingest_batch,
 };
 use crate::{Slice, ValueType, config::ColumnEncoding, key::InternalKey, value::InternalValue};
+
+/// One point read of one row page: the page prepared, then read for the
+/// version of `needle` a read at `seqno` sees among the rows of `run`.
+fn page_match_version(
+    page: RowPageColumns<'_>,
+    run: core::ops::Range<u32>,
+    needle: &[u8],
+    seqno: crate::SeqNo,
+    deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    copied: &mut usize,
+    budget: &mut super::DecodeBudget,
+) -> crate::Result<Option<super::KeyVersion>> {
+    super::PointPage::prepare(page, budget)?.version(run, needle, seqno, deletes, copied)
+}
 
 #[test]
 fn fixed_only_value_framing_has_no_overhead_and_round_trips() {
@@ -1325,48 +1339,67 @@ fn match_as_pages_within(
                 .map(Slice::from)
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    let columns = pages
-        .iter()
-        .zip(&batch.columns)
-        .map(|(page, c)| {
-            budget.parsed(Column::parse_page(
-                page,
-                batch.row_count,
-                stamp(c.column_id),
-            )?)
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
     let rows = batch.row_count;
-    // The key pages are searched on their own; the matcher reads the rest.
-    let mut columns: Vec<_> = columns;
-    let key = columns.remove(0);
-    let keys = budget.rows(key.values, TypeTag::Bytes, rows)?;
-    let run = super::key_rows(
-        rows,
-        needle,
-        &crate::comparator::default_comparator(),
-        |row| keys.get(TypeTag::Bytes, rows, row),
-    )?;
     let mut out = Vec::new();
-    // A miss on a page that has rows reads nothing more, as in a lookup.
-    if run.is_empty() && rows > 0 {
-        return Ok(out);
-    }
-    page_match_entries(
-        RowPageColumns {
-            ordinal: 0,
-            start: 0,
+    // Every version, newest first: a read at each version's seqno sees the
+    // one before it. The first read is the lookup `budget` is charged for;
+    // the ones after it repeat that lookup's preparation.
+    let mut seqno = crate::SeqNo::MAX;
+    let mut later = super::DecodeBudget::unbounded();
+    let mut first = true;
+    loop {
+        let budget = if first { &mut *budget } else { &mut later };
+        first = false;
+        let columns = pages
+            .iter()
+            .zip(&batch.columns)
+            .map(|(page, c)| {
+                budget.parsed(Column::parse_page(
+                    page,
+                    batch.row_count,
+                    stamp(c.column_id),
+                )?)
+            })
+            .collect::<crate::Result<crate::table::row_group::PageColumns<_>>>()?;
+        // The key pages are searched on their own; the matcher reads the rest.
+        let mut columns = columns;
+        let key = columns.remove(0);
+        let keys = budget.rows(key.values, TypeTag::Bytes, rows)?;
+        let run = super::key_rows(
             rows,
-            columns,
-        },
-        run,
-        needle,
-        deletes,
-        copied,
-        budget,
-        &mut out,
-    )?;
-    Ok(out)
+            needle,
+            &crate::comparator::default_comparator(),
+            |row| keys.get(TypeTag::Bytes, rows, row),
+        )?;
+        // A miss on a page that has rows reads nothing more, as in a lookup.
+        if run.is_empty() && rows > 0 {
+            return Ok(out);
+        }
+        let Some(version) = page_match_version(
+            RowPageColumns {
+                ordinal: 0,
+                start: 0,
+                rows,
+                columns,
+            },
+            run,
+            needle,
+            seqno,
+            deletes,
+            copied,
+            budget,
+        )?
+        else {
+            return Ok(out);
+        };
+        seqno = version.seqno;
+        out.push(entry(
+            needle,
+            version.seqno,
+            version.value_type,
+            &version.value,
+        ));
+    }
 }
 
 /// A lookup holds decoded only what a group a writer cut lets it hold: each
@@ -1406,9 +1439,10 @@ fn a_lookup_holds_decoded_no_more_rows_than_its_group_budget() {
 }
 
 #[test]
-fn page_match_entries_finds_every_version_of_a_key_and_nothing_else() {
-    // Three keys, the middle one in two versions: a lookup returns exactly its
-    // versions, newest first, and a key between or past them returns none.
+fn page_match_version_finds_every_version_of_a_key_and_nothing_else() {
+    // Three keys, the middle one in two versions: reads at falling seqnos
+    // return exactly its versions, newest first, and a key between or past
+    // them returns none.
     let batch = entries_to_column_batch(&[
         entry(b"a", 9, ValueType::Value, b"va"),
         entry(b"m", 7, ValueType::Value, b"new"),
@@ -1434,8 +1468,128 @@ fn page_match_entries_finds_every_version_of_a_key_and_nothing_else() {
     }
 }
 
+/// A read at a seqno sees the newest version below it and nothing newer: at
+/// the newest version's own seqno it sees the one before, and below every
+/// version it sees none.
 #[test]
-fn page_match_entries_rejects_an_empty_key_row() {
+fn page_match_version_returns_the_newest_version_below_the_seqno() {
+    let batch = entries_to_column_batch(&[
+        entry(b"m", 7, ValueType::Value, b"new"),
+        entry(b"m", 4, ValueType::Value, b"old"),
+    ])
+    .expect("batch");
+    let stamp = |column_id| crate::table::column_page::PageStamp {
+        group_tag: 1,
+        id: crate::table::column_page::PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let pages = batch
+        .columns
+        .iter()
+        .map(|c| {
+            Slice::from(
+                c.encode_page(2, stamp(c.column_id), ColumnEncoding::Auto)
+                    .expect("page"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let read = |seqno| {
+        let columns = pages
+            .iter()
+            .zip(&batch.columns)
+            .skip(1)
+            .map(|(page, c)| Column::parse_page(page, 2, stamp(c.column_id)).expect("parse"))
+            .collect();
+        page_match_version(
+            RowPageColumns {
+                ordinal: 0,
+                start: 0,
+                rows: 2,
+                columns,
+            },
+            0..2,
+            b"m",
+            seqno,
+            None,
+            &mut 0,
+            &mut super::DecodeBudget::default(),
+        )
+        .expect("lookup")
+        .map(|version| (version.seqno, version.value.to_vec()))
+    };
+    assert_eq!(read(crate::SeqNo::MAX), Some((7, b"new".to_vec())));
+    assert_eq!(read(8), Some((7, b"new".to_vec())));
+    assert_eq!(
+        read(7),
+        Some((4, b"old".to_vec())),
+        "a version at the seqno is not below it"
+    );
+    assert_eq!(read(5), Some((4, b"old".to_vec())));
+    assert_eq!(read(4), None);
+    assert_eq!(read(0), None);
+}
+
+/// A value one column stores whole is a view of that column's page: the read
+/// copies none of it. Guards against a lookup that copies the value out of
+/// the page it already holds.
+#[test]
+fn page_match_version_hands_out_a_view_of_the_page() {
+    let value = alloc::vec![b'v'; 4_096];
+    let batch = entries_to_column_batch(&[
+        entry(b"a", 9, ValueType::Value, b"other"),
+        entry(b"m", 7, ValueType::Value, &value),
+    ])
+    .expect("batch");
+    let stamp = |column_id| crate::table::column_page::PageStamp {
+        group_tag: 1,
+        id: crate::table::column_page::PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let pages = batch
+        .columns
+        .iter()
+        .map(|c| {
+            Slice::from(
+                c.encode_page(2, stamp(c.column_id), ColumnEncoding::Plain)
+                    .expect("page"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let columns = pages
+        .iter()
+        .zip(&batch.columns)
+        .skip(1)
+        .map(|(page, c)| Column::parse_page(page, 2, stamp(c.column_id)).expect("parse"))
+        .collect();
+    let mut copied = 0;
+    let version = page_match_version(
+        RowPageColumns {
+            ordinal: 0,
+            start: 0,
+            rows: 2,
+            columns,
+        },
+        1..2,
+        b"m",
+        crate::SeqNo::MAX,
+        None,
+        &mut copied,
+        &mut super::DecodeBudget::default(),
+    )
+    .expect("lookup")
+    .expect("the version");
+    assert_eq!(&*version.value, value.as_slice());
+    assert_eq!(copied, 0, "a view copies nothing");
+    let page = pages.last().expect("the value page").as_ptr_range();
+    let bytes = version.value.as_ptr_range();
+    assert!(
+        page.start <= bytes.start && bytes.end <= page.end,
+        "the value lies in its page",
+    );
+}
+
+#[test]
+fn page_match_version_rejects_an_empty_key_row() {
     // The point-read matcher applies the same non-empty-key invariant as the
     // scan path: a matched empty key in a corrupt block is an error, not a hit.
     let mut batch =
@@ -1451,7 +1605,7 @@ fn page_match_entries_rejects_an_empty_key_row() {
 }
 
 #[test]
-fn page_match_entries_fails_closed_when_a_delete_mask_position_overflows() {
+fn page_match_version_fails_closed_when_a_delete_mask_position_overflows() {
     // Two rows share a key, so both match the needle. With `block_start_row` at
     // u32::MAX, the second matched row's position (start + 1) overflows u32. A
     // masked point-read lookup must fail closed (error) like the scan path, never
@@ -1470,11 +1624,324 @@ fn page_match_entries_fails_closed_when_a_delete_mask_position_overflows() {
     );
 }
 
+/// Prepares a row page for point reads from the columns of `batch` at the
+/// indexes `order` names, in that order, and hands the outcome to `check`.
+fn prepare_columns<R>(
+    batch: &ColumnBatch,
+    order: &[usize],
+    check: impl FnOnce(crate::Result<super::PointPage<'_>>) -> R,
+) -> R {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let stamp = |column_id| PageStamp {
+        group_tag: 1,
+        id: PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let rows = batch.row_count;
+    let pages: Vec<(Slice, u16)> = order
+        .iter()
+        .map(|&at| {
+            let column = &batch.columns[at];
+            let page = column
+                .encode_page(rows, stamp(column.column_id), ColumnEncoding::Auto)
+                .expect("page");
+            (Slice::from(page), column.column_id)
+        })
+        .collect();
+    let mut budget = super::DecodeBudget::default();
+    let columns = pages
+        .iter()
+        .map(|(page, column_id)| budget.parsed(Column::parse_page(page, rows, stamp(*column_id))?))
+        .collect::<crate::Result<crate::table::row_group::PageColumns<_>>>();
+    check(columns.and_then(|columns| {
+        super::PointPage::prepare(
+            RowPageColumns {
+                ordinal: 0,
+                start: 0,
+                rows,
+                columns,
+            },
+            &mut budget,
+        )
+    }))
+}
+
+/// A row page is prepared for point reads from its seqnos, its value types
+/// and its value columns, in that order, each value column once: any other
+/// set of columns is a malformed page and is refused, each for its reason.
+/// The batch's columns are the key, the seqnos, the value types, the value.
 #[test]
-fn page_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
+fn a_row_page_of_the_wrong_columns_is_refused_for_point_reads() {
+    let batch = entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("batch");
+    let refused = |order: &[usize]| -> String {
+        prepare_columns(&batch, order, |page| match page {
+            Err(crate::Error::InvalidHeader(reason)) => reason.into(),
+            Err(other) => panic!("columns {order:?}: {other:?}"),
+            Ok(_) => panic!("columns {order:?} must be refused"),
+        })
+    };
+    assert!(
+        refused(&[2, 1, 3]).contains("unexpected intrinsic column layout"),
+        "the value types before the seqnos"
+    );
+    assert!(
+        refused(&[1, 3, 3]).contains("unexpected intrinsic column layout"),
+        "a value column where the value types belong"
+    );
+    assert!(
+        refused(&[1, 2, 3, 3]).contains("must be unique"),
+        "a value column twice"
+    );
+    assert!(
+        refused(&[1]).contains("missing the intrinsic columns"),
+        "no value types"
+    );
+    assert!(
+        refused(&[1, 2]).contains("carries no value column"),
+        "no value column"
+    );
+    prepare_columns(&batch, &[1, 2, 3], |page| {
+        assert!(page.is_ok(), "the page's own columns are taken");
+    });
+}
+
+/// A row page read before its columns were added, and a read given another
+/// number of pages than of key runs, are refused: neither serves a row.
+#[test]
+fn a_point_read_of_an_unfilled_page_or_of_mismatched_runs_is_refused() {
+    let unfilled = super::PointPage::new(1).expect("a page of one row");
+    let read = unfilled.version(0..1, b"k", crate::SeqNo::MAX, None, &mut 0);
+    assert!(
+        matches!(read, Err(crate::Error::InvalidHeader(m)) if m.contains("missing the intrinsic columns")),
+        "a page with no column added must be refused, got {read:?}",
+    );
+
+    let batch = entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("batch");
+    prepare_columns(&batch, &[1, 2, 3], |page| {
+        let page = page.expect("prepared");
+        let read = super::point_version(
+            core::slice::from_ref(&page),
+            &[],
+            b"k",
+            crate::SeqNo::MAX,
+            None,
+            &mut 0,
+        );
+        assert!(
+            matches!(read, Err(crate::Error::InvalidHeader(m)) if m.contains("differ from the pages")),
+            "one page and no run must be refused, got {read:?}",
+        );
+    });
+}
+
+/// A value whose one column is nullable is framed with its presence bits,
+/// and counted as built: it is not a view of the page.
+#[test]
+fn a_point_read_of_a_nullable_value_frames_it_and_counts_it() {
+    let mut batch =
+        entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"value")]).expect("batch");
+    // One row, its cell present.
+    batch.columns.last_mut().expect("a value column").validity = Some(alloc::vec![1u8]);
+
+    let mut copied = 0;
+    let found = match_as_pages(&batch, b"k", None, &mut copied).expect("a read");
+    let framed =
+        frame_value_cells_nullable(&[(TypeTag::Bytes, Some(&b"value"[..]))]).expect("framed");
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        &*found[0].value,
+        &framed[..],
+        "the cell framed with its presence"
+    );
+    assert_eq!(
+        copied,
+        framed.len(),
+        "the framed value is built, and counted"
+    );
+}
+
+/// A value read from a column stored by its ordinals is rebuilt, not viewed:
+/// the read counts its bytes as built. Sixty-four rows of small numbers,
+/// which the page stores bit-packed.
+#[test]
+fn a_point_read_of_a_value_stored_by_its_ordinal_rebuilds_and_counts_it() {
+    let entries: Vec<_> = (0..64u32)
+        .map(|i| {
+            entry(
+                alloc::format!("k{i:03}").as_bytes(),
+                5,
+                ValueType::Value,
+                b"",
+            )
+        })
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("batch");
+    let number = TypeTag::Number(super::Number::U64_LE);
+    let value = batch.columns.last_mut().expect("a value column");
+    value.type_tag = number;
+    value.data = (0..64u64)
+        .flat_map(|i| (i + 1_000).to_le_bytes())
+        .collect::<Vec<u8>>()
+        .into();
+
+    let mut copied = 0;
+    let found = match_as_pages(&batch, b"k007", None, &mut copied).expect("a read");
+    assert_eq!(found.len(), 1);
+    assert_eq!(&*found[0].value, &1_007u64.to_le_bytes()[..]);
+    assert_eq!(
+        copied, 8,
+        "the number is rebuilt from its ordinal, and counted"
+    );
+}
+
+/// A tombstone carries no value, whatever its row's value cells are: here
+/// its one value column is nullable and null, which framed as a value would
+/// be the presence bits of its cells. A point read returns the tombstone
+/// with an empty value, as a row table's does.
+#[test]
+fn a_point_read_of_a_tombstone_returns_no_value_whatever_its_cells() {
+    let mut batch = entries_to_column_batch(&[entry(b"gone", 5, ValueType::Tombstone, b"")])
+        .expect("a tombstone row");
+    let value = batch.columns.last_mut().expect("a value column");
+    assert!(value.column_id >= COL_VALUE, "self-check: the value column");
+    // One row, its cell null.
+    value.validity = Some(alloc::vec![0u8]);
+
+    let found = match_as_pages(&batch, b"gone", None, &mut 0).expect("a read");
+    assert_eq!(found.len(), 1, "the tombstone is found");
+    assert_eq!(found[0].key.value_type, ValueType::Tombstone);
+    assert!(
+        found[0].value.is_empty(),
+        "a tombstone has no value, got {:?}",
+        found[0].value
+    );
+}
+
+/// A read whose answer is the run's first row, at a valid position, still
+/// fails when a later row of the run lies past `u32::MAX`: the start row is
+/// corrupt, and which row answers does not make it less so. One read, at a
+/// seqno that sees the first row; a read that returned on that row before
+/// looking at the rest of the run would hand the value out.
+#[test]
+fn a_point_read_answered_by_the_first_row_still_rejects_an_overflowing_run() {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let batch = entries_to_column_batch(&[
+        entry(b"dup", 5, ValueType::Value, b"v0"),
+        entry(b"dup", 3, ValueType::Value, b"v1"),
+    ])
+    .expect("two-row same-key batch");
+    let stamp = |column_id| PageStamp {
+        group_tag: 1,
+        id: PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let pages = batch
+        .columns
+        .iter()
+        .map(|c| {
+            c.encode_page(batch.row_count, stamp(c.column_id), ColumnEncoding::Auto)
+                .map(Slice::from)
+        })
+        .collect::<crate::Result<Vec<_>>>()
+        .expect("pages");
+    let mut budget = super::DecodeBudget::default();
+    // Every column but the key's, as the read prepares a row page.
+    let columns = pages
+        .iter()
+        .zip(&batch.columns)
+        .skip(1)
+        .map(|(page, c)| {
+            budget.parsed(Column::parse_page(
+                page,
+                batch.row_count,
+                stamp(c.column_id),
+            )?)
+        })
+        .collect::<crate::Result<crate::table::row_group::PageColumns<_>>>()
+        .expect("columns");
+    let page = super::PointPage::prepare(
+        RowPageColumns {
+            ordinal: 0,
+            start: 0,
+            rows: batch.row_count,
+            columns,
+        },
+        &mut budget,
+    )
+    .expect("prepared");
+    let bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
+    let deletes = Some((&bitmap, u32::MAX));
+
+    let on_page = page.version(0..2, b"dup", crate::SeqNo::MAX, deletes, &mut 0);
+    assert!(
+        matches!(on_page, Err(crate::Error::InvalidHeader(m)) if m.contains("position exceeds u32::MAX")),
+        "one page's read must reject the run, got {on_page:?}",
+    );
+    let run = 0..2;
+    let across = super::point_version(
+        core::slice::from_ref(&page),
+        core::slice::from_ref(&run),
+        b"dup",
+        crate::SeqNo::MAX,
+        deletes,
+        &mut 0,
+    );
+    assert!(
+        matches!(across, Err(crate::Error::InvalidHeader(m)) if m.contains("position exceeds u32::MAX")),
+        "the read over the run's pages must reject it, got {across:?}",
+    );
+
+    // A run over two row pages whose first page lies wholly at valid
+    // positions: its one row is at `u32::MAX`, and it answers the read. The
+    // second page starts past `u32::MAX`, which only the check across the
+    // pages sees.
+    let second = {
+        let columns = pages
+            .iter()
+            .zip(&batch.columns)
+            .skip(1)
+            .map(|(page, c)| {
+                budget.parsed(Column::parse_page(
+                    page,
+                    batch.row_count,
+                    stamp(c.column_id),
+                )?)
+            })
+            .collect::<crate::Result<crate::table::row_group::PageColumns<_>>>()
+            .expect("columns");
+        super::PointPage::prepare(
+            RowPageColumns {
+                ordinal: 1,
+                start: batch.row_count,
+                rows: batch.row_count,
+                columns,
+            },
+            &mut budget,
+        )
+        .expect("prepared")
+    };
+    let two_pages = [page, second];
+    let over_two = super::point_version(
+        &two_pages,
+        &[0..1, 0..1],
+        b"dup",
+        crate::SeqNo::MAX,
+        deletes,
+        &mut 0,
+    );
+    assert!(
+        matches!(over_two, Err(crate::Error::InvalidHeader(m)) if m.contains("position exceeds u32::MAX")),
+        "a later page past u32::MAX must reject the read, got {over_two:?}",
+    );
+}
+
+#[test]
+fn page_match_version_refuses_the_version_it_reads_and_copies_nothing_before() {
     // Two versions of one key; the second carries an invalid value-type byte.
-    // The first version's key and value were already copied out of the columns
-    // when the second is refused, and those copies must still be reported.
+    // The first version is served as a view of its page, so nothing was
+    // copied when the read that reaches the second is refused.
     let mut batch = entries_to_column_batch(&[
         entry(b"dup", 5, ValueType::Value, b"v0"),
         entry(b"dup", 3, ValueType::Value, b"v1"),
@@ -1491,15 +1958,11 @@ fn page_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
         matches!(err, crate::Error::InvalidTag(("ValueType", 0xFF))),
         "expected an invalid value-type tag, got {err:?}",
     );
-    assert_eq!(
-        copied,
-        b"dup".len() + b"v0".len(),
-        "the first version was copied before the second failed",
-    );
+    assert_eq!(copied, 0, "a version served as a view copies nothing");
 }
 
 #[test]
-fn page_match_entries_refuses_a_run_outside_its_page() {
+fn page_match_version_refuses_a_run_outside_its_page() {
     // The run comes from the key search over the same page; one that names
     // rows the page does not have (or none) is an inconsistency to refuse,
     // never rows to read past the page.
@@ -1539,14 +2002,14 @@ fn page_match_entries_refuses_a_run_outside_its_page() {
             rows: 2,
             columns,
         };
-        let err = page_match_entries(
+        let err = page_match_version(
             page,
             run.clone(),
             b"k",
+            crate::SeqNo::MAX,
             None,
             &mut 0,
             &mut super::DecodeBudget::default(),
-            &mut Vec::new(),
         )
         .expect_err("a run outside the page must be refused");
         assert!(
@@ -1557,11 +2020,11 @@ fn page_match_entries_refuses_a_run_outside_its_page() {
 }
 
 #[test]
-fn page_match_entries_rejects_a_zero_row_block() {
+fn page_match_version_rejects_a_zero_row_block() {
     // A zero-row columnar block is malformed (the writer never emits one). The
     // point-read matcher must fail closed on it, not return an empty match that
-    // load_columnar_point_block would turn into an absent-key miss, hiding the
-    // on-disk corruption.
+    // the point read would turn into an absent-key miss, hiding the on-disk
+    // corruption.
     let batch = entries_to_column_batch(&[]).expect("zero-row batch");
     let err =
         match_as_pages(&batch, b"x", None, &mut 0).expect_err("a zero-row block must fail closed");

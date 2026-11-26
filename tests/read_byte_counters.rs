@@ -1514,11 +1514,11 @@ fn wide_subcolumn_segment(n: u32) -> (TempDir, Tree, Vec<u8>) {
 }
 
 #[test]
-fn a_point_read_of_a_split_value_counts_the_rows_it_gathers_and_the_block() {
-    // A columnar point read copies the matching key's rows out of the columns
-    // into owned entries, then encodes those into a small row block. Two
-    // gathers, each charged at the size of what it built: charging only the
-    // block drops the first, which is as large as the value itself.
+fn a_point_read_of_a_split_value_counts_the_value_it_frames_and_the_cached_row() {
+    // A columnar point read of a value split over sub-columns frames the
+    // value from its cells, and the row cache keeps its own copy of the row.
+    // Two copies, each charged at the size of what it built, and no third:
+    // the row found is not encoded into a block to be read again.
     let n = 200;
     let (_folder, tree, framed) = wide_subcolumn_segment(n);
     let m = tree.metrics();
@@ -1533,12 +1533,13 @@ fn a_point_read_of_a_split_value_counts_the_rows_it_gathers_and_the_block() {
             "the read rebuilds the framed value"
         );
     }
-    let rows = u64::from(n) * (key(0).len() + framed.len()) as u64;
-    let copied = m.bytes_copied() - before;
-    assert!(
-        copied >= 2 * rows,
-        "the rows were gathered ({rows} B) and then encoded into blocks at least \
-         as large, but only {copied} B were charged",
+    let framing = u64::from(n) * framed.len() as u64;
+    let cached_rows = u64::from(n) * (key(0).len() + framed.len()) as u64;
+    assert_eq!(
+        m.bytes_copied() - before,
+        framing + cached_rows,
+        "each value is framed once ({framing} B) and each row copied into the row \
+         cache once ({cached_rows} B)",
     );
 }
 
@@ -1597,11 +1598,10 @@ fn a_multi_get_caching_a_chunked_head_detaches_it_from_the_whole_value_read() {
 }
 
 #[test]
-fn a_multi_get_of_a_split_value_counts_the_values_it_rebuilds_and_the_blocks() {
-    // The row path over a split-value block rebuilds every row's value from
-    // its sub-columns and then encodes the rows into a row-major block. The
-    // rebuild is a gather of its own, as large as the values; charging only
-    // the encoded block drops it.
+fn a_multi_get_of_a_split_value_counts_the_values_it_frames_and_nothing_else() {
+    // A batch read of a value split over sub-columns frames each value from
+    // its cells, once, and that is all it copies: the group is read through
+    // its pages and not rebuilt into a row block.
     let n = 200;
     let (_folder, tree, framed) = wide_subcolumn_segment(n);
     let m = tree.metrics();
@@ -1611,11 +1611,10 @@ fn a_multi_get_of_a_split_value_counts_the_values_it_rebuilds_and_the_blocks() {
     let got = tree.multi_get(&keys, SeqNo::MAX).expect("multi_get");
     assert!(got.iter().all(Option::is_some), "every key is present");
     let values = u64::from(n) * framed.len() as u64;
-    let copied = m.bytes_copied() - before;
-    assert!(
-        copied >= 2 * values,
-        "every value was rebuilt ({values} B) and then encoded into blocks at \
-         least as large, but only {copied} B were charged",
+    assert_eq!(
+        m.bytes_copied() - before,
+        values,
+        "each value is framed once and nothing else is copied",
     );
 }
 
@@ -1662,18 +1661,21 @@ fn scanning_rows_of_a_split_value_counts_their_reconstruction() {
 }
 
 #[test]
-fn a_point_read_of_a_columnar_segment_counts_the_block_it_rebuilds() {
-    // A columnar point read rebuilds the looked-up key's rows into a small
-    // row-major block, a new buffer made from the decoded columns.
+fn a_point_read_of_a_columnar_segment_copies_only_the_row_it_caches() {
+    // A columnar point read of a value one column stores whole hands the
+    // value out as a view of its page: the only copy is the row cache's own
+    // of the row. Guards against the read copying the rows it found into a
+    // block of their own to search it.
     let (_folder, tree) = columnar_segment(1_000, 32);
     let m = tree.metrics();
 
     let before = m.bytes_copied();
     let got = tree.get(key(7), SeqNo::MAX).expect("get").expect("present");
     assert_eq!(got.len(), 32, "the point read returns the whole value");
-    assert!(
-        m.bytes_copied() - before >= 32,
-        "a point read rebuilt the value but charged no gather for it",
+    assert_eq!(
+        m.bytes_copied() - before,
+        (key(7).len() + 32) as u64,
+        "the row cache's copy of the row is the read's only one",
     );
 }
 

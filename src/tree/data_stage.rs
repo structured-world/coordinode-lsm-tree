@@ -116,10 +116,19 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         let mut jobs = 0usize;
         for (index, ((task, block), bytes)) in chunk.iter().zip(cached).zip(&special).enumerate() {
             if matches!(block, TaskBlock::Load) && bytes.is_none() {
+                // A columnar group is not rebuilt for the batch's keys: the
+                // job reads them through the group's pages.
+                let keys = if task.table.reads_keys_through_pages() {
+                    task.keys.iter().map(|&(idx, _)| idx).collect()
+                } else {
+                    Vec::new()
+                };
                 out.job(Job::Load {
                     index,
                     table: task.at,
                     handle: task.handle,
+                    seqno: task.table_seqno,
+                    keys,
                 });
                 jobs += 1;
             }
@@ -231,8 +240,8 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         Ok(count)
     }
 
-    /// Takes back the load of task `index` of `chunk`: `None` when the table
-    /// holds no key there (a columnar block its delete mask removes whole).
+    /// Takes back the load of task `index` of `chunk`: its block, whose keys
+    /// are read here, or the versions the job found of them itself.
     ///
     /// # Errors
     ///
@@ -241,12 +250,21 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         &mut self,
         chunk: &[BlockTask<'_>],
         index: usize,
-        block: Option<crate::table::DataBlock>,
+        loaded: super::read_job::Loaded,
     ) -> crate::Result<()> {
-        let (Some(block), Some(task)) = (block, chunk.get(index)) else {
-            return Ok(());
-        };
-        Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
+        match loaded {
+            super::read_job::Loaded::Entries(entries) => {
+                self.hits
+                    .extend(entries.into_iter().map(|(key, item)| (index, key, item)));
+                Ok(())
+            }
+            super::read_job::Loaded::Block(block) => {
+                let (Some(block), Some(task)) = (block, chunk.get(index)) else {
+                    return Ok(());
+                };
+                Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
+            }
+        }
     }
 
     /// Takes back the read of task `index` of `chunk` as its on-disk `frame`:
@@ -264,14 +282,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             return;
         };
         let resolved = if task.special {
-            task.table
-                .decode_special_block(&task.handle, &frame, keep_room)
-                .and_then(|block| match block {
-                    Some(block) => {
-                        Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
-                    }
-                    None => Ok(()),
-                })
+            self.read_special(task, index, &frame, keep_room)
         } else {
             let lead = self
                 .leads
@@ -295,6 +306,47 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                 .is_none_or(|(held, _)| index < *held)
         {
             self.decode_failure = Some((index, e));
+        }
+    }
+
+    /// Point-reads the keys of `task`, a Page-ECC or columnar table's, in the
+    /// `frame` read for it. A columnar group's keys are read through its
+    /// pages, taken from the frame: the group is not rebuilt into a row
+    /// block. A Page-ECC block is decoded and its keys read in it.
+    fn read_special(
+        &mut self,
+        task: &BlockTask<'_>,
+        index: usize,
+        frame: &crate::Slice,
+        keep_room: &mut u64,
+    ) -> crate::Result<()> {
+        #[cfg(feature = "columnar")]
+        if task.table.reads_keys_through_pages() {
+            let (keys, hits) = (self.keys, &mut self.hits);
+            return task.table.columnar_frame_entries(
+                &task.handle,
+                frame,
+                task.keys.len(),
+                |n| {
+                    task.keys
+                        .get(n)
+                        .and_then(|&(idx, _)| keys.get(idx))
+                        .map_or(&[][..], AsRef::as_ref)
+                },
+                task.table_seqno,
+                |n, item| {
+                    if let Some(&(idx, _)) = task.keys.get(n) {
+                        hits.push((index, idx, item));
+                    }
+                },
+            );
+        }
+        match task
+            .table
+            .decode_special_block(&task.handle, frame, keep_room)?
+        {
+            Some(block) => Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits),
+            None => Ok(()),
         }
     }
 

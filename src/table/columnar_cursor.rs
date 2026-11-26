@@ -317,7 +317,7 @@ impl ColumnarCursor {
                 directory: RowGroupBlocks {
                     directory: alloc::sync::Arc::clone(&first.directory),
                     row_pages: RowPageSet::Range(0..0),
-                    pages: Vec::new(),
+                    pages: crate::table::row_group::PageSlots::new(),
                 },
                 next_page: 0,
                 share,

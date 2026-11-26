@@ -34,8 +34,39 @@ pub(crate) struct RowGroupBlocks {
     /// The row pages the read selected.
     pub row_pages: RowPageSet,
     /// One slot per page the read wanted, in the directory's order.
-    pub pages: Vec<PageSlot>,
+    pub pages: PageSlots,
 }
+
+/// The slots of the pages a read wanted. A point read wants a handful (the
+/// key page, then the row's other columns on the one or two row pages its
+/// key's versions lie on), held without an allocation; a scan's many spill
+/// to the heap.
+pub(crate) type PageSlots = smallvec::SmallVec<[PageSlot; 8]>;
+
+/// Where a page a read fetched lies among its row pages.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowPageAt {
+    /// The row page's place among the row pages the read selected.
+    pub(crate) place: usize,
+    /// Its ordinal in the group.
+    pub(crate) ordinal: u16,
+    /// The group row its first row is.
+    pub(crate) start: u32,
+    /// Its rows.
+    pub(crate) rows: u32,
+}
+
+/// One item per row page a read selected, in row order: inline for the one
+/// or two row pages of a point read.
+pub(crate) type PerRowPage<T> = smallvec::SmallVec<[T; 2]>;
+
+/// Row page ordinals a read selected one by one: a point read's one or two,
+/// held without an allocation.
+pub(crate) type RowPageOrdinals = smallvec::SmallVec<[u16; 4]>;
+
+/// The columns of one row page, in write order: inline for a point read's
+/// few.
+pub(crate) type PageColumns<T> = smallvec::SmallVec<[T; 4]>;
 
 impl RowGroupBlocks {
     /// Every page of the group, `pages` holding one block per directory entry
@@ -86,7 +117,7 @@ pub(crate) enum RowPageSet {
     /// A run of consecutive row pages.
     Range(core::ops::Range<u16>),
     /// Row pages picked one by one, ascending.
-    Listed(Vec<u16>),
+    Listed(RowPageOrdinals),
 }
 
 impl RowPageSet {
@@ -131,6 +162,17 @@ pub(crate) enum RowPageSelect<'a> {
         /// Inclusive upper bound, or `None` for none.
         upper: Option<&'a [u8]>,
     },
+    /// The row pages whose zone for `column_id` may hold `key`, as
+    /// [`Self::Zone`] with both bounds `key` selects them, for a column the
+    /// group's rows ascend by in byte order: its zones ascend from row page
+    /// to row page, so the pages are found by bisection, not by reading
+    /// every row page's zone.
+    ZoneOfKey {
+        /// The column the rows ascend by.
+        column_id: u16,
+        /// The value looked for.
+        key: &'a [u8],
+    },
 }
 
 /// The pages a read of a row group wants: the columns it projects, times the
@@ -169,7 +211,9 @@ impl<'a> PageWant<'a> {
     /// The column this want selects row pages by, when it selects by zones.
     fn zone_column(&self) -> Option<u16> {
         match self.row_pages {
-            RowPageSelect::Zone { column_id, .. } => Some(column_id),
+            RowPageSelect::Zone { column_id, .. } | RowPageSelect::ZoneOfKey { column_id, .. } => {
+                Some(column_id)
+            }
             RowPageSelect::All | RowPageSelect::Range(_) => None,
         }
     }
@@ -212,26 +256,94 @@ impl<'a> PageWant<'a> {
                 column_id,
                 lower,
                 upper,
-            } => RowPageSet::Listed(
-                // A directory holds at most `u16::MAX` row pages, so the
-                // ordinals cover every one.
-                (0u16..)
-                    .zip(directory.row_pages())
-                    .filter(|&(ordinal, &rows)| {
-                        directory
-                            .head_zones()
-                            .zone(ordinal, *column_id)
-                            .or_else(|| block_zones.and_then(|z| z.zone(ordinal, *column_id)))
-                            .is_none_or(|zone| zone_may_match(zone, rows, *lower, *upper))
-                    })
-                    .map(|(ordinal, _)| ordinal)
-                    .collect(),
-            ),
+            } => Self::by_zones(directory, block_zones, *column_id, *lower, *upper),
+            RowPageSelect::ZoneOfKey { column_id, key } => {
+                match Self::bisect_zones(directory, *column_id, key) {
+                    Some(pages) if pages.is_empty() => RowPageSet::Listed(RowPageOrdinals::new()),
+                    Some(pages) => RowPageSet::Range(pages),
+                    // The directory keeps no zone of the column for some row
+                    // page: every row page's zone is read, as for any column.
+                    None => {
+                        Self::by_zones(directory, block_zones, *column_id, Some(key), Some(key))
+                    }
+                }
+            }
         };
         Ok(Wanted {
             columns: self.columns,
             row_pages,
         })
+    }
+
+    /// The row pages whose zone for `column_id` may hold a value within
+    /// `[lower, upper]`, each row page's zone read in turn. A row page the
+    /// column has no zone for is kept.
+    fn by_zones(
+        directory: &PageDirectory,
+        block_zones: Option<&PageZones>,
+        column_id: u16,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> RowPageSet {
+        RowPageSet::Listed(
+            // A directory holds at most `u16::MAX` row pages, so the
+            // ordinals cover every one.
+            (0u16..)
+                .zip(directory.row_pages())
+                .filter(|&(ordinal, &rows)| {
+                    directory
+                        .head_zones()
+                        .zone(ordinal, column_id)
+                        .or_else(|| block_zones.and_then(|z| z.zone(ordinal, column_id)))
+                        .is_none_or(|zone| zone_may_match(zone, rows, lower, upper))
+                })
+                .map(|(ordinal, _)| ordinal)
+                .collect(),
+        )
+    }
+
+    /// The row pages whose zone for `column_id`, a column the rows ascend by
+    /// in byte order, may hold `key`: the same pages [`Self::by_zones`]
+    /// selects for `[key, key]`, found by bisection. `None` when the
+    /// directory keeps no zone of the column for a row page it looked at.
+    ///
+    /// A zone's bounds are the first and last value of its row page cut to a
+    /// prefix (the upper one raised past the cut), so both ascend from row
+    /// page to row page as the values do: the pages whose upper bound is not
+    /// below `key` start at one row page, and the pages whose lower bound is
+    /// not above it end at one. A zone with no upper bound has none on any
+    /// row page after it either.
+    fn bisect_zones(
+        directory: &PageDirectory,
+        column_id: u16,
+        key: &[u8],
+    ) -> Option<core::ops::Range<u16>> {
+        let zones = directory.head_zones();
+        let count = u16::try_from(directory.row_pages().len()).ok()?;
+        let Some(last) = count.checked_sub(1) else {
+            return Some(0..0);
+        };
+        // Zones are kept row page by row page from the first, so one for the
+        // last row page means one for each: a row page without a zone would
+        // have to be kept, which a bisection that never looked at it cannot.
+        zones.zone(last, column_id)?;
+        // The first of `count` row pages `past` does not hold for, `past`
+        // holding for the row pages before one and for none from it on.
+        let first_not = |past: &dyn Fn(crate::table::column_page::Zone<'_>) -> bool| {
+            let (mut low, mut high) = (0u16, count);
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if past(zones.zone(middle, column_id)?) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            Some(low)
+        };
+        let start = first_not(&|zone| zone.max.is_some_and(|max| max < key))?;
+        let end = first_not(&|zone| zone.min <= key)?;
+        Some(start..end.max(start))
     }
 }
 
@@ -273,9 +385,9 @@ impl Wanted<'_> {
     /// The directory proved its entries a grid, each part's pages one per row
     /// page in row page order, so a page's index is its part's times the row
     /// page count plus its row page, and only the parts are looked at.
-    fn slots(&self, directory: &PageDirectory) -> Vec<PageSlot> {
+    fn slots(&self, directory: &PageDirectory) -> PageSlots {
         let row_page_count = directory.row_pages().len();
-        let mut slots = Vec::new();
+        let mut slots = PageSlots::new();
         for (part, first) in directory
             .entries()
             .iter()
@@ -530,16 +642,29 @@ impl GroupRead<'_> {
         earlier: &RowGroupBlocks,
         want: &PageWant<'_>,
     ) -> crate::Result<RowGroupBlocks> {
+        self.load_after_within(earlier, want, &Slice::empty())
+    }
+
+    /// [`Self::load_after`] with `front`, the group's first bytes as an
+    /// earlier read brought them in (the whole group's, when one request took
+    /// it): a zone block the selection needs is cut out of them rather than
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_after`].
+    pub(crate) fn load_after_within(
+        &self,
+        earlier: &RowGroupBlocks,
+        want: &PageWant<'_>,
+        front: &Slice,
+    ) -> crate::Result<RowGroupBlocks> {
         let directory = Arc::clone(&earlier.directory);
         let directory_len = indexed_directory_len(self.group)?;
         let zones = match want.zone_block_column(&directory) {
-            Some(column_id) => Some(self.zone_block(
-                &directory,
-                directory_len,
-                column_id,
-                &Slice::empty(),
-                true,
-            )?),
+            Some(column_id) => {
+                Some(self.zone_block(&directory, directory_len, column_id, front, true)?)
+            }
             None => None,
         };
         let wanted = want.resolve(&directory, zones.as_ref())?;
@@ -787,6 +912,11 @@ impl GroupRead<'_> {
         let directory_len = indexed_directory_len(self.group)?;
         self.check_block_len(directory_len)?;
         let directory = self.admit_directory(group, directory_len)?;
+        // The head zones, cut out of the same bytes, kept on the directory:
+        // a read that selects row pages by them next (a batch's keys, each
+        // by its own zone) finds them decoded, and the directory is cached
+        // with them.
+        let directory = self.with_head_zones(&directory, directory_len, group)?;
         // Every page: no zone selects among them.
         let wanted = PageWant::ALL.resolve(&directory, None)?;
         let mut pages = wanted.slots(&directory);
@@ -867,9 +997,9 @@ impl GroupRead<'_> {
         directory: &PageDirectory,
         directory_len: u32,
         front: &Slice,
-        mut pages: Vec<PageSlot>,
+        mut pages: PageSlots,
         with_directory: bool,
-    ) -> crate::Result<Vec<PageSlot>> {
+    ) -> crate::Result<PageSlots> {
         let entries = directory.entries();
         let io_buffer = self.budget.io_buffer() as usize;
         let leads = self.claim_pages(directory, directory_len, front, &mut pages, with_directory);
@@ -1387,9 +1517,15 @@ impl RowGroupBlocks {
         let mut batches = Vec::with_capacity(ordinals.len());
         for (columns, &ordinal) in columns.into_iter().zip(&ordinals) {
             let row_count = self.directory.row_page_rows(ordinal).ok_or_else(outside)?;
-            batches.push(ColumnBatch { row_count, columns });
+            batches.push(ColumnBatch {
+                row_count,
+                columns: columns.into_vec(),
+            });
         }
-        Ok(RowPages { ordinals, batches })
+        Ok(RowPages {
+            ordinals: ordinals.into_vec(),
+            batches,
+        })
     }
 
     /// The pages of the columns `want` names among those the read selected,
@@ -1407,7 +1543,7 @@ impl RowGroupBlocks {
         &self,
         want: impl Fn(u16) -> bool,
         budget: &mut crate::table::columnar::DecodeBudget,
-    ) -> crate::Result<Vec<crate::table::columnar::RowPageColumns<'_>>> {
+    ) -> crate::Result<PerRowPage<crate::table::columnar::RowPageColumns<'_>>> {
         use crate::table::columnar::{Column, RowPageColumns};
 
         let (ordinals, columns) = self.by_row_page(
@@ -1467,20 +1603,80 @@ impl RowGroupBlocks {
     fn by_row_page<'s, T>(
         &'s self,
         want: impl Fn(u16) -> bool,
+        read: impl FnMut(&'s crate::Slice, u32, PageStamp) -> crate::Result<T>,
+        column_of: impl Fn(&T) -> u16,
+    ) -> crate::Result<(RowPageOrdinals, PerRowPage<PageColumns<T>>)> {
+        let ordinals: RowPageOrdinals = self.row_pages.iter().collect();
+        // One column list per row page read, sized for every column the read
+        // fetched.
+        let per_page = self.pages.len() / ordinals.len().max(1);
+        let mut columns: PerRowPage<PageColumns<T>> = ordinals
+            .iter()
+            .map(|_| PageColumns::with_capacity(per_page))
+            .collect();
+        self.each_page(want, read, column_of, |at, column| {
+            columns
+                .get_mut(at.place)
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar: page names a row page the group does not have",
+                ))?
+                .push(column);
+            Ok(())
+        })?;
+        Ok((ordinals, columns))
+    }
+
+    /// The pages of the columns `want` names among those the read selected,
+    /// parsed but not decoded, each handed to `visit` as it is parsed with
+    /// where its row page lies: what a point read takes them through, with
+    /// no list of them built. A row page's columns arrive in write order, and
+    /// a column's pages in row order. What the parses hold decoded is charged
+    /// to `budget`, the group's, which `visit` is handed to charge what it
+    /// prepares.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::page_columns`], and what `visit` returns.
+    pub(crate) fn each_page_column<'s>(
+        &'s self,
+        want: impl Fn(u16) -> bool,
+        budget: &mut crate::table::columnar::DecodeBudget,
+        mut visit: impl FnMut(
+            RowPageAt,
+            crate::table::columnar::PageColumn<'s>,
+            &mut crate::table::columnar::DecodeBudget,
+        ) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        use crate::table::columnar::Column;
+
+        self.each_page(
+            want,
+            Column::parse_page,
+            |column| column.column_id,
+            |at, column| {
+                let column = budget.parsed(column)?;
+                visit(at, column, budget)
+            },
+        )
+    }
+
+    /// Reads every fetched page of a column `want` names with `read` and
+    /// hands what it returns to `visit` with where its row page lies, in the
+    /// directory's order, which is column-major: a row page's columns arrive
+    /// in write order. `column_of` names the column a result holds, which
+    /// must be the one the directory filed its page under.
+    ///
+    /// The checks every reading of a group makes before trusting its pages
+    /// live here, so the decoded and the parsed readings cannot drift apart.
+    fn each_page<'s, T>(
+        &'s self,
+        want: impl Fn(u16) -> bool,
         mut read: impl FnMut(&'s crate::Slice, u32, PageStamp) -> crate::Result<T>,
         column_of: impl Fn(&T) -> u16,
-    ) -> crate::Result<(Vec<u16>, Vec<Vec<T>>)> {
+        mut visit: impl FnMut(RowPageAt, T) -> crate::Result<()>,
+    ) -> crate::Result<()> {
         self.check_readable()?;
         let entries = self.directory.entries();
-        let ordinals: Vec<u16> = self.row_pages.iter().collect();
-        // One column list per row page read, sized for every column the read
-        // fetched. The slots are in directory order, which is column-major,
-        // so each row page's columns arrive in write order.
-        let per_page = self.pages.len() / ordinals.len().max(1);
-        let mut columns: Vec<Vec<T>> = ordinals
-            .iter()
-            .map(|_| Vec::with_capacity(per_page))
-            .collect();
         let unknown_row_page = || {
             crate::Error::InvalidHeader("columnar: page names a row page the group does not have")
         };
@@ -1512,12 +1708,18 @@ impl RowGroupBlocks {
                     .filter(|&place| place < range.len()),
                 RowPageSet::Listed(listed) => listed.binary_search(&entry.row_page).ok(),
             };
-            place
-                .and_then(|place| columns.get_mut(place))
-                .ok_or_else(unknown_row_page)?
-                .push(column);
+            let at = RowPageAt {
+                place: place.ok_or_else(unknown_row_page)?,
+                ordinal: entry.row_page,
+                start: self
+                    .directory
+                    .row_page_start(entry.row_page)
+                    .ok_or_else(unknown_row_page)?,
+                rows,
+            };
+            visit(at, column)?;
         }
-        Ok((ordinals, columns))
+        Ok(())
     }
 
     /// Each fetched page with the rows it holds, what its values were
