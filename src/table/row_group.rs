@@ -1638,7 +1638,7 @@ impl RowGroupBlocks {
         budget: &mut crate::table::columnar::DecodeBudget,
         mut visit: impl FnMut(
             RowPageAt,
-            crate::table::columnar::RowColumn<'s>,
+            crate::table::columnar::PageColumn<'s>,
             &mut crate::table::columnar::DecodeBudget,
         ) -> crate::Result<()>,
     ) -> crate::Result<()> {
@@ -1646,10 +1646,10 @@ impl RowGroupBlocks {
 
         self.each_page(
             want,
-            Column::parse_page_for_rows,
+            Column::parse_page,
             |column| column.column_id,
             |at, column| {
-                let column = budget.parsed_for_rows(column)?;
+                let column = budget.parsed(column)?;
                 visit(at, column, budget)
             },
         )
