@@ -783,6 +783,18 @@ const CACHE_BYTES: u64 = 16 * 1024 * 1024;
 /// each does with blocks it has no room for.
 const BATCH_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The block cache under study: `COMPARE_CACHE_BYTES` bytes in every group
+/// and on both engines, in place of each group's own size. A run with a
+/// cache far below the data reads through misses, inserts and evictions,
+/// which no published group does. A value that is not a byte count stops
+/// the run, as `COMPARE_SIZES` does.
+fn cache_bytes_or(group: u64) -> u64 {
+    std::env::var("COMPARE_CACHE_BYTES").map_or(group, |v| {
+        v.parse()
+            .unwrap_or_else(|_| panic!("COMPARE_CACHE_BYTES: not a byte count: {v}"))
+    })
+}
+
 /// [`rocksdb_options`] with a block cache of `cache_bytes`.
 fn rocksdb_options_cached(
     compression: Compression,
@@ -792,7 +804,7 @@ fn rocksdb_options_cached(
 ) -> rocksdb::Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     let cache = rocksdb::Cache::new_hyper_clock_cache(
-        usize::try_from(cache_bytes).expect("cache size fits usize"),
+        usize::try_from(cache_bytes_or(cache_bytes)).expect("cache size fits usize"),
         0,
     );
     block_opts.set_block_cache(&cache);
@@ -944,7 +956,7 @@ fn ours_config_cached(
     // either way: 16 MiB, the library default, in every group but the batched
     // reads of large values.
     let config = config.use_cache(std::sync::Arc::new(
-        lsm_tree::Cache::with_capacity_bytes(cache_bytes).with_row_cache(row_cache),
+        lsm_tree::Cache::with_capacity_bytes(cache_bytes_or(cache_bytes)).with_row_cache(row_cache),
     ));
     // Data-block hash index: a point get resolves a key to its in-block offset
     // by hash instead of binary-searching the restart array. 1.33 buckets/entry
