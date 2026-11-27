@@ -117,7 +117,7 @@ pub trait UserComparator: Send + Sync + core::panic::RefUnwindSafe + 'static {
 #[expect(clippy::inline_always, reason = "one slice compare on the read path")]
 #[inline(always)]
 #[must_use]
-pub fn same_user_key(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn same_user_key(a: &[u8], b: &[u8]) -> bool {
     a == b
 }
 
@@ -127,7 +127,7 @@ pub fn same_user_key(a: &[u8], b: &[u8]) -> bool {
 /// per-entry version grouping.
 #[inline]
 #[must_use]
-pub fn same_held_key(a: &crate::UserKey, b: &crate::UserKey) -> bool {
+pub(crate) fn same_held_key(a: &crate::UserKey, b: &crate::UserKey) -> bool {
     a.same_bytes(b)
 }
 
@@ -182,13 +182,13 @@ impl<T: UserComparator + ?Sized> UserComparator for Arc<T> {
 /// Maximum byte length for a comparator name.
 ///
 /// Enforced on write (`persist_version`) and read (`Manifest::decode_from`).
-pub const MAX_COMPARATOR_NAME_BYTES: usize = 256;
+pub(crate) const MAX_COMPARATOR_NAME_BYTES: usize = 256;
 
 /// Returns the default comparator (lexicographic byte ordering).
 ///
 /// Uses a shared static instance to avoid repeated allocations.
 #[must_use]
-pub fn default_comparator() -> SharedComparator {
+pub(crate) fn default_comparator() -> SharedComparator {
     // OnceBox builds the Arc once; subsequent calls just clone it (ref-count
     // bump). `once_cell::race::OnceBox` is lock-free (atomic pointer) and
     // no_std + alloc, so this path is identical under std and no_std.
