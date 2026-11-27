@@ -96,6 +96,9 @@ impl From<(u8, u64, u64, u64)> for CacheKey {
 
 /// A file that was deleted, as the cache keys its entries: no read reaches
 /// them again, since a file's id is never given to another.
+// no-std: files are reclaimed at their drop there, with no deleter thread to
+// run the walk; their entries age out of the cache.
+#[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeadFile {
     /// A table: its blocks, partial blocks, cached rows and directories.
@@ -110,6 +113,7 @@ pub(crate) enum DeadFile {
     },
 }
 
+#[cfg(feature = "std")]
 impl DeadFile {
     /// Whether `key` is an entry of this file.
     fn holds(self, key: &CacheKey) -> bool {
