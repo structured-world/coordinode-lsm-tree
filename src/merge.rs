@@ -230,7 +230,14 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
     }
 
     /// Plays again the games between `leaf` and the root.
-    #[inline]
+    // Always inline: the step calls it once per entry, and with the cold
+    // path calling it too the hint alone leaves it a call, 11% of the
+    // merger's cycles on two inputs that take turns.
+    #[expect(
+        clippy::inline_always,
+        reason = "one loop of a few games, called once per merged entry"
+    )]
+    #[inline(always)]
     #[expect(
         clippy::indexing_slicing,
         reason = "a node between a leaf and the root is below the tree's length"
