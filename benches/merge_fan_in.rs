@@ -26,8 +26,10 @@
 //! | key shape | `word` (keys differ within the compared word) or `deep` (4096 keys in a row share the word, so whole keys are compared) |
 //! | order | `bytes` (the default comparator) or `custom` (one the engine cannot treat as bytes, so no word helps) |
 //!
-//! Per arm it prints the median and P99 over the rounds of the merge time per
-//! entry, and the heap allocations per merge. Built with the `diagnostics`
+//! Per arm it prints the median, P99 and P999 over the rounds of the merge
+//! time per entry, and the heap allocations per merge. One sample is a whole
+//! merge, so the two tails say more than the slowest round only from about a
+//! thousand rounds up. Built with the `diagnostics`
 //! feature it also prints the word comparisons, whole-key comparisons and slot
 //! moves per entry; those counters cost time, so that build answers what
 //! happens, not how long it takes.
@@ -42,10 +44,6 @@
 //! `perf stat --control fifo:<ctl>,<ack> -D -1`: the bench enables counting
 //! around each merge, so the counts leave the inputs' construction out.
 
-#![expect(
-    clippy::expect_used,
-    reason = "only for invariants of the harness itself; setup I/O is propagated"
-)]
 #![expect(
     clippy::indexing_slicing,
     reason = "slot and node numbers are below the lengths they were built for"
@@ -489,9 +487,6 @@ impl SortedMerge {
             }
         }
         order.sort_by(|&a, &b| slots.order(a as usize, b as usize));
-        // The sort's comparisons are setup, not the merge's.
-        slots.word_compares.set(0);
-        slots.key_compares.set(0);
         Ok(Self {
             slots,
             sources,
@@ -658,20 +653,22 @@ impl Arm {
     }
 }
 
-/// The work the engine's merger counted so far, zero in a build that does not
-/// count.
-fn engine_work() -> Work {
+/// The work `merger` counted, zero in a build that does not count.
+fn engine_work(merger: &Merger<Source>) -> Work {
     #[cfg(feature = "diagnostics")]
     {
-        let counts = lsm_tree::diagnostics::Counts::now();
+        let work = merger.work();
         Work {
-            word_compares: counts.merge_word_compares,
-            key_compares: counts.merge_key_compares,
-            moves: counts.merge_moves,
+            word_compares: work.word_compares,
+            key_compares: work.key_compares,
+            moves: work.moves,
         }
     }
     #[cfg(not(feature = "diagnostics"))]
-    Work::default()
+    {
+        let _ = merger;
+        Work::default()
+    }
 }
 
 /// Merges `inputs` through `arm`, handing every entry to `each`, and returns
@@ -696,16 +693,11 @@ fn merge(
             Ok(merge.slots.work())
         }
         Arm::Engine => {
-            let before = engine_work();
-            for entry in Merger::new(sources, Arc::clone(comparator)).with_common_prefix(prefix) {
+            let mut merge = Merger::new(sources, Arc::clone(comparator)).with_common_prefix(prefix);
+            for entry in merge.by_ref() {
                 each(entry?);
             }
-            let after = engine_work();
-            Ok(Work {
-                word_compares: after.word_compares - before.word_compares,
-                key_compares: after.key_compares - before.key_compares,
-                moves: after.moves - before.moves,
-            })
+            Ok(engine_work(&merge))
         }
         Arm::Binary => {
             let mut merge = BinaryMerge::new(sources, Arc::clone(comparator), prefix)?;
@@ -791,9 +783,13 @@ impl PerfControl {
         let Ok(paths) = std::env::var("MERGE_FAN_IN_PERF_CTL") else {
             return Ok(None);
         };
-        let (ctl, ack) = paths
-            .split_once(',')
-            .expect("MERGE_FAN_IN_PERF_CTL is <ctl>,<ack>");
+        let Some((ctl, ack)) = paths.split_once(',') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("MERGE_FAN_IN_PERF_CTL is <ctl>,<ack>, got {paths:?}"),
+            )
+            .into());
+        };
         Ok(Some(Self {
             ctl: File::options().write(true).open(ctl)?,
             ack: File::open(ack)?,
@@ -881,14 +877,16 @@ fn main() -> lsm_tree::Result<()> {
                                 std::hint::black_box(&entry);
                             })?;
                             let elapsed = start.elapsed();
+                            // Read before anything is stored: the samples'
+                            // own buffers are not the merge's allocations.
+                            let allocated = ALLOCS.load(Ordering::Relaxed) - allocs_before;
                             if let Some(perf) = &mut perf {
                                 perf.send("disable\n")?;
                             }
                             assert_eq!(seen, entries, "{label}: every entry is merged");
                             let held = &mut samples[at];
                             held.times.push(elapsed);
-                            held.allocs
-                                .push(ALLOCS.load(Ordering::Relaxed) - allocs_before);
+                            held.allocs.push(allocated);
                             held.work = work;
                         }
                     }
@@ -900,10 +898,11 @@ fn main() -> lsm_tree::Result<()> {
                             held.times[at].as_nanos() as f64 / entries as f64
                         };
                         print!(
-                            "{label}/{}: {:.2} ns/entry, p99 {:.2}, {} allocs",
+                            "{label}/{}: {:.2} ns/entry, p99 {:.2}, p999 {:.2}, {} allocs",
                             arm.label(),
                             ns_at(1, 2),
                             ns_at(99, 100),
+                            ns_at(999, 1_000),
                             held.allocs[held.allocs.len() / 2],
                         );
                         if cfg!(feature = "diagnostics") {

@@ -401,6 +401,103 @@ fn merge_keeps_entries_of_the_greatest_key_word() {
     assert_eq!(tails, [0, 1, 2, 3, 4, 5]);
 }
 
+/// Errors the inputs give for their first entries come out in the order of
+/// the inputs: a caller that stops at the first one sees the earliest input's.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test assertions")]
+fn merge_yields_first_entry_errors_in_input_order() {
+    let ok = vec![Ok(InternalValue::from_components("a", b"", 0, Value))];
+    let mut iter = Merger::new(
+        vec![
+            vec![Err(crate::Error::Unrecoverable)].into_iter(),
+            ok.into_iter(),
+            vec![Err(crate::Error::Cancelled)].into_iter(),
+        ],
+        comparator::default_comparator(),
+    );
+    assert!(matches!(
+        iter.next().unwrap(),
+        Err(crate::Error::Unrecoverable)
+    ));
+    assert!(matches!(iter.next().unwrap(), Err(crate::Error::Cancelled)));
+    assert_eq!(
+        iter.next().unwrap().unwrap().key.user_key.as_ref(),
+        b"a".as_slice()
+    );
+    assert!(iter.next().is_none());
+}
+
+/// An input whose first pull panics leaves the merger refusing: a caller that
+/// caught the panic and asks again gets an error, never the entries of the
+/// other inputs with one of them gone, and never a clean end.
+#[cfg(feature = "std")]
+#[test]
+fn merge_refuses_after_an_inputs_first_pull_panicked() {
+    let a: Box<dyn Iterator<Item = IterItem>> =
+        Box::new(vec![Ok(InternalValue::from_components("a", b"", 0, Value))].into_iter());
+    let mut pulls = 0;
+    let b: Box<dyn Iterator<Item = IterItem>> = Box::new(core::iter::from_fn(move || {
+        pulls += 1;
+        assert!(pulls != 1, "the input's first pull fails");
+        (pulls == 2).then(|| Ok(InternalValue::from_components("b", b"", 0, Value)))
+    }));
+    let mut iter = Merger::new(vec![a, b], comparator::default_comparator());
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
+    assert!(unwound.is_err(), "the input's panic carries on");
+    for _ in 0..3 {
+        assert!(
+            matches!(iter.next(), Some(Err(_))),
+            "a merger a panic left half built answers with an error"
+        );
+    }
+}
+
+/// Orders keys by their bytes and panics when asked about `b` and `c`.
+#[cfg(feature = "std")]
+struct PanicsOnBAndC;
+
+#[cfg(feature = "std")]
+impl crate::comparator::UserComparator for PanicsOnBAndC {
+    fn name(&self) -> &'static str {
+        "merge-tests-panics-on-b-and-c"
+    }
+
+    fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+        assert!(
+            !matches!((a, b), (b"b", b"c") | (b"c", b"b")),
+            "this comparator fails on b and c"
+        );
+        a.cmp(b)
+    }
+}
+
+/// A comparator that panics while the tournament is replayed leaves the merger
+/// refusing. Four inputs of one entry each: taking `a` empties its slot, `b`
+/// wins the lower game, and the game at the root, `b` against `c`, panics with
+/// the lower node rewritten and the winner not yet. Asked again, the merger
+/// answers with an error, not with a clean end while `b`, `c` and `d` wait.
+#[cfg(feature = "std")]
+#[test]
+fn merge_refuses_after_a_comparator_panicked_in_a_replay() {
+    use alloc::sync::Arc;
+
+    let inputs: Vec<_> = ["a", "b", "c", "d"]
+        .into_iter()
+        .map(|key| vec![Ok(InternalValue::from_components(key, b"", 0, Value))].into_iter())
+        .collect();
+    let mut iter = Merger::new(inputs, Arc::new(PanicsOnBAndC));
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
+    assert!(unwound.is_err(), "the comparator's panic carries on");
+    for _ in 0..3 {
+        assert!(
+            matches!(iter.next(), Some(Err(_))),
+            "a merger a panic left half replayed answers with an error"
+        );
+    }
+}
+
 /// A merge of inputs that are all empty ends at once, and stays ended.
 #[test]
 fn merge_of_empty_inputs_is_empty() {
