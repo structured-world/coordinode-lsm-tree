@@ -22,6 +22,53 @@ fn insert_get_roundtrip() {
     assert_eq!(c.get(&2), None);
 }
 
+/// Blocks that fill seven tenths of a small cache are all found once read:
+/// the cache is cut into shards large enough that the keys' uneven spread
+/// over them leaves none past its share. Cut into 64 shards whatever its
+/// size, a 4 MiB cache gave each shard room for fifteen blocks where eleven
+/// fell on average, the fullest shards evicted on every round, and a read in
+/// twenty-five missed in a cache a third empty.
+#[test]
+fn blocks_within_seven_tenths_of_a_small_cache_are_all_found() {
+    let capacity = 4 << 20;
+    let c = ShardedCache::with_weighter(
+        capacity,
+        shards_for(capacity, 64),
+        8_192,
+        LenWeighter,
+        FxBuildHasher,
+    );
+    // Offsets of compressed blocks in a table, as the block cache keys them:
+    // each block a little over or under half its 4 KiB.
+    let mut offset = 0u64;
+    let keys: alloc::vec::Vec<u64> = (0..700u64)
+        .map(|n| {
+            offset += 1_900 + n.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 500;
+            offset
+        })
+        .collect();
+    let mut missed = 0;
+    for round in 0..8 {
+        for &key in &keys {
+            if c.get(&key).is_none() {
+                missed += u64::from(round >= 4);
+                c.insert(key, vec![0u8; 4_150]);
+            }
+        }
+    }
+    assert_eq!(missed, 0, "of {} reads", 4 * keys.len());
+}
+
+/// The shard count follows the capacity: one shard below two megabytes, a
+/// megabyte or more to each above, and never more than asked.
+#[test]
+fn a_cache_is_cut_into_shards_of_a_megabyte_or_more() {
+    let counts = [0, 1 << 20, 2 << 20, 4 << 20, 16 << 20, 64 << 20, 1 << 30]
+        .map(|capacity| shards_for(capacity, 64));
+    assert_eq!(counts, [1, 1, 2, 4, 16, 64, 64]);
+    assert_eq!(shards_for(1 << 30, 16), 16);
+}
+
 /// One shard of 1000 bytes filled with ten entries of 100 bytes, so the next
 /// insert of 100 bytes has to evict.
 fn full_shard(ghost: usize) -> ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighter, FxBuildHasher> {

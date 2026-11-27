@@ -460,9 +460,10 @@ const LOADS_PER_SHARD: usize = 64;
 /// above them and below a read that reaches a device or the network.
 const DEFAULT_LOAD_COALESCING_AFTER: core::time::Duration = core::time::Duration::from_micros(64);
 
-/// Number of shards in the block cache. 64 keeps per-shard write contention low
-/// on many-core hosts while the lock array stays small; reads take a shared lock
-/// and don't contend regardless of shard count.
+/// The most shards the block cache is split into; a small cache gets fewer
+/// (see [`crate::sharded_cache::shards_for`]). 64 keeps the inserts and
+/// evictions of concurrent misses apart on many-core hosts; reads take no
+/// lock whatever the count.
 const BLOCK_CACHE_SHARDS: usize = 64;
 /// The fewest fingerprints the ghost queues remember, all shards together
 /// (S3-FIFO remembers recent misses and cold evictions to admit a key on its
@@ -491,7 +492,7 @@ impl Cache {
         Self {
             data: ShardedCache::with_weighter(
                 bytes,
-                BLOCK_CACHE_SHARDS,
+                crate::sharded_cache::shards_for(bytes, BLOCK_CACHE_SHARDS),
                 ghost_fingerprints(bytes),
                 BlockWeighter,
                 rustc_hash::FxBuildHasher,

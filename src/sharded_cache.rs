@@ -640,6 +640,26 @@ fn shard_capacity(capacity: u64, shards: usize) -> u64 {
     capacity.div_ceil(shards as u64)
 }
 
+/// The least a shard holds where the cache is split at all. Keys fall on
+/// shards unevenly, by about the square root of the entries a shard holds,
+/// and a shard past its share evicts while the others have room: at 64 KiB
+/// a shard held fifteen blocks and a cache seven tenths full missed one read
+/// in twenty-five.
+const SHARD_BYTES_MIN: u64 = 1 << 20;
+
+/// How many shards a cache of `capacity` bytes is split into: a power of two,
+/// `most` at most, each of [`SHARD_BYTES_MIN`] or more. Shards only spread
+/// the writers of misses; a read takes no lock.
+pub(crate) fn shards_for(capacity: u64, most: usize) -> usize {
+    let fit = usize::try_from(capacity / SHARD_BYTES_MIN).unwrap_or(usize::MAX);
+    if fit <= 1 {
+        return 1;
+    }
+    // The largest power of two within `fit`.
+    let fit = 1 << fit.ilog2();
+    fit.min(most)
+}
+
 /// The S3-FIFO small queue target of a shard of `capacity`: 10% of it, at
 /// least 1 to stay meaningful for tiny shards.
 const fn small_target(capacity: u64) -> u64 {
