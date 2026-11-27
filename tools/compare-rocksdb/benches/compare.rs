@@ -770,8 +770,31 @@ fn rocksdb_options(
     hash_index: bool,
     blob_files: Option<BlobCodec>,
 ) -> rocksdb::Options {
+    rocksdb_options_cached(compression, hash_index, blob_files, CACHE_BYTES)
+}
+
+/// The block cache of both engines in every group but the batched reads of
+/// large values, which hold [`BATCH_CACHE_BYTES`].
+const CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The block cache of both engines in the batched reads of 1 and 4 MiB values:
+/// above the 64 MiB one batch reads, so each engine can keep a whole batch
+/// within its capacity and the group compares their batched reads, not what
+/// each does with blocks it has no room for.
+const BATCH_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// [`rocksdb_options`] with a block cache of `cache_bytes`.
+fn rocksdb_options_cached(
+    compression: Compression,
+    hash_index: bool,
+    blob_files: Option<BlobCodec>,
+    cache_bytes: u64,
+) -> rocksdb::Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
-    let cache = rocksdb::Cache::new_hyper_clock_cache(16 * 1024 * 1024, 0);
+    let cache = rocksdb::Cache::new_hyper_clock_cache(
+        usize::try_from(cache_bytes).expect("cache size fits usize"),
+        0,
+    );
     block_opts.set_block_cache(&cache);
     block_opts.set_ribbon_filter(10.0);
     if hash_index {
@@ -878,6 +901,25 @@ fn ours_config(
     strategy: IndexStrategy,
     row_cache: bool,
 ) -> Config {
+    ours_config_cached(
+        dir,
+        compression,
+        kv_separated,
+        strategy,
+        row_cache,
+        CACHE_BYTES,
+    )
+}
+
+/// [`ours_config`] with a block cache of `cache_bytes`.
+fn ours_config_cached(
+    dir: &std::path::Path,
+    compression: Compression,
+    kv_separated: Option<BlobCodec>,
+    strategy: IndexStrategy,
+    row_cache: bool,
+    cache_bytes: u64,
+) -> Config {
     let config = Config::new(
         dir,
         SequenceNumberCounter::default(),
@@ -898,10 +940,11 @@ fn ours_config(
     // the row cache for the plain, hash-index and ribbon arms too, and their
     // timed reads would then all be row-cache hits. The variants this suite
     // exists to separate would collapse into one, and the published numbers
-    // would say the wrong thing about every one of them. 16 MiB either way,
-    // matching the library default capacity.
+    // would say the wrong thing about every one of them. The same capacity
+    // either way: 16 MiB, the library default, in every group but the batched
+    // reads of large values.
     let config = config.use_cache(std::sync::Arc::new(
-        lsm_tree::Cache::with_capacity_bytes(16 * 1024 * 1024).with_row_cache(row_cache),
+        lsm_tree::Cache::with_capacity_bytes(cache_bytes).with_row_cache(row_cache),
     ));
     // Data-block hash index: a point get resolves a key to its in-block offset
     // by hash instead of binary-searching the restart array. 1.33 buckets/entry
@@ -1246,8 +1289,15 @@ fn point_read_variant(
         let warm: Vec<(&'static str, WarmEngine)> = series
             .iter()
             .map(|&(label, engine, strategy, row_cache)| {
-                let warm =
-                    WarmEngine::build(engine, compression, strategy, row_cache, &inputs, seeds);
+                let warm = WarmEngine::build(
+                    engine,
+                    compression,
+                    strategy,
+                    row_cache,
+                    CACHE_BYTES,
+                    &inputs,
+                    seeds,
+                );
                 verify_point_reads(&warm, &inputs);
                 (label, warm)
             })
@@ -1550,7 +1600,11 @@ fn open_rocksdb(
     hash_index: bool,
     blob_files: Option<BlobCodec>,
 ) -> rocksdb::DB {
-    let opts = rocksdb_options(compression, hash_index, blob_files);
+    open_rocksdb_with(dir, &rocksdb_options(compression, hash_index, blob_files))
+}
+
+/// Opens the RocksDB instance at `dir` with `opts`.
+fn open_rocksdb_with(dir: &std::path::Path, opts: &rocksdb::Options) -> rocksdb::DB {
     // Open through a column-family descriptor that carries the SAME options:
     // the default CF is what every read hits, and the descriptor form is what
     // makes `cf_handle(DEFAULT)` exist for `batched_multi_get_cf`. `DB::open_cf`
@@ -1559,7 +1613,7 @@ fn open_rocksdb(
     // to the data.
     let default_cf =
         rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
-    rocksdb::DB::open_cf_descriptors(&opts, dir, [default_cf]).expect("rocksdb: open")
+    rocksdb::DB::open_cf_descriptors(opts, dir, [default_cf]).expect("rocksdb: open")
 }
 
 /// Opens a RocksDB instance at `dir` with the matched options, populates
@@ -1849,8 +1903,22 @@ fn bench_seeded(run: &mut Run) {
             &mut seeds,
         );
     }
-    multi_get_variant(run, "multi_get", none, Spec::reads(none), &mut seeds);
-    multi_get_variant(run, "multi_get_zstd22", zstd, Spec::reads(zstd), &mut seeds);
+    multi_get_variant(
+        run,
+        "multi_get",
+        none,
+        Spec::reads(none),
+        CACHE_BYTES,
+        &mut seeds,
+    );
+    multi_get_variant(
+        run,
+        "multi_get_zstd22",
+        zstd,
+        Spec::reads(zstd),
+        CACHE_BYTES,
+        &mut seeds,
+    );
     range_scan_variant(run, "range_scan", none, Spec::reads(none), &mut seeds);
     range_scan_variant(
         run,
@@ -1891,7 +1959,14 @@ fn bench_seeded(run: &mut Run) {
             false,
             &mut seeds,
         );
-        multi_get_variant(run, &format!("multi_get{suffix}"), none, spec, &mut seeds);
+        multi_get_variant(
+            run,
+            &format!("multi_get{suffix}"),
+            none,
+            spec,
+            BATCH_CACHE_BYTES,
+            &mut seeds,
+        );
         range_scan_variant(run, &format!("range_scan{suffix}"), none, spec, &mut seeds);
         overwrite_variant(run, &format!("overwrite{suffix}"), none, spec, &mut seeds);
     }
@@ -1925,36 +2000,41 @@ enum WarmEngine {
 impl WarmEngine {
     /// Builds the warm state for `engine` with the matched per-engine
     /// configuration (`compression` on both; `strategy` selects the data-block
-    /// hash index on both ours and RocksDB, ribbon / `row_cache` are ours-only).
+    /// hash index on both ours and RocksDB, ribbon / `row_cache` are ours-only),
+    /// and a block cache of `cache_bytes` on both.
     fn build(
         engine: Engine,
         compression: Compression,
         strategy: IndexStrategy,
         row_cache: bool,
+        cache_bytes: u64,
         inputs: &WorkloadInputs,
         seeds: &mut SeedStates,
     ) -> Self {
         match engine {
             Engine::Ours | Engine::BlobTree(_) => {
                 let dir = copy_of(seeds.seed(engine, compression, strategy, inputs));
-                let tree = open_ours(
+                let tree = ours_config_cached(
                     dir.path(),
                     compression,
                     engine.kv_separated(),
                     strategy,
                     row_cache,
+                    cache_bytes,
                 )
+                .open()
                 .expect("ours: open");
                 Self::Ours { tree, _dir: dir }
             }
             Engine::RocksDb | Engine::RocksDbBlob(_) => {
                 let dir = copy_of(seeds.seed(engine, compression, strategy, inputs));
-                let db = open_rocksdb(
-                    dir.path(),
+                let opts = rocksdb_options_cached(
                     compression,
                     strategy == IndexStrategy::HashIndex,
                     engine.blob_files(),
+                    cache_bytes,
                 );
+                let db = open_rocksdb_with(dir.path(), &opts);
                 Self::RocksDb { db, _dir: dir }
             }
             Engine::SurrealKv => {
@@ -1979,8 +2059,8 @@ impl WarmEngine {
 /// working set exceeds the 16 MiB block cache, so the batch's blocks are cold.
 ///
 /// Apples-to-apples matches [`point_read_variant`]: identical [`WorkloadInputs`],
-/// the same seeded state and matched compression / bloom / 16 MiB cache
-/// ([`SeedStates`]). The only difference from `point_read` is one batched
+/// the same seeded state and matched compression / bloom / cache of
+/// `cache_bytes` ([`SeedStates`]). The only difference from `point_read` is one batched
 /// call instead of an N-iteration `get` loop. SurrealKV has no batch-get API, so
 /// it is omitted here (its sequential cost is already on the `point_read` chart);
 /// the series is `ours` vs `rocksdb` (plus `blob_tree` on the None variant).
@@ -1989,6 +2069,7 @@ fn multi_get_variant(
     group_name: &str,
     compression: Compression,
     spec: Spec,
+    cache_bytes: u64,
     seeds: &mut SeedStates,
 ) {
     if !run.wants(group_name) {
@@ -2017,6 +2098,7 @@ fn multi_get_variant(
                     compression,
                     IndexStrategy::Binary,
                     false,
+                    cache_bytes,
                     &inputs,
                     seeds,
                 );
@@ -2182,6 +2264,7 @@ fn warm_read_group(
                     compression,
                     IndexStrategy::Binary,
                     false,
+                    CACHE_BYTES,
                     &inputs,
                     seeds,
                 );
@@ -4163,7 +4246,7 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "multi_get",
-        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf). With 1 and 4 MiB values in the tables, RocksDB's HyperClockCache keeps a batch's blocks after the call past its 16 MiB capacity (64 MiB measured), so every later batch is all cache hits; ours keeps a batch's blocks within its 16 MiB cache and reads the rest again.",
+        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf). The groups of 1 and 4 MiB values give both engines a 128 MiB block cache, above the 64 MiB one batch reads: at 16 MiB RocksDB's HyperClockCache kept a batch's blocks past its capacity (64 MiB measured) while ours admitted none of them, so the group compared two cache policies and not two batched reads.",
     ),
     (
         "range_scan",
