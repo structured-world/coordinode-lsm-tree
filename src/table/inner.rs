@@ -291,6 +291,10 @@ pub struct Inner {
     #[cfg(feature = "std")]
     pub(crate) background_deleter: once_cell::race::OnceBox<Arc<crate::BackgroundDeleter>>,
 
+    /// The tree's row gate, taken from the cache at this table's first point
+    /// read and held: which of its keys go through the row cache.
+    pub(crate) row_gate: once_cell::race::OnceBox<Arc<crate::row_gate::RowGate>>,
+
     /// Tree-wide ECC heal-hint sink. Installed once by
     /// [`Table::install_heal_hints`](super::Table::install_heal_hints) after the
     /// table joins a tree. When present, a block read that is ECC-corrected and

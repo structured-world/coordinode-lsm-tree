@@ -536,6 +536,10 @@ impl Drop for TreeInner {
         log::trace!("Sending stop signal to compactors");
         self.stop_signal.send();
 
+        // The cache outlives the tree where trees share it: its row gate for
+        // this tree's id goes with the tree.
+        self.config.cache.forget_tree(self.id);
+
         // A tree closing persists its flushes: deferred ones, so a reopen
         // needs no replay of them; self-described ones, so the manifest names
         // their tables and a reopen that misses one refuses rather than takes
