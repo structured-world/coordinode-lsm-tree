@@ -166,3 +166,77 @@ fn row_cache_off_matches_row_cache_on() {
         assert_eq!(&*got, val(i).as_slice());
     }
 }
+
+/// What a cache holds after every key of a flushed tree was read twice
+/// through it, the tree's row share set to `share` eighths when given.
+fn cached_after_two_passes(rows: bool, share: Option<u8>) -> u64 {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 * 1024 * 1024).with_row_cache(rows));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    if let Some(share) = share {
+        cache.set_row_share(tree.id(), share);
+    }
+    for i in 0..N {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+    for _ in 0..2 {
+        for i in 0..N {
+            let got = tree.get(key(i), SeqNo::MAX).unwrap().unwrap();
+            assert_eq!(&*got, val(i).as_slice());
+        }
+    }
+    cache.size()
+}
+
+/// A tree whose row share is none reads as one with no row cache: its point
+/// reads leave the blocks they walked in the cache and not one row. A tree
+/// with every key inside leaves the rows too, and a tree with half of them
+/// about half as many. A share that still filled rows would spend the copy,
+/// the insert and the cache's bytes that closing the gate is there to save.
+#[test]
+fn a_trees_row_share_decides_which_reads_fill_rows() {
+    let off = cached_after_two_passes(false, None);
+    let none = cached_after_two_passes(true, Some(0));
+    let half = cached_after_two_passes(true, Some(4));
+    let all = cached_after_two_passes(true, Some(8));
+
+    assert_eq!(none, off, "a closed gate fills no row");
+    assert!(all > off, "an open gate fills rows: {all} against {off}");
+    let (rows_half, rows_all) = (half - off, all - off);
+    assert!(
+        rows_half * 10 > rows_all * 3 && rows_half * 10 < rows_all * 7,
+        "half the keys fill about half the rows: {rows_half} of {rows_all}",
+    );
+}
+
+/// A tree reads through the row cache until its own reads say otherwise, and
+/// trees sharing one cache each hold a share of their own.
+#[test]
+fn trees_sharing_a_cache_hold_their_own_row_shares() {
+    let (_dir_a, a, cache) = tree_with_row_cache();
+    let folder = get_tmp_folder();
+    let dir_b = tempfile::TempDir::new_in(folder).unwrap();
+    let b = Config::new(
+        dir_b.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+
+    assert_eq!(cache.row_share(a.id()), 8, "every key, by default");
+    assert_eq!(cache.row_share(b.id()), 8);
+    cache.set_row_share(a.id(), 0);
+    assert_eq!(cache.row_share(a.id()), 0);
+    assert_eq!(cache.row_share(b.id()), 8, "the other tree keeps its own");
+}

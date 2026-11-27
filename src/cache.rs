@@ -1261,6 +1261,20 @@ impl Cache {
         )
     }
 
+    /// Eighths, 0 to 8, of tree `tree`'s keys whose point reads go through
+    /// the row cache now: the tree's own choice, made from its reads.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn row_share(&self, tree: crate::TreeId) -> u8 {
+        self.row_gate(tree).eighths()
+    }
+
+    /// Sets tree `tree`'s row share, in eighths, until its reads move it.
+    #[doc(hidden)]
+    pub fn set_row_share(&self, tree: crate::TreeId, eighths: u8) {
+        self.row_gate(tree).set_eighths(eighths.min(8));
+    }
+
     /// Forgets the row gate of a tree that is gone. Its tables hold theirs
     /// until they drop.
     pub(crate) fn forget_tree(&self, tree: crate::TreeId) {

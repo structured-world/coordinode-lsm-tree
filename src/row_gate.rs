@@ -274,8 +274,8 @@ impl RowGate {
         }
     }
 
-    /// Sets the fraction, in eighths, as the simulation would.
-    #[cfg(test)]
+    /// Sets the fraction, in eighths, as the simulation would: for tests,
+    /// in this crate and of it.
     pub(crate) fn set_eighths(&self, eighths: u8) {
         self.eighths.store(eighths, Ordering::Relaxed);
     }
