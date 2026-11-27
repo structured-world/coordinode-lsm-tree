@@ -1139,10 +1139,12 @@ where
         self.capacity.load(Ordering::Relaxed)
     }
 
-    /// Removes every entry whose key `doomed` picks. Walks every shard under
-    /// its lock: for a sweep, not the hot path.
+    /// Removes every entry whose key `doomed` picks and returns the weight
+    /// they held. Walks every shard under its lock: for a sweep, not the hot
+    /// path.
     #[cfg(feature = "std")]
-    pub(crate) fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) {
+    pub(crate) fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) -> u64 {
+        let mut removed = 0;
         for shard in &self.shards {
             let mut evicted = Evicted::new();
             let mut write = self.lock(&shard.0);
@@ -1151,10 +1153,12 @@ where
                 .filter(|&link| doomed(write.key(link)))
                 .collect();
             for link in links {
+                removed += write.weight(link);
                 write.remove_entry(link, &mut evicted);
             }
             self.release(&shard.0, write, evicted);
         }
+        removed
     }
 
     /// Number of resident entries across all shards, as of each shard's last

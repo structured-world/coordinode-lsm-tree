@@ -3018,13 +3018,23 @@ struct Diagnosis {
     filter_loads: u64,
     blob_reads: u64,
     blob_bytes: u64,
+    /// Bytes of deleted files' entries the cache dropped, the sweeps that
+    /// dropped them, and the cache's capacity.
+    dead_bytes: u64,
+    dead_sweeps: u64,
+    cache_bytes: u64,
 }
 
 #[cfg(feature = "metrics")]
 impl Diagnosis {
     fn take(tree: &lsm_tree::AnyTree) -> Self {
         let m = tree.metrics();
+        let cache = &tree.tree_config().cache;
+        let (dead_bytes, dead_sweeps) = cache.dead_entries_dropped();
         Self {
+            dead_bytes,
+            dead_sweeps,
+            cache_bytes: cache.capacity(),
             filter_queries: m.filter_queries() as u64,
             filter_skips: m.io_skipped_by_filter() as u64,
             loads_cached: m.block_load_cached_count() as u64,
@@ -3054,7 +3064,9 @@ impl Diagnosis {
              filter queries {:.2}, filter skips {:.2}, block loads cached {:.2} io {:.2} \
              (data {:.2}, index {:.2}, filter {:.2}), blob reads {:.3} bytes {:.0}; \
              writer stalled {:.1}% of {elapsed:?}; \
-             {tables} tables at the end",
+             {tables} tables at the end; \
+             block cache hit rate {:.2}%; entries of deleted files dropped: {:.0} KiB \
+             in {} sweeps, {:.2}% of the cache a sweep",
             l0_seen as f64 / reads.max(1) as f64,
             per(self.filter_queries, before.filter_queries),
             per(self.filter_skips, before.filter_skips),
@@ -3066,6 +3078,13 @@ impl Diagnosis {
             per(self.blob_reads, before.blob_reads),
             per(self.blob_bytes, before.blob_bytes),
             100.0 * stalled.as_secs_f64() / elapsed.as_secs_f64(),
+            100.0 * (self.loads_cached - before.loads_cached) as f64
+                / ((self.loads_cached - before.loads_cached) + (self.loads_io - before.loads_io))
+                    .max(1) as f64,
+            (self.dead_bytes - before.dead_bytes) as f64 / 1024.0,
+            self.dead_sweeps - before.dead_sweeps,
+            100.0 * (self.dead_bytes - before.dead_bytes) as f64
+                / ((self.dead_sweeps - before.dead_sweeps).max(1) * self.cache_bytes.max(1)) as f64,
         );
     }
 }

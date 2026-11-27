@@ -207,6 +207,12 @@ pub struct Cache {
     /// larger-than-cache arms are unchanged or better, while a repeat point read
     /// skips the index walk and the data-block decode outright. Turn it off for
     /// a workload measured to be one of the exceptions.
+    /// Bytes of deleted files' entries dropped, and the sweeps that dropped
+    /// them.
+    #[cfg(feature = "metrics")]
+    dead_bytes: core::sync::atomic::AtomicU64,
+    #[cfg(feature = "metrics")]
+    dead_sweeps: core::sync::atomic::AtomicU64,
     row_cache_enabled: bool,
     /// Whether each tree chooses its row cache share from its reads; every
     /// key goes through the row cache otherwise.
@@ -490,6 +496,10 @@ impl Cache {
                 BlockWeighter,
                 rustc_hash::FxBuildHasher,
             ),
+            #[cfg(feature = "metrics")]
+            dead_bytes: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "metrics")]
+            dead_sweeps: core::sync::atomic::AtomicU64::new(0),
             row_cache_enabled: true,
             row_cache_adaptive: true,
             row_gates: spin::Mutex::new(hashbrown::HashMap::with_hasher(rustc_hash::FxBuildHasher)),
@@ -1171,8 +1181,37 @@ impl Cache {
     /// holds one shard's lock at a time, which lookups never take.
     #[cfg(feature = "std")]
     pub(crate) fn evict_files(&self, files: &[DeadFile]) {
-        self.data
+        let removed = self
+            .data
             .remove_where(|key| files.iter().any(|file| file.holds(key)));
+        self.count_dead(removed);
+    }
+
+    /// Counts a sweep that dropped `bytes` of deleted files' entries.
+    #[cfg(all(feature = "std", feature = "metrics"))]
+    fn count_dead(&self, bytes: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.dead_bytes.fetch_add(bytes, Relaxed);
+        self.dead_sweeps.fetch_add(1, Relaxed);
+    }
+
+    #[cfg(all(feature = "std", not(feature = "metrics")))]
+    #[expect(clippy::unused_self, reason = "the counting build reads the cache")]
+    const fn count_dead(&self, _bytes: u64) {}
+
+    /// The bytes that entries of deleted files held when the cache dropped
+    /// them, and the number of sweeps that dropped them, so far: what a cache
+    /// that left such entries to its eviction would have carried as dead
+    /// weight.
+    #[cfg(feature = "metrics")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dead_entries_dropped(&self) -> (u64, u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (
+            self.dead_bytes.load(Relaxed),
+            self.dead_sweeps.load(Relaxed),
+        )
     }
 
     #[doc(hidden)]
