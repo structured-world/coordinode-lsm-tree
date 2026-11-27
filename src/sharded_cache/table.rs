@@ -70,6 +70,28 @@ const FREQ_ONE: u64 = 1 << FREQ_SHIFT;
 /// Set in `meta` while the entry is in the main queue, clear in the small one.
 const MAIN: u64 = 1 << 28;
 
+/// Set in `meta` of an entry too heavy for its shard's queues: it is in
+/// neither, and whoever owns the table accounts for it apart.
+const LARGE: u64 = 1 << 29;
+
+/// Where an entry is queued.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Queue {
+    Small,
+    Main,
+    Large,
+}
+
+impl Queue {
+    const fn flags(self) -> u64 {
+        match self {
+            Self::Small => 0,
+            Self::Main => MAIN,
+            Self::Large => LARGE,
+        }
+    }
+}
+
 /// The version takes the upper half of `meta`.
 const VERSION_SHIFT: u32 = 32;
 
@@ -537,8 +559,15 @@ impl<K, V, P> Write<'_, K, V, P> {
         ((self.meta(link) & FREQ) >> FREQ_SHIFT) as u8
     }
 
-    pub(super) fn in_main(&self, link: u32) -> bool {
-        self.meta(link) & MAIN != 0
+    pub(super) fn queue(&self, link: u32) -> Queue {
+        let meta = self.meta(link);
+        if meta & LARGE != 0 {
+            Queue::Large
+        } else if meta & MAIN != 0 {
+            Queue::Main
+        } else {
+            Queue::Small
+        }
     }
 
     pub(super) fn clear_freq(&self, link: u32) {
@@ -630,7 +659,7 @@ impl<K, V, P> Write<'_, K, V, P> {
         value: V,
         weight: u64,
         freq: u8,
-        main: bool,
+        queue: Queue,
         next: u32,
     ) -> Node {
         let link = self.allocate();
@@ -646,9 +675,9 @@ impl<K, V, P> Write<'_, K, V, P> {
             (*slot.key.get()).write(key);
             (*slot.value.get()).write(value);
         }
-        let flags = (u64::from(freq) << FREQ_SHIFT) & FREQ | if main { MAIN } else { 0 };
+        let flags = (u64::from(freq) << FREQ_SHIFT) & FREQ | queue.flags();
         slot.meta.store(
-            (meta & !(STATE | REFS | FREQ | MAIN)) | VISIBLE | flags,
+            (meta & !(STATE | REFS | FREQ | MAIN | LARGE)) | VISIBLE | flags,
             Ordering::Release,
         );
         Node {
@@ -711,7 +740,7 @@ impl<K, V, P> Write<'_, K, V, P> {
         value: V,
         weight: u64,
         freq: u8,
-        main: bool,
+        queue: Queue,
     ) -> Node {
         // Two buckets an entry: most chains hold one slot, so a lookup reads
         // one slot's cache line, at four bytes a bucket.
@@ -725,7 +754,7 @@ impl<K, V, P> Write<'_, K, V, P> {
             value,
             weight,
             freq,
-            main,
+            queue,
             head.load(Ordering::Relaxed),
         );
         head.store(node.link, Ordering::Release);
@@ -746,11 +775,11 @@ impl<K, V, P> Write<'_, K, V, P> {
         value: V,
         weight: u64,
         freq: u8,
-        main: bool,
+        queue: Queue,
         evicted: &mut Evicted<V>,
     ) -> Node {
         let next = self.table.slot(old).next.load(Ordering::Relaxed);
-        let node = self.fill(self.hash(old), key, value, weight, freq, main, next);
+        let node = self.fill(self.hash(old), key, value, weight, freq, queue, next);
         self.link_to(old).store(node.link, Ordering::Release);
         self.retire(old, evicted);
         node

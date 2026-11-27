@@ -246,10 +246,86 @@ fn oversized_entry_is_rejected_without_evicting_residents() {
     let before = c.weight();
     assert!(before > 0);
 
-    // Heavier than any shard (100), lighter than the whole cache (800).
-    c.insert(1000, vec![0u8; 150]);
+    // Heavier than half the cache (400), lighter than all of it (800).
+    c.insert(1000, vec![0u8; 500]);
     assert_eq!(c.get(&1000), None, "an uncacheable entry is not admitted");
     assert_eq!(c.weight(), before, "the resident set is untouched");
+}
+
+/// An entry heavier than a shard and within half the cache is kept: found
+/// like any other, with every shard giving up a share of its bytes so the
+/// cache stays within its capacity.
+#[test]
+fn an_entry_heavier_than_a_shard_is_kept_within_the_capacity() {
+    // 800 bytes over 8 shards = 100 bytes per shard.
+    let c = byte_cache(800);
+    for k in 0..200u64 {
+        c.insert(k, vec![0u8; 10]);
+    }
+    assert!(c.weight() > 700, "the shards are near full");
+
+    c.insert(1_000, vec![7u8; 240]);
+    assert_eq!(c.get(&1_000), Some(vec![7u8; 240]));
+    assert!(c.weight() <= 800, "{} bytes resident", c.weight());
+    for shard in 0..8 {
+        let (_, resident) = c.shard_state(shard).unwrap();
+        assert!(resident <= 100 - 240 / 8, "shard {shard} holds {resident}");
+    }
+
+    c.remove(&1_000);
+    assert_eq!(c.get(&1_000), None);
+    for k in 1_000..1_200u64 {
+        c.insert(k, vec![0u8; 10]);
+    }
+    assert!(c.weight() > 700, "the shards took their bytes back");
+}
+
+/// Large entries are evicted among themselves, the unread ones first, so
+/// they never take more than half the cache.
+#[test]
+fn large_entries_evict_the_unread_among_them() {
+    let c = byte_cache(800);
+    c.insert(1, vec![1u8; 150]);
+    c.insert(2, vec![2u8; 150]);
+    assert!(c.get(&1).is_some(), "read once since it went in");
+
+    // Half the cache holds two of them: the third takes the unread one's
+    // place.
+    c.insert(3, vec![3u8; 150]);
+    assert_eq!(c.get(&1), Some(vec![1u8; 150]), "the read one stays");
+    assert_eq!(c.get(&2), None, "the unread one went");
+    assert_eq!(c.get(&3), Some(vec![3u8; 150]));
+    assert_eq!(c.weight(), 300);
+}
+
+/// A key's entry replaced across the line between the two kinds keeps the
+/// cache's weight what its entries weigh.
+#[test]
+fn replacing_between_large_and_small_keeps_the_weight() {
+    let c = byte_cache(800);
+    c.insert(1, vec![0u8; 150]);
+    assert_eq!(c.weight(), 150);
+    c.insert(1, vec![0u8; 20]);
+    assert_eq!((c.weight(), c.len()), (20, 1));
+    c.insert(1, vec![0u8; 300]);
+    assert_eq!((c.weight(), c.len()), (300, 1));
+    assert_eq!(c.get(&1), Some(vec![0u8; 300]));
+    c.set_capacity(400);
+    assert_eq!(c.get(&1), None, "heavier than half the shrunk cache");
+    assert_eq!(c.weight(), 0);
+}
+
+/// A first miss of a large entry is taken at once only while the whole
+/// cache has its bytes free; past that, on its second miss.
+#[test]
+fn a_large_miss_is_admitted_with_room_or_on_its_repeat() {
+    let c = byte_cache(800);
+    assert!(c.admit(&1, 150), "the cache is empty");
+    for k in 0..200u64 {
+        c.insert(k, vec![0u8; 10]);
+    }
+    assert!(!c.admit(&1_000, 150), "a first miss with no room");
+    assert!(c.admit(&1_000, 150), "the miss repeated");
 }
 
 #[test]
@@ -455,7 +531,8 @@ fn shrinking_to_a_quarter_evicts_down_to_it_and_keeps_hot_entries() {
 
     c.set_capacity(16_000);
     assert_eq!(c.capacity(), 16_000);
-    assert_eq!(c.max_entry_weight(), 4_000);
+    assert_eq!(c.shard_capacity(), 4_000);
+    assert_eq!(c.max_entry_weight(), 8_000);
     assert!(c.weight() <= 16_000, "{} bytes left", c.weight());
 
     let (hot_kept, cold_kept) =
@@ -486,7 +563,7 @@ fn growing_evicts_nothing_and_the_cache_fills_to_the_new_capacity() {
 
     c.set_capacity(32_000);
     assert_eq!((c.weight(), c.len()), before, "growing evicted");
-    assert_eq!(c.max_entry_weight(), 4_000);
+    assert_eq!(c.shard_capacity(), 4_000);
     for key in 1_000..2_000u64 {
         c.insert(key, vec![0u8; 100]);
     }
@@ -507,10 +584,10 @@ fn after_a_shrink_an_entry_heavier_than_the_new_shard_is_refused() {
     let c = byte_cache(80_000);
     c.insert(1, vec![1u8; 100]);
     c.set_capacity(8_000);
-    c.insert(1, vec![2u8; 2_000]);
-    c.insert(2, vec![2u8; 2_000]);
+    c.insert(1, vec![2u8; 5_000]);
+    c.insert(2, vec![2u8; 5_000]);
     assert_eq!(c.get(&1), Some(vec![1u8; 100]), "the old value stays");
-    assert_eq!(c.get(&2), None, "heavier than the 1,000-byte shard");
+    assert_eq!(c.get(&2), None, "heavier than half the 8,000 bytes");
 }
 
 /// The values a shrink evicts are dropped once each, and those a reader
@@ -579,10 +656,10 @@ fn resizes_racing_reads_and_inserts_settle_on_the_last_capacity() {
         handle.join().expect("thread panicked");
     }
 
-    assert_eq!(cache.max_entry_weight(), cache.capacity().div_ceil(8));
+    assert_eq!(cache.shard_capacity(), cache.capacity().div_ceil(8));
     for shard in 0..cache.shards.len() {
         let (capacity, resident) = cache.shard_state(shard).expect("a shard of the cache");
-        assert_eq!(capacity, cache.max_entry_weight());
+        assert_eq!(capacity, cache.shard_capacity());
         assert!(resident <= capacity);
     }
     assert_eq!(cache.weight(), cache.len() as u64 * 64);
