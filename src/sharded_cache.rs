@@ -652,6 +652,21 @@ where
             .max(self.capacity.load(Ordering::Relaxed) / 2)
     }
 
+    /// Whether an entry of `weight` is kept as a large one: heavier than half
+    /// a shard. A shard holds one such entry at most, so two whose keys fall
+    /// in one shard would evict each other however much room the cache has.
+    fn is_large(&self, weight: u64) -> bool {
+        self.shards.len() > 1 && weight > (self.shard_capacity() / 2).max(1)
+    }
+
+    /// What the large entries may weigh together: seven eighths of the
+    /// capacity, the rest staying with the shards' own queues for the blocks
+    /// every read walks.
+    fn large_limit(&self) -> u64 {
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        capacity - capacity / 8
+    }
+
     fn lock<'a>(&self, shard: &'a Shard<K, V>) -> Write<'a, K, V, Policy> {
         shard.write(&self.large_resident, self.shards.len())
     }
@@ -690,7 +705,7 @@ where
         reason = "`release` takes the shard's lock and drops it, which the lint does not follow"
     )]
     fn trim_large(&self, large: &mut Large, weight: u64) {
-        let limit = self.capacity.load(Ordering::Relaxed) / 2;
+        let limit = self.large_limit();
         // Each entry is turned at most once per frequency credit it holds.
         let mut turns = large.queue.len() * (usize::from(MAX_FREQ) + 1);
         while self.large_resident.load(Ordering::Relaxed) + weight > limit && turns > 0 {
@@ -733,7 +748,7 @@ where
                 return;
             };
             self.trim_large(&mut large, weight);
-            let limit = self.capacity.load(Ordering::Relaxed) / 2;
+            let limit = self.large_limit();
             if self.large_resident.load(Ordering::Relaxed) + weight > limit {
                 return;
             }
@@ -847,7 +862,7 @@ where
         if filled_only && !shard.filled.load(Ordering::Relaxed) {
             return false;
         }
-        let room = if weight > self.shard_capacity() {
+        let room = if self.is_large(weight) {
             // A large entry takes its bytes from every shard: at once only
             // while the whole cache has them free.
             self.weight() + weight <= self.capacity()
@@ -898,7 +913,7 @@ where
         if weight > self.max_entry_weight() {
             return;
         }
-        if weight > self.shard_capacity() {
+        if self.is_large(weight) {
             self.insert_large(key, value, weight, priority);
             return;
         }
@@ -911,11 +926,15 @@ where
 
     /// Inserts `key` as [`Self::insert_with_priority`] does, only when its
     /// shard's lock is free now: a caller that must not wait drops the entry.
-    /// An entry heavier than a shard is dropped too: taking it in waits for
-    /// every shard in turn.
+    /// A large entry goes the way every large one does, which waits for
+    /// nothing either.
     pub(crate) fn try_insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
-        if weight > self.shard_capacity() {
+        if weight > self.max_entry_weight() {
+            return;
+        }
+        if self.is_large(weight) {
+            self.insert_large(key, value, weight, priority);
             return;
         }
         let (h, shard) = self.locate(&key);

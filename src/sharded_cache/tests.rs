@@ -285,17 +285,31 @@ fn an_entry_heavier_than_a_shard_is_kept_within_the_capacity() {
 #[test]
 fn large_entries_evict_the_unread_among_them() {
     let c = byte_cache(800);
-    c.insert(1, vec![1u8; 150]);
-    c.insert(2, vec![2u8; 150]);
+    c.insert(1, vec![1u8; 300]);
+    c.insert(2, vec![2u8; 300]);
     assert!(c.get(&1).is_some(), "read once since it went in");
 
-    // Half the cache holds two of them: the third takes the unread one's
-    // place.
-    c.insert(3, vec![3u8; 150]);
-    assert_eq!(c.get(&1), Some(vec![1u8; 150]), "the read one stays");
+    // Seven eighths of the cache hold two of them: the third takes the
+    // unread one's place.
+    c.insert(3, vec![3u8; 300]);
+    assert_eq!(c.get(&1), Some(vec![1u8; 300]), "the read one stays");
     assert_eq!(c.get(&2), None, "the unread one went");
-    assert_eq!(c.get(&3), Some(vec![3u8; 150]));
-    assert_eq!(c.weight(), 300);
+    assert_eq!(c.get(&3), Some(vec![3u8; 300]));
+    assert_eq!(c.weight(), 600);
+}
+
+/// Entries heavier than half a shard do not depend on which shard their keys
+/// fall in: a shard holds one of them at most, so kept in the shards two
+/// that share one would evict each other in a cache with room for both.
+#[test]
+fn entries_heavier_than_half_a_shard_all_stay_while_the_cache_has_room() {
+    // 8,000 bytes over 8 shards = 1,000 a shard; ten entries of 600.
+    let c = byte_cache(8_000);
+    for key in 0..10u64 {
+        c.insert(key, vec![0u8; 600]);
+    }
+    assert!((0..10u64).all(|key| c.contains(&key)), "6,000 of 7,000");
+    assert_eq!(c.weight(), 6_000);
 }
 
 /// A key's entry replaced across the line between the two kinds keeps the
@@ -310,8 +324,8 @@ fn replacing_between_large_and_small_keeps_the_weight() {
     c.insert(1, vec![0u8; 300]);
     assert_eq!((c.weight(), c.len()), (300, 1));
     assert_eq!(c.get(&1), Some(vec![0u8; 300]));
-    c.set_capacity(400);
-    assert_eq!(c.get(&1), None, "heavier than half the shrunk cache");
+    c.set_capacity(200);
+    assert_eq!(c.get(&1), None, "heavier than the shrunk cache");
     assert_eq!(c.weight(), 0);
 }
 
