@@ -23,7 +23,7 @@
 //!   writer when no reader holds it, and otherwise by the last reader to let
 //!   go. A replaced entry's new slot takes the old one's place in the chain
 //!   in one store, so a reader finds one of the two.
-//! - **The buckets** double when the table holds an entry per bucket. The
+//! - **The buckets** double when the table holds an entry per two buckets. The
 //!   rebuild relinks every slot under a counter that is odd while it runs; a
 //!   reader that found nothing answers only if the counter stood still and
 //!   even through its walk. Old bucket arrays are kept until the table drops.
@@ -79,7 +79,7 @@ const FIRST: u32 = 32;
 const SEGMENTS: usize = 27;
 
 /// Buckets of a new table.
-const FIRST_BUCKETS: usize = 8;
+const FIRST_BUCKETS: usize = 16;
 
 /// `meta` of the same slot freed: the next version, no readers, no flags.
 const fn freed(meta: u64) -> u64 {
@@ -140,28 +140,58 @@ impl<K, V> Slot<K, V> {
 }
 
 /// The heads of the chains, a power of two of them.
-struct Buckets {
-    heads: Box<[AtomicU32]>,
+#[derive(Clone, Copy)]
+struct Buckets<'a> {
+    heads: &'a [AtomicU32],
 }
 
-impl Buckets {
-    fn new(len: usize) -> *mut Self {
-        Box::into_raw(Box::new(Self {
-            heads: (0..len).map(|_| AtomicU32::new(NIL)).collect(),
-        }))
+impl<'a> Buckets<'a> {
+    /// A new array of `len` empty chains, to be freed by [`Self::free`].
+    fn allocate(len: usize) -> *mut AtomicU32 {
+        let heads: Box<[AtomicU32]> = (0..len).map(|_| AtomicU32::new(NIL)).collect();
+        Box::into_raw(heads).cast()
+    }
+
+    /// The `len` heads at `at`.
+    ///
+    /// # Safety
+    ///
+    /// `at` came from [`Self::allocate`] with at least `len` heads and is not
+    /// freed while `'a` lasts.
+    #[expect(unsafe_code, reason = "see safety")]
+    const unsafe fn at(at: *const AtomicU32, len: usize) -> Self {
+        Self {
+            // SAFETY: the caller's contract.
+            heads: unsafe { core::slice::from_raw_parts(at, len) },
+        }
+    }
+
+    /// Frees an array of `len` heads.
+    ///
+    /// # Safety
+    ///
+    /// `at` came from [`Self::allocate`] with `len` heads, is freed once, and
+    /// nothing reads it afterwards.
+    #[expect(unsafe_code, reason = "see safety")]
+    unsafe fn free(at: *mut AtomicU32, len: usize) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(at, len)));
+        }
     }
 
     #[expect(
         clippy::indexing_slicing,
         reason = "a bucket number is masked to the count"
     )]
-    fn head(&self, hash: u64) -> &AtomicU32 {
+    fn head(self, hash: u64) -> &'a AtomicU32 {
         &self.heads[bucket_of(hash, self.heads.len() - 1)]
     }
 }
 
-/// A bucket array readers may still be walking, freed with the table.
-struct Retired(*mut Buckets);
+/// A bucket array readers may still be walking, and its length: freed with
+/// the table.
+struct Retired(*mut AtomicU32, usize);
 
 // SAFETY: the pointer is only dereferenced to free it, by the table's drop.
 #[expect(unsafe_code, reason = "see safety")]
@@ -188,7 +218,12 @@ pub(super) struct Node {
 /// See the module docs.
 pub(super) struct Table<K, V, P> {
     segments: [AtomicPtr<Slot<K, V>>; SEGMENTS],
-    buckets: AtomicPtr<Buckets>,
+    /// The bucket array, and its length less one beside it: one load each,
+    /// with no header to chase. A rebuild stores the array first, and a
+    /// reader loads the mask first, so a reader's mask is never of a longer
+    /// array than the one it then loads.
+    buckets: AtomicPtr<AtomicU32>,
+    mask: AtomicUsize,
     /// Odd while the buckets are rebuilt, and changed by every rebuild.
     rebuilds: AtomicUsize,
     writes: Writes<P>,
@@ -216,7 +251,8 @@ impl<K, V, P> Table<K, V, P> {
     pub(super) fn new(policy: P) -> Self {
         Self {
             segments: [const { AtomicPtr::new(core::ptr::null_mut()) }; SEGMENTS],
-            buckets: AtomicPtr::new(Buckets::new(FIRST_BUCKETS)),
+            buckets: AtomicPtr::new(Buckets::allocate(FIRST_BUCKETS)),
+            mask: AtomicUsize::new(FIRST_BUCKETS - 1),
             rebuilds: AtomicUsize::new(0),
             writes: Writes {
                 free: AtomicU32::new(NIL),
@@ -250,12 +286,14 @@ impl<K, V, P> Table<K, V, P> {
         }
     }
 
-    fn buckets(&self) -> &Buckets {
-        // SAFETY: never null, and every array ever stored lives as long as
-        // the table.
+    fn buckets(&self) -> Buckets<'_> {
+        let mask = self.mask.load(Ordering::Acquire);
+        let at = self.buckets.load(Ordering::Acquire);
+        // SAFETY: every array ever stored lives as long as the table, and the
+        // array loaded after a mask is the mask's own or a longer one.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            &*self.buckets.load(Ordering::Acquire)
+            Buckets::at(at, mask + 1)
         }
     }
 
@@ -414,17 +452,13 @@ impl<K, V, P> Drop for Table<K, V, P> {
                 }
             }
         }
-        let current = *self.buckets.get_mut();
-        for buckets in locked
-            .retired
-            .drain(..)
-            .map(|retired| retired.0)
-            .chain([current])
-        {
-            // SAFETY: each array came from `Buckets::new` and is freed once.
+        let current = Retired(*self.buckets.get_mut(), *self.mask.get_mut() + 1);
+        for Retired(at, len) in locked.retired.drain(..).chain([current]) {
+            // SAFETY: each array was allocated with this length, is freed
+            // once, and no reader is left.
             #[expect(unsafe_code, reason = "see safety")]
             unsafe {
-                drop(Box::from_raw(buckets));
+                Buckets::free(at, len);
             }
         }
     }
@@ -679,7 +713,9 @@ impl<K, V, P> Write<'_, K, V, P> {
         freq: u8,
         main: bool,
     ) -> Node {
-        if self.locked.len >= self.table.buckets().heads.len() {
+        // Two buckets an entry: most chains hold one slot, so a lookup reads
+        // one slot's cache line, at four bytes a bucket.
+        if self.locked.len * 2 >= self.table.buckets().heads.len() {
             self.grow();
         }
         let head = self.table.buckets().head(hash);
@@ -732,12 +768,14 @@ impl<K, V, P> Write<'_, K, V, P> {
     fn grow(&mut self) {
         let old_at = self.table.buckets.load(Ordering::Relaxed);
         let old = self.table.buckets();
-        let new_at = Buckets::new(old.heads.len() * 2);
-        // SAFETY: just allocated, and freed only with the table.
+        let len = old.heads.len() * 2;
+        let new_at = Buckets::allocate(len);
+        // SAFETY: just allocated with this length, and freed only with the
+        // table.
         #[expect(unsafe_code, reason = "see safety")]
-        let new = unsafe { &*new_at };
+        let new = unsafe { Buckets::at(new_at, len) };
         self.table.rebuilds.fetch_add(1, Ordering::AcqRel);
-        for head in &old.heads {
+        for head in old.heads {
             let mut link = head.load(Ordering::Relaxed);
             while link != NIL {
                 let slot = self.table.slot(link);
@@ -750,8 +788,9 @@ impl<K, V, P> Write<'_, K, V, P> {
             }
         }
         self.table.buckets.store(new_at, Ordering::Release);
+        self.table.mask.store(len - 1, Ordering::Release);
         self.table.rebuilds.fetch_add(1, Ordering::Release);
-        self.locked.retired.push(Retired(old_at));
+        self.locked.retired.push(Retired(old_at, old.heads.len()));
     }
 }
 
