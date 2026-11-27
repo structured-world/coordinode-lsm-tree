@@ -61,7 +61,8 @@ const MARGIN_PER_MILLE: u64 = 5;
 /// their ratios matter to the choice. What a block miss adds to a block hit
 /// is the one that differs by orders of magnitude between deployments (the
 /// codec, the device, the block size), so where the cache has timed its
-/// loads that time stands in for [`cost::BLOCK_MISS`].
+/// loads slower than [`cost::BLOCK_MISS`] allows for, that time prices a
+/// miss (see [`block_miss_cost`]).
 mod cost {
     /// A read answered by a cached row.
     pub(super) const ROW_HIT: u64 = 450;
@@ -78,6 +79,21 @@ mod cost {
     pub(super) const BLOCK_HIT: u64 = 1_400;
     /// A read that loaded its block from the file.
     pub(super) const BLOCK_MISS: u64 = 4_000;
+}
+
+/// What a read that misses its block costs where the cache has timed its
+/// loads at `load_nanos`, zero for none timed: a hit plus the load, and the
+/// constant at the least. The timed load is the read and the decode; the
+/// buffer, the insert and the eviction a miss also pays are in the constant
+/// alone, so a load out of the page cache, a few hundred nanoseconds, does
+/// not make a miss cost little more than a hit.
+const fn block_miss_cost(load_nanos: u64) -> u64 {
+    let timed = cost::BLOCK_HIT + load_nanos;
+    if timed > cost::BLOCK_MISS {
+        timed
+    } else {
+        cost::BLOCK_MISS
+    }
 }
 
 /// A shadow's entry, a row or a block of one table, as one word mixed from
@@ -326,11 +342,7 @@ impl RowGate {
     /// Prices the window's candidates into their running costs and moves to
     /// the cheapest when it beats the fraction in use by the margin.
     fn close_window(&self, sim: &mut Sim) {
-        // A miss is a hit plus the load; the constant where no load was timed.
-        let block_miss = match sim.load_nanos {
-            0 => cost::BLOCK_MISS,
-            load => cost::BLOCK_HIT + load,
-        };
+        let block_miss = block_miss_cost(sim.load_nanos);
         // Each window counts half of what the one after it does. One window
         // alone does not tell the candidates apart: a shadow holds a few
         // hundred entries, and a handful of block misses more or less in it,

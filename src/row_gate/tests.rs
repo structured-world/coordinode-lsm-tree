@@ -61,6 +61,20 @@ fn rounds_over_more_keys_than_the_cache_holds_turn_rows_off() {
     );
 }
 
+/// A cache whose loads come from the page cache times them at a few hundred
+/// nanoseconds, a fraction of what a miss costs the read that takes it: the
+/// allocation, the insert and the eviction it causes are not in that time.
+/// Priced as a hit plus such a load, a miss cost a fifth more than a hit, and
+/// a tree reading 70,000 keys evenly through a 16 MiB cache kept rows that
+/// made it a quarter slower. A miss costs the constant at the least, and
+/// more where the load is slower than the constant allows for.
+#[test]
+fn a_load_timed_fast_does_not_make_a_miss_cheap() {
+    assert_eq!(block_miss_cost(0), cost::BLOCK_MISS);
+    assert_eq!(block_miss_cost(300), cost::BLOCK_MISS);
+    assert_eq!(block_miss_cost(1_000_000), cost::BLOCK_HIT + 1_000_000);
+}
+
 /// The shadows stay within a two-hundredth of the cache however small the
 /// rows: a tree of rows a tenth of the floor samples more sparsely and
 /// weighs its entries at no less than the floor allows.
