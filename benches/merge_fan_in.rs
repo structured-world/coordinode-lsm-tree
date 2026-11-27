@@ -5,16 +5,16 @@
 //! the next one, with everything around it left out: the inputs are entries
 //! already in memory, so no block is decoded and nothing is written.
 //!
-//! Three structures merge the same inputs:
+//! Four structures merge the same inputs:
 //!
 //! | arm | structure |
 //! |---|---|
-//! | `sorted` | the engine's [`Merger`]: slot numbers kept in sorted order, a replaced entry placed by binary search |
+//! | `engine` | the engine's [`Merger`]: a tournament tree, an input that keeps winning taken with one game against its runner-up |
+//! | `sorted` | slot numbers kept in sorted order, a replaced entry placed by binary search: what the engine's merger was before |
 //! | `binary` | a binary min-heap of slot numbers, the replaced top sifted down |
-//! | `loser` | a tournament tree that only moves forward: the replaced winner replays its path to the root |
-//! | `streak` | that tree, taking the next entry of an input that keeps winning with one comparison and no game |
+//! | `loser` | the tournament tree alone: every replaced winner replays its path to the root |
 //!
-//! The two written here compare as the engine's does: by an eight-byte word of
+//! The three written here compare as the engine's does: by an eight-byte word of
 //! each key past the prefix every key shares, by the whole keys where the
 //! words tie, and by input number last, so every arm yields the same entries
 //! in the same order (checked before the rounds).
@@ -464,26 +464,91 @@ impl Iterator for BinaryMerge {
     }
 }
 
+/// Slot numbers kept in the order of their entries, the smallest first: what
+/// the engine's merger was before its tournament. A replaced smallest entry
+/// that is still the smallest costs one comparison; otherwise its place is
+/// found by binary search and the numbers before it move down one.
+struct SortedMerge {
+    slots: Slots,
+    sources: Vec<Source>,
+    order: Vec<u32>,
+}
+
+impl SortedMerge {
+    fn new(
+        mut sources: Vec<Source>,
+        comparator: SharedComparator,
+        prefix: usize,
+    ) -> lsm_tree::Result<Self> {
+        let mut slots = Slots::new(sources.len(), comparator, prefix);
+        let mut order = Vec::with_capacity(sources.len());
+        for (slot, source) in sources.iter_mut().enumerate() {
+            if let Some(entry) = source.next() {
+                slots.put(slot, entry?);
+                order.push(slot as u32);
+            }
+        }
+        order.sort_by(|&a, &b| slots.order(a as usize, b as usize));
+        // The sort's comparisons are setup, not the merge's.
+        slots.word_compares.set(0);
+        slots.key_compares.set(0);
+        Ok(Self {
+            slots,
+            sources,
+            order,
+        })
+    }
+}
+
+impl Iterator for SortedMerge {
+    type Item = Item;
+
+    #[inline]
+    fn next(&mut self) -> Option<Item> {
+        let slot = *self.order.first()? as usize;
+        match self.sources[slot].next() {
+            Some(Ok(entry)) => {
+                let old = self.slots.put(slot, entry);
+                if self.order.len() > 1
+                    && self.slots.order(slot, self.order[1] as usize) == KeyOrder::Greater
+                {
+                    // Past `order[1]`: behind every smaller entry.
+                    let rest = self.order[2..].partition_point(|&held| {
+                        self.slots.order(slot, held as usize) == KeyOrder::Greater
+                    });
+                    let end = 2 + rest;
+                    self.order.copy_within(1..end, 0);
+                    self.order[end - 1] = slot as u32;
+                    if cfg!(feature = "diagnostics") {
+                        self.slots
+                            .moves
+                            .set(self.slots.moves.get() + (end - 1) as u64);
+                    }
+                }
+                old.map(Ok)
+            }
+            Some(Err(e)) => Some(Err(e)),
+            None => {
+                self.order.remove(0);
+                self.slots.entries[slot].take().map(Ok)
+            }
+        }
+    }
+}
+
 /// A tournament tree that only moves forward: `tree[0]` is the winning slot,
 /// `tree[node]` the slot that lost the game at `node`. An input that ran out
-/// leaves its slot empty, and an empty slot loses every game.
-///
-/// With `STREAK`, an input that wins twice in a row has the best of the slots
-/// that lost to it on its path found, and while its next entries come before
-/// that slot's they are taken with one game and the tree left as it stands:
-/// replaying it would change nothing.
-struct LoserMerge<const STREAK: bool> {
+/// leaves its slot empty, and an empty slot loses every game. Every entry
+/// replays its path: the engine's merger is this tree with a way around the
+/// replay for an input that keeps winning.
+struct LoserMerge {
     slots: Slots,
     sources: Vec<Source>,
     tree: Vec<u32>,
     live: usize,
-    /// The slot the winning input's next entry must come before to win again
-    /// unplayed, while `chased`.
-    runner_up: usize,
-    chased: bool,
 }
 
-impl<const STREAK: bool> LoserMerge<STREAK> {
+impl LoserMerge {
     fn new(
         mut sources: Vec<Source>,
         comparator: SharedComparator,
@@ -503,8 +568,6 @@ impl<const STREAK: bool> LoserMerge<STREAK> {
             sources,
             tree: vec![0; leaves],
             live,
-            runner_up: 0,
-            chased: false,
         };
         // The winner of each subtree, by node number: leaves from `leaves` up.
         let mut winners: Vec<u32> = (0..2 * leaves as u32)
@@ -550,26 +613,9 @@ impl<const STREAK: bool> LoserMerge<STREAK> {
         }
         self.tree[0] = winner as u32;
     }
-
-    /// The best of the slots that lost on the path from `leaf` to the root:
-    /// the entry that wins once `leaf`'s input stops winning.
-    #[inline]
-    fn path_best(&self, leaf: usize) -> usize {
-        let mut node = (self.tree.len() + leaf) / 2;
-        let mut best = self.tree[node] as usize;
-        node >>= 1;
-        while node >= 1 {
-            let loser = self.tree[node] as usize;
-            if self.beats(loser, best) {
-                best = loser;
-            }
-            node >>= 1;
-        }
-        best
-    }
 }
 
-impl<const STREAK: bool> Iterator for LoserMerge<STREAK> {
+impl Iterator for LoserMerge {
     type Item = Item;
 
     #[inline]
@@ -583,52 +629,37 @@ impl<const STREAK: bool> Iterator for LoserMerge<STREAK> {
             Some(Err(e)) => return Some(Err(e)),
             None => {
                 self.live -= 1;
-                self.chased = false;
                 self.slots.entries[slot].take()
             }
         };
-        if STREAK && self.chased {
-            if self.beats(slot, self.runner_up) {
-                return old.map(Ok);
-            }
-            self.chased = false;
-            self.replay(slot);
-        } else {
-            self.replay(slot);
-            // The same input won again through its games: a streak may have
-            // started, and its runner-up is worth one walk of the path.
-            if STREAK && self.tree[0] as usize == slot && self.slots.entries[slot].is_some() {
-                self.runner_up = self.path_best(slot);
-                self.chased = true;
-            }
-        }
+        self.replay(slot);
         old.map(Ok)
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arm {
+    Engine,
     Sorted,
     Binary,
     Loser,
-    Streak,
 }
 
 impl Arm {
-    const ALL: [Self; 4] = [Self::Sorted, Self::Binary, Self::Loser, Self::Streak];
+    const ALL: [Self; 4] = [Self::Engine, Self::Sorted, Self::Binary, Self::Loser];
 
     fn label(self) -> &'static str {
         match self {
+            Self::Engine => "engine",
             Self::Sorted => "sorted",
             Self::Binary => "binary",
             Self::Loser => "loser",
-            Self::Streak => "streak",
         }
     }
 }
 
-/// The work the engine's merge heap counted so far, zero in a build that does
-/// not count.
+/// The work the engine's merger counted so far, zero in a build that does not
+/// count.
 fn engine_work() -> Work {
     #[cfg(feature = "diagnostics")]
     {
@@ -658,6 +689,13 @@ fn merge(
         .collect();
     match arm {
         Arm::Sorted => {
+            let mut merge = SortedMerge::new(sources, Arc::clone(comparator), prefix)?;
+            for entry in merge.by_ref() {
+                each(entry?);
+            }
+            Ok(merge.slots.work())
+        }
+        Arm::Engine => {
             let before = engine_work();
             for entry in Merger::new(sources, Arc::clone(comparator)).with_common_prefix(prefix) {
                 each(entry?);
@@ -677,14 +715,7 @@ fn merge(
             Ok(merge.slots.work())
         }
         Arm::Loser => {
-            let mut merge = LoserMerge::<false>::new(sources, Arc::clone(comparator), prefix)?;
-            for entry in merge.by_ref() {
-                each(entry?);
-            }
-            Ok(merge.slots.work())
-        }
-        Arm::Streak => {
-            let mut merge = LoserMerge::<true>::new(sources, Arc::clone(comparator), prefix)?;
+            let mut merge = LoserMerge::new(sources, Arc::clone(comparator), prefix)?;
             for entry in merge.by_ref() {
                 each(entry?);
             }
@@ -708,7 +739,7 @@ fn check_arms_agree(
         })?;
         Ok(out)
     };
-    let expected = output(Arm::Sorted)?;
+    let expected = output(Arm::Engine)?;
     assert_eq!(
         expected.len(),
         inputs.iter().map(Vec::len).sum::<usize>(),
@@ -723,7 +754,7 @@ fn check_arms_agree(
         }),
         "{label}: the merged entries ascend, a key's newer version first"
     );
-    for arm in [Arm::Binary, Arm::Loser, Arm::Streak] {
+    for arm in [Arm::Sorted, Arm::Binary, Arm::Loser] {
         assert!(
             output(arm)? == expected,
             "{label}: the {} merge yields what the engine's does",
