@@ -588,6 +588,183 @@ fn resizes_racing_reads_and_inserts_settle_on_the_last_capacity() {
     assert_eq!(cache.weight(), cache.len() as u64 * 64);
 }
 
+/// A key replaced over and over is found by every read made meanwhile, with
+/// one of the values written: the new slot takes the old one's place in the
+/// chain, so no read walks past both.
+#[cfg(feature = "std")]
+#[test]
+fn a_read_racing_replaces_of_its_key_always_finds_a_value() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    let cache = Arc::new(ShardedCache::with_weighter(
+        1 << 20,
+        1,
+        1024,
+        LenWeighter,
+        FxBuildHasher,
+    ));
+    // Neighbours in the one shard, so the key's chain is not it alone.
+    for key in 0..64u64 {
+        cache.insert(key, vec![0u8; 8]);
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (cache, done) = (Arc::clone(&cache), Arc::clone(&done));
+            thread::spawn(move || {
+                let mut reads = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    let value = cache.get(&7).expect("the key is always resident");
+                    assert!(value.iter().all(|&byte| byte == value[0]), "a torn value");
+                    reads += 1;
+                }
+                reads
+            })
+        })
+        .collect();
+    for round in 0..50_000u32 {
+        cache.insert(7, vec![round.to_le_bytes()[0]; 8]);
+    }
+    done.store(true, Ordering::Relaxed);
+    for reader in readers {
+        assert!(reader.join().expect("reader panicked") > 0);
+    }
+    assert_eq!((cache.len(), cache.weight()), (64, 64 * 8));
+}
+
+/// Entries resident before a shard's table grows are found by every read
+/// made while it grows: a read that walked links the rebuild moved looks
+/// again instead of answering that the key is gone.
+#[cfg(feature = "std")]
+#[test]
+fn a_read_racing_the_tables_growth_finds_what_was_resident() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    let cache = Arc::new(ShardedCache::with_weighter(
+        1 << 30,
+        1,
+        1024,
+        LenWeighter,
+        FxBuildHasher,
+    ));
+    for key in 0..32u64 {
+        cache.insert(key, vec![1u8; 8]);
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4u64)
+        .map(|t| {
+            let (cache, done) = (Arc::clone(&cache), Arc::clone(&done));
+            thread::spawn(move || {
+                let mut key = t;
+                while !done.load(Ordering::Relaxed) {
+                    assert!(cache.contains(&(key % 32)), "key {} lost", key % 32);
+                    key += 1;
+                }
+            })
+        })
+        .collect();
+    // Doubles the buckets a dozen times over.
+    for key in 1_000..60_000u64 {
+        cache.insert(key, vec![2u8; 8]);
+    }
+    done.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().expect("reader panicked");
+    }
+    assert_eq!(cache.len(), 32 + 59_000);
+}
+
+/// Values read, replaced, removed and evicted from several threads at once
+/// are each dropped once: by the writer that took the entry out, or by the
+/// last reader that held its slot.
+#[cfg(feature = "std")]
+#[test]
+fn values_under_concurrent_reads_and_writes_are_each_dropped_once() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    let drops = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let made = alloc::sync::Arc::new(AtomicUsize::new(0));
+    // Two shards of 2,000: forty entries of 100 fill the cache, so inserts
+    // evict throughout.
+    let cache = alloc::sync::Arc::new(ShardedCache::with_weighter(
+        4_000,
+        2,
+        1024,
+        CountedWeight,
+        FxBuildHasher,
+    ));
+    let workers: Vec<_> = (0..8u64)
+        .map(|t| {
+            let (cache, drops, made) = (
+                alloc::sync::Arc::clone(&cache),
+                alloc::sync::Arc::clone(&drops),
+                alloc::sync::Arc::clone(&made),
+            );
+            thread::spawn(move || {
+                for i in 0..20_000u64 {
+                    let key = (t * 31 + i) % 97;
+                    match (t + i) % 5 {
+                        0 | 1 => {
+                            made.fetch_add(1, Ordering::Relaxed);
+                            cache.insert(
+                                key,
+                                alloc::sync::Arc::new(Counted {
+                                    weight: 100,
+                                    drops: alloc::sync::Arc::clone(&drops),
+                                }),
+                            );
+                        }
+                        2 | 3 => {
+                            if let Some(value) = cache.get(&key) {
+                                assert_eq!(value.weight, 100);
+                            }
+                        }
+                        _ => cache.remove(&key),
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("worker panicked");
+    }
+
+    assert_eq!(cache.weight(), cache.len() as u64 * 100);
+    assert!(cache.weight() <= 4_000);
+    assert_eq!(
+        drops.load(Ordering::Relaxed) + cache.len(),
+        made.load(Ordering::Relaxed),
+        "every value not resident was dropped once"
+    );
+    drop(cache);
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        made.load(Ordering::Relaxed),
+        "each value once"
+    );
+}
+
+/// A shard that never fills keeps no more stale queue nodes than a small
+/// multiple of what it holds, however often its entries are replaced: no
+/// eviction pops them there.
+#[test]
+fn replacing_in_a_shard_that_never_fills_does_not_grow_its_queues() {
+    let c = ShardedCache::with_weighter(1 << 20, 1, 1024, LenWeighter, FxBuildHasher);
+    for round in 0..10_000u64 {
+        c.insert(round % 4, vec![0u8; 8]);
+    }
+    let queued = c.queued_nodes(0).expect("one shard");
+    assert!(
+        queued <= 2 * 4 + 16 + 1,
+        "{queued} nodes queued for 4 entries"
+    );
+}
+
 /// A value of some weight that counts its drops.
 struct Counted {
     weight: u64,

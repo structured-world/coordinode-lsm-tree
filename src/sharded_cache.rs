@@ -769,6 +769,15 @@ where
         Some(state)
     }
 
+    /// Nodes in one shard's two queues, stale ones included.
+    #[cfg(test)]
+    fn queued_nodes(&self, shard: usize) -> Option<usize> {
+        let write = self.shards.get(shard)?.0.table.lock();
+        let queued = write.policy().small.len() + write.policy().main.len();
+        drop(write);
+        Some(queued)
+    }
+
     /// One shard's running tallies of the small and main queues, then the
     /// same two summed over the entries it holds.
     #[cfg(test)]
