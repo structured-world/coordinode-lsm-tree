@@ -955,8 +955,16 @@ fn ours_config_cached(
     // would say the wrong thing about every one of them. The same capacity
     // either way: 16 MiB, the library default, in every group but the batched
     // reads of large values.
+    //
+    // A row-cache arm measures the library default, where a tree chooses the
+    // share of its keys that goes through the row cache. `COMPARE_ROWS_FIXED`
+    // sends every key through instead: with it and without, beside the arms
+    // with no row cache, a run shows what the tree's own choice costs or
+    // saves against both.
     let config = config.use_cache(std::sync::Arc::new(
-        lsm_tree::Cache::with_capacity_bytes(cache_bytes_or(cache_bytes)).with_row_cache(row_cache),
+        lsm_tree::Cache::with_capacity_bytes(cache_bytes_or(cache_bytes))
+            .with_row_cache(row_cache)
+            .with_adaptive_row_cache(std::env::var_os("COMPARE_ROWS_FIXED").is_none()),
     ));
     // Data-block hash index: a point get resolves a key to its in-block offset
     // by hash instead of binary-searching the restart array. 1.33 buckets/entry

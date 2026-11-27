@@ -167,6 +167,40 @@ fn row_cache_off_matches_row_cache_on() {
     }
 }
 
+/// A cache told not to adapt sends every key through the row cache whatever
+/// share a tree holds: the switch for a workload measured to do better with
+/// rows always on has to override the tree's own choice, not sit beside it.
+#[test]
+fn a_cache_told_not_to_adapt_fills_rows_for_every_key() {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache =
+        Arc::new(Cache::with_capacity_bytes(64 * 1024 * 1024).with_adaptive_row_cache(false));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    cache.set_row_share(tree.id(), 0);
+    for i in 0..N {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+    for _ in 0..2 {
+        for i in 0..N {
+            assert!(tree.get(key(i), SeqNo::MAX).unwrap().is_some());
+        }
+    }
+    assert_eq!(
+        cache.size(),
+        cached_after_two_passes(true, Some(8)),
+        "as a tree with every key inside its gate",
+    );
+}
+
 /// What a cache holds after every key of a flushed tree was read twice
 /// through it, the tree's row share set to `share` eighths when given.
 fn cached_after_two_passes(rows: bool, share: Option<u8>) -> u64 {

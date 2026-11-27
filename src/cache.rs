@@ -208,6 +208,9 @@ pub struct Cache {
     /// skips the index walk and the data-block decode outright. Turn it off for
     /// a workload measured to be one of the exceptions.
     row_cache_enabled: bool,
+    /// Whether each tree chooses its row cache share from its reads; every
+    /// key goes through the row cache otherwise.
+    row_cache_adaptive: bool,
     /// The share of each tree's keys that goes through the row cache, by the
     /// tree's id: a tree's tables take theirs here once and hold it. Trees
     /// sharing the cache each get a share of their own.
@@ -488,6 +491,7 @@ impl Cache {
                 rustc_hash::FxBuildHasher,
             ),
             row_cache_enabled: true,
+            row_cache_adaptive: true,
             row_gates: spin::Mutex::new(hashbrown::HashMap::with_hasher(rustc_hash::FxBuildHasher)),
             metadata_priority: true,
             loads: crate::inflight::InflightLoads::new(
@@ -738,6 +742,40 @@ impl Cache {
     #[must_use]
     pub fn row_cache_enabled(&self) -> bool {
         self.row_cache_enabled
+    }
+
+    /// Sets whether each tree chooses, from its own reads, what share of its
+    /// keys goes through the row cache. On by default.
+    ///
+    /// Rows pay where keys are read again while their rows still fit the
+    /// cache, and cost where they do not: a probe and a fill per miss, and
+    /// bytes taken from the blocks. A tree therefore plays one read in 256
+    /// against a small model of the cache under each share (none, an eighth,
+    /// a quarter, a half, all of its keys) and moves to the cheapest; trees
+    /// sharing a cache each choose their own. Turn it off to send every key
+    /// through the row cache whatever the reads, for a workload measured to
+    /// do better so.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::Cache;
+    ///
+    /// let cache = Cache::with_capacity_bytes(64 << 20).with_adaptive_row_cache(false);
+    /// assert!(cache.row_cache_enabled());
+    /// assert!(!cache.row_cache_adaptive());
+    /// ```
+    #[must_use]
+    pub fn with_adaptive_row_cache(mut self, adaptive: bool) -> Self {
+        self.row_cache_adaptive = adaptive;
+        self
+    }
+
+    /// Whether trees choose their row cache share from their reads (see
+    /// [`Cache::with_adaptive_row_cache`]).
+    #[must_use]
+    pub fn row_cache_adaptive(&self) -> bool {
+        self.row_cache_adaptive
     }
 
     /// Enables or disables high-priority pinning of index / filter /
