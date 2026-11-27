@@ -377,7 +377,11 @@ impl<K: Eq, V, P> Table<K, V, P> {
         'walk: loop {
             let rebuilds = self.rebuilds.load(Ordering::Acquire);
             if rebuilds & 1 == 1 {
-                core::hint::spin_loop();
+                // Wait for the rebuild behind the lock its writer holds: a
+                // writer the scheduler took off its core mid-rebuild would
+                // otherwise have every reader of the shard spin through its
+                // whole time slice.
+                drop(self.writes.locked.lock());
                 continue;
             }
             let buckets = self.buckets();
