@@ -376,6 +376,31 @@ fn merge_yields_every_first_entry_error_then_the_entries() {
     assert_eq!(rest, ["a", "b", "c"]);
 }
 
+/// Keys whose compared word is the greatest there is, the rank an empty slot
+/// carries, still come out, each once and in order: against a slot whose
+/// input ran out, and against the slots that pad three inputs to four.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test assertions")]
+fn merge_keeps_entries_of_the_greatest_key_word() {
+    let top = |tail: u8| {
+        let mut key = vec![0xFF; 8];
+        key.push(tail);
+        InternalValue::from_components(key, b"", 0, Value)
+    };
+    // Every key starts with eight 0xFF bytes: all of one rank, the empty
+    // slot's. The first input runs out while the others still hold entries.
+    let a = vec![Ok(top(1))];
+    let b = vec![Ok(top(0)), Ok(top(3)), Ok(top(5))];
+    let c = vec![Ok(top(2)), Ok(top(4))];
+    let tails: Vec<u8> = Merger::new(
+        vec![a.into_iter(), b.into_iter(), c.into_iter()],
+        comparator::default_comparator(),
+    )
+    .map(|entry| entry.unwrap().key.user_key.last().copied().unwrap())
+    .collect();
+    assert_eq!(tails, [0, 1, 2, 3, 4, 5]);
+}
+
 /// A merge of inputs that are all empty ends at once, and stays ended.
 #[test]
 fn merge_of_empty_inputs_is_empty() {

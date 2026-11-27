@@ -12,9 +12,11 @@ type IterItem = crate::Result<InternalValue>;
 
 pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = IterItem> + Send + 'a>;
 
-/// The rank of a slot that holds no entry: above every key word, so the slot
-/// loses to any that holds one.
-const EMPTY: u128 = 1 << 64;
+/// The rank of a slot that holds no entry: the greatest key word, so the slot
+/// loses to every entry of a lesser word by the ranks alone. An entry whose
+/// own word is the greatest ties with it, and the tie is settled by which of
+/// the two slots holds an entry.
+const EMPTY: u64 = u64::MAX;
 
 /// How long the winning input has been winning.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,7 +54,7 @@ pub struct Merger<I> {
     /// that pad the inputs to a power of two.
     entries: Vec<Option<InternalValue>>,
     /// Each slot's key word, or [`EMPTY`].
-    ranks: Vec<u128>,
+    ranks: Vec<u64>,
     /// `tree[0]` is the winning slot, `tree[node]` the slot that lost at
     /// `node`.
     tree: Vec<u32>,
@@ -128,16 +130,12 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
         self
     }
 
-    fn rank_of(&self, entry: &InternalValue) -> u128 {
+    fn rank_of(&self, entry: &InternalValue) -> u64 {
         debug_assert!(
             !self.lexicographic || entry.key.user_key.len() >= self.common_prefix,
             "a key shorter than the prefix every key is said to start with",
         );
-        u128::from(key_word(
-            &entry.key.user_key,
-            self.common_prefix,
-            self.lexicographic,
-        ))
+        key_word(&entry.key.user_key, self.common_prefix, self.lexicographic)
     }
 
     /// Whether the entry in slot `a` comes before the one in slot `b`. An
@@ -165,16 +163,19 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
     }
 
     /// [`Self::beats`] for two slots of one rank: by their keys, then by
-    /// their numbers.
+    /// their numbers. A slot that holds an entry comes before an empty one,
+    /// which an entry of the greatest key word ties with by rank.
     #[inline]
     #[expect(
         clippy::indexing_slicing,
         reason = "the tree only holds numbers of slots"
     )]
     fn beats_by_key(&self, a: usize, b: usize) -> bool {
-        let (Some(x), Some(y)) = (&self.entries[a], &self.entries[b]) else {
-            // Two empty slots: neither comes first.
-            return false;
+        let (x, y) = match (&self.entries[a], &self.entries[b]) {
+            (Some(x), Some(y)) => (x, y),
+            (Some(_), None) => return true,
+            // An empty slot comes before nothing.
+            (None, _) => return false,
         };
         #[cfg(feature = "diagnostics")]
         crate::diagnostics::add(&crate::diagnostics::MERGE_KEY_COMPARES, 1);
