@@ -56,40 +56,6 @@ fn bounded_read(reader: &mut impl Read, capacity: usize) -> crate::Result<Vec<u8
     Ok(output)
 }
 
-/// Like [`bounded_read`], but decodes straight into a caller-provided buffer of
-/// the exact expected size — no zero-filled `Vec` and no later copy. Returns the
-/// number of bytes written; the caller checks it equals the expected length.
-fn bounded_read_into(reader: &mut impl Read, dest: &mut [u8]) -> crate::Result<usize> {
-    let mut filled = 0;
-    while filled < dest.len() {
-        // `filled < dest.len()` by the loop guard, so the slice is non-empty.
-        let slot = dest.get_mut(filled..).unwrap_or(&mut []);
-        match reader.read(slot) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) => return Err(crate::Error::from(e)),
-        }
-    }
-
-    // If the buffer filled exactly, probe for excess: a frame that decodes to
-    // more than the declared size is corrupt / over-budget.
-    if filled == dest.len() {
-        let mut probe = [0u8; 1];
-        match reader.read(&mut probe) {
-            Ok(0) => {}
-            Ok(_) => {
-                return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: (filled as u64).saturating_add(1),
-                    limit: dest.len() as u64,
-                });
-            }
-            Err(e) => return Err(crate::Error::from(e)),
-        }
-    }
-
-    Ok(filled)
-}
-
 /// The error a frame compressed under `dict` failed with, decoded into a
 /// `capacity`-byte buffer.
 ///
@@ -375,13 +341,24 @@ impl ZstdProvider {
     /// Returns an error if the frame header is invalid, an I/O error occurs, or
     /// the frame decodes to more than `dest.len()` bytes.
     pub fn decompress_into(data: &[u8], dest: &mut [u8]) -> crate::Result<usize> {
+        use structured_zstd::decoding::errors::FrameDecoderError;
+
+        // No bytes are no frame: the whole-input decode would take them for
+        // zero frames and return nothing, where even an empty plaintext's
+        // frame has a header.
+        if data.is_empty() {
+            return Err(crate::Error::Decompress(crate::CompressionType::Zstd(0)));
+        }
+        // The frame's sequences are executed in `dest` itself: no window of
+        // the decoder's own to decode into and copy out of.
         with_plain_decoder(|decoder| {
-            // A malformed frame header surfaces on the first read.
-            let mut stream = structured_zstd::decoding::StreamingDecoder::new_with_decoder(
-                std::io::Cursor::new(data),
-                decoder,
-            );
-            bounded_read_into(&mut stream, dest)
+            decoder.decode_all(data, dest).map_err(|e| match e {
+                FrameDecoderError::TargetTooSmall => crate::Error::DecompressedSizeTooLarge {
+                    declared: dest.len() as u64 + 1,
+                    limit: dest.len() as u64,
+                },
+                e => crate::Error::Io(crate::io::Error::other(e.to_string())),
+            })
         })
     }
 
