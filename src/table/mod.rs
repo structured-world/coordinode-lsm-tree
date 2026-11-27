@@ -1375,6 +1375,7 @@ impl Table {
                 key_hash,
                 crate::cache::row_weight(key_len, value_len),
                 block,
+                self.cache.block_load_nanos(self.global_id(), block.offset),
             );
         }
     }

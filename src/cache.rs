@@ -847,6 +847,14 @@ impl Cache {
         crate::inflight::LoadTimer::start()
     }
 
+    /// What a cold load of a block like the one at `offset` has been taking,
+    /// in nanoseconds: its read and decode, as timed on the loads sampled so
+    /// far. Zero while none was.
+    pub(crate) fn block_load_nanos(&self, id: GlobalTableId, offset: u64) -> u64 {
+        self.loads
+            .estimate(&(TAG_BLOCK, id.tree_id(), id.table_id(), offset).into())
+    }
+
     /// Records the cold load of the block at `offset` that `timer` timed.
     pub(crate) fn record_block_load(
         &self,

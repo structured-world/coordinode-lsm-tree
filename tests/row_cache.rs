@@ -201,6 +201,51 @@ fn a_cache_told_not_to_adapt_fills_rows_for_every_key() {
     );
 }
 
+/// A tree read key by key, round after round, through a cache that holds
+/// most but not all of it gives its rows up: a row comes back only after
+/// every other key was read, by when the cache has dropped it. Left on, the
+/// rows cost such a tree a probe, a refusal or a fill on every read and
+/// answer almost none.
+#[test]
+fn a_tree_read_in_rounds_past_its_cache_gives_up_its_rows() {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache = Arc::new(Cache::with_capacity_bytes(16 * 1024 * 1024));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    let keys = 70_000u64;
+    // Scattered over the key space, so a round reads the blocks out of order.
+    let spread = |i: u64| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20).to_be_bytes();
+    let value = vec![7u8; 256];
+    for i in 0..keys {
+        tree.insert(spread(i), &value, 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+
+    let mut shares = Vec::new();
+    for _ in 0..12 {
+        for i in 0..keys {
+            assert!(tree.get(spread(i), SeqNo::MAX).unwrap().is_some());
+        }
+        shares.push(cache.row_share(tree.id()));
+    }
+    assert_eq!(
+        shares.last(),
+        Some(&0),
+        "shares after each round: {shares:?}"
+    );
+    assert!(
+        shares.iter().skip(5).all(|&share| share == 0),
+        "closed by the sixth round and stays closed: {shares:?}",
+    );
+}
+
 /// What a cache holds after every key of a flushed tree was read twice
 /// through it, the tree's row share set to `share` eighths when given.
 fn cached_after_two_passes(rows: bool, share: Option<u8>) -> u64 {

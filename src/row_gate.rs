@@ -19,10 +19,10 @@
 //! shadow cache per candidate fraction. A shadow holds weights and no values,
 //! has the cache's capacity divided by the sampling rate, and runs the cache's
 //! own policy and admission. Each window of sampled reads prices every
-//! candidate from what its shadow did, and the tree moves to the cheapest once
-//! it has won two windows in a row by more than a margin. Every candidate is
-//! played all the time, so a tree with rows off comes back to them when its
-//! reads change.
+//! candidate from what its shadow did, into a running cost that halves with
+//! every window, and the tree moves to the cheapest once it beats the
+//! fraction in use by more than a margin. Every candidate is played all the
+//! time, so a tree with rows off comes back to them when its reads change.
 
 use crate::sharded_cache::{Priority, ShardedCache, Weighter};
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -33,18 +33,23 @@ const CANDIDATES: [u8; 5] = [0, 1, 2, 4, 8];
 /// One read in this many is sampled, by key hash.
 const SAMPLE: u64 = 256;
 
-/// Sampled reads a window holds before its candidates are priced.
-const WINDOW: u32 = 1_024;
+/// Sampled reads a window holds before its candidates are priced: 131,072 of
+/// the tree's reads. A tree decides at its third window at the earliest.
+const WINDOW: u32 = 512;
 
-/// A candidate replaces the fraction in use only when it is cheaper by more
-/// than this many thousandths, in two windows running. Below the cost of
-/// the probe alone, about a hundredth of a read that goes to its block, so a
-/// tree whose rows are never read again stops probing for them.
+/// A candidate replaces the fraction in use only when its running cost is
+/// lower by more than this many thousandths. Rows that are never read again
+/// cost a tree a probe and a refusal or a fill each, a tenth of a read that
+/// goes to its block; an eighth of the keys left inside costs an eighth of
+/// that, which the margin has to stay under for such a tree to close fully.
 const MARGIN_PER_MILLE: u64 = 5;
 
 /// What each event of a point read costs, in nanoseconds, as the comparison
 /// harness measures them on a block of 4 KiB held in the page cache. Only
-/// their ratios matter to the choice.
+/// their ratios matter to the choice. What a block miss adds to a block hit
+/// is the one that differs by orders of magnitude between deployments (the
+/// codec, the device, the block size), so where the cache has timed its
+/// loads that time stands in for [`cost::BLOCK_MISS`].
 mod cost {
     /// A read answered by a cached row.
     pub(super) const ROW_HIT: u64 = 450;
@@ -92,13 +97,14 @@ struct Events {
 }
 
 impl Events {
-    const fn cost(self) -> u64 {
+    /// The window's cost where a block miss costs `block_miss`.
+    const fn cost(self, block_miss: u64) -> u64 {
         self.row_hits * cost::ROW_HIT
             + self.row_probes * cost::ROW_PROBE
             + self.row_refusals * cost::ROW_REFUSAL
             + self.row_fills * cost::ROW_FILL
             + self.block_hits * cost::BLOCK_HIT
-            + self.block_misses * cost::BLOCK_MISS
+            + self.block_misses * block_miss
     }
 }
 
@@ -111,8 +117,14 @@ struct Sim {
     events: [Events; CANDIDATES.len()],
     /// Sampled reads in the window so far.
     seen: u32,
-    /// The candidate that won the last window by the margin, if one did.
-    leader: Option<usize>,
+    /// Each candidate's cost over the windows so far, a window counting half
+    /// of what the next one does.
+    running: [u64; CANDIDATES.len()],
+    /// Windows closed so far.
+    windows: u32,
+    /// What the cache's loads were taking at the last sampled read, in
+    /// nanoseconds; zero where it has timed none.
+    load_nanos: u64,
 }
 
 /// A sampled read's place in its table: the block it came from, by offset,
@@ -157,7 +169,9 @@ impl RowGate {
                 capacity: 0,
                 events: [Events::default(); CANDIDATES.len()],
                 seen: 0,
-                leader: None,
+                running: [0; CANDIDATES.len()],
+                windows: 0,
+                load_nanos: 0,
             }),
         }
     }
@@ -185,7 +199,8 @@ impl RowGate {
     /// Plays one sampled read against every candidate's shadow, and at the
     /// end of a window moves the fraction to the candidate that keeps
     /// winning. Skipped when another sampled read is being played. `capacity`
-    /// is the cache's, which the shadows are scaled from.
+    /// is the cache's, which the shadows are scaled from, and `load_nanos`
+    /// what its cold loads have been taking, zero where none was timed.
     pub(crate) fn observe(
         &self,
         capacity: u64,
@@ -193,10 +208,12 @@ impl RowGate {
         key_hash: u64,
         row_weight: u64,
         block: BlockSeen,
+        load_nanos: u64,
     ) {
         let Some(mut sim) = self.sim.try_lock() else {
             return;
         };
+        sim.load_nanos = load_nanos;
         let capacity = capacity / SAMPLE;
         if sim.shadows.is_none() || sim.capacity != capacity {
             sim.capacity = capacity;
@@ -253,36 +270,52 @@ impl RowGate {
         }
     }
 
-    /// Prices the window's candidates and moves to the cheapest when it has
-    /// now won two windows running by the margin.
+    /// Prices the window's candidates into their running costs and moves to
+    /// the cheapest when it beats the fraction in use by the margin.
     fn close_window(&self, sim: &mut Sim) {
-        let costs = sim.events.map(Events::cost);
+        // A miss is a hit plus the load; the constant where no load was timed.
+        let block_miss = match sim.load_nanos {
+            0 => cost::BLOCK_MISS,
+            load => cost::BLOCK_HIT + load,
+        };
+        // Each window counts half of what the one after it does. One window
+        // alone does not tell the candidates apart: a shadow holds a few
+        // hundred entries, and a handful of block misses more or less in it,
+        // each worth dozens of row probes, falls to chance.
+        for (running, events) in sim.running.iter_mut().zip(sim.events) {
+            *running = *running / 2 + events.cost(block_miss);
+        }
         sim.events = [Events::default(); CANDIDATES.len()];
         sim.seen = 0;
+        sim.windows = sim.windows.saturating_add(1);
+        // The first window starts from empty shadows, where every candidate
+        // misses alike.
+        if sim.windows < 3 {
+            return;
+        }
 
         let in_use = self.eighths();
         let current = CANDIDATES
             .iter()
             .position(|&eighths| eighths == in_use)
             .unwrap_or(CANDIDATES.len() - 1);
-        let best = costs
+        let best = sim
+            .running
             .iter()
             .enumerate()
             .min_by_key(|&(_, cost)| *cost)
             .map_or(current, |(candidate, _)| candidate);
-        let (Some(&best_cost), Some(&current_cost)) = (costs.get(best), costs.get(current)) else {
+        let (Some(&best_cost), Some(&current_cost)) =
+            (sim.running.get(best), sim.running.get(current))
+        else {
             return;
         };
-        let wins = best != current && best_cost * 1_000 < current_cost * (1_000 - MARGIN_PER_MILLE);
-        if !wins {
-            sim.leader = None;
-        } else if sim.leader == Some(best) {
-            if let Some(&eighths) = CANDIDATES.get(best) {
-                self.eighths.store(eighths, Ordering::Relaxed);
-            }
-            sim.leader = None;
-        } else {
-            sim.leader = Some(best);
+        if best != current
+            && best_cost.saturating_mul(1_000)
+                < current_cost.saturating_mul(1_000 - MARGIN_PER_MILLE)
+            && let Some(&eighths) = CANDIDATES.get(best)
+        {
+            self.eighths.store(eighths, Ordering::Relaxed);
         }
     }
 

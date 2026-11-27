@@ -24,8 +24,68 @@ fn read_evenly(gate: &RowGate, keys: u64, reads: u64, seed: u64) {
             offset: key / 13 * 4_096,
             weight: 4_096,
         };
-        gate.observe(CACHE, 1, hash(key), 300, block);
+        gate.observe(CACHE, 1, hash(key), 300, block, 0);
     }
+}
+
+/// Every key read in turn, round after round, where the cache holds most but
+/// not all of them: a row comes back only after every other key was read, by
+/// when the cache has dropped it, so rows cost their probes, refusals and
+/// fills and answer almost nothing. The gate closes.
+#[test]
+fn rounds_over_more_keys_than_the_cache_holds_turn_rows_off() {
+    let gate = gate();
+    let keys = 70_000;
+    let mut closed_after = None;
+    for n in 0..60 * u64::from(WINDOW) * SAMPLE {
+        let key = n % keys;
+        let key_hash = hash(key);
+        if !RowGate::samples(key_hash) {
+            continue;
+        }
+        // Keys are stored in another order than they are read in.
+        let block = BlockSeen {
+            offset: hash(key ^ 0x5555) % keys / 14 * 4_096,
+            weight: 4_096,
+        };
+        gate.observe(CACHE, 1, key_hash, 330, block, 0);
+        if gate.eighths() == 0 && closed_after.is_none() {
+            closed_after = Some(n);
+        }
+    }
+    assert_eq!(gate.eighths(), 0);
+    // At its third window, which ends inside the sixth round of the keys.
+    assert!(
+        closed_after.is_some_and(|reads| reads <= 6 * keys),
+        "closed after {closed_after:?} reads",
+    );
+}
+
+/// Where a cold load is slow, a block kept out of the cache by rows costs
+/// more than the rows save. A hot set read beside many other keys keeps its
+/// rows while a block miss costs the constant, and gives them all up when the
+/// cache has timed its loads at a millisecond: the choice follows the load
+/// time the cache measured, not the constant.
+#[test]
+fn a_slow_load_weighs_against_rows_that_crowd_out_blocks() {
+    let play = |load_nanos: u64| {
+        let gate = gate();
+        for n in 0..40 * u64::from(WINDOW) {
+            // Nine reads in ten of 150 hot keys, the tenth of 20,000 others.
+            let key = if n % 10 == 0 {
+                150 + hash(n) % 20_000
+            } else {
+                hash(n) % 150
+            };
+            let block = BlockSeen {
+                offset: key / 13 * 4_096,
+                weight: 4_096,
+            };
+            gate.observe(CACHE, 1, hash(key), 300, block, load_nanos);
+        }
+        gate.eighths()
+    };
+    assert_eq!((play(0), play(1_000_000)), (8, 0));
 }
 
 /// Keys read evenly from far more than the cache holds leave their rows
