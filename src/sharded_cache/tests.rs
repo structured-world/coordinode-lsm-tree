@@ -352,20 +352,9 @@ fn high_priority_replace_keeps_per_queue_tallies_consistent() {
         c.insert(i, vec![0u8; 100]);
     }
 
-    // Recompute the per-queue tallies from the map and compare to the
-    // running counters: they must match exactly. Read everything under a
-    // tightly-scoped guard, then assert after it is dropped.
-    let (small_bytes, main_bytes, small, main) = {
-        let shard = c.shards[0].0.read();
-        let (mut small, mut main) = (0u64, 0u64);
-        for (_, slot) in &shard.map {
-            match slot.loc {
-                Location::Small => small += slot.weight,
-                Location::Main => main += slot.weight,
-            }
-        }
-        (shard.small_bytes, shard.main_bytes, small, main)
-    };
+    // Recompute the per-queue tallies from the entries and compare to the
+    // running counters: they must match exactly.
+    let [small_bytes, main_bytes, small, main] = c.queue_tallies(0).expect("one shard");
     assert_eq!(small_bytes, small, "small_bytes tally drifted");
     assert_eq!(main_bytes, main, "main_bytes tally drifted");
 }
@@ -591,11 +580,8 @@ fn resizes_racing_reads_and_inserts_settle_on_the_last_capacity() {
     }
 
     assert_eq!(cache.max_entry_weight(), cache.capacity().div_ceil(8));
-    for shard in &cache.shards {
-        let (capacity, resident) = {
-            let core = shard.0.read();
-            (core.capacity, core.resident_bytes())
-        };
+    for shard in 0..cache.shards.len() {
+        let (capacity, resident) = cache.shard_state(shard).expect("a shard of the cache");
         assert_eq!(capacity, cache.max_entry_weight());
         assert!(resident <= capacity);
     }

@@ -4,38 +4,29 @@
 //! In-tree sharded cache backing the block/blob cache ([`crate::Cache`]) and
 //! the file-descriptor cache ([`crate::descriptor_table`]).
 //!
-//! Replaces `quick_cache`, the last `std`-only dependency standing between the
-//! crate and a `no_std + alloc` build. A single implementation serves both
-//! targets:
+//! One implementation serves `std` and `no_std + alloc` alike:
 //!
 //! - **Eviction:** per-shard byte-weighted **S3-FIFO** (small / main / ghost
-//!   FIFO queues + a 2-bit frequency counter). S3-FIFO is uniquely suited to a
-//!   lock-free read path: a *read* only bumps the entry's frequency counter and
-//!   never reorders a queue (promotion small→main happens lazily at eviction
-//!   time, keyed on that counter), unlike LRU which must move the entry to the
-//!   MRU end on every hit. The frequency counter is an [`AtomicU8`](core::sync::atomic::AtomicU8), so reads
-//!   run under a *shared* lock and proceed concurrently.
-//! - **Concurrency:** N shards (key hash high-bits → shard), each behind an
-//!   `RwLock` that is `parking_lot::RwLock` under `std` (small, userspace
-//!   fast-path) and `spin::RwLock` under `no_std`. `get` / `peek` take the read
-//!   lock; `insert` / `remove` / eviction take the write lock. The total
-//!   resident weight is an [`AtomicU64`](core::sync::atomic::AtomicU64) so `size()` is lock-free.
-//!
-//! Full lock-free eviction (concurrent S3-FIFO queues with epoch reclamation)
-//! was rejected: it is `std`-only (no mature `no_std` epoch GC) and a large UB
-//! surface for marginal gain on a read-heavy block cache. The shared-read +
-//! per-shard-write design captures the read-concurrency win on both targets
-//! without that risk.
+//!   FIFO queues + a 2-bit frequency counter). A *read* only raises the
+//!   entry's frequency and never reorders a queue (promotion small→main
+//!   happens lazily at eviction time, keyed on that counter), unlike LRU
+//!   which must move the entry to the MRU end on every hit.
+//! - **Concurrency:** N shards (key hash → shard). A read takes no lock: it
+//!   finds its entry in the shard's table and holds the entry's slot for as
+//!   long as it clones the value (see [`table`]). Inserts, removals and
+//!   eviction of one shard take turns behind that shard's lock, which holds
+//!   the queues and the ghost set; readers never wait for it. Each shard's
+//!   resident weight and entry count are atomics, so `weight()` and `len()`
+//!   take no lock either.
+
+mod table;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::hash::{BuildHasher, Hash};
-use core::sync::atomic::{AtomicU8, Ordering};
-
-#[cfg(feature = "std")]
-type RwLock<T> = parking_lot::RwLock<T>;
-#[cfg(not(feature = "std"))]
-type RwLock<T> = spin::RwLock<T>;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use portable_atomic::AtomicU64;
+use table::{Node, Table, Write};
 
 /// Maximum value of an entry's frequency counter (2-bit, S3-FIFO).
 const MAX_FREQ: u8 = 3;
@@ -60,14 +51,6 @@ impl<K, V> Weighter<K, V> for UnitWeighter {
     }
 }
 
-/// Which FIFO queue an entry currently lives in. Mutated only under the shard
-/// write lock (eviction moves small→main); never read on the lock-free path.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Location {
-    Small,
-    Main,
-}
-
 /// Admission priority for an inserted entry.
 ///
 /// [`Priority::High`] entries skip the probationary *small* queue and enter the
@@ -90,36 +73,18 @@ pub(crate) enum Priority {
     Probation,
 }
 
-/// One cached entry: the value, its weight, the S3-FIFO frequency counter, and
-/// the queue it belongs to. `freq` is atomic so a `get` can bump it under a
-/// shared (read) lock; all other fields change only under the write lock.
-struct Slot<V> {
-    value: V,
-    weight: u64,
-    freq: AtomicU8,
-    loc: Location,
-}
-
-/// 64-byte-aligned wrapper so adjacent shard locks land on separate cache lines
+/// 64-byte-aligned wrapper so adjacent shards land on separate cache lines
 /// (no false sharing between shards under concurrent access).
 #[repr(align(64))]
 struct Padded<T>(T);
 
-/// Per-shard S3-FIFO core. Byte-weighted: `small_bytes + main_bytes` is the
-/// resident weight, kept at or below `capacity` by eviction. Removal is O(1)
-/// via lazy tombstoning — a removed key stays in its FIFO queue and is skipped
-/// (as "stale") when popped during eviction.
-struct ShardCore<K, V, S> {
-    /// Keyed by the entry's precomputed hash. The sharded wrapper already hashes
-    /// the key once (to pick the shard), so it passes that hash straight in and
-    /// the table never re-hashes on the read path. `(K, Slot)` tuples carry the
-    /// key for equality checks and rehashing during resize/eviction.
-    map: hashbrown::HashTable<(K, Slot<V>)>,
-    /// Kept so the cold paths (insert-resize, eviction lookups) can rehash a key
-    /// the wrapper did not pre-hash.
-    hasher: S,
-    small: VecDeque<K>,
-    main: VecDeque<K>,
+/// Per-shard S3-FIFO state, held behind the shard's table lock. Byte-weighted:
+/// `small_bytes + main_bytes` is the resident weight, kept at or below
+/// `capacity` by eviction. An entry taken out of the table stays in its FIFO
+/// queue as a stale node, skipped when popped during eviction.
+struct Policy {
+    small: VecDeque<Node>,
+    main: VecDeque<Node>,
     /// Fingerprints (the wrapper's precomputed key hashes) of keys evicted
     /// cold or missed into a full shard, oldest first. The hash is already
     /// mixed, so `ghost_set` is keyed by it as is: no key clone, no rehash.
@@ -140,16 +105,9 @@ struct ShardCore<K, V, S> {
     filled: bool,
 }
 
-impl<K, V, S> ShardCore<K, V, S>
-where
-    K: Eq + Hash + Clone,
-    V: Clone,
-    S: BuildHasher + Clone,
-{
-    fn new(capacity: u64, ghost_capacity: usize, hasher: S) -> Self {
+impl Policy {
+    fn new(capacity: u64, ghost_capacity: usize) -> Self {
         Self {
-            map: hashbrown::HashTable::new(),
-            hasher,
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
@@ -163,285 +121,30 @@ where
         }
     }
 
-    /// Sets the shard's capacity, evicting down to it in the shard's own
-    /// order when it shrank.
-    fn set_capacity(&mut self, capacity: u64, evicted: &mut Evicted<V>) {
-        self.capacity = capacity;
-        self.small_target = small_target(capacity);
-        self.evict_to_capacity(evicted);
-    }
-
-    /// Lock-free-path read: returns the value (cloned) and bumps the frequency
-    /// counter. Runs under a shared lock — the only mutation is the atomic
-    /// `freq` bump, which is safe to race (the counter is a hint).
-    fn get(&self, hash: u64, key: &K) -> Option<V> {
-        let (_, slot) = self.map.find(hash, |(k, _)| k == key)?;
-        // Saturating bump. A racing pair of `get`s may drop one increment; that
-        // only mildly under-counts frequency, never corrupts state.
-        let f = slot.freq.load(Ordering::Relaxed);
-        if f < MAX_FREQ {
-            slot.freq.store(f + 1, Ordering::Relaxed);
-        }
-        Some(slot.value.clone())
-    }
-
-    /// The resident value for `key`, by reference.
-    #[cfg(feature = "zstd")]
-    fn find(&self, hash: u64, key: &K) -> Option<&V> {
-        self.map
-            .find(hash, |(k, _)| k == key)
-            .map(|(_, slot)| &slot.value)
-    }
-
-    /// Read without promotion: returns the value (cloned) without touching the
-    /// frequency counter. Used by readers that inspect an entry without
-    /// counting it as a hit: the partial-decode tier and monitoring reports.
-    fn peek(&self, hash: u64, key: &K) -> Option<V> {
-        self.map
-            .find(hash, |(k, _)| k == key)
-            .map(|(_, slot)| slot.value.clone())
-    }
-
-    /// Whether `key` is resident, without cloning the value or touching the
-    /// frequency counter. For a caller that only wants to know whether it has
-    /// to fetch, `get`/`peek` would clone the value (an atomic bump on a
-    /// refcounted payload) just to drop it again.
-    fn contains(&self, hash: u64, key: &K) -> bool {
-        self.map.find(hash, |(k, _)| k == key).is_some()
-    }
-
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    /// Inserts or replaces `key`, evicting to stay within capacity. The shard's
-    /// running `small_bytes` / `main_bytes` tallies are kept current throughout
-    /// (the sharded wrapper reads them under a shared lock for `weight()`).
-    fn insert(
-        &mut self,
-        hash: u64,
-        key: K,
-        value: V,
-        weight: u64,
-        priority: Priority,
-        evicted: &mut Evicted<V>,
-    ) {
-        // An entry heavier than the shard can never stay resident: admitting
-        // it would evict the shard's whole population and then be evicted
-        // itself. Refused here, under the lock, so a resize between the
-        // caller's weighing and this insert is honored; the value is dropped
-        // with the evicted ones, after the lock.
-        if weight > self.capacity {
-            evicted.push(value);
-            return;
-        }
-        if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
-            // Replace in place: adjust the owning queue's byte tally by the
-            // weight delta.
-            let old = slot.weight;
-            evicted.push(core::mem::replace(&mut slot.value, value));
-            slot.weight = weight;
-            // Honor a High-priority refresh of a probationary (small) entry:
-            // promote it to main with full frequency credit so a re-inserted
-            // index/filter/range-tombstone block gets the same churn protection
-            // as a fresh High admission, instead of being left to cold-evict
-            // from the small queue. The stale small-queue entry is skipped on
-            // its next pop (lazy tombstone).
-            let promote = priority == Priority::High && slot.loc == Location::Small;
-            if promote {
-                slot.loc = Location::Main;
-                slot.freq.store(MAX_FREQ, Ordering::Relaxed);
-            }
-            match slot.loc {
-                // `slot.loc` is `Main` here when just promoted: move the old
-                // weight out of the small tally and the new weight into main,
-                // and enqueue the entry on the main queue. `slot` borrows
-                // `self.map`; the queue / tally fields are disjoint, so these
-                // direct field accesses are allowed alongside it.
-                Location::Main if promote => {
-                    self.small_bytes -= old;
-                    self.main_bytes += weight;
-                    self.main.push_back(key);
-                }
-                Location::Small => self.small_bytes = adjust(self.small_bytes, old, weight),
-                Location::Main => self.main_bytes = adjust(self.main_bytes, old, weight),
-            }
-        } else {
-            // Fresh entry. High-priority entries (pinned metadata) go straight to
-            // main with a full frequency credit so churn through the small queue
-            // can't cold-evict them. Otherwise: a ghost-queue hit (recently
-            // evicted from small) is re-admitted to main, else the entry enters
-            // the probationary small queue.
-            let (loc, init_freq) = match priority {
-                Priority::High => (Location::Main, MAX_FREQ),
-                Priority::Normal => {
-                    if self.take_ghost(hash) {
-                        (Location::Main, 0)
-                    } else {
-                        (Location::Small, 0)
-                    }
-                }
-                Priority::Probation => {
-                    // The fingerprint was spent on admitting the entry.
-                    self.take_ghost(hash);
-                    (Location::Small, 0)
-                }
-            };
-            let hasher = &self.hasher;
-            self.map.insert_unique(
-                hash,
-                (
-                    key.clone(),
-                    Slot {
-                        value,
-                        weight,
-                        freq: AtomicU8::new(init_freq),
-                        loc,
-                    },
-                ),
-                |(k, _)| hasher.hash_one(k),
-            );
-            match loc {
-                Location::Small => {
-                    self.small_bytes += weight;
-                    self.small.push_back(key);
-                }
-                Location::Main => {
-                    self.main_bytes += weight;
-                    self.main.push_back(key);
-                }
-            }
-        }
-
-        self.evict_to_capacity(evicted);
-    }
-
-    /// Removes `key` if present (lazy tombstone — the stale queue entry is
-    /// skipped on its next pop).
-    fn remove(&mut self, hash: u64, key: &K) {
-        let Ok(entry) = self.map.find_entry(hash, |(k, _)| k == key) else {
-            return;
-        };
-        let (_, slot) = entry.remove().0;
-        match slot.loc {
-            Location::Small => self.small_bytes -= slot.weight,
-            Location::Main => self.main_bytes -= slot.weight,
-        }
-    }
-
-    /// Resident weight of this shard (`small_bytes + main_bytes`). Read under a
-    /// shared lock by the wrapper's `weight()`.
+    /// Resident weight of the shard.
     #[inline]
     fn resident_bytes(&self) -> u64 {
         self.small_bytes + self.main_bytes
     }
 
-    /// Evicts until the shard is within capacity, handing what it evicts to
-    /// `evicted` for the caller to drop once the lock is released.
-    fn evict_to_capacity(&mut self, evicted: &mut Evicted<V>) {
-        if self.resident_bytes() > self.capacity {
-            self.filled = true;
-        }
-        while self.resident_bytes() > self.capacity {
-            if !self.evict_one(evicted) {
-                // Both queues are out of live entries — nothing left to free
-                // (e.g. a single entry larger than the whole shard capacity).
-                break;
-            }
-        }
-    }
-
-    /// Frees (or migrates) one live entry. Returns `false` only when both queues
-    /// hold no live entry. A small→main migration returns `true` (progress) even
-    /// though it frees no bytes: it shrinks the small queue, so a bounded number
-    /// of further calls reach a real eviction.
-    #[expect(
-        clippy::if_same_then_else,
-        reason = "the branches differ in which queue `||` tries first; the lint reads them as equal"
-    )]
-    fn evict_one(&mut self, evicted: &mut Evicted<V>) -> bool {
-        let prefer_small = self.main_bytes == 0 || self.small_bytes >= self.small_target;
-        if prefer_small {
-            self.evict_from_small(evicted) || self.evict_from_main(evicted)
+    /// Queues the node of an entry just written and counts its weight.
+    fn enqueue(&mut self, node: Node, main: bool, weight: u64) {
+        if main {
+            self.main_bytes += weight;
+            self.main.push_back(node);
         } else {
-            self.evict_from_main(evicted) || self.evict_from_small(evicted)
+            self.small_bytes += weight;
+            self.small.push_back(node);
         }
     }
 
-    /// Processes the small queue's oldest live entry: a frequently-used one
-    /// (freq > 0) migrates to the main queue; an unused one is evicted and its
-    /// key recorded in the ghost queue. Returns `false` if the small queue holds
-    /// no live entry.
-    fn evict_from_small(&mut self, evicted: &mut Evicted<V>) -> bool {
-        while let Some(key) = self.small.pop_front() {
-            let hash = self.hasher.hash_one(&key);
-            let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
-                continue; // stale tombstone — already removed
-            };
-            if slot.loc != Location::Small {
-                // Stale small-queue node: the entry was promoted to main
-                // out-of-band (a High-priority replace). Its weight already moved
-                // to `main_bytes` and a live main-queue node exists, so skip this
-                // node without touching tallies — otherwise it would double-count
-                // the move (and could underflow `small_bytes`).
-                continue;
-            }
-            let w = slot.weight;
-            if slot.freq.load(Ordering::Relaxed) > 0 {
-                // Hot: promote to main, reset frequency.
-                slot.freq.store(0, Ordering::Relaxed);
-                slot.loc = Location::Main;
-                self.small_bytes -= w;
-                self.main_bytes += w;
-                self.main.push_back(key);
-            } else {
-                // Cold: evict, remember the fingerprint in the ghost queue. The
-                // shard's accounting is whole before the value is handed on.
-                let removed = self
-                    .map
-                    .find_entry(hash, |(k, _)| *k == key)
-                    .ok()
-                    .map(|entry| entry.remove().0.1.value);
-                self.small_bytes -= w;
-                self.push_ghost(hash);
-                if let Some(value) = removed {
-                    evicted.push(value);
-                }
-            }
-            return true;
+    /// Takes the weight of an entry out of its queue's tally.
+    fn discount(&mut self, main: bool, weight: u64) {
+        if main {
+            self.main_bytes -= weight;
+        } else {
+            self.small_bytes -= weight;
         }
-        false
-    }
-
-    /// Processes the main queue's oldest live entry: one with remaining
-    /// frequency is reinserted at the back with its counter decremented; an
-    /// unused one is evicted. Returns `false` if the main queue holds no live
-    /// entry.
-    fn evict_from_main(&mut self, evicted: &mut Evicted<V>) -> bool {
-        while let Some(key) = self.main.pop_front() {
-            let hash = self.hasher.hash_one(&key);
-            let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
-                continue; // stale tombstone
-            };
-            let f = slot.freq.load(Ordering::Relaxed);
-            if f > 0 {
-                slot.freq.store(f - 1, Ordering::Relaxed);
-                self.main.push_back(key);
-            } else {
-                let w = slot.weight;
-                let removed = self
-                    .map
-                    .find_entry(hash, |(k, _)| *k == key)
-                    .ok()
-                    .map(|entry| entry.remove().0.1.value);
-                self.main_bytes -= w;
-                if let Some(value) = removed {
-                    evicted.push(value);
-                }
-            }
-            return true;
-        }
-        false
     }
 
     /// Whether the key hashed to `hash` is remembered in the ghost queue.
@@ -485,11 +188,184 @@ where
     }
 }
 
+/// What a shard's writer does to it, with the shard's lock held.
+impl<K: Eq, V> Write<'_, K, V, Policy> {
+    /// Inserts or replaces `key`, evicting to stay within capacity.
+    fn insert_entry(
+        &mut self,
+        hash: u64,
+        key: K,
+        value: V,
+        weight: u64,
+        priority: Priority,
+        evicted: &mut Evicted<V>,
+    ) {
+        // An entry heavier than the shard can never stay resident: admitting
+        // it would evict the shard's whole population and then be evicted
+        // itself. Refused here, under the lock, so a resize between the
+        // caller's weighing and this insert is honored; the value is dropped
+        // with the evicted ones, after the lock.
+        if weight > self.policy().capacity {
+            evicted.push(value);
+            return;
+        }
+        if let Some(old) = self.find(hash, &key) {
+            let (old_weight, old_main, old_freq) =
+                (self.weight(old), self.in_main(old), self.freq(old));
+            // Honor a High-priority refresh of a probationary (small) entry:
+            // promote it to main with full frequency credit so a re-inserted
+            // index/filter/range-tombstone block gets the same churn protection
+            // as a fresh High admission, instead of being left to cold-evict
+            // from the small queue.
+            let promote = priority == Priority::High && !old_main;
+            let main = old_main || promote;
+            let freq = if promote { MAX_FREQ } else { old_freq };
+            // The new value takes a slot of its own, so readers holding the
+            // old one keep it; the old slot's queue node goes stale and the
+            // entry queues again at the back.
+            let node = self.replace(old, key, value, weight, freq, main, evicted);
+            let policy = self.policy_mut();
+            policy.discount(old_main, old_weight);
+            policy.enqueue(node, main, weight);
+            self.sweep_queues();
+        } else {
+            // Fresh entry. High-priority entries (pinned metadata) go straight to
+            // main with a full frequency credit so churn through the small queue
+            // can't cold-evict them. Otherwise: a ghost-queue hit (recently
+            // evicted from small) is re-admitted to main, else the entry enters
+            // the probationary small queue.
+            let (main, freq) = match priority {
+                Priority::High => (true, MAX_FREQ),
+                Priority::Normal => (self.policy_mut().take_ghost(hash), 0),
+                Priority::Probation => {
+                    // The fingerprint was spent on admitting the entry.
+                    self.policy_mut().take_ghost(hash);
+                    (false, 0)
+                }
+            };
+            let node = self.insert(hash, key, value, weight, freq, main);
+            self.policy_mut().enqueue(node, main, weight);
+        }
+
+        self.evict_to_capacity(evicted);
+    }
+
+    /// Takes the entry in visible slot `link` out of the shard.
+    fn remove_entry(&mut self, link: u32, evicted: &mut Evicted<V>) {
+        let (main, weight) = (self.in_main(link), self.weight(link));
+        self.remove(link, evicted);
+        self.policy_mut().discount(main, weight);
+        self.sweep_queues();
+    }
+
+    /// Drops the stale nodes of both queues once they outnumber the entries
+    /// two to one: a shard that never fills pops none of them by evicting,
+    /// and each replace or removal leaves one behind.
+    fn sweep_queues(&mut self) {
+        let policy = self.policy();
+        if policy.small.len() + policy.main.len() <= 2 * self.len() + 16 {
+            return;
+        }
+        let mut small = core::mem::take(&mut self.policy_mut().small);
+        let mut main = core::mem::take(&mut self.policy_mut().main);
+        small.retain(|&node| self.is_live(node));
+        main.retain(|&node| self.is_live(node));
+        let policy = self.policy_mut();
+        policy.small = small;
+        policy.main = main;
+    }
+
+    /// Evicts until the shard is within capacity, handing what it evicts to
+    /// `evicted` for the caller to drop once the lock is released.
+    fn evict_to_capacity(&mut self, evicted: &mut Evicted<V>) {
+        if self.policy().resident_bytes() > self.policy().capacity {
+            self.policy_mut().filled = true;
+        }
+        while self.policy().resident_bytes() > self.policy().capacity {
+            if !self.evict_one(evicted) {
+                // Both queues are out of live entries: nothing left to free.
+                break;
+            }
+        }
+    }
+
+    /// Frees (or migrates) one live entry. Returns `false` only when both queues
+    /// hold no live entry. A small→main migration returns `true` (progress) even
+    /// though it frees no bytes: it shrinks the small queue, so a bounded number
+    /// of further calls reach a real eviction.
+    #[expect(
+        clippy::if_same_then_else,
+        reason = "the branches differ in which queue `||` tries first; the lint reads them as equal"
+    )]
+    fn evict_one(&mut self, evicted: &mut Evicted<V>) -> bool {
+        let policy = self.policy();
+        let prefer_small = policy.main_bytes == 0 || policy.small_bytes >= policy.small_target;
+        if prefer_small {
+            self.evict_from_small(evicted) || self.evict_from_main(evicted)
+        } else {
+            self.evict_from_main(evicted) || self.evict_from_small(evicted)
+        }
+    }
+
+    /// Processes the small queue's oldest live entry: a frequently-used one
+    /// (freq > 0) migrates to the main queue; an unused one is evicted and its
+    /// key recorded in the ghost queue. Returns `false` if the small queue holds
+    /// no live entry.
+    fn evict_from_small(&mut self, evicted: &mut Evicted<V>) -> bool {
+        while let Some(node) = self.policy_mut().small.pop_front() {
+            if !self.is_live(node) {
+                continue;
+            }
+            let weight = self.weight(node.link);
+            if self.freq(node.link) > 0 {
+                // Hot: promote to main, reset frequency.
+                self.clear_freq(node.link);
+                self.set_main(node.link);
+                let policy = self.policy_mut();
+                policy.small_bytes -= weight;
+                policy.main_bytes += weight;
+                policy.main.push_back(node);
+            } else {
+                // Cold: evict, remember the fingerprint in the ghost queue.
+                let hash = self.hash(node.link);
+                self.remove(node.link, evicted);
+                let policy = self.policy_mut();
+                policy.small_bytes -= weight;
+                policy.push_ghost(hash);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Processes the main queue's oldest live entry: one with remaining
+    /// frequency is reinserted at the back with its counter decremented; an
+    /// unused one is evicted. Returns `false` if the main queue holds no live
+    /// entry.
+    fn evict_from_main(&mut self, evicted: &mut Evicted<V>) -> bool {
+        while let Some(node) = self.policy_mut().main.pop_front() {
+            if !self.is_live(node) {
+                continue;
+            }
+            if self.freq(node.link) > 0 {
+                self.lower_freq(node.link);
+                self.policy_mut().main.push_back(node);
+            } else {
+                let weight = self.weight(node.link);
+                self.remove(node.link, evicted);
+                self.policy_mut().main_bytes -= weight;
+            }
+            return true;
+        }
+        false
+    }
+}
+
 /// What one insert replaced or evicted, dropped by its caller once the
-/// shard's lock is released, so no read of the shard waits behind the frees.
-/// The first few are held in place, their places unwritten until used, so
-/// collecting them allocates nothing under the lock and an insert that evicts
-/// one or none pays for no more than that one.
+/// shard's lock is released, so no writer of the shard waits behind the
+/// frees. The first few are held in place, their places unwritten until used,
+/// so collecting them allocates nothing under the lock and an insert that
+/// evicts one or none pays for no more than that one.
 pub(crate) struct Evicted<V> {
     /// The first [`HELD`] of them, the ones before `len` written.
     held: [core::mem::MaybeUninit<V>; HELD],
@@ -533,10 +409,43 @@ impl<V> Drop for Evicted<V> {
     }
 }
 
-/// Releases an insert's shard lock, then drops what the insert evicted.
-fn release<G, V>(guard: G, evicted: Evicted<V>) {
-    drop(guard);
-    drop(evicted);
+/// One shard: its table, and what its writers publish for readers that only
+/// want a number.
+struct Shard<K, V> {
+    table: Table<K, V, Policy>,
+    /// The shard's resident weight, as of its last writer.
+    resident: AtomicU64,
+    /// The shard's capacity, as of its last writer.
+    capacity: AtomicU64,
+    /// The shard's entries, as of its last writer.
+    len: AtomicUsize,
+    /// Whether the shard has ever had to evict to stay within capacity.
+    filled: AtomicBool,
+}
+
+impl<K, V> Shard<K, V> {
+    fn new(capacity: u64, ghost_capacity: usize) -> Self {
+        Self {
+            table: Table::new(Policy::new(capacity, ghost_capacity)),
+            resident: AtomicU64::new(0),
+            capacity: AtomicU64::new(capacity),
+            len: AtomicUsize::new(0),
+            filled: AtomicBool::new(false),
+        }
+    }
+
+    /// Publishes what `write` left, releases the shard's lock, then drops
+    /// what the writer evicted.
+    fn release(&self, write: Write<'_, K, V, Policy>, evicted: Evicted<V>) {
+        let policy = write.policy();
+        self.resident
+            .store(policy.resident_bytes(), Ordering::Relaxed);
+        self.capacity.store(policy.capacity, Ordering::Relaxed);
+        self.filled.store(policy.filled, Ordering::Relaxed);
+        self.len.store(write.len(), Ordering::Relaxed);
+        drop(write);
+        drop(evicted);
+    }
 }
 
 /// One shard's part of `capacity` spread over `shards`, rounded up so the
@@ -552,29 +461,22 @@ const fn small_target(capacity: u64) -> u64 {
     if target == 0 { 1 } else { target }
 }
 
-/// Applies a weight replacement (`old` → `new`) to a running byte tally without
-/// risking underflow when `new > old`.
-#[inline]
-fn adjust(total: u64, old: u64, new: u64) -> u64 {
-    total - old + new
-}
-
 /// A sharded, byte-weighted S3-FIFO cache. Generic over key, value, [`Weighter`]
 /// and hasher; cloned values are returned from `get` / `peek`.
 pub(crate) struct ShardedCache<K, V, W, S> {
-    shards: Vec<Padded<RwLock<ShardCore<K, V, S>>>>,
+    shards: Vec<Padded<Shard<K, V>>>,
     /// `shards.len() - 1`; `shards.len()` is always a power of two so this masks
     /// a hash to a shard index.
     shard_mask: u64,
     weighter: W,
     hasher: S,
     /// The total capacity, changed live by [`Self::set_capacity`].
-    capacity: portable_atomic::AtomicU64,
+    capacity: AtomicU64,
     /// One shard's capacity: the heaviest entry that can stay resident, read
     /// by callers deciding whether to build one (see
     /// [`Self::max_entry_weight`]). Each shard holds its own copy, set under
     /// its lock, which is what an insert is checked against.
-    per_shard_capacity: portable_atomic::AtomicU64,
+    per_shard_capacity: AtomicU64,
     /// Held by a resize from its first store to its last shard, so the total,
     /// the per-shard capacity and every shard end at the same resize's values
     /// when two race.
@@ -583,10 +485,10 @@ pub(crate) struct ShardedCache<K, V, W, S> {
 
 impl<K, V, W, S> ShardedCache<K, V, W, S>
 where
-    K: Eq + Hash + Clone,
+    K: Eq + Hash,
     V: Clone,
     W: Weighter<K, V>,
-    S: BuildHasher + Clone,
+    S: BuildHasher,
 {
     /// Builds a cache with `capacity` total weight, split across
     /// `shard_count_hint` shards (rounded up to a power of two, clamped to
@@ -606,11 +508,7 @@ where
 
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            shards.push(Padded(RwLock::new(ShardCore::new(
-                per_shard_cap,
-                ghost_capacity,
-                hasher.clone(),
-            ))));
+            shards.push(Padded(Shard::new(per_shard_cap, ghost_capacity)));
         }
 
         Self {
@@ -618,8 +516,8 @@ where
             shard_mask: shard_count as u64 - 1,
             weighter,
             hasher,
-            capacity: portable_atomic::AtomicU64::new(capacity),
-            per_shard_capacity: portable_atomic::AtomicU64::new(per_shard_cap),
+            capacity: AtomicU64::new(capacity),
+            per_shard_capacity: AtomicU64::new(per_shard_cap),
             resizing: spin::Mutex::new(()),
         }
     }
@@ -628,8 +526,7 @@ where
     /// Heavier inserts are refused (see [`Self::insert_with_priority`]);
     /// callers producing large entries can skip building them entirely.
     pub(crate) fn max_entry_weight(&self) -> u64 {
-        self.per_shard_capacity
-            .load(portable_atomic::Ordering::Relaxed)
+        self.per_shard_capacity.load(Ordering::Relaxed)
     }
 
     /// Changes the total capacity of the live cache, split over its shards as
@@ -639,15 +536,16 @@ where
     pub(crate) fn set_capacity(&self, capacity: u64) {
         let per_shard = shard_capacity(capacity, self.shards.len());
         let _resizing = self.resizing.lock();
-        self.capacity
-            .store(capacity, portable_atomic::Ordering::Relaxed);
-        self.per_shard_capacity
-            .store(per_shard, portable_atomic::Ordering::Relaxed);
+        self.capacity.store(capacity, Ordering::Relaxed);
+        self.per_shard_capacity.store(per_shard, Ordering::Relaxed);
         for shard in &self.shards {
             let mut evicted = Evicted::new();
-            let mut core = shard.0.write();
-            core.set_capacity(per_shard, &mut evicted);
-            release(core, evicted);
+            let mut write = shard.0.table.lock();
+            let policy = write.policy_mut();
+            policy.capacity = per_shard;
+            policy.small_target = small_target(per_shard);
+            write.evict_to_capacity(&mut evicted);
+            shard.0.release(write, evicted);
         }
     }
 
@@ -655,7 +553,7 @@ where
     /// the shard's table reuses for its own lookup. Hashing here (instead of
     /// once for the shard and again inside the table) is the per-access win.
     #[inline]
-    fn locate(&self, key: &K) -> (u64, &RwLock<ShardCore<K, V, S>>) {
+    fn locate(&self, key: &K) -> (u64, &Shard<K, V>) {
         let h = self.hasher.hash_one(key);
         // High bits are the best-mixed for most hashers; fold them down to the
         // shard index. `shards.len()` is a power of two, so `& mask` is exact.
@@ -678,19 +576,25 @@ where
     /// Returns the value for `key`, counting the access as a hit (promotes).
     pub(crate) fn get(&self, key: &K) -> Option<V> {
         let (h, shard) = self.locate(key);
-        shard.read().get(h, key)
+        shard
+            .table
+            .pin(h, key, true)
+            .map(|held| held.value().clone())
     }
 
     /// Returns the value for `key` WITHOUT counting it as a hit (no promotion).
     pub(crate) fn peek(&self, key: &K) -> Option<V> {
         let (h, shard) = self.locate(key);
-        shard.read().peek(h, key)
+        shard
+            .table
+            .pin(h, key, false)
+            .map(|held| held.value().clone())
     }
 
     /// Whether `key` is resident, without cloning it out or counting a hit.
     pub(crate) fn contains(&self, key: &K) -> bool {
         let (h, shard) = self.locate(key);
-        shard.read().contains(h, key)
+        shard.table.pin(h, key, false).is_some()
     }
 
     /// Whether a missed `key`, `weight` once built, should be inserted now:
@@ -715,20 +619,24 @@ where
     #[inline]
     fn admit_where(&self, key: &K, weight: u64, filled_only: bool) -> bool {
         let (h, shard) = self.locate(key);
+        if filled_only && !shard.filled.load(Ordering::Relaxed) {
+            return false;
+        }
+        if shard.resident.load(Ordering::Relaxed) + weight <= shard.capacity.load(Ordering::Relaxed)
         {
-            let core = shard.read();
-            if filled_only && !core.filled {
-                return false;
-            }
-            if core.resident_bytes() + weight <= core.capacity || core.in_ghost(h) {
-                return true;
-            }
+            return true;
         }
-        // A hint, taken on the read path: a read never waits for the shard
-        // for it, and a hint lost to a held lock costs the key one more miss.
-        if let Some(mut core) = shard.try_write() {
-            core.push_ghost(h);
+        // The ghost set is a hint, asked on the read path: a read never waits
+        // for the shard's writer for it, and a hint lost to a held lock costs
+        // the key one more miss.
+        let Some(mut write) = shard.table.try_lock() else {
+            return false;
+        };
+        let policy = write.policy_mut();
+        if policy.in_ghost(h) {
+            return true;
         }
+        policy.push_ghost(h);
         false
     }
 
@@ -738,7 +646,7 @@ where
     #[cfg(test)]
     pub(crate) fn has_filled(&self, key: &K) -> bool {
         let (_, shard) = self.locate(key);
-        shard.read().filled
+        shard.filled.load(Ordering::Relaxed)
     }
 
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
@@ -753,16 +661,16 @@ where
     pub(crate) fn insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
         // Refused before the lock, so a cache too small for the entry (or one
-        // of capacity zero) costs its readers no write lock; the shard checks
-        // again under it, for a resize that lands in between.
+        // of capacity zero) costs its writers no lock; the shard checks again
+        // under it, for a resize that lands in between.
         if weight > self.max_entry_weight() {
             return;
         }
         let (h, shard) = self.locate(&key);
         let mut evicted = Evicted::new();
-        let mut core = shard.write();
-        core.insert(h, key, value, weight, priority, &mut evicted);
-        release(core, evicted);
+        let mut write = shard.table.lock();
+        write.insert_entry(h, key, value, weight, priority, &mut evicted);
+        shard.release(write, evicted);
     }
 
     /// Inserts `key` as [`Self::insert_with_priority`] does, only when its
@@ -773,77 +681,115 @@ where
             return;
         }
         let (h, shard) = self.locate(&key);
-        if let Some(mut core) = shard.try_write() {
+        if let Some(mut write) = shard.table.try_lock() {
             let mut evicted = Evicted::new();
-            core.insert(h, key, value, weight, priority, &mut evicted);
-            release(core, evicted);
+            write.insert_entry(h, key, value, weight, priority, &mut evicted);
+            shard.release(write, evicted);
         }
     }
 
     /// Inserts the value `merge` derives from what `key` holds now, read and
-    /// replaced under one write lock, so a concurrent writer of the key cannot
-    /// slip between the two. `merge` returning `None` leaves the entry as it
-    /// is; a derived value heavier than a shard is refused, as by
-    /// [`Self::insert_with_priority`].
+    /// replaced under one hold of the shard's lock, so a concurrent writer of
+    /// the key cannot slip between the two. `merge` returning `None` leaves
+    /// the entry as it is; a derived value heavier than a shard is refused,
+    /// as by [`Self::insert_with_priority`].
     #[cfg(feature = "zstd")]
     pub(crate) fn insert_merged(&self, key: K, merge: impl FnOnce(Option<&V>) -> Option<V>) {
         let (h, shard) = self.locate(&key);
-        let mut core = shard.write();
-        let Some(value) = merge(core.find(h, &key)) else {
+        let mut write = shard.table.lock();
+        let held = write.find(h, &key).map(|link| write.value(link));
+        let Some(value) = merge(held) else {
             return;
         };
         let weight = self.weighter.weight(&key, &value);
         let mut evicted = Evicted::new();
-        core.insert(h, key, value, weight, Priority::Normal, &mut evicted);
-        release(core, evicted);
+        write.insert_entry(h, key, value, weight, Priority::Normal, &mut evicted);
+        shard.release(write, evicted);
     }
 
     /// Removes `key` if present.
     pub(crate) fn remove(&self, key: &K) {
         let (h, shard) = self.locate(key);
-        shard.write().remove(h, key);
+        let mut evicted = Evicted::new();
+        let mut write = shard.table.lock();
+        if let Some(link) = write.find(h, key) {
+            write.remove_entry(link, &mut evicted);
+        }
+        shard.release(write, evicted);
     }
 
-    /// Total resident weight across all shards. Sums each shard's tally under a
-    /// shared (read) lock — not the hot path (metrics / tests), and avoids a
-    /// 64-bit atomic (unavailable on 32-bit no-std targets like
-    /// `thumbv7em-none-eabihf`).
+    /// Total resident weight across all shards, as of each shard's last
+    /// writer.
     pub(crate) fn weight(&self) -> u64 {
         self.shards
             .iter()
-            .map(|s| s.0.read().resident_bytes())
+            .map(|shard| shard.0.resident.load(Ordering::Relaxed))
             .sum()
     }
 
     /// Total cache capacity: the value passed to [`Self::with_weighter`], or
     /// to the latest [`Self::set_capacity`].
     pub(crate) fn capacity(&self) -> u64 {
-        self.capacity.load(portable_atomic::Ordering::Relaxed)
+        self.capacity.load(Ordering::Relaxed)
     }
 
     /// Removes every entry whose key `doomed` picks. Walks every shard under
-    /// its write lock: for a sweep, not the hot path.
+    /// its lock: for a sweep, not the hot path.
     #[cfg(feature = "std")]
     pub(crate) fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) {
         for shard in &self.shards {
-            let mut core = shard.0.write();
-            let keys: alloc::vec::Vec<K> = core
-                .map
-                .iter()
-                .map(|(key, _)| key)
-                .filter(|key| doomed(key))
-                .cloned()
+            let mut evicted = Evicted::new();
+            let mut write = shard.0.table.lock();
+            let links: Vec<u32> = write
+                .links()
+                .filter(|&link| doomed(write.key(link)))
                 .collect();
-            for key in keys {
-                core.remove(self.hasher.hash_one(&key), &key);
+            for link in links {
+                write.remove_entry(link, &mut evicted);
             }
+            shard.0.release(write, evicted);
         }
     }
 
-    /// Number of resident entries across all shards (takes each shard's read
-    /// lock; intended for diagnostics, not the hot path).
+    /// Number of resident entries across all shards, as of each shard's last
+    /// writer.
     pub(crate) fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.0.read().len()).sum()
+        self.shards
+            .iter()
+            .map(|shard| shard.0.len.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// One shard's capacity and resident weight, read under its lock.
+    #[cfg(test)]
+    fn shard_state(&self, shard: usize) -> Option<(u64, u64)> {
+        let write = self.shards.get(shard)?.0.table.lock();
+        let state = (write.policy().capacity, write.policy().resident_bytes());
+        drop(write);
+        Some(state)
+    }
+
+    /// One shard's running tallies of the small and main queues, then the
+    /// same two summed over the entries it holds.
+    #[cfg(test)]
+    fn queue_tallies(&self, shard: usize) -> Option<[u64; 4]> {
+        let write = self.shards.get(shard)?.0.table.lock();
+        let (mut small, mut main) = (0, 0);
+        for link in write.links() {
+            if write.in_main(link) {
+                main += write.weight(link);
+            } else {
+                small += write.weight(link);
+            }
+        }
+        let tallies = [
+            write.policy().small_bytes,
+            write.policy().main_bytes,
+            small,
+            main,
+        ];
+        drop(write);
+        Some(tallies)
     }
 }
 
