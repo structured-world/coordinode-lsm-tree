@@ -537,6 +537,7 @@ impl<K, V, P> Write<'_, K, V, P> {
         }
     }
 
+    #[cfg(feature = "zstd")]
     pub(super) fn value(&self, link: u32) -> &V {
         // SAFETY: as for the key.
         #[expect(unsafe_code, reason = "see safety")]
@@ -546,6 +547,7 @@ impl<K, V, P> Write<'_, K, V, P> {
     }
 
     /// The numbers of the visible slots.
+    #[cfg(any(feature = "std", test))]
     pub(super) fn links(&self) -> impl Iterator<Item = u32> + '_ {
         (0..self.locked.allocated).filter(|&link| self.meta(link) & STATE == VISIBLE)
     }
