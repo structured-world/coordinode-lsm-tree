@@ -290,12 +290,41 @@ fn large_entries_evict_the_unread_among_them() {
     assert!(c.get(&1).is_some(), "read once since it went in");
 
     // Seven eighths of the cache hold two of them: the third takes the
-    // unread one's place.
+    // unread one's place, once that one has been in for a few inserts that
+    // needed room.
     c.insert(3, vec![3u8; 300]);
+    assert_eq!(c.get(&3), None, "the unread one has only just gone in");
+    for _ in 0..4 {
+        c.insert(3, vec![3u8; 300]);
+    }
     assert_eq!(c.get(&1), Some(vec![1u8; 300]), "the read one stays");
     assert_eq!(c.get(&2), None, "the unread one went");
     assert_eq!(c.get(&3), Some(vec![3u8; 300]));
     assert_eq!(c.weight(), 600);
+}
+
+/// Keys read in a round a little larger than the cache holds are found on
+/// most reads: the entries held stay for many rounds. Evicting the oldest for
+/// each miss would evict, every time, the key the round reads next, and no
+/// read would find its entry, while paying an insert and an eviction each.
+#[test]
+fn a_round_of_large_keys_larger_than_the_cache_is_mostly_found() {
+    // 8 MiB over 8 shards; entries of 600 KiB are large and eleven fit the
+    // 7 MiB they may weigh. The round has thirteen keys.
+    let c = byte_cache(8 << 20);
+    let mut found = 0;
+    for round in 0..40 {
+        for key in 0..13u64 {
+            if c.get(&key).is_some() {
+                found += usize::from(round >= 20);
+            } else {
+                c.insert(key, vec![0u8; 600 << 10]);
+            }
+        }
+    }
+    // Eleven of thirteen held: at least nine of each round's reads found,
+    // over the last twenty rounds.
+    assert!(found >= 20 * 9, "{found} of 260 reads found their entry");
 }
 
 /// Entries heavier than half a shard do not depend on which shard their keys
@@ -303,13 +332,29 @@ fn large_entries_evict_the_unread_among_them() {
 /// that share one would evict each other in a cache with room for both.
 #[test]
 fn entries_heavier_than_half_a_shard_all_stay_while_the_cache_has_room() {
-    // 8,000 bytes over 8 shards = 1,000 a shard; ten entries of 600.
-    let c = byte_cache(8_000);
+    // 8 MiB over 8 shards = 1 MiB a shard; ten entries of 600 KiB.
+    let c = byte_cache(8 << 20);
     for key in 0..10u64 {
-        c.insert(key, vec![0u8; 600]);
+        c.insert(key, vec![0u8; 600 << 10]);
     }
-    assert!((0..10u64).all(|key| c.contains(&key)), "6,000 of 7,000");
-    assert_eq!(c.weight(), 6_000);
+    assert!((0..10u64).all(|key| c.contains(&key)), "6 of 7 MiB");
+    assert_eq!(c.weight(), 10 * (600 << 10));
+}
+
+/// A block of half a shard in a cache too small for more stays in its
+/// shard's own queues, which keep index and filter blocks over data blocks:
+/// only entries of a blob frame's size and up go the large entries' way.
+#[test]
+fn an_ordinary_block_of_half_a_shard_is_not_a_large_entry() {
+    // 64 KiB over 8 shards = 8 KiB a shard; blocks of 5 KiB.
+    let c = byte_cache(64 << 10);
+    for key in 0..64u64 {
+        c.insert(key, vec![0u8; 5 << 10]);
+    }
+    // One to a shard: eight at most, where the large entries' 56 KiB would
+    // hold eleven.
+    assert!(c.len() <= 8, "{} blocks kept", c.len());
+    assert!(c.weight() <= 64 << 10);
 }
 
 /// A key's entry replaced across the line between the two kinds keeps the
