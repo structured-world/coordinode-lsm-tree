@@ -49,9 +49,14 @@ mod cost {
     /// A read answered by a cached row.
     pub(super) const ROW_HIT: u64 = 450;
     /// A row looked for and not found, before the read goes on to its block.
-    pub(super) const ROW_PROBE: u64 = 40;
-    /// A row copied out of its block and inserted.
-    pub(super) const ROW_FILL: u64 = 200;
+    pub(super) const ROW_PROBE: u64 = 60;
+    /// A row refused on its first miss into a full cache: its key written
+    /// to the ghost queue, an older one dropped from it. Measured as most of
+    /// the 470 ns a read of 70,000 keys through a 16 MiB cache pays for a
+    /// row cache that takes almost no row.
+    pub(super) const ROW_REFUSAL: u64 = 350;
+    /// A row admitted, copied out of its block and inserted.
+    pub(super) const ROW_FILL: u64 = 400;
     /// A read answered from a cached block.
     pub(super) const BLOCK_HIT: u64 = 1_400;
     /// A read that loaded its block from the file.
@@ -80,6 +85,7 @@ type Shadow = ShardedCache<ShadowKey, u32, Held, rustc_hash::FxBuildHasher>;
 struct Events {
     row_hits: u64,
     row_probes: u64,
+    row_refusals: u64,
     row_fills: u64,
     block_hits: u64,
     block_misses: u64,
@@ -89,6 +95,7 @@ impl Events {
     const fn cost(self) -> u64 {
         self.row_hits * cost::ROW_HIT
             + self.row_probes * cost::ROW_PROBE
+            + self.row_refusals * cost::ROW_REFUSAL
             + self.row_fills * cost::ROW_FILL
             + self.block_hits * cost::BLOCK_HIT
             + self.block_misses * cost::BLOCK_MISS
@@ -229,9 +236,14 @@ impl RowGate {
                 events.block_misses += 1;
                 shadow.insert(block, block_weight);
             }
-            if inside && shadow.admit(&row, u64::from(row_weight)) {
+            if !inside {
+                continue;
+            }
+            if shadow.admit(&row, u64::from(row_weight)) {
                 shadow.insert_with_priority(row, row_weight, Priority::Probation);
                 events.row_fills += 1;
+            } else {
+                events.row_refusals += 1;
             }
         }
 
