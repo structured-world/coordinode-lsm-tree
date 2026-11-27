@@ -40,7 +40,7 @@ fn rounds_over_more_keys_than_the_cache_holds_turn_rows_off() {
     for n in 0..60 * u64::from(WINDOW) * SAMPLE {
         let key = n % keys;
         let key_hash = hash(key);
-        if !RowGate::samples(key_hash) {
+        if !gate.samples(key_hash) {
             continue;
         }
         // Keys are stored in another order than they are read in.
@@ -59,6 +59,30 @@ fn rounds_over_more_keys_than_the_cache_holds_turn_rows_off() {
         closed_after.is_some_and(|reads| reads <= 6 * keys),
         "closed after {closed_after:?} reads",
     );
+}
+
+/// The shadows stay within a two-hundredth of the cache however small the
+/// rows: a tree of rows a tenth of the floor samples more sparsely and
+/// weighs its entries at no less than the floor allows.
+#[test]
+fn the_shadows_stay_within_a_two_hundredth_of_the_cache() {
+    for row in [24, 100, 300, 4_000] {
+        let gate = gate();
+        for n in 0..200_000 {
+            let key = hash(n) % 5_000_000;
+            let block = BlockSeen {
+                offset: key / 64 * 4_096,
+                weight: 4_096,
+            };
+            gate.observe(CACHE, 1, hash(key), row, block, 0);
+        }
+        assert!(
+            gate.memory() <= CACHE / 200,
+            "rows of {row}: {} bytes",
+            gate.memory(),
+        );
+        assert!(gate.memory() > 0);
+    }
 }
 
 /// Where a cold load is slow, a block kept out of the cache by rows costs

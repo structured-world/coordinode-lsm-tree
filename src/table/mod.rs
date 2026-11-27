@@ -1349,11 +1349,7 @@ impl Table {
         let gate: &crate::row_gate::RowGate = self.0.row_gate.get_or_init(|| {
             alloc::boxed::Box::new(self.cache.row_gate(self.global_id().tree_id()))
         });
-        (
-            gate.admits(key_hash),
-            crate::row_gate::RowGate::samples(key_hash),
-            Some(gate),
-        )
+        (gate.admits(key_hash), gate.samples(key_hash), Some(gate))
     }
 
     /// Plays a sampled point read, which found a row of `key_len` and

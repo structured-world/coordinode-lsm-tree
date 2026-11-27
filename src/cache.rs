@@ -1358,6 +1358,14 @@ impl Cache {
         self.row_gate(tree).eighths()
     }
 
+    /// Bytes the simulation of tree `tree`'s row gate holds now: at most a
+    /// two-hundredth of the cache's capacity, beside the bytes it caches.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn row_gate_bytes(&self, tree: crate::TreeId) -> u64 {
+        self.row_gate(tree).memory()
+    }
+
     /// Sets tree `tree`'s row share, in eighths, until its reads move it.
     #[doc(hidden)]
     pub fn set_row_share(&self, tree: crate::TreeId, eighths: u8) {

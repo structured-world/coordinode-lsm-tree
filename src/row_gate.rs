@@ -30,8 +30,20 @@ use core::sync::atomic::{AtomicU8, Ordering};
 /// The candidate fractions, in eighths of the keys.
 const CANDIDATES: [u8; 5] = [0, 1, 2, 4, 8];
 
-/// One read in this many is sampled, by key hash.
+/// One read in this many is sampled, by key hash; in more where rows are
+/// small (see [`ENTRY_FLOOR`]).
 const SAMPLE: u64 = 256;
+
+/// Bytes a shadow holds per entry: its slot in the table (48), its place in
+/// a queue (8) and its share of the buckets (8).
+const ENTRY_BYTES: u64 = 64;
+
+/// The least an entry weighs in a shadow that samples one read in
+/// [`SAMPLE`]: what keeps the five shadows' entries, [`ENTRY_BYTES`] each,
+/// within a two-hundredth of the cache's capacity. A tree of smaller rows
+/// samples one read in twice as many, up to sixteen times, for each halving
+/// of the row below it, and an entry lighter still is weighed at the floor.
+const ENTRY_FLOOR: u64 = CANDIDATES.len() as u64 * ENTRY_BYTES * 200 / SAMPLE;
 
 /// Sampled reads a window holds before its candidates are priced: 131,072 of
 /// the tree's reads. A tree decides at its third window at the earliest.
@@ -68,10 +80,22 @@ mod cost {
     pub(super) const BLOCK_MISS: u64 = 4_000;
 }
 
-/// A shadow's entry: a row or a block of one table.
-type ShadowKey = (u8, u64, u64);
-const ROW: u8 = 0;
-const BLOCK: u8 = 1;
+/// A shadow's entry, a row or a block of one table, as one word mixed from
+/// its kind, its table and its key hash or block offset: a third of the
+/// bytes a tuple of the three would take in every slot. Two entries of a few
+/// hundred sharing a word would be played as one, which a window's count of
+/// events does not notice.
+type ShadowKey = u64;
+const ROW: u64 = 0x9E37_79B9_7F4A_7C15;
+const BLOCK: u64 = 0xC2B2_AE3D_27D4_EB4F;
+
+/// The word of the entry of `kind` in `table` at `place`.
+const fn shadow_key(kind: u64, table: u64, place: u64) -> ShadowKey {
+    (table.wrapping_mul(kind) ^ place)
+        .wrapping_mul(kind)
+        .rotate_left(29)
+        ^ kind
+}
 
 /// Weighs a shadow's entry by the weight it holds in place of a value.
 #[derive(Clone, Copy)]
@@ -139,6 +163,9 @@ pub(crate) struct BlockSeen {
 pub(crate) struct RowGate {
     /// Eighths of the keys inside the row cache.
     eighths: AtomicU8,
+    /// How many times [`SAMPLE`] is doubled for this tree's rows: set when
+    /// its shadows are built, from the first row sampled.
+    sparser: AtomicU8,
     /// Taken by a sampled read that finds it free, and by none other.
     sim: spin::Mutex<Sim>,
 }
@@ -164,6 +191,7 @@ impl RowGate {
     pub(crate) fn new() -> Self {
         Self {
             eighths: AtomicU8::new(8),
+            sparser: AtomicU8::new(0),
             sim: spin::Mutex::new(Sim {
                 shadows: None,
                 capacity: 0,
@@ -192,8 +220,20 @@ impl RowGate {
     /// plays. Such a read goes to its block whatever the row cache holds, so
     /// the block it came from is known.
     #[inline]
-    pub(crate) const fn samples(key_hash: u64) -> bool {
-        (key_hash >> 40).is_multiple_of(SAMPLE)
+    pub(crate) fn samples(&self, key_hash: u64) -> bool {
+        let rate = SAMPLE << self.sparser.load(Ordering::Relaxed);
+        (key_hash >> 40) & (rate - 1) == 0
+    }
+
+    /// Bytes the shadows hold now.
+    pub(crate) fn memory(&self) -> u64 {
+        let sim = self.sim.lock();
+        sim.shadows.as_ref().map_or(0, |shadows| {
+            shadows
+                .iter()
+                .map(|shadow| shadow.len() as u64 * ENTRY_BYTES)
+                .sum()
+        })
     }
 
     /// Plays one sampled read against every candidate's shadow, and at the
@@ -214,7 +254,18 @@ impl RowGate {
             return;
         };
         sim.load_nanos = load_nanos;
-        let capacity = capacity / SAMPLE;
+        if sim.shadows.is_none() {
+            // Rows too small for the shadows' share of memory at one read in
+            // `SAMPLE` are sampled more sparsely, by as much as they fall
+            // short. The reads sampled before this one counted at the old
+            // rate into shadows that did not exist yet.
+            let short = ENTRY_FLOOR.div_ceil(row_weight.max(1)).next_power_of_two();
+            let sparser = u8::try_from(short.trailing_zeros().min(4)).unwrap_or(4);
+            self.sparser.store(sparser, Ordering::Relaxed);
+        }
+        let sparser = u32::from(self.sparser.load(Ordering::Relaxed));
+        let rate = SAMPLE << sparser;
+        let capacity = capacity / rate;
         if sim.shadows.is_none() || sim.capacity != capacity {
             sim.capacity = capacity;
             sim.shadows = Some(core::array::from_fn(|_| {
@@ -223,14 +274,16 @@ impl RowGate {
         }
 
         // In the sampled universe a block holds only its sampled keys: about
-        // one in `SAMPLE` of what it holds, or one key's share of it where it
+        // one in `rate` of what it holds, or one key's share of it where it
         // holds fewer keys than that. Weighing it so keeps the sampled blocks
-        // the same share of the shadow that all blocks are of the cache.
-        let keys = (block.weight / row_weight.max(1)).clamp(1, SAMPLE);
-        let block_weight = u32::try_from((block.weight / keys).max(1)).unwrap_or(u32::MAX);
-        let row_weight = u32::try_from(row_weight.max(1)).unwrap_or(u32::MAX);
-        let row: ShadowKey = (ROW, table, key_hash);
-        let block: ShadowKey = (BLOCK, table, block.offset);
+        // the same share of the shadow that all blocks are of the cache. No
+        // entry weighs less than the floor that bounds the shadows' memory.
+        let floor = ENTRY_FLOOR >> sparser;
+        let keys = (block.weight / row_weight.max(1)).clamp(1, rate);
+        let block_weight = u32::try_from((block.weight / keys).max(floor)).unwrap_or(u32::MAX);
+        let row_weight = u32::try_from(row_weight.max(floor)).unwrap_or(u32::MAX);
+        let row = shadow_key(ROW, table, key_hash);
+        let block = shadow_key(BLOCK, table, block.offset);
 
         let Sim {
             shadows, events, ..
