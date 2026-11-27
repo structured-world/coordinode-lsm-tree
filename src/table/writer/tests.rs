@@ -329,8 +329,9 @@ fn table_writer_count() -> crate::Result<()> {
         0,
         ValueType::Value,
     ))?;
+    // An entry counts its key, its value and its head.
     assert_eq!(1, writer.meta.key_count);
-    assert_eq!(2, writer.chunk_size);
+    assert_eq!(2 + ENTRY_HEAD, writer.chunk_size);
 
     writer.write(InternalValue::from_components(
         b"b",
@@ -339,7 +340,7 @@ fn table_writer_count() -> crate::Result<()> {
         ValueType::Value,
     ))?;
     assert_eq!(2, writer.meta.key_count);
-    assert_eq!(4, writer.chunk_size);
+    assert_eq!(2 * (2 + ENTRY_HEAD), writer.chunk_size);
 
     writer.write(InternalValue::from_components(
         b"c",
@@ -348,11 +349,60 @@ fn table_writer_count() -> crate::Result<()> {
         ValueType::Value,
     ))?;
     assert_eq!(3, writer.meta.key_count);
-    assert_eq!(6, writer.chunk_size);
+    assert_eq!(3 * (2 + ENTRY_HEAD), writer.chunk_size);
 
     writer.spill_block()?;
     assert_eq!(0, writer.chunk_size);
 
+    Ok(())
+}
+
+/// A row block closes before the entry that would take it past its size: 16
+/// byte keys with 256 byte values count 280 bytes each, so a 4 KiB block
+/// holds 14 of them. Closing after the entry that reached the size put 16 in
+/// a block of 4.4 KiB, and a point read decoded a tenth more than the size
+/// asked for on every miss.
+#[test]
+fn a_row_block_closes_before_the_entry_that_would_pass_its_size() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_compression(crate::CompressionType::None);
+    for i in 0..1_000u64 {
+        let mut key = [0u8; 16];
+        key[8..].copy_from_slice(&i.to_be_bytes());
+        writer.write(InternalValue::from_components(
+            key.to_vec(),
+            vec![7u8; 256],
+            0,
+            ValueType::Value,
+        ))?;
+        assert!(
+            writer.chunk_size <= 4_096,
+            "{} bytes counted in a 4 KiB block",
+            writer.chunk_size,
+        );
+    }
+    assert_eq!(writer.meta.data_block_count, 1_000 / 14);
+    Ok(())
+}
+
+/// A block that is not yet nearly full takes an entry that passes its size,
+/// and closes after it: entries of over half a block go two to a block, where
+/// closing before each would leave every block half empty.
+#[test]
+fn a_block_under_nine_tenths_takes_the_entry_that_passes_its_size() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_compression(crate::CompressionType::None);
+    for i in 0..100u64 {
+        writer.write(InternalValue::from_components(
+            i.to_be_bytes().to_vec(),
+            vec![7u8; 2_500],
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    assert_eq!(writer.meta.data_block_count, 50);
     Ok(())
 }
 
@@ -1528,7 +1578,9 @@ fn blocks_in_flight_are_counted_by_their_frames() -> crate::Result<()> {
 #[test]
 fn blocks_in_flight_count_toward_the_held_state() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
+    // A block size past ten entries, so a block closes where the test spills.
     let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(1 << 20)
         .use_data_block_compression(crate::CompressionType::None)
         .use_parallel_compression(four_workers()?);
     for block in 0..3u32 {
@@ -1561,7 +1613,10 @@ fn blocks_in_flight_count_their_compression_and_encryption_buffers() -> crate::R
     let held = |name: &str, encrypted: bool| -> crate::Result<u64> {
         let encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>> =
             encrypted.then(|| Arc::new(crate::encryption::Aes256GcmProvider::new(&[7; 32])) as _);
+        // A block size past ten entries, so a block closes where the test
+        // spills.
         let mut writer = Writer::new(dir.path().join(name), 1, 0, Arc::new(StdFs))?
+            .use_data_block_size(1 << 20)
             .use_data_block_compression(crate::CompressionType::Lz4)
             .use_encryption(encryption)
             .use_parallel_compression(four_workers()?);

@@ -632,9 +632,13 @@ impl Writer {
     ) -> (u64, u64) {
         let entries = load.entries;
         let entry_bytes = load.key_bytes + load.value_bytes;
-        // A block closes once its keys and values reach the block size, after
-        // one entry at the least, and each table's last one may be short.
-        let blocks = (entry_bytes / u64::from(self.data_block_size.max(1))).min(entries) + tables;
+        // A block closes once what its entries count has reached the block
+        // size, or before an entry that would pass it once it is nearly full:
+        // past nine tenths of the size either way, after one entry at the
+        // least, and each table's last one may be short.
+        let counted = entry_bytes + entries * super::ENTRY_HEAD as u64;
+        let full = (super::nearly_full(self.data_block_size) as u64).max(1);
+        let blocks = (counted / full).min(entries) + tables;
         let restarts = entries / u64::from(self.data_block_restart_interval.max(1)) + blocks;
         let hash = if self.hash_indexed {
             // A block's buckets: its entries at the ratio, rounded up, at

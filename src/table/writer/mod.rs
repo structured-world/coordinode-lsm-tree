@@ -110,6 +110,19 @@ const REFRESH_KEY_FRACTION: u64 = 64;
 /// refreshes the estimates sooner than the key count does.
 const REFRESH_HASH_STEP_KEYS: u64 = 8;
 
+/// Bytes an entry counts toward its row block beside its key and value: its
+/// value type, its seqno or seqno delta, the lengths of its key and value,
+/// and its share of the restart array. The block size is a size of the
+/// encoded block before compression, as the entries alone never were.
+pub(crate) const ENTRY_HEAD: usize = 8;
+
+/// The counted bytes past which a row block of `size` bytes is nearly full:
+/// nine tenths of it. Such a block closes before an entry that would take it
+/// past its size; one emptier than that takes the entry.
+pub(crate) const fn nearly_full(size: u32) -> usize {
+    size as usize / 10 * 9
+}
+
 /// Bytes a `linked_blob_files` record takes before its two keys: the blob
 /// file's id, entry count, bytes, on-disk bytes and block entry bytes.
 pub(crate) const LINKED_BLOB_FILE_FIXED_LEN: usize = 5 * core::mem::size_of::<u64>();
@@ -3143,6 +3156,22 @@ impl Writer {
         let user_key_len = user_key.len();
         let value_len = item.value.len();
 
+        // A row block that is nearly full closes before the entry that would
+        // take it past its size, so a block holds its size at the most where
+        // entries are small beside it: a point read decodes a whole block, and
+        // closing after the entry made every block a twelfth larger than the
+        // size asked for at 16 entries a block. A block not yet nearly full
+        // takes the entry and closes past its size, or an entry of half a
+        // block would leave every block half empty. Before anything below
+        // reads the forming block's place.
+        if !self.use_columnar
+            && self.chunk_size + self.entry_size(user_key_len, value_len)
+                > self.data_block_size as usize
+            && self.chunk_size > nearly_full(self.data_block_size)
+        {
+            self.spill_block()?;
+        }
+
         // Per-entry shape accounting (pairs with item_count: counts every
         // version). usize -> u64 is a widening cast on every supported target.
         self.meta.sum_user_key_bytes += user_key_len as u64;
@@ -3279,7 +3308,7 @@ impl Writer {
         if self.use_columnar {
             return crate::table::columnar::entry_row_bytes(key_len, value_len);
         }
-        key_len + value_len
+        key_len + value_len + ENTRY_HEAD
     }
 
     /// Writes a compressed block to disk.
