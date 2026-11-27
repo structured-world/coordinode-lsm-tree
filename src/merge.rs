@@ -367,9 +367,13 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
         // entry of the run costs one game. Once is not: inputs that take
         // turns by chance repeat that often, and the walk would be wasted. A
         // run that just ended left the runner-up the winner.
+        //
+        // Two inputs never chase: their replay is one game already, against
+        // the same slot a chase would play, and the game a chase loses would
+        // only be played again by the replay after it.
         self.run = if self.tree[0] as usize != slot {
             Run::None
-        } else if before == Run::None {
+        } else if before == Run::None || self.tree.len() == 2 {
             Run::Repeated
         } else {
             self.runner_up = self.path_best(slot);
