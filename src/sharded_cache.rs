@@ -712,8 +712,12 @@ where
     }
 
     /// Inserts or replaces `key` as a large entry, evicting older large
-    /// entries for its room and then every shard down to the share it now
-    /// lends. Refused when the large entries read since cannot make room.
+    /// entries for its room, then the shards that hold more than the share
+    /// they now lend leaves them. Refused when the large entries read since
+    /// cannot make room, and when another large insert is under way: a miss
+    /// never waits to be cached, and where nearly every block is a large one
+    /// (a cache far too small for its blocks) the misses of many threads
+    /// would otherwise all queue here.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "`release` takes the shard's lock and drops it, which the lint does not follow"
@@ -725,7 +729,9 @@ where
             return;
         };
         {
-            let mut large = self.large.lock();
+            let Some(mut large) = self.large.try_lock() else {
+                return;
+            };
             self.trim_large(&mut large, weight);
             let limit = self.capacity.load(Ordering::Relaxed) / 2;
             if self.large_resident.load(Ordering::Relaxed) + weight > limit {
@@ -740,11 +746,24 @@ where
             self.release(&shard.0, write, evicted);
             large.queue.push_back((at, node));
         }
+        // Only a shard holding more than its capacity less the share it now
+        // lends has anything to give up, and one whose lock is taken gives it
+        // up at that writer's next turn: no shard is waited for.
+        let lent = self
+            .large_resident
+            .load(Ordering::Relaxed)
+            .div_ceil(self.shards.len() as u64);
+        let limit = self.shard_capacity().saturating_sub(lent);
         for shard in &self.shards {
-            let mut evicted = Evicted::new();
-            let mut write = self.lock(&shard.0);
-            write.evict_to_capacity(&mut evicted);
-            self.release(&shard.0, write, evicted);
+            if shard.0.resident.load(Ordering::Relaxed) <= limit {
+                continue;
+            }
+            if let Some(mut write) = shard.0.table.try_lock() {
+                let mut evicted = Evicted::new();
+                write.policy_mut().lent = lent;
+                write.evict_to_capacity(&mut evicted);
+                self.release(&shard.0, write, evicted);
+            }
         }
     }
 
