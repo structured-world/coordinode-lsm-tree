@@ -6,6 +6,7 @@ use crate::InternalValue;
 use crate::comparator::SharedComparator;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
+use core::cell::Cell;
 use core::cmp::Ordering;
 
 type IterItem = crate::Result<InternalValue>;
@@ -39,23 +40,23 @@ enum Phase {
     Failing,
     /// The tournament is built and no error waits.
     Ready,
-    /// A step unwound part way: the tournament and the inputs no longer
-    /// agree, and every further call is refused.
+    /// A panic passed through the merger while its tournament was part way
+    /// through a change: the tournament and the inputs no longer agree, and
+    /// every further call is refused.
     Unwound,
 }
 
-/// Leaves a merger refusing unless the step it covers ends.
+/// Marks a merger [`Phase::Unwound`] unless the call it covers returns.
 ///
-/// An input or a comparator may panic, and a caller may catch the panic and
-/// ask the merger again. A step that unwound has taken an entry out of its
-/// slot or rewritten part of the tournament, so what the merger would yield
-/// next is no longer the merge of its inputs. Armed over such a step, this
-/// marks the merger [`Phase::Unwound`] as the panic passes; a step that ends
-/// disarms it, at no cost.
-struct Unwinding<'a>(&'a mut Phase);
+/// Held over a call of the user's comparator, the one thing that can panic
+/// while the tournament is part way through a change: a caller that catches
+/// the panic and asks the merger again would otherwise get entries out of
+/// order, or a clean end with entries still waiting. A call that returns
+/// forgets the guard, so nothing is stored for it.
+struct Unwinding<'a>(&'a Cell<Phase>);
 
 impl Unwinding<'_> {
-    /// The step ended: the merger stays as it is.
+    /// The call returned: the merger stays as it is.
     #[inline]
     fn disarm(self) {
         core::mem::forget(self);
@@ -64,11 +65,11 @@ impl Unwinding<'_> {
 
 impl Drop for Unwinding<'_> {
     fn drop(&mut self) {
-        *self.0 = Phase::Unwound;
+        self.0.set(Phase::Unwound);
     }
 }
 
-/// The error of a call to a merger a panic left part way through a step.
+/// The error of a call to a merger a panic left part way through a change.
 fn unwound() -> crate::Error {
     crate::Error::Io(crate::io::Error::new(
         crate::io::ErrorKind::Other,
@@ -87,6 +88,13 @@ pub struct MergeWork {
     /// Games a replayed entry lost, each rewriting one node of the
     /// tournament.
     pub moves: u64,
+}
+
+/// Adds one to a counter of the `diagnostics` build.
+#[cfg(feature = "diagnostics")]
+#[inline]
+fn count(counter: &Cell<u64>) {
+    counter.set(counter.get() + 1);
 }
 
 /// Merges multiple KV iterators into a single sorted stream, front to back.
@@ -109,20 +117,12 @@ pub struct MergeWork {
 /// wins" semantics (e.g. compaction) must pass sources in
 /// newest-first order.
 ///
-/// An input or the comparator that panics leaves the merger refusing: a
-/// caller that catches the panic and asks again gets an error, never entries
-/// with one of them missing.
+/// A panic of an input on its first entry, or of the comparator, leaves the
+/// merger refusing: a caller that catches it and asks again gets an error,
+/// never entries with one missing. A panic of an input on a later entry
+/// changes nothing, since its entry is taken only once the input returned.
 pub struct Merger<I> {
     iterators: Vec<I>,
-    game: Tournament,
-    /// Errors the inputs' first entries gave, the last input's first: yielded
-    /// from the back, before any entry.
-    failed: Vec<crate::Error>,
-    phase: Phase,
-}
-
-/// The inputs' current entries and the games between them.
-struct Tournament {
     /// Each input's current entry; `None` once it ran out, and in the slots
     /// that pad the inputs to a power of two.
     entries: Vec<Option<InternalValue>>,
@@ -139,6 +139,11 @@ struct Tournament {
     /// is replayed for it.
     runner_up: u32,
     run: Run,
+    /// Errors the inputs' first entries gave, the last input's first: yielded
+    /// from the back, before any entry.
+    failed: Vec<crate::Error>,
+    /// In a cell so a game, which only reads the merger, can mark it unwound.
+    phase: Cell<Phase>,
     comparator: SharedComparator,
     /// The comparator orders keys as their bytes do, so keys are compared
     /// directly rather than through it. See
@@ -148,11 +153,11 @@ struct Tournament {
     /// to look at.
     common_prefix: usize,
     #[cfg(feature = "diagnostics")]
-    word_compares: core::cell::Cell<u64>,
+    word_compares: Cell<u64>,
     #[cfg(feature = "diagnostics")]
-    key_compares: core::cell::Cell<u64>,
+    key_compares: Cell<u64>,
     #[cfg(feature = "diagnostics")]
-    moves: core::cell::Cell<u64>,
+    moves: Cell<u64>,
 }
 
 /// The eight bytes of `key` past `offset`, as a big-endian integer padded with
@@ -175,14 +180,56 @@ fn key_word(key: &[u8], offset: usize, lexicographic: bool) -> u64 {
     u64::from_be_bytes(padded)
 }
 
-/// Adds one to a counter of the `diagnostics` build.
-#[cfg(feature = "diagnostics")]
-#[inline]
-fn count(counter: &core::cell::Cell<u64>) {
-    counter.set(counter.get() + 1);
-}
+impl<I: Iterator<Item = IterItem>> Merger<I> {
+    #[must_use]
+    pub fn new(iterators: Vec<I>, comparator: SharedComparator) -> Self {
+        let lexicographic = comparator.is_lexicographic();
+        Self {
+            iterators,
+            entries: Vec::new(),
+            ranks: Vec::new(),
+            tree: Vec::new(),
+            live: 0,
+            runner_up: 0,
+            run: Run::None,
+            failed: Vec::new(),
+            phase: Cell::new(Phase::Unbuilt),
+            comparator,
+            lexicographic,
+            common_prefix: 0,
+            #[cfg(feature = "diagnostics")]
+            word_compares: Cell::new(0),
+            #[cfg(feature = "diagnostics")]
+            key_compares: Cell::new(0),
+            #[cfg(feature = "diagnostics")]
+            moves: Cell::new(0),
+        }
+    }
 
-impl Tournament {
+    /// Declares that every key the sources hold starts with the same `len`
+    /// bytes, under a comparator that orders keys by their bytes, or is
+    /// ignored under any other.
+    #[must_use]
+    pub fn with_common_prefix(mut self, len: usize) -> Self {
+        debug_assert!(
+            self.phase.get() == Phase::Unbuilt,
+            "set before the first entry is taken"
+        );
+        self.common_prefix = len;
+        self
+    }
+
+    /// What this merger did so far.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn work(&self) -> MergeWork {
+        MergeWork {
+            word_compares: self.word_compares.get(),
+            key_compares: self.key_compares.get(),
+            moves: self.moves.get(),
+        }
+    }
+
     fn rank_of(&self, entry: &InternalValue) -> u64 {
         debug_assert!(
             !self.lexicographic || entry.key.user_key.len() >= self.common_prefix,
@@ -233,16 +280,18 @@ impl Tournament {
         #[cfg(feature = "diagnostics")]
         count(&self.key_compares);
         let keys = if self.lexicographic {
+            // Bytes compared in place: nothing here can panic.
             x.key.cmp(&y.key)
         } else {
-            x.key.compare_with(&y.key, self.comparator.as_ref())
+            let unwinding = Unwinding(&self.phase);
+            let keys = x.key.compare_with(&y.key, self.comparator.as_ref());
+            unwinding.disarm();
+            keys
         };
         keys.then_with(|| a.cmp(&b)) == Ordering::Less
     }
 
     /// Takes each input's first entry and plays the whole tournament.
-    /// Returns the errors the inputs gave in place of a first entry, in the
-    /// order of the inputs.
     #[expect(
         clippy::indexing_slicing,
         reason = "slots and nodes are below the lengths set just above"
@@ -251,22 +300,23 @@ impl Tournament {
         clippy::cast_possible_truncation,
         reason = "a merge has far fewer than 2^32 inputs"
     )]
-    fn build<I: Iterator<Item = IterItem>>(&mut self, inputs: &mut [I]) -> Vec<crate::Error> {
-        let leaves = inputs.len().next_power_of_two().max(2);
+    fn build(&mut self) {
+        let leaves = self.iterators.len().next_power_of_two().max(2);
         self.entries = (0..leaves).map(|_| None).collect();
         self.ranks = alloc::vec![EMPTY; leaves];
-        let mut failed = Vec::new();
-        for (slot, input) in inputs.iter_mut().enumerate() {
-            match input.next() {
+        for slot in 0..self.iterators.len() {
+            match self.iterators[slot].next() {
                 Some(Ok(entry)) => {
                     self.ranks[slot] = self.rank_of(&entry);
                     self.entries[slot] = Some(entry);
                     self.live += 1;
                 }
-                Some(Err(e)) => failed.push(e),
+                Some(Err(e)) => self.failed.push(e),
                 None => {}
             }
         }
+        // Yielded from the back, the first input's first.
+        self.failed.reverse();
         // The winner of each subtree by node number, the leaves from `leaves`
         // up.
         let mut winners: Vec<u32> = (0..2 * leaves)
@@ -284,7 +334,6 @@ impl Tournament {
             winners[node] = winner;
         }
         self.tree[0] = winners[1];
-        failed
     }
 
     /// Plays again the games between `leaf` and the root.
@@ -354,16 +403,59 @@ impl Tournament {
         best
     }
 
-    /// Takes the winning entry out of `slot`, puts what its input gave next
-    /// (`pulled`) in its place and settles the tournament. Returns what the
-    /// merge yields for this step.
+    /// Builds the tournament at the first call, and yields the errors the
+    /// inputs' first entries gave, one a call and in the order of the inputs.
+    /// A merger a panic left part way through a change yields its refusal.
+    #[cold]
+    fn prepare(&mut self) -> Option<crate::Error> {
+        match self.phase.get() {
+            Phase::Unbuilt => {
+                // Unwound until built: a panic of an input or of the
+                // comparator in there leaves entries taken and no tournament
+                // over them.
+                self.phase.set(Phase::Unwound);
+                self.build();
+            }
+            Phase::Unwound => return Some(unwound()),
+            Phase::Failing | Phase::Ready => {}
+        }
+        let failed = self.failed.pop();
+        self.phase.set(if self.failed.is_empty() {
+            Phase::Ready
+        } else {
+            Phase::Failing
+        });
+        failed
+    }
+}
+
+impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
+    type Item = IterItem;
+
     #[inline]
     #[expect(
         clippy::indexing_slicing,
         reason = "the winning slot is an input's, below every per-slot length"
     )]
-    fn advance(&mut self, slot: usize, pulled: Option<IterItem>) -> Option<IterItem> {
-        let taken = match pulled {
+    fn next(&mut self) -> Option<Self::Item> {
+        // One source is already in order: a flush of one memtable would move
+        // every entry through the tournament and back for nothing.
+        if let [only] = self.iterators.as_mut_slice() {
+            return only.next();
+        }
+        if self.phase.get() != Phase::Ready
+            && let Some(e) = self.prepare()
+        {
+            return Some(Err(e));
+        }
+        if self.live == 0 {
+            return None;
+        }
+
+        let slot = self.tree[0] as usize;
+        // An input that panics here leaves the merger as it was: its entry
+        // is taken out of the slot only below.
+        let taken = match self.iterators[slot].next() {
             Some(Ok(next)) => {
                 self.ranks[slot] = self.rank_of(&next);
                 self.entries[slot].replace(next)
@@ -407,118 +499,6 @@ impl Tournament {
             Run::Chased
         };
         taken.map(Ok)
-    }
-}
-
-impl<I: Iterator<Item = IterItem>> Merger<I> {
-    #[must_use]
-    pub fn new(iterators: Vec<I>, comparator: SharedComparator) -> Self {
-        let lexicographic = comparator.is_lexicographic();
-        Self {
-            iterators,
-            game: Tournament {
-                entries: Vec::new(),
-                ranks: Vec::new(),
-                tree: Vec::new(),
-                live: 0,
-                runner_up: 0,
-                run: Run::None,
-                comparator,
-                lexicographic,
-                common_prefix: 0,
-                #[cfg(feature = "diagnostics")]
-                word_compares: core::cell::Cell::new(0),
-                #[cfg(feature = "diagnostics")]
-                key_compares: core::cell::Cell::new(0),
-                #[cfg(feature = "diagnostics")]
-                moves: core::cell::Cell::new(0),
-            },
-            failed: Vec::new(),
-            phase: Phase::Unbuilt,
-        }
-    }
-
-    /// Declares that every key the sources hold starts with the same `len`
-    /// bytes, under a comparator that orders keys by their bytes, or is
-    /// ignored under any other.
-    #[must_use]
-    pub fn with_common_prefix(mut self, len: usize) -> Self {
-        debug_assert!(
-            self.phase == Phase::Unbuilt,
-            "set before the first entry is taken"
-        );
-        self.game.common_prefix = len;
-        self
-    }
-
-    /// What this merger did so far.
-    #[cfg(feature = "diagnostics")]
-    #[must_use]
-    pub fn work(&self) -> MergeWork {
-        MergeWork {
-            word_compares: self.game.word_compares.get(),
-            key_compares: self.game.key_compares.get(),
-            moves: self.game.moves.get(),
-        }
-    }
-
-    /// Builds the tournament at the first call, and yields the errors the
-    /// inputs' first entries gave, one a call and in the order of the inputs.
-    /// A merger a panic left part way through a step yields its refusal.
-    #[cold]
-    fn prepare(&mut self) -> Option<crate::Error> {
-        match self.phase {
-            Phase::Unbuilt => {
-                let unwinding = Unwinding(&mut self.phase);
-                self.failed = self.game.build(&mut self.iterators);
-                unwinding.disarm();
-                // Yielded from the back.
-                self.failed.reverse();
-            }
-            Phase::Unwound => return Some(unwound()),
-            Phase::Failing | Phase::Ready => {}
-        }
-        let failed = self.failed.pop();
-        self.phase = if self.failed.is_empty() {
-            Phase::Ready
-        } else {
-            Phase::Failing
-        };
-        failed
-    }
-}
-
-impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
-    type Item = IterItem;
-
-    #[inline]
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "the winning slot is an input's, below the inputs' count"
-    )]
-    fn next(&mut self) -> Option<Self::Item> {
-        // One source is already in order: a flush of one memtable would move
-        // every entry through the tournament and back for nothing.
-        if let [only] = self.iterators.as_mut_slice() {
-            return only.next();
-        }
-        if self.phase != Phase::Ready
-            && let Some(e) = self.prepare()
-        {
-            return Some(Err(e));
-        }
-        if self.game.live == 0 {
-            return None;
-        }
-
-        let slot = self.game.tree[0] as usize;
-        // A panic of the input here leaves the merger as it was: nothing has
-        // been taken yet.
-        let pulled = self.iterators[slot].next();
-        let unwinding = Unwinding(&mut self.phase);
-        let item = self.game.advance(slot, pulled);
-        unwinding.disarm();
-        item
     }
 }
 
