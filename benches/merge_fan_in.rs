@@ -296,7 +296,7 @@ struct Work {
     moves: u64,
 }
 
-/// One current entry per input, compared as the engine's merge heap compares:
+/// One current entry per input, compared as the engine's merger compares:
 /// by key word, then by key, then by input number.
 struct Slots {
     entries: Vec<Option<InternalValue>>,
@@ -667,7 +667,7 @@ fn engine_work() -> Work {
         Work {
             word_compares: counts.merge_word_compares,
             key_compares: counts.merge_key_compares,
-            moves: counts.merge_slides,
+            moves: counts.merge_moves,
         }
     }
     #[cfg(not(feature = "diagnostics"))]

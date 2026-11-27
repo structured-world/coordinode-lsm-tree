@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 /// in tree structures that may be referenced inside `catch_unwind` blocks.
 ///
 /// Implementations must define a **strict total order** suitable for use in
-/// sorted data structures (memtable skip list, SST block index, merge heap).
+/// sorted data structures (memtable skip list, SST block index, merge).
 /// Specifically:
 ///
 /// - **Totality**: for all `a`, `b`, exactly one of `Less`, `Equal`, `Greater` holds

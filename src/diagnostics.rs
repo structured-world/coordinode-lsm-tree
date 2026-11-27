@@ -20,7 +20,7 @@ pub(crate) static REFS_UP: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REFS_DOWN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MERGE_WORD_COMPARES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MERGE_KEY_COMPARES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static MERGE_SLIDES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MERGE_MOVES: AtomicU64 = AtomicU64::new(0);
 
 /// Adds `by` to `counter`.
 #[inline]
@@ -45,12 +45,12 @@ pub struct Counts {
     pub refs_up: u64,
     /// Atomic reference count decrements.
     pub refs_down: u64,
-    /// Comparisons of two key words the merge heap made to place an entry.
+    /// Games the merger played by two slots' key words.
     pub merge_word_compares: u64,
-    /// Comparisons of two whole keys it made where their words tied.
+    /// Games it settled by two whole keys, where their words tied.
     pub merge_key_compares: u64,
-    /// Slot numbers it moved to make room for a replaced entry.
-    pub merge_slides: u64,
+    /// Games a replayed entry lost, each rewriting one node of the tournament.
+    pub merge_moves: u64,
 }
 
 impl Counts {
@@ -68,7 +68,7 @@ impl Counts {
             refs_down: read(&REFS_DOWN),
             merge_word_compares: read(&MERGE_WORD_COMPARES),
             merge_key_compares: read(&MERGE_KEY_COMPARES),
-            merge_slides: read(&MERGE_SLIDES),
+            merge_moves: read(&MERGE_MOVES),
         }
     }
 
@@ -85,7 +85,7 @@ impl Counts {
             refs_down: self.refs_down - before.refs_down,
             merge_word_compares: self.merge_word_compares - before.merge_word_compares,
             merge_key_compares: self.merge_key_compares - before.merge_key_compares,
-            merge_slides: self.merge_slides - before.merge_slides,
+            merge_moves: self.merge_moves - before.merge_moves,
         }
     }
 }

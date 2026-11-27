@@ -122,7 +122,7 @@ fn merger(c: &mut Criterion) {
             })
             .collect::<Vec<_>>();
 
-        let label_heap = format!("Merge {num} (MergeHeap)");
+        let label_heap = format!("Merge {num} (Merger)");
         c.bench_function(&label_heap, |b| {
             b.iter_custom(|iters| {
                 measure_with_percentiles(&label_heap, iters, || {

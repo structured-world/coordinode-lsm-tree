@@ -246,7 +246,7 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
             let other = self.tree[node] as usize;
             if self.beats(other, winner) {
                 #[cfg(feature = "diagnostics")]
-                crate::diagnostics::add(&crate::diagnostics::MERGE_SLIDES, 1);
+                crate::diagnostics::add(&crate::diagnostics::MERGE_MOVES, 1);
                 self.tree[node] = winner as u32;
                 winner = other;
             }
