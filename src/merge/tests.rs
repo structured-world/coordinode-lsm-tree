@@ -509,3 +509,24 @@ fn merge_of_empty_inputs_is_empty() {
     assert!(iter.next().is_none());
     assert!(iter.next().is_none());
 }
+
+/// The work a merger reports is the games it played: the benches divide by
+/// these counts, so a game counted twice or not at all skews every figure.
+/// Two versions of one key: the build ties on the word and goes to the keys,
+/// then each input running out replays one game, the first of them a loss.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn merge_reports_the_games_it_played() {
+    let newer = vec![Ok(InternalValue::from_components("k", b"", 1, Value))];
+    let older = vec![Ok(InternalValue::from_components("k", b"", 0, Value))];
+    let mut iter = Merger::new(
+        vec![newer.into_iter(), older.into_iter()],
+        comparator::default_comparator(),
+    );
+    assert_eq!(iter.by_ref().count(), 2);
+
+    let work = iter.work();
+    assert_eq!(work.word_compares, 3);
+    assert_eq!(work.key_compares, 1);
+    assert_eq!(work.moves, 1);
+}

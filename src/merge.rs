@@ -174,8 +174,8 @@ fn key_word(key: &[u8], offset: usize, lexicographic: bool) -> u64 {
         return u64::from_be_bytes(*head);
     }
     let mut padded = [0; 8];
-    if let Some(head) = padded.get_mut(..tail.len()) {
-        head.copy_from_slice(tail);
+    for (slot, byte) in padded.iter_mut().zip(tail) {
+        *slot = *byte;
     }
     u64::from_be_bytes(padded)
 }
