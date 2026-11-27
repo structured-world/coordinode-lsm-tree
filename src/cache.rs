@@ -94,6 +94,33 @@ impl From<(u8, u64, u64, u64)> for CacheKey {
     }
 }
 
+/// A file that was deleted, as the cache keys its entries: no read reaches
+/// them again, since a file's id is never given to another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeadFile {
+    /// A table: its blocks, partial blocks, cached rows and directories.
+    Table {
+        tree: crate::TreeId,
+        table: crate::TableId,
+    },
+    /// A blob file: its frames and the records read out of them alone.
+    BlobFile {
+        tree: crate::TreeId,
+        file: crate::vlog::BlobFileId,
+    },
+}
+
+impl DeadFile {
+    /// Whether `key` is an entry of this file.
+    fn holds(self, key: &CacheKey) -> bool {
+        let of_blob_file = matches!(key.0, TAG_BLOB | TAG_BLOB_RECORD);
+        match self {
+            Self::Table { tree, table } => !of_blob_file && key.1 == tree && key.2 == table,
+            Self::BlobFile { tree, file } => of_blob_file && key.1 == tree && key.2 == file,
+        }
+    }
+}
+
 /// What a cached row costs the cache: key bytes + value bytes + a fixed term for
 /// the `InternalKey` scalars (seqno + `value_type`) and the entry's own
 /// bookkeeping.
@@ -1069,6 +1096,15 @@ impl Cache {
     pub fn evict_partial_block(&self, id: GlobalTableId, offset: BlockOffset) {
         let key: CacheKey = (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into();
         self.data.remove(&key);
+    }
+
+    /// Takes every entry of the deleted `files` out of the cache, in one walk
+    /// over it: for the thread that deletes files, not for a read. The walk
+    /// holds one shard's lock at a time, which lookups never take.
+    #[cfg(feature = "std")]
+    pub(crate) fn evict_files(&self, files: &[DeadFile]) {
+        self.data
+            .remove_where(|key| files.iter().any(|file| file.holds(key)));
     }
 
     #[doc(hidden)]

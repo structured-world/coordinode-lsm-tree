@@ -419,6 +419,15 @@ impl Drop for Inner {
                 d.remove_for_table(&global_id);
             });
 
+            // What the table left in the block cache goes too, whenever its
+            // file does: no read reaches a deleted table's entries again. The
+            // walk over the cache is the deleter's, off this thread, which
+            // may be a reader's.
+            #[cfg(feature = "std")]
+            if let Some(deleter) = self.background_deleter.get() {
+                deleter.evict_table(global_id.table_id());
+            }
+
             // Drop the accessor and block index (releases all Arc<dyn FsFile>).
             drop(file_accessor);
             drop(block_index);

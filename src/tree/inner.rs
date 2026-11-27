@@ -445,13 +445,16 @@ impl TreeInner {
             budget.register(Arc::downgrade(&latest_super_version));
         }
 
+        let id = get_next_tree_id();
         Ok(Self {
-            id: get_next_tree_id(),
+            id,
             deletion_pause: DeletionPause::for_tree(Arc::clone(&life)),
             #[cfg(feature = "std")]
             background_deleter: Arc::new(crate::BackgroundDeleter::for_tree(
                 None,
                 Arc::clone(&life),
+                Arc::clone(&config.cache),
+                id,
             )),
             life,
             closing: core::sync::atomic::AtomicBool::new(false),

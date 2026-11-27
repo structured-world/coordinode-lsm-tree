@@ -32,3 +32,46 @@ fn drains_queued_deletions_on_drop() {
         );
     }
 }
+
+/// A tree's deleter told that a table and a blob file were deleted takes
+/// what they left in the tree's cache out of it, by the time its queue is
+/// drained, and leaves the tree's other files' entries where they are. Without
+/// it those entries stay until the cache evicts them by itself, holding
+/// capacity no read can use.
+#[test]
+fn a_deleted_files_entries_leave_the_trees_cache() {
+    use crate::table::block::BlockType;
+    use crate::vlog::blob_file::frame::decoded_frame;
+
+    let block = || crate::table::Block {
+        header: crate::table::block::Header {
+            uncompressed_length: 1_024,
+            ..crate::table::block::Header::test_dummy(BlockType::Data)
+        },
+        data: crate::Slice::from(&[0u8; 1_024][..]),
+    };
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(1 << 20));
+    let at = crate::table::BlockOffset(0);
+    let dead = crate::table::GlobalTableId::from((5, 9));
+    let live = crate::table::GlobalTableId::from((5, 10));
+    cache.insert_block(dead, at, block());
+    cache.insert_block(live, at, block());
+    let frame_at = |file| crate::cache::BlobFrameAt {
+        blob_file_id: file,
+        frame: 0,
+    };
+    for file in [3, 4] {
+        cache.insert_blob_frame(5, frame_at(file), Arc::new(decoded_frame(&[(b"k", b"v")])));
+    }
+
+    {
+        let deleter = BackgroundDeleter::spawn(None, None, Some((Arc::clone(&cache), 5)));
+        deleter.evict_table(9);
+        deleter.evict_blob_file(3);
+    }
+
+    assert!(cache.get_block(dead, at).is_none(), "the deleted table's");
+    assert!(cache.get_block(live, at).is_some(), "a live table's");
+    assert!(cache.get_blob_frame(5, frame_at(3)).is_none());
+    assert!(cache.get_blob_frame(5, frame_at(4)).is_some());
+}
