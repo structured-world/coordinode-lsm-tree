@@ -327,6 +327,27 @@ fn a_round_of_large_keys_larger_than_the_cache_is_mostly_found() {
     assert!(found >= 20 * 9, "{found} of 260 reads found their entry");
 }
 
+/// A round four times what the cache holds still leaves a set of entries in
+/// place that each round finds: an entry read once a round keeps its credit
+/// through the round's misses, which outnumber the entries held three to one.
+#[test]
+fn a_round_of_large_keys_four_times_the_cache_keeps_a_set_in_use() {
+    // Eleven entries of 600 KiB fit; the round has forty-four keys.
+    let c = byte_cache(8 << 20);
+    let mut found = 0;
+    for round in 0..80 {
+        for key in 0..44u64 {
+            if c.get(&key).is_some() {
+                found += usize::from(round >= 60);
+            } else {
+                c.insert(key, vec![0u8; 600 << 10]);
+            }
+        }
+    }
+    // A quarter of the keys can be held at best: eleven of each round's.
+    assert!(found >= 20 * 6, "{found} of 880 reads found their entry");
+}
+
 /// Entries heavier than half a shard do not depend on which shard their keys
 /// fall in: a shard holds one of them at most, so kept in the shards two
 /// that share one would evict each other in a cache with room for both.

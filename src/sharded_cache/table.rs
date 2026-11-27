@@ -335,8 +335,8 @@ impl<K, V, P> Table<K, V, P> {
 
     /// Lets go of a slot a reader held, freeing it when it was retired and
     /// this reader was its last.
-    fn unpin(&self, link: u32) {
-        let slot = self.slot(link);
+    #[inline]
+    fn unpin(&self, link: u32, slot: &Slot<K, V>) {
         let before = slot.meta.fetch_sub(REF, Ordering::AcqRel);
         if before & (STATE | REFS) != RETIRED | REF {
             return;
@@ -396,15 +396,10 @@ impl<K: Eq, V, P> Table<K, V, P> {
                     continue 'walk;
                 }
                 let slot_hash = slot.hash.load(Ordering::Relaxed);
-                let next = slot.next.load(Ordering::Acquire);
-                // The hash and the link are this entry's only if the slot was
-                // not freed between the two looks at its version.
-                if version_of(slot.meta.load(Ordering::Acquire)) != version_of(meta)
-                    || bucket_of(slot_hash, mask) != bucket
-                {
-                    continue 'walk;
-                }
                 if slot_hash == hash {
+                    // Held through the state seen before the hash was read:
+                    // the exchange fails if the slot was freed since, so a
+                    // hit takes no second look at the version.
                     let mut seen = meta;
                     loop {
                         if seen & STATE != VISIBLE || version_of(seen) != version_of(meta) {
@@ -426,10 +421,22 @@ impl<K: Eq, V, P> Table<K, V, P> {
                             Err(now) => seen = now,
                         }
                     }
-                    let pinned = Pinned { table: self, link };
+                    let pinned = Pinned {
+                        table: self,
+                        slot,
+                        link,
+                    };
                     if pinned.key() == key {
                         return Some(pinned);
                     }
+                }
+                let next = slot.next.load(Ordering::Acquire);
+                // The hash and the link are this entry's only if the slot was
+                // not freed between the two looks at its version.
+                if version_of(slot.meta.load(Ordering::Acquire)) != version_of(meta)
+                    || bucket_of(slot_hash, mask) != bucket
+                {
+                    continue 'walk;
                 }
                 link = next;
                 steps += 1;
@@ -493,6 +500,9 @@ impl<K, V, P> Drop for Table<K, V, P> {
 /// A reader's hold on a slot: its key and value stay until this is dropped.
 pub(super) struct Pinned<'a, K, V, P> {
     table: &'a Table<K, V, P>,
+    /// The slot held, found once: its place in the slab is not worked out
+    /// again for the key, the value and the release.
+    slot: &'a Slot<K, V>,
     link: u32,
 }
 
@@ -501,7 +511,7 @@ impl<K, V, P> Pinned<'_, K, V, P> {
         // SAFETY: a held slot keeps its entry until the last reader lets go.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            (*self.table.slot(self.link).key.get()).assume_init_ref()
+            (*self.slot.key.get()).assume_init_ref()
         }
     }
 
@@ -509,14 +519,14 @@ impl<K, V, P> Pinned<'_, K, V, P> {
         // SAFETY: as for the key.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            (*self.table.slot(self.link).value.get()).assume_init_ref()
+            (*self.slot.value.get()).assume_init_ref()
         }
     }
 }
 
 impl<K, V, P> Drop for Pinned<'_, K, V, P> {
     fn drop(&mut self) {
-        self.table.unpin(self.link);
+        self.table.unpin(self.link, self.slot);
     }
 }
 

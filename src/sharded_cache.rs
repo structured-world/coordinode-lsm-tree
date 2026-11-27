@@ -318,14 +318,23 @@ impl<K: Eq, V> Write<'_, K, V, Policy> {
     }
 
     /// One turn of the cache's clock over its large entries, at `node`: an
-    /// entry read since its last turn keeps its place for one frequency
-    /// credit, an unread one is taken out when `tenured` and left otherwise.
-    fn turn_large(&mut self, node: Node, tenured: bool, evicted: &mut Evicted<V>) -> Turn {
+    /// entry read since the clock last aged keeps its place, for one
+    /// frequency credit when this turn `ages` it; an unread one is taken out
+    /// when `tenured` and left otherwise.
+    fn turn_large(
+        &mut self,
+        node: Node,
+        tenured: bool,
+        ages: bool,
+        evicted: &mut Evicted<V>,
+    ) -> Turn {
         if !self.is_live(node) || self.queue(node.link) != Queue::Large {
             return Turn::Stale;
         }
         if self.freq(node.link) > 0 {
-            self.lower_freq(node.link);
+            if ages {
+                self.lower_freq(node.link);
+            }
             return Turn::Kept;
         }
         if !tenured {
@@ -577,16 +586,51 @@ struct Large {
     queue: VecDeque<(usize, Node, u64, bool)>,
     /// Inserts of a large entry that found no room for it, so far.
     crowded: u64,
+    /// `crowded` when the entries' frequencies were last aged.
+    aged_at: u64,
+    /// Inserts that needed room an unread entry stays for, per entry held.
+    /// Doubled, up to [`TENURE_MAX`], each time the key that needs room is
+    /// one the cache evicted not long ago: it is evicting what comes back,
+    /// so entries have to stay longer to be read again. Eased by one, down
+    /// to [`TENURE_MIN`], by each key that was not.
+    tenure: u64,
 }
 
+/// The least and most of [`Large::tenure`].
+const TENURE_MIN: u64 = 2;
+const TENURE_MAX: u64 = 64;
+
 impl Large {
+    /// Whether the entries' frequencies are due to age: once per four
+    /// inserts that needed room per entry held. Aged at every such insert,
+    /// a set of entries each read once a round lost its credits to a round's
+    /// misses whenever those outnumbered it, and was evicted while in use.
+    fn ages(&mut self) -> bool {
+        let due = self.crowded.wrapping_sub(self.aged_at) >= 4 * (self.queue.len() as u64 + 1);
+        if due {
+            self.aged_at = self.crowded;
+        }
+        due
+    }
+
     /// Whether an unread entry that went in at `stamp` has been in long
     /// enough to give way to a new one: for two inserts that needed room per
     /// entry held. Without it, keys read in a round a little larger than the
     /// cache holds each evict the one read next, and none is ever found;
     /// with it the entries held stay for many rounds and are found in each.
     fn tenured(&self, stamp: u64) -> bool {
-        self.crowded.wrapping_sub(stamp) >= 2 * (self.queue.len() as u64 + 1)
+        self.crowded.wrapping_sub(stamp) >= self.tenure * (self.queue.len() as u64 + 1)
+    }
+
+    /// Counts an insert that needed room, for a key the cache evicted not
+    /// long ago (`back`) or one it did not.
+    fn crowd(&mut self, back: bool) {
+        self.crowded += 1;
+        self.tenure = if back {
+            (self.tenure * 2).min(TENURE_MAX)
+        } else {
+            (self.tenure - 1).max(TENURE_MIN)
+        };
     }
 }
 
@@ -669,6 +713,8 @@ where
             large: spin::Mutex::new(Large {
                 queue: VecDeque::new(),
                 crowded: 0,
+                aged_at: 0,
+                tenure: TENURE_MIN,
             }),
             resizing: spin::Mutex::new(()),
         }
@@ -761,8 +807,10 @@ where
     )]
     fn trim_large(&self, large: &mut Large, weight: u64, forced: bool, pinned: bool) {
         let limit = self.large_limit();
-        // Each entry is turned at most once per frequency credit it holds.
-        let mut turns = large.queue.len() * (usize::from(MAX_FREQ) + 1);
+        let ages = forced || large.ages();
+        // Each entry is turned once, or once per frequency credit it holds
+        // where the turns age it.
+        let mut turns = large.queue.len() * if ages { usize::from(MAX_FREQ) + 1 } else { 1 };
         while self.large_resident.load(Ordering::Relaxed) + weight > limit && turns > 0 {
             turns -= 1;
             let Some((at, node, stamp, held_pinned)) = large.queue.pop_front() else {
@@ -781,7 +829,7 @@ where
             let tenured = forced || large.tenured(stamp) || (pinned && !held_pinned);
             let mut evicted = Evicted::new();
             let mut write = self.lock(&shard.0);
-            let turn = write.turn_large(node, tenured, &mut evicted);
+            let turn = write.turn_large(node, tenured, ages, &mut evicted);
             self.release(&shard.0, write, evicted);
             match turn {
                 Turn::Kept => large.queue.push_back((at, node, stamp, held_pinned)),
@@ -823,17 +871,18 @@ where
             // when replaced, so only the difference needs room. Looked up
             // under the shard's lock and let go before any eviction, which
             // may need that same lock.
-            let held = {
+            let (held, back) = {
                 let write = shard.0.table.lock();
-                write
+                let held = write
                     .find(h, &key)
                     .filter(|&link| write.queue(link) == Queue::Large)
-                    .map_or(0, |link| write.weight(link))
+                    .map_or(0, |link| write.weight(link));
+                (held, write.policy().in_ghost(h))
             };
             let more = weight.saturating_sub(held);
             let limit = self.large_limit();
             if self.large_resident.load(Ordering::Relaxed) + more > limit {
-                large.crowded += 1;
+                large.crowd(back);
                 self.trim_large(&mut large, more, false, priority == Priority::High);
             }
             if self.large_resident.load(Ordering::Relaxed) + more > limit {
