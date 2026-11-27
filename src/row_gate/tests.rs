@@ -63,6 +63,20 @@ fn the_gate_follows_a_change_of_reads_both_ways() {
     assert_eq!(gate.eighths(), 0, "then spread again");
 }
 
+/// Two trees reading through one cache choose apart: the one whose keys come
+/// back keeps its rows while the one whose keys do not gives them up, though
+/// their reads are interleaved.
+#[test]
+fn trees_with_opposite_reads_choose_opposite_fractions() {
+    let (hot, spread) = (gate(), gate());
+    for round in 0..20 {
+        read_evenly(&hot, 40, u64::from(WINDOW), 6 + round);
+        read_evenly(&spread, 1_000_000, u64::from(WINDOW), 60 + round);
+    }
+    assert_eq!(hot.eighths(), 8);
+    assert_eq!(spread.eighths(), 0);
+}
+
 /// A key is inside the gate by its hash alone, so the keys inside stay the
 /// same ones while the fraction stands, and a wider fraction keeps every key
 /// a narrower one held.
