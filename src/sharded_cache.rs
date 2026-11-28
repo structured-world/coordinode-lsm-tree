@@ -332,18 +332,20 @@ impl<K: Eq, V> Write<'_, K, V, Policy> {
     /// One turn of the cache's clock over its large entries, at `node`: an
     /// entry read since the clock last aged keeps its place, for one
     /// frequency credit when this turn `ages` it; an unread one is taken out
-    /// when `tenured` and left otherwise.
+    /// when `tenured` and left otherwise. A turn that does not `spare` takes
+    /// the entry out read or not.
     fn turn_large(
         &mut self,
         node: Node,
         tenured: bool,
         ages: bool,
+        spare: bool,
         evicted: &mut Evicted<V>,
     ) -> Turn {
         if !self.is_live(node) || self.queue(node.link) != Queue::Large {
             return Turn::Stale;
         }
-        if self.freq(node.link) > 0 {
+        if spare && self.freq(node.link) > 0 {
             if ages {
                 self.lower_freq(node.link);
             }
@@ -930,7 +932,8 @@ where
 
     /// Evicts large entries, oldest unread first, until `weight` more fits
     /// what they may weigh together, or none is left to give way. A resize
-    /// is `forced`: it evicts down whatever the entries' time in the cache.
+    /// is `forced`: it evicts down whatever the entries' time in the cache,
+    /// the unread first and then the read.
     /// Room for a `pinned` entry (an index, a filter: what every read walks)
     /// is taken from unread entries that are not, however lately they went
     /// in, as in a shard's queues such entries outlast the data blocks.
@@ -944,7 +947,20 @@ where
         // Each entry is turned once, or once per frequency credit it holds
         // where the turns age it.
         let mut turns = large.queue.len() * if ages { usize::from(MAX_FREQ) + 1 } else { 1 };
-        while self.large_resident.load(Ordering::Relaxed) + weight > limit && turns > 0 {
+        // A read gives an entry back the credit a turn took. Where readers
+        // kept the entries in credit through all those turns, a forced trim
+        // goes round once more and takes them read or not: the capacity it
+        // evicts down to is a bound.
+        let mut spare = true;
+        while self.large_resident.load(Ordering::Relaxed) + weight > limit {
+            if turns == 0 {
+                if !forced || !spare {
+                    return;
+                }
+                spare = false;
+                turns = large.queue.len();
+                continue;
+            }
             turns -= 1;
             let Some((at, node, stamp, held_pinned)) = large.queue.pop_front() else {
                 return;
@@ -971,7 +987,7 @@ where
                 large.queue.push_back((at, node, stamp, held_pinned));
                 continue;
             };
-            let turn = write.turn_large(node, tenured, ages, &mut evicted);
+            let turn = write.turn_large(node, tenured, ages, spare, &mut evicted);
             self.release(&shard.0, write, evicted);
             match turn {
                 Turn::Kept => large.queue.push_back((at, node, stamp, held_pinned)),

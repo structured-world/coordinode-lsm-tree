@@ -587,6 +587,52 @@ fn a_shrink_keeps_the_cache_within_its_new_capacity() {
     assert_eq!(c.get(&1_000), None, "the large entry gave way");
 }
 
+/// A shrink evicts the large entries the new capacity has no room for while
+/// they are being read. A read gives an entry back the credit a turn of the
+/// clock took, so turns that only spared the entries read ran out with the
+/// cache still over its capacity, and no later read took it down.
+#[cfg(feature = "std")]
+#[test]
+fn a_shrink_evicts_large_entries_that_readers_keep_reading() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
+
+    let cache = Arc::new(byte_cache(800));
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (cache, stop) = (Arc::clone(&cache), Arc::clone(&stop));
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = cache.get(&1);
+                    let _ = cache.get(&2);
+                }
+            })
+        })
+        .collect();
+
+    let mut over = None;
+    for round in 0..300 {
+        cache.set_capacity(800);
+        for _ in 0..2 {
+            cache.insert(1, vec![1u8; 300]);
+            cache.insert(2, vec![2u8; 300]);
+        }
+        // 200 bytes hold no entry of 300.
+        cache.set_capacity(200);
+        if cache.weight() > 200 {
+            over = Some((round, cache.weight()));
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().expect("thread panicked");
+    }
+    assert_eq!(over, None, "(round, bytes resident past a capacity of 200)");
+}
+
 /// Large entries are evicted among themselves, the unread ones first, so
 /// they never take more than half the cache.
 #[test]
