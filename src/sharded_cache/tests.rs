@@ -317,6 +317,14 @@ fn an_entry_heavier_than_a_shard_is_kept_within_the_capacity() {
     for shard in 0..8 {
         let (_, resident) = c.shard_state(shard).unwrap();
         assert!(resident <= 100 - 240 / 8, "shard {shard} holds {resident}");
+        // What a shard publishes as its room is what it was evicted down
+        // to: a miss asking whether it has room is not told of the bytes
+        // the large entry was just given.
+        let published = c.shards[shard]
+            .0
+            .capacity
+            .load(core::sync::atomic::Ordering::Relaxed);
+        assert!(published <= 100 - 240 / 8, "shard {shard} says {published}");
     }
 
     c.remove(&1_000);
@@ -1085,6 +1093,7 @@ fn a_read_racing_replaces_of_its_key_always_finds_a_value() {
                         reading.fetch_add(1, Ordering::Relaxed);
                     }
                     let value = found.expect("the key is always resident");
+                    assert_eq!(value.len(), 8, "a value of another length");
                     assert!(value.iter().all(|&byte| byte == value[0]), "a torn value");
                     if done.load(Ordering::Relaxed) {
                         return reads;

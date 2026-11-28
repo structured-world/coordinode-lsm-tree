@@ -38,12 +38,30 @@ const SAMPLE: u64 = 256;
 /// a queue (8) and its share of the buckets (8).
 const ENTRY_BYTES: u64 = 64;
 
+/// Bytes a shadow holds per key it remembers having refused or evicted: the
+/// fingerprint in its queue and in its set.
+const GHOST_BYTES: u64 = 24;
+
+/// A shadow remembers one such key per this many entries it can hold. The
+/// cache remembers about one per row it can hold, of all its reads; a
+/// shadow sees one read in [`SAMPLE`], so a quarter as many reach as far
+/// back for it as the cache's do, and they are bytes of the same budget.
+const GHOST_SHARE: u64 = 4;
+
+/// The fewest entries a shadow can hold for a tree to be simulated at all.
+/// A cache too small for that keeps every key in its row cache: a shadow of
+/// a handful of entries tells nothing, and its bookkeeping alone would
+/// outweigh the share of the cache it is given.
+const SHADOW_ENTRIES_MIN: u64 = 16;
+
 /// The least an entry weighs in a shadow that samples one read in
 /// [`SAMPLE`]: what keeps the five shadows' entries, [`ENTRY_BYTES`] each,
-/// within a two-hundredth of the cache's capacity. A tree of smaller rows
-/// samples one read in twice as many, up to sixteen times, for each halving
-/// of the row below it, and an entry lighter still is weighed at the floor.
-const ENTRY_FLOOR: u64 = CANDIDATES.len() as u64 * ENTRY_BYTES * 200 / SAMPLE;
+/// and the keys they remember, [`GHOST_BYTES`] each, within a two-hundredth
+/// of the cache's capacity. A tree of smaller rows samples one read in twice
+/// as many, up to sixteen times, for each halving of the row below it, and
+/// an entry lighter still is weighed at the floor.
+const ENTRY_FLOOR: u64 =
+    (CANDIDATES.len() as u64 * (ENTRY_BYTES + GHOST_BYTES / GHOST_SHARE) * 200).div_ceil(SAMPLE);
 
 /// Sampled reads a window holds before its candidates are priced: 131,072 of
 /// the tree's reads. A tree decides at its third window at the earliest.
@@ -287,7 +305,9 @@ impl RowGate {
         sim.shadows.as_ref().map_or(0, |shadows| {
             shadows
                 .iter()
-                .map(|shadow| shadow.len() as u64 * ENTRY_BYTES)
+                .map(|shadow| {
+                    shadow.len() as u64 * ENTRY_BYTES + shadow.ghosts() as u64 * GHOST_BYTES
+                })
                 .sum()
         })
     }
@@ -329,10 +349,29 @@ impl RowGate {
         let sparser = u32::from(self.sparser.load(Ordering::Relaxed));
         let rate = SAMPLE << sparser;
         let capacity = capacity / rate;
+        let floor = (ENTRY_FLOOR >> sparser).max(1);
+        let entries = capacity / floor;
+        if entries < SHADOW_ENTRIES_MIN {
+            sim.shadows = None;
+            return;
+        }
         if sim.shadows.is_none() || sim.capacity != capacity {
             sim.capacity = capacity;
+            // The keys a shadow remembers are counted in its share of
+            // memory like its entries, a fixed part of what it can hold. A
+            // thousand of them whatever the cache took more than the whole
+            // budget of a small cache's shadows.
+            let ghosts = usize::try_from(entries / GHOST_SHARE).unwrap_or(usize::MAX);
             sim.shadows = Some(core::array::from_fn(|_| {
-                ShardedCache::with_weighter(capacity, 1, 1_024, Held, rustc_hash::FxBuildHasher)
+                let shadow = ShardedCache::with_weighter(
+                    capacity,
+                    1,
+                    ghosts,
+                    Held,
+                    rustc_hash::FxBuildHasher,
+                );
+                shadow.set_ghosts(ghosts);
+                shadow
             }));
         }
 
@@ -341,7 +380,6 @@ impl RowGate {
         // holds fewer keys than that. Weighing it so keeps the sampled blocks
         // the same share of the shadow that all blocks are of the cache. No
         // entry weighs less than the floor that bounds the shadows' memory.
-        let floor = ENTRY_FLOOR >> sparser;
         let keys = (block.weight / row_weight.max(1)).clamp(1, rate);
         let block_weight = u32::try_from((block.weight / keys).max(floor)).unwrap_or(u32::MAX);
         let row_weight = u32::try_from(row_weight.max(floor)).unwrap_or(u32::MAX);
@@ -372,7 +410,10 @@ impl RowGate {
             if !inside {
                 continue;
             }
-            if shadow.admit(&row, u64::from(row_weight)) {
+            // A row the shadow could never hold is refused with nothing
+            // remembered of it, as the cache refuses one heavier than it
+            // keeps.
+            if u64::from(row_weight) <= capacity && shadow.admit(&row, u64::from(row_weight)) {
                 shadow.insert_with_priority(row, row_weight, Priority::Normal);
                 events.row_fills += 1;
             } else {

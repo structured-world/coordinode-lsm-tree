@@ -991,8 +991,9 @@ impl Cache {
     }
 
     /// The heaviest entry this cache can actually keep resident: half of its
-    /// capacity, or all of it where the cache is one shard (below two
-    /// megabytes). Heavier inserts are refused by the cache; callers that would
+    /// capacity, or all of it where the cache is one shard (one built below
+    /// two megabytes: a later resize keeps its shards). Heavier inserts are
+    /// refused by the cache; callers that would
     /// build such an entry (e.g. the scan read-ahead) can skip the work. An
     /// entry within it is one the cache can hold, not one it always takes: a
     /// cache full of what outranks the entry refuses it too.
@@ -1230,9 +1231,9 @@ impl Cache {
     const fn count_dead(&self, _bytes: u64) {}
 
     /// The bytes that entries of deleted files held when the cache dropped
-    /// them, and the number of sweeps that dropped them, so far: what a cache
-    /// that left such entries to its eviction would have carried as dead
-    /// weight.
+    /// them, and the number of walks over the cache made for them, so far,
+    /// those that found nothing to drop among them: what a cache that left
+    /// such entries to its eviction would have carried as dead weight.
     #[cfg(feature = "metrics")]
     #[doc(hidden)]
     #[must_use]

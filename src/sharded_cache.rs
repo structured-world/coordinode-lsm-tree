@@ -164,8 +164,11 @@ impl Policy {
     /// The push follows the write of the entry with nothing reserved first,
     /// here and where an entry is promoted, evicted or its table rebuilt: no
     /// caller sees the state between the two. A push unwinds only past
-    /// `isize::MAX` bytes; an allocation that fails aborts under `std`, and
-    /// without it there is no `catch_unwind` to return from.
+    /// `isize::MAX` bytes, which no shard's queue reaches. An allocation
+    /// that fails goes to the allocation error handler, not to a panic of
+    /// this call: in a program that links `std`, whatever features this
+    /// crate is built with, the handler aborts, and a program that does not
+    /// has no `catch_unwind` to return from.
     fn enqueue(&mut self, node: Node, queue: Queue, weight: u64) {
         match queue {
             Queue::Main => {
@@ -600,8 +603,14 @@ impl<K: Eq, V> Shard<K, V> {
         // again, and what the shard holds past it evicted, before the shard
         // is published. Without it the shard kept what it grew by and the
         // large entry both until its next writer, if one came.
+        //
+        // Only a share that grew is taken up here. A smaller one is left to
+        // the shard's next writer: the insert of a large entry has its
+        // shards give up the share it is about to take, ahead of the tally
+        // read here, and a release that took the tally's share back would
+        // publish the room the entry was just given.
         let lent = large.load(Ordering::Relaxed).div_ceil(shards as u64);
-        if lent != write.policy().lent {
+        if lent > write.policy().lent {
             write.policy_mut().lent = lent;
             write.evict_to_capacity(&mut evicted);
         }
@@ -1368,6 +1377,25 @@ where
         self.shards
             .iter()
             .map(|shard| shard.0.len.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Sets how many keys the cache remembers having refused or evicted, all
+    /// shards together, to exactly `ghosts`: below the least a cache built
+    /// by [`Self::with_weighter`] keeps, for one whose memory is counted to
+    /// the byte.
+    pub(crate) fn set_ghosts(&self, ghosts: usize) {
+        let each = ghosts / self.shards.len();
+        for shard in &self.shards {
+            shard.0.table.lock().policy_mut().ghost_capacity = each;
+        }
+    }
+
+    /// Keys the cache remembers having refused or evicted now.
+    pub(crate) fn ghosts(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.0.table.lock().policy().ghost.len())
             .sum()
     }
 

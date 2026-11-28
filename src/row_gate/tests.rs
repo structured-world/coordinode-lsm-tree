@@ -160,27 +160,50 @@ fn a_load_timed_fast_does_not_make_a_miss_cheap() {
 }
 
 /// The shadows stay within a two-hundredth of the cache however small the
-/// rows: a tree of rows a tenth of the floor samples more sparsely and
-/// weighs its entries at no less than the floor allows.
+/// rows and the cache, their entries and the keys they remember having
+/// refused counted alike: a tree of rows a tenth of the floor samples more
+/// sparsely and weighs its entries at no less than the floor allows, and a
+/// shadow remembers a quarter as many keys as it can hold entries. A
+/// thousand remembered keys a shadow, whatever the cache, were 120 KiB by
+/// themselves: more than a 16 MiB cache's whole share.
 #[test]
 fn the_shadows_stay_within_a_two_hundredth_of_the_cache() {
-    for row in [24, 100, 300, 4_000] {
-        let gate = gate();
-        for n in 0..200_000 {
-            let key = hash(n) % 5_000_000;
-            let block = BlockSeen {
-                offset: key / 64 * 4_096,
-                weight: 4_096,
-            };
-            gate.observe(CACHE, 1, hash(key), row, block, 0, true);
+    for cache in [2 << 20, CACHE, 256 << 20] {
+        for row in [24, 100, 300, 4_000] {
+            let gate = gate();
+            for n in 0..200_000 {
+                let key = hash(n) % 5_000_000;
+                let block = BlockSeen {
+                    offset: key / 64 * 4_096,
+                    weight: 4_096,
+                };
+                gate.observe(cache, 1, hash(key), row, block, 0, true);
+            }
+            assert!(
+                gate.memory() <= cache / 200,
+                "a cache of {cache}, rows of {row}: {} bytes",
+                gate.memory(),
+            );
+            assert!(gate.memory() > 0, "a cache of {cache}, rows of {row}");
         }
-        assert!(
-            gate.memory() <= CACHE / 200,
-            "rows of {row}: {} bytes",
-            gate.memory(),
-        );
-        assert!(gate.memory() > 0);
     }
+}
+
+/// A cache whose shadows could hold only a handful of entries is not
+/// simulated: its tree keeps every key in the row cache and holds no shadow.
+#[test]
+fn a_cache_too_small_to_shadow_is_not_simulated() {
+    let gate = gate();
+    for n in 0..200_000 {
+        let key = hash(n) % 5_000_000;
+        let block = BlockSeen {
+            offset: key / 13 * 4_096,
+            weight: 4_096,
+        };
+        gate.observe(64 << 10, 1, hash(key), 300, block, 0, true);
+    }
+    assert_eq!(gate.memory(), 0);
+    assert_eq!(gate.eighths(), 8);
 }
 
 /// Where a cold load is slow, a block kept out of the cache by rows costs
