@@ -33,6 +33,71 @@ fn drains_queued_deletions_on_drop() {
     }
 }
 
+/// A deleter whose worker never started does its unlinks where they are
+/// asked for, so no directory entry is left behind, and leaves a deleted
+/// file's cache entries to the cache: the walk is not the caller's to pay.
+#[test]
+fn a_deleter_without_a_worker_unlinks_in_place_and_walks_no_cache() {
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::default());
+    let path = PathBuf::from("/f");
+    let mut f = fs
+        .open(&path, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let block = crate::table::Block {
+        header: crate::table::block::Header {
+            uncompressed_length: 64,
+            ..crate::table::block::Header::test_dummy(crate::table::block::BlockType::Data)
+        },
+        data: crate::Slice::from(&[0u8; 64][..]),
+    };
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(1 << 20));
+    let (table, at) = (
+        crate::table::GlobalTableId::from((5, 9)),
+        crate::table::BlockOffset(0),
+    );
+    cache.insert_block(table, at, block);
+
+    let deleter = BackgroundDeleter {
+        sender: None,
+        worker: None,
+        life: None,
+        owner: Some((Arc::clone(&cache), 5)),
+    };
+    deleter.enqueue(Arc::clone(&fs), path.clone());
+    assert!(fs.open(&path, &FsOpenOptions::new().read(true)).is_err());
+    // A file already gone is logged, not a failure of the caller.
+    deleter.enqueue(Arc::clone(&fs), path);
+
+    deleter.evict_table(9);
+    deleter.evict_blob_file(3);
+    assert!(cache.get_block(table, at).is_some(), "left to the cache");
+}
+
+/// A deleter with no cache to evict from takes an eviction for nothing, and
+/// one with an interval waits it out after each unlink.
+#[test]
+fn a_deleter_without_a_cache_ignores_evictions_and_paces_its_unlinks() {
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::default());
+    let path = PathBuf::from("/f");
+    let mut f = fs
+        .open(&path, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.flush().unwrap();
+    drop(f);
+    {
+        let deleter = BackgroundDeleter::new(Some(Duration::from_millis(1)));
+        deleter.evict_table(9);
+        deleter.evict_blob_file(3);
+        deleter.enqueue(Arc::clone(&fs), path.clone());
+    }
+    assert!(fs.open(&path, &FsOpenOptions::new().read(true)).is_err());
+}
+
 /// The tables a compaction drops each queue an eviction and then an unlink.
 /// The worker takes every eviction queued out in one walk over the cache,
 /// with the unlinks between them still done in their order: stopping at the

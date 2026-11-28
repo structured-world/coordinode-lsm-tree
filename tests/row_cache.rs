@@ -328,6 +328,13 @@ fn a_tree_replaying_evenly_drawn_keys_past_its_cache_gives_up_its_rows() {
         shares.iter().skip(8).all(|&share| share == 0),
         "closed by the ninth pass and stays closed: {shares:?}",
     );
+    // What the tree's simulation holds stays within a two-hundredth of the
+    // cache it plays in miniature.
+    let held = cache.row_gate_bytes(tree.id());
+    assert!(
+        held > 0 && held <= cache.capacity() / 200,
+        "{held} bytes of shadows"
+    );
 }
 
 /// A tree read key by key, round after round, through a cache that holds

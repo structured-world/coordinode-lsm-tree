@@ -370,6 +370,87 @@ fn main_queues_filled_after_a_large_entry_take_its_place() {
     assert_eq!(c.get(&1_000), None, "the large entry gave way");
 }
 
+/// A writer that does not wait takes a large entry in when every lock it
+/// needs is free.
+#[test]
+fn a_writer_that_does_not_wait_takes_a_large_entry_with_its_locks_free() {
+    let c = byte_cache(800);
+    c.try_insert_with_priority(1_000, vec![7u8; 400], Priority::Normal);
+    assert_eq!(c.get(&1_000), Some(vec![7u8; 400]));
+}
+
+/// The same writer drops the entry when its shard's lock is taken, and when
+/// another large insert is under way: it waits for neither.
+#[test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the locks are held across the inserts on purpose"
+)]
+fn a_writer_that_does_not_wait_drops_a_large_entry_at_a_taken_lock() {
+    let c = byte_cache(800);
+    let shard = &c.shards[c.index_of(c.hasher.hash_one(1_000u64))].0;
+    let held = c.lock(shard);
+    c.try_insert_with_priority(1_000, vec![7u8; 400], Priority::Normal);
+    c.release(shard, held, Evicted::new());
+    assert!(!c.contains(&1_000), "its shard's lock was taken");
+
+    let large = c.large.lock();
+    c.insert(1_000, vec![7u8; 400]);
+    drop(large);
+    assert!(!c.contains(&1_000), "a large insert was under way");
+}
+
+/// A writer that does not wait leaves the large entries of shards whose
+/// locks are taken where they are, when it looks for room and when it sweeps
+/// the queue.
+#[test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the lock is held across the inserts on purpose"
+)]
+fn a_writer_that_does_not_wait_passes_over_a_taken_shards_large_entries() {
+    // Two large entries of 300 in shards of their own, the cache's seven
+    // eighths nearly full of them.
+    let c = byte_cache(800);
+    let first = keys_of_shard(&c, 0, 1_000).next().unwrap();
+    let second = keys_of_shard(&c, 1, 1_000).next().unwrap();
+    let third = keys_of_shard(&c, 2, 1_000).next().unwrap();
+    c.insert(first, vec![1u8; 300]);
+    c.insert(second, vec![2u8; 300]);
+
+    // The oldest one's shard is taken: the third finds no room.
+    let shard = &c.shards[0].0;
+    let held = c.lock(shard);
+    c.try_insert_with_priority(third, vec![3u8; 300], Priority::Normal);
+    assert!(!c.contains(&third));
+    assert!(c.contains(&second));
+
+    // A key written over and over from such a writer sweeps the queue, the
+    // taken shard's node kept for the next sweep.
+    c.remove(&second);
+    for _ in 0..200 {
+        c.try_insert_with_priority(third, vec![3u8; 150], Priority::Normal);
+    }
+    let queued = c.large.lock().queue.len();
+    assert!(queued < 100, "{queued} nodes queued");
+    c.release(shard, held, Evicted::new());
+    assert!(c.contains(&first), "the taken shard's entry was left");
+    assert!(c.contains(&third));
+}
+
+/// A large entry that is not pinned finds no room in what a pinned one
+/// holds: an index or a filter is not evicted for a data block.
+#[test]
+fn a_large_entry_does_not_take_a_pinned_ones_room() {
+    let c = byte_cache(800);
+    c.insert_with_priority(1, vec![1u8; 400], Priority::High);
+    for _ in 0..8 {
+        c.insert(2, vec![2u8; 400]);
+    }
+    assert!(c.contains(&1), "the pinned entry stays");
+    assert!(!c.contains(&2));
+}
+
 /// A large entry that only just went in gives way too when a main queue
 /// grows into what its shard lends. Spared for its tenure, it left the cache
 /// over its capacity for as long as no further write came.

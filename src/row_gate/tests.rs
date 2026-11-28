@@ -28,6 +28,14 @@ fn read_evenly(gate: &RowGate, keys: u64, reads: u64, seed: u64) {
     }
 }
 
+/// A gate prints the fraction it holds, and nothing of its simulation.
+#[test]
+fn a_gate_prints_its_fraction() {
+    let gate = gate();
+    gate.set_eighths(4);
+    assert_eq!(format!("{gate:?}"), "RowGate { eighths: 4, .. }");
+}
+
 /// A shadow counts hits on rows of a hot set that fits it. Where the cache
 /// gave the same reads no row, as when a stream of blocks evicts each row
 /// before its key is read again, the tree gives its rows up in spite of the
