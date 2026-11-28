@@ -22,6 +22,53 @@ fn insert_get_roundtrip() {
     assert_eq!(c.get(&2), None);
 }
 
+/// Blocks that fill seven tenths of a small cache are all found once read:
+/// the cache is cut into shards large enough that the keys' uneven spread
+/// over them leaves none past its share. Cut into 64 shards whatever its
+/// size, a 4 MiB cache gave each shard room for fifteen blocks where eleven
+/// fell on average, the fullest shards evicted on every round, and a read in
+/// twenty-five missed in a cache a third empty.
+#[test]
+fn blocks_within_seven_tenths_of_a_small_cache_are_all_found() {
+    let capacity = 4 << 20;
+    let c = ShardedCache::with_weighter(
+        capacity,
+        shards_for(capacity, 64),
+        8_192,
+        LenWeighter,
+        FxBuildHasher,
+    );
+    // Offsets of compressed blocks in a table, as the block cache keys them:
+    // each block a little over or under half its 4 KiB.
+    let mut offset = 0u64;
+    let keys: alloc::vec::Vec<u64> = (0..700u64)
+        .map(|n| {
+            offset += 1_900 + n.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 500;
+            offset
+        })
+        .collect();
+    let mut missed = 0;
+    for round in 0..8 {
+        for &key in &keys {
+            if c.get(&key).is_none() {
+                missed += u64::from(round >= 4);
+                c.insert(key, vec![0u8; 4_150]);
+            }
+        }
+    }
+    assert_eq!(missed, 0, "of {} reads", 4 * keys.len());
+}
+
+/// The shard count follows the capacity: one shard below two megabytes, a
+/// megabyte or more to each above, and never more than asked.
+#[test]
+fn a_cache_is_cut_into_shards_of_a_megabyte_or_more() {
+    let counts = [0, 1 << 20, 2 << 20, 4 << 20, 16 << 20, 64 << 20, 1 << 30]
+        .map(|capacity| shards_for(capacity, 64));
+    assert_eq!(counts, [1, 1, 2, 4, 16, 64, 64]);
+    assert_eq!(shards_for(1 << 30, 16), 16);
+}
+
 /// One shard of 1000 bytes filled with ten entries of 100 bytes, so the next
 /// insert of 100 bytes has to evict.
 fn full_shard(ghost: usize) -> ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighter, FxBuildHasher> {
@@ -246,10 +293,235 @@ fn oversized_entry_is_rejected_without_evicting_residents() {
     let before = c.weight();
     assert!(before > 0);
 
-    // Heavier than any shard (100), lighter than the whole cache (800).
-    c.insert(1000, vec![0u8; 150]);
+    // Heavier than half the cache (400), lighter than all of it (800).
+    c.insert(1000, vec![0u8; 500]);
     assert_eq!(c.get(&1000), None, "an uncacheable entry is not admitted");
     assert_eq!(c.weight(), before, "the resident set is untouched");
+}
+
+/// An entry heavier than a shard and within half the cache is kept: found
+/// like any other, with every shard giving up a share of its bytes so the
+/// cache stays within its capacity.
+#[test]
+fn an_entry_heavier_than_a_shard_is_kept_within_the_capacity() {
+    // 800 bytes over 8 shards = 100 bytes per shard.
+    let c = byte_cache(800);
+    for k in 0..200u64 {
+        c.insert(k, vec![0u8; 10]);
+    }
+    assert!(c.weight() > 700, "the shards are near full");
+
+    c.insert(1_000, vec![7u8; 240]);
+    assert_eq!(c.get(&1_000), Some(vec![7u8; 240]));
+    assert!(c.weight() <= 800, "{} bytes resident", c.weight());
+    for shard in 0..8 {
+        let (_, resident) = c.shard_state(shard).unwrap();
+        assert!(resident <= 100 - 240 / 8, "shard {shard} holds {resident}");
+    }
+
+    c.remove(&1_000);
+    assert_eq!(c.get(&1_000), None);
+    for k in 1_000..1_200u64 {
+        c.insert(k, vec![0u8; 10]);
+    }
+    assert!(c.weight() > 700, "the shards took their bytes back");
+}
+
+/// A large key written over and over leaves one entry and a queue of a few
+/// nodes: each write left the node of the entry it replaced behind, and
+/// nothing dropped them while the large entries stayed within their limit.
+#[test]
+fn a_large_key_written_over_and_over_leaves_a_short_queue() {
+    let c = byte_cache(800);
+    for _ in 0..5_000 {
+        c.insert(1, vec![1u8; 150]);
+    }
+    assert_eq!(c.weight(), 150);
+    let queued = c.large.lock().queue.len();
+    assert!(queued < 100, "{queued} nodes queued for one entry");
+}
+
+/// A writer that does not wait fills its shard against the share the shard
+/// lends now. No waiting writer had visited the shards since the large entry
+/// went in, they still held the share they lent before it, none, and the
+/// entries taken on that brought the cache to more than its capacity.
+#[test]
+fn a_writer_that_does_not_wait_fills_within_what_its_shard_lends() {
+    let c = byte_cache(800);
+    c.insert(1_000, vec![7u8; 400]);
+    assert_eq!(c.weight(), 400);
+    for k in 0..200u64 {
+        c.try_insert_with_priority(k, vec![0u8; 80], Priority::Normal);
+    }
+    assert!(c.weight() <= 800, "{} bytes resident", c.weight());
+}
+
+/// Entries that outrank a large one, taken into the main queues after it
+/// went in, take its place: the cache holds its capacity, not the main
+/// queues and the large entry both.
+#[test]
+fn main_queues_filled_after_a_large_entry_take_its_place() {
+    let c = byte_cache(800);
+    c.insert(1_000, vec![7u8; 300]);
+    for k in 0..400u64 {
+        c.insert_with_priority(k, vec![0u8; 50], Priority::High);
+    }
+    assert!(c.weight() <= 800, "{} bytes resident", c.weight());
+    assert_eq!(c.get(&1_000), None, "the large entry gave way");
+}
+
+/// A cache shrunk to where its main queues and its large entries do not both
+/// fit keeps the main queues: each shard keeps its main queue whatever it
+/// lends, and a large entry within the large entries' own limit stayed too.
+#[test]
+fn a_shrink_keeps_the_cache_within_its_new_capacity() {
+    // 800 bytes over 8 shards: a large entry of 300 and one entry of 50 in
+    // each shard's main queue, 700 in all.
+    let c = byte_cache(800);
+    c.insert(1_000, vec![7u8; 300]);
+    for k in 0..400u64 {
+        let shard = c.index_of(c.hasher.hash_one(k));
+        if c.shard_state(shard)
+            .is_some_and(|(_, resident)| resident == 0)
+        {
+            c.insert_with_priority(k, vec![0u8; 50], Priority::High);
+        }
+    }
+    assert_eq!(c.weight(), 700);
+
+    // At 600 the large entry is within the large entries' seven eighths and
+    // each shard keeps its main queue: 700 again, unless one gives way.
+    c.set_capacity(600);
+    assert!(c.weight() <= 600, "{} bytes resident", c.weight());
+    assert_eq!(c.get(&1_000), None, "the large entry gave way");
+}
+
+/// Large entries are evicted among themselves, the unread ones first, so
+/// they never take more than half the cache.
+#[test]
+fn large_entries_evict_the_unread_among_them() {
+    let c = byte_cache(800);
+    c.insert(1, vec![1u8; 300]);
+    c.insert(2, vec![2u8; 300]);
+    assert!(c.get(&1).is_some(), "read once since it went in");
+
+    // Seven eighths of the cache hold two of them: the third takes the
+    // unread one's place, once that one has been in for a few inserts that
+    // needed room.
+    c.insert(3, vec![3u8; 300]);
+    assert_eq!(c.get(&3), None, "the unread one has only just gone in");
+    for _ in 0..4 {
+        c.insert(3, vec![3u8; 300]);
+    }
+    assert_eq!(c.get(&1), Some(vec![1u8; 300]), "the read one stays");
+    assert_eq!(c.get(&2), None, "the unread one went");
+    assert_eq!(c.get(&3), Some(vec![3u8; 300]));
+    assert_eq!(c.weight(), 600);
+}
+
+/// Keys read in a round a little larger than the cache holds are found on
+/// most reads: the entries held stay for many rounds. Evicting the oldest for
+/// each miss would evict, every time, the key the round reads next, and no
+/// read would find its entry, while paying an insert and an eviction each.
+#[test]
+fn a_round_of_large_keys_larger_than_the_cache_is_mostly_found() {
+    // 8 MiB over 8 shards; entries of 600 KiB are large and eleven fit the
+    // 7 MiB they may weigh. The round has thirteen keys.
+    let c = byte_cache(8 << 20);
+    let mut found = 0;
+    for round in 0..40 {
+        for key in 0..13u64 {
+            if c.get(&key).is_some() {
+                found += usize::from(round >= 20);
+            } else {
+                c.insert(key, vec![0u8; 600 << 10]);
+            }
+        }
+    }
+    // Eleven of thirteen held: at least nine of each round's reads found,
+    // over the last twenty rounds.
+    assert!(found >= 20 * 9, "{found} of 260 reads found their entry");
+}
+
+/// A round four times what the cache holds still leaves a set of entries in
+/// place that each round finds: an entry read once a round keeps its credit
+/// through the round's misses, which outnumber the entries held three to one.
+#[test]
+fn a_round_of_large_keys_four_times_the_cache_keeps_a_set_in_use() {
+    // Eleven entries of 600 KiB fit; the round has forty-four keys.
+    let c = byte_cache(8 << 20);
+    let mut found = 0;
+    for round in 0..80 {
+        for key in 0..44u64 {
+            if c.get(&key).is_some() {
+                found += usize::from(round >= 60);
+            } else {
+                c.insert(key, vec![0u8; 600 << 10]);
+            }
+        }
+    }
+    // A quarter of the keys can be held at best: eleven of each round's.
+    assert!(found >= 20 * 6, "{found} of 880 reads found their entry");
+}
+
+/// Entries heavier than half a shard do not depend on which shard their keys
+/// fall in: a shard holds one of them at most, so kept in the shards two
+/// that share one would evict each other in a cache with room for both.
+#[test]
+fn entries_heavier_than_half_a_shard_all_stay_while_the_cache_has_room() {
+    // 8 MiB over 8 shards = 1 MiB a shard; ten entries of 600 KiB.
+    let c = byte_cache(8 << 20);
+    for key in 0..10u64 {
+        c.insert(key, vec![0u8; 600 << 10]);
+    }
+    assert!((0..10u64).all(|key| c.contains(&key)), "6 of 7 MiB");
+    assert_eq!(c.weight(), 10 * (600 << 10));
+}
+
+/// A block of half a shard in a cache too small for more stays in its
+/// shard's own queues, which keep index and filter blocks over data blocks:
+/// only entries of a blob frame's size and up go the large entries' way.
+#[test]
+fn an_ordinary_block_of_half_a_shard_is_not_a_large_entry() {
+    // 64 KiB over 8 shards = 8 KiB a shard; blocks of 5 KiB.
+    let c = byte_cache(64 << 10);
+    for key in 0..64u64 {
+        c.insert(key, vec![0u8; 5 << 10]);
+    }
+    // One to a shard: eight at most, where the large entries' 56 KiB would
+    // hold eleven.
+    assert!(c.len() <= 8, "{} blocks kept", c.len());
+    assert!(c.weight() <= 64 << 10);
+}
+
+/// A key's entry replaced across the line between the two kinds keeps the
+/// cache's weight what its entries weigh.
+#[test]
+fn replacing_between_large_and_small_keeps_the_weight() {
+    let c = byte_cache(800);
+    c.insert(1, vec![0u8; 150]);
+    assert_eq!(c.weight(), 150);
+    c.insert(1, vec![0u8; 20]);
+    assert_eq!((c.weight(), c.len()), (20, 1));
+    c.insert(1, vec![0u8; 300]);
+    assert_eq!((c.weight(), c.len()), (300, 1));
+    assert_eq!(c.get(&1), Some(vec![0u8; 300]));
+    c.set_capacity(200);
+    assert_eq!(c.get(&1), None, "heavier than the shrunk cache");
+    assert_eq!(c.weight(), 0);
+}
+
+/// A first miss of a large entry is taken at once only while the whole
+/// cache has its bytes free; past that, on its second miss.
+#[test]
+fn a_large_miss_is_admitted_with_room_or_on_its_repeat() {
+    let c = byte_cache(800);
+    assert!(c.admit(&1, 150), "the cache is empty");
+    for k in 0..200u64 {
+        c.insert(k, vec![0u8; 10]);
+    }
+    assert!(!c.admit(&1_000, 150), "a first miss with no room");
+    assert!(c.admit(&1_000, 150), "the miss repeated");
 }
 
 #[test]
@@ -352,20 +624,9 @@ fn high_priority_replace_keeps_per_queue_tallies_consistent() {
         c.insert(i, vec![0u8; 100]);
     }
 
-    // Recompute the per-queue tallies from the map and compare to the
-    // running counters: they must match exactly. Read everything under a
-    // tightly-scoped guard, then assert after it is dropped.
-    let (small_bytes, main_bytes, small, main) = {
-        let shard = c.shards[0].0.read();
-        let (mut small, mut main) = (0u64, 0u64);
-        for (_, slot) in &shard.map {
-            match slot.loc {
-                Location::Small => small += slot.weight,
-                Location::Main => main += slot.weight,
-            }
-        }
-        (shard.small_bytes, shard.main_bytes, small, main)
-    };
+    // Recompute the per-queue tallies from the entries and compare to the
+    // running counters: they must match exactly.
+    let [small_bytes, main_bytes, small, main] = c.queue_tallies(0).expect("one shard");
     assert_eq!(small_bytes, small, "small_bytes tally drifted");
     assert_eq!(main_bytes, main, "main_bytes tally drifted");
 }
@@ -466,7 +727,8 @@ fn shrinking_to_a_quarter_evicts_down_to_it_and_keeps_hot_entries() {
 
     c.set_capacity(16_000);
     assert_eq!(c.capacity(), 16_000);
-    assert_eq!(c.max_entry_weight(), 4_000);
+    assert_eq!(c.shard_capacity(), 4_000);
+    assert_eq!(c.max_entry_weight(), 8_000);
     assert!(c.weight() <= 16_000, "{} bytes left", c.weight());
 
     let (hot_kept, cold_kept) =
@@ -497,7 +759,7 @@ fn growing_evicts_nothing_and_the_cache_fills_to_the_new_capacity() {
 
     c.set_capacity(32_000);
     assert_eq!((c.weight(), c.len()), before, "growing evicted");
-    assert_eq!(c.max_entry_weight(), 4_000);
+    assert_eq!(c.shard_capacity(), 4_000);
     for key in 1_000..2_000u64 {
         c.insert(key, vec![0u8; 100]);
     }
@@ -518,10 +780,10 @@ fn after_a_shrink_an_entry_heavier_than_the_new_shard_is_refused() {
     let c = byte_cache(80_000);
     c.insert(1, vec![1u8; 100]);
     c.set_capacity(8_000);
-    c.insert(1, vec![2u8; 2_000]);
-    c.insert(2, vec![2u8; 2_000]);
+    c.insert(1, vec![2u8; 5_000]);
+    c.insert(2, vec![2u8; 5_000]);
     assert_eq!(c.get(&1), Some(vec![1u8; 100]), "the old value stays");
-    assert_eq!(c.get(&2), None, "heavier than the 1,000-byte shard");
+    assert_eq!(c.get(&2), None, "heavier than half the 8,000 bytes");
 }
 
 /// The values a shrink evicts are dropped once each, and those a reader
@@ -590,16 +852,214 @@ fn resizes_racing_reads_and_inserts_settle_on_the_last_capacity() {
         handle.join().expect("thread panicked");
     }
 
-    assert_eq!(cache.max_entry_weight(), cache.capacity().div_ceil(8));
-    for shard in &cache.shards {
-        let (capacity, resident) = {
-            let core = shard.0.read();
-            (core.capacity, core.resident_bytes())
-        };
-        assert_eq!(capacity, cache.max_entry_weight());
+    assert_eq!(cache.shard_capacity(), cache.capacity().div_ceil(8));
+    for shard in 0..cache.shards.len() {
+        let (capacity, resident) = cache.shard_state(shard).expect("a shard of the cache");
+        assert_eq!(capacity, cache.shard_capacity());
         assert!(resident <= capacity);
     }
     assert_eq!(cache.weight(), cache.len() as u64 * 64);
+}
+
+/// A key replaced over and over is found by every read made meanwhile, with
+/// one of the values written: the new slot takes the old one's place in the
+/// chain, so no read walks past both.
+#[cfg(feature = "std")]
+#[test]
+fn a_read_racing_replaces_of_its_key_always_finds_a_value() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+
+    let cache = Arc::new(ShardedCache::with_weighter(
+        1 << 20,
+        1,
+        1024,
+        LenWeighter,
+        FxBuildHasher,
+    ));
+    // Neighbours in the one shard, so the key's chain is not it alone.
+    for key in 0..64u64 {
+        cache.insert(key, vec![0u8; 8]);
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    // Readers that have made their first read: the writer starts once all
+    // have, so every reader reads while it writes however threads are run.
+    let reading = Arc::new(AtomicUsize::new(0));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (cache, done, reading) =
+                (Arc::clone(&cache), Arc::clone(&done), Arc::clone(&reading));
+            thread::spawn(move || {
+                let mut reads = 0u64;
+                loop {
+                    let value = cache.get(&7).expect("the key is always resident");
+                    assert!(value.iter().all(|&byte| byte == value[0]), "a torn value");
+                    reads += 1;
+                    if reads == 1 {
+                        reading.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if done.load(Ordering::Relaxed) {
+                        return reads;
+                    }
+                }
+            })
+        })
+        .collect();
+    while reading.load(Ordering::Relaxed) < readers.len() {
+        thread::yield_now();
+    }
+    for round in 0..50_000u32 {
+        cache.insert(7, vec![round.to_le_bytes()[0]; 8]);
+    }
+    done.store(true, Ordering::Relaxed);
+    for reader in readers {
+        assert!(reader.join().expect("reader panicked") > 0);
+    }
+    assert_eq!((cache.len(), cache.weight()), (64, 64 * 8));
+}
+
+/// Entries resident before a shard's table grows are found by every read
+/// made while it grows: a read that walked links the rebuild moved looks
+/// again instead of answering that the key is gone.
+#[cfg(feature = "std")]
+#[test]
+fn a_read_racing_the_tables_growth_finds_what_was_resident() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+
+    let cache = Arc::new(ShardedCache::with_weighter(
+        1 << 30,
+        1,
+        1024,
+        LenWeighter,
+        FxBuildHasher,
+    ));
+    for key in 0..32u64 {
+        cache.insert(key, vec![1u8; 8]);
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    // As above: the table grows only once every reader is reading.
+    let reading = Arc::new(AtomicUsize::new(0));
+    let readers: Vec<_> = (0..4u64)
+        .map(|t| {
+            let (cache, done, reading) =
+                (Arc::clone(&cache), Arc::clone(&done), Arc::clone(&reading));
+            thread::spawn(move || {
+                let mut key = t;
+                loop {
+                    assert!(cache.contains(&(key % 32)), "key {} lost", key % 32);
+                    if key == t {
+                        reading.fetch_add(1, Ordering::Relaxed);
+                    }
+                    key += 1;
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+            })
+        })
+        .collect();
+    while reading.load(Ordering::Relaxed) < readers.len() {
+        thread::yield_now();
+    }
+    // Doubles the buckets a dozen times over.
+    for key in 1_000..60_000u64 {
+        cache.insert(key, vec![2u8; 8]);
+    }
+    done.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().expect("reader panicked");
+    }
+    assert_eq!(cache.len(), 32 + 59_000);
+}
+
+/// Values read, replaced, removed and evicted from several threads at once
+/// are each dropped once: by the writer that took the entry out, or by the
+/// last reader that held its slot.
+#[cfg(feature = "std")]
+#[test]
+fn values_under_concurrent_reads_and_writes_are_each_dropped_once() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    let drops = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let made = alloc::sync::Arc::new(AtomicUsize::new(0));
+    // Two shards of 2,000: forty entries of 100 fill the cache, so inserts
+    // evict throughout.
+    let cache = alloc::sync::Arc::new(ShardedCache::with_weighter(
+        4_000,
+        2,
+        1024,
+        CountedWeight,
+        FxBuildHasher,
+    ));
+    let workers: Vec<_> = (0..8u64)
+        .map(|t| {
+            let (cache, drops, made) = (
+                alloc::sync::Arc::clone(&cache),
+                alloc::sync::Arc::clone(&drops),
+                alloc::sync::Arc::clone(&made),
+            );
+            thread::spawn(move || {
+                for i in 0..20_000u64 {
+                    let key = (t * 31 + i) % 97;
+                    match (t + i) % 5 {
+                        0 | 1 => {
+                            made.fetch_add(1, Ordering::Relaxed);
+                            cache.insert(
+                                key,
+                                alloc::sync::Arc::new(Counted {
+                                    weight: 100,
+                                    drops: alloc::sync::Arc::clone(&drops),
+                                }),
+                            );
+                        }
+                        2 | 3 => {
+                            if let Some(value) = cache.get(&key) {
+                                assert_eq!(value.weight, 100);
+                            }
+                        }
+                        _ => cache.remove(&key),
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("worker panicked");
+    }
+
+    assert_eq!(cache.weight(), cache.len() as u64 * 100);
+    assert!(cache.weight() <= 4_000);
+    assert_eq!(
+        drops.load(Ordering::Relaxed) + cache.len(),
+        made.load(Ordering::Relaxed),
+        "every value not resident was dropped once"
+    );
+    drop(cache);
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        made.load(Ordering::Relaxed),
+        "each value once"
+    );
+}
+
+/// A shard that never fills keeps no more stale queue nodes than a small
+/// multiple of what it holds, however often its entries are replaced: no
+/// eviction pops them there.
+#[test]
+fn replacing_in_a_shard_that_never_fills_does_not_grow_its_queues() {
+    let c = ShardedCache::with_weighter(1 << 20, 1, 1024, LenWeighter, FxBuildHasher);
+    for round in 0..10_000u64 {
+        c.insert(round % 4, vec![0u8; 8]);
+    }
+    let queued = c.queued_nodes(0).expect("one shard");
+    assert!(
+        queued <= 2 * 4 + 16 + 1,
+        "{queued} nodes queued for 4 entries"
+    );
 }
 
 /// A value of some weight that counts its drops.

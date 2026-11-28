@@ -770,8 +770,43 @@ fn rocksdb_options(
     hash_index: bool,
     blob_files: Option<BlobCodec>,
 ) -> rocksdb::Options {
+    rocksdb_options_cached(compression, hash_index, blob_files, CACHE_BYTES)
+}
+
+/// The block cache of both engines in every group but the batched reads of
+/// large values, which hold [`BATCH_CACHE_BYTES`].
+const CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The block cache of both engines in the batched reads of 1 and 4 MiB values:
+/// above the 64 MiB one batch reads, so each engine can keep a whole batch
+/// within its capacity and the group compares their batched reads, not what
+/// each does with blocks it has no room for.
+const BATCH_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The block cache under study: `COMPARE_CACHE_BYTES` bytes in every group
+/// and on both engines, in place of each group's own size. A run with a
+/// cache far below the data reads through misses, inserts and evictions,
+/// which no published group does. A value that is not a byte count stops
+/// the run, as `COMPARE_SIZES` does.
+fn cache_bytes_or(group: u64) -> u64 {
+    std::env::var("COMPARE_CACHE_BYTES").map_or(group, |v| {
+        v.parse()
+            .unwrap_or_else(|_| panic!("COMPARE_CACHE_BYTES: not a byte count: {v}"))
+    })
+}
+
+/// [`rocksdb_options`] with a block cache of `cache_bytes`.
+fn rocksdb_options_cached(
+    compression: Compression,
+    hash_index: bool,
+    blob_files: Option<BlobCodec>,
+    cache_bytes: u64,
+) -> rocksdb::Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
-    let cache = rocksdb::Cache::new_hyper_clock_cache(16 * 1024 * 1024, 0);
+    let cache = rocksdb::Cache::new_hyper_clock_cache(
+        usize::try_from(cache_bytes_or(cache_bytes)).expect("cache size fits usize"),
+        0,
+    );
     block_opts.set_block_cache(&cache);
     block_opts.set_ribbon_filter(10.0);
     if hash_index {
@@ -878,6 +913,38 @@ fn ours_config(
     strategy: IndexStrategy,
     row_cache: bool,
 ) -> Config {
+    ours_config_cached(
+        dir,
+        compression,
+        kv_separated,
+        strategy,
+        if row_cache { Rows::Chosen } else { Rows::Off },
+        CACHE_BYTES,
+    )
+}
+
+/// What our engine's cache does with rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    /// No row cache.
+    Off,
+    /// The library default: each tree chooses the share of its keys that goes
+    /// through the row cache.
+    Chosen,
+    /// Every key through the row cache.
+    All,
+}
+
+/// [`ours_config`] with a block cache of `cache_bytes` that treats rows as
+/// `rows` says.
+fn ours_config_cached(
+    dir: &std::path::Path,
+    compression: Compression,
+    kv_separated: Option<BlobCodec>,
+    strategy: IndexStrategy,
+    rows: Rows,
+    cache_bytes: u64,
+) -> Config {
     let config = Config::new(
         dir,
         SequenceNumberCounter::default(),
@@ -898,10 +965,18 @@ fn ours_config(
     // the row cache for the plain, hash-index and ribbon arms too, and their
     // timed reads would then all be row-cache hits. The variants this suite
     // exists to separate would collapse into one, and the published numbers
-    // would say the wrong thing about every one of them. 16 MiB either way,
-    // matching the library default capacity.
+    // would say the wrong thing about every one of them. The same capacity
+    // either way: 16 MiB, the library default, in every group but the batched
+    // reads of large values.
+    //
+    // The point reads' `ours` arm is the library default, where a tree chooses
+    // the share of its keys that goes through the row cache; beside it one arm
+    // sends every key through and one keeps no rows, so a run shows what the
+    // tree's own choice costs or saves against both.
     let config = config.use_cache(std::sync::Arc::new(
-        lsm_tree::Cache::with_capacity_bytes(16 * 1024 * 1024).with_row_cache(row_cache),
+        lsm_tree::Cache::with_capacity_bytes(cache_bytes_or(cache_bytes))
+            .with_row_cache(rows != Rows::Off)
+            .with_adaptive_row_cache(rows != Rows::All),
     ));
     // Data-block hash index: a point get resolves a key to its in-block offset
     // by hash instead of binary-searching the restart array. 1.33 buckets/entry
@@ -1212,30 +1287,58 @@ fn point_read_variant(
     // data-block index, plus — when `hash_overlays` is set — the data-block
     // hash index (ours + RocksDB) and the retrieval-ribbon locator (ours only)
     // as additional index strategies on the same chart.
-    // Tuple: (label, engine, index strategy, row_cache). The row cache is a cache
-    // property orthogonal to the index strategy, so it rides as a 4th field.
-    let mut series: Vec<(&str, Engine, IndexStrategy, bool)> = spec
+    // Tuple: (label, engine, index strategy, rows). What the cache does with
+    // rows is orthogonal to the index strategy, so it rides as a 4th field.
+    //
+    // With the overlays, `ours` is the library default: a key->value cache in
+    // front of the blocks for the share of its keys the tree chooses, so a
+    // repeat point read of one skips the index walk and the block decode.
+    // `ours-row-cache-on` sends every key through it and `ours-row-cache-off`
+    // none; the index strategies are measured with no rows, or every one of
+    // them would read as a row hit.
+    let mut series: Vec<(&str, Engine, IndexStrategy, Rows)> = spec
         .engines
         .iter()
-        .map(|&engine| (engine.label(), engine, IndexStrategy::Binary, false))
+        .map(|&engine| {
+            let rows = if hash_overlays && engine == Engine::Ours {
+                Rows::Chosen
+            } else {
+                Rows::Off
+            };
+            (engine.label(), engine, IndexStrategy::Binary, rows)
+        })
         .collect();
     if hash_overlays {
         series.push((
             "ours-hash-index",
             Engine::Ours,
             IndexStrategy::HashIndex,
-            false,
+            Rows::Off,
         ));
         series.push((
             "rocksdb-hash-index",
             Engine::RocksDb,
             IndexStrategy::HashIndex,
-            false,
+            Rows::Off,
         ));
-        series.push(("ours-ribbon", Engine::Ours, IndexStrategy::Ribbon, false));
-        // Row cache: binary-search index + a key->value cache in front, so a
-        // repeat point read skips the index walk + data-block decode entirely.
-        series.push(("ours-row-cache", Engine::Ours, IndexStrategy::Binary, true));
+        series.push((
+            "ours-ribbon",
+            Engine::Ours,
+            IndexStrategy::Ribbon,
+            Rows::Off,
+        ));
+        series.push((
+            "ours-row-cache-on",
+            Engine::Ours,
+            IndexStrategy::Binary,
+            Rows::All,
+        ));
+        series.push((
+            "ours-row-cache-off",
+            Engine::Ours,
+            IndexStrategy::Binary,
+            Rows::Off,
+        ));
     }
     series.retain(|&(label, ..)| run.wants_engine(label));
 
@@ -1245,9 +1348,16 @@ fn point_read_variant(
         // for reads, never for open / write / flush.
         let warm: Vec<(&'static str, WarmEngine)> = series
             .iter()
-            .map(|&(label, engine, strategy, row_cache)| {
-                let warm =
-                    WarmEngine::build(engine, compression, strategy, row_cache, &inputs, seeds);
+            .map(|&(label, engine, strategy, rows)| {
+                let warm = WarmEngine::build(
+                    engine,
+                    compression,
+                    strategy,
+                    rows,
+                    CACHE_BYTES,
+                    &inputs,
+                    seeds,
+                );
                 verify_point_reads(&warm, &inputs);
                 (label, warm)
             })
@@ -1261,6 +1371,175 @@ fn point_read_variant(
             })
             .collect();
         run.measure(group_name, n, arms);
+    }
+}
+
+/// How the keys of a drawn point-read pass are chosen.
+#[derive(Clone, Copy)]
+enum Draw {
+    /// Every draw any key, evenly.
+    Uniform,
+    /// Zipf with exponent 0.99 over the keys.
+    Zipf,
+    /// Nine draws in ten from a hundredth of the keys, the tenth from any.
+    Hot,
+    /// The first half of a pass as [`Draw::Hot`], the second as
+    /// [`Draw::Uniform`]: the reads change under the cache twice a pass.
+    Phase,
+}
+
+impl Draw {
+    const ALL: [Self; 4] = [Self::Uniform, Self::Zipf, Self::Hot, Self::Phase];
+
+    /// The key counts the drawn reads run at: the largest of the other read
+    /// groups, and one far past what the cache holds.
+    const SIZES: &'static [u64] = &[70_000, 1_000_000];
+
+    fn group(self) -> &'static str {
+        match self {
+            Self::Uniform => "point_read_uniform",
+            Self::Zipf => "point_read_zipf",
+            Self::Hot => "point_read_hot",
+            Self::Phase => "point_read_phase",
+        }
+    }
+
+    /// The keys one pass over `n` keys reads, as indices: `n` draws, so a
+    /// pass costs what a pass over every key does and the time per read is
+    /// the pass's time over `n`.
+    fn order(self, n: u64) -> Vec<u32> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let hot = (n / 100).max(1);
+        // The cumulative weight of the first k ranks, for the Zipf draws.
+        let cumulative: Vec<f64> = match self {
+            Self::Zipf => (1..=n)
+                .scan(0.0_f64, |sum, rank| {
+                    *sum += (rank as f64).powf(-0.99);
+                    Some(*sum)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        (0..n)
+            .map(|at| {
+                let any = next() % n;
+                let kind = match self {
+                    Self::Phase if at < n / 2 => Self::Hot,
+                    Self::Phase => Self::Uniform,
+                    kind => kind,
+                };
+                let key = match kind {
+                    Self::Uniform | Self::Phase => any,
+                    Self::Hot if next() % 10 == 0 => any,
+                    Self::Hot => any % hot,
+                    Self::Zipf => {
+                        let total = cumulative.last().copied().unwrap_or(1.0);
+                        let aim = (next() >> 11) as f64 / (1u64 << 53) as f64 * total;
+                        (cumulative.partition_point(|&sum| sum < aim) as u64).min(n - 1)
+                    }
+                };
+                u32::try_from(key).expect("a key index fits u32")
+            })
+            .collect()
+    }
+}
+
+/// Workload: point reads of keys drawn as `draw` says, from engines kept warm
+/// as [`point_read_variant`] keeps them.
+///
+/// The arms are our engine with the library default, where the tree chooses
+/// the share of its keys that goes through the row cache, with every key
+/// through it, with no rows, and RocksDB. A pass makes as many reads as there
+/// are keys.
+fn point_read_drawn(run: &mut Run, draw: Draw, seeds: &mut SeedStates) {
+    let group_name = draw.group();
+    if !run.wants(group_name) {
+        return;
+    }
+    let none = Compression::None;
+    let series: Vec<(&str, Engine, Rows)> = [
+        ("ours", Engine::Ours, Rows::Chosen),
+        ("ours-row-cache-on", Engine::Ours, Rows::All),
+        ("ours-row-cache-off", Engine::Ours, Rows::Off),
+        ("rocksdb", Engine::RocksDb, Rows::Off),
+    ]
+    .into_iter()
+    .filter(|&(label, ..)| run.wants_engine(label))
+    .collect();
+    for n in run.sizes_of(Draw::SIZES) {
+        let inputs = WorkloadInputs::of(n, Values::Pool);
+        let order = draw.order(n);
+        let warm: Vec<(&'static str, WarmEngine)> = series
+            .iter()
+            .map(|&(label, engine, rows)| {
+                let warm = WarmEngine::build(
+                    engine,
+                    none,
+                    IndexStrategy::Binary,
+                    rows,
+                    CACHE_BYTES,
+                    &inputs,
+                    seeds,
+                );
+                // Every key present with its value, checked before the
+                // rounds as the other point reads check it: the timed
+                // routine takes whatever a read returns.
+                verify_point_reads(&warm, &inputs);
+                (label, warm)
+            })
+            .collect();
+        let arms = warm
+            .iter()
+            .map(|(label, warm)| paired::Arm {
+                label,
+                routine: drawn_read_routine(warm, &inputs, &order),
+                metrics: None,
+            })
+            .collect();
+        run.measure(group_name, n, arms);
+    }
+}
+
+/// One `get` per index of `order`, timed.
+fn drawn_read_routine<'a>(
+    warm: &'a WarmEngine,
+    inputs: &'a WorkloadInputs,
+    order: &'a [u32],
+) -> paired::Routine<'a> {
+    let key = move |at: u32| &inputs.keys[usize::try_from(at).expect("an index fits usize")];
+    match warm {
+        WarmEngine::Ours { tree, .. } => Box::new(move |iters| {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                for &at in order {
+                    let got = tree.get(key(at), MAX_SEQNO).expect("ours: get");
+                    std::hint::black_box(got);
+                }
+            }
+            start.elapsed()
+        }),
+        WarmEngine::RocksDb { db, .. } => {
+            let read_opts = rocksdb_read_options();
+            Box::new(move |iters| {
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    for &at in order {
+                        let got = db
+                            .get_pinned_opt(key(at), &read_opts)
+                            .expect("rocksdb: get");
+                        std::hint::black_box(got);
+                    }
+                }
+                start.elapsed()
+            })
+        }
+        WarmEngine::SurrealKv { .. } => unreachable!("the drawn reads run ours and RocksDB"),
     }
 }
 
@@ -1550,7 +1829,11 @@ fn open_rocksdb(
     hash_index: bool,
     blob_files: Option<BlobCodec>,
 ) -> rocksdb::DB {
-    let opts = rocksdb_options(compression, hash_index, blob_files);
+    open_rocksdb_with(dir, &rocksdb_options(compression, hash_index, blob_files))
+}
+
+/// Opens the RocksDB instance at `dir` with `opts`.
+fn open_rocksdb_with(dir: &std::path::Path, opts: &rocksdb::Options) -> rocksdb::DB {
     // Open through a column-family descriptor that carries the SAME options:
     // the default CF is what every read hits, and the descriptor form is what
     // makes `cf_handle(DEFAULT)` exist for `batched_multi_get_cf`. `DB::open_cf`
@@ -1559,7 +1842,7 @@ fn open_rocksdb(
     // to the data.
     let default_cf =
         rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
-    rocksdb::DB::open_cf_descriptors(&opts, dir, [default_cf]).expect("rocksdb: open")
+    rocksdb::DB::open_cf_descriptors(opts, dir, [default_cf]).expect("rocksdb: open")
 }
 
 /// Opens a RocksDB instance at `dir` with the matched options, populates
@@ -1831,6 +2114,9 @@ fn bench_seeded(run: &mut Run) {
         false,
         &mut seeds,
     );
+    for draw in Draw::ALL {
+        point_read_drawn(run, draw, &mut seeds);
+    }
     // The cold reads run the head-to-head arms on both table codecs: a cold
     // read is where blob files and tables meet the device.
     let cold = Spec {
@@ -1849,8 +2135,22 @@ fn bench_seeded(run: &mut Run) {
             &mut seeds,
         );
     }
-    multi_get_variant(run, "multi_get", none, Spec::reads(none), &mut seeds);
-    multi_get_variant(run, "multi_get_zstd22", zstd, Spec::reads(zstd), &mut seeds);
+    multi_get_variant(
+        run,
+        "multi_get",
+        none,
+        Spec::reads(none),
+        CACHE_BYTES,
+        &mut seeds,
+    );
+    multi_get_variant(
+        run,
+        "multi_get_zstd22",
+        zstd,
+        Spec::reads(zstd),
+        CACHE_BYTES,
+        &mut seeds,
+    );
     range_scan_variant(run, "range_scan", none, Spec::reads(none), &mut seeds);
     range_scan_variant(
         run,
@@ -1891,7 +2191,14 @@ fn bench_seeded(run: &mut Run) {
             false,
             &mut seeds,
         );
-        multi_get_variant(run, &format!("multi_get{suffix}"), none, spec, &mut seeds);
+        multi_get_variant(
+            run,
+            &format!("multi_get{suffix}"),
+            none,
+            spec,
+            BATCH_CACHE_BYTES,
+            &mut seeds,
+        );
         range_scan_variant(run, &format!("range_scan{suffix}"), none, spec, &mut seeds);
         overwrite_variant(run, &format!("overwrite{suffix}"), none, spec, &mut seeds);
     }
@@ -1925,36 +2232,41 @@ enum WarmEngine {
 impl WarmEngine {
     /// Builds the warm state for `engine` with the matched per-engine
     /// configuration (`compression` on both; `strategy` selects the data-block
-    /// hash index on both ours and RocksDB, ribbon / `row_cache` are ours-only).
+    /// hash index on both ours and RocksDB, ribbon / `rows` are ours-only),
+    /// and a block cache of `cache_bytes` on both.
     fn build(
         engine: Engine,
         compression: Compression,
         strategy: IndexStrategy,
-        row_cache: bool,
+        rows: Rows,
+        cache_bytes: u64,
         inputs: &WorkloadInputs,
         seeds: &mut SeedStates,
     ) -> Self {
         match engine {
             Engine::Ours | Engine::BlobTree(_) => {
                 let dir = copy_of(seeds.seed(engine, compression, strategy, inputs));
-                let tree = open_ours(
+                let tree = ours_config_cached(
                     dir.path(),
                     compression,
                     engine.kv_separated(),
                     strategy,
-                    row_cache,
+                    rows,
+                    cache_bytes,
                 )
+                .open()
                 .expect("ours: open");
                 Self::Ours { tree, _dir: dir }
             }
             Engine::RocksDb | Engine::RocksDbBlob(_) => {
                 let dir = copy_of(seeds.seed(engine, compression, strategy, inputs));
-                let db = open_rocksdb(
-                    dir.path(),
+                let opts = rocksdb_options_cached(
                     compression,
                     strategy == IndexStrategy::HashIndex,
                     engine.blob_files(),
+                    cache_bytes,
                 );
+                let db = open_rocksdb_with(dir.path(), &opts);
                 Self::RocksDb { db, _dir: dir }
             }
             Engine::SurrealKv => {
@@ -1979,8 +2291,8 @@ impl WarmEngine {
 /// working set exceeds the 16 MiB block cache, so the batch's blocks are cold.
 ///
 /// Apples-to-apples matches [`point_read_variant`]: identical [`WorkloadInputs`],
-/// the same seeded state and matched compression / bloom / 16 MiB cache
-/// ([`SeedStates`]). The only difference from `point_read` is one batched
+/// the same seeded state and matched compression / bloom / cache of
+/// `cache_bytes` ([`SeedStates`]). The only difference from `point_read` is one batched
 /// call instead of an N-iteration `get` loop. SurrealKV has no batch-get API, so
 /// it is omitted here (its sequential cost is already on the `point_read` chart);
 /// the series is `ours` vs `rocksdb` (plus `blob_tree` on the None variant).
@@ -1989,6 +2301,7 @@ fn multi_get_variant(
     group_name: &str,
     compression: Compression,
     spec: Spec,
+    cache_bytes: u64,
     seeds: &mut SeedStates,
 ) {
     if !run.wants(group_name) {
@@ -2016,7 +2329,8 @@ fn multi_get_variant(
                     engine,
                     compression,
                     IndexStrategy::Binary,
-                    false,
+                    Rows::Off,
+                    cache_bytes,
                     &inputs,
                     seeds,
                 );
@@ -2181,7 +2495,8 @@ fn warm_read_group(
                     engine,
                     compression,
                     IndexStrategy::Binary,
-                    false,
+                    Rows::Off,
+                    CACHE_BYTES,
                     &inputs,
                     seeds,
                 );
@@ -2915,13 +3230,23 @@ struct Diagnosis {
     filter_loads: u64,
     blob_reads: u64,
     blob_bytes: u64,
+    /// Bytes of deleted files' entries the cache dropped, the sweeps that
+    /// dropped them, and the cache's capacity.
+    dead_bytes: u64,
+    dead_sweeps: u64,
+    cache_bytes: u64,
 }
 
 #[cfg(feature = "metrics")]
 impl Diagnosis {
     fn take(tree: &lsm_tree::AnyTree) -> Self {
         let m = tree.metrics();
+        let cache = &tree.tree_config().cache;
+        let (dead_bytes, dead_sweeps) = cache.dead_entries_dropped();
         Self {
+            dead_bytes,
+            dead_sweeps,
+            cache_bytes: cache.capacity(),
             filter_queries: m.filter_queries() as u64,
             filter_skips: m.io_skipped_by_filter() as u64,
             loads_cached: m.block_load_cached_count() as u64,
@@ -2951,7 +3276,9 @@ impl Diagnosis {
              filter queries {:.2}, filter skips {:.2}, block loads cached {:.2} io {:.2} \
              (data {:.2}, index {:.2}, filter {:.2}), blob reads {:.3} bytes {:.0}; \
              writer stalled {:.1}% of {elapsed:?}; \
-             {tables} tables at the end",
+             {tables} tables at the end; \
+             block cache hit rate {:.2}%; entries of deleted files dropped: {:.0} KiB \
+             in {} sweeps, {:.2}% of the cache a sweep",
             l0_seen as f64 / reads.max(1) as f64,
             per(self.filter_queries, before.filter_queries),
             per(self.filter_skips, before.filter_skips),
@@ -2963,6 +3290,13 @@ impl Diagnosis {
             per(self.blob_reads, before.blob_reads),
             per(self.blob_bytes, before.blob_bytes),
             100.0 * stalled.as_secs_f64() / elapsed.as_secs_f64(),
+            100.0 * (self.loads_cached - before.loads_cached) as f64
+                / ((self.loads_cached - before.loads_cached) + (self.loads_io - before.loads_io))
+                    .max(1) as f64,
+            (self.dead_bytes - before.dead_bytes) as f64 / 1024.0,
+            self.dead_sweeps - before.dead_sweeps,
+            100.0 * (self.dead_bytes - before.dead_bytes) as f64
+                / ((self.dead_sweeps - before.dead_sweeps).max(1) * self.cache_bytes.max(1)) as f64,
         );
     }
 }
@@ -4155,7 +4489,23 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "point_read",
-        "One get per stored key on a warm engine. Also our hash index, ribbon locator and row cache, and RocksDB's hash index, on the same chart.",
+        "One get per stored key on a warm engine. ours is the library default: each tree chooses, from its own reads, the share of its keys that goes through the row cache. ours-row-cache-on sends every key through it, ours-row-cache-off keeps no rows. Also our hash index and ribbon locator and RocksDB's hash index, measured with no rows, on the same chart.",
+    ),
+    (
+        "point_read_uniform",
+        "As many gets as there are keys on a warm engine, each of a key drawn evenly from all of them, at 70,000 and 1,000,000 keys through the 16 MiB cache. ours chooses its row cache share, ours-row-cache-on sends every key through the row cache, ours-row-cache-off keeps no rows.",
+    ),
+    (
+        "point_read_zipf",
+        "As point_read_uniform, the keys drawn by Zipf(0.99).",
+    ),
+    (
+        "point_read_hot",
+        "As point_read_uniform, nine draws in ten from a hundredth of the keys and the tenth from any.",
+    ),
+    (
+        "point_read_phase",
+        "As point_read_uniform, the first half of every pass drawn as point_read_hot and the second half evenly: the reads change under the cache twice a pass.",
     ),
     (
         "point_read_cold",
@@ -4163,7 +4513,7 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "multi_get",
-        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf). With 1 and 4 MiB values in the tables, RocksDB's HyperClockCache keeps a batch's blocks after the call past its 16 MiB capacity (64 MiB measured), so every later batch is all cache hits; ours keeps a batch's blocks within its 16 MiB cache and reads the rest again.",
+        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf). The groups of 1 and 4 MiB values give both engines a 128 MiB block cache, above the 64 MiB one batch reads: at 16 MiB RocksDB's HyperClockCache kept a batch's blocks past its capacity (64 MiB measured) while ours admitted none of them, so the group compared two cache policies and not two batched reads.",
     ),
     (
         "range_scan",

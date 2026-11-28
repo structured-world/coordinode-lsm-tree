@@ -291,6 +291,10 @@ pub struct Inner {
     #[cfg(feature = "std")]
     pub(crate) background_deleter: once_cell::race::OnceBox<Arc<crate::BackgroundDeleter>>,
 
+    /// The tree's row gate, taken from the cache at this table's first point
+    /// read and held: which of its keys go through the row cache.
+    pub(crate) row_gate: once_cell::race::OnceBox<Arc<crate::row_gate::RowGate>>,
+
     /// Tree-wide ECC heal-hint sink. Installed once by
     /// [`Table::install_heal_hints`](super::Table::install_heal_hints) after the
     /// table joins a tree. When present, a block read that is ECC-corrected and
@@ -418,6 +422,15 @@ impl Drop for Inner {
             file_accessor.as_descriptor_table().inspect(|d| {
                 d.remove_for_table(&global_id);
             });
+
+            // What the table left in the block cache goes too, whenever its
+            // file does: no read reaches a deleted table's entries again. The
+            // walk over the cache is the deleter's, off this thread, which
+            // may be a reader's.
+            #[cfg(feature = "std")]
+            if let Some(deleter) = self.background_deleter.get() {
+                deleter.evict_table(global_id.table_id());
+            }
 
             // Drop the accessor and block index (releases all Arc<dyn FsFile>).
             drop(file_accessor);

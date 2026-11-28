@@ -445,13 +445,16 @@ impl TreeInner {
             budget.register(Arc::downgrade(&latest_super_version));
         }
 
+        let id = get_next_tree_id();
         Ok(Self {
-            id: get_next_tree_id(),
+            id,
             deletion_pause: DeletionPause::for_tree(Arc::clone(&life)),
             #[cfg(feature = "std")]
             background_deleter: Arc::new(crate::BackgroundDeleter::for_tree(
                 None,
                 Arc::clone(&life),
+                Arc::clone(&config.cache),
+                id,
             )),
             life,
             closing: core::sync::atomic::AtomicBool::new(false),
@@ -532,6 +535,10 @@ impl Drop for TreeInner {
 
         log::trace!("Sending stop signal to compactors");
         self.stop_signal.send();
+
+        // The cache outlives the tree where trees share it: its row gate for
+        // this tree's id goes with the tree.
+        self.config.cache.forget_tree(self.id);
 
         // A tree closing persists its flushes: deferred ones, so a reopen
         // needs no replay of them; self-described ones, so the manifest names

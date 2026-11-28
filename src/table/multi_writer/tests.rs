@@ -1292,7 +1292,7 @@ fn a_target_below_the_table_tail_still_fills_a_block() -> crate::Result<()> {
     for i in 0..KEYS {
         let key = format!("key{i:06}").into_bytes();
         let value = random_bound_of(i as usize, Vec::new(), 24);
-        bytes += key.len() + value.len();
+        bytes += key.len() + value.len() + crate::table::writer::ENTRY_HEAD;
         mw.write(InternalValue::from_components(
             UserKey::from(key),
             value,
@@ -1301,8 +1301,9 @@ fn a_target_below_the_table_tail_still_fills_a_block() -> crate::Result<()> {
         ))?;
     }
     let tables = mw.finish()?.tables.len();
-    // A 4 KiB block each, and a partial one at the end.
-    let blocks = bytes / 4_096 + 1;
+    // A block each, closed past nine tenths of 4 KiB by what its entries
+    // count, and a partial one at the end.
+    let blocks = bytes / crate::table::writer::nearly_full(4_096) + 1;
     assert!(
         tables <= blocks,
         "{tables} tables for {KEYS} keys in {blocks} blocks",

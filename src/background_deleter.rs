@@ -57,10 +57,20 @@ use std::{
     time::Duration,
 };
 
-/// A unit of background work: unlink `path` through `fs`.
-struct DeleteJob {
-    fs: Arc<dyn Fs>,
-    path: PathBuf,
+/// Jobs the worker takes off its channel, at most, to find the evictions
+/// queued behind one: what it holds back in memory while it walks the cache.
+const EVICT_LOOKAHEAD: usize = 1_024;
+
+/// A unit of background work.
+enum DeleteJob {
+    /// Unlink `path` through `fs`.
+    Unlink { fs: Arc<dyn Fs>, path: PathBuf },
+    /// Take a deleted file's entries out of `cache`: no read reaches them
+    /// again, and until evicted they hold capacity live blocks could use.
+    Evict {
+        cache: Arc<crate::Cache>,
+        dead: crate::cache::DeadFile,
+    },
 }
 
 /// Rate-limited background file deleter.
@@ -75,6 +85,9 @@ pub struct BackgroundDeleter {
     /// The liveness of the tree whose files this deleter removes, given up
     /// only once the worker removed the last of them.
     life: Option<Arc<crate::close::Life>>,
+    /// The cache the tree's files are read through and the tree's id there,
+    /// for a deleter that also evicts what its deleted files left cached.
+    owner: Option<(Arc<crate::Cache>, crate::TreeId)>,
 }
 
 impl core::fmt::Debug for BackgroundDeleter {
@@ -92,15 +105,26 @@ impl BackgroundDeleter {
     /// (delete as fast as the queue drains, still off the foreground thread).
     #[must_use]
     pub fn new(min_interval: Option<Duration>) -> Self {
-        Self::spawn(min_interval, None)
+        Self::spawn(min_interval, None, None)
     }
 
-    /// A tree's deleter, keeping the tree open until its queue is drained.
-    pub(crate) fn for_tree(min_interval: Option<Duration>, life: Arc<crate::close::Life>) -> Self {
-        Self::spawn(min_interval, Some(life))
+    /// A tree's deleter, keeping the tree open until its queue is drained,
+    /// and evicting from `cache` what the files it deletes left there under
+    /// the tree's id.
+    pub(crate) fn for_tree(
+        min_interval: Option<Duration>,
+        life: Arc<crate::close::Life>,
+        cache: Arc<crate::Cache>,
+        tree: crate::TreeId,
+    ) -> Self {
+        Self::spawn(min_interval, Some(life), Some((cache, tree)))
     }
 
-    fn spawn(min_interval: Option<Duration>, life: Option<Arc<crate::close::Life>>) -> Self {
+    fn spawn(
+        min_interval: Option<Duration>,
+        life: Option<Arc<crate::close::Life>>,
+        owner: Option<(Arc<crate::Cache>, crate::TreeId)>,
+    ) -> Self {
         let (sender, receiver) = channel::<DeleteJob>();
         let worker = std::thread::Builder::new()
             .name("lsm-deleter".into())
@@ -110,6 +134,45 @@ impl BackgroundDeleter {
             sender: Some(sender),
             worker,
             life,
+            owner,
+        }
+    }
+
+    /// Queues the eviction of a deleted table's cached blocks, rows and
+    /// directories. Called once no read can reach the table again, from
+    /// whichever thread dropped its last handle: the walk over the cache runs
+    /// on the worker, never on a reader.
+    pub(crate) fn evict_table(&self, table: crate::TableId) {
+        if let Some((cache, tree)) = &self.owner {
+            self.send(DeleteJob::Evict {
+                cache: Arc::clone(cache),
+                dead: crate::cache::DeadFile::Table { tree: *tree, table },
+            });
+        }
+    }
+
+    /// [`Self::evict_table`] for a deleted blob file's cached frames and
+    /// records.
+    pub(crate) fn evict_blob_file(&self, file: crate::vlog::BlobFileId) {
+        if let Some((cache, tree)) = &self.owner {
+            self.send(DeleteJob::Evict {
+                cache: Arc::clone(cache),
+                dead: crate::cache::DeadFile::BlobFile { tree: *tree, file },
+            });
+        }
+    }
+
+    /// Hands `job` to the worker, or does it here when the worker is gone.
+    fn send(&self, job: DeleteJob) {
+        match &self.sender {
+            // `send` only fails if the receiver (worker) is gone; it hands the
+            // job back in the error.
+            Some(sender) => {
+                if let Err(std::sync::mpsc::SendError(job)) = sender.send(job) {
+                    Self::run_now(job);
+                }
+            }
+            None => Self::run_now(job),
         }
     }
 
@@ -121,41 +184,76 @@ impl BackgroundDeleter {
     /// silently dropped: the caller has typically already truncated the file,
     /// so dropping the job would leave a zero-length directory entry behind.
     pub fn enqueue(&self, fs: Arc<dyn Fs>, path: PathBuf) {
-        let job = DeleteJob { fs, path };
-        match &self.sender {
-            // `send` only fails if the receiver (worker) is gone; it hands the
-            // job back in the error, so reclaim it synchronously.
-            Some(sender) => {
-                if let Err(std::sync::mpsc::SendError(job)) = sender.send(job) {
-                    Self::unlink_now(&job);
+        self.send(DeleteJob::Unlink { fs, path });
+    }
+
+    /// Synchronous fallback for when the background worker is gone.
+    fn run_now(job: DeleteJob) {
+        match job {
+            DeleteJob::Unlink { fs, path } => {
+                if let Err(e) = fs.remove_file(&path) {
+                    log::warn!(
+                        "background deleter sync fallback failed to unlink {}: {e:?}",
+                        path.display(),
+                    );
                 }
             }
-            None => Self::unlink_now(&job),
+            DeleteJob::Evict { cache, dead } => cache.evict_files(&[dead]),
         }
     }
 
-    /// Synchronous unlink fallback for when the background worker is gone.
-    fn unlink_now(job: &DeleteJob) {
-        if let Err(e) = job.fs.remove_file(&job.path) {
-            log::warn!(
-                "background deleter sync fallback failed to unlink {}: {e:?}",
-                job.path.display(),
-            );
-        }
-    }
-
-    /// Worker loop: unlink each queued path, honoring the rate cap. Exits when
-    /// the channel closes (the deleter was dropped) and the queue is drained.
+    /// Worker loop: unlink each queued path, honoring the rate cap, and evict
+    /// what deleted files left cached. Exits when the channel closes (the
+    /// deleter was dropped) and the queue is drained.
     fn run(receiver: &Receiver<DeleteJob>, min_interval: Option<Duration>) {
-        while let Ok(job) = receiver.recv() {
-            if let Err(e) = job.fs.remove_file(&job.path) {
-                log::warn!(
-                    "background deleter failed to unlink {}: {e:?}",
-                    job.path.display(),
-                );
-            }
-            if let Some(interval) = min_interval {
-                std::thread::sleep(interval);
+        // Jobs taken off the channel while looking for evictions to batch,
+        // in the order they were queued.
+        let mut held: std::collections::VecDeque<DeleteJob> = std::collections::VecDeque::new();
+        loop {
+            let job = match held.pop_front() {
+                Some(job) => job,
+                None => match receiver.recv() {
+                    Ok(job) => job,
+                    Err(_) => return,
+                },
+            };
+            match job {
+                DeleteJob::Unlink { fs, path } => {
+                    if let Err(e) = fs.remove_file(&path) {
+                        log::warn!(
+                            "background deleter failed to unlink {}: {e:?}",
+                            path.display(),
+                        );
+                    }
+                    if let Some(interval) = min_interval {
+                        std::thread::sleep(interval);
+                    }
+                }
+                DeleteJob::Evict { cache, dead } => {
+                    // The inputs of one compaction are dropped together, each
+                    // queueing its eviction and then its unlink: one walk
+                    // over the cache takes out every file whose eviction is
+                    // queued, the unlinks between them kept in their order.
+                    // Stopping at the first unlink walked the whole cache
+                    // once per file.
+                    let mut files = vec![dead];
+                    let mut kept = std::collections::VecDeque::with_capacity(held.len());
+                    let queued = core::mem::take(&mut held).into_iter().chain(
+                        core::iter::from_fn(|| receiver.try_recv().ok()).take(EVICT_LOOKAHEAD),
+                    );
+                    for job in queued {
+                        match job {
+                            DeleteJob::Evict { cache: other, dead }
+                                if Arc::ptr_eq(&other, &cache) =>
+                            {
+                                files.push(dead);
+                            }
+                            other => kept.push_back(other),
+                        }
+                    }
+                    held = kept;
+                    cache.evict_files(&files);
+                }
             }
         }
     }

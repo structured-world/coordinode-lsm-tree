@@ -39,8 +39,7 @@
 //!
 //! The eager per-direction init below builds each tournament from
 //! a pre-populated `Vec<Option<MergerEntry>>` on first use, lazy
-//! per direction, independent of the other (mirrors the legacy
-//! `MergeHeap` `init_lo` / `init_hi` pattern).
+//! per direction, independent of the other.
 
 use crate::comparator::UserComparator;
 use crate::loser_tree::LoserTree;
@@ -109,7 +108,8 @@ impl<C: UserComparator + Clone> crate::loser_tree::EntryComparator<MergerEntry> 
 /// The key reversal elects the LARGEST key as winner under the
 /// loser tree's "smaller wins" semantics. The source-index
 /// reversal keeps `next_back()`'s tie-break opposite of
-/// `next()`'s, matching the legacy `MergeHeap` behaviour.
+/// `next()`'s: walked from the back, equal entries come out in
+/// the reverse of their order from the front.
 #[derive(Clone)]
 struct MaxCmp<C: UserComparator + Clone> {
     comparator: C,

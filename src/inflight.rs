@@ -218,7 +218,7 @@ std::thread_local! {
 /// Whether the calling thread may wait on another request's load: it holds
 /// no lead of a batched read.
 #[must_use]
-pub fn may_wait() -> bool {
+pub(crate) fn may_wait() -> bool {
     #[cfg(feature = "std")]
     {
         BATCH_LEADS.with(core::cell::Cell::get) == 0
@@ -233,7 +233,7 @@ pub fn may_wait() -> bool {
 /// Whether a batched read may lead loads on the calling thread: only where
 /// the thread's held leads are counted, so its other loads stop waiting.
 #[must_use]
-pub const fn batches_may_lead() -> bool {
+pub(crate) const fn batches_may_lead() -> bool {
     cfg!(feature = "std")
 }
 
@@ -245,7 +245,7 @@ pub const fn batches_may_lead() -> bool {
 /// token is `Send` only because the read state that may hold one is, and a
 /// resumable read crosses threads; debug builds check it is dropped on the
 /// thread whose count it holds.
-pub struct BatchToken {
+pub(crate) struct BatchToken {
     /// The thread whose count the token holds. Its id, never its counter's
     /// address: a thread that has exited can leave that address to the next.
     #[cfg(all(feature = "std", debug_assertions))]
@@ -255,7 +255,7 @@ pub struct BatchToken {
 impl BatchToken {
     /// Counts a batched lead on the calling thread.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         #[cfg(feature = "std")]
         BATCH_LEADS.with(|count| count.set(count.get() + 1));
         Self {
@@ -336,13 +336,13 @@ std::thread_local! {
 /// Makes the calling thread time every load (`Some(true)`), none
 /// (`Some(false)`), or sample them again (`None`), for tests.
 #[cfg(all(test, feature = "std"))]
-pub fn override_load_sampling_on_this_thread(sample: Option<bool>) {
+pub(crate) fn override_load_sampling_on_this_thread(sample: Option<bool>) {
     SAMPLING_OVERRIDE.with(|cell| cell.set(sample));
 }
 
 /// The timing of one physical load, when it is one of the sampled ones.
 #[derive(Clone, Copy)]
-pub struct LoadTimer {
+pub(crate) struct LoadTimer {
     // no-std: no clock to read; loads are not timed and the estimates stay
     // at zero.
     #[cfg(feature = "std")]
@@ -353,7 +353,7 @@ impl LoadTimer {
     /// Starts timing a physical load about to run on the calling thread, if
     /// it is one of the sampled ones.
     #[must_use]
-    pub fn start() -> Self {
+    pub(crate) fn start() -> Self {
         #[cfg(feature = "std")]
         {
             #[cfg(test)]
@@ -385,7 +385,7 @@ impl LoadTimer {
 /// its shard take at least the coalescing threshold: a load quicker than
 /// that costs less than waiting for another reader's, and the miss then
 /// loads alone without taking any lock here.
-pub struct InflightLoads<K, V, I, S> {
+pub(crate) struct InflightLoads<K, V, I, S> {
     shards: Vec<Padded<Shard<K, V, I, S>>>,
     shard_mask: u64,
     hasher: S,
@@ -399,7 +399,7 @@ pub struct InflightLoads<K, V, I, S> {
 }
 
 /// What a cache miss does about its load.
-pub enum Claim<'a, K, V, I, S>
+pub(crate) enum Claim<'a, K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
@@ -421,7 +421,7 @@ where
 /// Borrows the registry rather than sharing ownership of it: every reader on
 /// every core leads loads, and a reference count on the registry would be one
 /// cache line they all write.
-pub struct Lead<'a, K, V, I, S>
+pub(crate) struct Lead<'a, K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
@@ -433,12 +433,12 @@ where
 }
 
 /// A waiter's hold on a load another request leads.
-pub struct Join<V, I>(Arc<Ticket<V, I>>);
+pub(crate) struct Join<V, I>(Arc<Ticket<V, I>>);
 
 impl<V: Clone, I> Join<V, I> {
     /// Blocks until the leader settles, returning its value, or `None` when
     /// it failed and this request has to load on its own.
-    pub fn wait(self) -> Option<V> {
+    pub(crate) fn wait(self) -> Option<V> {
         self.0.wait()
     }
 
@@ -448,7 +448,7 @@ impl<V: Clone, I> Join<V, I> {
     /// then loads on its own instead. A join is taken from the registry,
     /// which a lead leaves before it settles, so the value is there only when
     /// the lead published between that claim and this call.
-    pub fn try_take(&self) -> Option<V> {
+    pub(crate) fn try_take(&self) -> Option<V> {
         self.0.try_take()
     }
 }
@@ -463,13 +463,13 @@ where
     /// value already made visible where a later request looks first (the
     /// cache), or a value no later request needs: once closed, a new miss of
     /// the key leads a load of its own.
-    pub fn publish(self, value: V) {
+    pub(crate) fn publish(self, value: V) {
         self.publish_with(|| value);
     }
 
     /// As [`Self::publish`], building the value only when a request waits
     /// for it.
-    pub fn publish_with(mut self, value: impl FnOnce() -> V) {
+    pub(crate) fn publish_with(mut self, value: impl FnOnce() -> V) {
         self.finish(Some(value));
     }
 
@@ -477,7 +477,7 @@ where
     /// and this lead hold the ticket otherwise. A request that joins after the
     /// answer and before the load closes finds no value and loads on its own,
     /// so `false` lets a leader skip building a value nobody would take.
-    pub fn has_waiters(&self) -> bool {
+    pub(crate) fn has_waiters(&self) -> bool {
         self.ticket
             .as_ref()
             .is_some_and(|ticket| Arc::strong_count(ticket) > 2)
@@ -525,7 +525,7 @@ where
     /// A registry of `shards` shards (rounded up to a power of two, at most
     /// 256) coordinating up to `per_shard_limit` loads each, once their
     /// physical loads take `coalesce_after` (see [`Self::set_coalesce_after`]).
-    pub fn new(
+    pub(crate) fn new(
         shards: usize,
         per_shard_limit: usize,
         coalesce_after: core::time::Duration,
@@ -558,7 +558,7 @@ where
     /// since a load that closed between that miss and this claim has already
     /// put its result there. While the key's shard loads quicker than the
     /// coalescing threshold, the request loads alone without a lock taken.
-    pub fn claim(&self, key: K, identity: I) -> Claim<'_, K, V, I, S> {
+    pub(crate) fn claim(&self, key: K, identity: I) -> Claim<'_, K, V, I, S> {
         self.claim_as(key, identity, false)
     }
 
@@ -567,7 +567,7 @@ where
     /// one whose load is coordinated already, such as a page of a row group
     /// whose directory load is, whose own loads may never have been timed.
     /// A threshold no load reaches still coordinates nothing.
-    pub fn claim_as(&self, key: K, identity: I, coordinated: bool) -> Claim<'_, K, V, I, S> {
+    pub(crate) fn claim_as(&self, key: K, identity: I, coordinated: bool) -> Claim<'_, K, V, I, S> {
         let shard = self.shard(&key);
         let coalesces = if coordinated {
             self.coalesce_after_nanos != NEVER
@@ -613,7 +613,7 @@ where
 
     /// How many loads are in flight, for tests.
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.shards
             .iter()
             .map(|shard| shard.0.state.lock().loads.len())
@@ -622,7 +622,7 @@ where
 
     /// How many requests wait on loads in flight, for tests.
     #[cfg(test)]
-    pub fn waiters(&self) -> usize {
+    pub(crate) fn waiters(&self) -> usize {
         // A ticket in the registry is held by the registry and by its lead,
         // which closes it before letting go; every other holder waits.
         self.shards
@@ -650,7 +650,7 @@ where
     /// zero coordinates every miss; one longer than any load is ever measured
     /// to take, none. Without a clock (`no_std`) loads are never measured, so
     /// only zero coordinates there.
-    pub fn set_coalesce_after(&mut self, coalesce_after: core::time::Duration) {
+    pub(crate) fn set_coalesce_after(&mut self, coalesce_after: core::time::Duration) {
         self.coalesce_after_nanos = u64::try_from(coalesce_after.as_nanos()).unwrap_or(NEVER);
     }
 
@@ -658,7 +658,7 @@ where
     /// [`Duration::MAX`] when none does.
     ///
     /// [`Duration::MAX`]: core::time::Duration::MAX
-    pub fn coalesce_after(&self) -> core::time::Duration {
+    pub(crate) fn coalesce_after(&self) -> core::time::Duration {
         if self.coalesce_after_nanos == NEVER {
             core::time::Duration::MAX
         } else {
@@ -675,7 +675,7 @@ where
 
     /// Folds the physical load of `key` that `timer` timed, if it is a
     /// sampled one, into its shard's estimate.
-    pub fn record_load(&self, key: &K, timer: LoadTimer) {
+    pub(crate) fn record_load(&self, key: &K, timer: LoadTimer) {
         #[cfg(feature = "std")]
         if let Some(started) = timer.started {
             // A load past `u64::MAX` nanoseconds (five centuries) is simply
@@ -692,7 +692,7 @@ where
     /// took: the wait's length shared among the reads it handed back. A
     /// batch's reads carry no key between them a sample could be told apart
     /// by, and how long storage takes is not a property of any one key.
-    pub fn record_batch_wait(&self, timer: LoadTimer, reads: usize) {
+    pub(crate) fn record_batch_wait(&self, timer: LoadTimer, reads: usize) {
         #[cfg(feature = "std")]
         if let Some(started) = timer.started
             && reads > 0
@@ -716,7 +716,7 @@ where
     /// took: the read's length shared among them, since they were asked for
     /// together.
     #[cfg(feature = "columnar")]
-    pub fn record_loads(&self, keys: impl Iterator<Item = K> + Clone, timer: LoadTimer) {
+    pub(crate) fn record_loads(&self, keys: impl Iterator<Item = K> + Clone, timer: LoadTimer) {
         #[cfg(feature = "std")]
         if let Some(started) = timer.started {
             // Counted only for a sampled read, so the others pay nothing.
@@ -739,7 +739,7 @@ where
     /// Whether a load of `key` is in flight now, coordinated here. A load
     /// of a shard that does not coordinate is never registered.
     #[cfg(feature = "zstd")]
-    pub fn in_flight(&self, key: &K) -> bool {
+    pub(crate) fn in_flight(&self, key: &K) -> bool {
         let shard = self.shard(key);
         self.coalesces(shard) && shard.state.lock().loads.contains_key(key)
     }
@@ -756,15 +756,15 @@ where
         estimate.store(old - old / 8 + sample / 8, Ordering::Relaxed);
     }
 
-    /// The load-time estimate of `key`'s shard, in nanoseconds, for tests.
-    #[cfg(test)]
-    pub fn estimate(&self, key: &K) -> u64 {
+    /// The load-time estimate of `key`'s shard, in nanoseconds: zero until a
+    /// load there was timed, as it stays in a build with no clock.
+    pub(crate) fn estimate(&self, key: &K) -> u64 {
         self.shard(key).load_nanos.load(Ordering::Relaxed)
     }
 
     /// The load-time estimates of every shard summed, for tests.
     #[cfg(test)]
-    pub fn estimates_total(&self) -> u64 {
+    pub(crate) fn estimates_total(&self) -> u64 {
         self.shards
             .iter()
             .map(|shard| shard.0.load_nanos.load(Ordering::Relaxed))

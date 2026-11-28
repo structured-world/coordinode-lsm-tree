@@ -32,3 +32,87 @@ fn drains_queued_deletions_on_drop() {
         );
     }
 }
+
+/// The tables a compaction drops each queue an eviction and then an unlink.
+/// The worker takes every eviction queued out in one walk over the cache,
+/// with the unlinks between them still done in their order: stopping at the
+/// first unlink, it walked the whole cache once per table.
+#[cfg(feature = "metrics")]
+#[test]
+fn evictions_queued_between_unlinks_take_one_walk_of_the_cache() {
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::default());
+    let paths: Vec<PathBuf> = (0..9).map(|i| PathBuf::from(format!("/f{i}"))).collect();
+    for p in &paths {
+        let mut f = fs
+            .open(p, &FsOpenOptions::new().write(true).create(true))
+            .unwrap();
+        f.write_all(b"data").unwrap();
+        f.flush().unwrap();
+    }
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(1 << 20));
+
+    {
+        // The first unlink holds the worker for the interval, while the
+        // tables' jobs queue behind it.
+        let deleter = BackgroundDeleter::spawn(
+            Some(Duration::from_millis(50)),
+            None,
+            Some((Arc::clone(&cache), 5)),
+        );
+        let mut paths = paths.iter();
+        deleter.enqueue(Arc::clone(&fs), paths.next().unwrap().clone());
+        for (table, path) in paths.enumerate() {
+            deleter.evict_table(table as u64);
+            deleter.enqueue(Arc::clone(&fs), path.clone());
+        }
+    }
+
+    let (_, walks) = cache.dead_entries_dropped();
+    assert_eq!(walks, 1, "eight tables' evictions");
+    for p in &paths {
+        assert!(fs.open(p, &FsOpenOptions::new().read(true)).is_err());
+    }
+}
+
+/// A tree's deleter told that a table and a blob file were deleted takes
+/// what they left in the tree's cache out of it, by the time its queue is
+/// drained, and leaves the tree's other files' entries where they are. Without
+/// it those entries stay until the cache evicts them by itself, holding
+/// capacity no read can use.
+#[test]
+fn a_deleted_files_entries_leave_the_trees_cache() {
+    use crate::table::block::BlockType;
+    use crate::vlog::blob_file::frame::decoded_frame;
+
+    let block = || crate::table::Block {
+        header: crate::table::block::Header {
+            uncompressed_length: 1_024,
+            ..crate::table::block::Header::test_dummy(BlockType::Data)
+        },
+        data: crate::Slice::from(&[0u8; 1_024][..]),
+    };
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(1 << 20));
+    let at = crate::table::BlockOffset(0);
+    let dead = crate::table::GlobalTableId::from((5, 9));
+    let live = crate::table::GlobalTableId::from((5, 10));
+    cache.insert_block(dead, at, block());
+    cache.insert_block(live, at, block());
+    let frame_at = |file| crate::cache::BlobFrameAt {
+        blob_file_id: file,
+        frame: 0,
+    };
+    for file in [3, 4] {
+        cache.insert_blob_frame(5, frame_at(file), Arc::new(decoded_frame(&[(b"k", b"v")])));
+    }
+
+    {
+        let deleter = BackgroundDeleter::spawn(None, None, Some((Arc::clone(&cache), 5)));
+        deleter.evict_table(9);
+        deleter.evict_blob_file(3);
+    }
+
+    assert!(cache.get_block(dead, at).is_none(), "the deleted table's");
+    assert!(cache.get_block(live, at).is_some(), "a live table's");
+    assert!(cache.get_blob_frame(5, frame_at(3)).is_none());
+    assert!(cache.get_blob_frame(5, frame_at(4)).is_some());
+}
