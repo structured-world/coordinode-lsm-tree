@@ -45,9 +45,9 @@ impl<T: DoubleEndedIterator<Item = crate::Result<InternalValue>> + SkipKey + Sen
 type ScanBox<'a> = Box<dyn ScanSource + 'a>;
 
 /// Wrap a vector of boxed double-ended source iterators into a
-/// `SeekingMerger`, the loser-tree-based merging iterator that
-/// replaces the legacy `Merger` (sorted-vector heap) on the read
-/// path. The `ScanBox`es become `MergeSource`s via the
+/// `SeekingMerger`, the merging iterator of the read path: it walks
+/// both ways and repositions, which the forward-only `Merger` of a
+/// flush and a compaction does not. The `ScanBox`es become `MergeSource`s via the
 /// `CoherentIterSource` adapter — its coherent-cursor contract
 /// is satisfied by every memtable / run / table iter we feed in
 /// here (they all share a single front/back cursor over the

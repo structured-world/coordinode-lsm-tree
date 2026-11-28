@@ -775,6 +775,16 @@ fn decompress_into_propagates_decode_error() {
     assert!(result.is_err(), "a corrupt frame must error");
 }
 
+/// No bytes are no frame: decoded as zero frames they would fill nothing and
+/// report success, into a buffer of any length, and a caller with an empty
+/// one would take the missing frame for an empty value.
+#[test]
+fn decompress_into_refuses_an_empty_input() {
+    let mut dest = vec![0u8; 64];
+    assert!(ZstdProvider::decompress_into(&[], &mut dest).is_err());
+    assert!(ZstdProvider::decompress_into(&[], &mut []).is_err());
+}
+
 #[test]
 fn a_single_pass_frame_at_level_22_still_round_trips() {
     // Turning the seed off changes how the encoder searches, never what the

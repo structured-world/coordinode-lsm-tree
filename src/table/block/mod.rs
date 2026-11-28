@@ -1252,11 +1252,14 @@ impl Block {
             CompressionType::Zstd(_) => {
                 // Decompress straight into the Slice allocation, skipping the
                 // zero-fill and the Vec -> Slice copy. SAFETY: the slice goes to
-                // this one decoder and no open trait, and it resolves matches
-                // in a window of its own and refuses an offset past what it
-                // wrote, so the slice is only written, whatever the frame
-                // holds. The length equality below rejects a short fill, so no
-                // uninitialized byte survives into the frozen Slice.
+                // this one decoder and no open trait. The decoder writes the
+                // frame's literals and matches into the slice itself, front
+                // to back, and refuses a match whose offset reaches before
+                // the slice's start, so a match copies only bytes the decoder
+                // already wrote and no byte is read before it is written,
+                // whatever the frame holds. The length equality below rejects
+                // a short fill, so no uninitialized byte survives into the
+                // frozen Slice.
                 #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                 let mut builder =
                     unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };

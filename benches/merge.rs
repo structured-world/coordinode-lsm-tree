@@ -122,7 +122,7 @@ fn merger(c: &mut Criterion) {
             })
             .collect::<Vec<_>>();
 
-        let label_heap = format!("Merge {num} (MergeHeap)");
+        let label_heap = format!("Merge {num} (Merger)");
         c.bench_function(&label_heap, |b| {
             b.iter_custom(|iters| {
                 measure_with_percentiles(&label_heap, iters, || {
@@ -182,16 +182,18 @@ fn mvcc_stream(c: &mut Criterion) {
             })
             .collect::<Vec<_>>();
 
-        let label = format!("MVCC stream {num} versions (MergeHeap)");
+        // Over the merger a read builds its stream on: the compaction merger
+        // only walks forward, and a stream of versions walks both ways.
+        let label = format!("MVCC stream {num} versions (SeekingMerger)");
         c.bench_function(&label, |b| {
             b.iter_custom(|iters| {
                 measure_with_percentiles(&label, iters, || {
-                    let iters_v = memtables
+                    let sources: Vec<_> = memtables
                         .iter()
-                        .map(|x| x.iter().map(Ok))
-                        .map(|x| Box::new(x) as BoxedIterator<'_>)
+                        .map(|x| CoherentIterSource::new(x.iter().map(Ok)))
                         .collect();
-                    let merger = MvccStream::new(Merger::new(iters_v, cmp.clone()), None);
+                    let merger =
+                        MvccStream::new(SeekingMerger::new(sources, DefaultUserComparator), None);
                     assert_eq!(26, merger.count());
                 })
             })

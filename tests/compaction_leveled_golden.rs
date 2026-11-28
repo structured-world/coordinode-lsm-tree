@@ -132,5 +132,6 @@ fn leveled_compaction_keeps_its_fingerprint() {
 ///
 /// The stream's small tables close on the state their writer holds as often
 /// as on their size, so a change to what the writer counts its filter and
-/// locator builds to hold moves the fingerprint as well.
-const EXPECTED: u64 = 0x50c1_3121_5f6d_4869;
+/// locator builds to hold moves the fingerprint as well, and so does a change
+/// to where a data block closes.
+const EXPECTED: u64 = 0x410c_c84b_61a9_c1aa;

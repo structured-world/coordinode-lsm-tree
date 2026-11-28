@@ -589,6 +589,12 @@ path = "benches/compaction_merge.rs"
 required-features = ["std"]
 
 [[bench]]
+name = "merge_fan_in"
+harness = false
+path = "benches/merge_fan_in.rs"
+required-features = ["std"]
+
+[[bench]]
 name = "row_block_carry"
 harness = false
 path = "benches/row_block_carry.rs"

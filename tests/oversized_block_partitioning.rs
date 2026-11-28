@@ -6,7 +6,11 @@
 
 use lsm_tree::{
     AbstractTree, AnyTree, Cache, Config, Guard, KvSeparationOptions, PrefixExtractor,
-    SequenceNumberCounter, config::PinningPolicy, get_tmp_folder,
+    SequenceNumberCounter,
+    config::{
+        BlockSizePolicy, BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry, PinningPolicy,
+    },
+    get_tmp_folder,
 };
 use std::sync::Arc;
 
@@ -22,11 +26,13 @@ impl PrefixExtractor for FirstFour {
     }
 }
 
-/// Enough keys for a filter and an index far past a shard of [`SMALL`].
+/// Enough keys for a filter and an index past a shard of [`SMALL`]: at 64
+/// filter bits a key and a data block a row (see [`config`]), each is over a
+/// megabyte and a half.
 const KEYS: u64 = 200_000;
 const READS: u64 = 500;
-/// A shard of 8 KiB: every whole block of [`KEYS`] keys is refused.
-const SMALL: u64 = 512 * 1024;
+/// Two shards of 1 MiB: every whole block of [`KEYS`] keys is refused.
+const SMALL: u64 = 2 * 1024 * 1024;
 /// A shard of 8 MiB: every whole block of [`KEYS`] keys fits.
 const LARGE: u64 = 512 * 1024 * 1024;
 
@@ -42,6 +48,10 @@ fn config(folder: &tempfile::TempDir, cache: u64) -> Config {
     )
     .use_cache(Arc::new(Cache::with_capacity_bytes(cache)))
     .table_target_size(u64::MAX / 2)
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(64.0),
+    )))
+    .data_block_size_policy(BlockSizePolicy::all(1))
     .filter_block_pinning_policy(PinningPolicy::all(false))
     .index_block_pinning_policy(PinningPolicy::all(false))
     .filter_block_partitioning_policy(PinningPolicy::all(false))

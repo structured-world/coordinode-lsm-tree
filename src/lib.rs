@@ -284,6 +284,9 @@ mod cache;
 /// (replaces `quick_cache`; works on `std` and `no_std + alloc`).
 mod sharded_cache;
 
+/// The share of a tree's keys whose point reads go through the row cache.
+mod row_gate;
+
 /// Coordination of concurrent cold loads of one cached object, so a miss
 /// shared by many readers reads and decodes it once.
 mod inflight;
@@ -362,7 +365,6 @@ pub(crate) mod xxh3;
 /// surface arrives once those two follow-ups land.
 pub mod io;
 
-mod heap;
 mod ingestion;
 mod io_policy;
 pub use io_policy::IoPolicy;
