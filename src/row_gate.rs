@@ -25,7 +25,7 @@
 //! time, so a tree with rows off comes back to them when its reads change.
 
 use crate::sharded_cache::{Priority, ShardedCache, Weighter};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// The candidate fractions, in eighths of the keys.
 const CANDIDATES: [u8; 5] = [0, 1, 2, 4, 8];
@@ -54,8 +54,13 @@ const GHOST_SHARE: u64 = 4;
 /// outweigh the share of the cache it is given.
 const SHADOW_ENTRIES_MIN: u64 = 16;
 
-/// What a gate's count of doublings holds while it samples no read.
-const UNSAMPLED: u8 = u8::MAX;
+/// The mask of a gate that samples no read: a bit above the 24 of the hash
+/// a read is sampled by, which [`RowGate::samples`] sets in every read's.
+const UNSAMPLED: u32 = 1 << 24;
+
+/// The mask of a gate that samples one read in [`SAMPLE`].
+#[expect(clippy::cast_possible_truncation, reason = "256")]
+const EVERY_SAMPLE: u32 = SAMPLE as u32 - 1;
 
 /// The least an entry weighs in a shadow that samples one read in
 /// [`SAMPLE`]: what keeps the five shadows' entries, [`ENTRY_BYTES`] each,
@@ -195,6 +200,9 @@ struct Sim {
     barred: u32,
     /// How long the next bar lasts, in windows.
     bar: u32,
+    /// How many times [`SAMPLE`] is doubled for this tree's rows: set when
+    /// its shadows are built, from the first row sampled.
+    sparser: u32,
 }
 
 impl Sim {
@@ -219,6 +227,7 @@ impl Sim {
             open_for: 0,
             barred: 0,
             bar: BAR_FIRST,
+            sparser: 0,
         }
     }
 }
@@ -262,10 +271,11 @@ pub(crate) struct BlockSeen {
 pub(crate) struct RowGate {
     /// Eighths of the keys inside the row cache.
     eighths: AtomicU8,
-    /// How many times [`SAMPLE`] is doubled for this tree's rows: set when
-    /// its shadows are built, from the first row sampled. [`UNSAMPLED`]
-    /// while the cache is too small to simulate.
-    sparser: AtomicU8,
+    /// The bits of a key hash's top 24 that are zero in a sampled read's:
+    /// the low ones of one read in [`SAMPLE`], more of them for a tree of
+    /// small rows (see [`Sim::sparser`]), and [`UNSAMPLED`] while the cache
+    /// is too small to simulate.
+    unsampled: AtomicU32,
     /// Taken by a sampled read that finds it free, and by none other.
     sim: spin::Mutex<Sim>,
 }
@@ -291,7 +301,7 @@ impl RowGate {
     pub(crate) fn new() -> Self {
         Self {
             eighths: AtomicU8::new(8),
-            sparser: AtomicU8::new(0),
+            unsampled: AtomicU32::new(EVERY_SAMPLE),
             sim: spin::Mutex::new(Sim::new()),
         }
     }
@@ -313,8 +323,11 @@ impl RowGate {
     /// the block it came from is known.
     #[inline]
     pub(crate) fn samples(&self, key_hash: u64) -> bool {
-        let sparser = self.sparser.load(Ordering::Relaxed);
-        sparser != UNSAMPLED && (key_hash >> 40) & ((SAMPLE << sparser) - 1) == 0
+        // The hash's top 24 bits under a bit of their own that only
+        // `UNSAMPLED` masks in: one load, and no branch on whether the tree
+        // samples at all.
+        let bits = (key_hash >> 40) as u32 | UNSAMPLED;
+        bits & self.unsampled.load(Ordering::Relaxed) == 0
     }
 
     /// Tells the gate its cache was resized: a tree that sampled no read
@@ -323,9 +336,12 @@ impl RowGate {
     pub(crate) fn resized(&self) {
         // Lost to a read that is turning sampling off or on right now, the
         // exchange leaves that read's answer, which a later resize redoes.
-        let _ = self
-            .sparser
-            .compare_exchange(UNSAMPLED, 0, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = self.unsampled.compare_exchange(
+            UNSAMPLED,
+            EVERY_SAMPLE,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     /// Bytes the shadows hold now.
@@ -372,10 +388,11 @@ impl RowGate {
             // short. The reads sampled before this one counted at the old
             // rate into shadows that did not exist yet.
             let short = ENTRY_FLOOR.div_ceil(row_weight.max(1)).next_power_of_two();
-            let sparser = u8::try_from(short.trailing_zeros().min(4)).unwrap_or(4);
-            self.sparser.store(sparser, Ordering::Relaxed);
+            sim.sparser = short.trailing_zeros().min(4);
+            let unsampled = u32::try_from((SAMPLE << sim.sparser) - 1).unwrap_or(u32::MAX);
+            self.unsampled.store(unsampled, Ordering::Relaxed);
         }
-        let sparser = u32::from(self.sparser.load(Ordering::Relaxed));
+        let sparser = sim.sparser;
         let rate = SAMPLE << sparser;
         let capacity = capacity / rate;
         let floor = (ENTRY_FLOOR >> sparser).max(1);
@@ -387,7 +404,7 @@ impl RowGate {
             // walk to its block past a row the cache holds for nothing.
             *sim = Sim::new();
             self.eighths.store(8, Ordering::Relaxed);
-            self.sparser.store(UNSAMPLED, Ordering::Relaxed);
+            self.unsampled.store(UNSAMPLED, Ordering::Relaxed);
             return;
         }
         if sim.shadows.is_none() || sim.capacity != capacity {
