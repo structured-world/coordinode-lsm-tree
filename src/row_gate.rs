@@ -167,19 +167,35 @@ struct Sim {
     load_nanos: u64,
     /// Sampled reads of the window whose row the cache held.
     held: u64,
-    /// How much of the row hits the shadows count the cache has been
-    /// delivering, in thousandths (see [`RowGate::trust`]).
-    trust: u64,
+    /// Windows the tree has had rows for, since it last had none.
+    open_for: u32,
+    /// Windows left in which the tree keeps no rows whatever its shadows
+    /// say (see [`RowGate::undelivered`]).
+    barred: u32,
+    /// How long the next bar lasts, in windows.
+    bar: u32,
 }
 
-/// Row hits the shadow of the fraction in use has to count in a window for
-/// the cache's own hits to be measured against them.
-const TRUST_HITS_MIN: u64 = 16;
+/// Windows a tree has rows for before its cache's row hits are checked
+/// against its shadows': the time a cache takes to fill with them.
+const BAR_SETTLE: u32 = 3;
 
-/// Each window a closed gate regains one part in this many of the trust it
-/// lost, so it tries its rows again after some tens of windows, a few
-/// million reads, and for one window where the cache still delivers none.
-const TRUST_REGAIN: u64 = 128;
+/// Row hits the shadow of the fraction in use has to count in a window for
+/// the cache's own to be checked against them.
+const BAR_HITS_MIN: u64 = 32;
+
+/// The cache delivers too little when it gives fewer than one in this many
+/// of the row hits the shadow counted. Far below what sampling a few hot
+/// keys can explain, where a tree's cache gives two fifths of its shadow's
+/// hits and its rows still pay.
+const BAR_BELOW: u64 = 8;
+
+/// The first bar, in windows: 33 million reads. Each bar that follows a
+/// trial in which the cache delivered as little is twice as long.
+const BAR_FIRST: u32 = 256;
+
+/// The longest bar, in windows.
+const BAR_LONGEST: u32 = 1 << 14;
 
 /// A sampled read's place in its table: the block it came from, by offset,
 /// and the block's weight in the cache.
@@ -231,7 +247,9 @@ impl RowGate {
                 windows: 0,
                 load_nanos: 0,
                 held: 0,
-                trust: 1_000,
+                open_for: 0,
+                barred: 0,
+                bar: BAR_FIRST,
             }),
         }
     }
@@ -371,30 +389,27 @@ impl RowGate {
             .iter()
             .position(|&eighths| eighths == in_use)
             .unwrap_or(CANDIDATES.len() - 1);
-        sim.trust = Self::trust(sim, current);
-        // What a read costs that goes to its block: the candidate with no
-        // rows sends every read there.
-        let block_read = sim
-            .events
-            .first()
-            .map_or(cost::BLOCK_HIT, |none| none.cost(block_miss))
-            / u64::from(sim.seen.max(1));
+        let undelivered = Self::undelivered(sim, current);
         // Each window counts half of what the one after it does. One window
         // alone does not tell the candidates apart: a shadow holds a few
         // hundred entries, and a handful of block misses more or less in it,
         // each worth dozens of row probes, falls to chance.
         for (running, events) in sim.running.iter_mut().zip(sim.events) {
-            // The row hits the cache is not delivering are reads that looked
-            // for a row, were refused one and went to their block.
-            let undelivered = events.row_hits * (1_000 - sim.trust) / 1_000;
-            let cost = events.cost(block_miss) - undelivered * cost::ROW_HIT
-                + undelivered * (cost::ROW_PROBE + cost::ROW_REFUSAL + block_read);
-            *running = *running / 2 + cost;
+            *running = *running / 2 + events.cost(block_miss);
         }
         sim.events = [Events::default(); CANDIDATES.len()];
         sim.seen = 0;
         sim.held = 0;
         sim.windows = sim.windows.saturating_add(1);
+        if undelivered {
+            sim.barred = sim.bar;
+            sim.bar = sim.bar.saturating_mul(2).min(BAR_LONGEST);
+            self.eighths.store(0, Ordering::Relaxed);
+        }
+        if sim.barred > 0 {
+            sim.barred -= 1;
+            return;
+        }
         // The first window starts from empty shadows, where every candidate
         // misses alike.
         if sim.windows < 3 {
@@ -421,28 +436,34 @@ impl RowGate {
         }
     }
 
-    /// How much of the row hits the shadows count the cache delivers, in
-    /// thousandths, after the window `sim` holds, where the candidate at
-    /// `current` is the fraction in use.
+    /// Whether, in the window `sim` holds, the cache gave almost none of the
+    /// row hits the shadow of the fraction in use, the candidate at
+    /// `current`, counted on the same sampled reads. Counts the window
+    /// toward the time the tree has had rows for.
     ///
     /// A shadow is the cache in miniature and not the cache: a block stands
     /// in it as one sampled key's share, so a miss brings in a fraction of
     /// the bytes it brings into the cache, and rows outlive in a shadow the
-    /// stream of blocks that evicts them from the cache. Where the shadow of
-    /// the fraction in use counts row hits the cache did not give the same
-    /// sampled reads, the trust halves toward what the cache gave, and every
-    /// candidate's row hits are priced by it. A tree with no rows has nothing
-    /// to measure and regains its trust slowly, until it tries rows again.
-    fn trust(sim: &Sim, current: usize) -> u64 {
-        let counted = sim.events.get(current).map_or(0, |events| events.row_hits);
+    /// stream of blocks that evicts them from the cache before their keys
+    /// are read again. Such a tree pays a probe and a refusal on every read
+    /// for rows it never holds. It keeps no rows for a bar of windows, then
+    /// lets its shadows choose again, and a trial that ends the same way
+    /// doubles the bar; one in which the cache delivers ends the doubling.
+    fn undelivered(sim: &mut Sim, current: usize) -> bool {
         if current == 0 {
-            sim.trust + (1_000 - sim.trust).div_ceil(TRUST_REGAIN)
-        } else if counted >= TRUST_HITS_MIN {
-            let delivered = (sim.held * 1_000 / counted).min(1_000);
-            u64::midpoint(sim.trust, delivered)
-        } else {
-            sim.trust
+            sim.open_for = 0;
+            return false;
         }
+        sim.open_for = sim.open_for.saturating_add(1);
+        let counted = sim.events.get(current).map_or(0, |events| events.row_hits);
+        if sim.open_for <= BAR_SETTLE || counted < BAR_HITS_MIN {
+            return false;
+        }
+        if sim.held * BAR_BELOW < counted {
+            return true;
+        }
+        sim.bar = BAR_FIRST;
+        false
     }
 
     /// Sets the fraction, in eighths, as the simulation would: for tests,

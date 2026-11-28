@@ -31,7 +31,8 @@ fn read_evenly(gate: &RowGate, keys: u64, reads: u64, seed: u64) {
 /// A shadow counts hits on rows of a hot set that fits it. Where the cache
 /// gave the same reads no row, as when a stream of blocks evicts each row
 /// before its key is read again, the tree gives its rows up in spite of the
-/// shadows, and does not take them back while the reads stay as they are.
+/// shadows for a bar of windows, and takes them back after it when the
+/// cache delivers.
 #[test]
 fn rows_the_cache_does_not_deliver_are_given_up() {
     let gate = gate();
@@ -47,10 +48,31 @@ fn rows_the_cache_does_not_deliver_are_given_up() {
     };
     play(8, false);
     assert_eq!(gate.eighths(), 0, "no row was delivered");
-    play(16, false);
-    assert_eq!(gate.eighths(), 0, "closed, with nothing new to measure");
-    // Tried again once the trust is back, and kept when the cache delivers.
     play(200, true);
+    assert_eq!(gate.eighths(), 0, "barred, whatever the cache would give");
+    play(100, true);
+    assert_eq!(gate.eighths(), 8, "the bar over, and the cache delivers");
+    // A trial that ends as the first did is followed by a bar twice as long.
+    play(8, false);
+    assert_eq!(gate.eighths(), 0);
+    play(400, true);
+    assert_eq!(gate.eighths(), 8, "the first bar's length again, not twice");
+}
+
+/// A cache that gives two fifths of the row hits its shadow counts keeps its
+/// rows: a sample of few hot keys differs from its shadow by as much while
+/// the rows pay.
+#[test]
+fn rows_delivered_in_part_are_kept() {
+    let gate = gate();
+    for n in 0..40 * u64::from(WINDOW) {
+        let key = hash(n) % 40;
+        let block = BlockSeen {
+            offset: key / 13 * 4_096,
+            weight: 4_096,
+        };
+        gate.observe(CACHE, 1, hash(key), 300, block, 0, n % 5 < 2);
+    }
     assert_eq!(gate.eighths(), 8);
 }
 
