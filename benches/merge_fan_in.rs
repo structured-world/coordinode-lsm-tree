@@ -350,9 +350,15 @@ impl Slots {
     fn order(&self, a: usize, b: usize) -> KeyOrder {
         tick(&self.word_compares);
         match self.words[a].cmp(&self.words[b]) {
-            KeyOrder::Equal => {}
-            order => return order,
+            KeyOrder::Equal => self.order_by_key(a, b),
+            order => order,
         }
+    }
+
+    /// [`Self::order`] for two occupied slots of one key word: by their
+    /// keys, then by their numbers.
+    #[inline]
+    fn order_by_key(&self, a: usize, b: usize) -> KeyOrder {
         tick(&self.key_compares);
         let (Some(x), Some(y)) = (&self.entries[a], &self.entries[b]) else {
             unreachable!("only occupied slots are ordered");
@@ -503,10 +509,13 @@ impl Iterator for SortedMerge {
         let slot = *self.order.first()? as usize;
         match self.sources[slot].next() {
             Some(Ok(entry)) => {
+                // The last input left is handed through with no key word
+                // taken, as the merger this arm stands for did.
+                if self.order.len() == 1 {
+                    return self.slots.entries[slot].replace(entry).map(Ok);
+                }
                 let old = self.slots.put(slot, entry);
-                if self.order.len() > 1
-                    && self.slots.order(slot, self.order[1] as usize) == KeyOrder::Greater
-                {
+                if self.slots.order(slot, self.order[1] as usize) == KeyOrder::Greater {
                     // Past `order[1]`: behind every smaller entry.
                     let rest = self.order[2..].partition_point(|&held| {
                         self.slots.order(slot, held as usize) == KeyOrder::Greater
@@ -551,6 +560,8 @@ impl LoserMerge {
     ) -> lsm_tree::Result<Self> {
         let leaves = sources.len().next_power_of_two().max(2);
         let mut slots = Slots::new(leaves, comparator, prefix);
+        // An empty slot holds the greatest key word, as in the engine.
+        slots.words.fill(u64::MAX);
         let mut live = 0;
         for (slot, source) in sources.iter_mut().enumerate() {
             if let Some(entry) = source.next() {
@@ -582,11 +593,19 @@ impl LoserMerge {
         Ok(merge)
     }
 
-    /// Whether slot `a` comes before slot `b`.
+    /// Whether slot `a` comes before slot `b`, played as the engine plays a
+    /// game: by key word first, an empty slot holding the greatest, and by
+    /// occupancy and key only where the words tie. The arm then differs from
+    /// the engine by the replay alone.
     #[inline]
     fn beats(&self, a: usize, b: usize) -> bool {
+        tick(&self.slots.word_compares);
+        let (word_a, word_b) = (self.slots.words[a], self.slots.words[b]);
+        if word_a != word_b {
+            return word_a < word_b;
+        }
         match (&self.slots.entries[a], &self.slots.entries[b]) {
-            (Some(_), Some(_)) => self.slots.order(a, b) == KeyOrder::Less,
+            (Some(_), Some(_)) => self.slots.order_by_key(a, b) == KeyOrder::Less,
             (Some(_), None) => true,
             (None, _) => false,
         }
@@ -624,6 +643,7 @@ impl Iterator for LoserMerge {
             Some(Err(e)) => return Some(Err(e)),
             None => {
                 self.live -= 1;
+                self.slots.words[slot] = u64::MAX;
                 self.slots.entries[slot].take()
             }
         };
@@ -897,10 +917,20 @@ fn main() -> lsm_tree::Result<()> {
                             let at = ((held.times.len() - 1) * num).div_ceil(den);
                             held.times[at].as_nanos() as f64 / entries as f64
                         };
+                        // The median of an even count is the mean of its two
+                        // middle samples, not the upper one.
+                        let middle = held.times.len() / 2;
+                        let median = if held.times.len().is_multiple_of(2) {
+                            (held.times[middle - 1] + held.times[middle]) / 2
+                        } else {
+                            held.times[middle]
+                        }
+                        .as_nanos() as f64
+                            / entries as f64;
                         print!(
                             "{label}/{}: {:.2} ns/entry, p99 {:.2}, p999 {:.2}, {} allocs",
                             arm.label(),
-                            ns_at(1, 2),
+                            median,
                             ns_at(99, 100),
                             ns_at(999, 1_000),
                             held.allocs[held.allocs.len() / 2],

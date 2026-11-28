@@ -397,7 +397,13 @@ impl<K: Eq, V, P> Table<K, V, P> {
                 if meta & STATE == FREE {
                     continue 'walk;
                 }
-                let slot_hash = slot.hash.load(Ordering::Relaxed);
+                // Acquired, against the release in `fill`: a reader that sees
+                // the hash of the entry now in a reused slot sees the store
+                // that freed the slot, and the look at the version below
+                // sends it round again. With the old version, the old link
+                // and the new hash it would skip this slot as another key's
+                // and could end the walk before a key that is resident.
+                let slot_hash = slot.hash.load(Ordering::Acquire);
                 if slot_hash == hash {
                     // Held through the state seen before the hash was read:
                     // the exchange fails if the slot was freed since, so a
@@ -681,7 +687,7 @@ impl<K, V, P> Write<'_, K, V, P> {
         let link = self.allocate();
         let slot = self.table.slot(link);
         let meta = slot.meta.load(Ordering::Relaxed);
-        slot.hash.store(hash, Ordering::Relaxed);
+        slot.hash.store(hash, Ordering::Release);
         slot.weight.store(weight, Ordering::Relaxed);
         // Released: a reader walking through the entry this slot held loads
         // the link and then looks at the slot's version again. Its load of

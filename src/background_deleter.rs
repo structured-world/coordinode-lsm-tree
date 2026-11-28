@@ -198,7 +198,10 @@ impl BackgroundDeleter {
                     );
                 }
             }
-            DeleteJob::Evict { cache, dead } => cache.evict_files(&[dead]),
+            // Left to the cache's own eviction: this runs on the thread that
+            // dropped the file's last handle, which may be a reader's, and
+            // the walk over the cache is not its to pay for.
+            DeleteJob::Evict { .. } => {}
         }
     }
 

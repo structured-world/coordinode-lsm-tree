@@ -51,24 +51,31 @@ fn evictions_queued_between_unlinks_take_one_walk_of_the_cache() {
     }
     let cache = Arc::new(crate::Cache::with_capacity_bytes(1 << 20));
 
-    {
-        // The first unlink holds the worker for the interval, while the
-        // tables' jobs queue behind it.
-        let deleter = BackgroundDeleter::spawn(
-            Some(Duration::from_millis(50)),
-            None,
-            Some((Arc::clone(&cache), 5)),
-        );
-        let mut paths = paths.iter();
-        deleter.enqueue(Arc::clone(&fs), paths.next().unwrap().clone());
-        for (table, path) in paths.enumerate() {
-            deleter.evict_table(table as u64);
-            deleter.enqueue(Arc::clone(&fs), path.clone());
-        }
+    // Every job queued before the worker's loop is run, here on this thread:
+    // what it finds queued does not depend on how threads are scheduled.
+    let (sender, receiver) = channel::<DeleteJob>();
+    for (table, path) in paths.iter().enumerate() {
+        sender
+            .send(DeleteJob::Evict {
+                cache: Arc::clone(&cache),
+                dead: crate::cache::DeadFile::Table {
+                    tree: 5,
+                    table: table as u64,
+                },
+            })
+            .unwrap();
+        sender
+            .send(DeleteJob::Unlink {
+                fs: Arc::clone(&fs),
+                path: path.clone(),
+            })
+            .unwrap();
     }
+    drop(sender);
+    BackgroundDeleter::run(&receiver, None);
 
     let (_, walks) = cache.dead_entries_dropped();
-    assert_eq!(walks, 1, "eight tables' evictions");
+    assert_eq!(walks, 1, "nine tables' evictions");
     for p in &paths {
         assert!(fs.open(p, &FsOpenOptions::new().read(true)).is_err());
     }

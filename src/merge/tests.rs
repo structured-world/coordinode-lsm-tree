@@ -453,6 +453,61 @@ fn merge_refuses_after_an_inputs_first_pull_panicked() {
     }
 }
 
+/// An input that yields `a`, panics where it would yield `c`, and would go on
+/// to `e` if asked again: it has moved past an entry it never returned.
+#[cfg(feature = "std")]
+fn skips_an_entry_in_a_panic() -> Box<dyn Iterator<Item = IterItem>> {
+    let mut pulls = 0;
+    Box::new(core::iter::from_fn(move || {
+        pulls += 1;
+        assert!(pulls != 2, "the input's second pull fails");
+        let key = if pulls == 1 { "a" } else { "e" };
+        (pulls <= 3).then(|| Ok(InternalValue::from_components(key, b"", 0, Value)))
+    }))
+}
+
+/// An input that panics on a later pull may have moved past an entry it never
+/// returned. The merger was as before the pull, so a caller that caught the
+/// panic and asked again got the merge on from the entry after the lost one,
+/// with nothing to say one was missing. It refuses instead.
+#[cfg(feature = "std")]
+#[test]
+fn merge_refuses_after_an_inputs_later_pull_panicked() {
+    let other: Box<dyn Iterator<Item = IterItem>> = Box::new(
+        ["b", "d"]
+            .into_iter()
+            .map(|key| Ok(InternalValue::from_components(key, b"", 0, Value))),
+    );
+    let mut iter = Merger::new(
+        vec![skips_an_entry_in_a_panic(), other],
+        comparator::default_comparator(),
+    );
+
+    // Taking `a` pulls the input again, for the entry that follows it.
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
+    assert!(unwound.is_err(), "the input's panic carries on");
+    for _ in 0..3 {
+        assert!(matches!(iter.next(), Some(Err(_))));
+    }
+}
+
+/// A single input is handed through without a tournament, and refused the
+/// same way once a pull of it panicked.
+#[cfg(feature = "std")]
+#[test]
+fn merge_of_one_input_refuses_after_its_pull_panicked() {
+    let mut iter = Merger::new(
+        vec![skips_an_entry_in_a_panic()],
+        comparator::default_comparator(),
+    );
+    assert!(matches!(iter.next(), Some(Ok(_))));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
+    assert!(unwound.is_err(), "the input's panic carries on");
+    for _ in 0..3 {
+        assert!(matches!(iter.next(), Some(Err(_))));
+    }
+}
+
 /// Orders keys by their bytes and panics when asked about `b` and `c`.
 #[cfg(feature = "std")]
 struct PanicsOnBAndC;

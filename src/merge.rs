@@ -48,11 +48,12 @@ enum Phase {
 
 /// Marks a merger [`Phase::Unwound`] unless the call it covers returns.
 ///
-/// Held over a call of the user's comparator, the one thing that can panic
-/// while the tournament is part way through a change: a caller that catches
-/// the panic and asks the merger again would otherwise get entries out of
-/// order, or a clean end with entries still waiting. A call that returns
-/// forgets the guard, so nothing is stored for it.
+/// Held over a call of the user's comparator, which can panic while the
+/// tournament is part way through a change, and over the pull of an input,
+/// which can panic having moved past an entry: a caller that catches the
+/// panic and asks the merger again would otherwise get entries out of order,
+/// one missing, or a clean end with entries still waiting. A call that
+/// returns forgets the guard, so nothing is stored for it.
 struct Unwinding<'a>(&'a Cell<Phase>);
 
 impl Unwinding<'_> {
@@ -441,7 +442,13 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
         // One source is already in order: a flush of one memtable would move
         // every entry through the tournament and back for nothing.
         if let [only] = self.iterators.as_mut_slice() {
-            return only.next();
+            if self.phase.get() == Phase::Unwound {
+                return Some(Err(unwound()));
+            }
+            let pulling = Unwinding(&self.phase);
+            let item = only.next();
+            pulling.disarm();
+            return item;
         }
         if self.phase.get() != Phase::Ready
             && let Some(e) = self.prepare()
@@ -453,9 +460,14 @@ impl<I: Iterator<Item = IterItem>> Iterator for Merger<I> {
         }
 
         let slot = self.tree[0] as usize;
-        // An input that panics here leaves the merger as it was: its entry
-        // is taken out of the slot only below.
-        let taken = match self.iterators[slot].next() {
+        // An input that panics here leaves the merger's own state as it was,
+        // its entry taken out of the slot only below, but not its own: it
+        // may have moved past an entry it never returned, and asked again
+        // would go on from the one after. The merger refuses from then on.
+        let pulling = Unwinding(&self.phase);
+        let pulled = self.iterators[slot].next();
+        pulling.disarm();
+        let taken = match pulled {
             Some(Ok(next)) => {
                 self.ranks[slot] = self.rank_of(&next);
                 self.entries[slot].replace(next)

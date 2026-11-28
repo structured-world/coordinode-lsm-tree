@@ -117,11 +117,21 @@ pub(crate) enum DeadFile {
 impl DeadFile {
     /// Whether `key` is an entry of this file.
     fn holds(self, key: &CacheKey) -> bool {
-        let of_blob_file = matches!(key.0, TAG_BLOB | TAG_BLOB_RECORD);
+        self.place() == Self::place_of(key)
+    }
+
+    /// The file as entries name theirs: whether it is a blob file, its tree
+    /// and its id.
+    const fn place(self) -> (bool, u64, u64) {
         match self {
-            Self::Table { tree, table } => !of_blob_file && key.1 == tree && key.2 == table,
-            Self::BlobFile { tree, file } => of_blob_file && key.1 == tree && key.2 == file,
+            Self::Table { tree, table } => (false, tree, table),
+            Self::BlobFile { tree, file } => (true, tree, file),
         }
+    }
+
+    /// The file `key` is an entry of, as [`Self::place`] names it.
+    const fn place_of(key: &CacheKey) -> (bool, u64, u64) {
+        (matches!(key.0, TAG_BLOB | TAG_BLOB_RECORD), key.1, key.2)
     }
 }
 
@@ -210,9 +220,9 @@ pub struct Cache {
     /// Bytes of deleted files' entries dropped, and the sweeps that dropped
     /// them.
     #[cfg(feature = "metrics")]
-    dead_bytes: core::sync::atomic::AtomicU64,
+    dead_bytes: portable_atomic::AtomicU64,
     #[cfg(feature = "metrics")]
-    dead_sweeps: core::sync::atomic::AtomicU64,
+    dead_sweeps: portable_atomic::AtomicU64,
     row_cache_enabled: bool,
     /// Whether each tree chooses its row cache share from its reads; every
     /// key goes through the row cache otherwise.
@@ -498,9 +508,9 @@ impl Cache {
                 rustc_hash::FxBuildHasher,
             ),
             #[cfg(feature = "metrics")]
-            dead_bytes: core::sync::atomic::AtomicU64::new(0),
+            dead_bytes: portable_atomic::AtomicU64::new(0),
             #[cfg(feature = "metrics")]
-            dead_sweeps: core::sync::atomic::AtomicU64::new(0),
+            dead_sweeps: portable_atomic::AtomicU64::new(0),
             row_cache_enabled: true,
             row_cache_adaptive: true,
             row_gates: spin::Mutex::new(hashbrown::HashMap::with_hasher(rustc_hash::FxBuildHasher)),
@@ -981,8 +991,11 @@ impl Cache {
     }
 
     /// The heaviest entry this cache can actually keep resident: half of its
-    /// capacity. Heavier inserts are refused by the cache; callers that would
-    /// build such an entry (e.g. the scan read-ahead) can skip the work.
+    /// capacity, or all of it where the cache is one shard (below two
+    /// megabytes). Heavier inserts are refused by the cache; callers that would
+    /// build such an entry (e.g. the scan read-ahead) can skip the work. An
+    /// entry within it is one the cache can hold, not one it always takes: a
+    /// cache full of what outranks the entry refuses it too.
     #[must_use]
     pub(crate) fn max_entry_weight(&self) -> u64 {
         self.data.max_entry_weight()
@@ -1190,9 +1203,17 @@ impl Cache {
     /// holds one shard's lock at a time, which lookups never take.
     #[cfg(feature = "std")]
     pub(crate) fn evict_files(&self, files: &[DeadFile]) {
-        let removed = self
-            .data
-            .remove_where(|key| files.iter().any(|file| file.holds(key)));
+        let removed = if let [file] = files {
+            self.data.remove_where(|key| file.holds(key))
+        } else {
+            // A batch is looked up by a key's file, not walked for every
+            // entry: the walk holds a shard's lock, and a thousand files
+            // against a million entries would be a billion comparisons there.
+            let dead: hashbrown::HashSet<(bool, u64, u64), rustc_hash::FxBuildHasher> =
+                files.iter().map(|file| file.place()).collect();
+            self.data
+                .remove_where(|key| dead.contains(&DeadFile::place_of(key)))
+        };
         self.count_dead(removed);
     }
 
@@ -1294,37 +1315,34 @@ impl Cache {
         if !self.row_cache_enabled {
             return 0;
         }
+        // A row the cache cannot keep at all is refused first, before its key
+        // is looked up or remembered: a value that big is re-read as often as
+        // any other, and each of those reads would otherwise take the shard's
+        // lock for a fingerprint that pushes out one of a row the cache could
+        // keep, or copy the row for an insert that drops it. The copy does
+        // not change the weight, so projecting it here is exact.
+        let weight = row_weight(user_key.len(), value.len());
+        if weight > self.data.max_entry_weight() {
+            return 0;
+        }
         let cache_key: CacheKey = (TAG_ROW, id.tree_id(), id.table_id(), key_hash).into();
         // A row is taken at once while its shard has room, and into a full
         // one only on its second miss: a key read once then costs a
         // fingerprint, not a copy of the row, an insert and the eviction of
         // something that may be read again.
-        if !self
-            .data
-            .admit(&cache_key, row_weight(user_key.len(), value.len()))
-        {
+        if !self.data.admit(&cache_key, weight) {
             return 0;
         }
         // The point-read path hands over a key and value that may be SUBSLICES
         // of the decoded data block, and a subslice keeps the whole block
         // allocation alive. The weigher charges a row its own key and value
         // bytes only, so a 100-byte row viewing a 4 KiB block would be
-        // accounted as 100 bytes while holding 4096 — and a workload touching
+        // accounted as 100 bytes while holding 4096, and a workload touching
         // one key per block, the one a row cache helps least, would overrun the
         // requested capacity by that ratio. Copying both out costs small
         // allocations per MISS, on a path that has just walked the index and
         // decoded a block, and it makes the charge equal to what is actually
         // retained.
-        //
-        // Unless the row cannot be admitted at all. A row heavier than one shard
-        // is refused by the insert below, and a value that big is re-read as
-        // often as any other, so copying it first would burn an allocation and a
-        // memcpy on every one of those reads to produce something immediately
-        // discarded. The copy does not change the weight, so projecting it here
-        // is exact.
-        if row_weight(user_key.len(), value.len()) > self.data.max_entry_weight() {
-            return 0;
-        }
         let iv = InternalValue {
             key: crate::key::InternalKey::new(crate::UserKey::from(user_key), seqno, value_type),
             value: crate::UserValue::from(value),

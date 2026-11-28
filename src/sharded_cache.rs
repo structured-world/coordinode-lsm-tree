@@ -160,6 +160,12 @@ impl Policy {
 
     /// Queues the node of an entry just written and counts its weight. A
     /// large entry is queued and counted by the cache, not here.
+    ///
+    /// The push follows the write of the entry with nothing reserved first,
+    /// here and where an entry is promoted, evicted or its table rebuilt: no
+    /// caller sees the state between the two. A push unwinds only past
+    /// `isize::MAX` bytes; an allocation that fails aborts under `std`, and
+    /// without it there is no `catch_unwind` to return from.
     fn enqueue(&mut self, node: Node, queue: Queue, weight: u64) {
         match queue {
             Queue::Main => {
@@ -449,6 +455,12 @@ impl<K: Eq, V> Write<'_, K, V, Policy> {
     /// frequency is reinserted at the back with its counter decremented; an
     /// unused one is evicted. Returns `false` if the main queue holds no live
     /// entry.
+    ///
+    /// Readers raise an entry's frequency without the lock, so a turn can
+    /// find an entry it lowered raised again. The turns need no bound for
+    /// that: an entry is kept only while a hit lands between every turn that
+    /// brings it to zero and the next, a few tens of nanoseconds each time,
+    /// and the first turn without one takes it out.
     fn evict_from_main(&mut self, evicted: &mut Evicted<V>) -> bool {
         while let Some(node) = self.policy_mut().main.pop_front() {
             if !self.is_live(node) {
@@ -528,12 +540,16 @@ struct Shard<K, V> {
     len: AtomicUsize,
     /// Whether the shard has ever had to evict to stay within capacity.
     filled: AtomicBool,
+    /// The weight of the shard's main queue, as of its last writer: what the
+    /// shard keeps whatever it lends to the large entries.
+    main: AtomicU64,
 }
 
-impl<K, V> Shard<K, V> {
+impl<K: Eq, V> Shard<K, V> {
     fn new(capacity: u64, ghost_capacity: usize) -> Self {
         Self {
             table: Table::new(Policy::new(capacity, ghost_capacity)),
+            main: AtomicU64::new(0),
             resident: AtomicU64::new(0),
             capacity: AtomicU64::new(capacity),
             len: AtomicUsize::new(0),
@@ -570,16 +586,29 @@ impl<K, V> Shard<K, V> {
     fn release(
         &self,
         mut write: Write<'_, K, V, Policy>,
-        evicted: Evicted<V>,
+        mut evicted: Evicted<V>,
         large: &AtomicU64,
+        shards: usize,
     ) -> bool {
         let released = core::mem::take(&mut write.policy_mut().large_released);
         if released > 0 {
             large.fetch_sub(released, Ordering::Relaxed);
         }
+        // A large entry that went in while this writer held the lock saw the
+        // shard as it was published before, could not have it give up its
+        // share, and left that to this writer's turn: the share is read
+        // again, and what the shard holds past it evicted, before the shard
+        // is published. Without it the shard kept what it grew by and the
+        // large entry both until its next writer, if one came.
+        let lent = large.load(Ordering::Relaxed).div_ceil(shards as u64);
+        if lent != write.policy().lent {
+            write.policy_mut().lent = lent;
+            write.evict_to_capacity(&mut evicted);
+        }
         let policy = write.policy();
         let over = policy.lent > 0
             && policy.resident_bytes() > policy.capacity.saturating_sub(policy.lent);
+        self.main.store(policy.main_bytes, Ordering::Relaxed);
         self.resident
             .store(policy.resident_bytes(), Ordering::Relaxed);
         self.capacity.store(policy.limit(), Ordering::Relaxed);
@@ -819,7 +848,7 @@ where
     }
 
     fn release(&self, shard: &Shard<K, V>, write: Write<'_, K, V, Policy>, evicted: Evicted<V>) {
-        if shard.release(write, evicted, &self.large_resident) {
+        if shard.release(write, evicted, &self.large_resident, self.shards.len()) {
             self.take_back();
         }
     }
@@ -831,26 +860,34 @@ where
     /// Without it a cache filled with large entries and then with blocks
     /// read again held both, up to nearly twice its capacity.
     ///
-    /// Counted as an insert that needed room, so the large entries age and
-    /// come to the end of their tenure as they do for one of their own.
     /// Called with no shard's lock held; skipped where the large entries'
-    /// lock is taken, by a writer that trims them itself.
+    /// lock is taken, by a writer that has them give way itself.
     #[cold]
     fn take_back(&self) {
+        if self.weight() <= self.capacity() {
+            return;
+        }
+        if let Some(mut large) = self.large.try_lock() {
+            self.give_way(&mut large, false);
+        }
+    }
+
+    /// Evicts large entries, oldest first, for what the cache weighs past
+    /// its capacity. However lately they went in or were read: the capacity
+    /// is a bound, and an entry spared for its tenure left the cache over it
+    /// for as long as no write came. A writer that does not `wait` leaves
+    /// the entries of shards whose locks are taken.
+    fn give_way(&self, large: &mut Large, wait: bool) {
         let over = self.weight().saturating_sub(self.capacity());
         if over == 0 {
             return;
         }
-        let Some(mut large) = self.large.try_lock() else {
-            return;
-        };
-        large.crowd(false);
         let keep = self
             .large_resident
             .load(Ordering::Relaxed)
             .saturating_sub(over);
         let room = self.large_limit().saturating_sub(keep);
-        self.trim_large(&mut large, room, false, false, false);
+        self.trim_large(large, room, true, false, wait);
     }
 
     /// Changes the total capacity of the live cache, split over its shards as
@@ -879,15 +916,7 @@ where
         // and the large entries that fit their own limit can together weigh
         // more than the new capacity. The large entries give way for the
         // rest: the main queues hold what outranks them.
-        let over = self.weight().saturating_sub(capacity);
-        if over > 0 {
-            let keep = self
-                .large_resident
-                .load(Ordering::Relaxed)
-                .saturating_sub(over);
-            let room = self.large_limit().saturating_sub(keep);
-            self.trim_large(&mut large, room, true, false, true);
-        }
+        self.give_way(&mut large, true);
     }
 
     /// Evicts large entries, oldest unread first, until `weight` more fits
@@ -1000,6 +1029,17 @@ where
             if self.large_resident.load(Ordering::Relaxed) + more > limit {
                 return;
             }
+            // Main queues full of what outranks this entry leave it no room
+            // whatever the small queues give up: seen before they are asked
+            // to, or an entry that is then refused had them evict for it.
+            let main: u64 = self
+                .shards
+                .iter()
+                .map(|shard| shard.0.main.load(Ordering::Relaxed))
+                .sum();
+            if main + self.large_resident.load(Ordering::Relaxed) + more > self.capacity() {
+                return;
+            }
             // The shards give up their share of what the large entries will
             // weigh, out of their small queues; if the cache would still
             // hold more than its capacity, their main queues are full of
@@ -1035,6 +1075,11 @@ where
                 .queue
                 .push_back((at, node, stamp, priority == Priority::High));
             self.sweep_large(&mut large, wait);
+            // Writers of other shards may have filled their main queues
+            // between the look at the cache's weight and the insert, and a
+            // shard released meanwhile found this lock taken: what the cache
+            // now weighs past its capacity is taken back here.
+            self.give_way(&mut large, wait);
         }
     }
 

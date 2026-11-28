@@ -370,6 +370,108 @@ fn main_queues_filled_after_a_large_entry_take_its_place() {
     assert_eq!(c.get(&1_000), None, "the large entry gave way");
 }
 
+/// A large entry that only just went in gives way too when a main queue
+/// grows into what its shard lends. Spared for its tenure, it left the cache
+/// over its capacity for as long as no further write came.
+#[test]
+fn a_main_queue_grown_past_what_it_lends_takes_a_young_large_entrys_place() {
+    // A large entry of 400 and one entry of 50 in each shard's main queue.
+    let c = byte_cache(800);
+    c.insert(1_000, vec![7u8; 400]);
+    for k in 0..400u64 {
+        let shard = c.index_of(c.hasher.hash_one(k));
+        if c.shard_state(shard)
+            .is_some_and(|(_, resident)| resident == 0)
+        {
+            c.insert_with_priority(k, vec![0u8; 50], Priority::High);
+        }
+    }
+    assert_eq!(c.weight(), 800);
+
+    c.insert_with_priority(5_000, vec![0u8; 50], Priority::High);
+    assert!(c.weight() <= 800, "{} bytes resident", c.weight());
+}
+
+/// The keys from `from` on that fall in `shard`.
+fn keys_of_shard(
+    c: &ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighter, FxBuildHasher>,
+    shard: usize,
+    from: u64,
+) -> impl Iterator<Item = u64> + '_ {
+    (from..).filter(move |&k| c.index_of(c.hasher.hash_one(k)) == shard)
+}
+
+/// A large entry the main queues leave no room for is refused before any
+/// shard is asked to give up its small queue: asked first, the shards
+/// evicted what they had there for an entry that was then not taken.
+#[test]
+fn a_large_entry_the_main_queues_leave_no_room_for_evicts_nothing() {
+    // Two shards of 1 MiB, 768 KiB in each main queue and 128 KiB in the
+    // first shard's small queue.
+    let c = ShardedCache::with_weighter(2 << 20, 2, 1024, LenWeighter, FxBuildHasher);
+    for shard in 0..2 {
+        for k in keys_of_shard(&c, shard, 0).take(64) {
+            c.insert_with_priority(k, vec![0u8; 12 << 10], Priority::High);
+        }
+    }
+    let small: alloc::vec::Vec<u64> = keys_of_shard(&c, 0, 1_000_000).take(8).collect();
+    for &k in &small {
+        c.insert(k, vec![0u8; 16 << 10]);
+    }
+    let before = c.weight();
+    assert_eq!(before, 2 * (768 << 10) + (128 << 10));
+
+    c.insert(9_000_000, vec![7u8; 1 << 20]);
+    assert_eq!(c.get(&9_000_000), None, "no room beside the main queues");
+    assert_eq!(c.weight(), before, "nothing evicted for it");
+    assert!(small.iter().all(|k| c.contains(k)));
+}
+
+/// A large entry that goes in while another shard's writer holds its lock
+/// sees that shard as it was published before the writer grew it. The writer
+/// reads the share its shard lends again before it publishes, and evicts
+/// down to it: left to the shard's next writer, the cache held the growth
+/// and the large entry both.
+#[test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the lock is held across the large insert on purpose; `release` drops it"
+)]
+fn a_writer_overtaken_by_a_large_entry_gives_up_its_shards_share() {
+    // Two shards of 1 MiB, 512 KiB of ordinary entries in each.
+    let c = ShardedCache::with_weighter(2 << 20, 2, 1024, LenWeighter, FxBuildHasher);
+    for shard in 0..2 {
+        for k in keys_of_shard(&c, shard, 0).take(32) {
+            c.insert(k, vec![0u8; 16 << 10]);
+        }
+    }
+    assert_eq!(c.weight(), 1 << 20);
+
+    // A writer grows the first shard to its capacity and has not published.
+    let grown: alloc::vec::Vec<u64> = keys_of_shard(&c, 0, 1_000_000).take(32).collect();
+    let shard = &c.shards[0].0;
+    let mut evicted = Evicted::new();
+    let mut write = c.lock(shard);
+    for &k in &grown {
+        let value = vec![0u8; 16 << 10];
+        write.insert_entry(
+            c.hasher.hash_one(k),
+            k,
+            value,
+            16 << 10,
+            Priority::Normal,
+            &mut evicted,
+        );
+    }
+    // A large entry of 1 MiB goes into the second shard meanwhile.
+    let large = keys_of_shard(&c, 1, 9_000_000).next().unwrap();
+    c.insert(large, vec![7u8; 1 << 20]);
+    assert!(c.contains(&large));
+
+    c.release(shard, write, evicted);
+    assert!(c.weight() <= 2 << 20, "{} bytes resident", c.weight());
+}
+
 /// A cache shrunk to where its main queues and its large entries do not both
 /// fit keeps the main queues: each shard keeps its main queue whatever it
 /// lends, and a large entry within the large entries' own limit stayed too.
@@ -893,12 +995,16 @@ fn a_read_racing_replaces_of_its_key_always_finds_a_value() {
             thread::spawn(move || {
                 let mut reads = 0u64;
                 loop {
-                    let value = cache.get(&7).expect("the key is always resident");
-                    assert!(value.iter().all(|&byte| byte == value[0]), "a torn value");
+                    let found = cache.get(&7);
+                    // Counted before the read is checked, so a reader whose
+                    // first read fails still lets the writer start and the
+                    // test end with its panic.
                     reads += 1;
                     if reads == 1 {
                         reading.fetch_add(1, Ordering::Relaxed);
                     }
+                    let value = found.expect("the key is always resident");
+                    assert!(value.iter().all(|&byte| byte == value[0]), "a torn value");
                     if done.load(Ordering::Relaxed) {
                         return reads;
                     }
@@ -949,10 +1055,11 @@ fn a_read_racing_the_tables_growth_finds_what_was_resident() {
             thread::spawn(move || {
                 let mut key = t;
                 loop {
-                    assert!(cache.contains(&(key % 32)), "key {} lost", key % 32);
+                    let found = cache.contains(&(key % 32));
                     if key == t {
                         reading.fetch_add(1, Ordering::Relaxed);
                     }
+                    assert!(found, "key {} lost", key % 32);
                     key += 1;
                     if done.load(Ordering::Relaxed) {
                         return;
