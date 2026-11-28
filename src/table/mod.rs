@@ -1380,6 +1380,8 @@ impl Table {
         held: bool,
     ) {
         if let (Some(gate), Some(block)) = (gate, fd.data_block()) {
+            // Before the capacity: a resize between the two is then seen.
+            let resizes = gate.resizes();
             gate.observe(
                 self.cache.capacity(),
                 self.global_id().table_id(),
@@ -1388,6 +1390,7 @@ impl Table {
                 block,
                 self.cache.block_load_nanos(self.global_id(), block.offset),
                 held,
+                resizes,
             );
         }
     }

@@ -24,7 +24,7 @@ fn read_evenly(gate: &RowGate, keys: u64, reads: u64, seed: u64) {
             offset: key / 13 * 4_096,
             weight: 4_096,
         };
-        gate.observe(CACHE, 1, hash(key), 300, block, 0, true);
+        gate.observe(CACHE, 1, hash(key), 300, block, 0, true, gate.resizes());
     }
 }
 
@@ -51,7 +51,7 @@ fn rows_the_cache_does_not_deliver_are_given_up() {
                 offset: key / 13 * 4_096,
                 weight: 4_096,
             };
-            gate.observe(CACHE, 1, hash(key), 300, block, 0, held);
+            gate.observe(CACHE, 1, hash(key), 300, block, 0, held, gate.resizes());
         }
     };
     play(8, false);
@@ -87,7 +87,7 @@ fn a_few_rows_the_cache_dropped_do_not_bar_the_rest() {
             offset: key / 13 * 4_096,
             weight: 4_096,
         };
-        gate.observe(CACHE, 1, hash(key), 300, block, 0, false);
+        gate.observe(CACHE, 1, hash(key), 300, block, 0, false, gate.resizes());
     }
     // The reads turn to the hot set, and the cache delivers.
     read_evenly(&gate, 40, 20 * u64::from(WINDOW), 9);
@@ -106,7 +106,16 @@ fn rows_delivered_in_part_are_kept() {
             offset: key / 13 * 4_096,
             weight: 4_096,
         };
-        gate.observe(CACHE, 1, hash(key), 300, block, 0, n % 5 < 2);
+        gate.observe(
+            CACHE,
+            1,
+            hash(key),
+            300,
+            block,
+            0,
+            n % 5 < 2,
+            gate.resizes(),
+        );
     }
     assert_eq!(gate.eighths(), 8);
 }
@@ -132,7 +141,7 @@ fn rounds_over_more_keys_than_the_cache_holds_turn_rows_off() {
             offset: hash(key ^ 0x5555) % keys / 14 * 4_096,
             weight: 4_096,
         };
-        gate.observe(CACHE, 1, key_hash, 330, block, 0, false);
+        gate.observe(CACHE, 1, key_hash, 330, block, 0, false, gate.resizes());
         if gate.eighths() == 0 && closed_after.is_none() {
             closed_after = Some(n);
         }
@@ -177,7 +186,7 @@ fn the_shadows_stay_within_a_two_hundredth_of_the_cache() {
                     offset: key / 64 * 4_096,
                     weight: 4_096,
                 };
-                gate.observe(cache, 1, hash(key), row, block, 0, true);
+                gate.observe(cache, 1, hash(key), row, block, 0, true, gate.resizes());
             }
             assert!(
                 gate.memory() <= cache / 200,
@@ -200,7 +209,7 @@ fn a_cache_too_small_to_shadow_is_not_simulated() {
             offset: key / 13 * 4_096,
             weight: 4_096,
         };
-        gate.observe(64 << 10, 1, hash(key), 300, block, 0, true);
+        gate.observe(64 << 10, 1, hash(key), 300, block, 0, true, gate.resizes());
     }
     assert_eq!(gate.memory(), 0);
     assert_eq!(gate.eighths(), 8);
@@ -226,7 +235,16 @@ fn a_slow_load_weighs_against_rows_that_crowd_out_blocks() {
                 offset: key / 13 * 4_096,
                 weight: 4_096,
             };
-            gate.observe(CACHE, 1, hash(key), 300, block, load_nanos, true);
+            gate.observe(
+                CACHE,
+                1,
+                hash(key),
+                300,
+                block,
+                load_nanos,
+                true,
+                gate.resizes(),
+            );
         }
         gate.eighths()
     };
@@ -308,7 +326,26 @@ fn read_once(gate: &RowGate, capacity: u64) {
         offset: 0,
         weight: 4_096,
     };
-    gate.observe(capacity, 1, hash(1), 300, block, 0, true);
+    gate.observe(capacity, 1, hash(1), 300, block, 0, true, gate.resizes());
+}
+
+/// A sampled read takes the cache's capacity and is played after: a cache
+/// that grew in between told the gate while it still sampled. The read,
+/// played at the capacity that was too small, does not leave the tree
+/// sampling none, with no later notice to undo it.
+#[test]
+fn a_read_played_at_a_capacity_since_resized_leaves_the_tree_sampling() {
+    let gate = gate();
+    let sampled = |gate: &RowGate| (0..100_000).map(hash).filter(|&h| gate.samples(h)).count();
+    let before = gate.resizes();
+    gate.resized();
+    let block = BlockSeen {
+        offset: 0,
+        weight: 4_096,
+    };
+    gate.observe(64 << 10, 1, hash(1), 300, block, 0, true, before);
+    assert!(sampled(&gate) > 0);
+    assert_eq!(gate.eighths(), 8);
 }
 
 /// A tree that gave its rows up while its cache could be simulated keeps

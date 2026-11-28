@@ -276,6 +276,8 @@ pub(crate) struct RowGate {
     /// small rows (see [`Sim::sparser`]), and [`UNSAMPLED`] while the cache
     /// is too small to simulate.
     unsampled: AtomicU32,
+    /// Resizes of the cache so far (see [`Self::resized`]).
+    resizes: AtomicU32,
     /// Taken by a sampled read that finds it free, and by none other.
     sim: spin::Mutex<Sim>,
 }
@@ -302,6 +304,7 @@ impl RowGate {
         Self {
             eighths: AtomicU8::new(8),
             unsampled: AtomicU32::new(EVERY_SAMPLE),
+            resizes: AtomicU32::new(0),
             sim: spin::Mutex::new(Sim::new()),
         }
     }
@@ -334,13 +337,29 @@ impl RowGate {
     /// because the cache was too small to simulate samples again, and its
     /// next sampled read finds out whether the cache now is large enough.
     pub(crate) fn resized(&self) {
-        // Lost to a read that is turning sampling off or on right now, the
-        // exchange leaves that read's answer, which a later resize redoes.
+        // Counted first, then sampling turned back on: a sampled read that
+        // turns it off for a capacity it read before this resize either
+        // sees the count moved and turns it on again, or stored before the
+        // exchange here, which then undoes it. The four accesses are
+        // ordered against each other for that.
+        self.resizes.fetch_add(1, Ordering::SeqCst);
+        self.sample_again();
+    }
+
+    /// How many times the cache was resized: read before the capacity a
+    /// sampled read is played at, and handed to [`Self::observe`] with it.
+    pub(crate) fn resizes(&self) -> u32 {
+        self.resizes.load(Ordering::SeqCst)
+    }
+
+    /// Has a gate that samples no read sample again.
+    fn sample_again(&self) {
+        // Failing, the exchange found a gate that samples.
         let _ = self.unsampled.compare_exchange(
             UNSAMPLED,
             EVERY_SAMPLE,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         );
     }
 
@@ -361,8 +380,9 @@ impl RowGate {
     /// end of a window moves the fraction to the candidate that keeps
     /// winning. Skipped when another sampled read is being played. `capacity`
     /// is the cache's, which the shadows are scaled from, `load_nanos` what
-    /// its cold loads have been taking, zero where none was timed, and
-    /// `held` whether the cache held the key's row.
+    /// its cold loads have been taking, zero where none was timed, `held`
+    /// whether the cache held the key's row, and `resizes` what
+    /// [`Self::resizes`] gave before `capacity` was read.
     #[expect(
         clippy::too_many_arguments,
         reason = "one sampled read, as the table saw it"
@@ -376,6 +396,7 @@ impl RowGate {
         block: BlockSeen,
         load_nanos: u64,
         held: bool,
+        resizes: u32,
     ) {
         let Some(mut sim) = self.sim.try_lock() else {
             return;
@@ -404,7 +425,13 @@ impl RowGate {
             // walk to its block past a row the cache holds for nothing.
             *sim = Sim::new();
             self.eighths.store(8, Ordering::Relaxed);
-            self.unsampled.store(UNSAMPLED, Ordering::Relaxed);
+            self.unsampled.store(UNSAMPLED, Ordering::SeqCst);
+            // A cache resized since this read took its capacity may be
+            // large enough now, and its notice came while the gate still
+            // sampled: the next sampled read finds out.
+            if self.resizes.load(Ordering::SeqCst) != resizes {
+                self.sample_again();
+            }
             return;
         }
         if sim.shadows.is_none() || sim.capacity != capacity {
