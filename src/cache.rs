@@ -1329,11 +1329,13 @@ impl Cache {
             key: crate::key::InternalKey::new(crate::UserKey::from(user_key), seqno, value_type),
             value: crate::UserValue::from(value),
         };
-        // On probation: a row earns the main queue by being read again, so a
-        // stream of rows read twice and no more cannot push out the blocks
-        // every read walks.
+        // A row admitted on its repeat goes to the main queue, as any entry
+        // the ghost queue remembers: its second read is what earned it. Held
+        // in the small queue until a third read there, a row of a hot set
+        // read beside many cold keys was evicted by their blocks before its
+        // key came back, and nine reads in ten of such a set found no row.
         self.data
-            .insert_with_priority(cache_key, Item::Row(iv), Priority::Probation);
+            .insert_with_priority(cache_key, Item::Row(iv), Priority::Normal);
         user_key.len() + value.len()
     }
 

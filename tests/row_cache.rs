@@ -201,6 +201,60 @@ fn a_cache_told_not_to_adapt_fills_rows_for_every_key() {
     );
 }
 
+/// A hot set read beside many cold keys is answered from its rows: nine reads
+/// in ten go to 1,200 keys whose rows are a fifth of the cache, the tenth to
+/// any of 40,000, whose blocks stream through the cache between two reads of
+/// a hot key. A row is kept from its second read on, or that stream evicts
+/// it before its key comes back and the hot reads walk to their blocks.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_hot_set_among_cold_keys_is_read_from_its_rows() {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache =
+        Arc::new(Cache::with_capacity_bytes(2 * 1024 * 1024).with_adaptive_row_cache(false));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache)
+    .open()
+    .unwrap();
+    let (keys, hot) = (40_000u64, 1_200u64);
+    let spread = |i: u64| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20).to_be_bytes();
+    let value = vec![7u8; 256];
+    for i in 0..keys {
+        tree.insert(spread(i), &value, 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let reads = 100_000usize;
+    let mut walked = 0;
+    for pass in 0..3 {
+        let before = tree.metrics().data_block_load_count();
+        for _ in 0..reads {
+            let any = next() % keys;
+            let at = if next() % 10 == 0 { any } else { any % hot };
+            assert!(tree.get(spread(at), SeqNo::MAX).unwrap().is_some());
+        }
+        if pass == 2 {
+            walked = tree.metrics().data_block_load_count() - before;
+        }
+    }
+    assert!(
+        walked * 4 < reads,
+        "{walked} of {reads} reads walked to a block",
+    );
+}
+
 /// One order of evenly drawn keys read over and over brings each key back
 /// after as many reads as the tree has keys, more than the cache remembers
 /// of the keys it refused: a row is refused on every read and never held.

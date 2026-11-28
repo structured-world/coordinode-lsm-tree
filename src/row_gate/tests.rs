@@ -78,8 +78,9 @@ fn rows_delivered_in_part_are_kept() {
 
 /// Every key read in turn, round after round, where the cache holds most but
 /// not all of them: a row comes back only after every other key was read, by
-/// when the cache has dropped it, so rows cost their probes, refusals and
-/// fills and answer almost nothing. The gate closes.
+/// when the cache has forgotten it was refused, so the cache holds no row
+/// while the shadows, which remember longer, count hits on some. The gate
+/// closes on what the cache delivers.
 #[test]
 fn rounds_over_more_keys_than_the_cache_holds_turn_rows_off() {
     let gate = gate();
@@ -96,15 +97,15 @@ fn rounds_over_more_keys_than_the_cache_holds_turn_rows_off() {
             offset: hash(key ^ 0x5555) % keys / 14 * 4_096,
             weight: 4_096,
         };
-        gate.observe(CACHE, 1, key_hash, 330, block, 0, true);
+        gate.observe(CACHE, 1, key_hash, 330, block, 0, false);
         if gate.eighths() == 0 && closed_after.is_none() {
             closed_after = Some(n);
         }
     }
     assert_eq!(gate.eighths(), 0);
-    // At its third window, which ends inside the sixth round of the keys.
+    // By its fourth window, which ends inside the eighth round of the keys.
     assert!(
-        closed_after.is_some_and(|reads| reads <= 6 * keys),
+        closed_after.is_some_and(|reads| reads <= 8 * keys),
         "closed after {closed_after:?} reads",
     );
 }
@@ -217,7 +218,8 @@ fn trees_with_opposite_reads_choose_opposite_fractions() {
     let (hot, spread) = (gate(), gate());
     for round in 0..20 {
         read_evenly(&hot, 40, u64::from(WINDOW), 6 + round);
-        read_evenly(&spread, 1_000_000, u64::from(WINDOW), 60 + round);
+        // A seed of its own a round, so no round reads the last one's keys.
+        read_evenly(&spread, 1_000_000, u64::from(WINDOW), 60 + 1_000 * round);
     }
     assert_eq!(hot.eighths(), 8);
     assert_eq!(spread.eighths(), 0);

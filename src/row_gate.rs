@@ -182,7 +182,7 @@ const BAR_SETTLE: u32 = 3;
 
 /// Row hits the shadow of the fraction in use has to count in a window for
 /// the cache's own to be checked against them.
-const BAR_HITS_MIN: u64 = 32;
+const BAR_HITS_MIN: u64 = 16;
 
 /// The cache delivers too little when it gives fewer than one in this many
 /// of the row hits the shadow counted. Far below what sampling a few hot
@@ -367,7 +367,7 @@ impl RowGate {
                 continue;
             }
             if shadow.admit(&row, u64::from(row_weight)) {
-                shadow.insert_with_priority(row, row_weight, Priority::Probation);
+                shadow.insert_with_priority(row, row_weight, Priority::Normal);
                 events.row_fills += 1;
             } else {
                 events.row_refusals += 1;
