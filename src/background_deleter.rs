@@ -57,6 +57,10 @@ use std::{
     time::Duration,
 };
 
+/// Jobs the worker takes off its channel, at most, to find the evictions
+/// queued behind one: what it holds back in memory while it walks the cache.
+const EVICT_LOOKAHEAD: usize = 1_024;
+
 /// A unit of background work.
 enum DeleteJob {
     /// Unlink `path` through `fs`.
@@ -202,8 +206,17 @@ impl BackgroundDeleter {
     /// what deleted files left cached. Exits when the channel closes (the
     /// deleter was dropped) and the queue is drained.
     fn run(receiver: &Receiver<DeleteJob>, min_interval: Option<Duration>) {
-        let mut next = receiver.recv().ok();
-        while let Some(job) = next.take() {
+        // Jobs taken off the channel while looking for evictions to batch,
+        // in the order they were queued.
+        let mut held: std::collections::VecDeque<DeleteJob> = std::collections::VecDeque::new();
+        loop {
+            let job = match held.pop_front() {
+                Some(job) => job,
+                None => match receiver.recv() {
+                    Ok(job) => job,
+                    Err(_) => return,
+                },
+            };
             match job {
                 DeleteJob::Unlink { fs, path } => {
                     if let Err(e) = fs.remove_file(&path) {
@@ -217,28 +230,30 @@ impl BackgroundDeleter {
                     }
                 }
                 DeleteJob::Evict { cache, dead } => {
-                    // The inputs of one compaction are dropped together: one
-                    // walk over the cache takes out all that are queued.
+                    // The inputs of one compaction are dropped together, each
+                    // queueing its eviction and then its unlink: one walk
+                    // over the cache takes out every file whose eviction is
+                    // queued, the unlinks between them kept in their order.
+                    // Stopping at the first unlink walked the whole cache
+                    // once per file.
                     let mut files = vec![dead];
-                    loop {
-                        match receiver.try_recv() {
-                            Ok(DeleteJob::Evict { cache: other, dead })
+                    let mut kept = std::collections::VecDeque::with_capacity(held.len());
+                    let queued = core::mem::take(&mut held).into_iter().chain(
+                        core::iter::from_fn(|| receiver.try_recv().ok()).take(EVICT_LOOKAHEAD),
+                    );
+                    for job in queued {
+                        match job {
+                            DeleteJob::Evict { cache: other, dead }
                                 if Arc::ptr_eq(&other, &cache) =>
                             {
                                 files.push(dead);
                             }
-                            Ok(other) => {
-                                next = Some(other);
-                                break;
-                            }
-                            Err(_) => break,
+                            other => kept.push_back(other),
                         }
                     }
+                    held = kept;
                     cache.evict_files(&files);
                 }
-            }
-            if next.is_none() {
-                next = receiver.recv().ok();
             }
         }
     }

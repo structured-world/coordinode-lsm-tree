@@ -327,6 +327,75 @@ fn an_entry_heavier_than_a_shard_is_kept_within_the_capacity() {
     assert!(c.weight() > 700, "the shards took their bytes back");
 }
 
+/// A large key written over and over leaves one entry and a queue of a few
+/// nodes: each write left the node of the entry it replaced behind, and
+/// nothing dropped them while the large entries stayed within their limit.
+#[test]
+fn a_large_key_written_over_and_over_leaves_a_short_queue() {
+    let c = byte_cache(800);
+    for _ in 0..5_000 {
+        c.insert(1, vec![1u8; 150]);
+    }
+    assert_eq!(c.weight(), 150);
+    let queued = c.large.lock().queue.len();
+    assert!(queued < 100, "{queued} nodes queued for one entry");
+}
+
+/// A writer that does not wait fills its shard against the share the shard
+/// lends now. No waiting writer had visited the shards since the large entry
+/// went in, they still held the share they lent before it, none, and the
+/// entries taken on that brought the cache to more than its capacity.
+#[test]
+fn a_writer_that_does_not_wait_fills_within_what_its_shard_lends() {
+    let c = byte_cache(800);
+    c.insert(1_000, vec![7u8; 400]);
+    assert_eq!(c.weight(), 400);
+    for k in 0..200u64 {
+        c.try_insert_with_priority(k, vec![0u8; 80], Priority::Normal);
+    }
+    assert!(c.weight() <= 800, "{} bytes resident", c.weight());
+}
+
+/// Entries that outrank a large one, taken into the main queues after it
+/// went in, take its place: the cache holds its capacity, not the main
+/// queues and the large entry both.
+#[test]
+fn main_queues_filled_after_a_large_entry_take_its_place() {
+    let c = byte_cache(800);
+    c.insert(1_000, vec![7u8; 300]);
+    for k in 0..400u64 {
+        c.insert_with_priority(k, vec![0u8; 50], Priority::High);
+    }
+    assert!(c.weight() <= 800, "{} bytes resident", c.weight());
+    assert_eq!(c.get(&1_000), None, "the large entry gave way");
+}
+
+/// A cache shrunk to where its main queues and its large entries do not both
+/// fit keeps the main queues: each shard keeps its main queue whatever it
+/// lends, and a large entry within the large entries' own limit stayed too.
+#[test]
+fn a_shrink_keeps_the_cache_within_its_new_capacity() {
+    // 800 bytes over 8 shards: a large entry of 300 and one entry of 50 in
+    // each shard's main queue, 700 in all.
+    let c = byte_cache(800);
+    c.insert(1_000, vec![7u8; 300]);
+    for k in 0..400u64 {
+        let shard = c.index_of(c.hasher.hash_one(k));
+        if c.shard_state(shard)
+            .is_some_and(|(_, resident)| resident == 0)
+        {
+            c.insert_with_priority(k, vec![0u8; 50], Priority::High);
+        }
+    }
+    assert_eq!(c.weight(), 700);
+
+    // At 600 the large entry is within the large entries' seven eighths and
+    // each shard keeps its main queue: 700 again, unless one gives way.
+    c.set_capacity(600);
+    assert!(c.weight() <= 600, "{} bytes resident", c.weight());
+    assert_eq!(c.get(&1_000), None, "the large entry gave way");
+}
+
 /// Large entries are evicted among themselves, the unread ones first, so
 /// they never take more than half the cache.
 #[test]
@@ -799,7 +868,7 @@ fn resizes_racing_reads_and_inserts_settle_on_the_last_capacity() {
 #[test]
 fn a_read_racing_replaces_of_its_key_always_finds_a_value() {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
 
     let cache = Arc::new(ShardedCache::with_weighter(
@@ -814,20 +883,32 @@ fn a_read_racing_replaces_of_its_key_always_finds_a_value() {
         cache.insert(key, vec![0u8; 8]);
     }
     let done = Arc::new(AtomicBool::new(false));
+    // Readers that have made their first read: the writer starts once all
+    // have, so every reader reads while it writes however threads are run.
+    let reading = Arc::new(AtomicUsize::new(0));
     let readers: Vec<_> = (0..4)
         .map(|_| {
-            let (cache, done) = (Arc::clone(&cache), Arc::clone(&done));
+            let (cache, done, reading) =
+                (Arc::clone(&cache), Arc::clone(&done), Arc::clone(&reading));
             thread::spawn(move || {
                 let mut reads = 0u64;
-                while !done.load(Ordering::Relaxed) {
+                loop {
                     let value = cache.get(&7).expect("the key is always resident");
                     assert!(value.iter().all(|&byte| byte == value[0]), "a torn value");
                     reads += 1;
+                    if reads == 1 {
+                        reading.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if done.load(Ordering::Relaxed) {
+                        return reads;
+                    }
                 }
-                reads
             })
         })
         .collect();
+    while reading.load(Ordering::Relaxed) < readers.len() {
+        thread::yield_now();
+    }
     for round in 0..50_000u32 {
         cache.insert(7, vec![round.to_le_bytes()[0]; 8]);
     }
@@ -845,7 +926,7 @@ fn a_read_racing_replaces_of_its_key_always_finds_a_value() {
 #[test]
 fn a_read_racing_the_tables_growth_finds_what_was_resident() {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
 
     let cache = Arc::new(ShardedCache::with_weighter(
@@ -859,18 +940,30 @@ fn a_read_racing_the_tables_growth_finds_what_was_resident() {
         cache.insert(key, vec![1u8; 8]);
     }
     let done = Arc::new(AtomicBool::new(false));
+    // As above: the table grows only once every reader is reading.
+    let reading = Arc::new(AtomicUsize::new(0));
     let readers: Vec<_> = (0..4u64)
         .map(|t| {
-            let (cache, done) = (Arc::clone(&cache), Arc::clone(&done));
+            let (cache, done, reading) =
+                (Arc::clone(&cache), Arc::clone(&done), Arc::clone(&reading));
             thread::spawn(move || {
                 let mut key = t;
-                while !done.load(Ordering::Relaxed) {
+                loop {
                     assert!(cache.contains(&(key % 32)), "key {} lost", key % 32);
+                    if key == t {
+                        reading.fetch_add(1, Ordering::Relaxed);
+                    }
                     key += 1;
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
                 }
             })
         })
         .collect();
+    while reading.load(Ordering::Relaxed) < readers.len() {
+        thread::yield_now();
+    }
     // Doubles the buckets a dozen times over.
     for key in 1_000..60_000u64 {
         cache.insert(key, vec![2u8; 8]);

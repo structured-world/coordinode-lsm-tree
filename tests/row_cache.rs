@@ -115,6 +115,32 @@ fn row_cache_snapshot_read_returns_the_older_version() {
     assert_eq!(&*tree.get(&k, 3).unwrap().unwrap(), val(2).as_slice());
 }
 
+/// A read at a snapshot below a table's newest versions is answered from a
+/// cached row like any other read. The row gate samples one key in 256 and
+/// sends a sampled read to its block so its simulation sees it, but a
+/// snapshot read is not played to the simulation: sampled, it walked to the
+/// block on every read and told the gate nothing.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_snapshot_read_of_a_cached_row_walks_to_no_block() {
+    let (_dir, tree, _cache) = tree_with_row_cache();
+    for i in 0..N {
+        tree.insert(key(i), val(i), i);
+    }
+    tree.flush_active_memtable(0).unwrap();
+    for i in 0..N {
+        assert!(tree.get(key(i), SeqNo::MAX).unwrap().is_some());
+    }
+
+    // The snapshot sees every key but the last written.
+    let before = tree.metrics().data_block_load_count();
+    for i in 0..N - 1 {
+        let got = tree.get(key(i), N - 1).unwrap().unwrap();
+        assert_eq!(&*got, val(i).as_slice());
+    }
+    assert_eq!(tree.metrics().data_block_load_count() - before, 0);
+}
+
 #[test]
 fn row_cache_overwrite_after_flush_is_not_stale() {
     // Overwriting a key and flushing creates a NEW SST (new table id). The old

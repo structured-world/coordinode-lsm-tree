@@ -325,7 +325,9 @@ impl<K, V, P> Table<K, V, P> {
         let free = &self.writes.free;
         let mut head = free.load(Ordering::Relaxed);
         loop {
-            slot.next.store(head, Ordering::Relaxed);
+            // Released, as in `fill`: a reader that takes this link for the
+            // entry's sees the store that freed the slot too.
+            slot.next.store(head, Ordering::Release);
             match free.compare_exchange_weak(head, link, Ordering::Release, Ordering::Relaxed) {
                 Ok(_) => return,
                 Err(now) => head = now,
@@ -681,7 +683,12 @@ impl<K, V, P> Write<'_, K, V, P> {
         let meta = slot.meta.load(Ordering::Relaxed);
         slot.hash.store(hash, Ordering::Relaxed);
         slot.weight.store(weight, Ordering::Relaxed);
-        slot.next.store(next, Ordering::Relaxed);
+        // Released: a reader walking through the entry this slot held loads
+        // the link and then looks at the slot's version again. Its load of
+        // this link has to bring the store that freed the slot with it, or
+        // on a weakly ordered target it could see the new link beside the
+        // old version, follow it, and miss a key that is resident.
+        slot.next.store(next, Ordering::Release);
         // SAFETY: a free slot off the free list holds no entry and no reader
         // reads one in it.
         #[expect(unsafe_code, reason = "see safety")]

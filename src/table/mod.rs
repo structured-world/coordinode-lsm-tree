@@ -1333,13 +1333,24 @@ impl Table {
         Ok(block)
     }
 
-    /// How a point read of the key hashed to `key_hash` uses the row cache:
-    /// whether it goes through it, whether the tree's row gate samples it,
-    /// and the gate. A cache that keeps no rows sends no read through; one
-    /// told not to adapt sends every read through and samples none. The gate
-    /// is taken from the cache at the first call and held by the table after.
+    /// How a point read at `seqno`, table-local, of the key hashed to
+    /// `key_hash` uses the row cache: whether it goes through it, whether the
+    /// tree's row gate samples it, and the gate. A cache that keeps no rows
+    /// sends no read through; one told not to adapt sends every read through
+    /// and samples none. The gate is taken from the cache at the first call
+    /// and held by the table after.
+    ///
+    /// A sampled read walks to its block whatever the row cache holds, which
+    /// pays only where the gate's simulation then sees it: a read of the
+    /// table's newest versions, of a row table. A snapshot read below them
+    /// fills no row and is not played, and a columnar table's read notes no
+    /// block to play it against; neither is sampled.
     #[inline]
-    fn row_read(&self, key_hash: u64) -> (bool, bool, Option<&crate::row_gate::RowGate>) {
+    fn row_read(
+        &self,
+        key_hash: u64,
+        seqno: SeqNo,
+    ) -> (bool, bool, Option<&crate::row_gate::RowGate>) {
         if !self.cache.row_cache_enabled() {
             return (false, false, None);
         }
@@ -1349,7 +1360,9 @@ impl Table {
         let gate: &crate::row_gate::RowGate = self.0.row_gate.get_or_init(|| {
             alloc::boxed::Box::new(self.cache.row_gate(self.global_id().tree_id()))
         });
-        (gate.admits(key_hash), gate.samples(key_hash), Some(gate))
+        let sampled =
+            gate.samples(key_hash) && seqno > self.metadata.seqnos.1 && !self.metadata.columnar;
+        (gate.admits(key_hash), sampled, Some(gate))
     }
 
     /// Plays a sampled point read, which found a row of `key_len` and
@@ -7624,7 +7637,7 @@ impl Table {
         // looks its row up as any other and goes to its block whatever it
         // found, so the gate's simulation learns which block the key lives
         // in and whether the cache held its row.
-        let (rows, sampled, gate) = self.row_read(key_hash);
+        let (rows, sampled, gate) = self.row_read(key_hash, seqno);
         let held = if rows && let Some(mut iv) = self.cache.get_row(self.global_id(), key_hash, key)
         {
             // Snapshot reads are exclusive: a version is visible iff its seqno is
@@ -7742,7 +7755,7 @@ impl Table {
         // decode, when the cached newest version is visible at this snapshot.
         // Inside the row gate only, and a sampled read goes on to its block,
         // as there.
-        let (rows, sampled, gate) = self.row_read(key_hash);
+        let (rows, sampled, gate) = self.row_read(key_hash, seqno);
         let held = if rows && let Some(iv) = self.cache.get_row(self.global_id(), key_hash, key) {
             // Exclusive snapshot visibility (see `Table::get`): serve only when
             // the cached newest version is strictly older than the query seqno.

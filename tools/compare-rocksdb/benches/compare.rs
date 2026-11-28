@@ -1487,6 +1487,10 @@ fn point_read_drawn(run: &mut Run, draw: Draw, seeds: &mut SeedStates) {
                     &inputs,
                     seeds,
                 );
+                // Every key present with its value, checked before the
+                // rounds as the other point reads check it: the timed
+                // routine takes whatever a read returns.
+                verify_point_reads(&warm, &inputs);
                 (label, warm)
             })
             .collect();
