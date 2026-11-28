@@ -11,6 +11,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.6.0...v8.0.0) - 2026-11-28
+
+### Added
+
+- *(ingest)* replace a tree's content with an ingestion ([#1109](https://github.com/structured-world/coordinode-lsm-tree/pull/1109))
+- *(cache)* resize a live block cache ([#1104](https://github.com/structured-world/coordinode-lsm-tree/pull/1104))
+- *(bench)* race the blob tree against RocksDB blob files ([#1049](https://github.com/structured-world/coordinode-lsm-tree/pull/1049))
+- opt-in mimalloc global allocator ([#1047](https://github.com/structured-world/coordinode-lsm-tree/pull/1047))
+
+### Fixed
+
+- *(version)* leave the visible seqno to the writer ([#1115](https://github.com/structured-world/coordinode-lsm-tree/pull/1115))
+- *(repair)* prove a replace's install by one mark ([#1112](https://github.com/structured-world/coordinode-lsm-tree/pull/1112))
+- *(table)* build the longest-prefix kernels for soft-float targets ([#1111](https://github.com/structured-world/coordinode-lsm-tree/pull/1111))
+- *(close)* hold the directory lock until the tree is closed ([#1103](https://github.com/structured-world/coordinode-lsm-tree/pull/1103))
+- *(persist)* never acknowledge a deferred file whose sync failed ([#1086](https://github.com/structured-world/coordinode-lsm-tree/pull/1086))
+- *(repair)* report a lost manifest as an unscopable loss ([#1084](https://github.com/structured-world/coordinode-lsm-tree/pull/1084))
+- *(flush)* remove a failed flush's files before it returns ([#1076](https://github.com/structured-world/coordinode-lsm-tree/pull/1076))
+- *(fs)* [**breaking**] read into ReadBuf memory without a byte slice ([#1051](https://github.com/structured-world/coordinode-lsm-tree/pull/1051))
+
+### Performance
+
+- *(merge,cache)* tournament merge, lock-free block cache, row gate ([#1119](https://github.com/structured-world/coordinode-lsm-tree/pull/1119))
+- *(columnar)* hand a point read its value as a page view ([#1116](https://github.com/structured-world/coordinode-lsm-tree/pull/1116))
+- *(checksum)* own xxh3 with a run-time kernel, check blob frames in two parts ([#1107](https://github.com/structured-world/coordinode-lsm-tree/pull/1107))
+- *(memtable)* skip shared key prefixes in skiplist searches ([#1096](https://github.com/structured-world/coordinode-lsm-tree/pull/1096))
+- *(memtable)* [**breaking**] keep written values in the memtable arena and trim the flush ([#1094](https://github.com/structured-world/coordinode-lsm-tree/pull/1094))
+- *(write)* speed up the overwrite path ([#1092](https://github.com/structured-world/coordinode-lsm-tree/pull/1092))
+- *(blob)* compress chunks in parallel, a dictionary per class, copy blocks whole ([#1071](https://github.com/structured-world/coordinode-lsm-tree/pull/1071))
+- *(blob)* [**breaking**] store values in frames by size class ([#1063](https://github.com/structured-world/coordinode-lsm-tree/pull/1063))
+- *(memtable)* leave a value segment's memory as it comes ([#1059](https://github.com/structured-world/coordinode-lsm-tree/pull/1059))
+- *(fs)* [**breaking**] fill batched reads in place and keep values cached ([#1044](https://github.com/structured-world/coordinode-lsm-tree/pull/1044))
+- *(table)* split blocks no cache shard can keep ([#1040](https://github.com/structured-world/coordinode-lsm-tree/pull/1040))
+
+### Bench
+
+- measure against read-tuned rocksdb ([#1101](https://github.com/structured-world/coordinode-lsm-tree/pull/1101))
+- *(compare)* measure the overwrite path in parts ([#1093](https://github.com/structured-world/coordinode-lsm-tree/pull/1093))
+- *(compare)* take blob trees against RocksDB blob files ([#1055](https://github.com/structured-world/coordinode-lsm-tree/pull/1055))
+
 ## [7.6.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.5.0...v7.6.0) - 2026-11-01
 
 ### Added
