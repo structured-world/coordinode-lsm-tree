@@ -64,7 +64,7 @@ const ENTRY_FLOOR: u64 =
     (CANDIDATES.len() as u64 * (ENTRY_BYTES + GHOST_BYTES / GHOST_SHARE) * 200).div_ceil(SAMPLE);
 
 /// Sampled reads a window holds before its candidates are priced: 131,072 of
-/// the tree's reads. A tree decides at its third window at the earliest.
+/// the tree's reads. A tree decides at its second window at the earliest.
 const WINDOW: u32 = 512;
 
 /// A candidate replaces the fraction in use only when its running cost is
@@ -458,8 +458,10 @@ impl RowGate {
             return;
         }
         // The first window starts from empty shadows, where every candidate
-        // misses alike.
-        if sim.windows < 3 {
+        // misses alike: the second is the first to tell them apart. A tree
+        // that waited for a third paid for rows that do not pay through
+        // another 131,072 reads.
+        if sim.windows < 2 {
             return;
         }
 
