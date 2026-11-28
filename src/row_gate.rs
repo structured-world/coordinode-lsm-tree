@@ -177,12 +177,18 @@ struct Sim {
 }
 
 /// Windows a tree has rows for before its cache's row hits are checked
-/// against its shadows': the time a cache takes to fill with them.
-const BAR_SETTLE: u32 = 3;
+/// against its shadows': the one in which the cache fills with them. A cache
+/// that delivers does so from its first window, and one that does not is
+/// then barred within a quarter of a million reads.
+const BAR_SETTLE: u32 = 1;
 
 /// Row hits the shadow of the fraction in use has to count in a window for
-/// the cache's own to be checked against them.
-const BAR_HITS_MIN: u64 = 16;
+/// the cache's own to be checked against them: an eighth of the window's
+/// reads. Fewer are a few keys the shadow remembers from reads that have
+/// since changed, which the cache has rightly dropped: checked at seventeen
+/// such hits, a tree whose reads turn from a hot set to all its keys and
+/// back was barred from the rows of its hot set.
+const BAR_HITS_MIN: u64 = WINDOW as u64 / 8;
 
 /// The cache delivers too little when it gives fewer than one in this many
 /// of the row hits the shadow counted. Far below what sampling a few hot

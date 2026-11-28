@@ -67,6 +67,33 @@ fn rows_the_cache_does_not_deliver_are_given_up() {
     assert_eq!(gate.eighths(), 8, "the first bar's length again, not twice");
 }
 
+/// A few rows the shadow still holds from reads that have since changed, and
+/// the cache has dropped, do not bar a tree from its rows: the shadow's
+/// count is a tenth of the window's reads, not a claim the rows pay.
+/// Barred on it, a tree whose reads turned from a hot set to all its keys
+/// had no rows when they turned back.
+#[test]
+fn a_few_rows_the_cache_dropped_do_not_bar_the_rest() {
+    let gate = gate();
+    // One read in ten of a hot set, the rest spread: the cache holds none
+    // of the hot rows.
+    for n in 0..8 * u64::from(WINDOW) {
+        let key = if n % 10 == 0 {
+            hash(n) % 40
+        } else {
+            1_000 + hash(n) % 1_000_000
+        };
+        let block = BlockSeen {
+            offset: key / 13 * 4_096,
+            weight: 4_096,
+        };
+        gate.observe(CACHE, 1, hash(key), 300, block, 0, false);
+    }
+    // The reads turn to the hot set, and the cache delivers.
+    read_evenly(&gate, 40, 20 * u64::from(WINDOW), 9);
+    assert_eq!(gate.eighths(), 8);
+}
+
 /// A cache that gives two fifths of the row hits its shadow counts keeps its
 /// rows: a sample of few hot keys differs from its shadow by as much while
 /// the rows pay.
