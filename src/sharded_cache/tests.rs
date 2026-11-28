@@ -587,6 +587,38 @@ fn a_shrink_keeps_the_cache_within_its_new_capacity() {
     assert_eq!(c.get(&1_000), None, "the large entry gave way");
 }
 
+/// Readers raise an entry's frequency without the shard's lock, so entries
+/// of the main queue read between every two turns of an eviction are found
+/// in credit at each: the turns then went on for as long as the reads did,
+/// under the lock. After as many turns as would wear every credit down, a
+/// turn takes its entry read or not.
+#[test]
+fn main_entries_read_between_every_turn_are_evicted_in_the_end() {
+    let c: ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighter, FxBuildHasher> =
+        ShardedCache::with_weighter(1_000, 1, 16, LenWeighter, FxBuildHasher);
+    for k in 0..4u64 {
+        c.insert_with_priority(k, vec![0u8; 100], Priority::High);
+    }
+    let shard = c.shards.first().expect("one shard");
+    let mut write = c.lock(&shard.0);
+    let before = write.policy().main_bytes;
+    assert_eq!(before, 400, "self-check: the entries are in the main queue");
+
+    let mut evicted = Evicted::new();
+    let mut turns = 0;
+    while write.policy().main_bytes == before {
+        turns += 1;
+        assert!(turns <= 1_000, "no entry evicted in {turns} turns");
+        for k in 0..4u64 {
+            assert!(c.get(&k).is_some());
+        }
+        assert!(write.evict_from_main(&mut evicted));
+    }
+    // Four entries of three credits each, and the turn that gives up.
+    assert!(turns <= 4 * 4 + 1, "{turns} turns");
+    c.release(&shard.0, write, evicted);
+}
+
 /// A shrink evicts the large entries the new capacity has no room for while
 /// they are being read. A read gives an entry back the credit a turn of the
 /// clock took, so turns that only spared the entries read ran out with the

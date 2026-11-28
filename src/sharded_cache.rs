@@ -117,6 +117,10 @@ struct Policy {
     /// table and queues have grown to what it holds, and an insert now takes
     /// the place of what it evicts rather than fresh memory.
     filled: bool,
+    /// Turns of the main queue that spared an entry in the eviction under
+    /// way, since one last took an entry out (see
+    /// [`Write::evict_from_main`]).
+    spared: usize,
 }
 
 impl Policy {
@@ -134,6 +138,7 @@ impl Policy {
             small_target: small_target(capacity),
             ghost_capacity,
             filled: false,
+            spared: 0,
         }
     }
 
@@ -391,6 +396,9 @@ impl<K: Eq, V> Write<'_, K, V, Policy> {
         if self.policy().resident_bytes() > self.policy().limit() {
             self.policy_mut().filled = true;
         }
+        // The turns that spare are counted within one eviction: entries
+        // spared by evictions far apart were read in between, not during.
+        self.policy_mut().spared = 0;
         while self.policy().resident_bytes() > self.policy().capacity {
             if !self.evict_one(evicted) {
                 // Both queues are out of live entries: nothing left to free.
@@ -462,22 +470,30 @@ impl<K: Eq, V> Write<'_, K, V, Policy> {
     /// entry.
     ///
     /// Readers raise an entry's frequency without the lock, so a turn can
-    /// find an entry it lowered raised again. The turns need no bound for
-    /// that: an entry is kept only while a hit lands between every turn that
-    /// brings it to zero and the next, a few tens of nanoseconds each time,
-    /// and the first turn without one takes it out.
+    /// find an entry it lowered raised again, and entries read between
+    /// every two turns were spared for as long as the reads went on, with
+    /// the shard's lock held. Turns that spared one after another, as many
+    /// as wear down every credit the queue can hold, are followed by one
+    /// that takes its entry read or not. Without such reads the bound is
+    /// never reached: the credits run out first.
     fn evict_from_main(&mut self, evicted: &mut Evicted<V>) -> bool {
         while let Some(node) = self.policy_mut().main.pop_front() {
             if !self.is_live(node) {
                 continue;
             }
-            if self.freq(node.link) > 0 {
+            let policy = self.policy();
+            let bound = (policy.main.len() + 1) * usize::from(MAX_FREQ);
+            if policy.spared < bound && self.freq(node.link) > 0 {
                 self.lower_freq(node.link);
-                self.policy_mut().main.push_back(node);
+                let policy = self.policy_mut();
+                policy.spared += 1;
+                policy.main.push_back(node);
             } else {
                 let weight = self.weight(node.link);
                 self.remove(node.link, evicted);
-                self.policy_mut().main_bytes -= weight;
+                let policy = self.policy_mut();
+                policy.spared = 0;
+                policy.main_bytes -= weight;
             }
             return true;
         }
