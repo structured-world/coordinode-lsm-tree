@@ -301,3 +301,43 @@ fn a_wider_fraction_keeps_the_keys_of_a_narrower_one() {
     assert!((410..=615).contains(&eighth.len()), "{}", eighth.len());
     assert!((1_640..=2_460).contains(&half.len()), "{}", half.len());
 }
+
+/// One sampled read of a row of 300 bytes through a cache of `capacity`.
+fn read_once(gate: &RowGate, capacity: u64) {
+    let block = BlockSeen {
+        offset: 0,
+        weight: 4_096,
+    };
+    gate.observe(capacity, 1, hash(1), 300, block, 0, true);
+}
+
+/// A tree that gave its rows up while its cache could be simulated keeps
+/// every key in the row cache once the cache is too small for that: nothing
+/// would ever take the rows back for it.
+#[test]
+fn a_cache_shrunk_below_its_shadows_takes_every_key_back() {
+    let gate = gate();
+    read_once(&gate, CACHE);
+    gate.set_eighths(0);
+    read_once(&gate, 64 << 10);
+    assert_eq!(gate.eighths(), 8);
+    assert_eq!(gate.memory(), 0);
+}
+
+/// A sampled read goes to its block whatever the row cache holds. A cache
+/// too small to simulate learns nothing from that, so its tree samples no
+/// read, and samples again once the cache is resized.
+#[test]
+fn a_cache_too_small_to_shadow_samples_no_read() {
+    let gate = gate();
+    let sampled = |gate: &RowGate| (0..100_000).map(hash).filter(|&h| gate.samples(h)).count();
+    assert!(sampled(&gate) > 0, "a new gate samples");
+    read_once(&gate, 64 << 10);
+    assert_eq!(sampled(&gate), 0);
+
+    gate.resized();
+    assert!(sampled(&gate) > 0, "a resized cache is tried again");
+    read_once(&gate, CACHE);
+    assert!(sampled(&gate) > 0);
+    assert!(gate.memory() > 0, "and simulated where it is large enough");
+}

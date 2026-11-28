@@ -633,3 +633,21 @@ fn resizes_racing_cold_loads_strand_no_ticket() {
     assert_eq!(cache.load_waiters(), 0);
     assert!(cache.size() <= cache.capacity());
 }
+
+/// A tree whose cache was too small to simulate samples no read. Growing the
+/// cache has it sample again, so its row share is once more its own choice.
+#[test]
+fn a_grown_cache_has_its_trees_sample_again() {
+    let cache = Cache::with_capacity_bytes(64 << 10);
+    let gate = cache.row_gate(7);
+    let block = crate::row_gate::BlockSeen {
+        offset: 0,
+        weight: 4_096,
+    };
+    gate.observe(cache.capacity(), 1, 1 << 40, 300, block, 0, true);
+    let sampled = |gate: &crate::row_gate::RowGate| (0..4_096_u64).any(|n| gate.samples(n << 40));
+    assert!(!sampled(&gate), "self-check: too small to simulate");
+
+    cache.set_capacity(64 << 20);
+    assert!(sampled(&gate));
+}

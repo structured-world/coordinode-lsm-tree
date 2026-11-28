@@ -433,6 +433,62 @@ fn a_trees_row_share_decides_which_reads_fill_rows() {
     );
 }
 
+/// What a cache holds after every key of a flushed columnar tree was read
+/// twice through it, the tree's row share set to `share` eighths.
+#[cfg(feature = "columnar")]
+fn columnar_cached_after_two_passes(rows: bool, share: u8) -> u64 {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 * 1024 * 1024).with_row_cache(rows));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    let lsm_tree::AnyTree::Standard(standard) = &tree else {
+        panic!("a standard tree");
+    };
+    standard
+        .update_runtime_config(|cfg| cfg.columnar = true)
+        .unwrap();
+    cache.set_row_share(tree.id(), share);
+    for i in 0..N {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+    for _ in 0..2 {
+        for i in 0..N {
+            let got = tree.get(key(i), SeqNo::MAX).unwrap().unwrap();
+            assert_eq!(&*got, val(i).as_slice());
+        }
+    }
+    cache.size()
+}
+
+/// A columnar table's reads are not played to the row gate, so a share its
+/// tree chose while its tables were row-major would stand for good. Every
+/// key of a columnar table goes through the row cache whatever the share: a
+/// tree that closed its gate and then turned columnar keeps its rows.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_table_fills_rows_whatever_its_trees_share() {
+    let off = columnar_cached_after_two_passes(false, 8);
+    let none = columnar_cached_after_two_passes(true, 0);
+    let all = columnar_cached_after_two_passes(true, 8);
+
+    assert!(
+        all > off,
+        "self-check: rows are filled: {all} against {off}"
+    );
+    assert_eq!(
+        none, all,
+        "a closed gate does not stand for a columnar table"
+    );
+}
+
 /// A tree reads through the row cache until its own reads say otherwise, and
 /// trees sharing one cache each hold a share of their own.
 #[test]

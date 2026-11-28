@@ -54,6 +54,9 @@ const GHOST_SHARE: u64 = 4;
 /// outweigh the share of the cache it is given.
 const SHADOW_ENTRIES_MIN: u64 = 16;
 
+/// What a gate's count of doublings holds while it samples no read.
+const UNSAMPLED: u8 = u8::MAX;
+
 /// The least an entry weighs in a shadow that samples one read in
 /// [`SAMPLE`]: what keeps the five shadows' entries, [`ENTRY_BYTES`] each,
 /// and the keys they remember, [`GHOST_BYTES`] each, within a two-hundredth
@@ -194,6 +197,32 @@ struct Sim {
     bar: u32,
 }
 
+impl Sim {
+    /// A simulation that has seen no read.
+    const fn new() -> Self {
+        Self {
+            shadows: None,
+            capacity: 0,
+            events: [Events {
+                row_hits: 0,
+                row_probes: 0,
+                row_refusals: 0,
+                row_fills: 0,
+                block_hits: 0,
+                block_misses: 0,
+            }; CANDIDATES.len()],
+            seen: 0,
+            running: [0; CANDIDATES.len()],
+            windows: 0,
+            load_nanos: 0,
+            held: 0,
+            open_for: 0,
+            barred: 0,
+            bar: BAR_FIRST,
+        }
+    }
+}
+
 /// Windows a tree has rows for before its cache's row hits are checked
 /// against its shadows': the one in which the cache fills with them. A cache
 /// that delivers does so from its first window, and one that does not is
@@ -234,7 +263,8 @@ pub(crate) struct RowGate {
     /// Eighths of the keys inside the row cache.
     eighths: AtomicU8,
     /// How many times [`SAMPLE`] is doubled for this tree's rows: set when
-    /// its shadows are built, from the first row sampled.
+    /// its shadows are built, from the first row sampled. [`UNSAMPLED`]
+    /// while the cache is too small to simulate.
     sparser: AtomicU8,
     /// Taken by a sampled read that finds it free, and by none other.
     sim: spin::Mutex<Sim>,
@@ -262,19 +292,7 @@ impl RowGate {
         Self {
             eighths: AtomicU8::new(8),
             sparser: AtomicU8::new(0),
-            sim: spin::Mutex::new(Sim {
-                shadows: None,
-                capacity: 0,
-                events: [Events::default(); CANDIDATES.len()],
-                seen: 0,
-                running: [0; CANDIDATES.len()],
-                windows: 0,
-                load_nanos: 0,
-                held: 0,
-                open_for: 0,
-                barred: 0,
-                bar: BAR_FIRST,
-            }),
+            sim: spin::Mutex::new(Sim::new()),
         }
     }
 
@@ -295,8 +313,19 @@ impl RowGate {
     /// the block it came from is known.
     #[inline]
     pub(crate) fn samples(&self, key_hash: u64) -> bool {
-        let rate = SAMPLE << self.sparser.load(Ordering::Relaxed);
-        (key_hash >> 40) & (rate - 1) == 0
+        let sparser = self.sparser.load(Ordering::Relaxed);
+        sparser != UNSAMPLED && (key_hash >> 40) & ((SAMPLE << sparser) - 1) == 0
+    }
+
+    /// Tells the gate its cache was resized: a tree that sampled no read
+    /// because the cache was too small to simulate samples again, and its
+    /// next sampled read finds out whether the cache now is large enough.
+    pub(crate) fn resized(&self) {
+        // Lost to a read that is turning sampling off or on right now, the
+        // exchange leaves that read's answer, which a later resize redoes.
+        let _ = self
+            .sparser
+            .compare_exchange(UNSAMPLED, 0, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// Bytes the shadows hold now.
@@ -352,17 +381,25 @@ impl RowGate {
         let floor = (ENTRY_FLOOR >> sparser).max(1);
         let entries = capacity / floor;
         if entries < SHADOW_ENTRIES_MIN {
-            sim.shadows = None;
+            // Nothing is learnt of this tree until its cache is resized:
+            // every key goes through the row cache, whatever the tree chose
+            // while it was simulated, and no read is sampled, which would
+            // walk to its block past a row the cache holds for nothing.
+            *sim = Sim::new();
+            self.eighths.store(8, Ordering::Relaxed);
+            self.sparser.store(UNSAMPLED, Ordering::Relaxed);
             return;
         }
         if sim.shadows.is_none() || sim.capacity != capacity {
-            sim.capacity = capacity;
             // The keys a shadow remembers are counted in its share of
             // memory like its entries, a fixed part of what it can hold. A
             // thousand of them whatever the cache took more than the whole
             // budget of a small cache's shadows.
             let ghosts = usize::try_from(entries / GHOST_SHARE).unwrap_or(usize::MAX);
-            sim.shadows = Some(core::array::from_fn(|_| {
+            // The capacity is recorded once the shadows built for it stand:
+            // a build that unwound leaves the old pair, rebuilt at the next
+            // sampled read.
+            let shadows = core::array::from_fn(|_| {
                 let shadow = ShardedCache::with_weighter(
                     capacity,
                     1,
@@ -372,7 +409,9 @@ impl RowGate {
                 );
                 shadow.set_ghosts(ghosts);
                 shadow
-            }));
+            });
+            sim.shadows = Some(shadows);
+            sim.capacity = capacity;
         }
 
         // In the sampled universe a block holds only its sampled keys: about

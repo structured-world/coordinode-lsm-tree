@@ -988,6 +988,9 @@ impl Cache {
     /// ```
     pub fn set_capacity(&self, bytes: u64) {
         self.data.set_capacity(bytes);
+        for gate in self.row_gates.lock().values() {
+            gate.resized();
+        }
     }
 
     /// The heaviest entry this cache can actually keep resident: half of its

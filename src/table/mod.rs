@@ -1343,8 +1343,11 @@ impl Table {
     /// A sampled read walks to its block whatever the row cache holds, which
     /// pays only where the gate's simulation then sees it: a read of the
     /// table's newest versions, of a row table. A snapshot read below them
-    /// fills no row and is not played, and a columnar table's read notes no
-    /// block to play it against; neither is sampled.
+    /// fills no row and is not played, and is not sampled.
+    ///
+    /// A columnar table's read notes no block to play it against, so the
+    /// gate learns nothing of such a table: every key of it goes through the
+    /// row cache, whatever its tree chose from the reads of its row tables.
     #[inline]
     fn row_read(
         &self,
@@ -1354,14 +1357,13 @@ impl Table {
         if !self.cache.row_cache_enabled() {
             return (false, false, None);
         }
-        if !self.cache.row_cache_adaptive() {
+        if !self.cache.row_cache_adaptive() || self.metadata.columnar {
             return (true, false, None);
         }
         let gate: &crate::row_gate::RowGate = self.0.row_gate.get_or_init(|| {
             alloc::boxed::Box::new(self.cache.row_gate(self.global_id().tree_id()))
         });
-        let sampled =
-            gate.samples(key_hash) && seqno > self.metadata.seqnos.1 && !self.metadata.columnar;
+        let sampled = gate.samples(key_hash) && seqno > self.metadata.seqnos.1;
         (gate.admits(key_hash), sampled, Some(gate))
     }
 
