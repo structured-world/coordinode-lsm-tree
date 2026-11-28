@@ -1308,7 +1308,7 @@ impl Table {
         pace: Option<&dyn crate::table::util::ReadPacer>,
         fd: &LookupFd,
     ) -> crate::Result<Block> {
-        crate::table::util::load_block_paced(
+        let block = crate::table::util::load_block_paced(
             self.global_id(),
             &self.path,
             &self.file_accessor,
@@ -1326,7 +1326,55 @@ impl Table {
             charge,
             pace,
             fd,
-        )
+        )?;
+        if block_type == BlockType::Data {
+            fd.note_data_block(*handle.offset(), block.data.len() as u64);
+        }
+        Ok(block)
+    }
+
+    /// How a point read of the key hashed to `key_hash` uses the row cache:
+    /// whether it goes through it, whether the tree's row gate samples it,
+    /// and the gate. A cache that keeps no rows sends no read through; one
+    /// told not to adapt sends every read through and samples none. The gate
+    /// is taken from the cache at the first call and held by the table after.
+    #[inline]
+    fn row_read(&self, key_hash: u64) -> (bool, bool, Option<&crate::row_gate::RowGate>) {
+        if !self.cache.row_cache_enabled() {
+            return (false, false, None);
+        }
+        if !self.cache.row_cache_adaptive() {
+            return (true, false, None);
+        }
+        let gate: &crate::row_gate::RowGate = self.0.row_gate.get_or_init(|| {
+            alloc::boxed::Box::new(self.cache.row_gate(self.global_id().tree_id()))
+        });
+        (gate.admits(key_hash), gate.samples(key_hash), Some(gate))
+    }
+
+    /// Plays a sampled point read, which found a row of `key_len` and
+    /// `value_len` bytes in the data block `fd` noted, against the row
+    /// gate's simulation. `held` is whether the row cache held the row.
+    #[cold]
+    fn play_row_read(
+        &self,
+        gate: Option<&crate::row_gate::RowGate>,
+        key_hash: u64,
+        (key_len, value_len): (usize, usize),
+        fd: &LookupFd,
+        held: bool,
+    ) {
+        if let (Some(gate), Some(block)) = (gate, fd.data_block()) {
+            gate.observe(
+                self.cache.capacity(),
+                self.global_id().table_id(),
+                key_hash,
+                crate::cache::row_weight(key_len, value_len),
+                block,
+                self.cache.block_load_nanos(self.global_id(), block.offset),
+                held,
+            );
+        }
     }
 
     /// Loads a data-carrying block STRAIGHT FROM THE FILE, bypassing the
@@ -7571,16 +7619,26 @@ impl Table {
         // (same as `point_read`). Use it only when the cached newest version is
         // visible at the query snapshot; otherwise fall through, because an older
         // version may apply at this snapshot.
-        if let Some(mut iv) = self.cache.get_row(self.global_id(), key_hash, key) {
+        //
+        // Only for a key inside the tree's row gate. A read the gate samples
+        // looks its row up as any other and goes to its block whatever it
+        // found, so the gate's simulation learns which block the key lives
+        // in and whether the cache held its row.
+        let (rows, sampled, gate) = self.row_read(key_hash);
+        let held = if rows && let Some(mut iv) = self.cache.get_row(self.global_id(), key_hash, key)
+        {
             // Snapshot reads are exclusive: a version is visible iff its seqno is
             // strictly less than the query seqno. Only serve the cached newest
             // version when it is visible; otherwise fall through (an older
             // version may apply at this snapshot).
-            if iv.key.seqno < seqno {
+            if !sampled && iv.key.seqno < seqno {
                 iv.key.seqno = apply_global_seqno(iv.key.seqno, global_seqno);
                 return Ok(Some(iv));
             }
-        }
+            true
+        } else {
+            false
+        };
 
         let item = self.point_read(key, seqno, key_hash, &fd)?;
 
@@ -7592,18 +7650,24 @@ impl Table {
         if seqno > self.metadata.seqnos.1
             && let Some(iv) = &item
         {
-            let detached = self.cache.insert_row(
-                self.global_id(),
-                key_hash,
-                &iv.key.user_key,
-                iv.key.seqno,
-                iv.key.value_type,
-                &iv.value,
-            );
-            #[cfg(feature = "metrics")]
-            self.metrics.record_gather(detached);
-            #[cfg(not(feature = "metrics"))]
-            let _ = detached;
+            if rows && !held {
+                let detached = self.cache.insert_row(
+                    self.global_id(),
+                    key_hash,
+                    &iv.key.user_key,
+                    iv.key.seqno,
+                    iv.key.value_type,
+                    &iv.value,
+                );
+                #[cfg(feature = "metrics")]
+                self.metrics.record_gather(detached);
+                #[cfg(not(feature = "metrics"))]
+                let _ = detached;
+            }
+            if sampled {
+                let lens = (iv.key.user_key.len(), iv.value.len());
+                self.play_row_read(gate, key_hash, lens, &fd, held);
+            }
         }
 
         // Translate table-local seqno back to global coordinate so callers
@@ -7676,14 +7740,20 @@ impl Table {
         // Row-cache fast path (mirrors `Table::get`): serve the value tuple from
         // a prior cached point-read result, skipping the index walk + block
         // decode, when the cached newest version is visible at this snapshot.
-        if let Some(iv) = self.cache.get_row(self.global_id(), key_hash, key) {
+        // Inside the row gate only, and a sampled read goes on to its block,
+        // as there.
+        let (rows, sampled, gate) = self.row_read(key_hash);
+        let held = if rows && let Some(iv) = self.cache.get_row(self.global_id(), key_hash, key) {
             // Exclusive snapshot visibility (see `Table::get`): serve only when
             // the cached newest version is strictly older than the query seqno.
-            if iv.key.seqno < seqno {
+            if !sampled && iv.key.seqno < seqno {
                 let s = apply_global_seqno(iv.key.seqno, global_seqno);
                 return Ok(Some((iv.key.value_type, s, iv.value)));
             }
-        }
+            true
+        } else {
+            false
+        };
 
         let item = self.point_read_value(key, seqno, key_hash, &fd)?;
 
@@ -7694,13 +7764,18 @@ impl Table {
         if seqno > self.metadata.seqnos.1
             && let Some((vt, s, v)) = &item
         {
-            let detached = self
-                .cache
-                .insert_row(self.global_id(), key_hash, key, *s, *vt, v);
-            #[cfg(feature = "metrics")]
-            self.metrics.record_gather(detached);
-            #[cfg(not(feature = "metrics"))]
-            let _ = detached;
+            if rows && !held {
+                let detached = self
+                    .cache
+                    .insert_row(self.global_id(), key_hash, key, *s, *vt, v);
+                #[cfg(feature = "metrics")]
+                self.metrics.record_gather(detached);
+                #[cfg(not(feature = "metrics"))]
+                let _ = detached;
+            }
+            if sampled {
+                self.play_row_read(gate, key_hash, (key.len(), v.len()), &fd, held);
+            }
         }
 
         // Translate table-local seqno back to the global coordinate, mirroring
@@ -10596,6 +10671,7 @@ impl Table {
 
                 #[cfg(feature = "std")]
                 background_deleter: once_cell::race::OnceBox::new(),
+                row_gate: once_cell::race::OnceBox::new(),
 
                 heal_hints: once_cell::race::OnceBox::new(),
 

@@ -192,6 +192,13 @@ impl Drop for Inner {
                 .inspect(|d| d.remove_for_blob_file(&global_id));
             drop(file_accessor);
 
+            // The frames and records the file left in the block cache go
+            // with it, by the deleter's walk, off this thread.
+            #[cfg(feature = "std")]
+            if let Some(deleter) = self.background_deleter.get() {
+                deleter.evict_blob_file(self.id);
+            }
+
             // A pin may list the file through another view of it (the one
             // before a tight-space relocation): it stays until that pin drops.
             // Checked before the checkpoint below, whose release would

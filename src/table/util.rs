@@ -217,6 +217,8 @@ pub(crate) struct LookupFd {
     /// read just before it was.
     fd: core::cell::OnceCell<(alloc::sync::Arc<dyn crate::fs::FsFile>, u64)>,
     held: Option<HeldFd>,
+    /// The data block this read last took, for the row gate's simulation.
+    data_block: core::cell::Cell<Option<crate::row_gate::BlockSeen>>,
 }
 
 /// A descriptor an earlier read of the same scan resolved, held weakly so it
@@ -228,6 +230,19 @@ struct HeldFd {
 }
 
 impl LookupFd {
+    /// Notes the data block this read took: its offset and what it weighs.
+    #[inline]
+    pub(crate) fn note_data_block(&self, offset: u64, weight: u64) {
+        self.data_block
+            .set(Some(crate::row_gate::BlockSeen { offset, weight }));
+    }
+
+    /// The data block this read last took, if it took one.
+    #[inline]
+    pub(crate) fn data_block(&self) -> Option<crate::row_gate::BlockSeen> {
+        self.data_block.get()
+    }
+
     /// The table's file, resolved on the first call. An untraced read leaves
     /// the descriptor cache as it found it, as it leaves the block cache.
     pub(crate) fn resolve(
@@ -338,6 +353,7 @@ impl ScanFd {
         LookupFd {
             fd: core::cell::OnceCell::new(),
             held: self.0.take(),
+            data_block: core::cell::Cell::new(None),
         }
     }
 
@@ -345,7 +361,7 @@ impl ScanFd {
     /// one it started from when it needed none (its block came from the
     /// cache).
     pub(crate) fn keep(&self, read: LookupFd) {
-        let LookupFd { fd, held } = read;
+        let LookupFd { fd, held, .. } = read;
         let kept = match (fd.into_inner(), held) {
             // The read went through the descriptor it started from: kept as
             // it is, without touching its reference counts again.

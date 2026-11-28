@@ -166,3 +166,205 @@ fn row_cache_off_matches_row_cache_on() {
         assert_eq!(&*got, val(i).as_slice());
     }
 }
+
+/// A cache told not to adapt sends every key through the row cache whatever
+/// share a tree holds: the switch for a workload measured to do better with
+/// rows always on has to override the tree's own choice, not sit beside it.
+#[test]
+fn a_cache_told_not_to_adapt_fills_rows_for_every_key() {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache =
+        Arc::new(Cache::with_capacity_bytes(64 * 1024 * 1024).with_adaptive_row_cache(false));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    cache.set_row_share(tree.id(), 0);
+    for i in 0..N {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+    for _ in 0..2 {
+        for i in 0..N {
+            assert!(tree.get(key(i), SeqNo::MAX).unwrap().is_some());
+        }
+    }
+    assert_eq!(
+        cache.size(),
+        cached_after_two_passes(true, Some(8)),
+        "as a tree with every key inside its gate",
+    );
+}
+
+/// One order of evenly drawn keys read over and over brings each key back
+/// after as many reads as the tree has keys, more than the cache remembers
+/// of the keys it refused: a row is refused on every read and never held.
+/// The tree's model has to forget as soon as the cache does, or it counts
+/// those rows as held and keeps them: such a tree read 3769 ns a key with
+/// its rows against 2998 without. It gives them up.
+#[test]
+fn a_tree_replaying_evenly_drawn_keys_past_its_cache_gives_up_its_rows() {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache = Arc::new(Cache::with_capacity_bytes(16 * 1024 * 1024));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    let keys = 70_000u64;
+    let spread = |i: u64| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20).to_be_bytes();
+    let value = vec![7u8; 256];
+    for i in 0..keys {
+        tree.insert(spread(i), &value, 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let order: Vec<u64> = (0..keys)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % keys
+        })
+        .collect();
+    let mut shares = Vec::new();
+    for _ in 0..16 {
+        for &at in &order {
+            assert!(tree.get(spread(at), SeqNo::MAX).unwrap().is_some());
+        }
+        shares.push(cache.row_share(tree.id()));
+    }
+    assert!(
+        shares.iter().skip(8).all(|&share| share == 0),
+        "closed by the ninth pass and stays closed: {shares:?}",
+    );
+}
+
+/// A tree read key by key, round after round, through a cache that holds
+/// most but not all of it gives its rows up: a row comes back only after
+/// every other key was read, by when the cache has dropped it. Left on, the
+/// rows cost such a tree a probe, a refusal or a fill on every read and
+/// answer almost none.
+#[test]
+fn a_tree_read_in_rounds_past_its_cache_gives_up_its_rows() {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache = Arc::new(Cache::with_capacity_bytes(16 * 1024 * 1024));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    let keys = 70_000u64;
+    // Scattered over the key space, so a round reads the blocks out of order.
+    let spread = |i: u64| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20).to_be_bytes();
+    let value = vec![7u8; 256];
+    for i in 0..keys {
+        tree.insert(spread(i), &value, 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+
+    let mut shares = Vec::new();
+    for _ in 0..12 {
+        for i in 0..keys {
+            assert!(tree.get(spread(i), SeqNo::MAX).unwrap().is_some());
+        }
+        shares.push(cache.row_share(tree.id()));
+    }
+    assert_eq!(
+        shares.last(),
+        Some(&0),
+        "shares after each round: {shares:?}"
+    );
+    assert!(
+        shares.iter().skip(5).all(|&share| share == 0),
+        "closed by the sixth round and stays closed: {shares:?}",
+    );
+}
+
+/// What a cache holds after every key of a flushed tree was read twice
+/// through it, the tree's row share set to `share` eighths when given.
+fn cached_after_two_passes(rows: bool, share: Option<u8>) -> u64 {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 * 1024 * 1024).with_row_cache(rows));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    if let Some(share) = share {
+        cache.set_row_share(tree.id(), share);
+    }
+    for i in 0..N {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+    for _ in 0..2 {
+        for i in 0..N {
+            let got = tree.get(key(i), SeqNo::MAX).unwrap().unwrap();
+            assert_eq!(&*got, val(i).as_slice());
+        }
+    }
+    cache.size()
+}
+
+/// A tree whose row share is none reads as one with no row cache: its point
+/// reads leave the blocks they walked in the cache and not one row. A tree
+/// with every key inside leaves the rows too, and a tree with half of them
+/// about half as many. A share that still filled rows would spend the copy,
+/// the insert and the cache's bytes that closing the gate is there to save.
+#[test]
+fn a_trees_row_share_decides_which_reads_fill_rows() {
+    let off = cached_after_two_passes(false, None);
+    let none = cached_after_two_passes(true, Some(0));
+    let half = cached_after_two_passes(true, Some(4));
+    let all = cached_after_two_passes(true, Some(8));
+
+    assert_eq!(none, off, "a closed gate fills no row");
+    assert!(all > off, "an open gate fills rows: {all} against {off}");
+    let (rows_half, rows_all) = (half - off, all - off);
+    assert!(
+        rows_half * 10 > rows_all * 3 && rows_half * 10 < rows_all * 7,
+        "half the keys fill about half the rows: {rows_half} of {rows_all}",
+    );
+}
+
+/// A tree reads through the row cache until its own reads say otherwise, and
+/// trees sharing one cache each hold a share of their own.
+#[test]
+fn trees_sharing_a_cache_hold_their_own_row_shares() {
+    let (_dir_a, a, cache) = tree_with_row_cache();
+    let folder = get_tmp_folder();
+    let dir_b = tempfile::TempDir::new_in(folder).unwrap();
+    let b = Config::new(
+        dir_b.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+
+    assert_eq!(cache.row_share(a.id()), 8, "every key, by default");
+    assert_eq!(cache.row_share(b.id()), 8);
+    cache.set_row_share(a.id(), 0);
+    assert_eq!(cache.row_share(a.id()), 0);
+    assert_eq!(cache.row_share(b.id()), 8, "the other tree keeps its own");
+}

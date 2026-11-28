@@ -6236,8 +6236,12 @@ impl Tree {
 
         let deletion_pause = crate::deletion_pause::DeletionPause::for_tree(Arc::clone(&life));
         #[cfg(feature = "std")]
-        let background_deleter =
-            Arc::new(crate::BackgroundDeleter::for_tree(None, Arc::clone(&life)));
+        let background_deleter = Arc::new(crate::BackgroundDeleter::for_tree(
+            None,
+            Arc::clone(&life),
+            Arc::clone(&config.cache),
+            tree_id,
+        ));
         let heal_hints =
             crate::heal_hints::HealHints::new_shared(config.initial_runtime_config.auto_heal);
 

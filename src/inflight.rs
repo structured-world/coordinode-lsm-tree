@@ -756,8 +756,8 @@ where
         estimate.store(old - old / 8 + sample / 8, Ordering::Relaxed);
     }
 
-    /// The load-time estimate of `key`'s shard, in nanoseconds, for tests.
-    #[cfg(test)]
+    /// The load-time estimate of `key`'s shard, in nanoseconds: zero until a
+    /// load there was timed, as it stays in a build with no clock.
     pub fn estimate(&self, key: &K) -> u64 {
         self.shard(key).load_nanos.load(Ordering::Relaxed)
     }

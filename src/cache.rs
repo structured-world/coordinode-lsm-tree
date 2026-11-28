@@ -94,6 +94,37 @@ impl From<(u8, u64, u64, u64)> for CacheKey {
     }
 }
 
+/// A file that was deleted, as the cache keys its entries: no read reaches
+/// them again, since a file's id is never given to another.
+// no-std: files are reclaimed at their drop there, with no deleter thread to
+// run the walk; their entries age out of the cache.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeadFile {
+    /// A table: its blocks, partial blocks, cached rows and directories.
+    Table {
+        tree: crate::TreeId,
+        table: crate::TableId,
+    },
+    /// A blob file: its frames and the records read out of them alone.
+    BlobFile {
+        tree: crate::TreeId,
+        file: crate::vlog::BlobFileId,
+    },
+}
+
+#[cfg(feature = "std")]
+impl DeadFile {
+    /// Whether `key` is an entry of this file.
+    fn holds(self, key: &CacheKey) -> bool {
+        let of_blob_file = matches!(key.0, TAG_BLOB | TAG_BLOB_RECORD);
+        match self {
+            Self::Table { tree, table } => !of_blob_file && key.1 == tree && key.2 == table,
+            Self::BlobFile { tree, file } => of_blob_file && key.1 == tree && key.2 == file,
+        }
+    }
+}
+
 /// What a cached row costs the cache: key bytes + value bytes + a fixed term for
 /// the `InternalKey` scalars (seqno + `value_type`) and the entry's own
 /// bookkeeping.
@@ -102,7 +133,7 @@ impl From<(u8, u64, u64, u64)> for CacheKey {
 /// cannot drift: a pre-check that charged less than the weigher would copy a
 /// value the cache then refuses, and one that charged more would skip a row that
 /// would have fit.
-const fn row_weight(key_len: usize, value_len: usize) -> u64 {
+pub(crate) const fn row_weight(key_len: usize, value_len: usize) -> u64 {
     key_len as u64 + value_len as u64 + 16
 }
 
@@ -176,7 +207,26 @@ pub struct Cache {
     /// larger-than-cache arms are unchanged or better, while a repeat point read
     /// skips the index walk and the data-block decode outright. Turn it off for
     /// a workload measured to be one of the exceptions.
+    /// Bytes of deleted files' entries dropped, and the sweeps that dropped
+    /// them.
+    #[cfg(feature = "metrics")]
+    dead_bytes: core::sync::atomic::AtomicU64,
+    #[cfg(feature = "metrics")]
+    dead_sweeps: core::sync::atomic::AtomicU64,
     row_cache_enabled: bool,
+    /// Whether each tree chooses its row cache share from its reads; every
+    /// key goes through the row cache otherwise.
+    row_cache_adaptive: bool,
+    /// The share of each tree's keys that goes through the row cache, by the
+    /// tree's id: a tree's tables take theirs here once and hold it. Trees
+    /// sharing the cache each get a share of their own.
+    row_gates: spin::Mutex<
+        hashbrown::HashMap<
+            crate::TreeId,
+            alloc::sync::Arc<crate::row_gate::RowGate>,
+            rustc_hash::FxBuildHasher,
+        >,
+    >,
     /// When true (default), index / filter / range-tombstone blocks are admitted
     /// at [`Priority::High`] so heavy data-block churn (working set >> cache)
     /// cannot evict the metadata blocks every seek touches, sparing a re-read +
@@ -410,14 +460,30 @@ const LOADS_PER_SHARD: usize = 64;
 /// above them and below a read that reaches a device or the network.
 const DEFAULT_LOAD_COALESCING_AFTER: core::time::Duration = core::time::Duration::from_micros(64);
 
-/// Number of shards in the block cache. 64 keeps per-shard write contention low
-/// on many-core hosts while the lock array stays small; reads take a shared lock
-/// and don't contend regardless of shard count.
+/// The most shards the block cache is split into; a small cache gets fewer
+/// (see [`crate::sharded_cache::shards_for`]). 64 keeps the inserts and
+/// evictions of concurrent misses apart on many-core hosts; reads take no
+/// lock whatever the count.
 const BLOCK_CACHE_SHARDS: usize = 64;
-/// Seeds the per-shard ghost-queue sizing (S3-FIFO remembers recently-evicted
-/// fingerprints to fast-track re-admission). Matches the previous
-/// `estimated_items_capacity`.
-const BLOCK_CACHE_EST_ITEMS: usize = 10_000;
+/// The fewest fingerprints the ghost queues remember, all shards together
+/// (S3-FIFO remembers recent misses and cold evictions to admit a key on its
+/// second miss).
+const GHOST_FINGERPRINTS_MIN: u64 = 10_000;
+/// The most: a fingerprint takes about 24 bytes, so this bounds the ghost
+/// queues at about 24 MiB however large the cache.
+const GHOST_FINGERPRINTS_MAX: u64 = 1 << 20;
+/// Bytes of capacity per fingerprint remembered: about one per cached row of
+/// a few hundred bytes. A fixed count, as before, forgot a row's first miss
+/// long before its second could come in a cache that holds many more rows
+/// than that count.
+const BYTES_PER_GHOST_FINGERPRINT: u64 = 512;
+
+/// The ghost queues' size, all shards together, for a cache of `bytes`.
+fn ghost_fingerprints(bytes: u64) -> usize {
+    let wanted =
+        (bytes / BYTES_PER_GHOST_FINGERPRINT).clamp(GHOST_FINGERPRINTS_MIN, GHOST_FINGERPRINTS_MAX);
+    usize::try_from(wanted).unwrap_or(usize::MAX)
+}
 
 impl Cache {
     /// Creates a new block cache with roughly `n` bytes of capacity.
@@ -426,12 +492,18 @@ impl Cache {
         Self {
             data: ShardedCache::with_weighter(
                 bytes,
-                BLOCK_CACHE_SHARDS,
-                BLOCK_CACHE_EST_ITEMS,
+                crate::sharded_cache::shards_for(bytes, BLOCK_CACHE_SHARDS),
+                ghost_fingerprints(bytes),
                 BlockWeighter,
                 rustc_hash::FxBuildHasher,
             ),
+            #[cfg(feature = "metrics")]
+            dead_bytes: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "metrics")]
+            dead_sweeps: core::sync::atomic::AtomicU64::new(0),
             row_cache_enabled: true,
+            row_cache_adaptive: true,
+            row_gates: spin::Mutex::new(hashbrown::HashMap::with_hasher(rustc_hash::FxBuildHasher)),
             metadata_priority: true,
             loads: crate::inflight::InflightLoads::new(
                 LOAD_SHARDS,
@@ -683,6 +755,40 @@ impl Cache {
         self.row_cache_enabled
     }
 
+    /// Sets whether each tree chooses, from its own reads, what share of its
+    /// keys goes through the row cache. On by default.
+    ///
+    /// Rows pay where keys are read again while their rows still fit the
+    /// cache, and cost where they do not: a probe and a fill per miss, and
+    /// bytes taken from the blocks. A tree therefore plays one read in 256
+    /// against a small model of the cache under each share (none, an eighth,
+    /// a quarter, a half, all of its keys) and moves to the cheapest; trees
+    /// sharing a cache each choose their own. Turn it off to send every key
+    /// through the row cache whatever the reads, for a workload measured to
+    /// do better so.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::Cache;
+    ///
+    /// let cache = Cache::with_capacity_bytes(64 << 20).with_adaptive_row_cache(false);
+    /// assert!(cache.row_cache_enabled());
+    /// assert!(!cache.row_cache_adaptive());
+    /// ```
+    #[must_use]
+    pub fn with_adaptive_row_cache(mut self, adaptive: bool) -> Self {
+        self.row_cache_adaptive = adaptive;
+        self
+    }
+
+    /// Whether trees choose their row cache share from their reads (see
+    /// [`Cache::with_adaptive_row_cache`]).
+    #[must_use]
+    pub fn row_cache_adaptive(&self) -> bool {
+        self.row_cache_adaptive
+    }
+
     /// Enables or disables high-priority pinning of index / filter /
     /// range-tombstone blocks (see [`Cache::metadata_priority`] field docs),
     /// returning the cache for builder-style configuration. On by default.
@@ -740,6 +846,14 @@ impl Cache {
     /// estimate that decides whether misses share loads.
     pub(crate) fn time_load() -> crate::inflight::LoadTimer {
         crate::inflight::LoadTimer::start()
+    }
+
+    /// What a cold load of a block like the one at `offset` has been taking,
+    /// in nanoseconds: its read and decode, as timed on the loads sampled so
+    /// far. Zero while none was.
+    pub(crate) fn block_load_nanos(&self, id: GlobalTableId, offset: u64) -> u64 {
+        self.loads
+            .estimate(&(TAG_BLOCK, id.tree_id(), id.table_id(), offset).into())
     }
 
     /// Records the cold load of the block at `offset` that `timer` timed.
@@ -866,7 +980,7 @@ impl Cache {
         self.data.set_capacity(bytes);
     }
 
-    /// The heaviest entry this cache can actually keep resident: one shard's
+    /// The heaviest entry this cache can actually keep resident: half of its
     /// capacity. Heavier inserts are refused by the cache; callers that would
     /// build such an entry (e.g. the scan read-ahead) can skip the work.
     #[must_use]
@@ -874,12 +988,16 @@ impl Cache {
         self.data.max_entry_weight()
     }
 
-    /// The largest payload of a block of `block_type` this cache can keep.
+    /// The largest payload of a block of `block_type` one shard of this cache
+    /// keeps by itself: what a writer cuts a block to where it can. A heavier
+    /// block is still kept, up to [`Self::max_entry_weight`], by every shard
+    /// giving up a share of its bytes.
     #[must_use]
     pub(crate) fn largest_block(&self, block_type: BlockType) -> u64 {
         // A cache smaller than a header keeps no block at all: zero is the
         // answer, not a masked underflow.
-        self.max_entry_weight()
+        self.data
+            .shard_capacity()
             .saturating_sub(Header::header_len(block_type) as u64)
     }
 
@@ -1067,6 +1185,44 @@ impl Cache {
         self.data.remove(&key);
     }
 
+    /// Takes every entry of the deleted `files` out of the cache, in one walk
+    /// over it: for the thread that deletes files, not for a read. The walk
+    /// holds one shard's lock at a time, which lookups never take.
+    #[cfg(feature = "std")]
+    pub(crate) fn evict_files(&self, files: &[DeadFile]) {
+        let removed = self
+            .data
+            .remove_where(|key| files.iter().any(|file| file.holds(key)));
+        self.count_dead(removed);
+    }
+
+    /// Counts a sweep that dropped `bytes` of deleted files' entries.
+    #[cfg(all(feature = "std", feature = "metrics"))]
+    fn count_dead(&self, bytes: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.dead_bytes.fetch_add(bytes, Relaxed);
+        self.dead_sweeps.fetch_add(1, Relaxed);
+    }
+
+    #[cfg(all(feature = "std", not(feature = "metrics")))]
+    #[expect(clippy::unused_self, reason = "the counting build reads the cache")]
+    const fn count_dead(&self, _bytes: u64) {}
+
+    /// The bytes that entries of deleted files held when the cache dropped
+    /// them, and the number of sweeps that dropped them, so far: what a cache
+    /// that left such entries to its eviction would have carried as dead
+    /// weight.
+    #[cfg(feature = "metrics")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dead_entries_dropped(&self) -> (u64, u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (
+            self.dead_bytes.load(Relaxed),
+            self.dead_sweeps.load(Relaxed),
+        )
+    }
+
     #[doc(hidden)]
     pub fn insert_block(&self, id: GlobalTableId, offset: BlockOffset, block: Block) {
         // Pin index / filter / range-tombstone blocks: they are touched on every
@@ -1138,6 +1294,17 @@ impl Cache {
         if !self.row_cache_enabled {
             return 0;
         }
+        let cache_key: CacheKey = (TAG_ROW, id.tree_id(), id.table_id(), key_hash).into();
+        // A row is taken at once while its shard has room, and into a full
+        // one only on its second miss: a key read once then costs a
+        // fingerprint, not a copy of the row, an insert and the eviction of
+        // something that may be read again.
+        if !self
+            .data
+            .admit(&cache_key, row_weight(user_key.len(), value.len()))
+        {
+            return 0;
+        }
         // The point-read path hands over a key and value that may be SUBSLICES
         // of the decoded data block, and a subslice keeps the whole block
         // allocation alive. The weigher charges a row its own key and value
@@ -1162,11 +1329,54 @@ impl Cache {
             key: crate::key::InternalKey::new(crate::UserKey::from(user_key), seqno, value_type),
             value: crate::UserValue::from(value),
         };
-        self.data.insert(
-            (TAG_ROW, id.tree_id(), id.table_id(), key_hash).into(),
-            Item::Row(iv),
-        );
+        // On probation: a row earns the main queue by being read again, so a
+        // stream of rows read twice and no more cannot push out the blocks
+        // every read walks.
+        self.data
+            .insert_with_priority(cache_key, Item::Row(iv), Priority::Probation);
         user_key.len() + value.len()
+    }
+
+    /// The row gate of tree `tree`: made at the first call for it, and the
+    /// same one at every later call.
+    pub(crate) fn row_gate(
+        &self,
+        tree: crate::TreeId,
+    ) -> alloc::sync::Arc<crate::row_gate::RowGate> {
+        alloc::sync::Arc::clone(
+            self.row_gates
+                .lock()
+                .entry(tree)
+                .or_insert_with(|| alloc::sync::Arc::new(crate::row_gate::RowGate::new())),
+        )
+    }
+
+    /// Eighths, 0 to 8, of tree `tree`'s keys whose point reads go through
+    /// the row cache now: the tree's own choice, made from its reads.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn row_share(&self, tree: crate::TreeId) -> u8 {
+        self.row_gate(tree).eighths()
+    }
+
+    /// Bytes the simulation of tree `tree`'s row gate holds now: at most a
+    /// two-hundredth of the cache's capacity, beside the bytes it caches.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn row_gate_bytes(&self, tree: crate::TreeId) -> u64 {
+        self.row_gate(tree).memory()
+    }
+
+    /// Sets tree `tree`'s row share, in eighths, until its reads move it.
+    #[doc(hidden)]
+    pub fn set_row_share(&self, tree: crate::TreeId, eighths: u8) {
+        self.row_gate(tree).set_eighths(eighths.min(8));
+    }
+
+    /// Forgets the row gate of a tree that is gone. Its tables hold theirs
+    /// until they drop.
+    pub(crate) fn forget_tree(&self, tree: crate::TreeId) {
+        self.row_gates.lock().remove(&tree);
     }
 
     /// Caches a blob file frame, checked and decoded, under its file and
