@@ -201,6 +201,55 @@ fn a_cache_told_not_to_adapt_fills_rows_for_every_key() {
     );
 }
 
+/// One order of evenly drawn keys read over and over brings each key back
+/// after as many reads as the tree has keys, more than the cache remembers
+/// of the keys it refused: a row is refused on every read and never held.
+/// The tree's model has to forget as soon as the cache does, or it counts
+/// those rows as held and keeps them: such a tree read 3769 ns a key with
+/// its rows against 2998 without. It gives them up.
+#[test]
+fn a_tree_replaying_evenly_drawn_keys_past_its_cache_gives_up_its_rows() {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let cache = Arc::new(Cache::with_capacity_bytes(16 * 1024 * 1024));
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache.clone())
+    .open()
+    .unwrap();
+    let keys = 70_000u64;
+    let spread = |i: u64| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20).to_be_bytes();
+    let value = vec![7u8; 256];
+    for i in 0..keys {
+        tree.insert(spread(i), &value, 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let order: Vec<u64> = (0..keys)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % keys
+        })
+        .collect();
+    let mut shares = Vec::new();
+    for _ in 0..16 {
+        for &at in &order {
+            assert!(tree.get(spread(at), SeqNo::MAX).unwrap().is_some());
+        }
+        shares.push(cache.row_share(tree.id()));
+    }
+    assert!(
+        shares.iter().skip(8).all(|&share| share == 0),
+        "closed by the ninth pass and stays closed: {shares:?}",
+    );
+}
+
 /// A tree read key by key, round after round, through a cache that holds
 /// most but not all of it gives its rows up: a row comes back only after
 /// every other key was read, by when the cache has dropped it. Left on, the

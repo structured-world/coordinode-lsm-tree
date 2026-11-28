@@ -165,7 +165,21 @@ struct Sim {
     /// What the cache's loads were taking at the last sampled read, in
     /// nanoseconds; zero where it has timed none.
     load_nanos: u64,
+    /// Sampled reads of the window whose row the cache held.
+    held: u64,
+    /// How much of the row hits the shadows count the cache has been
+    /// delivering, in thousandths (see [`RowGate::trust`]).
+    trust: u64,
 }
+
+/// Row hits the shadow of the fraction in use has to count in a window for
+/// the cache's own hits to be measured against them.
+const TRUST_HITS_MIN: u64 = 16;
+
+/// Each window a closed gate regains one part in this many of the trust it
+/// lost, so it tries its rows again after some tens of windows, a few
+/// million reads, and for one window where the cache still delivers none.
+const TRUST_REGAIN: u64 = 128;
 
 /// A sampled read's place in its table: the block it came from, by offset,
 /// and the block's weight in the cache.
@@ -216,6 +230,8 @@ impl RowGate {
                 running: [0; CANDIDATES.len()],
                 windows: 0,
                 load_nanos: 0,
+                held: 0,
+                trust: 1_000,
             }),
         }
     }
@@ -255,8 +271,13 @@ impl RowGate {
     /// Plays one sampled read against every candidate's shadow, and at the
     /// end of a window moves the fraction to the candidate that keeps
     /// winning. Skipped when another sampled read is being played. `capacity`
-    /// is the cache's, which the shadows are scaled from, and `load_nanos`
-    /// what its cold loads have been taking, zero where none was timed.
+    /// is the cache's, which the shadows are scaled from, `load_nanos` what
+    /// its cold loads have been taking, zero where none was timed, and
+    /// `held` whether the cache held the key's row.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one sampled read, as the table saw it"
+    )]
     pub(crate) fn observe(
         &self,
         capacity: u64,
@@ -265,11 +286,13 @@ impl RowGate {
         row_weight: u64,
         block: BlockSeen,
         load_nanos: u64,
+        held: bool,
     ) {
         let Some(mut sim) = self.sim.try_lock() else {
             return;
         };
         sim.load_nanos = load_nanos;
+        sim.held += u64::from(held);
         if sim.shadows.is_none() {
             // Rows too small for the shadows' share of memory at one read in
             // `SAMPLE` are sampled more sparsely, by as much as they fall
@@ -343,15 +366,34 @@ impl RowGate {
     /// the cheapest when it beats the fraction in use by the margin.
     fn close_window(&self, sim: &mut Sim) {
         let block_miss = block_miss_cost(sim.load_nanos);
+        let in_use = self.eighths();
+        let current = CANDIDATES
+            .iter()
+            .position(|&eighths| eighths == in_use)
+            .unwrap_or(CANDIDATES.len() - 1);
+        sim.trust = Self::trust(sim, current);
+        // What a read costs that goes to its block: the candidate with no
+        // rows sends every read there.
+        let block_read = sim
+            .events
+            .first()
+            .map_or(cost::BLOCK_HIT, |none| none.cost(block_miss))
+            / u64::from(sim.seen.max(1));
         // Each window counts half of what the one after it does. One window
         // alone does not tell the candidates apart: a shadow holds a few
         // hundred entries, and a handful of block misses more or less in it,
         // each worth dozens of row probes, falls to chance.
         for (running, events) in sim.running.iter_mut().zip(sim.events) {
-            *running = *running / 2 + events.cost(block_miss);
+            // The row hits the cache is not delivering are reads that looked
+            // for a row, were refused one and went to their block.
+            let undelivered = events.row_hits * (1_000 - sim.trust) / 1_000;
+            let cost = events.cost(block_miss) - undelivered * cost::ROW_HIT
+                + undelivered * (cost::ROW_PROBE + cost::ROW_REFUSAL + block_read);
+            *running = *running / 2 + cost;
         }
         sim.events = [Events::default(); CANDIDATES.len()];
         sim.seen = 0;
+        sim.held = 0;
         sim.windows = sim.windows.saturating_add(1);
         // The first window starts from empty shadows, where every candidate
         // misses alike.
@@ -359,11 +401,6 @@ impl RowGate {
             return;
         }
 
-        let in_use = self.eighths();
-        let current = CANDIDATES
-            .iter()
-            .position(|&eighths| eighths == in_use)
-            .unwrap_or(CANDIDATES.len() - 1);
         let best = sim
             .running
             .iter()
@@ -381,6 +418,30 @@ impl RowGate {
             && let Some(&eighths) = CANDIDATES.get(best)
         {
             self.eighths.store(eighths, Ordering::Relaxed);
+        }
+    }
+
+    /// How much of the row hits the shadows count the cache delivers, in
+    /// thousandths, after the window `sim` holds, where the candidate at
+    /// `current` is the fraction in use.
+    ///
+    /// A shadow is the cache in miniature and not the cache: a block stands
+    /// in it as one sampled key's share, so a miss brings in a fraction of
+    /// the bytes it brings into the cache, and rows outlive in a shadow the
+    /// stream of blocks that evicts them from the cache. Where the shadow of
+    /// the fraction in use counts row hits the cache did not give the same
+    /// sampled reads, the trust halves toward what the cache gave, and every
+    /// candidate's row hits are priced by it. A tree with no rows has nothing
+    /// to measure and regains its trust slowly, until it tries rows again.
+    fn trust(sim: &Sim, current: usize) -> u64 {
+        let counted = sim.events.get(current).map_or(0, |events| events.row_hits);
+        if current == 0 {
+            sim.trust + (1_000 - sim.trust).div_ceil(TRUST_REGAIN)
+        } else if counted >= TRUST_HITS_MIN {
+            let delivered = (sim.held * 1_000 / counted).min(1_000);
+            u64::midpoint(sim.trust, delivered)
+        } else {
+            sim.trust
         }
     }
 

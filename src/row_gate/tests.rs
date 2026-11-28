@@ -24,8 +24,34 @@ fn read_evenly(gate: &RowGate, keys: u64, reads: u64, seed: u64) {
             offset: key / 13 * 4_096,
             weight: 4_096,
         };
-        gate.observe(CACHE, 1, hash(key), 300, block, 0);
+        gate.observe(CACHE, 1, hash(key), 300, block, 0, true);
     }
+}
+
+/// A shadow counts hits on rows of a hot set that fits it. Where the cache
+/// gave the same reads no row, as when a stream of blocks evicts each row
+/// before its key is read again, the tree gives its rows up in spite of the
+/// shadows, and does not take them back while the reads stay as they are.
+#[test]
+fn rows_the_cache_does_not_deliver_are_given_up() {
+    let gate = gate();
+    let play = |windows: u64, held: bool| {
+        for n in 0..windows * u64::from(WINDOW) {
+            let key = hash(n) % 40;
+            let block = BlockSeen {
+                offset: key / 13 * 4_096,
+                weight: 4_096,
+            };
+            gate.observe(CACHE, 1, hash(key), 300, block, 0, held);
+        }
+    };
+    play(8, false);
+    assert_eq!(gate.eighths(), 0, "no row was delivered");
+    play(16, false);
+    assert_eq!(gate.eighths(), 0, "closed, with nothing new to measure");
+    // Tried again once the trust is back, and kept when the cache delivers.
+    play(200, true);
+    assert_eq!(gate.eighths(), 8);
 }
 
 /// Every key read in turn, round after round, where the cache holds most but
@@ -48,7 +74,7 @@ fn rounds_over_more_keys_than_the_cache_holds_turn_rows_off() {
             offset: hash(key ^ 0x5555) % keys / 14 * 4_096,
             weight: 4_096,
         };
-        gate.observe(CACHE, 1, key_hash, 330, block, 0);
+        gate.observe(CACHE, 1, key_hash, 330, block, 0, true);
         if gate.eighths() == 0 && closed_after.is_none() {
             closed_after = Some(n);
         }
@@ -88,7 +114,7 @@ fn the_shadows_stay_within_a_two_hundredth_of_the_cache() {
                 offset: key / 64 * 4_096,
                 weight: 4_096,
             };
-            gate.observe(CACHE, 1, hash(key), row, block, 0);
+            gate.observe(CACHE, 1, hash(key), row, block, 0, true);
         }
         assert!(
             gate.memory() <= CACHE / 200,
@@ -119,7 +145,7 @@ fn a_slow_load_weighs_against_rows_that_crowd_out_blocks() {
                 offset: key / 13 * 4_096,
                 weight: 4_096,
             };
-            gate.observe(CACHE, 1, hash(key), 300, block, load_nanos);
+            gate.observe(CACHE, 1, hash(key), 300, block, load_nanos, true);
         }
         gate.eighths()
     };
